@@ -49,6 +49,10 @@ from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
 _SM80 = "SdpaFwdDslSm80"
+# Same adapter as SM80: one kernel skeleton, two device families.  The row
+# states the box (flavor + tile geometry) it was validated on and the exact
+# (major, minor) set it may run on; the adapter no longer hardcodes either.
+_SM89 = "SdpaFwdDslSm80"
 
 
 def _adapter(name: str):
@@ -646,6 +650,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if capabilities.sm_lo == 89 and facts.h_q != facts.h_kv:
+        # The Ada row's L20 run covered the equal-head layout only: a GQA/MQA
+        # graph reaches the same template through the KV-head broadcast (or
+        # PackGQA), neither of which was measured on this part.  Declined rather
+        # than served unmeasured -- the SM80 row keeps serving A100 either way.
+        return "GQA / MQA (H_q != H_kv) is not claimed by this SM89 row"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.s_q == 1 and not capabilities.decode:
@@ -1533,6 +1543,98 @@ def _sm80_spec() -> EngineSpec:
     )
 
 
+def _sm89_spec() -> EngineSpec:
+    """SM89 (Ada / L20) prefill row: the SAME ``prefill_f16`` template and the same
+    frozen gptoss geometry as ``sdpa_fwd_prefill_sm80``, on a part with 99 KiB of
+    opt-in SMEM per block instead of A100's 164 KiB.
+
+    This row exists because "the SM80 kernels do not run on Ada" is an
+    ARTIFACT OF THE SHARED SKELETON'S LARGEST FLAVOR: the SM80 row has to carry
+    the d=256 flavor, whose pinned point allocates 128 KiB (sQ_buf 64 KiB +
+    sK_buf 64 KiB), so cc 8.0 exactly is the honest gate for that row.  The d64
+    gptoss point allocates 32 KiB and fits Ada with room to spare, so it is
+    served here under a box that claims ONLY what was measured on an L20.
+
+    Deliberately narrow (see the SM89 execution plan's scope table):
+      * forward, FP16/BF16, prefill only.  No backward, no FP8/MXFP8, no
+        native-FP32 output.
+      * ``d_shapes={(64, 64)}`` exactly, ``d_pad_multiple=1``: the adapter pads
+        head dims host-side, so a graph with d < 64 rides the d64 kernel rather
+        than any envelope, and a graph with d > 64 is declined instead of
+        silently landing on the 128-wide flavor (which does not fit Ada).
+      * dense BSHD / dense_flex only: THD is gated off by the SM80 forward row
+        already, and the L20 run did not qualify it.
+      * masks: the band claim is explicit and RESTRICTED (see ``band=`` below),
+        because the legacy capability flags can only WIDEN a row.  Measured on
+        the L20: unmasked, top-left causal and ``sliding_window_length=W`` (W
+        keys ending at self), on square AND rectangular graphs (256x512 and
+        512x256 both get a plan).  NOT claimed: the bottom-right anchor — a
+        rectangular bottom-right-causal graph is DECLINED by this row (the
+        backend's plans stand instead), which the test file pins as a rejection
+        rather than a silent fallback; and right-band widening, whose kwarg is
+        accepted and IGNORED (the served output is bit-identical to plain
+        top-left causal with and without ``diagonal_band_right_bound``), so
+        advertising it would be a false capability.  ``padded``/``sink``/
+        ``bias``/``decode`` are NOT claimed either: each needs its own L20
+        evidence, and the SM80 row keeps serving A100 regardless.
+      * ``tile_ms``/``tile_ns`` stay empty: the tile geometry is the row's
+        validated box, not a user knob, and an unvalidated tile is exactly what
+        the row must not advertise.
+    """
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm89",
+        capabilities=Capabilities(
+            sm_lo=89,
+            sm_hi=89,  # Ada (L20): the 99 KiB opt-in SMEM part this was measured on
+            phase="prefill",
+            d_shapes=frozenset({(64, 64)}),
+            d_pad_multiple=1,  # host-side head-dim padding, like the SM80 row
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            # Mask claim in the canonical spelling.  The flags alone would
+            # derive exactly this (`causal` + `swa`, nothing else), but stating
+            # it explicitly is what makes the ANCHOR restriction part of the
+            # row's identity rather than an accident of two booleans being
+            # absent: this row serves the top-left anchor only.  The L20 run
+            # qualified top-left causal on square AND rectangular graphs; a
+            # RECTANGULAR bottom-right-causal graph -- the case where the two
+            # anchors really are different masks -- is DECLINED by this row and
+            # the backend's plans stand in (test_sm89_d64.py pins that
+            # rejection), so the anchor has no measurement behind it and is not
+            # claimed.
+            causal=True,
+            swa=True,
+            band=band.BandSupport(
+                right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
+                left=frozenset({band.LEFT_NONE, band.LEFT_WINDOW}),
+                anchors=frozenset({band.ANCHOR_TOP_LEFT}),
+            ),
+            stats=True,
+            stats_log2=True,
+            lse_optional=True,
+            decode=False,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # NOT claimed: right_band_widening.  The kwarg is ACCEPTED but the
+            # L20 measurement found the served output bit-identical to plain
+            # top-left causal with and without ``diagonal_band_right_bound``, so
+            # the row must not advertise a widening it does not apply.  That is
+            # a kernel-side gap to investigate separately, not a row to widen.
+        ),
+        lower=partial(
+            lower_dsl_prefill,
+            api_type=_SM89,
+            # The validated box and the device family: both are plan-time data
+            # on the row, so the adapter cannot silently serve another part or
+            # another tile geometry under this engine's name.
+            api_ctor_extra={
+                "device_cc": ((8, 9),),
+                "flavor_params": {"flavor": "gptoss", "d_qk": 64, "d_v": 64, "tile_m": 128, "tile_n": 64, "num_warps": 4},
+            },
+        ),
+    )
+
+
 def _sm120_spec() -> EngineSpec:
     from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
 
@@ -1660,6 +1762,7 @@ def lower_dsl_prefill(
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
     api_type: str = _SM100,
+    api_ctor_extra: Optional[dict] = None,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -1668,6 +1771,13 @@ def lower_dsl_prefill(
     ``EngineSpec.lower`` may bind a different implementation through
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
+
+    ``api_ctor_extra`` carries plan-time data a row states about itself that the
+    shared adapter cannot know: which device family the row was validated on,
+    and which kernel box (flavor + tile geometry) it was measured at.  The keys
+    are checked against the adapter's constructor here, loudly and at build
+    time, and applied after construction but BEFORE ``check_support()`` so the
+    gate they feed is the row's own rather than a default.
     """
     from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
@@ -1687,7 +1797,20 @@ def lower_dsl_prefill(
     api_cls = _adapter(api_type)
     _ctor_params = frozenset(inspect.signature(api_cls.__init__).parameters)
     _exec_params = frozenset(inspect.signature(api_cls.execute).parameters)
+    # A row's own plan-time data (device family, validated kernel box). The keys
+    # are checked against the adapter's signature HERE, loudly and at build time,
+    # so a typo in a row fails on the first graph instead of silently doing
+    # nothing -- and they reach the constructor BEFORE check_support(), which is
+    # the gate they feed.
+    api_ctor_extra = dict(api_ctor_extra) if api_ctor_extra else {}
+    if api_ctor_extra:
+        _unknown = set(api_ctor_extra) - _ctor_params
+        if _unknown:
+            raise ValueError(
+                f"cudnn.sdpa: engine {spec.name} declares adapter construction extras " f"{sorted(_unknown)} that {api_cls.__name__}.__init__ does not accept"
+            )
     api = api_cls(
+        **api_ctor_extra,
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
@@ -2088,6 +2211,10 @@ ENGINE_SPECS = (
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),
+    # SM89 sits last: it is the narrowest row and overlaps SM80's d64 box on
+    # Ada, so putting it after the A100 row leaves every existing tie-break
+    # untouched on cc 8.0 (where the SM89 row is not eligible at all).
+    _sm89_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

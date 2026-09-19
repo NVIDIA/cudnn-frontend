@@ -200,16 +200,21 @@ def test_band_support_rejects_unknown_or_empty_axis_claims():
 
 
 def test_shipped_rows_express_both_a_full_and_a_restricted_claim():
-    # The tree already contains a restricted row (the MXFP8 backward: causal
-    # only, top-left only) next to the full ones -- the model must represent
-    # both, which is why "every built-in row supports causal" cannot be read as
-    # "the causal axis can be deleted".
+    # The tree contains RESTRICTED rows next to the full ones -- the MXFP8
+    # backward (causal only, top-left only) and the SM89 forward (top-left
+    # anchor only, no right-band widening) -- which is why "every built-in row
+    # supports causal" cannot be read as "the causal axis can be deleted": a
+    # claim narrower than the full set on at least one axis is declarable, and
+    # it is what the probe decides with.
+    full = band.BandSupport.full_masks()
     claims = {spec.name: spec.capabilities.band for _, spec in _rows()}
-    assert band.BandSupport.full_masks() in claims.values()
-    restricted = [name for name, claim in claims.items() if claim != band.BandSupport.full_masks()]
+    assert full in claims.values()
+    restricted = {name: claim for name, claim in claims.items() if claim != full}
     assert restricted, "no restricted row left in the tree; the model's restricted path is no longer exercised"
-    for name in restricted:
-        assert claims[name] == band.BandSupport.causal_and_unmasked(), name
+    for name, claim in restricted.items():
+        assert claim.right < full.right or claim.left < full.left or claim.anchors < full.anchors, name
+    # Both named restricted shapes the model ships are in the tree.
+    assert band.BandSupport.causal_and_unmasked() in restricted.values()
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +445,12 @@ def test_negative_right_bound_is_still_refused_by_the_forward_probe():
         caps = spec.capabilities
         reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **band_right(-1)))
         if kind == "fwd":
-            assert reason == "negative diagonal_band_right_bound (-1) is not supported", spec.name
+            # The forward probe asks the row's right-mode claim BEFORE it can
+            # look at the value, so only a row that serves widening reaches the
+            # negative-bound guard; one that does not reports the band.
+            assert reason == (
+                "negative diagonal_band_right_bound (-1) is not supported" if caps.right_band_widening else band.feature_reason(band.LABEL_RIGHT_FINITE)
+            ), spec.name
         else:
             # The backward probe has no such early value guard: the row's band
             # claim decides, so a row that serves widening still serves -1 (the
