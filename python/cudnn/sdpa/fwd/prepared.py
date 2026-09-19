@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import inspect
 import math
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
@@ -103,7 +104,7 @@ def facts_of_pack(pack, index: int) -> BufferFacts:
 
 class ThdLaunchSpec:
     """Plan-time facts of one THD f16 launch (built by :func:`build_thd_spec`); read-only after
-    build except for the lazily allocated read-only dummies it owns."""
+    build except for its bounded cache of immutable validated geometry."""
 
     __slots__ = (
         "fn",
@@ -138,6 +139,7 @@ class ThdLaunchSpec:
         "neg_inf",
         "device_index",
         "_dummies",
+        "_geometry_cache",
     )
 
     def frame(self) -> List[Any]:
@@ -246,6 +248,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._dummies = {}
+    s._geometry_cache = None
     if not s.has_sink:
         s._dummies["sinks"] = _zeroed_device_buffer(s.qh * 4, s.device_index)
     if not s.paged:  # the all-KV-zero clamp's V stub: one (kh, d_v) row of zeros
@@ -301,7 +304,7 @@ class ResolvedGeometry(NamedTuple):
     (token, head, elem) strides and the row span the capacities are computed from."""
 
     b: int
-    roles: Dict[str, Tuple[int, int, int, int]]  # name -> (ts, hs, es, row_span)
+    roles: Mapping[str, Tuple[int, int, int, int]]  # name -> (ts, hs, es, row_span)
 
 
 def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]]) -> ResolvedGeometry:
@@ -317,6 +320,15 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     q_lens, kv_lens = facts.get("q_lens"), facts.get("kv_lens")
     if q_lens is None or kv_lens is None:
         raise ValueError(f"cudnn.sdpa: " + ("THD execute requires seq_q_lens and seq_kv_lens"))
+    # Only the pure layout calculation is reusable. Addresses, observed storage spans,
+    # producer devices, workspace and stream are still validated/bound on EVERY call
+    # by bind_thd, including its per-call padded-Stats seed. Geometry changes (also
+    # execute-time overrides) take the same admission rules below.
+    names = ("q", "o") + (() if spec.paged else ("k", "v"))
+    key = (q_lens.shape, kv_lens.shape, tuple((facts[name].shape, facts[name].strides) for name in names))
+    cached = spec._geometry_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
     b = q_lens.numel - (1 if cu_q else 0)
     if b <= 0 or b > spec.b:
         raise ValueError(f"cudnn.sdpa: " + (f"seq_q_lens describes {b} sequences; this plan is prepared for 1..{spec.b}"))
@@ -325,7 +337,7 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     if spec.has_lse and spec.lse_padded and b != spec.b:
         raise ValueError(f"cudnn.sdpa: " + (f"a per-batch padded Stats buffer is declared for {spec.b} sequences; running {b} is not supported"))
     roles: Dict[str, Tuple[int, int, int, int]] = {}
-    for name in ("q", "o") + (() if spec.paged else ("k", "v")):
+    for name in names:
         f = facts[name]
         decl = spec.decl[name]
         h, d = decl[0], decl[1]
@@ -351,7 +363,12 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         if ts < (h - 1) * hs + d or (ts * width) % _ALIGN_TMA != 0:
             raise ValueError(f"cudnn.sdpa: " + (f"{name}: token stride {ts} must cover the {h} heads and be a 16-byte multiple"))
         roles[name] = (ts, hs, es, (h - 1) * hs + (d - 1) * es + 1)
-    return ResolvedGeometry(b, roles)
+    geometry = ResolvedGeometry(b, MappingProxyType(roles))
+    # Publish one immutable record, never a separately updated key/value pair: concurrent
+    # calls with different geometry may replace the cache but keep their own geometry.
+    # One entry bounds retained metadata independently of the number of batch shapes.
+    spec._geometry_cache = (key, geometry)
+    return geometry
 
 
 def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> None:
