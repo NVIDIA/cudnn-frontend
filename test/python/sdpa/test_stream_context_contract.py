@@ -220,14 +220,19 @@ def test_sentinel_handles_leave_the_ambient_stream_in_place():
 def test_torch_work_inside_the_context_follows_the_launch_stream():
     """Ordering evidence for the helper itself, independent of any engine.
 
-    The ambient stream poisons the tensor; the launch stream spins and then
-    restores it; the work under test runs inside the context while torch's
-    ambient stream is still the other one.  Work that lands on the launch stream
-    is ordered after the restore; work that escapes to the ambient stream races
-    it, so the result is not ``real * 2``.  The ambient/launch mismatch is the
-    point: with both on the same stream the check would pass either way, which is
-    how the first version of this case was written and why the mutation control
-    in the A2 evidence exists.
+    Initialization is ordered before the trial: the poison write completes and
+    records ``poison_ready``, and the launch stream waits on that event before it
+    spins and restores the tensor.  The work under test then runs inside the
+    context while torch's ambient stream is still a different one.
+
+    Scope: this asserts the ordering contract, not a device-level detector.  A
+    value race between the two streams is scheduler dependent -- on the L20 the
+    escaped work is often queued behind the spin kernel, which occupies the SMs,
+    so an escaped multiply can still land after the restore and read the correct
+    data.  The deterministic evidence for the context is the stream/device
+    contract asserted by the other cases in this file; kernel-level side-stream
+    ordering stays in ``sdpa/frost/test_sdpa_stream_ordering.py``, which needs
+    the Blackwell line.
     """
     from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
 
@@ -237,9 +242,15 @@ def test_torch_work_inside_the_context_follows_the_launch_stream():
     real = torch.arange(64, dtype=torch.float32, device=device)
     x = torch.full((64,), -7.0, dtype=torch.float32, device=device)
 
+    # Initialization completes before the trial starts: the launch stream waits
+    # on the poison event instead of relying on cross-stream luck, and no
+    # device-wide synchronize is used inside the window.
+    poison_ready = torch.cuda.Event()
     with torch.cuda.stream(ambient):
         x.fill_(-7.0)
+        poison_ready.record(ambient)
     with torch.cuda.stream(launch):
+        launch.wait_event(poison_ready)
         torch.cuda._sleep(_SPIN_CYCLES)
         x.copy_(real)
     with torch.cuda.stream(ambient):
