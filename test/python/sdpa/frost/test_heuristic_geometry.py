@@ -130,7 +130,10 @@ def test_swa_split_model_receives_live_cluster_work(monkeypatch):
 
     monkeypatch.setattr(heur, "choose_split_kv", recording)
     facts = _facts(s_q=256, s_kv=8192, causal=True, bottom_right=True, window_left=127)
-    assert heur.recommend("A", facts, {SPEC.name: 20500})
+    # Pin a candidate's geometry, not the performance policy's preferred one.
+    knobs = heur.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, pack_gqa=True, split_kv=1, sched_policy=0)
+    heur._split_points(SPEC.capabilities, facts, knobs.tile_m, knobs.tile_n, knobs.cga, pack_g=8, unsplit_knobs=knobs)
+    assert len(seen) == 1
     assert seen[0]["kv_tiles"] == 2  # full 64-token packed cluster plus its aligned band
     assert seen[0]["unsplit_launch"].kv_tiles == 2
     assert seen[0]["q_tiles"] == 4 and seen[0]["heads_q"] == 4
