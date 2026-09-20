@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""The SM100 THD (packed / ragged) f16 forward launch, prepared once and bound per call.
+"""SM100/SM107 f16 forward launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
 * **Observation** — :class:`BufferFacts`: what the caller's buffer is (address, dtype, device,
   the element span the producer guarantees, shape / strides). Read from the graph's normalized
-  ``VariantPack`` (:func:`facts_of_pack`) or from a torch tensor handed to the standalone
+  ``VariantPack`` (:func:`facts_of_roles`) or from a torch tensor handed to the standalone
   adapter (:func:`facts_of_tensor`). Nothing downstream looks at a buffer object again.
 * **Semantics** — :class:`ThdLaunchSpec`, built by the adapter after ``compile()``: the
   positional argument template of the explicit host entry with every plan constant filled,
@@ -19,6 +19,11 @@ Three owners, one implementation each:
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` both go through
 ``bind_thd`` and the artifact's positional tvm-ffi entry.
+
+Dense launches use :class:`DenseLaunchSpec` and :func:`bind_dense`. A split plan adds an
+immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
+and final outputs before either launch. Partial LSE remains natural-log even when final
+Stats are absent or use log2. Every execution owns both argument frames.
 """
 
 from __future__ import annotations
@@ -75,25 +80,12 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
 
 
 def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
-    """Facts of several variant-pack operands in one native crossing (see :func:`facts_of_pack`)."""
+    """Project normalized operands into immutable facts in one native crossing.
+
+    Effective dtype/geometry follow graph declarations and overrides; span and
+    device retain the producer's observations. No operand objects are built.
+    """
     return pack.native._facts_as(indices, BufferFacts, _DTYPE_BY_CODE)
-
-
-def facts_of_pack(pack, index: int) -> BufferFacts:
-    """Facts of variant-pack operand ``index``: the producer's observed span / device, the
-    effective (graph-described, overridden) geometry; no operand object is built."""
-    native = pack.native
-    code_bits = tuple(native.dtype(index))
-    nbytes = native.observed_bytes(index)
-    width = max(1, (int(code_bits[1]) + 7) // 8) if len(code_bits) == 2 else 1
-    return BufferFacts(
-        native.pointer(index),
-        _DTYPE_BY_CODE.get(code_bits, ""),
-        tuple(native.observed_device(index)),
-        -1 if nbytes < 0 else nbytes // width,  # producer bytes -> elements of the EFFECTIVE (declared) dtype
-        tuple(native.shape(index)),
-        tuple(native.stride(index)),
-    )
 
 
 class ThdLaunchSpec:
@@ -615,7 +607,7 @@ class PreparedThdLaunch:
             "q_lens": (binding.cu_seq_len_q if spec.lens_form & 1 else binding.seq_len_q).get_uid(),
             "kv_lens": (binding.cu_seq_len_kv if spec.lens_form & 2 else binding.seq_len_kv).get_uid(),
         }
-        if spec.has_lse:
+        if binding.stats is not None:
             uids["lse"] = binding.stats.get_uid()
         if spec.has_sink:
             uids["sinks"] = binding.sink_token.get_uid()
@@ -654,6 +646,18 @@ _FILLED_PER_CALL_DENSE = frozenset(
 )
 
 
+class SplitCombineSpec(NamedTuple):
+    """Immutable combine artifact and workspace geometry; addresses are bound per call."""
+
+    fn: Any
+    owner: Any
+    o: BufferFacts
+    lse: BufferFacts
+    lse_offset: int
+    output_dtype: str
+    has_stats: bool
+
+
 class DenseLaunchSpec:
     """Plan-time facts of one dense f16 launch (built by :func:`build_dense_spec`); read-only after build."""
 
@@ -682,6 +686,7 @@ class DenseLaunchSpec:
         "gate_expect",
         "split",
         "fp32_partial",
+        "combine",
         "tile_n",
         "causal",
         "causal_bottom_right",
@@ -721,6 +726,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.index = {n: i for i, n in enumerate(order)}
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
+    if getattr(km.CFG, "PACK_GQA", False) and s.qh != s.kh * km.CFG.QH_PER_KH:
+        raise ValueError("cudnn.sdpa: runtime head counts must match the compiled PackGQA ratio")
+    if hasattr(km, "N_Q") and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
+        raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
     s.split = int(api.split_kv)
@@ -750,6 +759,29 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     params = getattr(km, "PARAMS", None)
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
     s.device_index = int(api.q_desc.device.index or 0)
+    s.combine = None
+    if s.split > 1:
+        from cudnn.sdpa.fwd.api_dsl import ws_align
+        from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+        owner = split_combine.compile_ptr(
+            dtype_o=api._combine_dtype_tag(), dtype_partial=api._partial_dtype_tag(), has_lse=api.lse_desc is not None, stats_log2=api.stats_log2
+        )
+        fn = positional_entry(owner)
+        if fn is None:
+            raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
+        rows, sq, h, d = s.split * s.b, s.s_q_max, s.qh, s.d_v
+        o_size, lse_size = rows * sq * h * d, rows * h * sq
+        device = (_DLPACK_CUDA, s.device_index)
+        s.combine = SplitCombineSpec(
+            fn,
+            owner,
+            BufferFacts(0, s.expect["o"], device, o_size, (rows, h, sq, d), (sq * h * d, d, h * d, 1)),
+            BufferFacts(0, "float32", device, lse_size, (rows, h, sq), (h * sq, sq, 1)),
+            ws_align(o_size * s.elem_bytes["o"]),
+            str(api.o_desc.dtype).split(".")[-1],
+            api.lse_desc is not None,
+        )
     s._dummies = {}
     if not s.has_sink:
         s._dummies["sinks"] = _zeroed_device_buffer(s.qh * 4, s.device_index)
@@ -796,7 +828,16 @@ class _DenseRole(NamedTuple):
 
 
 def _dense_role(
-    spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, heads: int, d: int, s_max: int, expect: str, b_mult: int = 1
+    spec: DenseLaunchSpec,
+    facts: Dict[str, Optional[BufferFacts]],
+    name: str,
+    heads: int,
+    d: int,
+    s_max: int,
+    expect: str,
+    b_mult: int = 1,
+    *,
+    tma: bool = True,
 ) -> _DenseRole:
     """One BHSD operand of a dense launch: dtype / device / alignment, the fixed head count and head
     dim, batch and sequence within the plan's envelope, and a layout TMA binds zero-copy — head dim
@@ -808,10 +849,9 @@ def _dense_role(
     if f.dtype != expect:
         raise ValueError(f"cudnn.sdpa: {name}: runtime buffer dtype {f.dtype} does not match its declaration ({expect})")
     _on_plan_device(spec, name, f)
-    if f.ptr % _ALIGN_TMA != 0:
-        raise ValueError(
-            f"cudnn.sdpa: {name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {f.ptr % _ALIGN_TMA}"
-        )
+    align = _ALIGN_TMA if tma else _buffers.DTYPE_ITEMSIZE[expect]
+    if f.ptr % align != 0:
+        raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {align}-byte aligned; got data_ptr() % {align} == {f.ptr % align}")
     if len(f.shape) != 4:
         raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(f.shape)}")
     b, h, seq, dd = (int(x) for x in f.shape)
@@ -825,7 +865,15 @@ def _dense_role(
     # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
-    bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in f.strides), _buffers.DTYPE_ITEMSIZE[expect])
+    if tma:
+        bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in f.strides), _buffers.DTYPE_ITEMSIZE[expect])
+    else:
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+        if not dense_layout_ok(f.shape, f.strides):
+            raise ValueError(f"cudnn.sdpa: {name}: split output needs contiguous D and non-overlapping strides; got {f.shape} / {f.strides}")
+        st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(f.shape, f.strides))
+        bound = st[0], st[2], st[1]
     if bound is None:
         raise ValueError(
             f"cudnn.sdpa: {name}: shape {tuple(f.shape)} strides {tuple(f.strides)} is not a layout the kernel binds zero-copy: the head dim must be "
@@ -836,6 +884,33 @@ def _dense_role(
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; its geometry {tuple(f.shape)} / {tuple(f.strides)} needs {need}")
     return _DenseRole(f.ptr, (bs, ss, hs), b, seq)
+
+
+def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: int, *, required: bool):
+    """Validate main or final Stats with the same device, span and non-aliasing contract."""
+    if required:
+        if lse is None:
+            raise ValueError("cudnn.sdpa: lse_tensor is required by this compiled specialization")
+        _on_plan_device(spec, "lse_tensor", lse)
+        if lse.dtype != "float32":
+            raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
+        if lse.ptr % _ALIGN_F32 != 0:
+            raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
+        sh, st = tuple(int(x) for x in lse.shape), tuple(int(x) for x in lse.strides)
+        if len(sh) == 4 and sh[3] == 1:
+            sh, st = sh[:3], st[:3]
+        if len(sh) != 3 or sh[0] < b or sh[1] != spec.qh or sh[2] < s_q:
+            raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {spec.qh}, {s_q}[, 1]) or larger; got {tuple(lse.shape)}")
+        need = (b - 1) * st[0] + (spec.qh - 1) * st[1] + (s_q - 1) * st[2] + 1
+        if lse.span >= 0 and lse.span < need:
+            raise ValueError(f"cudnn.sdpa: lse_tensor spans {lse.span} elements; its geometry needs {need}")
+        if not _covering((b, spec.qh, s_q), st):
+            raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
+        return lse.ptr, (st[0], st[1], st[2])
+    elif lse is not None:
+        raise ValueError("cudnn.sdpa: this specialization was compiled without a Stats output; construct the API without sample_lse")
+
+    return None, (0, 0, 0)
 
 
 def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], stream, stream_int: int) -> List[Any]:
@@ -892,28 +967,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     if spec.fp32_partial:
         frame[ix["o_partial_ptr"]] = o.ptr
 
-    lse = facts.get("lse")
-    if spec.has_lse:
-        if lse is None:
-            raise ValueError("cudnn.sdpa: lse_tensor is required by this compiled specialization")
-        _on_plan_device(spec, "lse_tensor", lse)
-        if lse.dtype != "float32":
-            raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
-        if lse.ptr % _ALIGN_F32 != 0:
-            raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-        sh, st = tuple(int(x) for x in lse.shape), tuple(int(x) for x in lse.strides)
-        if len(sh) == 4 and sh[3] == 1:
-            sh, st = sh[:3], st[:3]
-        if len(sh) != 3 or sh[0] < b * spec.split or sh[1] != spec.qh or sh[2] < s_q:
-            raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b * spec.split}, {spec.qh}, {s_q}[, 1]) or larger; got {tuple(lse.shape)}")
-        need = (b * spec.split - 1) * st[0] + (spec.qh - 1) * st[1] + (s_q - 1) * st[2] + 1
-        if lse.span >= 0 and lse.span < need:
-            raise ValueError(f"cudnn.sdpa: lse_tensor spans {lse.span} elements; its geometry needs {need}")
-        if not _covering((b * spec.split, spec.qh, s_q), st):
-            raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
-        frame[ix["lse_ptr"]], frame[ix["lse_strides"]] = lse.ptr, (st[0], st[1], st[2])
-    elif lse is not None:
-        raise ValueError("cudnn.sdpa: this specialization was compiled without a Stats output; construct the API without sample_lse")
+    frame[ix["lse_ptr"]], frame[ix["lse_strides"]] = _dense_lse(spec, facts.get("lse"), b * spec.split, s_q, required=spec.has_lse)
 
     sinks = facts.get("sinks")
     if spec.has_sink:
@@ -953,13 +1007,42 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     return frame
 
 
+def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int):
+    """Bind partial workspace and final strided outputs before either split kernel launches."""
+    combine = spec.combine
+    if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
+        raise ValueError("cudnn.sdpa: split workspace must be non-null and 16-byte aligned")
+    q = facts.get("q")
+    if q is None or len(q.shape) != 4 or (q.shape[0], q.shape[2]) != (spec.b, spec.s_q_max):
+        raise ValueError(f"cudnn.sdpa: a split launch runs the declared (B, S_q) = ({spec.b}, {spec.s_q_max})")
+    o = _dense_role(spec, facts, "o", spec.qh, spec.d_v, spec.s_q_max, combine.output_dtype, tma=False)
+    if (o.b, o.s) != (spec.b, spec.s_q_max):
+        raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
+    lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    lse_partial_ptr = workspace_ptr + combine.lse_offset
+    partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
+    frame = bind_dense(spec, partials, stream, stream_int)
+    combine_args = (
+        workspace_ptr,
+        lse_partial_ptr,
+        o.ptr,
+        lse_ptr,
+        (spec.b, spec.qh, spec.s_q_max, spec.d_v),
+        spec.split,
+        (*o.strides, 1),
+        lse_strides,
+        stream,
+    )
+    return frame, combine_args
+
+
 class PreparedDenseLaunch:
     """The graph plan's dense f16 launch: the spec plus this graph's operand uids."""
 
     def __init__(self, spec: DenseLaunchSpec, binding, *, seq_kv_src=None, seq_q_src=None, gate_src=None):
         self.spec = spec
         uids = {"q": binding.q.get_uid(), "k": binding.k.get_uid(), "v": binding.v.get_uid(), "o": binding.o.get_uid()}
-        if spec.has_lse:
+        if binding.stats is not None:
             uids["lse"] = binding.stats.get_uid()
         if spec.has_sink:
             uids["sinks"] = binding.sink_token.get_uid()
@@ -984,4 +1067,9 @@ class PreparedDenseLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
-        self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
+        if self.spec.combine is not None:
+            frame, combine_args = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
+            self.spec.fn(*frame)
+            self.spec.combine.fn(*combine_args)
+        else:
+            self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))

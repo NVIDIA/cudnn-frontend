@@ -172,3 +172,92 @@ def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, ma
     assert dense_bind_strides.cache_info().hits == hits + 1
     with pytest.raises(ValueError, match=match):
         bind(original._replace(**updates))
+
+
+def _split_fixture(stats):
+    b, h, hk, sq, sk, d, splits = 2, 2, 1, 4, 128, 16, 2
+    spec = SimpleNamespace(
+        b=b,
+        qh=h,
+        kh=hk,
+        d_qk=d,
+        d_v=d,
+        s_q_max=sq,
+        s_k_max=sk,
+        split=splits,
+        expect=dict(q="bfloat16", k="bfloat16", v="bfloat16", o="float32"),
+        device_index=0,
+        paged=False,
+        fp32_partial=True,
+        has_lse=True,
+        has_sink=False,
+        seq_q_present=False,
+        seq_kv_present=False,
+        gate_expect=None,
+        shape_fixed=False,
+        lpt_grid_fixed=False,
+        kv_tail_admitted=lambda q, kv: True,
+        dummy=lambda name: 0x100000,
+    )
+    spec.order = sorted(prep._FILLED_AT_BUILD_DENSE | prep._FILLED_PER_CALL_DENSE)
+    spec.index = {name: i for i, name in enumerate(spec.order)}
+    spec.template = [None] * len(spec.order)
+    spec.frame = lambda: list(spec.template)
+    facts = {}
+    for i, (name, heads, seq) in enumerate((("q", h, sq), ("k", hk, sk), ("v", hk, sk), ("o", h, sq))):
+        facts[name] = prep.BufferFacts(0x1000 * (i + 1), "bfloat16", (2, 0), b * heads * seq * d, (b, heads, seq, d), (seq * heads * d, d, heads * d, 1))
+    if stats:
+        facts["lse"] = prep.BufferFacts(0x20000, "float32", (2, 0), b * h * sq, (b, h, sq), (h * sq, sq, 1))
+    rows = b * splits
+    spec.combine = prep.SplitCombineSpec(
+        None,
+        None,
+        prep.BufferFacts(0, "float32", (2, 0), rows * h * sq * d, (rows, h, sq, d), (sq * h * d, d, h * d, 1)),
+        prep.BufferFacts(0, "float32", (2, 0), rows * h * sq, (rows, h, sq), (h * sq, sq, 1)),
+        rows * h * sq * d * 4,
+        "bfloat16",
+        stats,
+    )
+    return spec, facts
+
+
+@pytest.mark.parametrize("stats", [False, True])
+def test_split_frames_rebind_workspace_outputs_and_stream_independently(stats):
+    spec, facts = _split_fixture(stats)
+
+    def bind(i):
+        workspace, stream = 0x100000 + i * 0x10000, 17 + i
+        rebound = {name: f._replace(ptr=f.ptr + i * 0x100000) for name, f in facts.items()}
+        main, combine = prep.bind_dense_split(spec, rebound, workspace, stream, stream)
+        assert main[spec.index["o_ptr"]] == main[spec.index["o_partial_ptr"]] == combine[0] == workspace
+        assert main[spec.index["lse_ptr"]] == combine[1] == workspace + spec.combine.lse_offset
+        assert combine[2] == rebound["o"].ptr
+        assert combine[3] == (rebound["lse"].ptr if stats else None)
+        assert main[spec.index["stream"]] == combine[-1] == stream
+        return main, combine
+
+    with ThreadPoolExecutor(2) as pool:
+        frames = list(pool.map(bind, range(8)))
+    assert len({id(main) for main, _ in frames}) == 8
+    assert spec.combine.o.ptr == spec.combine.lse.ptr == 0, "workspace addresses must never be cached on the plan"
+    assert all(value is None for value in spec.template), "per-call binding must not mutate the plan"
+
+
+@pytest.mark.parametrize(
+    "role,updates,match",
+    [
+        ("o", {"span": 1}, "spans"),
+        ("o", {"device": (1, 0)}, "CUDA device"),
+        ("o", {"dtype": "float32"}, "dtype"),
+        ("o", {"strides": (128, 0, 32, 1)}, "non-overlapping"),
+        ("o", {"strides": (128, 16, 32, 2)}, "contiguous D"),
+        ("lse", {"strides": (8, 0, 1)}, "alias"),
+        ("lse", {"span": 1}, "spans"),
+        ("q", {"shape": (1, 2, 4, 16)}, "declared"),
+    ],
+)
+def test_split_final_outputs_are_validated_before_launch(role, updates, match):
+    spec, facts = _split_fixture(True)
+    changed = dict(facts, **{role: facts[role]._replace(**updates)})
+    with pytest.raises(ValueError, match=match):
+        prep.bind_dense_split(spec, changed, 0x100000, 17, 17)

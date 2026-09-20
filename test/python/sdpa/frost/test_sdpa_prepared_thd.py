@@ -590,7 +590,23 @@ def test_graph_and_standalone_execute_bind_the_same_frame():
 # --- dense (padded) f16 through the same prepared machinery ------------------------------------------------
 
 
-def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=None, bottom_right=False):
+def _dense_graph(
+    b,
+    h,
+    hk,
+    s_q,
+    s_kv,
+    d,
+    *,
+    causal=True,
+    bshd_storage=True,
+    d_v=None,
+    bottom_right=False,
+    split_kv=1,
+    stats=True,
+    stats_log2=False,
+    o_stride=None,
+):
     """A dense bf16 graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
     repacks and the prepared launch therefore declines)."""
     d_v = d if d_v is None else d_v
@@ -603,9 +619,10 @@ def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=
     tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=cudnn.data_type.BFLOAT16, name="k")
     tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=cudnn.data_type.BFLOAT16, name="v")
     mask = dict(use_causal_mask_bottom_right=True) if (causal and bottom_right) else dict(use_causal_mask=causal)
-    to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=True, attn_scale=1.0 / math.sqrt(d), **mask)
-    to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v))
-    ts.set_output(True).set_dim([b, h, s_q, 1]).set_stride([h * s_q, s_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=stats, stats_use_log2=stats_log2, attn_scale=1.0 / math.sqrt(d), **mask)
+    to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v) if o_stride is None else o_stride)
+    if stats:
+        ts.set_output(True).set_dim([b, h, s_q, 1]).set_stride([h * s_q, s_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -615,6 +632,12 @@ def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=
     idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
         idx = next(i for i, n in enumerate(names) if n == want or n.startswith(want + "["))
+    if split_kv > 1:
+        from dataclasses import replace
+
+        chosen = g.plans[idx]
+        g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv))
+        idx = len(g.plans) - 1
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
@@ -889,3 +912,119 @@ def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
     for k_hnd, v_hnd in ((True, False), (False, True)):
         with pytest.raises(ValueError, match="compiled for NHD"):
             prep_mod._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("stats,stats_log2", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("output_layout", ["bshd", "bhsd_padded", "bhsd_offset"])
+def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, output_layout, monkeypatch):
+    """Split execution binds workspace per call and writes the declared O without a copy kernel."""
+    b, h, hk, sq, sk = 2, 8, 2, 4, 1024
+    stride = (h * sq * (d + 8), sq * (d + 8), d + 8, 1) if output_layout != "bshd" else (sq * h * d, d, h * d, 1)
+    g, t = _dense_graph(b, h, hk, sq, sk, d, causal=False, split_kv=2, stats=stats, stats_log2=stats_log2, o_stride=stride)
+    plan = _plan(g)
+    assert isinstance(plan._prepared, prep_mod.PreparedDenseLaunch), "split plans must not fall back to the tensor adapter"
+    assert plan._prepared.spec.combine is not None
+    assert plan._compiled.kernel_template == f"decode_d{d}_f16"
+    workspaces = [torch.empty(g.get_workspace_size(), dtype=torch.uint8, device=DEV) for _ in range(2)]
+    bufs = _dense_buffers(b, h, hk, sq, sk, d, seed=123)
+    backing = torch.full((b, h, sq, d + 8), 42.0, dtype=torch.bfloat16, device=DEV) if output_layout != "bshd" else None
+    if backing is not None:
+        if output_layout == "bhsd_offset":
+            storage = torch.full((backing.numel() + 1,), 42.0, dtype=backing.dtype, device=DEV)
+            backing = storage[1:].view(backing.shape)
+        bufs["o"] = backing[..., :d]
+    pack = {t[n]: bufs[n] for n in ("q", "k", "v", "o")}
+    if stats:
+        pack[t["stats"]] = bufs["lse"]
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+
+    def check():
+        q, k, v = (bufs[n].double() for n in ("q", "k", "v"))
+        scores = q @ k.repeat_interleave(h // hk, dim=1).transpose(-1, -2) / math.sqrt(d)
+        ref = scores.softmax(-1) @ v.repeat_interleave(h // hk, dim=1)
+        torch.testing.assert_close(bufs["o"].double(), ref, atol=5e-3, rtol=3e-2)
+        if stats:
+            ref_lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0)
+            torch.testing.assert_close(bufs["lse"].squeeze(-1).double(), ref_lse, atol=1e-4, rtol=1e-4)
+        if backing is not None:
+            assert torch.all(backing[..., d:] == 42.0), "combine must preserve padding beyond D"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared split must not use tensor adapter, copies or execution-time compilation")
+
+    monkeypatch.setattr(plan._compiled, "execute_resolved", forbidden)
+    import cutlass.cute as cute
+
+    monkeypatch.setattr(cute, "compile", forbidden)
+    for ws in workspaces:
+        bufs["q"].mul_(0.75)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            g.execute(pack, ws, handle=handle)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        stream.synchronize()
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        g.execute(pack, workspaces[1], handle=handle)
+    bufs["q"].mul_(0.5)
+    bufs["o"].fill_(float("nan"))
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph.replay()
+    stream.synchronize()
+    check()
+    with pytest.raises(ValueError, match="workspace"):
+        g.execute(pack, workspaces[0][:1], handle=handle)
+    with pytest.raises(ValueError, match="aligned"):
+        g.execute(pack, torch.empty(g.get_workspace_size() + 1, dtype=torch.uint8, device=DEV)[1:], handle=handle)
+    with pytest.raises(ValueError, match="CUDA device"):
+        g.execute(pack, torch.empty(g.get_workspace_size(), dtype=torch.uint8), handle=handle)
+    # A valid smaller allocation cannot change the fixed split-workspace geometry.
+    with pytest.raises(ValueError, match="declared"):
+        g.execute(pack, workspaces[0], override_uids=[t["q"].get_uid()], override_shapes=[[1, h, sq, d]], override_strides=[bufs["q"].stride()])
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("kh", [1, 2])
+@pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
+def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_hnd):
+    """One compiled page-layout specialization must cover both pools, including singleton KH."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, sq, d, page_size, n_pages = 2, 8, 4, 128, 16, 8
+    q = torch.empty((b, sq, h, d), dtype=torch.bfloat16, device=DEV).transpose(1, 2)
+    o = torch.empty_like(q)
+
+    def pool(hnd):
+        if hnd:
+            return torch.empty((n_pages, kh, page_size, d), dtype=q.dtype, device=DEV)
+        return torch.empty((n_pages, page_size, kh, d), dtype=q.dtype, device=DEV).transpose(1, 2)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=pool(k_hnd),
+        sample_v=pool(v_hnd),
+        sample_o=o,
+        seq_kv_lens_present=True,
+        paged_page_size=page_size,
+        paged_max_seq_len_kv=64,
+        split_kv=1,
+        pack_gqa=False,
+    )
+    if k_hnd == v_hnd:
+        assert api.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="paged K and V pools must use the same HND or NHD layout kind"):
+            api.check_support()

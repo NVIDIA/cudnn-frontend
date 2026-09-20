@@ -898,28 +898,8 @@ class VariantPackNative {
         return operands_.at(index).observed_bytes;
     }
 
-    // Every fact an engine binds from, for several operands, in ONE crossing:
-    // (pointer, dtype_code, dtype_bits, device_type, device_id, observed_bytes, shape, stride) per index.
-    py::list
-    facts(const std::vector<size_t> &indices) const {
-        py::list out;
-        for (size_t index : indices) {
-            const Operand &operand = operands_.at(index);
-            out.append(py::make_tuple(reinterpret_cast<int64_t>(pointers_.at(index)),
-                                      static_cast<int>(operand.dtype.code),
-                                      static_cast<int>(operand.dtype.bits),
-                                      operand.observed_device_type,
-                                      operand.observed_device_id,
-                                      operand.observed_bytes,
-                                      operand.shape,
-                                      stride(index)));
-        }
-        return out;
-    }
-
-    // Private typed projection of facts(), not another observation or validation path.
-    // Build the consumer's immutable records directly: facts()'s shape/stride lists
-    // and Python's second conversion loop otherwise allocate the same metadata twice.
+    // Build the consumer's immutable records in one native crossing, without
+    // intermediate Python lists or a second observation/validation path.
     // Effective dtype/geometry and observed producer span/device remain separate.
     py::list
     facts_as(const std::vector<size_t> &indices, const py::object &constructor, const py::dict &dtype_names) const {
@@ -1260,7 +1240,6 @@ its parts.
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
         .def("observed_bytes", &VariantPackNative::observed_bytes)
-        .def("facts", &VariantPackNative::facts)
         .def("_facts_as", &VariantPackNative::facts_as)
         .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
