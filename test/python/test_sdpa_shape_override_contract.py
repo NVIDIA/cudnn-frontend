@@ -97,7 +97,10 @@ class OverrideCase:
         if not backend:
             pytest.skip("no native backend plan claims the override graph on this part")
         g.select_plan(backend[0])
-        g.check_support()
+        try:
+            g.check_support()
+        except cudnn.cudnnGraphNotSupportedError as error:
+            pytest.skip(f"native plan does not support this graph: {error}")
         g.build_plans()
         self.backend_evidence()
         if measured:
@@ -154,6 +157,20 @@ class OverrideCase:
         assert self.graph.selected_engine is None
         assert self.graph._lowered_graph is not None
         assert self.graph._cpp_plans_created and self.graph._is_built
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [(cudnn.cudnnGraphNotSupportedError, pytest.skip.Exception), (RuntimeError, RuntimeError)],
+    ids=["unsupported-plan-skips", "other-errors-propagate"],
+)
+def test_native_plan_support_failure(monkeypatch, error, expected):
+    def reject_support(graph):
+        raise error("native support probe")
+
+    monkeypatch.setattr(pygraph, "check_support", reject_support)
+    with pytest.raises(expected, match="native support probe"):
+        OverrideCase(measured=False)
 
 
 @pytest.fixture
