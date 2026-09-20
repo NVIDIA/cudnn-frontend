@@ -426,6 +426,37 @@ def _synth_kv_padding(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
     )
 
 
+def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int]) -> Optional[str]:
+    """Pure admission for the graph's normalized VariantPack executor.
+
+    Shared by planning and lowering; no adapter, tensor framework or compilation.
+    ``split_kv=None`` asks whether the provider has a possible prepared plan.
+    A complete assignment additionally checks the final O store's layout.
+    Runtime geometry still has to fit the compiled binder's per-call contract.
+    """
+    if capabilities.sm_lo not in (100, 107) or facts.is_fp8 or facts.is_mxfp8:
+        return "this engine has no prepared shape/stride override executor"
+    if _synth_kv_padding(capabilities, facts) or facts.has_bias:
+        return "prepared overrides cannot use synthesized KV lengths or bias"
+    if facts.thd:
+        return "prepared THD overrides cannot use an epilogue gate or split-KV" if facts.has_epilogue_gate or (split_kv or 1) > 1 else None
+    if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
+        return "prepared dense overrides require per-batch lengths, not prefix sums"
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    tensors = [facts.q_t] + ([] if facts.has_paged_kv else [facts.k_t, facts.v_t])
+    if facts.has_epilogue_gate:
+        tensors.append(facts.epilogue_gate_t)
+    if split_kv is not None and split_kv <= 1:
+        tensors.append(facts.o_t)
+    for tensor in tensors:
+        if tensor is None or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 2) is None:
+            return "prepared overrides require input and unsplit-output layouts that bind without a copy"
+    if facts.o_t is None or not ga.dense_layout_ok(tuple(facts.o_t.get_dim()), tuple(facts.o_t.get_stride())):
+        return "prepared overrides require a non-overlapping dense output layout"
+    return None
+
+
 def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
     """Smallest native flavor whose envelope covers this graph -- honouring the
     per-shape envelope floors, so the knob domains (cga, split) describe the
@@ -808,6 +839,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
         if not (facts.padded or _band_covers_kv_tail(facts)):
             return f"S_kv ({facts.s_kv}) must be a multiple of {capabilities.skv_tile} unless a padding mask is given or the causal mask covers the KV tail"
+    if facts.shape_overrides:
+        return _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
     return None
 
 
@@ -1530,11 +1563,6 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     and ``engine.FrostSdpaFwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
-    # The family still contains tensor-bound executors that only understand
-    # declared geometry. Keep override-enabled graphs on a compatible provider,
-    # including when a caller explicitly pins an engine or requests FROST first.
-    if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
-        return None, "override-enabled graphs require a provider that honors execute-time shape and stride overrides"
     # The record validate() attached, not a fresh parse: one per graph, shared
     # with whatever ranked these plans before this engine was imported.
     facts = graph._facts_for(ga.analyze)
@@ -1699,6 +1727,10 @@ def lower_dsl_prefill(
         ),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    if facts.shape_overrides:
+        reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
+        if reason is not None:
+            raise NotImplementedError(reason)
     api.compile()
     # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
     # decode-shaped "decode_d256_f16"), when the adapter records one.
@@ -1914,49 +1946,23 @@ def lower_dsl_prefill(
     _execute.kernel_template = kernel_template
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
-    if not (facts.is_fp8 or facts.is_mxfp8) and not synth_kv_padding and bias_src is None:
+    if _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1)) is None:
         # The prepared launch (cudnn.sdpa.fwd.prepared): the plan binds the normalized VariantPack itself.
         # THD: the f16 ragged plan without a gate. Dense: the f16 plan whose declared Q/K/V/O layouts TMA
         # binds zero-copy. Split plans bind their partial workspace and final strided O in the same prepared call.
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
-        if facts.thd and gate_src is None and getattr(api, "_thd_spec", None) is not None:
+        if facts.thd and getattr(api, "_thd_spec", None) is not None:
             _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
-        elif (
-            not facts.thd
-            and facts.cu_seq_q_t is None
-            and facts.cu_seq_kv_t is None  # the dense host reads per-batch lengths; a prefix-sum form stays on the tensor arm
-            and getattr(api, "_dense_spec", None) is not None
-            and _dense_layouts_bind_zero_copy(api, facts, gate_src)
-        ):
+        elif not facts.thd and getattr(api, "_dense_spec", None) is not None:
             _execute.prepared = PreparedDenseLaunch(
                 api._dense_spec, binding, seq_kv_src=seq_kv_src, seq_q_src=seq_q_src if seq_q_lens_present else None, gate_src=gate_src
             )
         if _execute.prepared is not None:
             _execute.default_stream = lambda: api._get_default_stream(None)
+    if facts.shape_overrides and _execute.prepared is None:
+        raise NotImplementedError("this plan has no prepared shape/stride override executor")
     return _execute
-
-
-def _dense_layouts_bind_zero_copy(api, facts, gate_src) -> bool:
-    """Whether every dense operand's DECLARED layout is one the kernel binds without a repack
-    (`config_sm100.dense_bind_strides`, the binder's own predicate): the prepared launch never copies, so a
-    graph declared in a layout the tensor path normalizes by copying keeps the tensor path."""
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-    def ok(desc, elem_bytes):
-        return dense_bind_strides(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), elem_bytes) is not None
-
-    bpe = api._o_dtype().itemsize
-    descs = [(api.q_desc, 2)] + ([] if api.paged else [(api.k_desc, 2), (api.v_desc, 2)])
-    if api.split_kv > 1:
-        # The combine uses ordinary global stores with the actual output layout, not a TMA store.
-        if not ga.dense_layout_ok(tuple(api.o_desc.shape), tuple(api.o_desc.stride)):
-            return False
-    else:
-        descs.append((api.o_desc, bpe))
-    if gate_src is not None and getattr(api, "gate_desc", None) is not None:
-        descs.append((api.gate_desc, api.gate_desc.dtype.itemsize))
-    return all(ok(d, b) for d, b in descs)
 
 
 def engine_name(

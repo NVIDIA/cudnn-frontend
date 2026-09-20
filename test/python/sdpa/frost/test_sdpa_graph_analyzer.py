@@ -106,42 +106,91 @@ def test_probe_accepts_dsv4_causal():
     assert engines.engine_name() in _eligible(g)
 
 
-@pytest.mark.parametrize("arch", ["sm100", "sm120"])
+@pytest.mark.parametrize("unsupported", ["sm120", "synth_kv"])
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_fwd_override_graph_declines_before_lowering(monkeypatch, arch, opt_in):
-    """Default activation must not choose an executor that discards runtime geometry."""
+def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
+    """Graph admission declines legacy executors before loading a DSL adapter."""
     from dataclasses import replace
     from unittest.mock import Mock
 
     from cudnn.engines.base import PlanConfig
     from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
 
-    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0) if arch == "sm100" else (12, 0))
+    arch = "sm120" if unsupported == "sm120" else "sm100"
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0) if arch == "sm120" else (10, 0))
     if opt_in:
         monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     else:
         monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch=arch))
-    lower = Mock(side_effect=AssertionError("override-enabled graph must decline before compilation"))
-    spec = replace(spec, lower=lower)
-    engine = FrostSdpaFwdEngine(spec, 20511)
+    lower = Mock(side_effect=AssertionError("legacy override graph must decline before compilation"))
+    engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
     for enabled in (False, True):
         graph = _mk_graph(is_override_shape_enabled=enabled)
         q, k, v, dims, strides = _mk_qkv(graph, d=128)
+        if unsupported == "synth_kv":
+            k.set_dim((B, H, 129, 128))
+            v.set_dim((B, H, 129, 128))
         o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
         _finish_output(o, dims, strides)
         if not enabled:
             engine.check_support(graph)
             continue
-        with pytest.raises(NotImplementedError, match="override-enabled"):
+        with pytest.raises(NotImplementedError, match="prepared"):
             engine.check_support(graph)
-        with pytest.raises(NotImplementedError, match="override-enabled"):
+        with pytest.raises(NotImplementedError, match="prepared"):
             engine.build_plan(graph, PlanConfig(engine.engine_id))
         from cudnn.engines.heuristics import rank
 
         backend = [PlanConfig(7, {}, mode=cudnn.heur_mode.A)]
         assert rank(graph, [engine], backend, [cudnn.heur_mode.A]) == [PlanConfig(7, {})]
     lower.assert_not_called()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
+    """A plain-store O may serve split plans even when TMA cannot bind it unsplit."""
+    from cudnn.sdpa.fwd import heuristics
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=d)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    # Odd token pitch is legal for the combine's ordinary global stores, not TMA.
+    output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
+    _finish_output(o, dims, output_strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    unsplit = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
+    from dataclasses import replace
+
+    split = replace(unsplit, split_kv=2)
+    assert engines.analyze_for(spec, graph)[1] is None  # provider has a compatible plan
+    assert engines.analyze_for(spec, graph, unsplit)[1] is not None
+    assert engines.analyze_for(spec, graph, split)[1] is None
+    monkeypatch.setattr(heuristics, "_knob_sets", lambda *_: [unsplit, split])
+    plans = heuristics.recommend("A", facts, {spec.name: 20511})
+    assert [p.knobs for p in plans] == [split]
+    # Restore a TMA-bindable output: both contracts become eligible, regardless of ranking.
+    o.set_stride(strides)
+    fresh = ga.analyze(graph)
+    assert engines.mismatch(spec.capabilities, fresh, unsplit) is None
+    assert engines.mismatch(spec.capabilities, fresh, split) is None
+
+
+@pytest.mark.parametrize("feature", ["fp8", "mxfp8", "bias", "synth_kv"])
+def test_prepared_override_capability_declines_legacy_features(feature):
+    """The same pure predicate serves candidate filtering and runtime executor selection."""
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    changed = dict(fp8=dict(is_fp8=True), mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    assert engines._prepared_decline_reason(caps, facts, 1) is None
+    assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
 def test_probe_accepts_bf16():
@@ -2060,3 +2109,26 @@ def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
     assert cpp_amax.get_is_virtual() and list(cpp_amax.get_dim()) == [1, 1, 1, 1] and list(cpp_amax.get_stride()) == [1, 1, 1, 1]
     assert not cpp_o.get_is_virtual() and tuple(cpp_o.get_dim()) == dims and tuple(cpp_o.get_stride()) == bshd
     assert tuple(cpp_stats.get_dim()) == stats_dims and tuple(cpp_stats.get_stride()) == stats_bsh1
+
+
+def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
+    """Planning is graph metadata arithmetic, including explicit override-capable plans."""
+    import builtins
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] in ("torch", "cutlass", "cuda") or name.endswith("api_dsl") or name.endswith("prepared"):
+            raise AssertionError(f"planning imported a lowering dependency: {name}")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    for split in (1, 2):
+        knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
+        assert engines.mismatch(spec.capabilities, facts, knobs) is None
