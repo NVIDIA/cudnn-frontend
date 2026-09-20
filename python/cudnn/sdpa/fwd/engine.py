@@ -77,6 +77,9 @@ class _FrostSdpaFwdPlan(CompiledPlan):
                     raise ValueError(
                         f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
                     )
+                device = getattr(ctx.workspace, "__dlpack_device__", None)
+                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                    raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
             raw_stream = ctx.stream
             if raw_stream is None:
                 # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does

@@ -1542,3 +1542,52 @@ def test_create_execution_plan_appends_a_python_plan(monkeypatch):
     g.select_plan(last)
     g.build_plans()
     g.execute({C: torch.empty(2, 2)})
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_backend_decline_does_not_retain_graph_frames(monkeypatch, caplog, chained):
+    """A saved backend diagnostic must not retain the graph through exception frames,
+    including after repeated build attempts re-raise it."""
+    import gc
+    import weakref
+    import cudnn
+
+    def decline(self):
+        if chained:
+            try:
+                raise RuntimeError("inner backend diagnostic")
+            except RuntimeError as cause:
+                raise cudnn.cudnnGraphNotSupportedError("unsupported test graph") from cause
+        raise cudnn.cudnnGraphNotSupportedError("unsupported test graph")
+
+    monkeypatch.setattr(pygraph, "_lower_backend_graph", decline)
+    graph = pygraph()
+    graph.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    # Logging handlers may retain the original error as LogRecord.args. Keep
+    # this detector scoped to the diagnostic retained by the graph itself.
+    import logging
+
+    with caplog.at_level(logging.CRITICAL, logger="cudnn.pygraph"):
+        graph._finalize_backend_layout()
+    saved = graph._backend_declined
+    assert type(saved) is cudnn.cudnnGraphNotSupportedError
+    assert str(saved) == "unsupported test graph"
+    assert saved.__traceback__ is None and saved.__cause__ is None and saved.__context__ is None
+    graph._planning_done = True
+    for _ in range(3):
+        try:
+            graph.build_plans()
+        except cudnn.cudnnGraphNotSupportedError as exc:
+            assert type(exc) is type(saved) and str(exc) == str(saved)
+        else:
+            pytest.fail("the saved backend decline was not raised")
+        assert saved.__traceback__ is None and saved.__cause__ is None and saved.__context__ is None
+    graph_ref = weakref.ref(graph)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del graph
+        assert graph_ref() is None, "backend diagnostics must not need cyclic GC to release CUDA resources"
+    finally:
+        if was_enabled:
+            gc.enable()

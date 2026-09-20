@@ -1917,14 +1917,13 @@ def lower_dsl_prefill(
     if not (facts.is_fp8 or facts.is_mxfp8) and not synth_kv_padding and bias_src is None:
         # The prepared launch (cudnn.sdpa.fwd.prepared): the plan binds the normalized VariantPack itself.
         # THD: the f16 ragged plan without a gate. Dense: the f16 plan whose declared Q/K/V/O layouts TMA
-        # binds zero-copy and that runs unsplit (the split's combine pass is still a tensor call).
+        # binds zero-copy. Split plans bind their partial workspace and final strided O in the same prepared call.
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and gate_src is None and getattr(api, "_thd_spec", None) is not None:
             _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
         elif (
             not facts.thd
-            and api.split_kv == 1
             and facts.cu_seq_q_t is None
             and facts.cu_seq_kv_t is None  # the dense host reads per-batch lengths; a prefix-sum form stays on the tensor arm
             and getattr(api, "_dense_spec", None) is not None
@@ -1948,7 +1947,13 @@ def _dense_layouts_bind_zero_copy(api, facts, gate_src) -> bool:
         return dense_bind_strides(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), elem_bytes) is not None
 
     bpe = api._o_dtype().itemsize
-    descs = [(api.q_desc, 2), (api.o_desc, bpe)] + ([] if api.paged else [(api.k_desc, 2), (api.v_desc, 2)])
+    descs = [(api.q_desc, 2)] + ([] if api.paged else [(api.k_desc, 2), (api.v_desc, 2)])
+    if api.split_kv > 1:
+        # The combine uses ordinary global stores with the actual output layout, not a TMA store.
+        if not ga.dense_layout_ok(tuple(api.o_desc.shape), tuple(api.o_desc.stride)):
+            return False
+    else:
+        descs.append((api.o_desc, bpe))
     if gate_src is not None and getattr(api, "gate_desc", None) is not None:
         descs.append((api.gate_desc, api.gate_desc.dtype.itemsize))
     return all(ok(d, b) for d, b in descs)

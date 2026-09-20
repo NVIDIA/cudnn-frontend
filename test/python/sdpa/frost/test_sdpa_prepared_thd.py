@@ -382,29 +382,35 @@ def test_bare_address_and_wrong_device_are_rejected_before_launch():
 
 @requires_pre_rubin_blackwell
 @requires_dsl
-def test_zero_kv_clamp_and_runtime_strides():
-    """All-zero KV lengths bind the V stub the spec allocated at build (no allocation, no first-use
-    initialization during execute); K/V sliced from a fused slab bind their runtime token stride; a
+def test_zero_kv_clamp_and_runtime_strides(monkeypatch):
+    """All-zero KV lengths bind descriptor-only K/V views of live Q/O storage (no private allocation
+    at build or execute); K/V sliced from a fused slab bind their runtime token stride; a
     layout TMA cannot express is rejected before launch."""
+
+    def no_private_allocation(*args, **kwargs):
+        pytest.fail("prepared launch allocated private device memory")
+
+    monkeypatch.setattr(prep_mod._buffers, "DeviceBuffer", no_private_allocation)
     b, ql, kl, hq, hk, d = 4, 4, 64, 8, 2, 128
     g, t = _thd_graph(b, ql, kl, hq, hk, d)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     bufs = _buffers(b, ql, kl, hq, hk, d)
     spec = _plan(g)._prepared.spec
-    assert "v_stub" in spec._dummies and "sinks" in spec._dummies, "resources exist before the first execute"
-    stub_before = spec.dummy("v_stub")
     rec = _Recorder(spec)
     try:
         zero_kv = dict(bufs, k=torch.empty(0, hk, d, device=DEV, dtype=torch.bfloat16), v=torch.empty(0, hk, d, device=DEV, dtype=torch.bfloat16))
         zero_kv["cu_kv"] = torch.zeros(b + 1, device=DEV, dtype=torch.int32)
         zero_kv["off_kv"] = torch.zeros(b + 1, device=DEV, dtype=torch.int32)
+        zero_kv["o"].fill_(float("nan"))  # The descriptor-only V alias must never be read.
+        zero_kv["lse"].fill_(float("nan"))
         g.execute(_pack(t, zero_kv), ws)
         torch.cuda.synchronize()
     finally:
         rec.restore()
     frame = rec.frames[-1]
-    assert frame["problem_size"][4] == 1 and frame["v_ptr"] == stub_before and frame["k_ptr"] == frame["q_ptr"]
-    assert spec.dummy("v_stub") == stub_before
+    assert frame["problem_size"][4] == 1 and frame["v_ptr"] == frame["o_ptr"] and frame["k_ptr"] == frame["q_ptr"]
+    assert torch.count_nonzero(zero_kv["o"]) == 0
+    assert torch.isneginf(zero_kv["lse"]).all()
     # K / V sliced out of a fused (T, 2*H_kv, D) slab: a runtime token stride of 2*H_kv*D, bound as such
     slab = torch.randn(b * kl, 2 * hk, d, device=DEV, dtype=torch.bfloat16)
     k_view, v_view = slab[:, :hk], slab[:, hk:]
@@ -590,7 +596,23 @@ def test_graph_and_standalone_execute_bind_the_same_frame():
 # --- dense (padded) f16 through the same prepared machinery ------------------------------------------------
 
 
-def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=None, bottom_right=False):
+def _dense_graph(
+    b,
+    h,
+    hk,
+    s_q,
+    s_kv,
+    d,
+    *,
+    causal=True,
+    bshd_storage=True,
+    d_v=None,
+    bottom_right=False,
+    split_kv=1,
+    stats=True,
+    stats_log2=False,
+    o_stride=None,
+):
     """A dense bf16 graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
     repacks and the prepared launch therefore declines)."""
     d_v = d if d_v is None else d_v
@@ -603,9 +625,10 @@ def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=
     tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=cudnn.data_type.BFLOAT16, name="k")
     tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=cudnn.data_type.BFLOAT16, name="v")
     mask = dict(use_causal_mask_bottom_right=True) if (causal and bottom_right) else dict(use_causal_mask=causal)
-    to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=True, attn_scale=1.0 / math.sqrt(d), **mask)
-    to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v))
-    ts.set_output(True).set_dim([b, h, s_q, 1]).set_stride([h * s_q, s_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=stats, stats_use_log2=stats_log2, attn_scale=1.0 / math.sqrt(d), **mask)
+    to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v) if o_stride is None else o_stride)
+    if stats:
+        ts.set_output(True).set_dim([b, h, s_q, 1]).set_stride([h * s_q, s_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -615,6 +638,12 @@ def _dense_graph(b, h, hk, s_q, s_kv, d, *, causal=True, bshd_storage=True, d_v=
     idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
         idx = next(i for i, n in enumerate(names) if n == want or n.startswith(want + "["))
+    if split_kv > 1:
+        from dataclasses import replace
+
+        chosen = g.plans[idx]
+        g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv))
+        idx = len(g.plans) - 1
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
@@ -651,6 +680,57 @@ def _dense_reference(bufs, causal=True):
 
 def _dense_pack(t, bufs):
     return {t["q"]: bufs["q"], t["k"]: bufs["k"], t["v"]: bufs["v"], t["o"]: bufs["o"], t["stats"]: bufs["lse"]}
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_decode_d128_prepared_rebind_and_capture(s_q, monkeypatch):
+    """The small-Q decode tile uses the prepared binder and remains correct with new
+    buffers, an explicit non-current stream and changed-input CUDA-graph replay."""
+
+    def no_private_allocation(*args, **kwargs):
+        pytest.fail("prepared launch allocated private device memory")
+
+    monkeypatch.setattr(prep_mod._buffers, "DeviceBuffer", no_private_allocation)
+    b, h, hk, sk, d = 4, 8, 2, 128, 128
+    g, t = _dense_graph(b, h, hk, s_q, sk, d, causal=False)
+    plan = _plan(g)
+    assert plan._compiled.kernel_template == "decode_d128_f16"
+    assert isinstance(plan._prepared, prep_mod.PreparedDenseLaunch)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+
+    def check(bufs):
+        o_ref, lse_ref = _dense_reference(bufs, causal=False)
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=5e-2, rtol=3e-2)
+        torch.testing.assert_close(bufs["lse"].squeeze(-1), lse_ref, atol=5e-3, rtol=1e-3)
+
+    for seed in (11, 12):
+        bufs = _dense_buffers(b, h, hk, s_q, sk, d, seed=seed)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            g.execute(_dense_pack(t, bufs), ws, handle=handle)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        stream.synchronize()
+        check(bufs)
+
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture, stream=stream):
+        g.execute(_dense_pack(t, bufs), ws, handle=handle)
+    bufs["q"].mul_(0.75)
+    bufs["o"].fill_(float("nan"))
+    bufs["lse"].fill_(float("nan"))
+    capture.replay()
+    torch.cuda.synchronize()
+    check(bufs)
 
 
 @requires_pre_rubin_blackwell
@@ -843,3 +923,163 @@ def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
     for k_hnd, v_hnd in ((True, False), (False, True)):
         with pytest.raises(ValueError, match="compiled for NHD"):
             prep_mod._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("stats,stats_log2", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("output_layout", ["bshd", "bhsd_padded", "bhsd_offset"])
+def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, output_layout, monkeypatch):
+    """Split execution binds workspace per call and writes the declared O without a copy kernel."""
+    b, h, hk, sq, sk = 2, 8, 2, 4, 1024
+    stride = (h * sq * (d + 8), sq * (d + 8), d + 8, 1) if output_layout != "bshd" else (sq * h * d, d, h * d, 1)
+    g, t = _dense_graph(b, h, hk, sq, sk, d, causal=False, split_kv=2, stats=stats, stats_log2=stats_log2, o_stride=stride)
+    plan = _plan(g)
+    assert isinstance(plan._prepared, prep_mod.PreparedDenseLaunch), "split plans must not fall back to the tensor adapter"
+    assert plan._prepared.spec.combine is not None
+    assert plan._compiled.kernel_template == f"decode_d{d}_f16"
+    workspaces = [torch.empty(g.get_workspace_size(), dtype=torch.uint8, device=DEV) for _ in range(2)]
+    bufs = _dense_buffers(b, h, hk, sq, sk, d, seed=123)
+    backing = torch.full((b, h, sq, d + 8), 42.0, dtype=torch.bfloat16, device=DEV) if output_layout != "bshd" else None
+    if backing is not None:
+        if output_layout == "bhsd_offset":
+            storage = torch.full((backing.numel() + 1,), 42.0, dtype=backing.dtype, device=DEV)
+            backing = storage[1:].view(backing.shape)
+        bufs["o"] = backing[..., :d]
+    pack = {t[n]: bufs[n] for n in ("q", "k", "v", "o")}
+    if stats:
+        pack[t["stats"]] = bufs["lse"]
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+
+    def check():
+        q, k, v = (bufs[n].double() for n in ("q", "k", "v"))
+        scores = q @ k.repeat_interleave(h // hk, dim=1).transpose(-1, -2) / math.sqrt(d)
+        ref = scores.softmax(-1) @ v.repeat_interleave(h // hk, dim=1)
+        torch.testing.assert_close(bufs["o"].double(), ref, atol=5e-3, rtol=3e-2)
+        if stats:
+            ref_lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0)
+            torch.testing.assert_close(bufs["lse"].squeeze(-1).double(), ref_lse, atol=1e-4, rtol=1e-4)
+        if backing is not None:
+            assert torch.all(backing[..., d:] == 42.0), "combine must preserve padding beyond D"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared split must not use tensor adapter, copies or execution-time compilation")
+
+    monkeypatch.setattr(plan._compiled, "execute_resolved", forbidden)
+    import cutlass.cute as cute
+
+    monkeypatch.setattr(cute, "compile", forbidden)
+    for ws in workspaces:
+        bufs["q"].mul_(0.75)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            g.execute(pack, ws, handle=handle)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        stream.synchronize()
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        g.execute(pack, workspaces[1], handle=handle)
+    bufs["q"].mul_(0.5)
+    bufs["o"].fill_(float("nan"))
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph.replay()
+    stream.synchronize()
+    check()
+    with pytest.raises(ValueError, match="workspace"):
+        g.execute(pack, workspaces[0][:1], handle=handle)
+    with pytest.raises(ValueError, match="aligned"):
+        g.execute(pack, torch.empty(g.get_workspace_size() + 1, dtype=torch.uint8, device=DEV)[1:], handle=handle)
+    with pytest.raises(ValueError, match="CUDA device"):
+        g.execute(pack, torch.empty(g.get_workspace_size(), dtype=torch.uint8), handle=handle)
+    # A valid smaller allocation cannot change the fixed split-workspace geometry.
+    with pytest.raises(ValueError, match="declared"):
+        g.execute(pack, workspaces[0], override_uids=[t["q"].get_uid()], override_shapes=[[1, h, sq, d]], override_strides=[bufs["q"].stride()])
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("kh", [1, 2])
+@pytest.mark.parametrize("k_hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
+def test_paged_adapter_rejects_mixed_pool_layout_at_support_check(kh, k_hnd, v_hnd):
+    """One compiled page-layout specialization must cover both pools, including singleton KH."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, sq, d, page_size, n_pages = 2, 8, 4, 128, 16, 8
+    q = torch.empty((b, sq, h, d), dtype=torch.bfloat16, device=DEV).transpose(1, 2)
+    o = torch.empty_like(q)
+
+    def pool(hnd):
+        if hnd:
+            return torch.empty((n_pages, kh, page_size, d), dtype=q.dtype, device=DEV)
+        return torch.empty((n_pages, page_size, kh, d), dtype=q.dtype, device=DEV).transpose(1, 2)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=pool(k_hnd),
+        sample_v=pool(v_hnd),
+        sample_o=o,
+        seq_kv_lens_present=True,
+        paged_page_size=page_size,
+        paged_max_seq_len_kv=64,
+        split_kv=1,
+        pack_gqa=False,
+    )
+    if k_hnd == v_hnd:
+        assert api.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="paged K and V pools must use the same HND or NHD layout kind"):
+            api.check_support()
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("d", [128, 256])
+def test_prepared_split_survives_collecting_another_plan_during_capture(d):
+    """A compiled, abandoned plan may be collected inside another plan's capture."""
+    import gc
+    import weakref
+
+    b, h, hk, sq, sk = 2, 8, 2, 4, 256
+    graph, tensors = _dense_graph(b, h, hk, sq, sk, d, causal=False, split_kv=2)
+    assert isinstance(_plan(graph)._prepared, prep_mod.PreparedDenseLaunch)
+    bufs = _dense_buffers(b, h, hk, sq, sk, d)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    graph.execute(_dense_pack(tensors, bufs), workspace)
+    torch.cuda.synchronize()
+    reference_o, reference_lse = _dense_reference(bufs, causal=False)
+    capture, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    previous_stream = torch.cuda.current_stream()
+    stream.wait_stream(previous_stream)
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        victim, _ = _dense_graph(b, h, hk, sq, sk, d, causal=False, split_kv=2)
+        victim._lifetime_cycle = victim
+        victim_ref = weakref.ref(victim)
+        del victim
+        assert victim_ref() is not None
+        with torch.cuda.graph(capture, stream=stream, capture_error_mode="global"):
+            gc.collect()
+            assert victim_ref() is None
+            graph.execute(_dense_pack(tensors, bufs), workspace)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        capture.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(bufs["o"].float(), reference_o, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"].squeeze(-1), reference_lse, atol=1e-3, rtol=1e-3)
+    finally:
+        torch.cuda.set_stream(previous_stream)
+        if was_enabled:
+            gc.enable()

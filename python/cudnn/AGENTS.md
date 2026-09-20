@@ -49,6 +49,10 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   the override triple. A family with incomplete coverage declines override-enabled
   graphs at planning. Detectors: `test_uid_map_plan_rejects_runtime_overrides_before_execute`
   and `test_fwd_override_graph_declines_before_lowering`.
+- **Shape overrides do not enlarge the producer's storage.** Validate metadata
+  inputs against their observed span as well as their effective shape, and check
+  pointer alignment for the element type. The host-only detector is
+  `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -357,3 +361,10 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Torch custom-op implementations live with their owning operation family and may be re-exported from `experimental/ops/` while maturing (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
+
+CUDA-owning objects can be reclaimed by cyclic GC inside an unrelated graph
+capture. Keep disabled ABI slots non-owning, and scope resource destruction so it
+does not invalidate that capture; merely collecting before a test is not a
+library fix. `test_collect_unrelated_resources_during_capture` forces collection
+inside a global-mode capture and checks both replay and subsequent native cuDNN
+execution, which also detects backend-handle destruction poisoning later plans.
