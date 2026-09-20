@@ -976,6 +976,10 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         _on_plan_device(spec, "sinks", sinks)
         if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
             raise ValueError(f"cudnn.sdpa: sinks must be a contiguous ({spec.qh},) float32 tensor")
+        if sinks.ptr % _ALIGN_F32:
+            raise ValueError("cudnn.sdpa: sinks must be 4-byte aligned")
+        if sinks.span >= 0 and sinks.span < spec.qh:
+            raise ValueError(f"cudnn.sdpa: sinks spans {sinks.span} elements; this launch reads {spec.qh}")
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         if sinks is not None:
@@ -989,6 +993,10 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         _on_plan_device(spec, name, f)
         if f.dtype != "int32" or not f.contiguous or f.numel < b:
             raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        if f.ptr % _ALIGN_F32:
+            raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
+        if f.span >= 0 and f.span < b:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
         return f.ptr
 
     if spec.seq_kv_present:

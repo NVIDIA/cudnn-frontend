@@ -261,3 +261,43 @@ def test_split_final_outputs_are_validated_before_launch(role, updates, match):
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError, match=match):
         prep.bind_dense_split(spec, changed, 0x100000, 17, 17)
+
+
+@pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
+@pytest.mark.parametrize("invalid", ["span", "alignment"])
+def test_dense_metadata_rejects_short_observed_storage_and_misalignment(role, invalid):
+    """Effective overrides cannot enlarge the physical storage read by scalar pointers."""
+    import cudnn
+
+    spec, facts = _split_fixture(False)
+    if role == "sinks":
+        spec.has_sink = True
+        count, code = spec.qh, 2  # DLPack float32
+    else:
+        setattr(spec, "seq_q_present" if role == "seq_q_lens" else "seq_kv_present", True)
+        count, code = spec.b, 0  # DLPack int32
+    native = cudnn._pybind_module.VariantPackNative(1)
+    observed = 1 if invalid == "span" else count
+    ptr = 0x20000 + (2 if invalid == "alignment" else 0)
+    native.set_operand(0, ptr, [observed], [1], code, 32, 1, observed * 4, 2, 0)
+    native.override_operand(0, [count], [1])
+    facts[role] = prep.facts_of_roles(SimpleNamespace(native=native), [0])[0]
+    assert facts[role].numel == count and facts[role].span == observed
+    with pytest.raises(ValueError, match="spans" if invalid == "span" else "4-byte aligned"):
+        prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+
+
+@pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
+@pytest.mark.parametrize("span_known", [False, True])
+def test_dense_metadata_keeps_sized_and_bare_pointer_contracts(role, span_known):
+    spec, facts = _split_fixture(False)
+    if role == "sinks":
+        spec.has_sink = True
+        count, dtype = spec.qh, "float32"
+    else:
+        setattr(spec, "seq_q_present" if role == "seq_q_lens" else "seq_kv_present", True)
+        count, dtype = spec.b, "int32"
+    facts[role] = prep.BufferFacts(0x20000, dtype, (2, 0) if span_known else (-1, -1), count if span_known else -1, (count,), (1,))
+    main, _ = prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+    slot = {"sinks": "sinks_ptr", "seq_q_lens": "seq_q_lens_addr", "seq_kv_lens": "meta_ptr"}[role]
+    assert main[spec.index[slot]] == 0x20000
