@@ -465,8 +465,14 @@ def test_native_dense_engine_follows_the_bound_handle_stream():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    if all(is_python_engine(plan.engine_id) for plan in g.plans):
+    # This case is about the native backend. Where a Python DSL engine also claims
+    # the graph the ranked list can put it first (on an SM120 the five
+    # sdpa_fwd_prefill_sm120 plans precede eng8), so pin a backend plan instead of
+    # executing whatever the default selection happens to be.
+    backend = [index for index, plan in enumerate(g.plans) if not is_python_engine(plan.engine_id)]
+    if not backend:
         pytest.skip("no native backend plan claimed the dense graph on this part")
+    g.select_plan(backend[0])
     g.check_support()
     g.build_plans()
     workspace = g.get_workspace_size()
