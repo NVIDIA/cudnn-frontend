@@ -599,6 +599,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
+    if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
+        if knobs is not None and knobs.sched_policy not in (None, SCHED_NATURAL):
+            return "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)"
+        for name, tensor in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
+            dim, stride = tuple(tensor.get_dim()), tuple(tensor.get_stride())
+            if (stride[2], stride[1], stride[3]) != (dim[1] * dim[3], dim[3], 1):
+                return f"SM80 THD {name} requires compact packed BSHD strides"
+        if (facts.seq_q_t is None and facts.cu_seq_q_t is None) or (facts.seq_kv_t is None and facts.cu_seq_kv_t is None):
+            return "SM80 THD forward requires Q and KV lengths (seq_len_* or cu_seq_len_*)"
+        if facts.has_bias or facts.has_sink:
+            return "SM80 THD forward does not support bias or sink fusion"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
@@ -1433,9 +1444,9 @@ def _sm80_spec() -> EngineSpec:
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
     selection (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
-    caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
-    gated off (the standalone wrapper's varlen path serves THD); knob domains
-    are empty (no tunables wired)."""
+    caching. Native-flavor packed THD graphs bind the varlen template directly;
+    the dense head-dim envelope is not offered to THD. Dense graphs expose
+    scheduler tuning; THD requires the natural 3-D grid."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
@@ -1444,6 +1455,7 @@ def _sm80_spec() -> EngineSpec:
             phase="prefill",
             d_shapes=frozenset({(256, 256)}),  # flavor envelopes; host-side zero-padding
             d_pad_multiple=1,
+            thd_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
             right_band_widening=True,
@@ -1451,6 +1463,8 @@ def _sm80_spec() -> EngineSpec:
             bottom_right=True,
             swa=True,
             padded=True,
+            thd=True,
+            cu_seq_len=True,
             sink=True,
             stats=True,
             stats_log2=True,
@@ -1462,9 +1476,8 @@ def _sm80_spec() -> EngineSpec:
             lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
-            # The static-grid remap serves all three policies (the template's
-            # sched_policy field); the adapter maps the explicit int to its
-            # kernel token and derives only when the knob is None.
+            # Dense graphs serve all three schedulers; the THD grid is 3-D
+            # and the THD-only mismatch above accepts natural scheduling only.
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
