@@ -1319,7 +1319,9 @@ class DenseScoreRecomputeSm90:
                     if pos < col_limit:
                         mOut_cur[pos] = acc_out_regs[r]
                     else:
-                        mOut_cur[pos] = Float32(0.0)
+                        # Match the dense-score mask contract without changing
+                        # the zero contribution to the L1 denominator above.
+                        mOut_cur[pos] = Float32(float("-inf"))
 
             # Broadcast accumulated warp_col_sum from lane 0 to all lanes
             warp_col_sum = sm90_ops.shuffle_sync(warp_col_sum, 0)
