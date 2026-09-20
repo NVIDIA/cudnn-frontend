@@ -1130,17 +1130,31 @@ def _host(
             stream=current_stream,
         )
 
-    if cutlass.const_expr(PAGED_KV):
-        # A unit column stride removes repeated dynamic address multiplication
-        # from the page-load loop. Select by this call's metadata in the compiled
-        # host; arbitrary Int64 strides retain the general kernel specialization.
-        if table_strides[1] == cutlass.Int64(1):
-            layout = cute.make_layout((B, SKV // cutlass.Int32(PAGE_SIZE)), stride=(table_strides[0], 1))
-            launch(kernel_args, cute.make_tensor(block_table_ptr, layout), cute.make_tensor(block_table_v_ptr, layout), paged_hnd, grid_shape, stream)
+    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, grid, current_stream):
+        if cutlass.const_expr(PAGED_KV):
+            # Keep the common unit page-column stride static in the device code.
+            if strides[1] == cutlass.Int64(1):
+                layout = cute.make_layout((batch, kv_extent // cutlass.Int32(PAGE_SIZE)), stride=(strides[0], 1))
+                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, grid, current_stream)
+            else:
+                launch(args, kt, vt, hnd, grid, current_stream)
         else:
-            launch(kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, grid_shape, stream)
+            launch(args, kt, vt, hnd, grid, current_stream)
+
+    compact_inner = o_strides[2] == cutlass.Int64(d_v)
+    if cutlass.const_expr(lse_ptr is not None):
+        compact_inner = compact_inner & (lse_strides[2] == cutlass.Int64(1))
+    if compact_inner:
+        output = cute.make_tensor(o_ptr, cute.make_layout((B * SPLIT_KV, SQ, QH, d_v), stride=(o_strides[0], o_strides[1], d_v, 1)))
+        stats = None
+        if cutlass.const_expr(lse_ptr is not None):
+            stats = cute.make_tensor(lse_ptr, cute.make_layout((B * SPLIT_KV, QH, SQ), stride=(lse_strides[0], lse_strides[1], 1)))
+        args = kernel_args[:3] + (output, stats) + kernel_args[5:]
+        launch_tables(args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream)
     else:
-        launch(kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, grid_shape, stream)
+        launch_tables(
+            kernel_args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream
+        )
 
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
