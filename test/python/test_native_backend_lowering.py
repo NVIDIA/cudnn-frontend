@@ -36,6 +36,41 @@ def _assert_ran_on_backend(g):
     assert g._cpp_plans_created and g._is_built
 
 
+@pytest.mark.parametrize("implementation", [cudnn.attention_implementation.AUTO, cudnn.attention_implementation.UNIFIED])
+@pytest.mark.parametrize("opt_in", ["0", "1"])
+def test_sm10x_block_mask_requires_fixed_backend(cudnn_handle, monkeypatch, implementation, opt_in):
+    """A native block-mask bug is declined at planning, irrespective of FROST opt-in."""
+    if torch.cuda.get_device_properties(0).major != 10:
+        pytest.skip("SM10x backend workaround")
+    if cudnn.backend_version() < 91400:
+        pytest.skip("Block-mask descriptors require cuDNN 9.14+")
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", opt_in)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=cudnn_handle,
+    )
+    q = g.tensor(dim=[1, 6, 256, 128], stride=[196608, 32768, 128, 1])
+    k = g.tensor(dim=[1, 3, 256, 128], stride=[98304, 32768, 128, 1])
+    v = g.tensor(dim=[1, 3, 256, 128], stride=[98304, 32768, 128, 1])
+    mask = g.tensor(dim=[1, 6, 2, 1], stride=[12, 2, 1, 1], data_type=cudnn.data_type.UINT8)
+    o, _ = g.sdpa(q, k, v, generate_stats=False, attn_scale=0.125, block_mask=mask, implementation=implementation)
+    o.set_output(True).set_dim([1, 6, 256, 128]).set_stride([196608, 32768, 128, 1])
+    # The graph is semantically valid. Only the native backend support surface
+    # depends on the installed cuDNN version; no FROST row serves block masks.
+    g.validate()
+    assert g._lowered_graph is None
+    if cudnn.backend_version() < 92600:
+        for _ in range(2):
+            with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="requires cuDNN 9.26.0"):
+                g.create_execution_plans([cudnn.heur_mode.A])
+            assert not g._planning_done
+    else:
+        g.build([cudnn.heur_mode.A])
+        assert g.selected_engine is None and g._cpp_plans_created and g._is_built
+
+
 def test_native_matmul_lowers_to_backend():
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
