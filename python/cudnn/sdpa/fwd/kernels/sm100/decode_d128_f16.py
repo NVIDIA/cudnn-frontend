@@ -1924,8 +1924,11 @@ def _host(
     paged_hnd: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    """Bind the shared explicit SDPA ABI and launch the existing decode kernel."""
-    B, QH, KH, SQ, SKV, _ = problem_size
+    """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
+
+    The private raw entry assumes validated operands, including the compiled GQA
+    ratio. Graph/adapter calls bind through prepared.py; direct tests use launch_f16.
+    """
     (
         q_tensor,
         k_tensor,
@@ -1963,7 +1966,7 @@ def _host(
         d_qk=d_qk,
         d_v=d_v,
         lse_kind=lse_kind,
-        thd=CFG.THD_VARLEN,
+        thd=False,
         split_kv=SPLIT_KV,
         tensor_map_qwords=16,
         paged=PAGED_KV,
@@ -2027,7 +2030,6 @@ def compile(  # noqa: A001
 
     i32 = cutlass.Int32(0)
     i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
-    thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
         P(STORAGE_DTYPE),
@@ -2048,9 +2050,9 @@ def compile(  # noqa: A001
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),
-        P(cutlass.Int32, 4) if thd else None,
-        P(cutlass.Int32, 4) if thd else None,
-        i32 if thd else None,
+        None,
+        None,
+        None,
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
@@ -2063,5 +2065,5 @@ def compile(  # noqa: A001
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
-        symbol="frost_sdpa_fwd_decode_prepared",
+        symbol="frost_sdpa_fwd_decode",
     )
