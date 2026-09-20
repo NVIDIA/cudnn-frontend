@@ -608,13 +608,12 @@ only to decline is why `closed_under` existed.
 
 ### Ranking and the one plan list
 
-- `create_execution_plans()` gathers the inputs — the parsed facts, the family's
-  offered ids, and the backend's own `(engine_id, knobs)` recommendation from
-  `backend_plan_entries()` — and hands all of it to the graph's family in ONE
-  call (`engines/heuristics.py::rank` → the family's `recommend`). What comes
-  back IS the plan list, position for position. There is no second merge step:
-  splitting the decision is what forced the previous design to concatenate the
-  two sides and call it ranking.
+- `create_execution_plans()` gathers the parsed facts, eligible engine ids, and
+  the backend's `(engine_id, knobs)` entries. `engines/heuristics.py::rank` calls
+  the family's hook with `(kind, facts, offered)`. The hook returns its own
+  proposals plus an optional internal `cudnn.engines.heuristics.BACKEND` marker.
+  `_assemble()` expands that marker into the mode's backend block, then strips
+  mode annotations and deduplicates to form the final `graph.plans` list.
 - **The backend's entries arrive tagged with the mode that produced them.**
   `_create_backend_plans()` asks C++ one heuristic mode at a time and records
   `get_execution_plan_count()` after each, so a family can say "the backend's
@@ -645,8 +644,9 @@ only to decline is why `closed_under` existed.
   spans.** An OPENSOURCE query registers a C++ OSS candidate without adding a
   plan, so it contributes no span; judging by spans would rethrow a later
   mode's failure and discard the delegate that successful query earned.
-- The family places the backend's entries wherever it wants; nothing rewrites
-  the list it returns, so a ranked index means what the heuristics said.
+- The family positions the backend block with its marker; without a marker,
+  its proposals precede the backend. Ranked indices address the assembled list,
+  never the marker or an unexpanded family proposal.
   `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry
   `backend_plan_entries()` appends, where the backend picks among OSS
   candidates it never exposes as plans and which therefore cannot be

@@ -26,6 +26,13 @@ ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every o
 SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
+**Execute-time shape/stride overrides:** FROST forward engines conservatively
+decline graphs created with `is_override_shape_enabled=True`, including explicit
+opt-in. Some executors still bind the declared tensor geometry, so these graphs
+stay on a compatible provider instead of silently ignoring an override. This
+restriction also withholds prepared forward plans on such graphs; their partial
+override support is not a family-wide contract. Static-geometry graphs are unchanged.
+
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
 > the same commit — see `python/cudnn/sdpa/AGENTS.md` **Rule S2** and

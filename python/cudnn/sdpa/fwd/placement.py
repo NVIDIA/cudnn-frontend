@@ -21,7 +21,8 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 
 - decode-shaped, ``2 <= s_q <= 16``, dense or paged: 0.02-0.65 on every cell (llama d128, qwen35
   d256, gpt_oss d64, deepseek_v4 d512; q = 2, 3, 4, 8, 16; kv 2k-128k; b 1-128). The backend has
-  no decode-class engine for ``s_q > 1``; whichever FROST tile serves the rows, it wins -> LEAD.
+  no decode-class engine for ``s_q > 1``; within that KV domain FROST leads. Keep shorter caches
+  backend-first rather than extrapolating these measurements.
 - ``s_q == 1``, d256: b = 1 loses everywhere (1.3-5.4x); with ``units = b * h_kv``, ``units >= 32``
   wins 0.54-0.75 at every kv, and ``8 <= units < 32`` wins once ``units * s_kv >= 2**17`` KV tokens
   are in flight (0.59-0.87) and loses below (1.27-1.57). d512 (one KV head): the backend does not
@@ -32,7 +33,7 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 - ``s_q == 1``, d128 (and d64 through the d128 envelope): the backend's decode engine is ahead or
   at parity on every measured cell (1.04-1.06 at b = 128, 1.2-3.6x at b = 1, kv 128k) -> TRAIL.
 - prefill, d512 (DeepSeek-V4 shared-KV MQA, 8-128 query heads): 0.33-0.75 on every cell, chunked
-  and dense squares alike -> LEAD.
+  and dense squares alike -> LEAD, restricted to KV lengths of at least 2k as above.
 - prefill, d128 / d256: a chunk attending to a longer cache wins while the launch is small, in
   128-row Q tiles ``b * h_q * ceil(s_q / 128)`` (``prefill_sweep``: q 256-2048, kv 8k-128k, TP 1-8):
   ``<= 64`` tiles win from an 8k cache (0.52-0.77; 0.11-0.43 at >= 32k), ``<= 128`` tiles win from a
@@ -62,6 +63,7 @@ TRAIL = "trail"  # the backend block ahead of FROST's proposals
 
 # SM100 f16/bf16 thresholds (provenance in the module docstring).
 DECODE_SHAPED_MAX_S_Q = 16  # spec-decode verify depth; the backend has no decode-class engine above s_q == 1
+SHORT_QUERY_MIN_KV_TOKENS = 2048  # lower measured KV bound for short-query and d512 prefill placement
 SQ1_MIN_KV_UNITS = 32  # s_q == 1, d256 / d512: b * h_kv from which FROST wins at every kv (0.54-0.75)
 SQ1_SMALL_BATCH_MIN_UNITS = 8  # s_q == 1, d256: below 8 units (b = 1) FROST loses at every kv
 SQ1_SMALL_BATCH_MIN_KV_TOKENS = 2**17  # s_q == 1, d256, 8 <= units < 32: KV tokens in flight (units * s_kv) from which FROST wins
@@ -113,7 +115,7 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
-        return LEAD
+        return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS else TRAIL
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
@@ -131,7 +133,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     if facts.thd or facts.has_paged_kv or facts.window_left is not None or envelope_padded:
         return TRAIL
     if flavor == (512, 512):
-        return LEAD
+        return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS else TRAIL
     tiles = _q_tiles(facts)
     if tiles <= CHUNKED_SMALL_MAX_Q_TILES and facts.s_kv >= CHUNKED_SMALL_MIN_KV_TOKENS:
         return LEAD

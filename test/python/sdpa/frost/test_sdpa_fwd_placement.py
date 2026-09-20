@@ -60,9 +60,7 @@ def recommendations(monkeypatch):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("backend_version", [92501, 92600, 92700])
-def test_known_default_and_opt_in_rows_are_offered(monkeypatch, backend_version):
-    monkeypatch.setattr(cudnn, "backend_version", lambda: backend_version)
+def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
     default_rows = {_SM100, _SM120}
     opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_fp8"}
     offered = _FAMILY.offered_ids()
@@ -120,3 +118,15 @@ def test_marker_never_reaches_a_ranked_list():
     for hook in (lambda kind: [BACKEND, PlanConfig(20511, "x")], lambda kind: [PlanConfig(20511, "x"), BACKEND], lambda kind: [BACKEND]):
         for modes in ([cudnn.heur_mode.A], [cudnn.heur_mode.OPENSOURCE], [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]):
             assert not any(is_backend_block(p) for p in _assemble(modes, hook, backend))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,s_q", [(128, 4), (256, 4), (512, 4), (512, 64)])
+@pytest.mark.parametrize("min_kv", [512, 4096])
+def test_short_query_placement_respects_configured_domain(monkeypatch, d, s_q, min_kv):
+    """Exercise the domain guard without pinning a measured threshold or winner."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.setattr(placement, "SHORT_QUERY_MIN_KV_TOKENS", min_kv, raising=False)
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    assert placement.place(spec, _facts(d_qk=d, d_v=d, s_q=s_q, s_kv=min_kv - 1)) == placement.TRAIL

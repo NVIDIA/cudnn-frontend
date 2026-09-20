@@ -647,7 +647,7 @@ this seam exists rather than an engine-side `propose_plans`:
   configs, best first,** for `kind` `"A"` or `"FALLBACK"`; `_assemble` builds one
   block per requested mode from it.
 - **It places BOTH sides through one marker.** The list may hold `BACKEND`
-  (`cudnn.engines.BACKEND`) once: the backend's own ranked block for the mode
+  (`cudnn.engines.heuristics.BACKEND`) once: the backend's own ranked block for the mode
   goes there, so the family says, per shard, whether its configs lead or
   follow. `sdpa/fwd/placement.py` holds the benchmark-driven, tunable policy;
   `test_sdpa_fwd_placement.py` checks the hook contract with synthetic verdicts.

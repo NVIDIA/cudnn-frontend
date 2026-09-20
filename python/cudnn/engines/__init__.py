@@ -16,7 +16,6 @@ a family and a slot.
 """
 
 from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig, public_knobs_repr
-from .heuristics import BACKEND
 from .engine_ids import (
     BACKEND_ENGINE_ID_BASE,
     BACKEND_HEURISTIC_ENGINE_ID,
@@ -56,7 +55,6 @@ __all__ = [
     "CPP_OSS_ENGINE_ID_BASE",
     "PYTHON_ENGINE_ID_BASE",
     "BACKEND_HEURISTIC_ENGINE_ID",
-    "BACKEND",
     "is_python_engine",
     "is_backend_engine",
 ]

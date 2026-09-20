@@ -44,6 +44,11 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   defined or explicitly rejected — an unhandled overlap is an untested code
   path with unspecified semantics, and "both supplied" is exactly the case
   no per-argument check catches (raised in review on PR #266).
+- **An execute-time shape/stride override must reach the executor or raise
+  before launch.** A raw uid-map plan cannot consume it; do not silently drop
+  the override triple. A family with incomplete coverage declines override-enabled
+  graphs at planning. Detectors: `test_uid_map_plan_rejects_runtime_overrides_before_execute`
+  and `test_fwd_override_graph_declines_before_lowering`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

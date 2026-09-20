@@ -63,7 +63,7 @@ def test_sm10x_block_mask_requires_fixed_backend(cudnn_handle, monkeypatch, impl
     assert g._lowered_graph is None
     if cudnn.backend_version() < 92600:
         for _ in range(2):
-            with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="requires cuDNN 9.26.0"):
+            with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"requires cuDNN 9\.26\.0"):
                 g.create_execution_plans([cudnn.heur_mode.A])
             assert not g._planning_done
     else:

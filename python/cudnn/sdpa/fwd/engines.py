@@ -1530,6 +1530,11 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     and ``engine.FrostSdpaFwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
+    # The family still contains tensor-bound executors that only understand
+    # declared geometry. Keep override-enabled graphs on a compatible provider,
+    # including when a caller explicitly pins an engine or requests FROST first.
+    if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
+        return None, "override-enabled graphs require a provider that honors execute-time shape and stride overrides"
     # The record validate() attached, not a fresh parse: one per graph, shared
     # with whatever ranked these plans before this engine was imported.
     facts = graph._facts_for(ga.analyze)
