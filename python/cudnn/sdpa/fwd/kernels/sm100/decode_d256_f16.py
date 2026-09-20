@@ -1107,7 +1107,8 @@ def _host(
     tma_v_desc = _create_tma_desc(v_tensor, box_kv, _tma_swz(CFG.V_SWZ_BYTES), kv_stride_order)
 
     grid_shape = (QH // HEADS_PER_TILE, B, SPLIT_KV)
-    _kernel(
+
+    kernel_args = (
         tma_q_desc,
         tma_k_desc,
         tma_v_desc,
@@ -1120,14 +1121,26 @@ def _host(
         cutlass.Int32(B),
         scale_softmax_log2,
         seq_q_lens_addr,
-        block_table_tensor,
-        block_table_v_tensor,
-        paged_hnd,
-    ).launch(
-        grid=grid_shape,
-        block=[CFG.THREADS_PER_CTA, 1, 1],
-        stream=stream,
     )
+
+    def launch(args, k_table, v_table, hnd, grid, current_stream):
+        _kernel(*args, k_table, v_table, hnd).launch(
+            grid=grid,
+            block=[CFG.THREADS_PER_CTA, 1, 1],
+            stream=current_stream,
+        )
+
+    if cutlass.const_expr(PAGED_KV):
+        # A unit column stride removes repeated dynamic address multiplication
+        # from the page-load loop. Select by this call's metadata in the compiled
+        # host; arbitrary Int64 strides retain the general kernel specialization.
+        if table_strides[1] == cutlass.Int64(1):
+            layout = cute.make_layout((B, SKV // cutlass.Int32(PAGE_SIZE)), stride=(table_strides[0], 1))
+            launch(kernel_args, cute.make_tensor(block_table_ptr, layout), cute.make_tensor(block_table_v_ptr, layout), paged_hnd, grid_shape, stream)
+        else:
+            launch(kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, grid_shape, stream)
+    else:
+        launch(kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, grid_shape, stream)
 
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself

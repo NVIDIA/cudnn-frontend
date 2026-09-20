@@ -115,3 +115,79 @@ def test_direct_d256_decode_launch_rejects_rows_outside_tile():
     mod = _load("sm100", "decode_d256_f16", 256, 256)
     with pytest.raises(ValueError, match="decode Q rows exceed"):
         launch_f16(None, *([None] * 8), (1, 2, 2, 17, 128, 0), 1.0, 0, 0, host=mod._host)
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("splits", [1, 2])
+def test_d256_paged_host_rebinds_table_column_stride(batch, splits):
+    """One compiled host handles unit, nonunit, then unit strides, including wide unused slots."""
+    import cuda.bindings.driver as cuda_driver
+
+    h, d, page_size = 8, 256, 16
+    mod = _load("sm100", "decode_d256_f16", d, d, paged_kv=True, page_size=page_size, pack_gqa=True, qh_per_kh=h, split_kv=splits)
+    fn = mod.compile(d_qk=d, d_v=d, has_lse=True, paged_hnd=False)
+    gen = torch.Generator(device="cuda").manual_seed(912)
+    q = torch.randn((batch, 1, h, d), device="cuda", dtype=torch.float16, generator=gen)
+    sinks = torch.zeros(h, device="cuda", dtype=torch.float32)
+    desc = torch.zeros(1, device="cuda", dtype=torch.int64)
+    scale = 1.0 / math.sqrt(d)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    for pages, column_stride in ((16, 1), (16, 3), (16, 1), (1, 2**31 + 32)):
+        num_pages = batch * pages + 2
+        k = torch.randn((num_pages, page_size, 1, d), device="cuda", dtype=torch.float16, generator=gen)
+        v = torch.randn((num_pages, page_size, 1, d), device="cuda", dtype=torch.float16, generator=gen)
+        # Padding holds a valid, deliberately different page: reading it exposes
+        # a mistaken unit-stride path without an out-of-bounds page access.
+        v[0].fill_(42.0)
+        batch_stride = 2**31 + 32 if batch == 1 else (pages - 1) * column_stride + 3
+        span = (batch - 1) * batch_stride + (pages - 1) * column_stride + 1
+        tables = []
+        for reverse in (False, True):
+            table = torch.zeros(span, device="cuda", dtype=torch.int32).as_strided((batch, pages), (batch_stride, column_stride))
+            ids = torch.arange(1, batch * pages + 1, device="cuda", dtype=torch.int32).view(batch, pages)
+            table.copy_(ids.flip(1) if reverse else ids)
+            tables.append(table)
+        k_table, v_table = tables
+        lens = torch.full((batch,), pages * page_size - 3, device="cuda", dtype=torch.int32)
+        o = torch.full((batch * splits, 1, h, d), float("nan"), device="cuda", dtype=torch.float32 if splits > 1 else q.dtype)
+        lse = torch.full((batch * splits, h, 1), float("nan"), device="cuda", dtype=torch.float32)
+        launch_f16(
+            fn,
+            q,
+            k,
+            v,
+            o,
+            lse,
+            sinks,
+            lens,
+            desc,
+            (batch, h, 1, 1, pages * page_size, 0),
+            scale * math.log2(math.e),
+            0,
+            0,
+            o_partial_f32=o if splits > 1 else None,
+            block_table_tensor=k_table,
+            block_table_v_tensor=v_table,
+            page_size=page_size,
+            stream=stream,
+            host=mod._host,
+        )
+        length = pages * page_size - 3
+        tiles = (length + 127) // 128
+        for b in range(batch):
+            keys = k[k_table[b].long()].reshape(-1, d).double()
+            values = v[v_table[b].long()].reshape(-1, d).double()
+            for split in range(splits):
+                begin = (split * (tiles // splits) + min(split, tiles % splits)) * 128
+                end = min(begin + (tiles // splits + (split < tiles % splits)) * 128, length)
+                out_index = b + split * batch
+                if begin >= end:
+                    assert torch.count_nonzero(o[out_index]) == 0
+                    assert torch.isneginf(lse[out_index]).all()
+                else:
+                    scores = (q[b, 0].double() @ keys[begin:end].T) * scale
+                    expected = scores.softmax(-1) @ values[begin:end]
+                    torch.testing.assert_close(o[out_index, 0].float(), expected.float(), atol=2e-3, rtol=2e-3)
+                    torch.testing.assert_close(lse[out_index, :, 0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
