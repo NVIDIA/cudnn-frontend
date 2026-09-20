@@ -19,8 +19,9 @@ never to the legacy default stream.
 This file keeps those cases where they can actually run, and adds the boundary
 cases the engine suite does not cover: exception and nesting restoration, the
 ``verify_current`` override of the raw-handle fast path, the default-stream
-sentinels staying distinguishable, tensor-device precedence, and the engine lane
-that is the single guard the adapter glue relies on.
+sentinels staying distinguishable, tensor-device precedence, one launch per
+fresh stream/device/input set, CUDA-graph capture and replay, and the engine
+lane that is the single guard the adapter glue relies on.
 
 Nothing here executes a FROST kernel. Kernel-level ordering evidence stays in
 ``sdpa/frost/test_sdpa_stream_ordering.py`` (Blackwell + DSL) and in the
@@ -41,12 +42,13 @@ from cuda.bindings import driver as cuda_driver
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
 
-# Bounded device-side spin used to make a mis-ordered launch observable.  On the
-# L20 the helper mutation used to validate this detector (replace the context
-# with a no-op) stops being masked between 6e8 and 1.2e9 cycles, so the value
-# below is the smallest measured spin with margin -- the same order as the
-# engine-level case in sdpa/frost/test_sdpa_stream_ordering.py.  Override with
-# CUDNN_TEST_STREAM_SPIN_CYCLES when calibrating another part.
+# Bounded device-side spin used to make a mis-ordered launch observable, at the
+# same order as the engine-level case in sdpa/frost/test_sdpa_stream_ordering.py.
+# Measured on the L20: with the context replaced in place by a no-op, this
+# value-race form stays masked here -- the ambient work is scheduled after the
+# launch spin -- so the deterministic stream/device assertions, not this case,
+# are what a disabled context makes fail.  The ordering case says so explicitly.
+# Override with CUDNN_TEST_STREAM_SPIN_CYCLES when calibrating another part.
 _SPIN_CYCLES = int(os.environ.get("CUDNN_TEST_STREAM_SPIN_CYCLES", "1000000000"))
 
 
@@ -225,22 +227,31 @@ def test_torch_work_inside_the_context_follows_the_launch_stream():
     spins and restores the tensor.  The work under test then runs inside the
     context while torch's ambient stream is still a different one.
 
-    Scope: this asserts the ordering contract, not a device-level detector.  A
-    value race between the two streams is scheduler dependent -- on the L20 the
-    escaped work is often queued behind the spin kernel, which occupies the SMs,
-    so an escaped multiply can still land after the restore and read the correct
-    data.  The deterministic evidence for the context is the stream/device
-    contract asserted by the other cases in this file; kernel-level side-stream
-    ordering stays in ``sdpa/frost/test_sdpa_stream_ordering.py``, which needs
-    the Blackwell line.
+    The reader waits on an event the work itself records, so it observes the
+    stream the multiply really used instead of racing it: with the context the
+    record lands on the launch stream behind the restore and the reader sees the
+    doubled data, while a context that fails to switch streams records on the
+    ambient stream, lets the reader run while the launch stream still spins, and
+    reads back the poison value.  That failure mode is verified by disabling the
+    helper in place (mutation run), not by leaving the outcome to the scheduler.
+
+    Scope: kernel-level side-stream ordering stays in
+    ``sdpa/frost/test_sdpa_stream_ordering.py``, which needs the Blackwell line.
     """
     from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
 
     device = torch.device("cuda")
     ambient = torch.cuda.Stream(device=device)
     launch = torch.cuda.Stream(device=device)
+    reader = torch.cuda.Stream(device=device)
     real = torch.arange(64, dtype=torch.float32, device=device)
     x = torch.full((64,), -7.0, dtype=torch.float32, device=device)
+    # Every buffer and event is created before the trial window: a fresh
+    # allocation inside it can call cudaMalloc, which synchronizes the device and
+    # would hide the very ordering this case observes.
+    observed = torch.empty_like(x)
+    done = torch.cuda.Event()
+    torch.cuda.synchronize()
 
     # Initialization completes before the trial starts: the launch stream waits
     # on the poison event instead of relying on cross-stream luck, and no
@@ -253,11 +264,20 @@ def test_torch_work_inside_the_context_follows_the_launch_stream():
         launch.wait_event(poison_ready)
         torch.cuda._sleep(_SPIN_CYCLES)
         x.copy_(real)
+
+    # The event is recorded inside the context, so it lands on whichever stream
+    # the multiply actually used, and the reader is ordered behind that record.
     with torch.cuda.stream(ambient):
         with _torch_stream_context(_cu(launch), device):
             x.mul_(2.0)
+            done.record()
+    with torch.cuda.stream(reader):
+        reader.wait_event(done)
+        observed.copy_(x)
+
     torch.cuda.synchronize()
     torch.testing.assert_close(x, real * 2.0, atol=0, rtol=0)
+    torch.testing.assert_close(observed, real * 2.0, atol=0, rtol=0)
 
 
 @pytest.mark.L0
@@ -306,6 +326,174 @@ def test_device_isolation_uses_the_tensor_device_and_restores_the_caller(two_dev
 
     torch.cuda.synchronize(device0)
     assert torch.cuda.current_device() == original_device
+
+
+@pytest.mark.L0
+def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
+    """Fresh stream, fresh device, fresh storage every round: nothing is reused.
+
+    A helper that cached the previous stream, device or tensor address passes a
+    single-device single-call case.  Each round here uses new launch and ambient
+    streams and new source storage on the other device, and the observed value
+    must be the transform of the storage that is current in that round.
+    """
+    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
+
+    device0, device1 = two_devices_or_skip
+    original_device = torch.cuda.current_device()
+
+    for round_index, device in enumerate((device0, device1)):
+        ambient = torch.cuda.Stream(device=device)
+        launch = torch.cuda.Stream(device=device)
+        source = torch.full((64,), float(round_index + 1), dtype=torch.float32, device=device)
+        target = torch.empty_like(source)
+
+        with torch.cuda.device(device), torch.cuda.stream(ambient):
+            with _torch_stream_context(_cu(launch), device):
+                assert _current_handle(device) == _handle(launch), "the round reused a stale stream"
+                target.copy_(source)
+                target.mul_(3.0)
+            assert _current_handle(device) == _handle(ambient), "the round left the ambient stream switched"
+
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(target, source * 3.0, atol=0, rtol=0)
+
+    assert torch.cuda.current_device() == original_device, "the last round leaked its device"
+
+
+@pytest.mark.L0
+def test_capture_and_replay_run_on_the_context_stream():
+    """Capture the context's own work, then replay it against new inputs.
+
+    The engine suite uses CUDA-graph capture as a cheap deterministic stream
+    detector: work launched on some other stream is captured empty and replays
+    zeros.  Inside a capture the launch handle *is* the capture stream, so
+    entering it must keep the work capturable, and the replay must read the
+    inputs as they are at replay time instead of the values captured with the
+    graph.  ``torch.cuda.graph`` owns capture setup and the private pool, so the
+    warmup exercises the same ops outside the capture with preallocated storage.
+    """
+    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
+
+    device = torch.device("cuda")
+    source = torch.arange(64, dtype=torch.float32, device=device)
+    updated = source + 5.0
+    target = torch.empty_like(source)
+    side = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(side):
+        target.copy_(source)
+        target.mul_(2.0)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        capture_stream = _current_handle(device)
+        with _torch_stream_context(capture_stream, device):
+            assert _current_handle(device) == capture_stream, "the capture stream was switched"
+            target.copy_(source)
+            target.mul_(2.0)
+
+    source.copy_(updated)
+    target.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(target, updated * 2.0, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+def test_native_dense_engine_follows_the_bound_handle_stream():
+    """The dense lane this part can really execute, checked with a real reference.
+
+    On an L20 the FROST/DSL engines never claim the graph -- their kernel cases
+    skip on sm_89 -- so those rows belong to the architecture CI.  The native
+    backend does claim it (three ``eng8`` plans here), which makes this the one
+    dense f16 SDPA execution available locally.  The handle is bound to a
+    non-default stream while torch's ambient stream is deliberately a different
+    one, the same graph is captured on that stream and replayed after the input
+    buffers change, and every result is compared with an independent float64
+    reference.  Measured on the L20: max abs error 1.7e-4 on both streams and
+    1.8e-4 after the replay, so the 1e-3 bound keeps margin without hiding a
+    wrong-output regression.
+    """
+    import cudnn
+    from cudnn.engines import is_python_engine
+
+    device = torch.device("cuda")
+    b, h, s, d = 1, 4, 256, 64
+    dims, strides = (b, h, s, d), (s * h * d, d, h * d, 1)
+
+    def make_inputs(seed):
+        torch.manual_seed(seed)
+        q_gpu = torch.randn(b, s, h, d, device=device, dtype=torch.float16).transpose(1, 2)
+        k_gpu = torch.randn(b, s, h, d, device=device, dtype=torch.float16).transpose(1, 2)
+        v_gpu = torch.randn(b, s, h, d, device=device, dtype=torch.float16).transpose(1, 2)
+        o_gpu = torch.empty(b, s, h, d, device=device, dtype=torch.float16).transpose(1, 2)
+        return q_gpu, k_gpu, v_gpu, o_gpu
+
+    def reference(q_gpu, k_gpu, v_gpu):
+        scores = torch.matmul(q_gpu.double(), k_gpu.double().transpose(-1, -2)) * (1.0 / d**0.5)
+        return torch.matmul(torch.softmax(scores, dim=-1), v_gpu.double())
+
+    def assert_matches(o_gpu, q_gpu, k_gpu, v_gpu):
+        assert bool(torch.isfinite(o_gpu).all()), "the engine produced non-finite output"
+        torch.testing.assert_close(o_gpu.double(), reference(q_gpu, k_gpu, v_gpu), atol=1e-3, rtol=1e-3)
+
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    q = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="v")
+    o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, attn_scale=1.0 / (d**0.5), is_inference=True, use_causal_mask=False)
+    o.set_output(True).set_dim(dims).set_stride(strides)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    if all(is_python_engine(plan.engine_id) for plan in g.plans):
+        pytest.skip("no native backend plan claimed the dense graph on this part")
+    g.check_support()
+    g.build_plans()
+    workspace = g.get_workspace_size()
+    ws = torch.empty(workspace, device=device, dtype=torch.uint8) if workspace else None
+
+    handle = cudnn.create_handle()
+    qa, ka, va, oa = make_inputs(0)
+    vp_a = {q: qa, k: ka, v: va, o: oa}
+    oa.zero_()
+    g.execute(vp_a, ws, handle=handle)
+    torch.cuda.synchronize()
+    assert_matches(oa, qa, ka, va)
+
+    side = torch.cuda.Stream(device=device)
+    ambient = torch.cuda.Stream(device=device)
+    cudnn.set_stream(handle=handle, stream=side.cuda_stream)
+    with torch.cuda.stream(ambient):
+        oa.zero_()
+        with torch.cuda.stream(side):
+            g.execute(vp_a, ws, handle=handle)
+        side.synchronize()
+        assert_matches(oa, qa, ka, va)
+
+    qb, kb, vb, ob = make_inputs(1)
+    vp_b = {q: qb, k: kb, v: vb, o: ob}
+    with torch.cuda.stream(side):
+        for _ in range(3):  # warm up outside the capture
+            g.execute(vp_b, ws, handle=handle)
+    side.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        g.execute(vp_b, ws, handle=handle)
+
+    qc, kc, vc, _ = make_inputs(2)
+    qb.copy_(qc)
+    kb.copy_(kc)
+    vb.copy_(vc)
+    ob.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_matches(ob, qb, kb, vb)
 
 
 @pytest.mark.L0
