@@ -13,13 +13,13 @@ import torch
 import cudnn
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd import engines as fwd_engines
-from frost_test_utils import select_engine
+from frost_test_utils import requires_dsl, select_engine
 
 _SM80 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
     reason="needs an SM80 (A100) GPU",
 )
-pytestmark = [pytest.mark.L0, _SM80]
+pytestmark = [pytest.mark.L0, _SM80, requires_dsl]
 _ENGINE = "sdpa_fwd_prefill_sm80"
 
 
@@ -74,7 +74,6 @@ def _make_graph(
         return node
 
     q = port("q", sq, tq, cu_q, h, d)
-    q_ro_buf = vp[next(node for node in vp if node.get_name() == "q_ro")]
     k = port("k", skv, tkv, cu_kv, hkv, d)
     v = port("v", skv, tkv, cu_kv, hkv, dv)
     q_is_cu, kv_is_cu = (cu_lens, cu_lens) if isinstance(cu_lens, bool) else cu_lens
@@ -103,7 +102,7 @@ def _make_graph(
     o.set_output(True).set_data_type(io).set_dim((b, h, sq, dv)).set_stride((sq * h * dv, dv, h * dv, 1))
     o_ro = graph.tensor(name="o_ro", dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
     o.set_ragged_offset(o_ro)
-    vp[o_ro] = q_ro_buf
+    vp[o_ro] = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * h * dv).view(b + 1, 1, 1, 1)
     vp[o] = torch.full((1, tq + cap_extra, h, dv), float("nan"), dtype=dtype, device=dev)
 
     if stats_output:
@@ -185,6 +184,10 @@ def test_graph_thd_forward_unequal_lengths(dtype, hkv, d, dv, causal, bottom_rig
         stats_log2=stats_log2,
     )
     q, k, v, o, stats = nodes
+    offset_buffers = {node.get_name(): tensor.view(-1) for node, tensor in vp.items() if node.get_name().endswith("_ro")}
+    for name, cu, heads, width in (("q", cu_q, 2, d), ("k", cu_kv, hkv, d), ("v", cu_kv, hkv, dv), ("o", cu_q, 2, dv)):
+        expected = torch.tensor(cu, dtype=torch.int64, device="cuda") * heads * width
+        torch.testing.assert_close(offset_buffers[f"{name}_ro"], expected)
     facts = ga.analyze(graph)
     assert facts is not None and facts.thd and facts.packed_layout
     caps = next(spec.capabilities for spec in fwd_engines.ENGINE_SPECS if spec.name == _ENGINE)
