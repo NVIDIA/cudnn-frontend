@@ -33,14 +33,27 @@ def _previous_projection(native, indices):
 
 
 @pytest.mark.parametrize("code,bits,lanes", [(4, 16, 1), (2, 32, 1), (0, 32, 1), (1, 8, 1), (17, 4, 2), (255, 0, 1)])
-@pytest.mark.parametrize("shape,strides,nbytes", [((2, 3), (8, 1), 22), ((2, 3), (), 12), ((0, 3), (), 0), ((), (), -1)])
-def test_native_facts_projection_preserves_dtype_layout_device_span_and_order(code, bits, lanes, shape, strides, nbytes):
+@pytest.mark.parametrize(
+    "shape,strides,nbytes,expected_strides",
+    [
+        ((2, 3), (8, 1), 22, (8, 1)),
+        ((2, 3), (), 12, (3, 1)),
+        ((0, 3), (), 0, (3, 1)),
+        ((2, 0, 3), (), 0, (0, 3, 1)),
+        ((2, 1, 3), (), 12, (3, 3, 1)),
+        ((1, 3), (2**40, 1), 6, (2**40, 1)),
+        ((), (), -1, ()),
+    ],
+)
+def test_native_facts_projection_preserves_dtype_layout_device_span_and_order(code, bits, lanes, shape, strides, nbytes, expected_strides):
     native = cudnn._pybind_module.VariantPackNative(3)
     for i, device in enumerate(((2, 1), (1, 0), (-1, -1))):
         native.set_operand(i, 4096 * (i + 1), shape, strides, code, bits, lanes, nbytes, *device)
     indices = [2, 0, 2, 1]
     projected = _project(native, indices)
     assert projected == _previous_projection(native, indices)
+    assert tuple(native.stride(0)) == expected_strides
+    assert all(f.strides == expected_strides for f in projected)
     assert [f.ptr for f in projected] == [12288, 4096, 12288, 8192]
     assert [f.device for f in projected] == [(-1, -1), (2, 1), (-1, -1), (1, 0)]
     assert all(isinstance(f, prep.BufferFacts) and isinstance(f.shape, tuple) and isinstance(f.strides, tuple) for f in projected)

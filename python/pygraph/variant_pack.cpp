@@ -168,6 +168,22 @@ struct Operand {
     int32_t observed_device_id   = -1;
 };
 
+// Emit effective strides into either a native vector or a Python tuple without
+// materializing an intermediate container. Empty producer strides mean compact.
+template <typename Store>
+void
+write_effective_strides(const Operand &operand, Store &&store) {
+    if (!operand.stride.empty()) {
+        for (size_t d = 0; d < operand.stride.size(); ++d) store(d, operand.stride[d]);
+        return;
+    }
+    int64_t running = 1;
+    for (int d = operand.ndim - 1; d >= 0; --d) {
+        store(d, running);
+        if (d > 0) running *= operand.shape[d];
+    }
+}
+
 // Slots from the base to one past the last addressed slot.
 int64_t
 span_of(const std::vector<int64_t> &shape, const std::vector<int64_t> &stride) {
@@ -916,15 +932,7 @@ class VariantPackNative {
             for (size_t d = 0; d < operand.shape.size(); ++d) shape[d] = py::int_(operand.shape[d]);
 
             py::tuple strides(operand.stride.empty() ? operand.shape.size() : operand.stride.size());
-            if (operand.stride.empty()) {
-                int64_t running = 1;
-                for (int d = operand.ndim - 1; d >= 0; --d) {
-                    strides[d] = py::int_(running);
-                    if (d > 0) running *= operand.shape[d];
-                }
-            } else {
-                for (size_t d = 0; d < operand.stride.size(); ++d) strides[d] = py::int_(operand.stride[d]);
-            }
+            write_effective_strides(operand, [&strides](size_t d, int64_t value) { strides[d] = py::int_(value); });
             const auto dtype_key =
                 py::make_tuple(static_cast<int>(operand.dtype.code), static_cast<int>(operand.dtype.bits));
             PyObject *dtype = PyDict_GetItem(dtype_names.ptr(), dtype_key.ptr());
@@ -958,7 +966,7 @@ class VariantPackNative {
         const Operand &operand = operands_.at(index);
         if (!operand.stride.empty()) return operand.stride;
         std::vector<int64_t> dense(operand.ndim, 1);
-        for (int d = operand.ndim - 2; d >= 0; d--) dense[d] = dense[d + 1] * operand.shape[d + 1];
+        write_effective_strides(operand, [&dense](size_t d, int64_t value) { dense[d] = value; });
         return dense;
     }
 
