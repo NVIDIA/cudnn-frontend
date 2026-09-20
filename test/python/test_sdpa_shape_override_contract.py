@@ -9,11 +9,15 @@ run actually uses through ``override_uids`` / ``override_shapes`` /
 ``override_strides``. The declaration is what the heuristic sees at build time,
 so the plan is chosen for the declared class rather than for the run.
 
-The measured override window and strict xfails are scoped to the L20 (SM89),
-cuDNN 9.26.0, and the selected native plan. They are observations, not portable
-shape guarantees. Other configurations still exercise the declared-shape smoke
-and malformed override-triple checks. The oversized probe has physical storage
-for every row it names, even though the graph declaration remains smaller.
+The measured override window and strict xfails are scoped to the SM89 Ada
+compute capability (cc 8.9) with cuDNN 9.26.0 and the selected native plan --
+the plan is pinned and asserted, so the window cannot silently move with the
+heuristics. The window was measured on an L20 and reproduces on an L40S (same cc,
+same backend, same plan); the gate deliberately does not name a board, so any
+cc 8.9 part with that backend runs it. They are observations, not portable shape
+guarantees. Other configurations still exercise the declared-shape smoke and
+malformed override-triple checks. The oversized probe has physical storage for
+every row it names, even though the graph declaration remains smaller.
 
 The contract under test belongs to the native backend, and on parts where a
 Python DSL engine also claims the graph the default selection picks that engine
@@ -65,8 +69,8 @@ class OverrideCase:
     """One override-enabled graph with independently sized physical storage."""
 
     def __init__(self, *, s_max=S_MAX, s_kv_max=None, causal=False, stats=False, storage_rows=None, measured=True):
-        if measured and (torch.cuda.get_device_capability() != (8, 9) or torch.cuda.get_device_name() != "NVIDIA L20" or cudnn.backend_version() != 92600):
-            pytest.skip("override window measured only on L20 (SM89), cuDNN 9.26.0")
+        if measured and (torch.cuda.get_device_capability() != (8, 9) or cudnn.backend_version() != 92600):
+            pytest.skip("override window measured on cc 8.9 (SM89) with cuDNN 9.26.0")
         s_kv_max = s_max if s_kv_max is None else s_kv_max
         self.causal = causal
         self.stats = stats
