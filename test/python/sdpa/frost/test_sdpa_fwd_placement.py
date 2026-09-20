@@ -78,6 +78,11 @@ _SM100_CASES = [
     ("decode_d256_units_8_kv8k", dict(s_q=1, h_q=8, h_kv=1, d_qk=256, d_v=256, b=8, s_kv=8192), placement.TRAIL),
     ("decode_d256_b1", dict(s_q=1, h_q=32, h_kv=2, d_qk=256, d_v=256, b=1, s_kv=131072), placement.TRAIL),
     ("decode_d512_b1_32_heads", dict(s_q=1, h_q=32, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=131072), placement.LEAD),
+    ("decode_d512_b1_32_heads_kv8k", dict(s_q=1, h_q=32, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=8192), placement.TRAIL),
+    ("decode_d512_b1_64_heads_kv8k", dict(s_q=1, h_q=64, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=8192), placement.TRAIL),
+    ("decode_d512_b1_32_heads_kv32k", dict(s_q=1, h_q=32, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=32768), placement.TRAIL),
+    ("decode_d512_b1_below_verified_kv", dict(s_q=1, h_q=32, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=131071), placement.TRAIL),
+    ("decode_d512_b32_kv8k", dict(s_q=1, h_q=32, h_kv=1, d_qk=512, d_v=512, b=32, s_kv=8192), placement.LEAD),
     ("decode_d512_b1_16_heads", dict(s_q=1, h_q=16, h_kv=1, d_qk=512, d_v=512, b=1, s_kv=131072), placement.TRAIL),
     ("decode_d512_b128", dict(s_q=1, h_q=8, h_kv=1, d_qk=512, d_v=512, b=128, s_kv=131072), placement.LEAD),
     # prefill
@@ -115,6 +120,9 @@ _SM120_CASES = [
     ("decode_d512_group_128", dict(s_q=1, h_q=128, h_kv=1, b=128, s_kv=131072, d_qk=512, d_v=512), placement.TRAIL),
     ("decode_d512_group_64", dict(s_q=1, h_q=64, h_kv=1, b=128, s_kv=131072, d_qk=512, d_v=512), placement.LEAD),
     ("decode_d512_b1_32_heads", dict(s_q=1, h_q=32, h_kv=1, b=1, s_kv=131072, d_qk=512, d_v=512), placement.LEAD),
+    ("decode_d512_b1_32_heads_kv8k", dict(s_q=1, h_q=32, h_kv=1, b=1, s_kv=8192, d_qk=512, d_v=512), placement.TRAIL),
+    ("decode_d512_b1_below_verified_kv", dict(s_q=1, h_q=32, h_kv=1, b=1, s_kv=131071, d_qk=512, d_v=512), placement.TRAIL),
+    ("decode_d512_b8_kv8k", dict(s_q=1, h_q=32, h_kv=1, b=8, s_kv=8192, d_qk=512, d_v=512), placement.LEAD),
     ("decode_d512_b1_16_heads", dict(s_q=1, h_q=16, h_kv=1, b=1, s_kv=131072, d_qk=512, d_v=512), placement.TRAIL),
     ("mtp", dict(s_q=4, h_q=32, h_kv=2, b=1, d_qk=256, d_v=256), placement.LEAD),
     ("square", dict(s_q=2048, h_q=8, h_kv=1, s_kv=2048), placement.LEAD),
@@ -138,7 +146,9 @@ def test_unmeasured_rows_keep_the_historical_order():
 
 
 @pytest.mark.L0
-def test_only_the_f16_sm100_and_sm120_slots_are_default_candidates():
+@pytest.mark.parametrize("backend_version", [92501, 92600, 92700])
+def test_only_the_f16_sm100_and_sm120_slots_are_default_candidates(monkeypatch, backend_version):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: backend_version)
     assert set(_FAMILY.offered_ids()) == {_SM100, _SM120}
 
 
