@@ -20,7 +20,37 @@ from fe_api.dsa.dsa_reference import (
     _batched_ratio_causal_mask,
     _ratio_causal_mask,
     check_ref_dense_score_recompute,
+    ref_indexer_forward,
 )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+@pytest.mark.parametrize("heads", [16, 32, 64])
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("singleton_first", [True, False])
+def test_DSA_dense_indexer_sm90_singleton_and_mask_cache(heads, ratio, singleton_first, monkeypatch):
+    from cudnn import DSA
+
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This regression exercises the SM90 dense score kernel")
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
+
+    # Exercise both compile orders: singleton layouts must also work on a cache hit.
+    monkeypatch.setattr(_interface_sm90._dense_score_recompute, "compile_cache", {})
+    lengths = [(1, 1), (3, 7), (7, 67)]
+    if not singleton_first:
+        lengths.reverse()
+    for seqlen_q, seqlen_k in lengths:
+        q = torch.randn(1, seqlen_q, heads, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(1, seqlen_k, 1, 128, dtype=torch.bfloat16, device="cuda")
+        weights = torch.randn(1, seqlen_q, heads, dtype=torch.bfloat16, device="cuda")
+        offsets = torch.zeros(1, dtype=torch.int32, device="cuda")
+        result = DSA.dense_indexer_score_recompute_wrapper(q, k, weights, ratio=ratio, qhead_per_kv_head=heads, q_causal_offsets=offsets)
+        expected = ref_indexer_forward(q, k, weights, ratio, q_causal_offsets=offsets)
+        torch.testing.assert_close(result["out"], expected, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(result["denom"], torch.logsumexp(expected, dim=-1), atol=5e-3, rtol=5e-3)
+    assert len(_interface_sm90._dense_score_recompute.compile_cache) == 1
 
 
 @pytest.mark.L0

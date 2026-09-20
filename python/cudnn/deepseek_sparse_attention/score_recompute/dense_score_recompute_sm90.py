@@ -1372,7 +1372,9 @@ class DenseScoreRecomputeSm90:
                     if pos < col_limit:
                         mOut_cur[pos] = acc_out_regs[r]
                     else:
-                        mOut_cur[pos] = Float32(0.0)
+                        # Raw indexer scores use -inf for causal masking,
+                        # including masked columns within a visited KV tile.
+                        mOut_cur[pos] = Float32(float("-inf"))
 
             # LSE computation: only on last head tile when acc_out_regs has final scores.
             # On earlier head tiles acc_out_regs only has partial head sums, so
