@@ -15,6 +15,13 @@ shape guarantees. Other configurations still exercise the declared-shape smoke
 and malformed override-triple checks. The oversized probe has physical storage
 for every row it names, even though the graph declaration remains smaller.
 
+The contract under test belongs to the native backend, and on parts where a
+Python DSL engine also claims the graph the default selection picks that engine
+(SM120 ranks ``sdpa_fwd_prefill_sm120`` ahead of ``eng8``), so every case pins a
+backend plan explicitly and skips a part that has none. Without the pin the
+portable cases would fail on those parts for a reason that has nothing to do
+with overrides.
+
 The reference is FP64 over the same FP16 inputs. A served run measures ~3e-4
 (FP16 storage); a mis-served run is O(1) wrong, so the tolerance is not what
 decides these tests.
@@ -27,6 +34,7 @@ import torch
 
 import cudnn
 from cudnn._pygraph import pygraph
+from cudnn.engines import is_python_engine
 
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
@@ -82,7 +90,15 @@ class OverrideCase:
         else:
             self.o, self.st = g.sdpa(self.q, self.k, self.v, is_inference=True, use_causal_mask=causal, attn_scale=_SCALE)
         self.o.set_output(True).set_data_type(DT)
-        g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        backend = [index for index, plan in enumerate(g.plans) if not is_python_engine(plan.engine_id)]
+        if not backend:
+            pytest.skip("no native backend plan claims the override graph on this part")
+        g.select_plan(backend[0])
+        g.check_support()
+        g.build_plans()
         self.backend_evidence()
         if measured:
             name = g.get_plan_name_at_index(g._plan_index)
