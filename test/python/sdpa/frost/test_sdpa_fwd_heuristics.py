@@ -119,9 +119,13 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
         facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
         f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
         assert seen, "the split leg never consulted the wave-cost model"
+        # Geometry runners now consult the model too. Packed candidates carry
+        # p=4 (24 head groups), unpacked ones carry all 96 heads; no candidate
+        # may mistake the GQA ratio G=12 for p and model only eight heads.
+        assert {kw["heads_q"] for kw in seen} == {24, 96}
         for kw in seen:
-            assert (kw["q_tiles"], kw["heads_q"]) == (1, 24), f"split launch fed the GQA ratio, not the packed group: {kw}"
-            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
+            assert kw["q_tiles"] == 1
+            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == kw["heads_q"], kw["unsplit_launch"]
             # The combine still reduces the graph's own (S_q, H, B) rows.
             assert kw["combine_rows"] == 1 * 96 * b
         assert f16[0].knobs.pack_gqa is True and f16[0].knobs.cga == 1 and f16[0].knobs.split_kv == want, (b, f16[0].knobs)

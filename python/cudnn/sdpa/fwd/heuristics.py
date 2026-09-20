@@ -41,6 +41,7 @@ the honest answer while nobody has timed it.
 from __future__ import annotations
 
 from dataclasses import replace
+from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import cudnn
@@ -58,6 +59,7 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
+    cga_ctas,
     d192_square_br_as_tl,
     d256_square_br_as_tl,
     decode_d256_q_tile,
@@ -869,6 +871,56 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     return (False, True)
 
 
+def _sm100_f16(caps: Capabilities, facts) -> bool:
+    return caps.sm_lo == 100 and caps.sm_hi < 107 and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+
+
+def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
+    """Maximum issued KV range of this candidate's Q clusters under SWA.
+
+    Mirrors the range, not the element mask: the last Q cluster retains its
+    full token span, including padding, just as compute_kv_loop_bounds does.
+    Distinct Q-start residues repeat after tile_n/gcd(token_span,tile_n)
+    clusters. Within one residue, both unclipped bounds move by whole tiles;
+    their clipped intersection is largest at one of the two integer points
+    nearest its center. Thus planning never scans an unbounded Q sequence.
+    """
+    kv_tiles = _ceil_div(facts.s_kv, tile_n)
+    if facts.window_left is None:
+        return kv_tiles
+    causal = facts.causal or facts.right_band_widening
+    right = facts.right_bound if facts.right_band_widening else 0
+    if facts.padded and facts.bottom_right:
+        # Device KV lengths change the diagonal's tile residue. Bound every
+        # possible alignment without reading a device value on the host.
+        return min(kv_tiles, _ceil_div(token_span + facts.window_left + right + tile_n - 1, tile_n)) if causal else kv_tiles
+    diagonal = facts.s_kv - facts.s_q if facts.bottom_right else 0
+    if not causal:
+        return max(0, kv_tiles - max(0, (diagonal - facts.window_left) // tile_n))
+    q_tiles = _ceil_div(facts.s_q, token_span)
+    period = tile_n // gcd(token_span, tile_n)
+    step = period * token_span // tile_n
+    longest = 0
+    for residue in range(min(period, q_tiles)):
+        lo = (residue * token_span + diagonal - facts.window_left) // tile_n
+        hi = _ceil_div(residue * token_span + diagonal + token_span + right, tile_n)
+        last = (q_tiles - 1 - residue) // period
+        center = max(0, min(last, (kv_tiles - lo - hi) // (2 * step)))
+        for index in (center, min(last, center + 1)):
+            longest = max(longest, min(kv_tiles, hi + index * step) - max(0, lo + index * step))
+    return longest
+
+
+def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int) -> _SplitKvLaunch:
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
+    ctas = cga or 1
+    if _sm100_f16(caps, facts):
+        kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
+        ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
+
+
 def _split_points(
     caps: Capabilities,
     facts,
@@ -939,7 +991,7 @@ def _split_points(
         # the list as usual.
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g),
-            kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
+            kv_tiles=_swa_kv_tiles(facts, token_span=decode_d256_q_tile(facts.s_q, decode_pack_g) // decode_pack_g, tile_n=tile_n or 128),
             sm_count=sm_count,
             q_tile=decode_d256_q_tile(facts.s_q, decode_pack_g),
         )
@@ -950,25 +1002,11 @@ def _split_points(
             if split not in points:
                 points.append(split)
         return points
-    rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m, cga)
-    split_launch = _SplitKvLaunch(
-        q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
-        heads_q=facts.h_q // pack_g,
-        kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
-        ctas_per_tile=cga or 1,
-    )
+    split_launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g)
     unsplit_launch = None
     if unsplit_knobs is not None:
         unsplit_pack_g = _pack_gqa_group(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.pack_gqa)
-        unsplit_launch = _SplitKvLaunch(
-            q_tiles=_ceil_div(
-                facts.s_q * unsplit_pack_g,
-                _pack_gqa_tile_q(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.cga),
-            ),
-            heads_q=facts.h_q // unsplit_pack_g,
-            kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
-            ctas_per_tile=unsplit_knobs.cga or 1,
-        )
+        unsplit_launch = _split_launch(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.tile_n, unsplit_knobs.cga, unsplit_pack_g)
     split = choose_split_kv(
         q_tiles=split_launch.q_tiles,
         heads_q=split_launch.heads_q,
@@ -1005,8 +1043,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    axis at a time in impact order (tiles, sched, pack_gqa, split) with the
-    other axes held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Two
+    geometry at a time (tiles, CGA, sched, pack_gqa, split), recomputing split
+    for SM100 f16 geometry runners, capped at ``_MAX_SETS_PER_ENGINE``. Two
     axes carry a structural coupling: a packed set rides the largest tile
     that admits the ratio, and a split set rides the plain scheduler. Axis
     interactions the kernels cannot serve are the generators'/mismatch's job
@@ -1072,6 +1110,31 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         pack_g=split_pack_g,
         unsplit_knobs=unsplit_leg,
     )
+
+    def _resplit(knobs: SdpaFwdKnobs) -> SdpaFwdKnobs:
+        # A runner's changed packing/tile/CGA is a different launch, not just
+        # a label on the baseline's split. Keep other architecture policies
+        # unchanged until they have their own geometry validation.
+        if not _sm100_f16(caps, facts):
+            return knobs
+
+        def leg(split):
+            policy, auto_cga = _auto_sched_cga(spec, facts, split_kv=split, sched_policy=plain_sched if split > 1 else scheds[0], pack_gqa=knobs.pack_gqa)
+            cga = knobs.cga if knobs.cga in effective_cgas(caps, facts, split) else auto_cga
+            return replace(knobs, sched_policy=policy, cga=cga, split_kv=split)
+
+        unsplit, split = leg(1), leg(2)
+        points = _split_points(
+            caps,
+            facts,
+            split.tile_m,
+            split.tile_n,
+            split.cga,
+            pack_g=_pack_gqa_group(caps, facts, split.tile_m, split.pack_gqa),
+            unsplit_knobs=unsplit,
+        )
+        return leg(points[0])
+
     base = _leg(splits[0])
     out = [base]
     for tile_m, tile_n in tiles[1:]:
@@ -1080,7 +1143,13 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # set-cap slots for mismatch to drop.
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga):
             continue
-        out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
+        out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
+    if _sm100_f16(caps, facts):
+        # Explicit widths can select a different supported template even when
+        # the auto-ranking prefers another one. Cost each with its own split.
+        for cga in sorted(effective_cgas(caps, facts, base.split_kv)):
+            if cga != base.cga:
+                out.append(_resplit(replace(base, cga=cga)))
     # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
     # scheduler above, so an LPT runner is only a candidate without one.
     sched_host = unsplit_leg
@@ -1096,10 +1165,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     if pack_tile is not None:
         if base.pack_gqa is True:
             _, unpacked_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=False)
-            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga))
+            out.append(_resplit(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga)))
         else:
             _, packed_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=True)
-            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga))
+            out.append(_resplit(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga)))
     for split in splits[1:]:
         out.append(_leg(split))
     seen, unique = set(), []

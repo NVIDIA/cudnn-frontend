@@ -487,6 +487,16 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
+def cga_ctas(d_qk: int, cta_mma: Optional[int] = None) -> int:
+    """Physical CTAs per cluster, including the D512 non-MMA role CTAs.
+
+    Public CGA selects the MMA width. It is not a physical launch count for
+    the role-split D512 flavor, whose CGA_M/CTA_MMA ratio is two.
+    """
+    cls = {128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    return cls.CGA_M // cls.CTA_MMA * (cls.CTA_MMA if cta_mma is None else cta_mma)
+
+
 def _tma_iters_for(d_elems: int, bpe_val: int, swz_b: int) -> int:
     inner_bytes = d_elems * bpe_val
     if inner_bytes % swz_b != 0:
