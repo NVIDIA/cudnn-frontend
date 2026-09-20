@@ -133,6 +133,16 @@ class SimtCompiled:
         from cudnn.frost.template_loader import load_template
 
         self.spec, self.binding, self.params = spec, spec.binding, params
+        # This fixed-domain plan owns its declaration. Runtime buffers and their
+        # metadata are checked on every call; no buffer or address is retained.
+        operands = []
+        for tensor in self.binding.bound_tensors():
+            dim, stride = tuple(tensor.get_dim()), tuple(tensor.get_stride())
+            dtype = "int32" if tensor is spec.offsets else "bfloat16"
+            extent = 1 + sum((int(d) - 1) * int(s) for d, s in zip(dim, stride))
+            operands.append((tensor, dim, stride, dtype, extent * (4 if dtype == "int32" else 2)))
+        self._operand_specs = tuple(operands)
+        self._expert_strides = (int(spec.gate.tensor.get_stride()[0] * 2), int(spec.up.tensor.get_stride()[0] * 2))
         regular, small = _template_paths()
         self.generated_path = small if spec.rows <= 8 else regular
         self.module = load_template(str(self.generated_path), params, tag="moe_swiglu_simt_sm120")
@@ -144,34 +154,31 @@ class SimtCompiled:
         if stream is None:
             raise ValueError("SM120 SwiGLU execution requires an explicit stream")
         spec = self.spec
-        tensors = self.binding.bound_tensors()
         ranges = {}
-        for tensor in tensors:
+        for tensor, dim, stride, dtype, nbytes in self._operand_specs:
             buf = pack[tensor]
-            dtype = "int32" if tensor is spec.offsets else "bfloat16"
-            if tuple(buf.shape) != tuple(tensor.get_dim()) or tuple(buf.stride()) != tuple(tensor.get_stride()) or buffers.dtype_name(buf) != dtype:
+            if tuple(buf.shape) != dim or tuple(buf.stride()) != stride or buffers.dtype_name(buf) != dtype:
                 raise ValueError("SM120 SwiGLU operand must match its declared shape, stride and dtype")
             address = int(buf.data_ptr())
             if tuple(map(int, buf.__dlpack_device__())) != (2, self.params.device_ordinal) or address <= 0 or address % 16:
                 raise ValueError("SM120 SwiGLU requires 16-byte aligned CUDA operands on its compiled device")
-            extent = 1 + sum((int(d) - 1) * int(s) for d, s in zip(buf.shape, buf.stride()))
-            ranges[id(tensor)] = (address, address + extent * (4 if dtype == "int32" else 2))
+            ranges[id(tensor)] = (address, address + nbytes)
         start, end = ranges[id(spec.output)]
-        for tensor in tensors:
+        for tensor, _, _, _, _ in self._operand_specs:
             if tensor is spec.output:
                 continue
             a, b = ranges[id(tensor)]
             if not (end <= a or b <= start):
                 raise ValueError("SM120 SwiGLU output must not overlap an input")
         self.kernel(
-            int(pack[spec.tokens].data_ptr()),
-            int(pack[spec.gate.source].data_ptr()) + spec.gate.byte_offset,
-            int(pack[spec.up.source].data_ptr()) + spec.up.byte_offset,
-            int(pack[spec.offsets].data_ptr()),
-            int(pack[spec.output].data_ptr()),
+            ranges[id(spec.tokens)][0],
+            ranges[id(spec.gate.source)][0] + spec.gate.byte_offset,
+            ranges[id(spec.up.source)][0] + spec.up.byte_offset,
+            ranges[id(spec.offsets)][0],
+            ranges[id(spec.output)][0],
             int(spec.rows),
-            int(spec.gate.tensor.get_stride()[0] * 2),
-            int(spec.up.tensor.get_stride()[0] * 2),
+            self._expert_strides[0],
+            self._expert_strides[1],
             cuda.CUstream(stream),
         )
 

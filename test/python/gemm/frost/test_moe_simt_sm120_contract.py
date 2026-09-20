@@ -4,6 +4,9 @@
 """Graph and launch contracts for the explicit SM120 SwiGLU engine."""
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, local
+from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
 import cudnn
@@ -136,11 +139,74 @@ def test_engine_record_preserves_explicit_opt_in(monkeypatch):
 
 
 def make_compiled(spec):
-    compiled = impl.SimtCompiled.__new__(impl.SimtCompiled)
-    compiled.spec, compiled.binding, compiled.params = spec, spec.binding, impl.KernelParams(0, "cpu")
     calls = []
-    compiled.kernel = lambda *a: calls.append(a)
+    module = SimpleNamespace(compile=lambda: lambda *a: calls.append(a))
+    with patch.object(template_loader, "load_template", return_value=module):
+        compiled = impl.SimtCompiled(spec, impl.KernelParams(0, "cpu"))
     return compiled, calls
+
+
+@pytest.mark.parametrize("parent,compact", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize("attribute", ["shape", "stride"])
+def test_compiled_plan_retains_its_operand_contract(parent, compact, attribute):
+    spec = impl.analyze(graph(parent=parent, compact=compact))
+    compiled, calls = make_compiled(spec)
+    pack = frame(spec)
+    if attribute == "shape":
+        spec.tokens.set_dim([1, 7, 2048])
+    else:
+        spec.tokens.set_stride([16384, 1024, 1])
+    changed = {**pack, spec.tokens: operand(pack[spec.tokens].data_ptr(), spec.tokens.get_dim(), spec.tokens.get_stride())}
+    with pytest.raises(ValueError, match="declared shape, stride and dtype"):
+        compiled(changed, stream=17)
+    assert not calls
+    compiled(pack, stream=17)
+    assert len(calls) == 1
+
+
+def test_compiled_parent_plan_retains_expert_strides():
+    spec = impl.analyze(graph(parent=True))
+    compiled, calls = make_compiled(spec)
+    pack = frame(spec)
+    spec.gate.tensor.set_stride([1572864, 1, 2048])
+    spec.up.tensor.set_stride([1572864, 1, 2048])
+    compiled(pack, stream=17)
+    assert calls[0][6:8] == (6291456, 6291456)
+
+
+@pytest.mark.parametrize("parent,compact", [(True, False), (False, False), (False, True)])
+def test_concurrent_calls_keep_independent_bindings(parent, compact):
+    spec = impl.analyze(graph(parent=parent, compact=compact))
+    compiled, _ = make_compiled(spec)
+    barrier, current = Barrier(2), local()
+
+    def launch(*args):
+        barrier.wait(timeout=10)
+        assert tuple(int(a) for a in args) == current.expected
+        barrier.wait(timeout=10)
+
+    compiled.kernel = launch
+
+    def execute(offset, stream):
+        pack = frame(spec, offset)
+        current.expected = (
+            pack[spec.tokens].data_ptr(),
+            pack[spec.gate.source].data_ptr() + spec.gate.byte_offset,
+            pack[spec.up.source].data_ptr() + spec.up.byte_offset,
+            pack[spec.offsets].data_ptr(),
+            pack[spec.output].data_ptr(),
+            8,
+            3145728 if compact else 6291456,
+            3145728 if compact else 6291456,
+            stream,
+        )
+        for _ in range(8):
+            compiled(pack, stream=stream)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(execute, 0, 17), pool.submit(execute, 0x1000000000, 29)]
+        for future in pending:
+            future.result(timeout=20)
 
 
 @pytest.mark.parametrize("parent,compact", [(True, False), (False, False), (False, True)])
