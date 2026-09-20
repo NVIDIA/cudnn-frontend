@@ -537,6 +537,28 @@ Yanqin/Yihua's parent-weight binding integration with our research and
 implementation. Performance measurements remain scoped to their source,
 device and workload; see [the integration handoff](../../FROST_MOE_HANDOFF.md).
 
+### Explicit SM120 grouped projection
+
+The experimental `frost_moe_fc2_sm120` engine (`20403`) supplies the BF16
+projection stage alongside the explicit SM120 SwiGLU engine. It accepts
+canonical expert weights, compact tokens and output, int32 group starts,
+and FP32 accumulation on the 188-SM SM120 device. Declared dimensions are
+1–65537 rows, 1–128 experts and groups, output widths 16–8192 divisible by
+16, and reduction widths 8–8192 divisible by 8. Operand transforms,
+epilogues, additional outputs, and dynamic graph dimensions decline.
+
+Enable `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and explicitly select engine
+`20403`; an empty knob record selects its default configuration. The public
+knob record permits static or dynamic scheduling and otherwise requires the
+engine's fixed geometry and stage count. Plans compile before execution,
+require 128 bytes of caller-owned workspace, and use the supplied stream.
+CuTe DSL 4.7 or newer is required before kernel import. Performance and
+correctness claims apply only to their validated device and workload scope.
+
+This implementation builds on NVIDIA Frost/CuTeDSL/CUTLASS, Yanqin Zhai's
+[PR #1090](https://github.com/NVIDIA/cudnn-frontend/pull/1090), and NVIDIA
+CuTeDSL MegaMoE, together with our research and implementation.
+
 ### Prepared K64 paired FC2 weights
 
 On SM100, paired FC2 engine 20402 also accepts BF16 `weight_layout="k_blocked_64_v1"`

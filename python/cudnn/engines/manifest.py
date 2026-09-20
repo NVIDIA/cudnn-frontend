@@ -214,6 +214,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "frost_gemm": EngineSlot(0, opt_in=True),
             "frost_moe_swiglu_pair": EngineSlot(1, opt_in=True),
             "frost_moe_fc2_pair": EngineSlot(2, opt_in=True),
+            "frost_moe_fc2_sm120": EngineSlot(3, opt_in=True),
             "frost_moe_swiglu_simt_sm120": EngineSlot(4, opt_in=True),
         },
         # Facts + heuristics: the plan the engine would build, listed WITH its

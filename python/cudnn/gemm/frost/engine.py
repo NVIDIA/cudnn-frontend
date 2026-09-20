@@ -221,6 +221,44 @@ class FrostMoeFc2PairEngine(FrostGemmEngine):
             raise NotImplementedError(f"frost_moe_fc2_pair: {exc}") from exc
 
 
+class FrostMoeSm120Engine(FrostGemmEngine):
+    """Explicit BF16 grouped projection on the supported SM120 device."""
+
+    name = "frost_moe_fc2_sm120"
+
+    def knobs_to_public(self, knobs):
+        from .moe_sm120 import _knobs
+
+        return _knobs(knobs).to_public()
+
+    def knobs_from_public(self, public):
+        from .moe_sm120 import Sm120Knobs
+
+        return Sm120Knobs.from_public(public) if public else None
+
+    def check_support(self, graph):
+        from .compiler import _graph_dynamic_shapes
+        from .moe_sm120 import analyze, device_params
+
+        try:
+            analyze(graph, dynamic_shapes=_graph_dynamic_shapes(graph))
+            device_params()
+        except (NotImplementedError, ValueError) as exc:
+            raise NotImplementedError(f"frost_moe_fc2_sm120: {exc}") from exc
+
+    def build_plan(self, graph, plan, ctx=None):
+        from cudnn.frost.device import build_device
+        from .moe_sm120 import build
+
+        handle = ctx.handle if ctx is not None else None
+        device = handle.device.ordinal if hasattr(handle, "device") else None
+        try:
+            with build_device(device):
+                return _FrostGemmPlan(build(graph, plan.knobs if plan is not None else None))
+        except (NotImplementedError, ValueError) as exc:
+            raise NotImplementedError(f"frost_moe_fc2_sm120: {exc}") from exc
+
+
 class FrostMoeSimtSm120Engine(FrostGemmEngine):
     """Explicit fixed-domain SwiGLU specialization; no automatic selection."""
 
@@ -267,7 +305,7 @@ def FrostGemmEngines(ids):
     of engine ids -- an engine does not carry one of its own.
     """
     out = []
-    for cls in (FrostGemmEngine, FrostMoePairEngine, FrostMoeFc2PairEngine, FrostMoeSimtSm120Engine):
+    for cls in (FrostGemmEngine, FrostMoePairEngine, FrostMoeFc2PairEngine, FrostMoeSm120Engine, FrostMoeSimtSm120Engine):
         if cls.name in ids:
             engine = cls()
             engine.engine_id = ids[cls.name]
