@@ -5,17 +5,20 @@
 
 Layout
 ------
-One package per arch line — ``sm80/``, ``sm100/`` (SM100/SM103), ``sm107/``
-(Rubin), ``sm120/`` (SM120/SM121) — holding the flavor templates that arch
-owns.  Within a package the filename encodes the rest of the coverage matrix:
-``<phase>_d<dim>_<dtype-family>.py``, e.g. ``sm100/prefill_d512_f16.py``
-(``f16`` covers fp16 and bf16, picked by ``TemplateParams``).
+One package per arch line — ``sm80/``, ``sm90/`` (Hopper), ``sm100/``
+(SM100/SM103), ``sm107/`` (Rubin), ``sm120/`` (SM120/SM121) — holding the
+flavor templates that arch owns.  Within a package the filename encodes the
+rest of the coverage matrix: ``<phase>_d<dim>_<dtype-family>.py``, e.g.
+``sm100/prefill_d512_f16.py`` (``f16`` covers fp16 and bf16, picked by
+``TemplateParams``).
 
 A file omits the dimension when one implementation covers a range of head
 dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension.
+``sm90/prefill_d512_f16.py`` is that line's only template: one D512 tile over
+three warpgroups, for every head dim up to it at multiples of eight.
 A ``decode_`` phase is a second template for the SAME flavor and contract,
 selected by the adapter when the graph is decode-shaped:
 ``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed
@@ -29,7 +32,7 @@ arch's package, so the directory a file lives in always names its only owner:
 - ``_common_blackwell.py`` — the tcgen05 pipeline helpers shared by ``sm100/``
   and ``sm107/`` (cc 100-119; ``engines._BLACKWELL`` spans the same range).
 - ``thd_helpers.py`` — the THD/varlen metadata + per-batch O-descriptor setup,
-  used by ``sm100/``, ``sm107/`` and ``sm120/``.
+  used by ``sm90/``, ``sm100/``, ``sm107/`` and ``sm120/``.
 
 Loading
 -------

@@ -310,13 +310,19 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
+      config_sm90.py            TemplateParams + the D512 envelope check +
+                                raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
+                                      the Hopper line's only flavor: one D512
+                                      tile over three warpgroups
+        sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
+        sm100/prefill_d256_f16.py
         sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
@@ -330,7 +336,7 @@ python/cudnn/
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
-        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
+        thd_helpers.py            SHARED by sm90/ + sm100/ + sm107/ + sm120/
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
