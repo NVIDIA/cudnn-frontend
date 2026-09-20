@@ -904,10 +904,10 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
 - FALLBACK is one config per cell today — the smallest tile the row admits, the
   config that asks least of the device. Picking the handful that between them
   cover the plane needs measurements; the TODO is in `_mode_fallback`.
-- Which side leads is a measurement: `sdpa/fwd/placement.py` places the
-  SDPA-forward family per timed shard (B200 / RTX PRO 6000 CSVs under
-  `benchmark/attention_inference/results`, bound by `test_sdpa_fwd_placement.py`);
-  an untimed row keeps the order this dispatch has always had. A cost model
+- `sdpa/fwd/placement.py` places the SDPA-forward family using B200 / RTX PRO
+  6000 measurements; an untimed row keeps the order this dispatch has always
+  had. Rankings are tuned and evaluated offline; unit tests check the planner's
+  marker contract independently of workload winners. A cost model
   that can compare a python config against a cuDNN engine on a common currency
   (predicted time) would replace the table with a number.
 - DSL engine integration (the cuTile matmul engine lives in this track).

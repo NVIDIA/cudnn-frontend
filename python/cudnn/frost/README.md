@@ -649,9 +649,9 @@ this seam exists rather than an engine-side `propose_plans`:
 - **It places BOTH sides through one marker.** The list may hold `BACKEND`
   (`cudnn.engines.BACKEND`) once: the backend's own ranked block for the mode
   goes there, so the family says, per shard, whether its configs lead or
-  follow. That is a measurement, not a preference: `sdpa/fwd/placement.py`
-  holds one constant per timed threshold and `test_sdpa_fwd_placement.py`
-  binds them to the committed benchmark CSVs. No marker = ours first.
+  follow. `sdpa/fwd/placement.py` holds the benchmark-driven, tunable policy;
+  `test_sdpa_fwd_placement.py` checks the hook contract with synthetic verdicts.
+  Performance rankings are evaluated offline. No marker = ours first.
 - **Each mode contributes a block, and the blocks concatenate** in the caller's
   order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
   ahead of every fallback.

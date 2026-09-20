@@ -9,13 +9,13 @@ splices the backend block where the family's :data:`~cudnn.engines.heuristics.BA
 Participation is not decided here -- an engine that admits the graph is always in the list, and
 ``build_plans`` walks past a declined entry -- only the default winner is.
 
-Thresholds are fitted to the recorded measurements. Kernel time (torch profiler, L2 flushed,
-median of 20) of the FROST plan divided by the backend plan on the same graph,
-``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``), 2026-09-18, cuDNN 9.27, cutlass DSL
-4.7.1, CSVs under ``benchmark/attention_inference/results/<config>/{b200,rtxpro6000}/``.
-``test_sdpa_fwd_placement.py`` re-derives every decisive cell of those CSVs and asserts this table
-agrees, so the numbers below cannot drift away from the data without a red test.
-That check verifies the fit to its input data, not an independent holdout.
+Thresholds are tunable performance policy, initially fitted to B200 / RTX PRO 6000 kernel-time
+measurements using ``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``), 2026-09-18,
+cuDNN 9.27, cutlass DSL 4.7.1, torch profiler, L2 flushed, median of 20. A separate B200 follow-up
+used public cuDNN 9.26 GA for the D512 single-token boundary. These measurements exclude host
+enqueue overhead. Re-evaluate rankings offline when kernels or backend versions change;
+unit tests exercise placement-marker contracts with synthetic verdicts rather than pinning
+workload winners to historical timing data. Raw measurements are archived separately.
 
 SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 
@@ -29,7 +29,6 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   length. A 2026-09-19 public-cuDNN-9.26 BF16/FP16 follow-up found the same shortcut loses at
   2k-32k KV (1.7-2.2x), including shared K=V, but wins at 128k (0.80-0.88). Require 128k KV
   for this small-batch shortcut; it is a verified point, not an exact measured crossover.
-  See ``results/d512_boundary/b200/README.md`` under the inference benchmark for provenance.
 - ``s_q == 1``, d128 (and d64 through the d128 envelope): the backend's decode engine is ahead or
   at parity on every measured cell (1.04-1.06 at b = 128, 1.2-3.6x at b = 1, kv 128k) -> TRAIL.
 - prefill, d512 (DeepSeek-V4 shared-KV MQA, 8-128 query heads): 0.33-0.75 on every cell, chunked
