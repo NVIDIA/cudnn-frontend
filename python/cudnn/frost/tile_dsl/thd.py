@@ -37,6 +37,8 @@ from cutlass._mlir.dialects import arith
 
 # int64 words per 128-byte TMA descriptor.
 TENSOR_MAP_QWORDS = 128 // 8
+# Byte alignment every tensor-map object must sit on: CUtensorMap is declared `alignas(128)`
+TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
@@ -56,6 +58,14 @@ THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim co
 #   [ ...the forward layout... | row_off(B+1) ]
 THD_ROWOFF_OFF = lambda b: 4 * b + 4  # noqa: E731
 THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
+
+# --- optional TENSOR-MAP extension -----------------------------------------
+# For a launch ABI with no descriptor operand: the ``B + 3`` tensor maps follow the
+# forward layout on the next ``TENSOR_MAP_ALIGN`` boundary of a buffer based on one.
+#
+#   [ ...the forward layout... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
+THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
+THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
 
 # Threads for a THD setup launch. The metadata write itself is one elected
 # thread; the batch-remap ranking that follows is parallel over batches, so the
@@ -393,10 +403,13 @@ def emit_clamped_desc(
 
 
 __all__ = [
+    "TENSOR_MAP_ALIGN",
     "TENSOR_MAP_QWORDS",
     "THD_BWD_META_WORDS",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",
+    "THD_MAPS_META_WORDS",
+    "THD_MAPS_OFF",
     "THD_META_WORDS",
     "THD_REMAP_OFF",
     "THD_ROWOFF_OFF",
