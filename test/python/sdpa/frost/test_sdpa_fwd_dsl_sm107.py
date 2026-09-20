@@ -1178,8 +1178,9 @@ def test_sm107_gate_rows_claim_exactly_d256():
         if spec.name not in _GATE_ROWS:
             assert spec.capabilities.epilogue_gate is False, spec.name
             assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
-    # No new engine row: the gate is a FEATURE of the two existing Rubin rows.
-    assert len(engines.ENGINE_SPECS) == 9
+    # The gate is a FEATURE of the Rubin rows, never a row of its own -- a claim
+    # unrelated rows landing cannot falsify (a bare spec count could not say it).
+    assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_ROWS)
 
     f16, fp8, mxfp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1]), _caps(_GATE_ROWS[2])
     assert engines.mismatch(f16, _gate_facts()) is None

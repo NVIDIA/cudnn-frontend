@@ -30,6 +30,14 @@ pytest fe_api/gemm/          # OSS kernel tests
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated torch stream; use it instead of creating handles per-test.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
+- **Keep `sdpa/frost/` paths contiguous on the command line.** `sdpa/frost/conftest.py` sets `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` through an autouse fixture, because the FROST manifest rows are opt-in. Interleaving a top-level path between two `sdpa/frost/` paths — `pytest sdpa/frost/test_a.py test_dispatch.py sdpa/frost/test_b.py` — silently drops that fixture for everything after the top-level file: `_frost_opt_in` is absent from `item.fixturenames` and no FROST row is offered. Any top-level file does it, not just `test_dispatch.py`, and both contiguous orders are fine. Tests that *pin* an engine then fail loudly, but a test that `pytest.skip`s when it finds no python plan goes **falsely green**. Detector, as its own plugin so no test file changes:
+
+  ```python
+  @pytest.hookimpl(hookwrapper=True)
+  def pytest_runtest_call(item):
+      print(item.name, os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"), "_frost_opt_in" in item.fixturenames)
+      yield
+  ```
 
 ### Layout
 
@@ -55,6 +63,17 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **Decode Stats must be tested independently of training.** The random SDPA harness uses `generate_stats=cfg.is_train`, so its `s_q == 1` inference sweep checks O without checking LSE. For ragged GQA decode, request Stats explicitly, initialize every head to NaN, and compare every head against the reference. Include padded-Stats, MHA, and `s_q > 1` controls; pin a backend plan when testing native codegen so FROST cannot mask it. `test_mhas_v2.py::test_sdpa_ragged_decode_stats` is the detector (NVBug 6783545); run with `--runxfail` when checking an affected older backend.
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
+- **A new architecture reuses the shared forward harness through `_ARCH`, not by copying it.** `sdpa/frost/test_sdpa_fwd_dsl_sm100.py` is 2 842 lines, 66 tests and 16 helpers whose *only* arch dependence is a module-level `_ARCH` string fed to `engine_name(arch=...)`. A new row gets all of it from a file carrying its **own** device gate:
+
+  ```python
+  @pytest.fixture
+  def sm100(monkeypatch):
+      import test_sdpa_fwd_dsl_sm100 as module
+      monkeypatch.setattr(module, "_ARCH", "sm90")
+      return module
+  ```
+
+  Two traps. (1) That module's `pytestmark = requires_blackwell` skips all of its cases on a non-Blackwell card, so the delegating file must carry its own gate and call the runners **as functions** — widening the shared gate instead puts three other architectures at risk, and its parametrized head dims are the SM100 line's. (2) `test_sdpa_compiled_cache_gpu.py` keeps `_ARCH` inside its `_CHILD` subprocess source string, where `monkeypatch` cannot reach; parameterize the string. Detector for the pin itself: delete the arch's row from `ENGINE_SPECS` and every strict `select_engine` pin must fail with `no plan for engine ...` — if it doesn't, the pin wasn't strict.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
 ### Confirm you are testing the code you edited

@@ -48,6 +48,7 @@ from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
 _SM80 = "SdpaFwdDslSm80"
+_SM90 = "SdpaFwdDslSm90"
 
 
 def _adapter(name: str):
@@ -2041,6 +2042,53 @@ def _sm120_fp8_spec() -> EngineSpec:
     )
 
 
+def _sm90_spec() -> EngineSpec:
+    """D512 tile with TMA padding; the adapter declines unserved native declarations at build."""
+    from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
+
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm90",
+        capabilities=Capabilities(
+            sm_lo=90,
+            sm_hi=90,
+            phase="prefill",
+            d_shapes=frozenset({(D_TILE, D_TILE)}),
+            # The envelope floor is a ROW decision, not a template one:
+            # config_sm90.head_dims_mismatch still serves every multiple of 8 in
+            # (0, 512] for a direct adapter caller. Unfloored, the sole cc-9.0 row
+            # would take a d64 graph at 8x zero-padding -- and lead the preference
+            # order while doing it. 256 = at most 2x padding, matching the SM120
+            # d512 flavor. d <= 256 f16 Hopper graphs get no FROST plan and fall
+            # back to the backend; an exact (512, 512) hit is unaffected.
+            d_envelope_floors=(((D_TILE, D_TILE), 256),),
+            d_pad_multiple=D_ALIGN,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            bottom_right=True,
+            right_band_widening=True,
+            swa=True,
+            padded=True,
+            padded_stats=True,
+            sink=True,
+            stats=True,
+            stats_log2=True,
+            lse_optional=True,
+            decode=True,  # stated, not inherited: S_q == 1 is served (the sink decode tests pin it)
+            thd=True,
+            cu_seq_len=True,
+            skv_tile=0,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            tile_ms=frozenset({TILE_M}),
+            tile_ns=frozenset({TILE_N}),
+            cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
+            softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM90),
+    )
+
+
 ENGINE_SPECS = (
     _sm100_spec(),
     _sm100_mxfp8_spec(),
@@ -2051,6 +2099,7 @@ ENGINE_SPECS = (
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),
+    _sm90_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

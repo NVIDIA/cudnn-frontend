@@ -758,7 +758,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
 
 
 def _pack_gqa_wins(facts, tile_q: int) -> bool:
-    """Pack when the Q sequence cannot fit in a single tile, then we can further
+    """Pack when the Q sequence does not fill a single tile, then we can further
     apply split_kv on top of GQA packing.
 
     TODO: we may enhance this heuristic logic in the future by considering more
@@ -771,9 +771,12 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
     The SM100 family runs CGA tiles. D192 accepts CGA1 and CGA2, so callers must
-    pass the CGA of the complete assignment they are evaluating. SM120 launches
-    one CTA per tile, so it is ``tile_m`` itself.
+    pass the CGA of the complete assignment they are evaluating. SM90 and SM120
+    launch one CTA per tile, so it is ``tile_m`` itself.
     """
+    if caps.sm_lo == 90 and caps.sm_hi == 90:
+        # One 64-row CTA per grid tile; the cluster chain below would answer 128.
+        return tile_m or _sole(caps.tile_ms)
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
@@ -864,7 +867,15 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
+    tile_q = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    if caps.sm_lo == 90 and caps.sm_hi == 90:
+        # SM90 runs one CTA per (Q tile, head, batch) and each walks the whole KV
+        # range, so cost is the CTA COUNT: pack when it needs fewer grid tiles.
+        g = _pack_gqa_group(caps, facts, tile_m, True)
+        wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
+    else:
+        wins = _pack_gqa_wins(facts, tile_q)
+    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
 
