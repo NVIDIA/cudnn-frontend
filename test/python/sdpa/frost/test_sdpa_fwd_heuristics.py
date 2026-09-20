@@ -7,10 +7,10 @@ Unit tier (no GPU): recommend() emits ordered COMPLETE knob assignments — the
 same engine repeated with different sets, every set admissible, no cartesian
 blowup, cross-axis constraints never emitted, mode never on an entry.
 
-Executable tier (SM100): the ranked list carries knob-suffixed duplicates of
-one cell; the split_kv entry, pinned by name, builds, carves its partial slabs
-from the caller workspace, recombines correctly (O and Stats), and its
-(engine_id, knobs) tuple replays on a fresh graph.
+Executable tier (SM100): explicit public knob assignments build independently
+of recommendation order. The split plan carves its partial slabs from caller
+workspace, recombines correctly (O and Stats), and its (engine_id, knobs)
+record replays on a fresh graph.
 """
 
 import math
@@ -507,37 +507,32 @@ def _build_decodeish_graph(*, causal=True):
     st.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
     return g, (q, k, v, o, st), (B, H, SQ, SKV, D)
+
+
+def _append_explicit_f16_plan(g, *, split_kv):
+    engine = next(e for e in manifest.engines_for(g) if e.name == _F16)
+    knobs = {
+        cudnn.knob_type.TILE_M: 128,
+        cudnn.knob_type.TILE_N: 128,
+        cudnn.knob_type.TILE_CGA_M: 1,
+        cudnn.knob_type.SCHED_POLICY: 0,
+        cudnn.knob_type.SPLIT_KV: split_kv,
+        cudnn.knob_type.PACK_GQA: 0,
+    }
+    g.create_execution_plan(engine.engine_id, knobs)
+    index = g.get_execution_plan_count() - 1
+    assert g.get_engine_and_knobs_at_index(index) == (engine.engine_id, knobs)
+    return index
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_split_kv_plan_pinned_by_name_matches_reference():
+def test_explicit_split_kv_plan_matches_reference_and_roundtrips():
     """Issue F-2 regression: the split plan is graph-reachable, carves its
     slabs from the caller workspace, and recombines exactly."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph(causal=False)
-    # The split value depends on this device's SM count — ask the chooser
-    # rather than hard-coding one that only holds at one part's geometry.
-    from cudnn._device import device_info
-    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m
-    from cudnn.sdpa.fwd.heuristics import choose_split_kv
-
-    want = choose_split_kv(
-        q_tiles=-(-SQ // cga_tile_m(D)),
-        heads_q=H,
-        batch=B,
-        kv_tiles=-(-SKV // 128),
-        sm_count=device_info(torch.cuda.current_device()).sm_count,
-        combine_rows=SQ * H * B,
-        ctas_per_tile=2,
-    )
-    if want == 1:
-        pytest.skip("this part is small enough that the shape already fills it")
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    f16 = [n for n in names if n.split("[")[0] == "sdpa_fwd_prefill_sm100"]
-    assert len(f16) >= 3, f"expected knob-suffixed duplicates of the f16 family engine: {f16}"
-    split_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and f"split_kv={want}" in n)
+    split_idx = _append_explicit_f16_plan(g, split_kv=2)
     g.select_plan(split_idx)
     g.check_support()
     g.build_plans()
@@ -559,25 +554,33 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
 
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
-    assert knobs.split_kv == want
-    g2, _handles2, _ = _build_decodeish_graph(causal=False)
-    cfg = g2.create_execution_plan(eng_id, knobs)
-    assert cfg is not None
+    assert knobs[cudnn.knob_type.SPLIT_KV] == 2
+    g2, (q2, k2, v2, o2, st2), _ = _build_decodeish_graph(causal=False)
+    g2.create_execution_plan(eng_id, knobs)
+    replay_idx = g2.get_execution_plan_count() - 1
+    assert g2.get_engine_and_knobs_at_index(replay_idx) == (eng_id, knobs)
+    g2.select_plan(replay_idx)
+    g2.check_support()
+    g2.build_plans()
+    replay_o, replay_st = torch.empty_like(o_gpu), torch.empty_like(st_gpu)
+    replay_ws = torch.empty(g2.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    g2.execute({q2: q_gpu, k2: k_gpu, v2: v_gpu, o2: replay_o, st2: replay_st}, replay_ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replay_o, o_gpu, atol=0, rtol=0)
+    torch.testing.assert_close(replay_st, st_gpu, atol=0, rtol=0)
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_runner_up_sched_plan_builds_and_matches_the_winner():
-    """select_plan on a runner-up knob set compiles the adapter with exactly
-    that set and executes correctly — honored, not silently degraded."""
+def test_explicit_natural_unsplit_plan_builds_and_matches_reference():
+    """A pinned scheduler is honored regardless of the recommendation list."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    nat_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and "sched_policy=0" in n and "split_kv=1" in n)
+    nat_idx = _append_explicit_f16_plan(g, split_kv=1)
     g.select_plan(nat_idx)
     g.check_support()
     g.build_plans()
     eng_id, knobs = g.get_engine_and_knobs_at_index(nat_idx)
-    assert knobs.sched_policy == 0 and knobs.split_kv == 1
+    assert knobs[cudnn.knob_type.SCHED_POLICY] == 0 and knobs[cudnn.knob_type.SPLIT_KV] == 1
 
     torch.manual_seed(0)
     q_gpu = torch.randn(B, SQ, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
