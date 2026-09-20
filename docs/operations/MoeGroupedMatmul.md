@@ -510,6 +510,33 @@ With K64 weights and unchanged FC2, matched T8/T64 full MoE tests measured
 1.19–1.53% lower latency; these are operator measurements, not model E2E.
 See `FROST_MOE_HANDOFF.md` for exact shapes, source and validation scope.
 
+### Explicit SM120 SwiGLU specialization
+
+The experimental `frost_moe_swiglu_simt_sm120` engine (`20404`) serves a
+fixed-domain BF16 grouped SwiGLU graph on the 188-SM SM120 device. It accepts
+128 experts, hidden size 2048, intermediate size 768, and 1–4096 routed rows.
+Both projections and the intermediate activation use FP32; the final output
+is BF16. The graph must declare standard unit-beta `swish(gate) * up`, one
+shared token input, and one compact output, with one int32 group-start offset
+per expert.
+
+Weights may be two independent canonical expert tensors or two complete halves
+of a declared canonical parent tensor. The engine reads those declared layouts
+directly. Other dimensions, layouts, additional outputs, quantization, and
+dynamic graph dimensions decline during support checking.
+
+Enable `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and explicitly select
+`graph.create_execution_plan(20404, {})`. This engine has no tuning knobs and
+does not establish a ranking heuristic. Plans compile before execution and
+require no workspace; execution binds the live CUDA pointers on the supplied
+stream and rejects output/input overlap. CuTe DSL 4.7 or newer is required,
+with a version error raised before importing its kernel module.
+
+This specialization combines NVIDIA Frost/CuTeDSL/CUTLASS infrastructure and
+Yanqin/Yihua's parent-weight binding integration with our research and
+implementation. Performance measurements remain scoped to their source,
+device and workload; see [the integration handoff](../../FROST_MOE_HANDOFF.md).
+
 ### Prepared K64 paired FC2 weights
 
 On SM100, paired FC2 engine 20402 also accepts BF16 `weight_layout="k_blocked_64_v1"`
