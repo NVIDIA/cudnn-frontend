@@ -29,6 +29,16 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm90 import (
+    BAND_COORDINATE_LIMIT as _SM90_BAND_COORDINATE_LIMIT,
+    SCALE_NEGATIVE as _SM90_SCALE_NEGATIVE,
+    SCALE_POSITIVE as _SM90_SCALE_POSITIVE,
+    SCALE_ZERO as _SM90_SCALE_ZERO,
+    TILE_M as _SM90_TILE_M,
+    TILE_N as _SM90_TILE_N,
+    TemplateParams as Sm90TemplateParams,
+    head_dims_mismatch as _sm90_head_dims_mismatch,
+)
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
@@ -3968,6 +3978,380 @@ def sdpa_fwd_wrapper_dsl_sm100(
         scale_softmax=scale_softmax,
         sinks=sinks,
         seq_kv_lens=seq_kv_lens,
+        current_stream=current_stream,
+    )
+    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
+
+
+# ---------------------------------------------------------------------------
+# SM90: adapter over the Hopper D512 prefill kernel template
+# ---------------------------------------------------------------------------
+
+
+class SdpaFwdDslSm90(SdpaFwdDsl):
+    """Compile and execute native dense or packed SM90 D512 forward attention.
+
+    Q, K, V and O keep their declared strides: the kernel binds native TMA
+    views over caller storage, with no BSHD gather. Dtype, shape, band,
+    lengths, sink, Stats and the sign of ``scale_softmax`` are compile-time
+    specializations; an explicit zero scale stays zero. Contradictory
+    declarations raise ValueError, unserved ones NotImplementedError.
+    Non-overlapping operands are caller contract, as on the sibling adapters.
+    The compiled launcher refuses dtype, device, layout and alignment
+    mismatches, a THD workspace off the 128-byte tensor-map boundary included.
+    """
+
+    def _initialize_implementation(self) -> None:
+        pass
+
+    def check_support(self) -> bool:
+        from cudnn.frost import buffers
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
+
+        # Rule 7: reject a too-old DSL before compile() loads the SM90 template.
+        too_old = buffers.cutedsl_requirement_error("SM90 SDPA")
+        if too_old is not None:
+            raise ImportError(too_old)
+        self._logger.debug("Entering check_support")
+        self._not_implemented_error_if(buffers.current_sm() != 90, "SM90 D512 SDPA requires a Hopper SM90 device")
+
+        # Contradictory declarations first.
+        descs = (self.q_desc, self.k_desc, self.v_desc, self.o_desc)
+        device = buffers.current_device_id()
+        for desc in (*descs, self.lse_desc):
+            if desc is not None:
+                self._value_error_if(
+                    desc.device.type != "cuda" or desc.device.index not in (None, device),
+                    f"SM90 SDPA: {desc.name} must name CUDA storage on the plan's device {device}",
+                )
+        for desc in descs:
+            self._value_error_if(desc.ndim != 4, f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}")
+        b, h_q, s_q, d_qk = self.q_desc.shape
+        _, h_kv, s_kv, _ = self.k_desc.shape
+        d_v = self.v_desc.shape[3]
+        for label, value in (("B", b), ("H_q", h_q), ("H_kv", h_kv), ("S_q", s_q), ("S_kv", s_kv), ("D_QK", d_qk), ("D_V", d_v)):
+            self._value_error_if(value <= 0, f"{label} must be > 0; got {value}")
+        self._value_error_if(h_q % h_kv != 0, f"H_q ({h_q}) must be divisible by H_kv ({h_kv}) for GQA / MQA")
+        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
+        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
+        self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="Stats")
+        for desc in descs[1:]:
+            self._check_dtype(desc, self.q_desc.dtype, name=desc.name, extra_error_msg=f"{desc.name} must match Q")
+        self._value_error_if(self.thd_stats_padded and not self.thd, "SM90 SDPA: thd_stats_padded requires thd=True")
+        self._value_error_if(self.thd and self.seq_q_lens_present, "SM90 SDPA: seq_q_lens_present is dense-only; THD always requires Q lengths")
+        if self.thd:
+            self.seq_kv_lens_present = True
+        self._value_error_if(self.seq_q_lens_present and not self.seq_kv_lens_present, "SM90 SDPA: dense Q and KV lengths must be provided together")
+        for name, value in (("window_size_left", self.window_size_left), ("window_size_right", self.window_size_right)):
+            self._value_error_if(value is not None and value < 0, f"SM90 SDPA: {name} must be >= 0; got {value}")
+        self._value_error_if(self.window_size_right is not None and not self.is_causal, "SM90 SDPA: window_size_right requires is_causal=True")
+        self._value_error_if(self.causal_bottom_right and not self.is_causal, "SM90 SDPA: causal_bottom_right requires is_causal=True")
+
+        # Well-formed declarations this engine does not serve.
+        refusals = (
+            (self.paged, "paged KV"),
+            (self.gate_desc is not None, "epilogue gate fusion (served by the SM107 d256 SDPA engines only)"),
+            (self._pertensor or self.pv_bf16, "FP8 or PV BF16 inputs"),
+            # has_amax_o is a quantized-path flag; inert here, so only the declared output is refused.
+            (self.amax_o_desc is not None, "an Amax_O output"),
+            (self.dtype_o is not None and self.dtype_o != self.q_desc.dtype, "an output dtype different from Q"),
+            (
+                self.softmax_precision is not None and getattr(self.softmax_precision, "name", str(self.softmax_precision)).lower() not in ("float", "float32"),
+                "non-FP32 softmax precision",
+            ),
+            (self.split_kv != 1, "split-KV"),
+            (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
+            (self.cga not in (None, 1), "CGA other than 1"),
+            (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
+            (self.lse_desc is not None and self.lse_desc.dtype != torch.float32, "Stats other than FP32"),
+            (any(value >= 2**31 for value in (b, h_q, h_kv, s_q, s_kv)), "graph dimensions outside positive Int32"),
+        )
+        for refused, feature in refusals:
+            self._not_implemented_error_if(refused, f"SM90 SDPA does not support {feature}")
+        reason = _sm90_head_dims_mismatch(d_qk, d_v)
+        self._not_implemented_error_if(reason is not None, reason)
+        self._not_implemented_error_if((self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd, "SM90 SDPA: cumulative lengths are THD-only")
+        self._not_implemented_error_if(self.thd and self.thd_stats_padded, "SM90 SDPA: THD Stats must stay packed (SDPA Rule S1)")
+
+        # Native TMA binding (Rule 2): the declared strides are the kernel's, with no BSHD gather.
+        if self.thd:
+            self._thd_check_strides_native()
+            strides = tuple((0, *desc.stride[1:]) for desc in descs)
+        else:
+            quantum = 16 // self.q_desc.dtype.itemsize
+            strides = []
+            for desc in descs:
+                self._not_implemented_error_if(
+                    not dense_layout_ok(desc.shape, desc.stride),
+                    f"{desc.name}: dense strides {desc.stride} are outside dense_flex (D innermost-contiguous, non-broadcast, each covering the full pitch below it)",
+                )
+                # dense_layout_ok wildcards a unit axis, whose stride the kernel's maps still read: pin it to D.
+                pinned = tuple(desc.shape[3] if size == 1 else stride for size, stride in zip(desc.shape[:3], desc.stride))
+                self._not_implemented_error_if(
+                    any(stride % quantum for stride in pinned), f"{desc.name}: TMA strides must be 16-byte multiples; got {desc.stride}"
+                )
+                strides.append((*pinned, 1))
+            strides = tuple(strides)
+        lse_stride = None
+        if self.lse_desc is not None:
+            hs, ss = self.lse_desc.stride[1:]
+            if self.thd:
+                # Rule S1: the shared packing classifier; a head stride covering the packed total is caller contract.
+                self._not_implemented_error_if(
+                    thd_stats_packing(hs, ss, h_q) is None,
+                    f"Stats: packed Stats must be token-major or head-major (SDPA Rule S1); got {self.lse_desc.stride}",
+                )
+                lse_stride = (0, hs, ss)
+            else:
+                lse_stride = tuple(stride if size > 1 else 0 for stride, size in zip(self.lse_desc.stride, (b, h_q, s_q)))
+                self._not_implemented_error_if(
+                    not dense_layout_ok((b, h_q, s_q, 1), (*lse_stride, 1)),
+                    f"Stats: dense Stats strides {self.lse_desc.stride} are outside dense_flex (non-broadcast, non-overlapping, each covering the full pitch below it)",
+                )
+
+        # The base's canonical band; a bound at or beyond S_q + S_kv masks nothing.
+        unpadded = not (self.thd or self.seq_q_lens_present or self.seq_kv_lens_present)
+        envelope = s_q + s_kv
+        left = None if self.window_left is None or self.window_left >= envelope else int(self.window_left)
+        right = None if self.window_right is None or self.window_right >= envelope else int(self.window_right)
+        if left is None and right is None:
+            band = dict(causal=False)
+        else:
+            self._not_implemented_error_if(
+                envelope + 2 * _SM90_TILE_M >= _SM90_BAND_COORDINATE_LIMIT,
+                "SM90 SDPA: a diagonal band needs S_q + S_kv below 2**30 (Int32 band coordinates)",
+            )
+            causal = right == 0
+            bottom_right = self.causal_bottom_right or (unpadded and s_q == s_kv)
+            band = dict(causal=causal, window_left=left, window_right=right or None, bottom_right=None if bottom_right == causal else bottom_right)
+        # Pending cases inspect the declared left bound, vacuous bounds included.
+        pending = (
+            (self.causal_bottom_right and unpadded and s_q > s_kv, "unpadded bottom-right S_q > S_kv"),
+            (self.window_size_left is not None and unpadded and s_q > s_kv, "unpadded sliding-window S_q > S_kv"),
+            (self.pack_gqa and self.thd, "THD PackGQA"),
+        )
+        for refused, feature in pending:
+            self._not_implemented_error_if(refused, f"{feature} is not yet supported on SM90")
+
+        if self.scale_softmax is None:
+            self.scale_softmax = 1.0 / math.sqrt(d_qk)
+        # The kernel specializes on the scale's sign; a literal zero stays zero.
+        scale = self.scale_softmax
+        scale_mode = _SM90_SCALE_ZERO if scale == 0 else _SM90_SCALE_NEGATIVE if scale < 0 else _SM90_SCALE_POSITIVE
+        sched = self.sched_policy
+        if sched is None:
+            # The shared heuristic's first candidate and the sibling adapters' rule.
+            sched = SCHED_NATURAL if self.thd or not self.is_causal else _causal_sched_policy(s_kv, d_qk, d_v, elem_bytes=2)
+        self._not_implemented_error_if(
+            sched not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2), "SM90 SDPA supports only NATURAL/LPT/LPT_L2 single-tile scheduling"
+        )
+        self._not_implemented_error_if(
+            self.thd and sched != SCHED_NATURAL,
+            "SM90 SDPA: THD walks its live units with the natural single-tile work decoder; SCHED_LPT and SCHED_LPT_L2 are dense-only",
+        )
+        self._not_implemented_error_if(
+            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M), "SM90 D512 PackGQA requires a head ratio dividing tile_m=64"
+        )
+
+        self.params = Sm90TemplateParams(
+            dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
+            **band,
+            thd_varlen=self.thd,
+            has_lse=self.lse_desc is not None,
+            has_sink=self.has_sink,
+            stats_log2=self.stats_log2,
+            pack_gqa=self.pack_gqa,
+            qh_per_kh=h_q // h_kv,
+            sched_policy=sched,
+            scale_mode=scale_mode,
+            seq_q_lens_present=self.seq_q_lens_present,
+            seq_kv_lens_present=self.seq_kv_lens_present,
+        )
+        self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
+        self.head_dim_qk, self.head_dim_v = d_qk, d_v
+        self.dtype = self.q_desc.dtype
+        self._strides, self._lse_stride = strides, lse_stride
+        self._is_supported = True
+        self._logger.debug("check_support completed successfully")
+        return True
+
+    def compile(self) -> None:
+        self._logger.debug("Entering compile")
+        self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            return
+        template = _load_kernel_template("sm90/prefill_d512_f16.py", self.params, tag="sdpa_fwd_sm90_d512")
+        self._compiled_kernel = template.compile(
+            self.batch_size,
+            self.h_q,
+            self.h_kv,
+            self.s_q_max,
+            self.s_k_max,
+            *self._strides,
+            self._lse_stride,
+            target="sm_90a",
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+        )
+        self._logger.debug("compile completed")
+
+    def scratch_workspace_bytes(self) -> int:
+        """THD: the metadata, then the ``B + 3`` tensor maps, bound as ``seq_kv_lens``; a dense plan needs none."""
+        self._ensure_support_checked()
+        if not self.thd:
+            return 0
+        from cudnn.frost.tile_dsl.thd import THD_MAPS_META_WORDS
+
+        return THD_MAPS_META_WORDS(self.batch_size) * 4
+
+    def execute(
+        self,
+        q_tensor: torch.Tensor,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        o_tensor: torch.Tensor,
+        lse_tensor: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        seq_q_lens: Optional[torch.Tensor] = None,
+        seq_kv_lens: Optional[torch.Tensor] = None,
+        scale_softmax: Optional[float] = None,
+        workspace: Optional[torch.Tensor] = None,
+        current_stream: Optional[cuda.CUstream] = None,
+    ) -> None:
+        """Execute tensors matching the compiled specialization, on the plan's device: the launcher only checks that operands agree."""
+        import cutlass
+
+        self._logger.debug("Entering execute")
+        if self._compiled_kernel is None:
+            raise RuntimeError("SM90 SDPA: execute requires a compiled plan; runtime JIT is forbidden")
+        self._value_error_if(self.has_sink and sinks is None, "sinks is required by this compiled specialization")
+        self._value_error_if(
+            not self.has_sink and sinks is not None, "this specialization was compiled without sink support; construct the API with has_sink=True"
+        )
+        self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
+        self._value_error_if(self.lse_desc is not None and lse_tensor is None, "lse_tensor is required by this compiled specialization")
+        self._value_error_if(
+            self.lse_desc is None and lse_tensor is not None, "this specialization was compiled without an LSE output; construct the API with sample_lse"
+        )
+        scale = self.scale_softmax if scale_softmax is None else float(scale_softmax)
+        self._value_error_if(
+            (scale == 0) != (self.scale_softmax == 0) or (scale < 0) != (self.scale_softmax < 0), "SM90 SDPA scale does not match its compile-time sign mode"
+        )
+        stream = self._get_default_stream(current_stream)
+        # Dense ports bind as given: the launcher refuses a layout other than the compiled one. THD binds packed (1, H, T, D) views.
+        data = []
+        for i, (tensor, desc, strides) in enumerate(
+            zip((q_tensor, k_tensor, v_tensor, o_tensor), (self.q_desc, self.k_desc, self.v_desc, self.o_desc), self._strides)
+        ):
+            if self.thd:
+                limit = self.max_total_seq_len_q if i in (0, 3) else self.max_total_seq_len_kv
+                tokens = self._thd_declared_total(self._thd_capacity(tensor, desc), limit)
+                tensor = tensor.as_strided((1, desc.shape[1], tokens, desc.shape[3]), strides)
+            data.append(tensor)
+        lse = None
+        if lse_tensor is not None and self.thd:
+            # The caller's packed span, never allocator slack; the kernel stores rows through the device prefix sums.
+            tokens = self._thd_declared_total(self._thd_capacity(lse_tensor, self.lse_desc.unsqueeze(-1)), self.max_total_seq_len_q)
+            lse = lse_tensor.as_strided((1, self.h_q, tokens), self._lse_stride)
+        elif lse_tensor is not None:
+            lse = self._checked_lse_view(lse_tensor)
+        lengths = []
+        for tensor, cumulative, name in zip((seq_q_lens, seq_kv_lens), (self.cu_seq_q_lens, self.cu_seq_kv_lens), ("Q lengths", "KV lengths")):
+            if tensor is not None:
+                tensor = self._checked_cu_seq_lens(tensor, name) if cumulative else self._checked_seq_lens(tensor, name)
+            lengths.append(tensor)
+        sink = None if sinks is None else self._checked_sinks_1d(sinks)
+        # The launch ABI keeps both seq-lens slots tensors; a cached dummy fills an unread one.
+        device = q_tensor.device
+        with _torch_stream_context(stream, device):
+            dummy = self._dummy("seq_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+        if self.thd:
+            # One chunk, bound as seq_kv_lens; the launcher refuses a base off the 128-byte tensor-map boundary.
+            nbytes = self.scratch_workspace_bytes()
+            meta = WorkspaceCarver(workspace, nbytes, "SdpaFwdDslSm90").take(nbytes // 4, torch.int32)
+            lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
+            seq_q, seq_kv = dummy, meta
+            # thd_max_sq (the plan-time S_q envelope), thd_q_lens, thd_kv_lens, thd_lens_form.
+            thd = (cutlass.Int32(self.s_q_max), *lengths, cutlass.Int32(lens_form))
+        else:
+            seq_q, seq_kv = (dummy if tensor is None else tensor for tensor in lengths)
+            thd = (cutlass.Int32(0), None, None, None)
+        self._compiled_kernel(*data, lse, sink, seq_q, seq_kv, cutlass.Float32(scale), *thd, stream)
+        self._logger.debug("execute completed")
+
+
+def sdpa_fwd_wrapper_dsl_sm90(
+    q_tensor: torch.Tensor,
+    k_tensor: torch.Tensor,
+    v_tensor: torch.Tensor,
+    is_causal: bool = False,
+    causal_bottom_right: bool = False,
+    window_size_left: Optional[int] = None,
+    scale_softmax: Optional[float] = None,
+    seq_q_lens: Optional[torch.Tensor] = None,
+    seq_kv_lens: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    current_stream: Optional[cuda.CUstream] = None,
+) -> TupleDict:
+    """SM90 SDPA forward; returns ``TupleDict(o_tensor=..., lse_tensor=...)``."""
+
+    if current_stream is not None:
+        raise NotImplementedError(
+            "sdpa_fwd_wrapper_dsl_sm90: explicit current_stream is not "
+            "yet supported. Wrap the call in `with torch.cuda.stream(s):` to "
+            "dispatch onto a non-default stream."
+        )
+    if q_tensor.ndim != 4 or k_tensor.ndim != 4 or v_tensor.ndim != 4:
+        raise ValueError(f"Q, K, and V must be rank-4 BHSD; got Q={q_tensor.ndim}D K={k_tensor.ndim}D V={v_tensor.ndim}D")
+    b, h_q, s_q, _ = q_tensor.shape
+    d_v = v_tensor.shape[-1]
+    o_tensor = torch.empty(
+        (b, s_q, h_q, d_v),
+        dtype=q_tensor.dtype,
+        device=q_tensor.device,
+    ).transpose(1, 2)
+    lse_tensor = _allocate_lse_tensor(q_tensor)
+    cache_key = _make_cache_key(
+        SdpaFwdDslSm90,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse=lse_tensor,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        scale_softmax=scale_softmax,
+        seq_q_lens_present=seq_q_lens is not None,
+        seq_kv_lens_present=seq_kv_lens is not None,
+        has_sink=sinks is not None,
+    )
+    sdpa_fwd = _get_or_create_api(
+        cache_key,
+        sample_q=q_tensor,
+        sample_k=k_tensor,
+        sample_v=v_tensor,
+        sample_o=o_tensor,
+        sample_lse=lse_tensor,
+        seq_q_lens_present=seq_q_lens is not None,
+        seq_kv_lens_present=seq_kv_lens is not None,
+        has_sink=sinks is not None,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        scale_softmax=scale_softmax,
+    )
+    sdpa_fwd.execute(
+        q_tensor=q_tensor,
+        k_tensor=k_tensor,
+        v_tensor=v_tensor,
+        o_tensor=o_tensor,
+        lse_tensor=lse_tensor,
+        sinks=sinks,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        scale_softmax=scale_softmax,
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
