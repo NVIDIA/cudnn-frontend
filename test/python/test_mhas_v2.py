@@ -114,7 +114,7 @@ def _frost_engines_enabled(engine="sdpa_fwd_prefill_sm100"):
 
 def _frost_sm100_unavailable_reason(engine="sdpa_fwd_prefill_sm100"):
     """Why the FROST SM100 f16/bf16 row would NOT serve a graph here, or None when it
-    would: the engines must be opted in, the device a pre-Rubin Blackwell (cc 10.0-10.6,
+    would: the engine must be offered by the manifest, the device a pre-Rubin Blackwell (cc 10.0-10.6,
     the row's arch domain) and a CuTe DSL at the FROST floor importable (the row declines
     without one and the native backend then serves the graph)."""
     if not _frost_engines_enabled(engine):

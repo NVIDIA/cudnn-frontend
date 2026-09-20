@@ -9,12 +9,13 @@ splices the backend block where the family's :data:`~cudnn.engines.heuristics.BA
 Participation is not decided here -- an engine that admits the graph is always in the list, and
 ``build_plans`` walks past a declined entry -- only the default winner is.
 
-Every threshold is a measurement, not a preference. Kernel time (torch profiler, L2 flushed,
+Thresholds are fitted to the recorded measurements. Kernel time (torch profiler, L2 flushed,
 median of 20) of the FROST plan divided by the backend plan on the same graph,
 ``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``), 2026-09-18, cuDNN 9.27, cutlass DSL
 4.7.1, CSVs under ``benchmark/attention_inference/results/<config>/{b200,rtxpro6000}/``.
 ``test_sdpa_fwd_placement.py`` re-derives every decisive cell of those CSVs and asserts this table
 agrees, so the numbers below cannot drift away from the data without a red test.
+That check verifies the fit to its input data, not an independent holdout.
 
 SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 
@@ -76,14 +77,11 @@ def _q_tiles(facts) -> int:
     return facts.b * facts.h_q * -(-facts.s_q // 128)
 
 
-_MEASURED_ROWS = {"sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm120"}  # the rows with a table (and the default candidates)
-
-
 def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
-    Keyed by the row's name: the SM100 f16/bf16 row has the shard table, the
-    SM120 row leads everywhere, and every unmeasured row (SM107, SM80, fp8,
+    Keyed by the row's name: the SM100 and SM120 f16/bf16 rows each use their
+    measured shard table, and every unmeasured row (SM107, SM80, fp8,
     mxfp8) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm100":
