@@ -336,6 +336,11 @@ def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
     single-device single-call case.  Each round here uses new launch and ambient
     streams and new source storage on the other device, and the observed value
     must be the transform of the storage that is current in that round.
+
+    The factories queue their fill on the device's current stream, so each round
+    finishes that initialization before its trial starts: the fill is recorded and
+    the launch stream waits on that record, which is what keeps the round from
+    reading storage whose producer has not run yet.
     """
     from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
 
@@ -347,10 +352,14 @@ def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
         launch = torch.cuda.Stream(device=device)
         source = torch.full((64,), float(round_index + 1), dtype=torch.float32, device=device)
         target = torch.empty_like(source)
+        ready = torch.cuda.Event()
+        ready.record()
+        torch.cuda.synchronize(device)
 
         with torch.cuda.device(device), torch.cuda.stream(ambient):
             with _torch_stream_context(_cu(launch), device):
                 assert _current_handle(device) == _handle(launch), "the round reused a stale stream"
+                launch.wait_event(ready)
                 target.copy_(source)
                 target.mul_(3.0)
             assert _current_handle(device) == _handle(ambient), "the round left the ambient stream switched"
@@ -380,6 +389,7 @@ def test_capture_and_replay_run_on_the_context_stream():
     updated = source + 5.0
     target = torch.empty_like(source)
     side = torch.cuda.Stream(device=device)
+    torch.cuda.synchronize()  # the factories above are complete before the warmup
     with torch.cuda.stream(side):
         target.copy_(source)
         target.mul_(2.0)
@@ -393,9 +403,13 @@ def test_capture_and_replay_run_on_the_context_stream():
             target.copy_(source)
             target.mul_(2.0)
 
-    source.copy_(updated)
-    target.zero_()
-    graph.replay()
+    # The replay reads the buffers as they are now, so the update and the reset go
+    # on the capture stream in program order ahead of it instead of racing it from
+    # the default stream.
+    with torch.cuda.stream(side):
+        source.copy_(updated)
+        target.zero_()
+        graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(target, updated * 2.0, atol=0, rtol=0)
 
@@ -461,23 +475,36 @@ def test_native_dense_engine_follows_the_bound_handle_stream():
     handle = cudnn.create_handle()
     qa, ka, va, oa = make_inputs(0)
     vp_a = {q: qa, k: ka, v: va, o: oa}
+
+    # First run on the handle's own (default) stream, with the output reset ordered
+    # ahead of the engine write on that same stream.
     oa.zero_()
     g.execute(vp_a, ws, handle=handle)
     torch.cuda.synchronize()
     assert_matches(oa, qa, ka, va)
 
+    # Second run: the engine must follow the stream bound to the handle while
+    # torch's ambient stream is a different one.  Both the reset and the write stay
+    # on the bound stream, and g.execute is called with ambient current -- a nested
+    # side-stream context would leave ambient == handle and test nothing.
     side = torch.cuda.Stream(device=device)
     ambient = torch.cuda.Stream(device=device)
     cudnn.set_stream(handle=handle, stream=side.cuda_stream)
-    with torch.cuda.stream(ambient):
+    with torch.cuda.stream(side):
         oa.zero_()
-        with torch.cuda.stream(side):
-            g.execute(vp_a, ws, handle=handle)
-        side.synchronize()
-        assert_matches(oa, qa, ka, va)
+    with torch.cuda.stream(ambient):
+        g.execute(vp_a, ws, handle=handle)
+    side.synchronize()
+    assert_matches(oa, qa, ka, va)
 
+    # Capture on the bound stream after a warmup.  The input factories and the
+    # reset are completed (host barrier) before the capture, so nothing inside the
+    # graph reads storage whose producer has not run.
     qb, kb, vb, ob = make_inputs(1)
     vp_b = {q: qb, k: kb, v: vb, o: ob}
+    with torch.cuda.stream(side):
+        ob.zero_()
+    torch.cuda.synchronize()
     with torch.cuda.stream(side):
         for _ in range(3):  # warm up outside the capture
             g.execute(vp_b, ws, handle=handle)
@@ -486,13 +513,17 @@ def test_native_dense_engine_follows_the_bound_handle_stream():
     with torch.cuda.graph(graph, stream=side):
         g.execute(vp_b, ws, handle=handle)
 
+    # The replay reads the buffers as they are at replay time: update them and
+    # reset the output on the capture stream, in program order before the replay.
     qc, kc, vc, _ = make_inputs(2)
-    qb.copy_(qc)
-    kb.copy_(kc)
-    vb.copy_(vc)
-    ob.zero_()
-    graph.replay()
     torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        qb.copy_(qc)
+        kb.copy_(kc)
+        vb.copy_(vc)
+        ob.zero_()
+        graph.replay()
+    side.synchronize()
     assert_matches(ob, qb, kb, vb)
 
 
