@@ -25,7 +25,6 @@ def _fixture(*, padded_stats=False):
     spec.expect = dict.fromkeys(("q", "k", "v", "o"), "bfloat16")
     spec.decl = {name: (hh, d, hh * d, d, 1, hh * d) for name, hh in (("q", h), ("k", hk), ("v", hk), ("o", h))}
     spec._geometry_cache = None
-    spec._dummies = {"sinks": SimpleNamespace(data_ptr=lambda: 0x100000), "v_stub": SimpleNamespace(data_ptr=lambda: 0x200000)}
     spec.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
     spec.index = {name: i for i, name in enumerate(spec.order)}
     spec.template = [None] * len(spec.order)

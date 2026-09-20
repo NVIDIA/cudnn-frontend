@@ -356,3 +356,10 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Torch custom-op implementations live with their owning operation family and may be re-exported from `experimental/ops/` while maturing (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
+
+CUDA-owning objects can be reclaimed by cyclic GC inside an unrelated graph
+capture. Keep disabled ABI slots non-owning, and scope resource destruction so it
+does not invalidate that capture; merely collecting before a test is not a
+library fix. `test_collect_unrelated_resources_during_capture` forces collection
+inside a global-mode capture and checks both replay and subsequent native cuDNN
+execution, which also detects backend-handle destruction poisoning later plans.

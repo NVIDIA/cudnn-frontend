@@ -124,32 +124,11 @@ class ThdLaunchSpec:
         "scratch_bytes",
         "neg_inf",
         "device_index",
-        "_dummies",
         "_geometry_cache",
     )
 
     def frame(self) -> List[Any]:
         return list(self.template)
-
-    def dummy(self, key: str) -> int:
-        """Address of a zero-filled read-only device buffer owned by this spec; every one the frame can
-        need is allocated and initialized at build (:func:`build_thd_spec`), never during execute."""
-        return self._dummies[key].data_ptr()
-
-
-def _zeroed_device_buffer(nbytes: int, device_index: int) -> "_buffers.DeviceBuffer":
-    """A ``cuMemAlloc`` buffer zeroed synchronously (cuMemsetD32 + stream sync at build): ready for
-    whatever stream later reads it."""
-    from cuda.bindings import driver as _drv
-
-    buf = _buffers.DeviceBuffer(int(nbytes), device_index)
-    (err,) = _drv.cuMemsetD32(buf.data_ptr(), 0, (int(nbytes) + 3) // 4)
-    if int(err) != 0:
-        raise RuntimeError(f"cudnn.sdpa: cuMemsetD32 failed: {err}")
-    (err,) = _drv.cuStreamSynchronize(_drv.CUstream(0))
-    if int(err) != 0:
-        raise RuntimeError(f"cudnn.sdpa: cuStreamSynchronize failed: {err}")
-    return buf
 
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
@@ -233,12 +212,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.off_o_desc, s.scratch_bytes = int(plan.off_o_desc), int(plan.scratch_bytes)
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
-    s._dummies = {}
     s._geometry_cache = None
-    if not s.has_sink:
-        s._dummies["sinks"] = _zeroed_device_buffer(s.qh * 4, s.device_index)
-    if not s.paged:  # the all-KV-zero clamp's V stub: one (kh, d_v) row of zeros
-        s._dummies["v_stub"] = _zeroed_device_buffer(s.kh * s.d_v * _buffers.DTYPE_ITEMSIZE[s.expect["v"]], s.device_index)
     scale = float(api.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else scale_softmax)
 
     t: List[Any] = [None] * len(order)
@@ -560,12 +534,14 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
         if spec.total_kv is not None:
             t_kv = min(t_kv, spec.total_kv)
         if t_kv == 0:
-            # all-KV-zero clamp: one packed row of K aliases Q's storage, V a zero stub; the kernel reads no K/V row
+            # All-KV-zero clamp: descriptor-only K/V rows alias live Q/O storage.
+            # The setup kernel sees zero KV lengths and never reads either row;
+            # QH >= KH guarantees that each allocation covers its one-row view.
             kh, d_qk, d_v = spec.kh, spec.d_qk, spec.d_v
             t_kv = 1
             frame[ix["k_ptr"]] = q.ptr
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
-            frame[ix["v_ptr"]] = spec.dummy("v_stub")
+            frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
     if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
         frame[ix["lse_ext"]] = t_q
@@ -582,7 +558,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     else:
         if sinks is not None:
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a sink; construct the API with has_sink"))
-        frame[ix["sinks_ptr"]] = spec.dummy("sinks")
+        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
 
     if workspace_ptr % _ALIGN_TMA != 0:
         raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
@@ -638,10 +614,10 @@ class PreparedThdLaunch:
 # Constants written at build, and slots bind_dense writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
     "lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides meta_ptr o_desc_ptr".split()
+    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
-    "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr problem_size seq_q_lens_addr "
+    "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr o_desc_ptr problem_size seq_q_lens_addr "
     "o_partial_ptr block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides stream".split()
 )
 
@@ -694,14 +670,10 @@ class DenseLaunchSpec:
         "shape_fixed",
         "lpt_grid_fixed",
         "device_index",
-        "_dummies",
     )
 
     def frame(self) -> List[Any]:
         return list(self.template)
-
-    def dummy(self, key: str) -> int:
-        return self._dummies[key].data_ptr()
 
     def kv_tail_admitted(self, s_q: int, s_kv: int) -> bool:
         """The compiled artifact's KV-tail contract (the adapter's check_support rule, applied to the
@@ -718,7 +690,7 @@ class DenseLaunchSpec:
 def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     """The adapter's plan-time facts for a dense (padded) launch: the positional entry, the argument
     template with every constant filled, the fixed specialization the binder checks each call against,
-    and the read-only dummies (zeroed at build)."""
+    with no owned device allocations."""
     km = api._k_mod
     raw, compiled, order = _positional_order(api)
     s = DenseLaunchSpec()
@@ -782,12 +754,6 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             str(api.o_desc.dtype).split(".")[-1],
             api.lse_desc is not None,
         )
-    s._dummies = {}
-    if not s.has_sink:
-        s._dummies["sinks"] = _zeroed_device_buffer(s.qh * 4, s.device_index)
-    if not s.seq_kv_present:
-        s._dummies["meta"] = _zeroed_device_buffer(max(s.b, 1) * 4, s.device_index)
-    s._dummies["o_desc"] = _zeroed_device_buffer(128, s.device_index)
     scale = float(api.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else scale_softmax)
 
     t: List[Any] = [None] * len(order)
@@ -811,8 +777,6 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)
     put("gate_strides", (0, 0, 0))
-    put("meta_ptr", None if s.seq_kv_present else s.dummy("meta"))
-    put("o_desc_ptr", s.dummy("o_desc"))
     unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE)
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
@@ -984,7 +948,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     else:
         if sinks is not None:
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
-        frame[ix["sinks_ptr"]] = spec.dummy("sinks")
+        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
 
     def lens(name: str) -> int:
         f = facts.get(name)
@@ -999,8 +963,10 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
             raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
         return f.ptr
 
-    if spec.seq_kv_present:
-        frame[ix["meta_ptr"]] = lens("seq_kv_lens")
+    # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
+    # meta and only THD reads o_desc. Bind live storage instead of owning dummies.
+    frame[ix["o_desc_ptr"]] = q.ptr
+    frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else q.ptr
     if spec.seq_q_present:
         frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
 
