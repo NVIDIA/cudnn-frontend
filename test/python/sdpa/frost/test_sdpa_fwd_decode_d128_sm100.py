@@ -38,7 +38,7 @@ import os
 import pytest
 import torch
 
-from frost_test_utils import offers_engine, requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import launch_f16, offers_engine, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -403,7 +403,6 @@ def _run_kernel(
         k_rows = [_gather_kv(k_pool, bt[b], lens[b], hnd) for b in range(B)]
         v_rows = [_gather_kv(v_pool, bt[b], lens[b], hnd) for b in range(B)]
         paged_kw = dict(paged_kv=True, page_size=P)
-        compile_kw = dict(k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
         skv = 0
     else:
         skv = max_pages * P
@@ -413,7 +412,6 @@ def _run_kernel(
         v_rows = [v_view[b, : lens[b]] for b in range(B)]
         bt = None
         paged_kw = {}
-        compile_kw = {}
     params = TemplateParams(
         dtype_qkv=3 if dtype == torch.float16 else 2,
         window_left=window_left,
@@ -438,7 +436,7 @@ def _run_kernel(
         tag=f"decode_test_{'p' + str(P) if paged else 'dense'}_s{splits}_g{G if pack else 1}_{dtype}_br{int(causal_br)}_w{window_left}_sk{int(has_sink)}_l2{int(stats_log2)}_q{int(q_lens is not None)}_sc{sched}_lse{int(has_lse)}",
     )
     assert mod.CGA_TILE_M == 128 and mod.CFG.STAGES_KV == 3 and mod.CFG.TOTAL_WARPS == 12
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=s_q, skv=skv, d_qk=d, d_v=d, has_lse=has_lse, **compile_kw)
+    fn = mod.compile(d_qk=d, d_v=d, has_lse=has_lse, paged_hnd=paged and hnd)
     o_p = torch.zeros(splits * B, s_q, H, d, device=dev, dtype=torch.float32 if splits > 1 else dtype)
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -447,7 +445,8 @@ def _run_kernel(
         kwargs["o_partial_f32"] = o_p
     if paged:
         kwargs.update(block_table_tensor=bt, block_table_v_tensor=bt)
-    fn(
+    launch_f16(
+        fn,
         q,
         k_view,
         v_view,
@@ -461,7 +460,9 @@ def _run_kernel(
         cutlass.Int32(0),
         int(seq_q.data_ptr()) if q_lens is not None else 0,
         **kwargs,
+        page_size=P if paged else 0,
         stream=stream,
+        host=mod._host,
     )
     if splits == 1:
         o_out, lse_out = o_p, lse_p
