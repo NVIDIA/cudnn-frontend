@@ -3024,30 +3024,6 @@ class FlexAttentionBackwardSm100:
             work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
-    def _dq_semaphore_lock_value(
-        self,
-        iter_idx: Int32,
-        curr_q_cnt: Int32,
-        curr_full_cnt: Int32,
-        curr_dq_write_order: cute.Tensor,
-        curr_dq_write_order_full: cute.Tensor,
-        full_first: cutlass.Constexpr[bool] = False,
-    ) -> Int32:
-        sparse_iter = iter_idx // self.subtile_factor
-        lock_value = Int32(0)
-        if const_expr(full_first):
-            if sparse_iter < curr_full_cnt:
-                lock_value = curr_dq_write_order_full[sparse_iter]
-            else:
-                lock_value = curr_dq_write_order[sparse_iter - curr_full_cnt]
-        else:
-            if sparse_iter < curr_q_cnt:
-                lock_value = curr_dq_write_order[sparse_iter]
-            else:
-                lock_value = curr_dq_write_order_full[sparse_iter - curr_q_cnt]
-        return lock_value
-
-    @cute.jit
     def dQacc_reduce(
         self,
         mdQaccum: cute.Tensor,
@@ -3143,18 +3119,16 @@ class FlexAttentionBackwardSm100:
             full_first_sparse = const_expr(self.use_2cta_instrs)
             for block_group in cutlass.range_constexpr(2):
                 is_full_group = const_expr((full_first_sparse and block_group == 0) or (not full_first_sparse and block_group == 1))
-                iter_offset = Int32(0)
                 if const_expr(is_full_group):
                     group_loop_count = curr_full_cnt * self.subtile_factor
-                    if const_expr(not full_first_sparse):
-                        iter_offset = curr_q_cnt * self.subtile_factor
                 else:
                     group_loop_count = curr_q_cnt * self.subtile_factor
-                    if const_expr(full_first_sparse):
-                        iter_offset = curr_full_cnt * self.subtile_factor
 
+                # Both sparse groups retain store overlap unless the next writer
+                # turn blocks. D192 already drains its shared dS/dQ storage.
+                delayed_group = const_expr(self.deterministic and self.tile_hdim != 192)
+                previous_m_block = Int32(-1)
                 for group_iter_idx in cutlass.range(group_loop_count, unroll=1):
-                    iter_idx = group_iter_idx + iter_offset
                     sparse_iter_idx = group_iter_idx // self.subtile_factor
                     subtile_offset = group_iter_idx % self.subtile_factor
                     if const_expr(is_full_group):
@@ -3162,6 +3136,14 @@ class FlexAttentionBackwardSm100:
                     else:
                         m_block = curr_q_idx[sparse_iter_idx] * self.subtile_factor + subtile_offset
                     m_block_oob_upper = m_block >= m_block_max
+                    # Fetch the sparse writer order before waiting for dQ so the metadata
+                    # load can overlap the producer's matrix operations.
+                    lock_value = Int32(0)
+                    if const_expr(self.deterministic):
+                        if const_expr(is_full_group):
+                            lock_value = curr_dq_write_order_full[sparse_iter_idx]
+                        else:
+                            lock_value = curr_dq_write_order[sparse_iter_idx]
                     pipeline_dQ.consumer_wait(dQ_consumer_state)
                     # TMEM -> RMEM
                     tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
@@ -3189,17 +3171,27 @@ class FlexAttentionBackwardSm100:
                         cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         cute.arch.fence_view_async_shared()
-                        # semaphore acquire
-                        if const_expr(self.deterministic and stage == 0):
+                        # Do not carry completed work into a blocking writer wait.
+                        if const_expr(delayed_group and stage == 0):
+                            if is_tma_warp and not m_block_oob_upper:
+                                current_lock = Int32(0)
+                                if tidx == 0 and lock_value != 0:
+                                    current_lock = barrier.ld_acquire(mdQ_semaphore_cur[m_block, None].iterator + cta_rank_in_cluster)
+                                current_lock = cute.arch.shuffle_sync(current_lock, Int32(0))
+                                if current_lock != lock_value:
+                                    if previous_m_block >= 0:
+                                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                                        cute.arch.sync_warp()
+                                        barrier.arrive_inc(mdQ_semaphore_cur[previous_m_block, None].iterator, tidx, cta_rank_in_cluster)
+                                        previous_m_block = Int32(-1)
+                                    barrier.wait_eq(
+                                        mdQ_semaphore_cur[m_block, None].iterator,
+                                        tidx,
+                                        cta_rank_in_cluster,
+                                        lock_value,
+                                    )
+                        elif const_expr(self.deterministic and stage == 0):
                             if not m_block_oob_upper:
-                                lock_value = self._dq_semaphore_lock_value(
-                                    iter_idx,
-                                    curr_q_cnt,
-                                    curr_full_cnt,
-                                    curr_dq_write_order,
-                                    curr_dq_write_order_full,
-                                    full_first=full_first_sparse,
-                                )
                                 barrier.wait_eq(
                                     mdQ_semaphore_cur[(m_block, None)].iterator,
                                     tidx,
@@ -3216,12 +3208,22 @@ class FlexAttentionBackwardSm100:
                                     self.tma_copy_bytes["dQ"] // 1,
                                 )
                             cute.arch.cp_async_bulk_commit_group()
-                            cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
+                            # At most the current store may remain in flight when
+                            # releasing the previous tile, even with >2 SMEM stages.
+                            pending_stores = const_expr(1 if self.deterministic and stage == 0 else self.sdQaccum_stage - 1)
+                            cute.arch.cp_async_bulk_wait_group(pending_stores, read=read_flag)
                         elif is_tma_warp:
                             # Drain pending TMA stores so SMEM buffers are safe to reuse
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                         self.reduce_sync_barrier.arrive_and_wait()
                         dQ_tma_store_producer_state.advance()
+                        if const_expr(delayed_group and stage == 0):
+                            if previous_m_block >= 0:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[previous_m_block, None].iterator,
+                                    tidx,
+                                    cta_rank_in_cluster,
+                                )
 
                     if const_expr(self.tile_hdim == 192):
                         if const_expr(self.sdQaccum_stage > 1):
@@ -3233,7 +3235,7 @@ class FlexAttentionBackwardSm100:
 
                     # semaphore release
                     # NOTE: arrive_inc calls red_release which issues membar
-                    if const_expr(self.deterministic):
+                    if const_expr(self.deterministic and not delayed_group):
                         if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
                             if is_tma_warp and not m_block_oob_upper:
                                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -3241,6 +3243,24 @@ class FlexAttentionBackwardSm100:
                         if not m_block_oob_upper:
                             barrier.arrive_inc(
                                 mdQ_semaphore_cur[m_block, None].iterator,
+                                tidx,
+                                cta_rank_in_cluster,
+                            )
+
+                    if const_expr(delayed_group):
+                        previous_m_block = Int32(-1)
+                        if not m_block_oob_upper:
+                            previous_m_block = m_block
+
+                if const_expr(delayed_group):
+                    if group_loop_count > 0:
+                        # Flush before crossing full/partial groups or work tiles.
+                        if is_tma_warp:
+                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                        self.reduce_sync_barrier.arrive_and_wait()
+                        if previous_m_block >= 0:
+                            barrier.arrive_inc(
+                                mdQ_semaphore_cur[previous_m_block, None].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
                             )
