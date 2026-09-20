@@ -9,21 +9,11 @@ run actually uses through ``override_uids`` / ``override_shapes`` /
 ``override_strides``. The declaration is what the heuristic sees at build time,
 so the plan is chosen for the declared class rather than for the run.
 
-What this file pins, on a device that serves the unified SDPA engine:
-
-* the declared-shape run is correct, and an override inside the measured legal
-  window is correct against an independent FP64 reference built from the
-  already-quantized inputs;
-* the legal window is NOT "any extent up to the declaration": the non-causal
-  class serves multiples of the plan's Q tile, the causal class serves any
-  length above 1, and the two classes do not mix (declared prefill -> ``s_q=1``
-  is rejected with ``CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE``);
-* an override beyond the declaration, and a non-causal override off the tile
-  grid, are strict xfails: the tree rejects neither, so they fail (wrong output)
-  until the contract is made explicit;
-* rebinding the graph to fresh buffers for a second run gives that run's own
-  answer and leaves the first buffers alone;
-* the Stats geometry follows the same override as the output.
+The measured override window and strict xfails are scoped to the L20 (SM89),
+cuDNN 9.26.0, and the selected native plan. They are observations, not portable
+shape guarantees. Other configurations still exercise the declared-shape smoke
+and malformed override-triple checks. The oversized probe has physical storage
+for every row it names, even though the graph declaration remains smaller.
 
 The reference is FP64 over the same FP16 inputs. A served run measures ~3e-4
 (FP16 storage); a mis-served run is O(1) wrong, so the tolerance is not what
@@ -41,11 +31,13 @@ from cudnn._pygraph import pygraph
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
-pytestmark = pytest.mark.L0
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(cudnn.backend_version() < 92300, reason="override workspace queries need cuDNN >= 9.23")]
+
+_MEASURED_PREFILL_PLAN = "eng8_k24=1_k27=0_k38=0_k40=3_k41=1"
+_MEASURED_DECODE_PLAN = "eng8_k24=1_k27=0_k38=0_k40=2_k41=1"
 
 B, H, D = 1, 4, 64
 S_MAX = 256
-TILE = 64  # Q tile of the selected plan (measured on L20: eng8_k24=1_k27=0_k38=0_k40=3_k41=1)
 DT = cudnn.data_type.HALF
 _SCALE = 1.0 / math.sqrt(D)
 _ATOL = 5e-3
@@ -62,14 +54,18 @@ def _reference(q, k, v, causal):
 
 
 class OverrideCase:
-    """One override-enabled graph plus a buffer set allocated at the declared extent."""
+    """One override-enabled graph with independently sized physical storage."""
 
-    def __init__(self, *, s_max=S_MAX, s_kv_max=None, causal=False, stats=False, declared_only=False):
+    def __init__(self, *, s_max=S_MAX, s_kv_max=None, causal=False, stats=False, storage_rows=None, measured=True):
+        if measured and (torch.cuda.get_device_capability() != (8, 9) or torch.cuda.get_device_name() != "NVIDIA L20" or cudnn.backend_version() != 92600):
+            pytest.skip("override window measured only on L20 (SM89), cuDNN 9.26.0")
         s_kv_max = s_max if s_kv_max is None else s_kv_max
         self.causal = causal
         self.stats = stats
         self.s_max = s_max
         self.s_kv_max = s_kv_max
+        self.q_rows = s_max if storage_rows is None else storage_rows
+        self.kv_rows = s_kv_max if storage_rows is None else storage_rows
         g = pygraph(
             io_data_type=DT,
             intermediate_data_type=cudnn.data_type.FLOAT,
@@ -87,17 +83,23 @@ class OverrideCase:
             self.o, self.st = g.sdpa(self.q, self.k, self.v, is_inference=True, use_causal_mask=causal, attn_scale=_SCALE)
         self.o.set_output(True).set_data_type(DT)
         g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        self.backend_evidence()
+        if measured:
+            name = g.get_plan_name_at_index(g._plan_index)
+            expected = _MEASURED_DECODE_PLAN if s_max == 1 else _MEASURED_PREFILL_PLAN
+            if name != expected:
+                pytest.skip(f"override window not measured for selected plan {name}")
         self.workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
         self.bufs = self.new_buffers()
 
     def new_buffers(self):
-        """Fresh buffers at the declared extent: an override says how much of them this run uses."""
+        """Storage covers the declaration and, for the invalid-geometry probe, the override."""
         return (
-            torch.randn(B, H, self.s_max, D, dtype=torch.float16, device="cuda"),
-            torch.randn(B, H, self.s_kv_max, D, dtype=torch.float16, device="cuda"),
-            torch.randn(B, H, self.s_kv_max, D, dtype=torch.float16, device="cuda"),
-            torch.full((B, H, self.s_max, D), float("nan"), dtype=torch.float16, device="cuda"),
-            torch.full((B, H, self.s_max), float("nan"), dtype=torch.float32, device="cuda"),
+            torch.randn(B, H, self.q_rows, D, dtype=torch.float16, device="cuda"),
+            torch.randn(B, H, self.kv_rows, D, dtype=torch.float16, device="cuda"),
+            torch.randn(B, H, self.kv_rows, D, dtype=torch.float16, device="cuda"),
+            torch.full((B, H, self.q_rows, D), float("nan"), dtype=torch.float16, device="cuda"),
+            torch.full((B, H, self.q_rows), float("nan"), dtype=torch.float32, device="cuda"),
         )
 
     def execute(self, s_q, s_kv, *, bufs=None, override=True):
@@ -106,8 +108,8 @@ class OverrideCase:
         kwargs = {}
         if override:
             q_geom, kv_geom = [B, H, s_q, D], [B, H, s_kv, D]
-            q_stride = [H * self.s_max * D, self.s_max * D, D, 1]
-            kv_stride = [H * self.s_kv_max * D, self.s_kv_max * D, D, 1]
+            q_stride = list(qt.stride())
+            kv_stride = list(kt.stride())
             uids = [self.q.get_uid(), self.k.get_uid(), self.v.get_uid(), self.o.get_uid()]
             shapes = [q_geom, kv_geom, kv_geom, q_geom]
             strides = [q_stride, kv_stride, kv_stride, q_stride]
@@ -115,8 +117,9 @@ class OverrideCase:
                 data[self.st] = stt
                 uids.append(self.st.get_uid())
                 shapes.append([B, H, s_q])
-                strides.append([H * self.s_max, self.s_max, 1])
+                strides.append(list(stt.stride()))
             kwargs = dict(override_uids=uids, override_shapes=shapes, override_strides=strides)
+        self.workspace = torch.empty(self.graph.get_workspace_size(**kwargs), dtype=torch.uint8, device="cuda")
         self.graph.execute(data, self.workspace, **kwargs)
         torch.cuda.synchronize()
         return ot[:, :, :s_q].float(), (stt[:, :, :s_q].double() if self.stats else None)
@@ -128,9 +131,7 @@ class OverrideCase:
         torch.testing.assert_close(o_actual, ref, atol=_ATOL, rtol=1e-2)
         if self.stats:
             assert torch.isfinite(st_actual).all(), "Stats carries a non-finite value on a served override"
-            ref_lse = torch.logsumexp(
-                (qt[:, :, :s_q].double() @ kt[:, :, :s_kv].double().transpose(-1, -2)) * _SCALE, dim=-1
-            )
+            ref_lse = torch.logsumexp((qt[:, :, :s_q].double() @ kt[:, :, :s_kv].double().transpose(-1, -2)) * _SCALE, dim=-1)
             torch.testing.assert_close(st_actual, ref_lse, atol=1e-3, rtol=1e-3)
 
     def backend_evidence(self):
@@ -141,7 +142,7 @@ class OverrideCase:
 
 @pytest.fixture
 def case():
-    return OverrideCase()
+    return OverrideCase(measured=False)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +168,7 @@ def test_non_causal_override_on_the_tile_grid_is_served(s_actual):
 
 
 @pytest.mark.parametrize("s_actual", [2, 33, 64, 96, 128], ids=lambda s: f"s{s}")
-def test_causal_override_serves_every_length_above_one(s_actual):
+def test_causal_override_serves_measured_lengths(s_actual):
     """The causal class does not need tile alignment: 33 and 96 are served here."""
     case = OverrideCase(causal=True)
     got = case.execute(s_actual, s_actual)
@@ -228,7 +229,11 @@ def test_the_declared_class_decides_the_plan_not_the_run(capsys):
     observations = []
     for declared in (64, S_MAX):
         case = OverrideCase(s_max=declared, s_kv_max=declared)
+        selected_index = case.graph._plan_index
+        selected_name = case.graph.get_plan_name_at_index(selected_index)
         got = case.execute(64, 64, override=declared != 64)
+        assert case.graph._plan_index == selected_index
+        assert case.graph.get_plan_name_at_index(selected_index) == selected_name
         case.assert_served(64, 64, got=got)
         names = [case.graph.get_plan_name_at_index(i) for i in range(case.graph.get_execution_plan_count())]
         observations.append((declared, names))
@@ -260,19 +265,16 @@ def test_prefill_to_decode_is_rejected_by_the_backend():
     assert "NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE" in str(excinfo.value), str(excinfo.value)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="beyond the declared extent the tree neither rejects nor serves "
-    "(measured: s=320 finite but wrong, s=512 NaN)",
-)
+@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason="L20/cuDNN 9.26 eng8 accepts an override beyond the declaration")
 def test_override_beyond_the_declared_extent_is_rejected():
-    case = OverrideCase()
+    case = OverrideCase(storage_rows=320)
     with pytest.raises(Exception):
         case.execute(320, 320)
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="non-causal override off the tile grid is silently wrong (measured: s=96 max|dO| 8.1e-01, "
     "s=160 4.9e-01) while the same shape declared outright is correct",
 )
@@ -284,7 +286,7 @@ def test_non_causal_override_off_the_tile_grid_is_served():
 
 def test_override_triple_must_name_the_same_tensors():
     """A short or mismatched override triple is refused before anything runs."""
-    case = OverrideCase()
+    case = OverrideCase(measured=False)
     geom = [B, H, 64, D]
     stride = [H * S_MAX * D, S_MAX * D, D, 1]
     qt, kt, vt, ot, _ = case.bufs

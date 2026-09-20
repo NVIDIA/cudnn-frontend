@@ -1190,7 +1190,15 @@ The declaration is the envelope the plan is built for, not a promise about any
 one run. One plan can then serve many extents without being rebuilt, which is
 what a serving stack wants when it groups requests into length buckets.
 
+The example requires a frontend compiled against cuDNN >= 9.21 and a cuDNN
+>= 9.23 runtime for the workspace query with overrides. Its 64-row extent is
+from the measured plan below; validate other plans before using that window.
+
 ```python
+import cudnn
+import torch
+
+B, H, D = 1, 4, 64
 g = cudnn.pygraph(
     io_data_type=cudnn.data_type.HALF,
     intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1209,13 +1217,14 @@ q, k, v = (torch.randn(B, H, 256, D, dtype=torch.float16, device="cuda") for _ i
 o = torch.empty(B, H, 256, D, dtype=torch.float16, device="cuda")
 geometry = [B, H, 64, D]
 strides = [H * 256 * D, 256 * D, D, 1]
-g.execute(
-    {Q: q, K: k, V: v, O: o},
-    workspace,
+overrides = dict(
     override_uids=[Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid()],
     override_shapes=[geometry, geometry, geometry, geometry],
     override_strides=[strides, strides, strides, strides],
 )
+# Query for the same geometry passed to execute (cuDNN >= 9.23).
+workspace = torch.empty(g.get_workspace_size(**overrides), dtype=torch.uint8, device="cuda")
+g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
 ```
 
 ### What an override does and does not do
@@ -1239,21 +1248,28 @@ g.execute(
 ### Boundaries
 
 Measured on an L20 (SM89), cuDNN 9.26, FP16, `B=1 H=4 D=64`, plan
-`eng8_k24=1_k27=0_k38=0_k40=3_k41=1`, buffers allocated at the declared extent:
+`eng8_k24=1_k27=0_k38=0_k40=3_k41=1` for prefill and
+`eng8_k24=1_k27=0_k38=0_k40=2_k41=1` for decode. Buffers cover the declared
+extent, or the larger override for the explicitly oversized probe:
 
 | declared | run | result |
 |---|---|---|
 | 256, non-causal | 64 / 128 / 192 / 256 | served, max abs error ~3e-4 (FP16 storage) |
-| 256, causal | 2 ... 256 | served, same error |
+| 256, causal | 2 / 33 / 64 / 96 / 128 | served, same error |
 | 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
 | 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
 | 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
 | 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
-| 256 | 320 / 512 (beyond the declaration) | **not rejected**: wrong output / NaN |
+| 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
 | any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
 
-Two consequences are worth stating plainly, because neither is an error a caller
-can catch:
+These are observations of this platform and plan, not a portable supported-shape
+contract. The tests gate measured overrides and strict xfails on the device,
+runtime version, and selected plan. The oversized probe allocates physical
+storage for every overridden row; an xfail does not make an undersized CUDA
+allocation safe. Acceptance outside the declaration is not a correctness guarantee.
+
+Two consequences for callers:
 
 1. **Decode and prefill are different engine classes.** A declared prefill graph
    cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
