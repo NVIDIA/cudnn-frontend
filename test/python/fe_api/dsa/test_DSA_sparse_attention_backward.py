@@ -109,6 +109,67 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("max_topk", [512, 1024])
+@pytest.mark.parametrize(
+    "num_heads,head_dim,expected_backend,static_stride",
+    [
+        (16, 512, "generic_m64", False),
+        (16, 576, "h16_m128", True),
+        (32, 512, "generic_m64", False),
+        (32, 576, "h32_m64", True),
+        (64, 512, "generic_m64", False),
+        (64, 576, "generic_m64", False),
+        (96, 512, "generic_m64", False),
+        (96, 576, "h96_h64_h32", True),
+        (128, 512, "h128_2cta_m64", False),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_topk_stride_specialization(max_topk, num_heads, head_dim, expected_backend, static_stride, monkeypatch):
+    """Specialize only the measured backends, without making Q a compile key."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    backend, _ = interface._select_sm100_backend(
+        num_heads,
+        head_dim,
+        head_dim_v=512,
+        dtype=torch.bfloat16,
+        max_topk=max_topk,
+        device_capability=(10, 0),
+    )
+    assert backend == expected_backend
+
+    symbolic_q = object()
+    static_tensor, dynamic_tensor = object(), object()
+    fake_calls = []
+    dynamic_calls = []
+    monkeypatch.setattr(interface.cute, "sym_int", lambda: symbolic_q)
+
+    def fake_compact(dtype, shape, **kwargs):
+        fake_calls.append((dtype, shape, kwargs))
+        return static_tensor
+
+    def dynamic(tensor):
+        dynamic_calls.append(tensor)
+        return dynamic_tensor
+
+    monkeypatch.setattr(interface.cute.runtime, "make_fake_compact_tensor", fake_compact)
+    monkeypatch.setattr(interface, "to_cute_tensor", dynamic)
+    indices = torch.empty((3, max_topk), dtype=torch.int32)
+    result = interface._topk_indices_compile_tensor(indices, max_topk, backend)
+    if static_stride:
+        assert result is static_tensor
+        assert fake_calls == [(interface.cutlass.Int32, (symbolic_q, max_topk), {"stride_order": (1, 0), "assumed_align": 16})]
+        assert not dynamic_calls
+    else:
+        assert result is dynamic_tensor
+        assert dynamic_calls == [indices]
+        assert not fake_calls
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
