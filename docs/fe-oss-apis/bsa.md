@@ -162,8 +162,7 @@ that budget raises `RuntimeError`.
 
 ## Sage FP8 forward
 
-Sage FP8 is a forward-only path (blk64 by default, native blk128 on SM120).
-Its public wrapper accepts contiguous
+Sage FP8 is a forward-only blk64 path. Its public wrapper accepts contiguous
 BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
 internally:
 
@@ -179,10 +178,8 @@ o_fp8 = fp8_result["o_tensor"]
 ```
 
 Q, K, and V must be BF16 MHA tensors in contiguous BHSD layout, have matching
-batch and head counts, and use `D=128`. Pass `sparse_block_size=128` on SM120
-to select native KV128, with sparse indices shaped
-`[B, H, ceil(S_q/128), topk]`; the default remains 64. Metadata describes
-the selected block size, as in the regular forward API. It lazily loads the
+batch and head counts, and use `D=128`. The wrapper accepts the same blk64
+sparse index metadata used by the regular forward API. It lazily loads the
 quantizer, creates the E4M3 tensors and FP32 scales needed by the kernel, and
 does not expose those implementation details as public inputs or outputs.
 
@@ -199,55 +196,12 @@ The architecture-specific FP8 contracts are:
   expose `kv_splits` or `use_clc`.
 - SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
   tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
-  `(B, N_kv)`, or `(B, H, N_kv)`. Both `sparse_block_size=64` and `128` are
-  supported. It does not use split-KV. Empty per-query-block counts produce
-  zero output. The blk128 option is rejected on other architectures.
-
-The native blk128 implementation is a separate Q128/KV128 kernel, derived
-from the existing SM120 FP8 blk64 source. It consumes the original metadata
-directly, without expanding indices, calling a blk64 attention kernel, or
-combining intermediate outputs. It uses FP8 `mma.sync`, eight compute warps
-and an additional register-donating warpgroup whose first warp issues TMA
-loads. Quantization writes V directly into private KV128 tiles; no separate
-transpose/repack launch is added. Public inputs remain contiguous BF16 BHSD.
-
-Long fixed-count blocked-V loops (at least 128 selected KV blocks) use the
-private PTXAS `--register-usage-level=2` scheduling option. Short loops,
-variable per-row counts, legacy BHSD V and blk64 retain the default options.
-The compile-cache key includes the option string. This beta compiler tuning
-feature has only a small measured benefit; revalidate it after toolchain
-changes. See the [SM120 FP8 review summary](../../benchmark/bsa/SM120_FP8_REVIEW.md)
-for paired timings, accuracy evidence, NCU counters and reproduction.
-
-Quantization uses E4M3 Q with per-row scales, mean-centered E4M3 K with
-per-16-token scales (eight per KV128 tile), and E4M3 V with per-head/channel
-scales shared across batch and sequence. Softmax uses FP32; probabilities
-are scaled by 256 and cast to E4M3 for PV. The output is BF16. This is an
-approximate FP8 path, not BF16-equivalent arithmetic. Blk64 and blk128 need
-not be bit-identical because changing the online-softmax tile size changes
-rounding. LSE remains private and is not returned by the public FP8 API.
-
-From a checkout installed with its CUDA dependencies on an idle SM120 GPU:
-
-```bash
-(cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa -m L0)
-CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_fp8_blk128.py \
-  --sequence 142720 --heads 8 --densities 0.15 0.20 \
-  --patterns strided local --warmup 10 --repeats 41
-```
-
-The benchmark expands metadata only to construct a matched-mask blk64
-baseline, outside timing. It reports attention-only and quantization-inclusive
-paired CUDA-graph medians plus sampled FP32-reference errors. It is not a
-dense BF16 comparison or a multi-GPU communication-overlap benchmark.
+  `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
 
 `block_sparse_attention_fp8_forward` relies on functionality introduced in
 CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
 newer. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
 loaded lazily, so importing `cudnn` does not eagerly import it.
-The quantizer uses shuffle-based FP32 max reductions on SM120, where the
-SM100 floating-point `redux` instruction is unsupported. Scaling and rounding
-are unchanged.
 
 ## Backward
 
@@ -295,7 +249,6 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
-| SM120 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
 positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be

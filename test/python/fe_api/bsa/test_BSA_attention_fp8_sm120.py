@@ -26,47 +26,6 @@ def _require_sm120():
 
 
 @pytest.mark.L0
-def test_sm120_fp8_revision_benchmark_preserves_baseline_layout(monkeypatch, capsys):
-    """An archived blocked-V revision must not be timed in legacy BHSD mode."""
-    _require_sm120()
-    import json
-    import sys
-    from pathlib import Path
-
-    native = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8")
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4] / "benchmark" / "bsa"))
-    benchmark = importlib.import_module("benchmark_sm120_fp8_revision")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "benchmark_sm120_fp8_revision",
-            "--baseline-kernel",
-            native.__file__,
-            "--sequence",
-            "256",
-            "--heads",
-            "1",
-            "--densities",
-            "1",
-            "--patterns",
-            "strided",
-            "--warmup",
-            "1",
-            "--repeats",
-            "1",
-        ],
-    )
-    assert benchmark.main() == 0
-    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
-    assert records[0]["v_block_sizes"] == [128, 128]
-    assert len(records) == 3
-    assert all(all(record["bitwise_equal"]) for record in records[1:])
-    assert records[0]["configured_baseline_compile_options"] == records[0]["configured_candidate_compile_options"]
-    assert all(record["baseline_compile_options"] == record["candidate_compile_options"] for record in records[1:])
-
-
-@pytest.mark.L0
 @torch_fork_set_rng(seed=120128)
 def test_sm120_fp8_blk128_compile_options_are_scoped_and_cached(monkeypatch):
     """Compiler tuning must neither affect blk64 nor alias an untuned callable."""
