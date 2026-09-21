@@ -31,6 +31,7 @@ import os
 
 import pytest
 import torch
+from cuda.bindings import driver as cuda
 
 pytestmark = pytest.mark.L0
 
@@ -38,7 +39,7 @@ pytestmark = pytest.mark.L0
 import sys  # noqa: E402
 
 from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry  # noqa: E402
-from cudnn.gated_attention_block.api import QuantSpec  # noqa: E402
+from cudnn.gated_attention_block.api import MxQuantSpec, QuantSpec  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,6 +52,7 @@ from gated_block_reference import (  # noqa: E402
     make_inputs,
     qk_norm_rope_reference,
     quant_e4m3,
+    quantize_block_inputs_mxfp8,
 )
 
 _SM107 = (10, 7)
@@ -303,12 +305,12 @@ def test_fp8_stage_list_and_workspace():
 
 
 def test_fp8_fused_stage_list_and_workspace():
-    """Fully fused (round 2): THREE stages and FIVE workspace slots -- COMPACT e4m3
+    """Fully fused (round 2): THREE stages and FIVE data slots -- COMPACT e4m3
     q8 / k8 / v8 (the unfused pipeline's own slots, so the SDPA reads exactly what
-    the shipped FP8 SDPA reads), the bf16 GATE, the e4m3 O -- and no bf16 slab,
-    no bf16 O, no round-1 ``qkv8`` slab.  The expected total is derived from the
-    geometry, never a literal."""
-    from cudnn.gated_attention_block.api import _align_up
+    the shipped FP8 SDPA reads), the bf16 GATE, the e4m3 O -- plus the 36-B quant
+    slot LAST, and no bf16 slab, no bf16 O, no round-1 ``qkv8`` slab.  The expected
+    total is derived from the geometry, never a literal."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _align_up
 
     blk = _decl_block(quant=_SPEC, **_FUSED)
     assert [s.name for s in blk._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "out_proj"]
@@ -325,7 +327,7 @@ def test_fp8_fused_stage_list_and_workspace():
     assert (lay.q8, lay.k8, lay.v8) == (0, _align_up(q8_b), _align_up(q8_b) + _align_up(kv8_b))
     assert lay.gate16 == lay.v8 + _align_up(kv8_b) and lay.o8 == lay.gate16 + _align_up(gate_b)
     want = _align_up(q8_b) + 2 * _align_up(kv8_b) + _align_up(gate_b) + _align_up(o8_b)
-    assert lay.total_bytes == want == lay.engine_scratch, (lay.total_bytes, want)
+    assert lay.quant == want and lay.total_bytes == want + _align_up(_QUANT_SLOT_BYTES) == lay.engine_scratch, (lay.total_bytes, want)
     # q8 + k8 + v8 is the Q|K|V width per token -- the same e4m3 bytes round 1's slab held, per tensor now.
     assert q8_b + 2 * kv8_b == t * g.n_qkv and g.n_qkv == g.n_qkvg - g.h_q * g.d_head
     # -51 % of the unfused FP8 workspace (no bf16 slab, no bf16 O; the e4m3 slots are shared).
@@ -497,3 +499,224 @@ def test_fp8_block_second_execute_agrees_bitwise():
     blk.execute(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out2, ws)
     torch.cuda.synchronize()
     torch.testing.assert_close(out2, out, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# Rule 8: the quant scalars live in the workspace, filled at execute (R4 + R2); the plan owns no device memory
+# ---------------------------------------------------------------------------
+
+
+def _quant_words(spec: QuantSpec) -> list:
+    """The nine fp32 words of the quant slot in ``_QUANT_WORDS`` order (``descale_* = 1 / scale_*``)."""
+    return [spec.alpha_qkvg, spec.scale_q, spec.scale_k, spec.scale_v, spec.alpha_o, spec.scale_o, 1.0 / spec.scale_q, 1.0 / spec.scale_k, 1.0 / spec.scale_v]
+
+
+def _bf16_block() -> GatedAttentionBlockFwd:
+    geom = GatedAttentionBlockGeometry(**_GEOM)
+    inp = make_inputs(RefGeometry(**_GEOM), batch=1, seq_len=256, dtype=torch.bfloat16)
+    out = torch.empty(1, 256, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    return GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom)
+
+
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_quant_slot_is_the_last_workspace_slot(kw):
+    """Declaration-time arithmetic, any device: the nine-word slot (36 B, one 256-B alignment unit) is reserved
+    LAST in both FP8 layouts, so every pre-existing offset is unchanged and the carve grows by exactly 256 B; a
+    bf16 block reserves none (``quant == -1``) and has no values to fill."""
+    import dataclasses
+
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _QUANT_WORDS, _align_up
+
+    assert _QUANT_WORDS == ("alpha_qkvg", "scale_q", "scale_k", "scale_v", "alpha_o", "scale_o", "descale_q", "descale_k", "descale_v")
+    assert _QUANT_SLOT_BYTES == 4 * 9 and _align_up(_QUANT_SLOT_BYTES) == 256
+    lay = _decl_block(quant=_SPEC, **kw)._layout()
+    assert lay.quant >= 0 and lay.quant % 256 == 0
+    assert lay.total_bytes == lay.engine_scratch == lay.quant + 256
+    others = [v for k, v in dataclasses.asdict(lay).items() if k not in ("quant", "total_bytes", "engine_scratch", "base_align") and v >= 0]
+    assert max(others) < lay.quant, "the quant slot is appended after every data slot"
+    bf16 = _bf16_block()
+    assert bf16._layout().quant == -1 and bf16._quant_values() is None
+
+
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_fill_quant_slot_writes_the_nine_words_on_the_given_stream(kw):
+    """R4 on any GPU: ``_fill_quant_slot`` writes the nine fp32 words with driver memsets on the stream it is
+    given -- no torch op, no host sync, no allocation -- touches nothing outside the 36 B, and returns 1-element
+    views of the words (plus ``qscal`` = words 0..3, 16-B aligned) that alias the workspace."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _QUANT_WORDS
+
+    blk = _decl_block(quant=_SPEC, **kw)
+    lay = blk._layout()
+    blk._ws = lay
+    ws = torch.full((lay.total_bytes,), 0xFF, dtype=torch.uint8, device="cuda")
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        qd = blk._fill_quant_slot(ws, side.cuda_stream)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    side.synchronize()
+    want = torch.tensor(_quant_words(_SPEC), dtype=torch.float32)
+    got = ws[lay.quant : lay.quant + _QUANT_SLOT_BYTES].view(torch.float32).cpu()
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert blk._quant_values() == dict(zip(_QUANT_WORDS, _quant_words(_SPEC)))
+    assert set(qd) == set(_QUANT_WORDS) | {"qscal"}
+    for i, name in enumerate(_QUANT_WORDS):
+        v = qd[name]
+        assert v.dtype == torch.float32 and tuple(v.shape) == (1,) and v.data_ptr() == ws.data_ptr() + lay.quant + 4 * i
+    qs = qd["qscal"]
+    assert tuple(qs.shape) == (4,) and qs.is_contiguous() and qs.data_ptr() == ws.data_ptr() + lay.quant and qs.data_ptr() % 16 == 0
+    torch.testing.assert_close(qs.cpu(), want[:4], rtol=0, atol=0)
+    assert (ws[: lay.quant] == 0xFF).all() and (ws[lay.quant + _QUANT_SLOT_BYTES :] == 0xFF).all(), "only the nine words were written"
+
+
+def test_quant_scalars_are_not_plan_owned():
+    """The contract this batch changes: ``compile()`` owns no device scalars (no ``_quant_dev`` /
+    ``_make_quant_dev``), ``_FusedQkvProjection`` takes no ``device`` and ``execute_fp8`` takes ``qscal`` as a
+    required keyword (the block's workspace view)."""
+    import inspect
+
+    from cudnn.gated_attention_block.api import _FusedQkvProjection
+
+    blk = _decl_block(quant=_SPEC, **_FUSED)
+    assert not hasattr(blk, "_quant_dev") and not hasattr(GatedAttentionBlockFwd, "_make_quant_dev")
+    assert "device" not in inspect.signature(_FusedQkvProjection.__init__).parameters and not hasattr(blk._proj, "_qscal")
+    p = inspect.signature(_FusedQkvProjection.execute_fp8).parameters
+    assert p["qscal"].kind is inspect.Parameter.KEYWORD_ONLY and p["qscal"].default is inspect.Parameter.empty
+
+
+def _declare_fp8_block(geom_kw, batch, seq_len, **blk_kw):
+    """A DECLARED (not checked, not compiled) FP8 block on calibrated data; returns ``(blk, args, oracle)``
+    with ``args`` the positional execute arguments through ``out``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    inp, desc = _make_fp8_inputs(geom_kw, batch, seq_len)
+    spec = _calibrated_spec(inp, desc, geom, batch, seq_len)
+    fused = bool(blk_kw.get("fuse_gate")) and bool(blk_kw.get("fuse_norm_rope"))
+    ref = _fp8_oracle(inp, geom, spec, fused=fused)
+    out = torch.empty(batch, seq_len, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out)
+    return GatedAttentionBlockFwd(*args, geom, quant=spec, **blk_kw), args, ref
+
+
+def _declare_mxfp8_fused_block(geom_kw, batch, seq_len):
+    """A DECLARED fully fused MXFP8 block (``scale_o == 1.0``, D8); returns ``(blk, args, execute kwargs)``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    mx, desc = quantize_block_inputs_mxfp8(make_inputs(RefGeometry(**geom_kw), batch=batch, seq_len=seq_len, dtype=torch.bfloat16))
+    out = torch.empty(batch, seq_len, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    args = (mx["h"], mx["w_qkvg"], mx["w_q_norm"], mx["w_k_norm"], mx["cos"], mx["sin"], mx["w_o"], out)
+    blk = GatedAttentionBlockFwd(*args, geom, quant=MxQuantSpec(**desc, scale_o=1.0), sample_h_sf=mx["h_sf"], sample_w_qkvg_sf=mx["w_qkvg_sf"], **_FUSED)
+    return blk, args, dict(h_sf=mx["h_sf"], w_qkvg_sf=mx["w_qkvg_sf"])
+
+
+def _check_support_or_skip(blk) -> None:
+    """A fork that has not landed in this checkout is a SKIP with the block's own reason, not a failure."""
+    try:
+        blk.check_support()
+    except NotImplementedError as exc:
+        if "not landed" in str(exc):
+            pytest.skip(str(exc))
+        raise
+
+
+@requires_rubin
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_quant_slot_is_filled_on_launch_stream_and_matches_spec(kw):
+    """After an execute on a side stream (ambient AND ``current_stream``), the quant slot holds the nine words
+    of the block's ``QuantSpec`` and the alignment tail behind it is untouched; the output is bit-identical to
+    the default-stream run (the fills are ordered with the kernels that read them)."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES
+
+    if kw:
+        _require_fp8_forks()
+    out_ref, ref, blk = _run_fp8_block(_GEOM, batch=1, seq_len=512, **kw)
+    inp, _ = _make_fp8_inputs(_GEOM, 1, 512)  # same seed path -> same inputs
+    ws = torch.full((blk.get_workspace_size(),), 0xFF, dtype=torch.uint8, device="cuda")
+    out = torch.empty_like(out_ref)
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        blk.execute(
+            inp["h"],
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            out,
+            ws,
+            current_stream=cuda.CUstream(side.cuda_stream),
+        )
+    side.synchronize()
+    lay = blk._ws
+    got = ws[lay.quant : lay.quant + _QUANT_SLOT_BYTES].view(torch.float32).cpu()
+    torch.testing.assert_close(got, torch.tensor(_quant_words(blk.quant), dtype=torch.float32), rtol=0, atol=0)
+    assert (ws[lay.quant + _QUANT_SLOT_BYTES : lay.total_bytes] == 0xFF).all(), "the slot's alignment tail must stay untouched"
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    assert _cos(out, ref) > 0.99
+
+
+@requires_rubin
+@pytest.mark.parametrize("cfg", ["fp8_unfused", "fp8_fused", "mxfp8_fused"])
+def test_execute_allocates_nothing_and_never_synchronizes(cfg, compile_allocates_nothing):
+    """R9 around BUILD and EXECUTE (Rule 8): ``compile()`` makes no torch allocation (the quant scalars are no
+    longer plan-owned tensors) and three warm executes allocate nothing and never block the host."""
+    if cfg == "mxfp8_fused":
+        blk, args, exec_kw = _declare_mxfp8_fused_block(_GEOM, 1, 512)
+    else:
+        if cfg == "fp8_fused":
+            _require_fp8_forks()
+        blk, args, _ = _declare_fp8_block(_GEOM, 1, 512, **(_FUSED if cfg == "fp8_fused" else {}))
+        exec_kw = {}
+    _check_support_or_skip(blk)
+    compile_allocates_nothing(blk)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    blk.execute(*args, ws, **exec_kw)  # warm: the adapter's cached dummies, plan caches
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            blk.execute(*args, ws, **exec_kw)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "execute() allocated (Rule 8 / R9)"
+    assert torch.isfinite(args[-1].float()).all()
+
+
+@requires_rubin
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_first_execute_inside_capture(kw):
+    """Rule 8's capture detector: ``compile()``, then the FIRST execute of the plan runs inside ``torch.cuda.graph``
+    (the quant fills are memset nodes; the graph-route handle already exists), and the replay is bit-identical to
+    an eager execute of the same plan and stable across replays."""
+    if kw:
+        _require_fp8_forks()
+    blk, args, ref = _declare_fp8_block(_GEOM, 1, 512, **kw)
+    _check_support_or_skip(blk)
+    blk.compile()
+    out = args[-1]
+    ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        blk.execute(*args, ws)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = out.clone()
+    assert torch.isfinite(replayed.float()).all(), "the captured first execute replayed a non-finite output"
+    out2 = torch.empty_like(out)
+    blk.execute(*args[:-1], out2, torch.zeros_like(ws))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, out2, rtol=0, atol=0)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, replayed, rtol=0, atol=0)
+    assert _cos(replayed, ref) > 0.99

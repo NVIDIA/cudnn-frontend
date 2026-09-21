@@ -226,8 +226,8 @@ def test_a_caller_stream_orders_every_stage(how):
     """Every stage -- the CuTe-DSL kernels AND the two FROST GEMMs -- launches on
     ONE stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit
     (``current_stream=``).  The GEMMs take it through ``run_proj_gemm(stream=)``
-    (the JIT plan's own ``stream=``; a cached per-(device, stream) cuDNN handle on
-    the graph route).  Before that they launched on the DEFAULT stream regardless,
+    (the JIT plan's own ``stream=``; the per-device cuDNN handle re-streamed to it
+    on the graph route).  Before that they launched on the DEFAULT stream regardless,
     so under a caller stream the SDPA consumed a slab the projection had not
     written yet -- all-zero output, reproduced on SM107 (Rule 5).  This is the
     inverse of the refusal the v1 block shipped.
@@ -281,20 +281,36 @@ def test_run_proj_gemm_refuses_a_handle_bound_to_another_stream():
         run_proj_gemm(plan, None, None, None, None, h, stream=torch.cuda.default_stream().cuda_stream)
 
 
-def test_graph_route_handles_are_cached_per_device_and_stream():
-    """The graph route's cuDNN handle is created ONCE per (device, stream) and
-    stays bound to that stream -- never re-``set_stream``ed, so two streams driving
-    a block concurrently never share one; and never created per execute (Rule 1)."""
+def test_graph_route_handle_is_per_device_and_restreamed(monkeypatch):
+    """R7 (torch-op form): the graph route owns ONE process-lifetime cuDNN handle per
+    device and re-streams it with ``cudnn.set_stream`` before every launch -- so a
+    second execute, on any stream, never calls ``cudnnCreate`` again (a captured
+    execute records no resource creation).  Runs on any device: a stand-in graph
+    records the handle it is executed with; no kernel launches."""
     import cudnn
-    from cudnn.gated_attention_block.kernels.proj_gemm import handle_for_stream
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, graph_handle, run_proj_gemm
 
+    dev = torch.device("cuda", torch.cuda.current_device())
+    h = graph_handle(dev)
+    assert graph_handle(torch.device("cuda")) is h and graph_handle(dev) is h, "one handle per device, whichever spelling names it"
+
+    seen = []
+
+    class _Graph:  # the plan's graph, standing in for the backend: records (handle, its stream) per execute
+        def execute(self, vp, workspace, handle):
+            seen.append((handle, int(cudnn.get_stream(handle))))
+
+    plan = ProjGemmPlan(graph=_Graph(), a="a", b="b", c="c", m=1, k=1, n=1, label="probe")  # route None -> the graph route, no JIT
+    x = torch.zeros(1, 1, device="cuda")
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
-    h1 = handle_for_stream(torch.device("cuda"), s1.cuda_stream)
-    assert handle_for_stream(torch.device("cuda", torch.cuda.current_device()), s1.cuda_stream) is h1, "same (device, stream) must hit the cache"
-    assert cudnn.get_stream(h1) == s1.cuda_stream
-    h2 = handle_for_stream(torch.device("cuda"), s2.cuda_stream)
-    assert h2 is not h1 and cudnn.get_stream(h2) == s2.cuda_stream
-    assert cudnn.get_stream(h1) == s1.cuda_stream, "creating a second handle must not rebind the first"
+    monkeypatch.setattr(cudnn, "create_handle", lambda: pytest.fail("run_proj_gemm called cudnnCreate: the per-device handle must already exist"))
+    run_proj_gemm(plan, x, x, x, x, stream=s1.cuda_stream)
+    assert seen[-1] == (h, s1.cuda_stream) and cudnn.get_stream(h) == s1.cuda_stream
+    run_proj_gemm(plan, x, x, x, x, stream=s2.cuda_stream)
+    assert seen[-1] == (h, s2.cuda_stream) and cudnn.get_stream(h) == s2.cuda_stream, "the same handle, re-streamed"
+    run_proj_gemm(plan, x, x, x, x)  # no stream: torch's current stream on out.device
+    assert seen[-1] == (h, torch.cuda.current_stream().cuda_stream)
+    assert len(seen) == 3
 
 
 # ---------------------------------------------------------------------------
