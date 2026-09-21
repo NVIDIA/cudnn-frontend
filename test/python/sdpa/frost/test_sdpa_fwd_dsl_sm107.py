@@ -2736,7 +2736,12 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     print("SASS LINES", len(sass))
     """)
 
-_WAIT_FORM_SLACK = 4
+# Per-counter bounds, each BELOW the change one ring-wait instantiation makes when it falls back from the spin to the sleeping
+# form (measured on the d192x128 mxfp8 kernel, 42 instantiations: SYNCS.PHASECHK 142 -> 58 = -2 per site, USYNCS.PHASECHK
+# 75 -> 117 = +1 per site, NANOSLEEP 73 -> 31 = -1 per site), so a single site regressing fails all three assertions. The counts
+# are deterministic for a given DSL + ptxas (the same cubin md5 across compiles); a toolchain change that moves them shows up
+# as a pin failure with the new values printed, and is re-pinned deliberately, never by widening these.
+_WAIT_FORM_SLACK = {"SYNCS_PHASECHK": 1, "USYNCS_PHASECHK": 0, "NANOSLEEP": 0}
 _SM107_WAIT_FORM_PIN_ROWS = [
     # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
     # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
@@ -2769,4 +2774,5 @@ def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spi
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
     print(f"\nsm107 {quant} d={d_qk}x{d_v} SPIN_RING_WAITS={spin} sm_107a SASS: {stats}")
     for name, want in (("SYNCS_PHASECHK", n_syncs), ("USYNCS_PHASECHK", n_usyncs), ("NANOSLEEP", n_sleep)):
-        assert abs(stats[name] - want) <= _WAIT_FORM_SLACK, f"{name} = {stats[name]}, pinned {want} +- {_WAIT_FORM_SLACK} for SPIN_RING_WAITS={spin}"
+        slack = _WAIT_FORM_SLACK[name]
+        assert abs(stats[name] - want) <= slack, f"{name} = {stats[name]}, pinned {want} +- {slack} for SPIN_RING_WAITS={spin}"
