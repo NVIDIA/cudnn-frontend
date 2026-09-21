@@ -38,6 +38,26 @@ def _allocate_inputs(cfg, next_n: int):
     return input_values, seq_lens
 
 
+def _allocate_outputs(op, input_values):
+    """The caller owns the outputs and the radix-scratch workspace (Rule 8 / R2)."""
+    n_rows = input_values.shape[0]
+    device = input_values.device
+    indices = torch.empty(n_rows, op.top_k, dtype=torch.int32, device=device)
+    values = torch.empty(n_rows, op.top_k, dtype=input_values.dtype, device=device) if op.return_val else None
+    workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
+    return indices, values, workspace
+
+
+def _import_dsa():
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Indexer top-k requires compute capability 9.0 or newer")
+    return DSA
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_top_k_params
@@ -48,6 +68,7 @@ def test_DSA_indexer_top_k_compile_execute(
     next_n,
     return_val,
     request,
+    compile_allocates_nothing,
 ):
     try:
         from cudnn import DSA
@@ -76,8 +97,9 @@ def test_DSA_indexer_top_k_compile_execute(
             return_val=return_val,
         )
         assert op.check_support()
-        op.compile()
-        indices, values = op.execute(input_values, seq_lens, current_stream=stream)
+        compile_allocates_nothing(op)
+        indices, values, workspace = _allocate_outputs(op, input_values)
+        op.execute(input_values, seq_lens, indices, values, current_stream=stream, workspace=workspace)
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
@@ -91,6 +113,84 @@ def test_DSA_indexer_top_k_compile_execute(
             values,
             return_val,
         )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("return_val", [True, False])
+def test_DSA_indexer_top_k_execute_allocates_nothing(dtype, return_val, compile_allocates_nothing):
+    """R9: warm executes into caller-owned outputs and workspace allocate nothing; the
+    fe_api conftest arms torch's sync debug mode around execute(), so they never sync either."""
+    DSA = _import_dsa()
+    from cudnn.api_base import ws_align
+
+    n_rows, num_cols, top_k = 64, 4096, 512
+    input_values = torch.randn(n_rows, num_cols, dtype=dtype, device="cuda")
+    seq_lens = torch.randint(num_cols // 2, num_cols + 1, (n_rows,), dtype=torch.int32, device="cuda")
+
+    op = DSA.IndexerTopK(sample_input_values=input_values, sample_seq_lens=seq_lens, top_k=top_k, return_val=return_val)
+    assert op.check_support()
+    compile_allocates_nothing(op)
+    assert op.scratch_workspace_bytes() == ws_align(n_rows * (2 if dtype == torch.float32 else 1) * num_cols * 4)
+
+    indices, values, workspace = _allocate_outputs(op, input_values)
+    op.execute(input_values, seq_lens, indices, values, workspace=workspace)
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        op.execute(input_values, seq_lens, indices, values, workspace=workspace)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "IndexerTopK.execute allocated device memory"
+
+    check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, indices, values, return_val)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_top_k_execute_requires_outputs_and_workspace():
+    """Rule 1 both directions on the outputs; R2 on the workspace: execute() never allocates on the caller's behalf."""
+    DSA = _import_dsa()
+
+    n_rows, num_cols, top_k = 32, 1024, 128
+    input_values = torch.randn(n_rows, num_cols, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
+
+    op = DSA.IndexerTopK(sample_input_values=input_values, sample_seq_lens=seq_lens, top_k=top_k, return_val=True)
+    assert op.check_support()
+    op.compile()
+    indices, values, workspace = _allocate_outputs(op, input_values)
+    required = op.scratch_workspace_bytes()
+
+    with pytest.raises(TypeError):
+        op.execute(input_values, seq_lens)
+    with pytest.raises(ValueError, match="out_indices is required"):
+        op.execute(input_values, seq_lens, None, values, workspace=workspace)
+    with pytest.raises(ValueError, match="out_indices dtype mismatch"):
+        op.execute(input_values, seq_lens, indices.to(torch.int64), values, workspace=workspace)
+    with pytest.raises(ValueError, match="out_indices tensor shape mismatch"):
+        op.execute(input_values, seq_lens, indices[:, : top_k - 1], values, workspace=workspace)
+    with pytest.raises(ValueError, match="out_indices must be contiguous"):
+        op.execute(input_values, seq_lens, torch.empty(n_rows, 2 * top_k, dtype=torch.int32, device="cuda")[:, ::2], values, workspace=workspace)
+    with pytest.raises(ValueError, match="out_values is required"):
+        op.execute(input_values, seq_lens, indices, None, workspace=workspace)
+    with pytest.raises(ValueError, match="out_values dtype mismatch"):
+        op.execute(input_values, seq_lens, indices, values.to(torch.float32), workspace=workspace)
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace but execute\(\) received none"):
+        op.execute(input_values, seq_lens, indices, values)
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        op.execute(input_values, seq_lens, indices, values, workspace=torch.empty(required - 1, dtype=torch.uint8, device="cuda"))
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        op.execute(input_values, seq_lens, indices, values, workspace=torch.empty(required + 16, dtype=torch.uint8, device="cuda")[16:])
+    op.execute(input_values, seq_lens, indices, values, workspace=workspace)
+
+    # return_val=False: a provided-but-uncompiled out_values must raise, not be ignored.
+    op_indices_only = DSA.IndexerTopK(sample_input_values=input_values, sample_seq_lens=seq_lens, top_k=top_k, return_val=False)
+    assert op_indices_only.check_support()
+    op_indices_only.compile()
+    with pytest.raises(ValueError, match="out_values must be None"):
+        op_indices_only.execute(input_values, seq_lens, indices, values, workspace=workspace)
+    op_indices_only.execute(input_values, seq_lens, indices, None, workspace=workspace)
+    check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, indices, None, False)
 
 
 @pytest.mark.L0
@@ -152,13 +252,7 @@ def test_DSA_indexer_top_k_wrapper(
 @torch_fork_set_rng(seed=0)
 def test_DSA_indexer_top_k_wrapper_ignores_vector_padding_with_negative_infinity():
     """OOB vector lanes must not join a real -inf threshold bin."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    if torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Indexer top-k requires compute capability 9.0 or newer")
+    DSA = _import_dsa()
 
     num_rows = 633
     num_cols = 768

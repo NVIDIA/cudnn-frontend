@@ -404,6 +404,20 @@ result = DSA.indexer_top_k_wrapper(
 indices, values = result["indices"], result["values"]
 ```
 
+`IndexerTopK` owns no device memory. `execute(input_values, seq_lens,
+out_indices, out_values=None, current_stream=None, workspace=None)` writes into
+caller-owned outputs: `out_indices` is `(n_rows, top_k)` INT32 and `out_values`
+is `(n_rows, top_k)` in the input dtype, both contiguous and on `input_values`'
+device. `out_values` is required when the object was built with
+`return_val=True` and must be `None` otherwise. The radix scratch is carved from
+`workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
+(`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
+32-byte aligned; an absent or undersized workspace raises before launch.
+`compile()` builds the kernel from fake tensors and allocates nothing.
+`indexer_top_k_wrapper` allocates the outputs and the workspace per call on the
+launch stream. Rows the `next_n` stagger leaves empty receive no writes, so
+`out_indices` keeps whatever the caller stored there.
+
 #### Compact vs. non-compact sparse indices
 
 Providing `topk_length` declares a compact input layout for Sparse Attention

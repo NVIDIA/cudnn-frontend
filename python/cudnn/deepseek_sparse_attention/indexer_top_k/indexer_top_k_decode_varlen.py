@@ -592,19 +592,32 @@ def _bucket_num_cols(num_cols: int) -> int:
 
 _compile_cache: dict[tuple, object] = {}
 
+# The radix scratch and the input must both be 32-byte aligned (the kernel's
+# assumed_align); torch allocations are 512-byte aligned, workspace views may not be.
+BUFFER_ALIGN = 32
 
-def cute_dsl_topk_wrapper(
-    input_values,
-    seq_lens,
+
+def buffer_numbers(torch_dtype) -> int:
+    """int32 radix-scratch words per input element: two histogram passes for fp32."""
+    return 2 if torch_dtype == torch.float32 else 1
+
+
+def compile_topk_kernel(
+    torch_dtype,
+    num_rows,
+    num_cols,
     top_k,
     next_n,
     return_val=True,
     load_balance=False,
     num_copy_bits=256,
 ):
-    torch_dtype = input_values.dtype
+    """The compiled kernel for this plan-time key, from the module cache.
+
+    Every operand is a fake cute tensor (R11); the kernel is compiled for the
+    CURRENT device, so callers wrap this in ``torch.cuda.device(...)``.
+    """
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
-    num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148
@@ -677,53 +690,46 @@ def cute_dsl_topk_wrapper(
             options=compile_options(),
         )
         _compile_cache[key] = compiled_kernel
-    else:
-        compiled_kernel = _compile_cache[key]
+    return _compile_cache[key]
 
-    output_indices_torch = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
-    if return_val:
-        output_values_torch = torch.empty(num_rows, top_k, dtype=torch_dtype, device="cuda")
-    else:
-        output_values_torch = None
 
-    if dtype == cutlass.Float32:
-        buffer_numbers = 2
-    else:
-        buffer_numbers = 1
+def launch_topk_kernel(
+    compiled_kernel,
+    input_values,
+    seq_lens,
+    out_indices,
+    out_values,
+    buffer,
+    next_n,
+):
+    """Launch on the TVM-FFI environment stream (torch's current stream).
 
-    # Decode-varlen IMA workaround.
-    elems_per_row = buffer_numbers * num_cols
+    ``out_indices`` / ``out_values`` and the int32 radix scratch ``buffer`` of shape
+    ``(num_rows, buffer_numbers, num_cols)`` are the caller's (R2); nothing is
+    allocated here.
+    """
+    num_rows, num_cols = input_values.shape
+    elems_per_row = buffer.shape[1] * num_cols
     int32_max = (1 << 31) - 1
-    total_elems = num_rows * elems_per_row
 
-    if total_elems <= int32_max:
-        # int32 fast path: single launch, unchanged from before chunking.
-        buffer_torch = torch.empty(
-            num_rows,
-            buffer_numbers,
-            num_cols,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        # TVM FFI uses env stream automatically
+    if num_rows * elems_per_row <= int32_max:
         compiled_kernel(
             input_values,
             None,  # indices, used for merge blocks kernel of the multi-cta.
-            buffer_torch,
-            None,  # g_global_counter_torch
+            buffer,
+            None,  # g_global_counter
             seq_lens,
-            output_indices_torch,
-            output_values_torch,
+            out_indices,
+            out_values,
         )
-        return output_indices_torch, output_values_torch
+        return
 
-    # Fallback
+    # The kernel indexes the scratch with int32: launch per row chunk that fits.
     if elems_per_row > 0:
         max_chunk_rows = int32_max // elems_per_row + 1
     else:
         max_chunk_rows = num_rows
-    input_elem_bytes = max(1, dtype.width // 8)
-    align_rows = max(1, 32 // input_elem_bytes)
+    align_rows = max(1, BUFFER_ALIGN // input_values.element_size())
     row_step = (next_n * align_rows) // math.gcd(next_n, align_rows)
     if max_chunk_rows < row_step:
         chunk_rows = num_rows
@@ -733,20 +739,39 @@ def cute_dsl_topk_wrapper(
         row_hi = min(row_lo + chunk_rows, num_rows)
         batch_lo = row_lo // next_n
         batch_hi = row_hi // next_n
-        chunk_extra = torch.empty(
-            row_hi - row_lo,
-            buffer_numbers,
-            num_cols,
-            dtype=torch.int32,
-            device="cuda",
-        )
         compiled_kernel(
             input_values[row_lo:row_hi],
             None,
-            chunk_extra,
+            buffer[row_lo:row_hi],
             None,
             seq_lens[batch_lo:batch_hi],
-            output_indices_torch[row_lo:row_hi],
-            output_values_torch[row_lo:row_hi] if return_val else None,
+            out_indices[row_lo:row_hi],
+            out_values[row_lo:row_hi] if out_values is not None else None,
         )
-    return output_indices_torch, output_values_torch
+
+
+def cute_dsl_topk_wrapper(
+    input_values,
+    seq_lens,
+    top_k,
+    next_n,
+    out_indices,
+    out_values,
+    buffer,
+    return_val=True,
+    load_balance=False,
+    num_copy_bits=256,
+):
+    """Compile (cached) for the current device, then launch into the caller's tensors."""
+    num_rows, num_cols = input_values.shape
+    compiled_kernel = compile_topk_kernel(
+        input_values.dtype,
+        num_rows,
+        num_cols,
+        top_k,
+        next_n,
+        return_val=return_val,
+        load_balance=load_balance,
+        num_copy_bits=num_copy_bits,
+    )
+    launch_topk_kernel(compiled_kernel, input_values, seq_lens, out_indices, out_values, buffer, next_n)
