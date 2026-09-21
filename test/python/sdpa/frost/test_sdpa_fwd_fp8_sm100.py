@@ -19,7 +19,7 @@ Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (fp8 SDPA). Skips otherw
 """
 
 import math
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
@@ -76,10 +76,28 @@ def _quant(x, in_key):
     return (x / dq).clamp(-fmax, fmax).to(fp8), dq
 
 
+# The kernels' softmax: 128-wide KV tiles, a running max in log2 units that moves only when a
+# tile beats it by more than config_sm100.rescale_threshold (4 at fp8), P cast to the INPUT fp8
+# type for P@V (scale_s/descale_s are accepted and ignored) while the row sum keeps the fp32 P,
+# and the sink added to the sum after the loop. sdpa.fp8_ref.compute_ref is that softmax
+# (BLOCK = 128, rescale_threshold in log2 units, sink_in_max=False); its s_scale is the cast
+# scale times 2**rescale_threshold. The d128 cell casts P * 2**4
+# (prefill_d128_fp8_sm100.P_CAST_LOG2_SCALE); the others cast P as is.
+_P_RESCALE_THRESHOLD_LOG2 = 4.0
+
+
+def _p_cast_log2_scale(d_qk):
+    return 4.0 if d_qk <= 128 else 0.0
+
+
 def _ref(
-    qd,
-    kd,
-    vd,
+    q8,
+    k8,
+    v8,
+    dq,
+    dk,
+    dv,
+    in_key,
     *,
     scale,
     is_causal=False,
@@ -91,48 +109,44 @@ def _ref(
     seq_lens_kv=None,
     return_stats=False,
 ):
-    b, h_q, s_q, _ = qd.shape
-    _, h_kv, s_kv, _ = vd.shape
-    dev = qd.device
-    g = h_q // h_kv
-    k_e = kd.repeat_interleave(g, dim=1)
-    v_e = vd.repeat_interleave(g, dim=1)
-    scores = torch.matmul(qd, k_e.transpose(-1, -2)) * scale
-    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
-    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
-    if is_causal:
-        lim = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j > lim + right_bound)
-    if swa_window is not None:
-        swa_base = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j < swa_base - swa_window)
-    if seq_lens_kv is not None:
-        # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
-        slk = torch.as_tensor(seq_lens_kv, device=dev, dtype=torch.long).view(b, 1, 1, 1)
-        masked = masked | (j >= slk)
-    scores = scores.masked_fill(masked, float("-inf"))
+    """sdpa.fp8_ref.compute_ref on this file's bhsd fp8 tensors (fp32 O, natural-log LSE [b, h, s])."""
+    import cudnn
+    from sdpa.fp8_ref import compute_ref
 
-    def finalize(o, lse=None):
-        if seq_lens_q is not None:
-            slq = torch.as_tensor(seq_lens_q, device=dev, dtype=torch.long).view(b, 1, 1, 1)
-            valid_q = i < slq
-            o = torch.where(valid_q, o, torch.zeros_like(o))
-            if lse is not None:
-                lse = torch.where(valid_q.squeeze(-1), lse, torch.full_like(lse, float("-inf")))
-        return _ReferenceWithStats(o, lse) if lse is not None else o
-
-    if sinks is not None:
-        col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
-        ext = torch.cat([scores, col], dim=-1)
-        probs = torch.softmax(ext, dim=-1)
-        o = torch.matmul(probs[..., :s_kv], v_e)
-        return finalize(o, torch.logsumexp(ext, dim=-1) if return_stats else None)
-    row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
-    probs = torch.softmax(scores, dim=-1)
-    probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
-    o = torch.matmul(probs, v_e)
-    return finalize(o, torch.logsumexp(scores, dim=-1) if return_stats else None)
+    b, h_q, s_q, d_qk = q8.shape
+    s_kv = k8.shape[2]
+    dev = q8.device
+    padding = None
+    if seq_lens_q is not None or seq_lens_kv is not None:
+        padding = (
+            torch.as_tensor(seq_lens_q if seq_lens_q is not None else [s_q] * b, dtype=torch.int32, device=dev),
+            torch.as_tensor(seq_lens_kv if seq_lens_kv is not None else [s_kv] * b, dtype=torch.int32, device=dev),
+        )
+    s_scale = 2.0 ** (_p_cast_log2_scale(d_qk) + _P_RESCALE_THRESHOLD_LOG2)
+    o, stats, _ = compute_ref(
+        q8.transpose(1, 2),
+        k8.transpose(1, 2),
+        v8.transpose(1, 2),
+        attn_scale=scale,
+        q_descale=dq,
+        k_descale=dk,
+        v_descale=dv,
+        s_scale=s_scale,
+        s_descale=1.0 / s_scale,
+        torch_itype=_FP8[in_key],
+        torch_otype=torch.float16,
+        padding=padding,
+        left_bound=(swa_window + 1) if swa_window is not None else None,
+        right_bound=right_bound if is_causal else None,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT,
+        sink_token=sinks.view(1, h_q, 1, 1) if sinks is not None else None,
+        rescale_threshold=_P_RESCALE_THRESHOLD_LOG2,
+        dtype=torch.float64,
+        quantize_o=False,
+        sink_in_max=False,
+    )
+    o = o.transpose(1, 2)
+    return _ReferenceWithStats(o, stats.squeeze(-1)) if return_stats else o
 
 
 def _run(
@@ -159,7 +173,15 @@ def _run(
     stats_layout="contiguous",
     return_lse=False,
     poison_tmem_before_execute: bool = False,
+    gate: Optional[torch.Tensor] = None,
+    amax: bool = True,
 ):
+    """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
+    adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
+    folds sigmoid(G) into the reference O -- the reference ``Amax_O`` stays the
+    UNGATED O's, since it is an output of the sdpa node, which precedes the
+    tail; ``amax=False`` leaves ``Amax_O`` a virtual (unrequested) port, which
+    the engine folds out (has_amax_o=False)."""
     import cudnn
 
     dev = "cuda"
@@ -212,10 +234,17 @@ def _run(
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
+    if gate is not None:
+        # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
+        o.set_dim(list(Ob.shape)).set_stride(list(Ob.stride()))
+        gate_t = g.tensor_like(gate)
+        vp[gate_t] = gate
+        o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
-    amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if amax:
+        amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
     g.build_operation_graph()
@@ -229,7 +258,9 @@ def _run(
         # No Stats output: the kernel compiles the LSE store out (has_lse=False)
         # — no dummy buffer exists at any level, so the dense workspace is 0.
         assert g.get_workspace_size() == 0
-    vp.update({o: Ob, amx_o: amax_o})
+    vp[o] = Ob
+    if amax:
+        vp[amx_o] = amax_o
     if stats:
         vp[stats_t] = lse
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -256,21 +287,18 @@ def _run(
     ref_kw = _ref_kwargs(sdpa_kwargs)
     if sink is not None:
         ref_kw["sinks"] = sink.flatten()
+
+    def _gated(o_ref):
+        return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
+
+    # Amax_O is the sdpa NODE's output (pre-gate, pre-quant): its reference is the
+    # UNGATED O's amax even when the tail gates the O the graph returns.
     if return_lse:
         assert stats, "return_lse requires stats=True"
-        o_ref, lse_ref = _ref(
-            Q8.float() * dq,
-            K8.float() * dk,
-            V8.float() * dv,
-            scale=scale,
-            seq_lens_q=seq_lens_q,
-            seq_lens_kv=seq_lens_kv,
-            return_stats=True,
-            **ref_kw,
-        )
-        return _RunWithStatsResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
-    o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
-    return _RunResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item())
+        o_ref_ungated, lse_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, return_stats=True, **ref_kw)
+        return _RunWithStatsResult(Ob, _gated(o_ref_ungated), amax_o.item(), o_ref_ungated.abs().max().item(), lse.squeeze(-1), lse_ref)
+    o_ref_ungated = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
+    return _RunResult(Ob, _gated(o_ref_ungated), amax_o.item(), o_ref_ungated.abs().max().item())
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -295,12 +323,20 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
-def _half_atol(in_key):
-    return 7e-2 if in_key == "e5m2" else 5e-2
+def _half_atol(in_key, d_v=None):
+    # _ref casts P the way the kernels do, so this is the residual of what the
+    # reference does NOT mirror. d128/d192/d512 cells: exp2 is MUFU, the cast
+    # reference matches to <= 0.006 (fp64, offline) except the d192 e5m2+sink
+    # path, whose kernel scales the rescale threshold by log2(e) (0.03). The
+    # d256 cell computes exp2 with ex2_emulation_2 (degree-1/2 polynomial) on
+    # part of every tile and, under a plain causal mask, for the rescale factor
+    # too: ~40% of its P values sit one fp8 step off an exact-exp2 cast, up to
+    # 0.058 on the suite's data (pack_gqa_ratios[d256-g16_mqa]).
+    return 7.5e-2 if d_v == 256 else 4e-2
 
 
 def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = _half_atol(in_key)
+    atol = _half_atol(in_key, out.shape[-1])
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -702,12 +738,117 @@ def test_fp8_d256_padding(in_key, causal):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-@pytest.mark.L1
-@_skip_d256_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [256], ids=["d256"])
 @torch_fork_set_rng(seed=0)
-def test_fp8_d256_dense_q_trim_stats_sink():
-    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
-    d = 256
+def test_fp8_dense_q_trim_bottom_right_multiwave(d):
+    """More Q tiles than SMs (3 x 8 heads x 8 tiles of 128 rows), batches of
+    different lengths, bottom-right: a persistent worker crosses batches, and
+    the second tile's diagonal and keyless-row test must use ITS batch's
+    lengths (the wide templates take the next tile's bounds from the scheduler
+    payload and used to keep the previous batch's lengths)."""
+    result = _run(
+        3,
+        8,
+        8,
+        1024,
+        1024,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_lens_q=[1024, 640, 0],
+        seq_lens_kv=[800, 1024, 512],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    # batch 0: diagonal 800 - 1024 = -224 -> rows 0..223 keyless; batch 1: diagonal +384, no keyless row; batch 2 empty
+    assert (result.output[0, :, :224] == 0).all() and torch.isneginf(result.stats[0, :, :224]).all()
+    assert (result.output[1, :, 640:] == 0).all() and (result.output[2] == 0).all()
+    torch.testing.assert_close(result.stats[0, :, 224:], result.reference_stats[0, :, 224:], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :640], result.reference_stats[1, :, :640], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_bottom_right_sink(d):
+    """Keyless rows (bottom-right, S_kv < S_q) WITH a sink: the row's mass is
+    the sink alone, so LSE = sink_logit and O = 0 -- a kernel that lets the
+    masked scores through its softmax returns NaN there. scale * log2(e) > 1 makes the
+    scaled sentinel overflow, the case that trips a finite-sentinel mask."""
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=0.75,  # scale * log2(e) > 1: the scaled finite sentinel overflows, the case a sum-based dead-row test misses
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        sink=sink,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    assert (result.output[0, :, :56] == 0).all() and (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    assert torch.isfinite(result.stats[0]).all(), "keyless rows with a sink must carry the sink logit, not NaN"
+    torch.testing.assert_close(result.stats[0, :, :56], sink.view(8, 1).expand(8, 56), atol=1e-4, rtol=0)
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
+@pytest.mark.parametrize("band", [False, True], ids=["br", "br_band"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_bottom_right(d, d_v, band):
+    """Short per-batch Q under bottom-right causal (and with a left band): the
+    tile bounds and the per-element mask must agree on the per-batch Q length.
+    Batches: full Q, mid-tile Q (129 of 256), empty Q."""
+    kw = dict(use_causal_mask_bottom_right=True)
+    if band:
+        kw["left_bound"] = 65  # window = 64; sdpa_fp8 spells the band as left_bound
+    result = _run(
+        3,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=kw,
+        seq_lens_q=[256, 129, 0],
+        seq_lens_kv=[200, 256, 128],
+        d_qk=d,
+        d_v=d_v,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    assert (result.output[1, :, 129:] == 0).all() and (result.output[2] == 0).all()
+    # batch 0: S_kv 200 < S_q 256 under bottom-right puts rows 0..55 above the diagonal -- keyless inside a
+    # live tile, so exactly O = 0 / LSE = -inf (a finite mask sentinel would leave them a uniform average).
+    assert (result.output[0, :, :56] == 0).all() and torch.isneginf(result.stats[0, :, :56]).all()
+    assert torch.isneginf(result.stats[1, :, 129:]).all() and torch.isneginf(result.stats[2]).all()
+    torch.testing.assert_close(result.stats[0], result.reference_stats[0], atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(result.stats[1, :, :129], result.reference_stats[1, :, :129], atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_q_trim_stats_sink(d, d_v):
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite --
+    on every SM100 per-tensor FP8 flavor (FlashInfer hands per-batch Q lengths
+    with every padded dense graph)."""
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,
@@ -723,7 +864,7 @@ def test_fp8_d256_dense_q_trim_stats_sink():
         seq_lens_q=[129, 0],
         seq_lens_kv=[200, 256],
         d_qk=d,
-        d_v=d,
+        d_v=d_v,
         return_lse=True,
     )
     _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
@@ -1217,9 +1358,9 @@ def _run_thd(
             if stats:
                 lse_ref[cu_q[b] : cu_q[b + 1]] = sink.flatten().to(lse_ref) if sink is not None else float("-inf")
             continue
-        qb = (q8[cu_q[b] : cu_q[b + 1]].float() * dq).permute(1, 0, 2).unsqueeze(0)
-        kb = (k8[cu_k[b] : cu_k[b + 1]].float() * dk).permute(1, 0, 2).unsqueeze(0)
-        vb = (v8[cu_k[b] : cu_k[b + 1]].float() * dv).permute(1, 0, 2).unsqueeze(0)
+        qb = q8[cu_q[b] : cu_q[b + 1]].permute(1, 0, 2).unsqueeze(0)
+        kb = k8[cu_k[b] : cu_k[b + 1]].permute(1, 0, 2).unsqueeze(0)
+        vb = v8[cu_k[b] : cu_k[b + 1]].permute(1, 0, 2).unsqueeze(0)
         ref_kw = {}
         if bottom_right:
             ref_kw.update(is_causal=True, bottom_right=True)
@@ -1229,48 +1370,14 @@ def _run_thd(
             ref_kw["swa_window"] = swa_window
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qb, kb, vb, scale=scale, **ref_kw)
+        ob, lse_b = _ref(qb, kb, vb, dq, dk, dv, in_key, scale=scale, return_stats=True, **ref_kw)
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
         if stats:
-            lse_ref[cu_q[b] : cu_q[b + 1]] = (
-                _ref_lse(
-                    qb,
-                    kb,
-                    scale=scale,
-                    causal=bottom_right or causal or swa_window is not None,
-                    bottom_right=bottom_right,
-                    swa_window=swa_window,
-                    sinks=(sink.flatten() if sink is not None else None),
-                )
-                .squeeze(0)
-                .T
-            )
+            lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
 
     o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
     return o_out, o_ref, amax_o.item(), o_ref.abs().max().item(), lse_out, (lse_ref if stats else None)
-
-
-def _ref_lse(qd, kd, *, scale, causal, bottom_right=False, swa_window=None, sinks=None):
-    """Natural-log LSE reference over per-sequence scores, [1, H, S_q]."""
-    _, h_q, s_q, _ = qd.shape
-    _, h_kv, s_kv, _ = kd.shape
-    dev = qd.device
-    k_e = kd.repeat_interleave(h_q // h_kv, dim=1)
-    scores = torch.matmul(qd, k_e.transpose(-1, -2)) * scale
-    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
-    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    diag = s_kv - s_q if bottom_right else 0
-    masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
-    if causal:
-        masked = masked | (j > i + diag)
-    if swa_window is not None:
-        masked = masked | (j < i + diag - swa_window)
-    scores = scores.masked_fill(masked, float("-inf"))
-    if sinks is not None:
-        col = sinks.view(1, h_q, 1, 1).float().expand(1, h_q, s_q, 1).to(dev)
-        scores = torch.cat([scores, col], dim=-1)
-    return torch.logsumexp(scores, dim=-1)
 
 
 @pytest.mark.L0
@@ -1380,7 +1487,7 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
@@ -1537,7 +1644,7 @@ def test_fp8_sm100_execute_lse_contract():
         api.execute(lse_tensor=lse, **ex)
     api.execute(**ex)
     torch.cuda.synchronize()
-    o_ref = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
+    o_ref = _ref(q8, q8, q8, dq, dq, dq, "e4m3", scale=api.scale_softmax, is_causal=True)
     torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
 
 
@@ -1776,13 +1883,18 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 @_skip_d512_on_rubin
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
-    """D256 serves its own envelope; shapes straddling the D512 floor decline."""
+    """The D512 flavor serves the (256, 512] band on both head dims; shapes
+    straddling its floor decline.  Below it the D256 flavor is exact-shape only
+    (its padded envelope is non-deterministic, see
+    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
+    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
+    """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+    for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
+    for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
         assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
 
@@ -1799,12 +1911,127 @@ def test_fp8_envelope_floor_matches_engine_row():
 
 
 @pytest.mark.L0
-@_skip_d512_on_rubin
-def test_fp8_d512_mxfp8_declines():
-    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
-    rejected up front, not fail late in the lowering."""
-    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+def test_fp8_d512_family_shape_maps():
+    """D512 per-tensor and MXFP8 have native kernels on both arch lines."""
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes, supported_cgas_for
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 7))
+    for device_cc in ((10, 0), (10, 7)):
+        for pertensor in (False, True):
+            expected = (1,) if device_cc == (10, 0) and not pertensor else (2,)
+            assert supported_cgas_for((512, 512), fp8=True, device_cc=device_cc, pertensor=pertensor) == expected
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@torch_fork_set_rng(seed=931)
+def test_fp8_stats_log2_every_flavor(d_qk, d_v):
+    """Both bases agree with analytic constant logits on every kernel flavor.
+
+    Nonzero logits catch scaling only log(sum_exp) and forgetting the maximum.
+    The same inputs exercise both cache specializations and leave O unchanged.
+    """
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 1, 2, 256
+    qf = torch.full((b, h, s, d_qk), 0.125, device="cuda")
+    kf = torch.full_like(qf, 0.25)
+    vf = torch.full((b, h, s, d_v), 0.5, device="cuda")
+    q, dq = _quant(qf, "e4m3")
+    k, dk = _quant(kf, "e4m3")
+    v, dv = _quant(vf, "e4m3")
+    expected = (q.float() * dq)[0, 0, 0].double().dot((k.float() * dk)[0, 0, 0].double()) * d_qk**-0.5 + math.log(s)
+    q, k, v = [x.transpose(1, 2).contiguous().transpose(1, 2) for x in (q, k, v)]
+    dq, dk, dv = [torch.tensor([x], dtype=torch.float32, device="cuda") for x in (dq, dk, dv)]
+    outputs = []
+    stats = []
+    for log2 in (False, True):
+        o = torch.empty(b, s, h, d_v, device="cuda", dtype=torch.float16).transpose(1, 2)
+        lse = torch.full((b, h, s), float("nan"), device="cuda")
+        api = SdpaFwdDslSm100(
+            sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=d_qk**-0.5, stats_log2=log2, split_kv=1, pertensor_fp8=True
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, descale_q=dq, descale_k=dk, descale_v=dv)
+        torch.cuda.synchronize()
+        want = expected * (math.log2(math.e) if log2 else 1.0)
+        # The develop D256 kernel has the same 0.0171 natural-LSE error on
+        # these inputs. Keep its analytic check at the established FP8 scale,
+        # while checking the base change itself strictly against the same data.
+        analytic_atol = 3e-2 if d_qk == 256 else 1e-4
+        torch.testing.assert_close(lse, torch.full_like(lse, want.item()), atol=analytic_atol, rtol=1e-4)
+        stats.append(lse)
+        torch.testing.assert_close(o, torch.full_like(o, 0.5), atol=1e-2, rtol=1e-2)
+        outputs.append(o)
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+    torch.testing.assert_close(stats[1], stats[0] * math.log2(math.e), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=931)
+def test_fp8_graph_stats_use_log2(mask):
+    """The public FP8 wrapper forwards the log base and preserves its default."""
+    results = []
+    for log2 in (None, False, True):
+        torch.manual_seed(931)
+        kw = dict(_MASKS[mask])
+        if log2 is not None:
+            kw["stats_use_log2"] = log2
+        result = _run(1, 2, 2, 128, 256, "e4m3", torch.bfloat16, scale=128**-0.5, sdpa_kwargs=kw, return_lse=True)
+        factor = math.log2(math.e) if log2 else 1.0
+        torch.testing.assert_close(result.stats, result.reference_stats * factor, atol=1e-4, rtol=1e-4)
+        _check(result.output, result.reference, torch.bfloat16, "e4m3", result.amax, result.reference_amax)
+        results.append(result)
+    torch.testing.assert_close(results[0].stats, results[1].stats, atol=0, rtol=0)
+    torch.testing.assert_close(results[2].stats, results[1].stats * math.log2(math.e), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(results[2].output, results[1].output, atol=0, rtol=0)
+
+
+# --- Epilogue gate (PR-A) on the per-tensor FP8 d256 kernel, graph path ----------
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 107, reason="the fused epilogue gate (O * sigmoid(G)) is served by the Rubin (sm107) d256 rows only")
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_gate_tail_graph_api(out_key):
+    """Rubin graph-path e2e for the FP8 row's gate claim: the 3-node tail on
+    ``sdpa_fp8`` with a bf16 G (the only gate dtype the row lists), bf16 and
+    e4m3 O.  ``Amax_O`` is an output of the sdpa NODE, which precedes the
+    sigmoid/mul tail, so it is the amax of the UNGATED normalised O (pre-gate,
+    pre-quant): identical for G = +1e4 (sigmoid 1) and G = -1e4 (sigmoid 0, the
+    returned O ~0), and identical to the no-gate graph's -- the fused kernel
+    folds |h| = |u/2| and doubles once per tile, bit-exact in fp32.  It is also
+    a COMPILE-TIME fact: a graph that does not request it (``amax=False`` ->
+    has_amax_o=False, the atomic folded out) produces a BITWISE identical O."""
+    scale = 1.0 / math.sqrt(256)
+    gate = (torch.randn(1, 512, 8, 256, device="cuda") * 2.0).to(torch.bfloat16).transpose(1, 2)
+
+    def _graph(gate_t, amax):
+        torch.manual_seed(0)  # _run draws Q/K/V from the global RNG: every specialization must see the same problem
+        return _run(1, 8, 8, 512, 512, "e4m3", _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=256, d_v=256, gate=gate_t, amax=amax)
+
+    runs = {amax: _graph(gate, amax) for amax in (True, False)}
+    out, o_ref, a_o, a_o_ref = runs[True]
+    assert torch.isfinite(out.float()).all(), "unwritten / non-finite O cells"
+    _check(out, o_ref, _OUT[out_key], "e4m3", a_o, a_o_ref)  # the reference O carries sigmoid(G); the reference amax is the UNGATED O's
+    assert torch.equal(runs[True].output, runs[False].output), "has_amax_o=False must fold only the Amax_O write out"
+    assert runs[False].amax == 0.0, "the unrequested Amax_O buffer was never bound, so never written"
+    # The probe that found the gated-value fold: Amax_O belongs to the sdpa node, so G must not move it.
+    # sigmoid(-1e4) == 0 zeroes the O the graph returns while its Amax_O stays the ungated amax;
+    # sigmoid(+1e4) == 1 returns the ungated O; both equal the no-gate graph's Amax_O bit-for-bit
+    # (2 * max|u/2| == max|u| in fp32), not merely within the 0.03 bound.
+    no_gate = _graph(None, True)
+    pos = _graph(torch.full_like(gate, 1e4), True)
+    neg = _graph(torch.full_like(gate, -1e4), True)
+    assert neg.output.float().abs().max().item() <= 1e-3, "sigmoid(G) == 0 must zero the O the graph returns"
+    assert no_gate.amax > 0.06, f"the probe's ungated amax {no_gate.amax:.4f} is too small to tell from zero -- reshape it"
+    assert abs(no_gate.amax - no_gate.reference_amax) <= 0.03, f"no-gate Amax_O {no_gate.amax:.4f} vs ref {no_gate.reference_amax:.4f}"
+    assert (
+        pos.amax == neg.amax == no_gate.amax
+    ), f"Amax_O must be G-independent and equal the no-gate graph's: +1e4 {pos.amax:.6f}, -1e4 {neg.amax:.6f}, none {no_gate.amax:.6f}"

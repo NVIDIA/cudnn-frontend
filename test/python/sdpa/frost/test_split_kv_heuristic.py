@@ -13,7 +13,7 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
-from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_split_kv, split_kv_candidates
+from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
 pytestmark = pytest.mark.L0
@@ -185,16 +185,20 @@ def test_exactly_balanced_launch_never_splits():
 _FIT_S_Q = 512
 
 # (base_ctas, chosen split) pinned against a per-split sweep on B300 (148 SMs,
-# d128, 512 KV tiles, S_q=512, bf16, mask-free), re-measured for the two-kernel
-# cost model. A change that moves any of these is a policy change and needs its
-# own measurement.
+# d128, 512 KV tiles, S_q=512, bf16, mask-free). A change that moves any of
+# these is a policy change and needs its own measurement.
 #
-# The model matches the measured optimum on 8 of 12; mean regret 1.009, worst
-# 1.035. The misses (88, 100, 150, 160) all sit within ~10% of a FULL machine,
-# where the measured curve is nearly flat -- e.g. base=88 spans 2.264..2.512 ms
-# across every split -- so the ranking there is worth little and the model
-# prefers the cheap answer. Regret, not exact agreement, is the bar.
-_B300_FIT = [(8, 16), (16, 8), (32, 4), (64, 2), (88, 1), (100, 1), (120, 1), (128, 1), (150, 2), (160, 2), (200, 2), (296, 1)]
+# Re-swept end-to-end (split kernel + combine) once SM100 splits started writing
+# fp32 partials, which changed BOTH kernels: the epilogue stopped staging O
+# through SMEM and TMA, and the combine reads wider partials. The measured
+# optimum moved at 88 (1 -> 4), 150 (2 -> 4) and 160 (2 -> 4), so these entries
+# and _SPLIT_KV_COMBINE_COST were refitted together.
+#
+# The model now matches the measured optimum on 11 of 12; mean regret 1.0001,
+# worst 1.0007. The one miss is base=100, where split 1 and split 4 measure
+# 0.6701 vs 0.6706 ms -- a 0.07% tie the ranking cannot meaningfully resolve.
+# Regret, not exact agreement, is the bar.
+_B300_FIT = [(8, 16), (16, 8), (32, 4), (64, 2), (88, 4), (100, 4), (120, 1), (128, 1), (150, 4), (160, 4), (200, 2), (296, 1)]
 
 
 @pytest.mark.parametrize("base_ctas,expected", _B300_FIT, ids=[f"{b}ctas" for b, _ in _B300_FIT])
@@ -270,6 +274,40 @@ def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     covered = ga.SdpaGraphFacts(s_q=128, s_kv=1000, causal=True)
     why = mismatch(caps, covered, SdpaFwdKnobs(split_kv=2)) or ""
     assert "split_kv" not in why
+
+
+def test_split_kv_tail_rule_exempts_paged_but_not_dense_padded():
+    """The synthesized-padding exclusion is about the DENSE mask-free path. A
+    paged graph is padded by construction (per-batch KV lengths are mandatory
+    and bound the walk on device), so a declared ``paged_attention_max_seq_len_kv``
+    that is not a 128-multiple — FlashInfer passes its true max, e.g. 4000 —
+    must not block the split. The neighbouring dense cases keep their verdicts:
+    a dense padded graph still declines the split (its padded path yields no
+    per-split partials) and a dense mask-free ragged S_kv still declines."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    caps = Capabilities(
+        sm_lo=100,
+        sm_hi=100,
+        phase="prefill",
+        d_shapes=frozenset({(128, 128)}),
+        skv_tail_via_padding=True,
+        split_kv_supported=True,
+        paged_kv=True,
+        padded=True,
+    )
+    paged = ga.SdpaGraphFacts(s_q=1, s_kv=4000, padded=True, has_paged_kv=True, page_size=16)
+    why = mismatch(caps, paged, SdpaFwdKnobs(split_kv=2)) or ""
+    assert "split_kv" not in why, why
+    # Unchanged: a dense padded graph never splits, whatever its S_kv.
+    for s_kv in (4000, 4096):
+        dense_padded = ga.SdpaGraphFacts(s_q=1, s_kv=s_kv, padded=True)
+        why = mismatch(caps, dense_padded, SdpaFwdKnobs(split_kv=2))
+        assert why is not None and "split_kv" in why, (s_kv, why)
+    # Unchanged: a dense mask-free ragged S_kv rides the synthesized padding.
+    dense_ragged = ga.SdpaGraphFacts(s_q=1, s_kv=4000)
+    why = mismatch(caps, dense_ragged, SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why, why
 
 
 def test_split_domains_match_the_wired_lowerings():
@@ -378,3 +416,253 @@ def test_decode_rows_barely_pay_for_the_combine():
     prefill = choose_split_kv(q_tiles=1, heads_q=8, batch=1, kv_tiles=512, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8 * 4096)
     assert decode > 1
     assert decode >= prefill
+
+
+# --- the d256 decode tile's own model ----------------------------------------
+#
+# sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
+# split) unit and is HBM-bound, so its split trades the device's idle SMs
+# against the split path's second launch. Pinned at the B200 fit (148 SMs,
+# 128-key tiles); the shapes are Qwen3.5 32/2 (2 KV heads, packed 16:1).
+
+
+def _decode_tile(units, s_kv, sm_count=B200_SMS, **kw):
+    return choose_decode_tile_split_kv(units=units, kv_tiles=-(-s_kv // 128), sm_count=sm_count, **kw)
+
+
+def test_decode_tile_serving_shape_stays_unsplit_for_eager_callers():
+    """b=32 x 2 KV heads (64 units) over 4096 keys: split 2 saves ~6 us of GPU
+    time (56.9 -> 51.0 us CUDA-graph replay) and costs an eager caller ~30 us
+    of host time per execute (62 -> 92 us), so the default does not split. A
+    captured caller's optimum -- the launch term at 0 -- is the split."""
+    assert _decode_tile(64, 4096) == 1
+    assert _decode_tile(64, 4096, launch_cost=0.0) == 2
+
+
+def test_decode_tile_small_batch_splits_to_fill_the_machine():
+    """16 units (b=8) over 4096 keys: unsplit, 16 of 148 SMs stream 32 tiles
+    each; split 8 puts 128 streams on the device and the GPU saving (~56 ->
+    ~20 us) pays for the launch. Fewer units split at least as much."""
+    assert _decode_tile(16, 4096) == 8
+    assert _decode_tile(8, 4096) >= 8
+    assert _decode_tile(2, 4096) == 16  # 32 tiles: the thinnest split keeps two
+
+
+def test_decode_tile_wide_q_tile_splits_the_serving_shape():
+    """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step):
+    a lone CTA there streams a tile 1.6x slower (90.2 vs 57.1 us unsplit), so
+    split 2 saves ~32 us of GPU time -- enough to pay for the launch -- and
+    leads in both regimes; a saturated launch still does not split.  The
+    adapter does not route that tile today (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS
+    keeps (16, 32] rows on the prefill tile: even split, 96-103 us eager against
+    the prefill tile's 66 us); its fit stays pinned for when it is routed."""
+    assert _decode_tile(64, 4096, q_tile=32) == 2
+    assert _decode_tile(64, 4096, q_tile=32, launch_cost=0.0) == 2
+    assert _decode_tile(16, 4096, q_tile=32) == 8
+    assert _decode_tile(256, 4096, q_tile=32) == 1
+
+
+def test_decode_tile_saturated_launch_never_splits():
+    """256 units (b=128) already saturate HBM twice over, 128 once: the bytes
+    do not change with the split, only the fixed costs, so neither regime
+    splits."""
+    for units in (128, 256):
+        assert _decode_tile(units, 4096) == 1
+        assert _decode_tile(units, 4096, launch_cost=0.0) == 1
+
+
+def test_decode_tile_long_kv_pays_for_the_launch():
+    """At 64 units the GPU saving of a split grows with the KV length: 8192
+    keys (~22 us) does not cover the eager launch, 16384 (~45 us) does; past
+    saturation a finer split only adds fixed cost."""
+    assert _decode_tile(64, 8192) == 1
+    assert _decode_tile(64, 8192, launch_cost=0.0) == 2
+    assert _decode_tile(64, 16384) == 2
+    assert _decode_tile(64, 65536) == 2
+
+
+def test_decode_tile_short_kv_does_not_split():
+    """Two or three tiles cannot be cut (the thinnest split keeps two); a
+    handful can be, but saves too little GPU time to pay for a launch."""
+    assert _decode_tile(2, 256) == 1
+    assert _decode_tile(2, 384) == 1
+    assert _decode_tile(2, 1024) == 1
+    assert _decode_tile(2, 1024, launch_cost=0.0) > 1
+
+
+@pytest.mark.parametrize("q_tile", [16, 32])
+@pytest.mark.parametrize("units", [2, 16, 64, 128])
+def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
+    """On tile-aligned KV lengths the choice is monotone in the length and a
+    power of two (split_kv is a kernel-module cache key)."""
+    got = [_decode_tile(units, 128 << i, q_tile=q_tile) for i in range(12)]
+    assert all(a <= b for a, b in zip(got, got[1:])), got
+    assert all(s & (s - 1) == 0 for s in got), got
+
+
+def test_decode_tile_degenerate_inputs_do_not_split():
+    assert choose_decode_tile_split_kv(units=0, kv_tiles=32, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=0, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=0) == 1
+
+
+# --- a quantized O is a legal split target ---------------------------------
+#
+# The split kernels write HALF partials whatever the O dtype and the combine
+# performs the only cast down to it, so nothing about an FP8 output makes the
+# reduction narrower. Both the eligibility gate and the candidate generator
+# used to decline it; these pin that they no longer do.
+
+
+def _fp8_caps():
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    return next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_fp8").capabilities
+
+
+def _fp8_facts(dtype_o, *, mx=False):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    return ga.SdpaGraphFacts(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=512,
+        s_kv=16384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=dtype_o,
+        is_fp8=not mx,
+        is_mxfp8=mx,
+        device_sm_count=B200_SMS,
+        device_cc=(10, 0),
+    )
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2", "HALF", "BFLOAT16"])
+@pytest.mark.parametrize("mx", [False, True], ids=["fp8", "mxfp8"])
+def test_quantized_output_does_not_block_a_split(out_name, mx):
+    """mismatch() must not decline split_kv on the O dtype alone."""
+    import cudnn
+
+    why = mismatch(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name), mx=mx), SdpaFwdKnobs(split_kv=4)) or ""
+    assert "split_kv" not in why, f"quantized O declined the split: {why}"
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2"])
+def test_quantized_output_still_gets_split_candidates(out_name):
+    """And the generator must actually PROPOSE one — passing the eligibility
+    gate is not enough if the candidate list is still hard-coded to [1]."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    points = _split_points(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name)), 128, 128, 2)
+    assert points[0] > 1, f"a decode-shaped FP8-out graph got no split: {points}"
+    assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
+
+
+def test_quantized_and_half_outputs_choose_the_same_split():
+    """The O dtype is not a performance input: partials are half either way, so
+    the chooser must land on the same split for an FP8 and a bf16 output."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = _fp8_caps()
+    fp8 = _split_points(caps, _fp8_facts(cudnn.data_type.FP8_E4M3), 128, 128, 2)
+    half = _split_points(caps, _fp8_facts(cudnn.data_type.BFLOAT16), 128, 128, 2)
+    assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
+
+
+def test_every_combine_call_site_matches_the_compiled_arity():
+    """The combine is invoked POSITIONALLY, so adding a parameter to its host
+    silently breaks every call site that was not updated with it.
+
+    The failure is a TypeError raised only when a split actually runs, so a
+    missed site hides until some shape happens to split -- and the arms that
+    never split (dense half, THD) look fine either way. Compare the sites
+    against the signature instead of waiting for a shape to find them."""
+    import ast
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    from typing import get_origin
+
+    import cutlass
+
+    # Constexpr values specialize the compiled callable; they are absent from
+    # its runtime ABI. Call sites pass the stream separately by keyword.
+    params = [
+        name
+        for name, param in inspect.signature(split_combine._host).parameters.items()
+        if name != "stream" and param.annotation is not cutlass.Constexpr and get_origin(param.annotation) is not cutlass.Constexpr
+    ]
+    expected = len(params)
+
+    tree = ast.parse(inspect.getsource(api_dsl))
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_combine_kernel"]
+    assert sites, "no combine call sites found — did the attribute get renamed?"
+    bad = [(n.lineno, len(n.args)) for n in sites if len(n.args) != expected]
+    assert not bad, f"combine call sites passing != {expected} positional args ({params}): {bad}"
+
+
+def test_every_split_capable_sm100_kernel_has_the_slot():
+    """A split-capable SM100 kernel either carries the o_partial_f32 slot, or the
+    adapter must know it does not.
+
+    _fp32_partial_split() is unconditional for SM100, so a kernel that wires
+    make_split_helpers WITHOUT the slot gets handed an argument it never
+    declares -- a launch-time arity error on whatever shape happens to split.
+    That is exactly how sm100/prefill_d512_mxfp8 arrived: split-capable from the
+    day it landed, written against the staged epilogue. Scanning the directory
+    means the NEXT such kernel fails here instead of in production.
+
+    A kernel without the slot is fine, provided _SLOTLESS_FLAVORS records it and
+    the predicate excludes that flavor.
+    """
+    import pathlib
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    # (mxfp8, d_shape) pairs the adapter deliberately keeps on half partials.
+    _SLOTLESS_FLAVORS = {"prefill_d512_mxfp8.py"}
+
+    kdir = pathlib.Path(api_dsl.__file__).parent / "kernels" / "sm100"
+    assert kdir.is_dir(), f"kernel directory moved: {kdir}"
+
+    offenders = []
+
+    def has_slot(src: str) -> bool:
+        if "\nEXPLICIT_ABI = True" in src:
+            # explicit host entry: the slot is the o_partial_ptr parameter (the shared prologue
+            # names o_partial_f32 in every host, so the source string is no evidence)
+            sig = src[src.index("\ndef _host(") : src.index(") -> None:", src.index("\ndef _host("))]
+            return "o_partial_ptr" in sig
+        return "o_partial_f32" in src
+
+    for f in sorted(kdir.glob("prefill_*.py")):
+        src = f.read_text()
+        if "make_split_helpers" not in src:
+            continue  # not split-capable, nothing to carry
+        if has_slot(src):
+            continue  # wired
+        if f.name in _SLOTLESS_FLAVORS:
+            continue  # known, and excluded by _fp32_partial_split
+        offenders.append(f.name)
+
+    assert not offenders, (
+        f"split-capable SM100 kernels with no o_partial_f32 slot: {offenders}. "
+        "Either port the fp32 partial store into them, or exclude their flavor in "
+        "api_dsl.SdpaFwdDsl._fp32_partial_split and list them in _SLOTLESS_FLAVORS."
+    )
+
+    # ...and the recorded exceptions must still be real, or this guard rots.
+    for name in _SLOTLESS_FLAVORS:
+        src = (kdir / name).read_text()
+        assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
+        assert not has_slot(src), f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"

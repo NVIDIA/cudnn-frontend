@@ -465,6 +465,10 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.DO_SWZ_BYTES == 128,
             "bwd d512: Q/K/V/dO swizzle must all be 128B",
         ),
+        # Not only a swizzle width: S_SWZ_BYTES alone sets the fp32 ship's
+        # 256 B per-lane row, which S_XFER_SWIZZLE's sshift is derived from.
+        # A moved S mismatches that swizzle -- bank-conflicted, not wrong.
+        (cfg.S_SWZ_BYTES == 128, f"bwd d512: S swizzle must be 128B (sets the fp32 ship's 256 B row); got {cfg.S_SWZ_BYTES}"),
         # --- caps ----------------------------------------------------------
         (
             sg0_smem <= _SM100_MAX_DYN_SMEM,

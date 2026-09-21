@@ -42,16 +42,18 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
     ceil_div,
     even_offsets,
+    expand_config_variants,
     fto_alignment,
     rand_e8m0,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -362,7 +364,7 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     chain = analyze(_graph(2048, 256, 256, 9, variant, dtype)[0])
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
         label = cfg.name
@@ -416,8 +418,17 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
         bl_label = "unfused per-group cuBLAS bf16 + pointwise" + ("" if bl_sets is pool else " [no rotation]")
         print(f"  {bl_label:64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
 
-    spec_map = _build_spec_map(variant, args.dtype)
-    labels = select_configs(args.configs, spec_map)
+    spec_map = expand_config_variants(
+        _build_spec_map(variant, args.dtype),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
+    labels = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
     print(f"  sweeping {len(labels)} configs (each JITs once, ~15-25 s)", flush=True)
 
     best = None
@@ -431,7 +442,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph(S, N, K, E, variant, args.dtype, offsets, alignment)
-            plan = jit_from_cudnn_graph(g, config=cfg)
+            plan = with_workspace(jit_from_cudnn_graph(g, config=cfg))
         except (NotImplementedError, ValueError) as e:
             print(f"  {label:64s} SKIP: {type(e).__name__}: {str(e)[:40]}", flush=True)
             continue

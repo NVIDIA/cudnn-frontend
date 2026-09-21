@@ -271,6 +271,31 @@ def load_mask_payload_to_smem(
 
 
 @cute.jit
+def create_mask_payload_pipeline(
+    barrier_storage: cute.Pointer,
+    consumer_threads: cutlass.Constexpr[int],
+    tx_count: cutlass.Constexpr[int],
+    defer_sync: cutlass.Constexpr[bool] = True,
+):
+    """Create a CTA-local mask slot whose reuse waits for every reader.
+
+    PipelineTmaAsync normally elects one empty-barrier signaller per warp.
+    Mask words are read independently by each lane; count each reader and
+    make every lane signal instead. This also avoids depending on warp-local
+    reconvergence to order the next bulk copy after all shared loads.
+    """
+    return cutlass.pipeline.PipelineTmaAsync.create(
+        barrier_storage=barrier_storage,
+        num_stages=1,
+        producer_group=cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1),
+        consumer_group=cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, consumer_threads),
+        tidx=Int32(0),  # A local pipeline signals whenever tidx % 32 == 0.
+        tx_count=tx_count,
+        defer_sync=defer_sync,
+    )
+
+
+@cute.jit
 def consume_mask_payload_from_smem(
     s_mask: cute.Tensor,
     payload_group_idx: Int32,
@@ -283,6 +308,9 @@ def consume_mask_payload_from_smem(
     s_mask_thread = s_mask[payload_group_idx, None]
     r_mask = cute.make_rmem_tensor_like(s_mask_thread, Uint32)
     cute.autovec_copy(s_mask_thread, r_mask)
+    # Finish generic-proxy shared reads before allowing the producer to
+    # overwrite this slot through cp.async.bulk (the async proxy).
+    cute.arch.fence_proxy("async.shared", space="cta")
     mask_pipeline.consumer_release(consumer_state)
     consumer_state.advance()
     return r_mask, consumer_state
@@ -1218,7 +1246,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     tidx: Int32,
     q_stage: cutlass.Constexpr,
     m_block_size: cutlass.Constexpr,
-    mLSE,
+    track_row_max: cutlass.Constexpr[bool],
     seqlen_info,
     m_block: Int32,
     sScale: cute.Tensor,
@@ -1244,7 +1272,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     warp-group can:
 
     - seed fully-masked-row stats (row_sum=1; row_max=-inf when tracked) for LSE
-    - run `correction_epilogue` with `scale=0` so the output tile is written as zeros
+    - run `correction_epilogue` with `is_empty=True` so the output tile is written as zeros
       (independent of any prior tmem contents)
     - wait on `mbar_softmax_corr_full` and arrive `mbar_softmax_corr_empty`
       (and `mbar_corr_epi_*` when applicable) so phases stay aligned across tiles
@@ -1256,11 +1284,11 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
-        row_max_value = -Float32.inf if const_expr(mLSE is not None) else None
+        row_max_value = -Float32.inf if const_expr(track_row_max) else None
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
-            if const_expr(mLSE is not None):
+            if const_expr(track_row_max):
                 sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
@@ -1280,11 +1308,12 @@ def handle_block_sparse_empty_tile_correction_sm100(
             stage,
             m_block,
             seqlen_info.seqlen_q,
-            Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
+            Float32(0.0),  # is_empty below bypasses uninitialized TMEM instead of multiplying it by zero
             sO[None, None, stage],
             mO_cur,
             gO_stage,
             gmem_tiled_copy_O,
+            is_empty=True,
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)

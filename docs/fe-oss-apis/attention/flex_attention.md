@@ -22,7 +22,7 @@ The endpoint representation supports a range of sparse attention patterns.
 Rows in the following figure are queries, columns are keys, blue cells are
 visible, and light-gray cells are masked:
 
-![Supported static attention mask shapes](assets/static_mask_shapes.png)
+![Supported static attention mask shapes](assets/static_mask_shapes.webp)
 
 `create_mask_plan` compiles these endpoints into architecture-native packed
 forward and, when requested, backward metadata. The resulting `MaskPlan` can
@@ -81,6 +81,7 @@ Fixed-length tensor shapes are:
 | `mask_func` | `[Hmask, nfunc, B * Sq]` | CUDA INT32 |
 | `out` | `[B, Sq, Hq, Dv]` | same as `q` |
 | `lse` | `[B, Hq, Sq]` | FP32 |
+| `max_logit` (optional) | `[Hq]` | FP32 |
 
 `Hq` must be divisible by `Hkv`, supporting MHA, GQA, and MQA. `Hmask` must
 be `1` for a mask shared by all query heads or `Hq` for per-head masks.
@@ -88,9 +89,30 @@ be `1` for a mask shared by all query heads or `Hq` for per-head masks.
 batch-major order, but every endpoint remains a sample-local key coordinate
 in `[0, Sk]`. Endpoints must be nondecreasing within each query row.
 
-With `return_lse=False` (the default), `flex_attn_func` returns only `out`.
-With `return_lse=True`, it returns `(out, lse)`. LSE is still maintained
-internally when gradients require it.
+With both output flags disabled (the default), `flex_attn_func` returns `out`.
+The optional statistics are returned in this order:
+
+| `return_lse` | `return_max_logit` | Return value |
+|---|---|---|
+| `False` | `False` | `out` |
+| `True` | `False` | `(out, lse)` |
+| `False` | `True` | `(out, max_logit)` |
+| `True` | `True` | `(out, lse, max_logit)` |
+
+LSE is still maintained internally when gradients require it. `max_logit[h]`
+is the maximum of `softmax_scale * dot(q[b, i, h], k[b, j, h // (Hq/Hkv)])`
+over all batches and mask-visible query/key pairs for query head `h`.
+This is a signed maximum, not an absolute maximum. A head with no visible
+pair returns `-inf`. The same `[Hq]` reduction applies to variable-length
+THD inputs across all sequences. `return_max_logit=True` requires a
+non-negative scale; at zero scale a head with visible pairs returns zero.
+`max_logit` is non-differentiable; output and LSE retain their gradient support.
+
+```python
+out, lse, max_logit = flex_attn_func(
+    q, k, v, mask_plan=plan, return_lse=True, return_max_logit=True
+)
+```
 
 ## Variable-length THD API
 
@@ -150,7 +172,7 @@ them, so later mutations of the caller's tensors do not change plan geometry.
   an autograd-enabled call requiring gradients.
 
 The execution function accepts `softmax_scale` (default
-`1 / sqrt(Dqk)`), `deterministic`, and `return_lse`. Plan reuse requires the
+`1 / sqrt(Dqk)`), `deterministic`, `return_lse`, and `return_max_logit`. Plan reuse requires the
 same fixed/variable mode, sequence and head geometry, dtype, and device used
 at construction.
 
@@ -171,6 +193,16 @@ buffers are per-execution workspace rather than plan state, so one plan can be
 used by independent calls.
 
 ## Explicit compile and execute APIs
+
+To enable the maximum statistic in the explicit API, provide a contiguous CUDA
+FP32 `[Hq]` sample buffer as `FlexAttentionFwd(..., sample_max_logit=max_logit)`
+and supply `max_logit_tensor=max_logit` on every `execute()` call. Its presence,
+shape, dtype, stride, and device must match the compiled descriptor. Each call
+resets this buffer to `-inf` on the launch stream before the attention kernel
+reduces into it, including during CUDA graph replay. `execute()` requires no
+additional allocation for this output. The statistic uses the kernel's row
+maxima and CTA-local/global atomic reductions; enabling it specializes the
+kernel and may affect performance.
 
 Most PyTorch users should use `flex_attn_func`. Framework integrations can use
 `FlexAttentionFwd` and `FlexAttentionBwd` directly. Constructors capture sample
@@ -228,4 +260,33 @@ as validation errors.
 ## Benchmark
 
 The Flex-only static-mask benchmark and its protocol are documented in
-[`benchmark/flex_attention/README.md`](../../../benchmark/flex_attention/README.md).
+[`benchmark/flex_attention/README.md`](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/flex_attention/README.md).
+
+### Reference results from the original implementation
+
+The following figures are carried over from the original FlexAttention
+repository (`docs/assets/static_mask_benchmark*.png`, source checkout revision
+`9c6cbf7`). They report measurements on NVIDIA GB300 with BF16 inputs,
+`B=1`, `S=128K`, and `Hq=Hkv=4`, for the eight static mask patterns shown above.
+The panels report forward and backward active TFLOP/s, counting only visible
+query/key pairs. The head dimensions are indicated in each figure.
+
+The figures retain their original comparison labels: PyTorch FlexAttention,
+FA4 (native causal / mask_mod), Magi backend, and FlexAttention (ours).
+Here, "ours" refers to the original implementation migrated into
+`cudnn.flex_attention`. These are pre-migration reference results; the migrated
+cuDNN Frontend wrappers have not been remeasured for these figures. The benchmark
+linked above measures the current Flex Attention implementation only.
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=128](assets/static_mask_benchmark.webp)
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=192 and Dv=128](assets/static_mask_benchmark_d192.webp)
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=256](assets/static_mask_benchmark_d256.webp)
+
+## Design documentation
+
+[Flex Attention Mask Plan Design](flex_attention_design.md) describes interval
+coordinates, planner stages, partial/full CSR topology, consumer-specific
+packed predicates, forward/backward consumption, and plan compatibility and
+ownership.

@@ -65,7 +65,7 @@ unsupported-kernel declines fall back, while unexpected native binding,
 allocation, and launch failures propagate.
 
 The current native kernel requires CUTLASS DSL 4.7 or newer. If only the
-package-wide `cutedsl>=4.5` minimum is present and the native import is
+package-wide `nvidia-cutlass-dsl>=4.6.2` floor is present and the native import is
 unavailable, the adapter catches that typed `ImportError` and executes FLA's
 original path. Hardware correctness coverage is SM80, SM89, SM90, and SM100;
 the native kernel is additionally runtime-validated on SM103 and SM120.

@@ -221,6 +221,17 @@ def test_v2_cpasync_planner_is_safe_for_arbitrary_t_d_and_sm(monkeypatch):
 
 
 def test_v2_cpasync_burst_store_uses_compact_row_major_staging():
+    # This is the only test in this host-contract module that imports a kernel
+    # implementation directly.  The public dependency floor stays at 4.6.2 for
+    # downstreams such as vLLM/SGLang, while FROST's tile-DSL primitives require
+    # 4.7.0.  Keep exercising the host contracts on 4.6.2 and skip only this
+    # implementation-detail assertion there.
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("the v2-cpasync kernel requires nvidia-cutlass-dsl>=4.7.0")
+
     from cudnn.causal_conv1d_bulk_sm100.backward_kernel_vec2_cpasync import (
         _DX_STAGE_STRIDE,
     )

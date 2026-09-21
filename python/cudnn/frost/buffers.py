@@ -18,9 +18,13 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import logging
+import re as _re
 import struct
 
 from cudnn import _pybind_module
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
@@ -213,14 +217,31 @@ class DeviceBuffer(DeviceView):
         super().__init__(int(ptr), (int(nbytes),), "uint8", device_id)
 
     def __del__(self):
-        # At interpreter teardown the context can already be gone, which makes
-        # the free fail on memory the driver has reclaimed anyway.
+        # Cyclic GC can run during someone else's CUDA graph capture. This
+        # allocation is no longer live; releasing it must not invalidate that
+        # capture. Relax only this thread's safety check, and always restore it.
         try:
             from cuda.bindings import driver as _drv
 
-            _drv.cuMemFree(self.data_ptr())
+            ptr = getattr(self, "_ptr", 0)
+            if not ptr:
+                return
+            err, previous = _drv.cuThreadExchangeStreamCaptureMode(_drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+            if int(err) != 0:
+                _LOG.warning("cudnn.frost: cannot release DeviceBuffer: capture-mode exchange failed: %s", err)
+                return
+            try:
+                (err,) = _drv.cuMemFree(ptr)
+                if int(err) == 0:
+                    self._ptr = 0
+                elif err not in (_drv.CUresult.CUDA_ERROR_DEINITIALIZED, _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED):
+                    _LOG.warning("cudnn.frost: cuMemFree failed: %s", err)
+            finally:
+                err, _ = _drv.cuThreadExchangeStreamCaptureMode(previous)
+                if int(err) != 0:
+                    _LOG.warning("cudnn.frost: restoring capture mode failed: %s", err)
         except Exception:  # noqa: BLE001
-            pass
+            pass  # Interpreter teardown may already have unloaded CUDA / logging.
 
 
 def probe(buf):
@@ -456,6 +477,8 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
 # version, so the check belongs where an engine can still decline.
 CUTEDSL_MIN_VERSION = (4, 7, 0)
 
+_RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
+
 _DSL_STATE = None
 
 
@@ -506,11 +529,23 @@ def cutedsl_too_old(version):
     dist, ver = version
     if dist != "nvidia-cutlass-dsl":
         return False
-    try:
-        parts = tuple(int(x) for x in ver.split("+", 1)[0].split(".")[:3])
-    except ValueError:
+    # PEP 440 public versions: keep the leading integer of each release component
+    # so a prerelease of X ("4.6.2a0", "4.6.2rc1") compares as X -- below the
+    # floor it is too old, at/above it is not. Local labels ("+...") are dropped,
+    # and a dotted post/dev segment ("4.6.post1", "4.6.2.dev0") ends the release
+    # segment: what precedes it is the version being compared.
+    parts = []
+    for component in ver.split("+", 1)[0].split(".")[:3]:
+        m = _RELEASE_INT.match(component)
+        if m is None:
+            break
+        parts.append(int(m.group(1)))
+    if not parts:
         return False
-    return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+    # A short public version ("4.6") means the omitted components are zero
+    # ("4.6.0"), so it compares against the floor instead of slipping past it.
+    parts += [0] * (3 - len(parts))
+    return tuple(parts) < CUTEDSL_MIN_VERSION
 
 
 def cutedsl_requirement_error(what):

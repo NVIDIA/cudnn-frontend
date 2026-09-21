@@ -1176,12 +1176,19 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_discrete(request, ab_dtype, c_d
 
     baseline = run(deterministic=False)
     deterministic = run(deterministic=True)
+    # The FP8 kernels may reassociate the same fp32 dprob sum differently on
+    # Rubin (the observed delta is below 5e-4).  This remains far below the
+    # tens-of-percent signal from a dropped or duplicated partial.  Keep the
+    # tighter default for the FP4 kernel, which does not show that drift.
+    dprob_tol = 1e-3 if ab_dtype == torch.float8_e4m3fn else 1e-4
     _assert_dprob_deterministic(
         (inputs, cfg),
         baseline,
         deterministic,
         lambda: run(deterministic=True),
         ref_inputs=_dense_ref_inputs_from_discrete(inputs),
+        dprob_rtol=dprob_tol,
+        dprob_atol=dprob_tol,
     )
 
 

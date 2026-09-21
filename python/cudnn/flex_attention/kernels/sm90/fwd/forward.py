@@ -67,7 +67,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             self.mma_pv_is_rs,
         )
 
-    def _get_shared_storage_cls(self):
+    def _get_shared_storage_cls(self, return_max_logit: bool):
         sK_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)],
             self.buffer_align_bytes,
@@ -87,6 +87,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         scheduler_work_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
         sMask_size = self.num_mask_payload_groups * self.mask_payload_words * self.mask_stages if self.use_smem_mask_pipeline else 0
         sMask_struct = cute.struct.Align[cute.struct.MemRange[Uint32, sMask_size], 16]
+        sMaxLogit_size = self.qhead_per_kvhead if return_max_logit and self.pack_gqa else int(return_max_logit)
+        sMaxLogit_struct = cute.struct.Align[cute.struct.MemRange[Float32, sMaxLogit_size], 16]
 
         @cute.struct
         class SharedStorageQKV:
@@ -97,6 +99,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             mbar_ptr_O_empty: mbar_ptr_O_empty_struct
             scheduler_work: scheduler_work_struct
             sMask: sMask_struct
+            sMaxLogit: sMaxLogit_struct
             sV: sVO_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -112,6 +115,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         mV: cute.Tensor,  # (b, s_k, h_k, dv) or (total_k, h_k, dv) for varlen
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -127,7 +131,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
 
-        self._check_type(*(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK)))
+        self._check_type(*(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mMaxLogit, mCuSeqlensQ, mCuSeqlensK)))
 
         assert blocksparse_tensors is not None
         self.varlen_q = mCuSeqlensQ is not None
@@ -167,7 +171,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
 
         self.mask_payload_words = (self.tile_m * self.tile_n // self.num_mma_threads + 31) // 32
         assert blocksparse_tensors.mask_block_masks is not None
-        SharedStorage = self._get_shared_storage_cls()
+        SharedStorage = self._get_shared_storage_cls(mMaxLogit is not None)
 
         mQ_og, mO_og = mQ, mO
         if const_expr(self.pack_gqa):
@@ -238,6 +242,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             tma_tensor_V,
             tma_tensor_O,
             mLSE,
+            mMaxLogit,
             mCuSeqlensQ,
             mCuSeqlensK,
             tma_atom_Q,
@@ -245,6 +250,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             tma_atom_V,
             tma_atom_O,
             softmax_scale_log2,
+            softmax_scale,
             blocksparse_tensors,
             self.sQ_layout,
             self.sK_layout,
@@ -271,6 +277,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
@@ -278,6 +285,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         blocksparse_tensors: BlockSparseTensors,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -353,6 +361,9 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )
+        sMaxLogit = None
+        if const_expr(mMaxLogit is not None):
+            sMaxLogit = storage.sMaxLogit.get_tensor(cute.make_layout((self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,)))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -435,6 +446,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 tiled_mma_pv,
                 mO,
                 mLSE,
+                mMaxLogit,
                 sQ,
                 sK,
                 sVt,
@@ -445,9 +457,11 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 pipeline_q,
                 pipeline_mask,
                 sMask,
+                sMaxLogit,
                 tma_atom_O,
                 tidx,
                 softmax_scale_log2,
+                softmax_scale,
                 SeqlenInfoCls,
                 ConsumerTileSchedulerCls,
                 blocksparse_tensors,
@@ -569,6 +583,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         tiled_mma_pv: cute.TiledMma,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sVt: cute.Tensor,
@@ -579,9 +594,11 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         pipeline_q: pipeline.PipelineAsync,
         pipeline_mask: Optional[pipeline.PipelineAsync],
         sMask: Optional[cute.Tensor],
+        sMaxLogit: Optional[cute.Tensor],
         tma_atom_O: Optional[cute.CopyAtom],
         tidx: Int32,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: BlockSparseTensors,
@@ -716,9 +733,12 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             self.epilogue(
                 acc_O,
                 softmax.row_sum,
+                softmax.row_max,
                 mO,
                 mLSE,
+                mMaxLogit,
                 sO,
+                sMaxLogit,
                 seqlen,
                 tma_atom_O,
                 tiled_mma_pv,
@@ -726,6 +746,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                softmax_scale,
                 sO_empty_mbar_ptr,
             )
             work_tile = next_work_tile

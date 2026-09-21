@@ -5,7 +5,7 @@
 
 One frozen dataclass per kernel flavor (the model families the head-dim
 envelopes are named after), all served by the same kernel skeleton
-(``kernels/prefill_f16_sm80.py``; qwen d=256 by ``prefill_d256_f16_sm80.py``).
+(``kernels/sm80/prefill_f16.py``; qwen d=256 by ``sm80/prefill_d256_f16.py``).
 Knob provenance per flavor:
 
 - **gptoss** (d_qk = d_v = 64): picked from the A100-PCIE-40GB perf sweep. At
@@ -89,6 +89,8 @@ class TemplateParams:
     has_seq_kv_lens: bool = False
     has_seq_q_lens: bool = False
     has_sink: bool = False
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)).
+    stats_log2: bool = False
     has_bias: bool = False
     bias_is_fp32: bool = False
     has_rope: bool = False

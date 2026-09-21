@@ -103,6 +103,24 @@ def _div_up(a, b):
     return (a + cutlass.Int32(b - 1)) // cutlass.Int32(b)
 
 
+def swa_kv_lo_tile(anchor_row, window_left: int, tile_n: int):
+    """First KV tile a left window of ``window_left`` keeps for ``anchor_row``
+    (the q row plus the bottom-right diagonal); 0 while the window still
+    reaches kv 0.  The forward's KV-loop lower bound, and the backward's
+    deterministic dQ relay -- a kv-tile's turn on a q-tile is its rank among
+    that q-tile's visitors, which start here.
+    """
+    cond = anchor_row > cutlass.Int32(window_left)
+    delta = anchor_row - cutlass.Int32(window_left)
+    return cutlass.Int32(
+        arith.select(
+            cond.ir_value(),
+            (delta // cutlass.Int32(tile_n)).ir_value(),
+            cutlass.Int32(0).ir_value(),
+        )
+    )
+
+
 def compute_kv_loop_bounds(
     q_row_coord,
     seqlen_q,
@@ -133,17 +151,7 @@ def compute_kv_loop_bounds(
         # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
         # lower bound is q + (S_kv - S_q) - W, same anchor the causal upper
         # bound uses (causal_diag folds to 0 for top-left).
-        swa_base = q_row_coord + causal_diag
-        cond = swa_base > cutlass.Int32(window_left)
-        delta = swa_base - cutlass.Int32(window_left)
-        kv_lo_swa = cutlass.Int32(
-            arith.select(
-                cond.ir_value(),
-                (delta // cutlass.Int32(tile_n)).ir_value(),
-                cutlass.Int32(0).ir_value(),
-            )
-        )
-        left = cute.math.max(left, kv_lo_swa)
+        left = cute.math.max(left, swa_kv_lo_tile(q_row_coord + causal_diag, window_left, tile_n))
 
     unmasked_hi = right
     if cutlass.const_expr(mask_flags & MASK_PADDED):
@@ -183,3 +191,55 @@ def compute_kv_loop_bounds(
         unmasked_hi=unmasked_hi,
         right=right,
     )
+
+
+# The KV-major dual: a backward CTA owns one KV tile and loops over Q tiles, so
+# it needs the range of q tiles that attend its kv rows.  Causal trims from
+# BELOW (q rows above the diagonal never see this kv tile), the sliding window
+# trims from ABOVE (rows more than window_left past the tile never see it).
+# Same inputs and conventions as compute_kv_loop_bounds; the causal diagonal is
+# derived the same way, and the right-band widening may be a runtime value
+# (the backward keeps it dynamic).
+
+
+class QLoopBounds(NamedTuple):
+    lo: object  # first q tile attending the kv tile (inclusive)
+    hi: object  # one past the last; hi <= lo means the kv tile has no work
+
+
+def compute_q_loop_bounds(
+    kv_row_coord,
+    seqlen_q,
+    seq_kv_len,
+    n_q_tiles,
+    window_left: int,
+    mask_flags: int,
+    tile_q: int,
+    tile_kv: int,
+    bottom_right: bool = False,
+    window_right=0,
+) -> QLoopBounds:
+    if cutlass.const_expr(bottom_right):
+        causal_diag = seq_kv_len - seqlen_q
+    else:
+        causal_diag = cutlass.Int32(0)
+
+    lo = cutlass.Int32(0)
+    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
+        # kv rows [kv_row_coord, +tile_kv) are attended by q whenever
+        # kv <= q + causal_diag + window_right: the first such q is the tile's
+        # first row minus the diagonal minus the band widening (the widening
+        # is subtracted so the straddling rows of the previous tile keep their
+        # dQ and this tile keeps their dK/dV contribution).
+        q_lo_abs = kv_row_coord - causal_diag - window_right
+        lo = cute.math.max(q_lo_abs // cutlass.Int32(tile_q), cutlass.Int32(0))
+
+    hi = n_q_tiles
+    if cutlass.const_expr(mask_flags & MASK_SWA):
+        # The window keeps kv >= q + causal_diag - window_left, so no q at or
+        # past kv_row_coord + tile_kv + window_left - causal_diag attends the tile.
+        q_hi_abs = kv_row_coord + cutlass.Int32(tile_kv + window_left) - causal_diag
+        q_hi_abs = cute.math.max(q_hi_abs, cutlass.Int32(0))
+        hi = cute.math.min(_div_up(q_hi_abs, tile_q), n_q_tiles)
+
+    return QLoopBounds(lo=lo, hi=hi)

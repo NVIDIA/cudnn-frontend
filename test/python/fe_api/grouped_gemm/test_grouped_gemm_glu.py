@@ -846,8 +846,9 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_m_cache_behavior(request, monke
     if use_full_dynamic:
         monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
     else:
-        monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "0")
 
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -928,6 +929,7 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_nk_cache_behavior(request, monk
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -1443,6 +1445,7 @@ def _test_grouped_gemm_glu_discrete_wrapper_dynamic_m_cache_behavior(request, mo
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}

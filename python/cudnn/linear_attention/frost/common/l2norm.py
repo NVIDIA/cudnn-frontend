@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Q/K row L2 normalization helper for GDN (the main kernels stay unchanged
-and consume normalized workspace copies through their usual descriptors).
+"""Q/K row L2 normalization helper for GDN.  The main kernels consume the
+normalized workspace copies through their usual descriptors.
 
 Normalize every d-element q/k row (d in {64, 128}) into compact io-dtype
-workspace buffers and stash the fp32 inverse norms.  The backward projection
-back through the normalize Jacobian runs inside the bprop kernel's dQ/dK
-epilogues, so it has no helper here.
+workspace buffers and store the fp32 inverse norms.  The backward projection
+through the normalize Jacobian runs inside the bprop kernel's dQ/dK epilogues.
 """
 
 from typing import NamedTuple
@@ -66,10 +65,9 @@ def frost_l2norm_qk(
     """Grid over all q rows then all k rows, FWD_LANES lanes x (d // FWD_LANES)
     elements per row, FWD_ROWS_PER_GROUP consecutive rows per lane group: fp32 sums
     of squares, rsqrt with the shared epsilon floor, normalized rows to the
-    compact io workspace, inverse norms to their fp32 slots.  Each access is
+    compact io workspace, inverse norms to their fp32 slots.  Accesses are
     indexed chunk-major, so the lanes of one access cover a contiguous span of
-    the row rather than striding across it.  Tail rows clamp their loads and
-    skip stores."""
+    the row.  Tail rows clamp their loads and skip stores."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     vec_chunks = cutlass.const_expr(fwd_vec_chunks(d))
@@ -191,18 +189,20 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
 
 
-def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, stream) -> L2NormQkRecipe:
+def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, stream) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  Sources
     are read through their own strides; ``expand_num > 1`` writes the q rows
     onto sub-token ``expand_phase`` of the expanded workspace, leaving the
     off-phase rows untouched.  ``expand_fill`` instead walks every expanded q
     row and normalizes a zero row on the off-phase ones, so q_n and inv_q come
-    out fully written on the expanded timeline."""
+    out fully written on the expanded timeline.  ``skip_q`` walks the k rows
+    alone (the state summaries take no q); q, q_n and inv_q are then never
+    read and may alias the k buffers."""
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, d_k = (int(s_) for s_ in k.shape)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
-    n_q_rows = total * h_q * (int(expand_num) if expand_fill else 1)
+    n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
@@ -225,4 +225,4 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     return r
 
 
-frost_l2norm_qk.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_l2norm_qk.set_name_prefix("cudnn", remove_cutlass_symbol=False)

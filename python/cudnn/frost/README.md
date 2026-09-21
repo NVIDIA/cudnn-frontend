@@ -12,14 +12,17 @@ While an engine matures its manifest row is marked `opt_in=True`, so it is
 offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. That flag is a
 per-engine maturity gate, not an architecture switch: an engine graduates by
 flipping one field once it has the arch coverage and the benchmarks to justify
-serving graphs unasked. Engines that are the only implementation of their
+serving graphs unasked. The SDPA forward f16/bf16 rows for SM100 and SM120 have
+graduated; where a graduated engine is timed behind the backend its family ranks
+the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
+ranks FROST first everywhere. Engines that are the only implementation of their
 operation (GDN/KDA/GDN2 -- the backend has no lowering for those nodes at all)
 are never gated.
 
 This document is the contract for the FROST side of that mechanism. If you are
 an agent or a human adding an engine, a kernel, a knob, or an op: read "The
 rules" at the bottom first, then the section for the layer you are touching.
-`docs/python_graph_and_execution_backends.md` covers the graph IR and the
+`docs/utilities/python_graph_and_execution_backends.md` covers the graph IR and the
 backend contract from the frontend's side; this file covers what a FROST
 engine owes it.
 
@@ -140,7 +143,7 @@ EngineFamily(
   `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
   a graph a python engine may serve (it runs the family's semantic rules; the
   backend's verdict is deferred to planning) — see
-  `docs/python_graph_and_execution_backends.md`, *The manifest*.
+  `docs/utilities/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
@@ -314,23 +317,55 @@ python/cudnn/
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
-      kernels/
-        prefill_d256_f16_sm100.py     naming: <phase>_d<dim>_<dtype-family>_sm<arch>.py
-        prefill_d512_f16_sm100.py
-        prefill_f16_sm120.py
-        _common_sm100.py
-        thd_helpers.py
+      kernels/                  one package per ARCH LINE; everything below
+                                an arch package is owned by that arch alone
+        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+                                      (S_q x packed heads <= 16 rows; swap-AB tile)
+        sm100/prefill_d512_f16.py
+        sm100/split_combine.py        the split-KV reduction pass
+        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm120/prefill_f16.py          general SM120 template (d <= 256)
+        sm120/prefill_d256_f16.py     d256 flavor
+        sm120/prefill_d512_f16.py     d512 flavor
+        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
+        sm120/prefill_d512_fp8.py     d512 flavor for FP8
+        sm120/_common.py              SM120-only warp-level primitives
+        _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
+                                  sits ABOVE both rather than inside either
+        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
     bwd/                        future: same shape, its own api_dsl.py
 
-  gemm/frost/                   engine.py + graph_analyzer.py + compiler.py
-                                + kernel_templates/
+  gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
+                                layer (recipe, tile_config, kernel_registry ...);
+                                compiler.py / epilogue_codegen.py are FACADES that
+                                become the active arch tree's module on first
+                                import (arch_family.py picks it from the GPU, or
+                                CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
+    sm100/                      compiler.py + epilogue_codegen.py
+                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+    sm120/                      compiler.py + epilogue_codegen.py
+                                + kernel_templates/ (sm120_*)
+    kernel_templates/           SHARED by both trees (the split-K reduction), so
+                                it sits above them like thd_helpers.py does
 ```
 
-Two levels under the pass directory, always. The coverage axes (arch, phase,
-head dim, dtype family) are encoded in filenames and engine names, never in
-directory depth. A dimension may be omitted from a filename when one kernel
-implementation covers multiple dimensions. A new reader should be able to list
-`sdpa/fwd/kernels/` and see the whole coverage matrix on one screen.
+Two levels under the pass directory, always. **Arch is the one coverage axis
+that may be a directory** — `kernels/sm<arch>/` — because it partitions the
+kernels into disjoint sets that never run on the same device, and because the
+arch lines are separately owned: a Rubin change cannot touch an SM100 file if
+the two live in different directories. Every OTHER axis (phase, head dim, dtype
+family) stays in the filename and the engine name:
+`<phase>_d<dim>_<dtype-family>.py`. A dimension may be omitted when one kernel
+implementation covers multiple dimensions.
+
+A module SHARED across arch lines lives at `kernels/` level, not inside one
+arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
+file sits in always names its only owner, and a file inside `sm107/` can be
+changed without asking who else imports it.
+
+A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
+coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 
@@ -383,8 +418,8 @@ g.create_execution_plans([A])   family_for(graph): node types
                                      per heur_mode, tagged
                                 rank(graph, engines,
                                      backend_plans, modes)
-                                  -> resolve_heuristics()   --> recommend(modes, facts,
-                                                                  offered, backend_plans)
+                                  -> resolve_heuristics()   --> recommend(kind, facts, offered)
+                                                                  [+ BACKEND marker per shard]
                                                                   mismatch(capabilities,
                                                                     facts, knobs) per cell
                                   -> ONE ranked list = graph.plans
@@ -575,7 +610,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `prefill_d512_f16_sm100.py` with different
+  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -594,7 +629,8 @@ def rank(graph, engines, backend_plans, modes=None) -> List[PlanConfig]:
     family = manifest.family_for(graph)
     recommend = manifest.resolve_heuristics(family)   # the family's own rules
     facts = graph._facts_for(manifest.resolve_analyzer(family))
-    return recommend(modes, facts, {e.name: e.engine_id for e in engines}, backend_plans)
+    offered = {e.name: e.engine_id for e in engines if accepts(e, graph)}
+    return _assemble(modes, lambda kind: recommend(kind, facts, offered), backend_plans)
 ```
 
 Ranking knowledge is op-specific -- what makes one SDPA engine beat another
@@ -607,13 +643,15 @@ the backend's.
 The family is the smallest scope that can rank, and that is the whole reason
 this seam exists rather than an engine-side `propose_plans`:
 
-- **`recommend(modes, facts, offered, backend_plans) -> [PlanConfig]` returns
-  `graph.plans`, position for position.** Nothing downstream reorders it.
-- **It places BOTH sides.** The backend's entries arrive tagged with the
-  `heur_mode` that produced them, so the family says, per mode, whether its own
-  configs lead or follow. That is a measurement, not a preference: whether a
-  FROST cell beats the backend's kernel on a given arch is a number someone
-  timed.
+- **`recommend(kind, facts, offered) -> [PlanConfig]` names the family's own
+  configs, best first,** for `kind` `"A"` or `"FALLBACK"`; `_assemble` builds one
+  block per requested mode from it.
+- **It places BOTH sides through one marker.** The list may hold `BACKEND`
+  (`cudnn.engines.heuristics.BACKEND`) once: the backend's own ranked block for the mode
+  goes there, so the family says, per shard, whether its configs lead or
+  follow. `sdpa/fwd/placement.py` holds the benchmark-driven, tunable policy;
+  `test_sdpa_fwd_placement.py` checks the hook contract with synthetic verdicts.
+  Performance rankings are evaluated offline. No marker = ours first.
 - **Each mode contributes a block, and the blocks concatenate** in the caller's
   order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
   ahead of every fallback.
@@ -737,7 +775,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `prefill_d512_f16_sm100.py`) and must be unreachable for any
+  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -804,8 +842,11 @@ Asserts:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum.** Coverage axes go in
-    filenames and engine names, never in directory depth.
+10. **Two directory levels under the pass, maximum**, and ARCH is the only
+    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
+    Every other axis -- phase, head dim, dtype family -- goes in the filename and
+    the engine name. A module shared across arch lines stays at `kernels/` level
+    rather than inside one arch package.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.

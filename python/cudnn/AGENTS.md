@@ -4,7 +4,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 
 ## Import-time rules (the most common way to break this package)
 
-- `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` pointing at `pip install nvidia-cudnn-frontend[cutedsl]`.
+- `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` that names the missing framework module (torch, jax, cuda-python) alongside the base `pip install nvidia-cudnn-frontend` hint — or, for a CuTe DSL below `CUTEDSL_MIN_VERSION`, points at the DSL upgrade (Rule 7).
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
@@ -44,6 +44,16 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   defined or explicitly rejected — an unhandled overlap is an untested code
   path with unspecified semantics, and "both supplied" is exactly the case
   no per-argument check catches (raised in review on PR #266).
+- **An execute-time shape/stride override must reach the executor or raise
+  before launch.** A raw uid-map plan cannot consume it; do not silently drop
+  the override triple. Filter override-enabled graphs per plan's binding capability,
+  preserving prepared plans while declining tensor-only ones. Detectors:
+  `test_uid_map_plan_rejects_runtime_overrides_before_execute` and
+  `test_override_filter_preserves_compatible_split_candidates`.
+- **Shape overrides do not enlarge the producer's storage.** Validate metadata
+  inputs against their observed span as well as their effective shape, and check
+  pointer alignment for the element type. The host-only detector is
+  `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -124,18 +134,13 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
-  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
-  tensor even when only KV is padded, so no static rule separates "declares
-  per-batch Q lengths" from "the lengths are actually short" — declining the
-  declaration would drop the KV-only-padding population these kernels serve
-  correctly. It goes away when the FP8 kernels get the epilogue trim; until
-  then the read is what keeps a short length from being silently ignored.
-- `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
-  (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
-  wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
-  `graph.execute()` does not route here. Still a violation, and it is the one to
-  fix first if that spec ever gains THD.
+- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
+  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
+  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
+  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
+  the graph's envelope `S_max` and turns the per-batch lengths into
+  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
+  violation on the wrapper surface (a caller contract, documented there).
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -170,10 +175,12 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
-- **Known open cleanup (issue #604)**: the SM80 engines' `_compile_cached`
-  (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
-  token extents like the SM100/SM120 THD compiles rather than copying its
-  pattern.
+- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
+  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
+  plus the plan-time sequence count; the regression tests are
+  `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
+  `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
+  pattern, not a shape-keyed one.
 - **Key on exactly the contract-relevant set — no more, no less.** Both
   failure modes shipped on PR #553 and were caught in review: *under-keying*
   (the cache keyed only `x.shape`/`w.shape` while `check_support()`
@@ -265,7 +272,7 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
-  (`ci/stages/oss_tests/jobs.yml` on the GitLab side); a lane below your floor
+  (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
@@ -294,6 +301,10 @@ python/cudnn/gemm/
 │   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
 │   │                                #   quant, srelu, swiglu, unfused, wgrad
 │   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
+├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
+│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
+│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
+│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```
@@ -348,6 +359,13 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 ## Other notes
 
 - `wrapper.py` `Graph` context manager (the pythonic graph builder) requires cuDNN backend ≥ 9.12 (`backend_version() >= 91200`) and builds plans on `__exit__`.
-- Torch custom ops live in `experimental/ops/` (pattern doc: `docs/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
+- Torch custom-op implementations live with their owning operation family and may be re-exported from `experimental/ops/` while maturing (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
+
+CUDA-owning objects can be reclaimed by cyclic GC inside an unrelated graph
+capture. Keep disabled ABI slots non-owning, and scope resource destruction so it
+does not invalidate that capture; merely collecting before a test is not a
+library fix. `test_collect_unrelated_resources_during_capture` forces collection
+inside a global-mode capture and checks both replay and subsequent native cuDNN
+execution, which also detects backend-handle destruction poisoning later plans.

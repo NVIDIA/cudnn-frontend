@@ -31,8 +31,8 @@ def load_config(name: str) -> "BenchmarkConfig":
         ValueError: If config not found or doesn't define CONFIG
 
     Example:
-        config = load_config("mlperf")
-        print(config.name)  # "mlperf"
+        config = load_config("llama")
+        print(config.name)  # "llama3.1"
     """
     try:
         module = importlib.import_module(f".{name}", package=__package__)

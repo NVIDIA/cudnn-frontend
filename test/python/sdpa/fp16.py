@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import cudnn
+import math
 import pytest
 import torch
 from enum import IntEnum
@@ -130,11 +131,19 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
         pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
+    # Same gate as test_sdpa_edge_cases.py: the random sweeps draw zero-length
+    # sequences (~10% per batch), which older engines answer with NaN rows.
+    if cudnn_version < "9.25.0" and (0 in cfg.seq_len_q or 0 in cfg.seq_len_kv):
+        print("@@@@ Overall result: WAIVED, zero sequence length SDPA requires cuDNN 9.25.0 or higher.")
+        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
-    max_t_q = packed_token_capacity(cfg.seq_len_q) if cfg.is_ragged else None
-    max_t_kv = packed_token_capacity(cfg.seq_len_kv) if cfg.is_ragged else None
+    # total_q/total_kv are first-class capacities: honor explicit (possibly
+    # slack-fuzzed) totals, falling back to the minimal packed capacity.
+    max_t_q = (cfg.total_q or packed_token_capacity(cfg.seq_len_q)) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or packed_token_capacity(cfg.seq_len_kv)) if cfg.is_ragged else None
 
     # When perf mode is enabled, use normal distribution instead of sparse small integers
     # to avoid artificially fast timings from GPU memory compression of sparse data.
@@ -239,7 +248,7 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
 
     if cfg.is_block_mask:
         TILE_M, TILE_N = 128, 128
-        block_mask_gpu = torch.randint(0, 256, (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8), dtype=torch.uint8, device="cuda")
+        block_mask_gpu = torch.randint(0, 256, (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8), dtype=torch.uint8, device="cuda", generator=rng_data_gen)
         allocs[TensorUid.block_mask] = (block_mask_gpu, None, None)
 
     if cfg.is_dropout:
@@ -395,6 +404,12 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         score_sum_exp=score_sum_exp,
         sink_token=sink_token,
         unfuse_fma=cfg.with_unfuse_fma,
+        # Declared packed token totals (first-class total_q/total_kv). The
+        # backward graph always declares them; forward declaration is opt-in
+        # so it can be fuzzed on/off.
+        max_total_seq_len_q=cfg.total_q if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
+        max_total_seq_len_kv=cfg.total_kv if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
+        stats_use_log2=cfg.with_stats_log2,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
@@ -745,8 +760,10 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_ragged and cfg.is_train:
         dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q)
 
-    max_t_q = packed_token_capacity(seq_len_q_ref.tolist()) if cfg.is_ragged else None
-    max_t_kv = packed_token_capacity(seq_len_kv_ref.tolist()) if cfg.is_ragged else None
+    # Must match the allocation capacity: first-class total_q/total_kv when
+    # set, else the guaranteed-surplus packed capacity (GitHub #624).
+    max_t_q = (cfg.total_q or packed_token_capacity(seq_len_q_ref.tolist())) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or packed_token_capacity(seq_len_kv_ref.tolist())) if cfg.is_ragged else None
 
     attn_scale = 0.125
 
@@ -779,6 +796,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                 if cudnn_version < "9.14.0":
                     stats_ref[i, :, m:, :] = 0
                     stats_gpu[i, :, m:, :] = 0
+                    if cfg.with_stats_log2:
+                        allocs["stats_log2"][0][i, :, m:, :] = 0
                 else:
                     stats_ref[i, :, m:, :] = -float("inf")
             # zero out padded regions for score_max and score_sum_exp
@@ -884,6 +903,9 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_train:
         dkv_atol = 2e-2 if cfg.data_type == torch.float16 else 7e-2
         err_count += approx_equal(allocs[TensorUid.stats], stats_ref, atol=2e-2, rtol=2e-2, tag="stats", disp_elems=diffs)
+        if cfg.with_stats_log2:
+            # The forward's own output, snapshotted before the natural-log restore that fed the backward.
+            err_count += approx_equal(allocs["stats_log2"], stats_ref * math.log2(math.e), atol=2e-2, rtol=2e-2, tag="stats_log2", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dQ], dQ_ref, atol=2e-2, rtol=2e-2, tag="dQ", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dK], dK_ref, atol=dkv_atol, rtol=2e-2, tag="dK", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dV], dV_ref, atol=dkv_atol, rtol=2e-2, tag="dV", disp_elems=diffs)
@@ -923,6 +945,13 @@ def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checke
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
 
     execute_graph(fwd_graph, fwd_pack, allocs, tensors, cudnn_handle, request, label="Forward")
+
+    if cfg.is_train and cfg.with_stats_log2:
+        # The forward wrote base-2 stats. Keep them for the comparison and hand the backward the
+        # natural-log form it consumes, as a training caller would (-inf rows are unaffected).
+        stats_gpu = tensors.get(TensorUid.stats)
+        allocs["stats_log2"] = (stats_gpu.clone(), None, None)
+        stats_gpu.mul_(math.log(2.0))
 
     if cfg.is_train:
         execute_graph(bwd_graph, bwd_pack, allocs, tensors, cudnn_handle, request, label="Backward")

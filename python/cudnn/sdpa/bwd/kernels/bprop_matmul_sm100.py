@@ -8,7 +8,7 @@ bf16 GEMMs; at bf16 there is no descale epilogue, so nothing is fused here.
 
 WHY THIS EXISTS -- the one thing the generic GEMM cannot express
 ---------------------------------------------------------------
-``gemm/frost/kernel_templates/sm100_matmul.py`` carries a single batch axis
+``gemm/frost/sm100/kernel_templates/sm100_matmul.py`` carries a single batch axis
 ``l`` with ONE uniform stride.  The SDPA operands are BSHD ``[B, S, H, D]``, so
 the batch element is the PAIR ``(b, h)`` at offset ``b*(S*H*D) + h*D`` -- a
 two-level stride that no single uniform stride can express.  Flattening it
@@ -21,8 +21,8 @@ become **4-D** ``[k, m, h, b]`` (``cuTensorMapEncodeTiled`` allows 5), with
 single flat ``l`` -- ``_decode_bh`` splits it only where a TMA coordinate is
 formed, which is the whole change.
 
-KEEP IN SYNC WITH ``gemm/frost/kernel_templates/sm100_matmul.py``
------------------------------------------------------------------
+KEEP IN SYNC WITH ``gemm/frost/sm100/kernel_templates/sm100_matmul.py``
+-----------------------------------------------------------------------
 This file is a FORK of that template, taken from its rendered dense-bf16
 expansion (config ``sm100_128x256x128_128x256x32_cluster2x1_2ctamma``, no
 epilogue fusion, TMA-store epilogue).  The mainloop, the CLC scheduler, the
@@ -43,11 +43,12 @@ without making the same change upstream.
 
 from __future__ import annotations
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -63,6 +64,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
+from cudnn.frost.device import compute_capability, resolve_device
 from cudnn.frost.tile_dsl.constants import DTYPE_FP16
 from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
@@ -210,7 +212,6 @@ num_tmem_alloc_cols = 512
 tmem_alloc_exclusive = False
 acc_stages = 1  # 512 acc cols/stage
 vec_bytes_epi = int(PARAMS.vec_bytes_epi)
-frost_compile_options = "--enable-tvm-ffi --gpu-arch sm_100a"
 n_tma_outputs = 1
 moe_aligned_offsets = False
 epi_slot_widen = 1
@@ -1882,8 +1883,28 @@ def _host(
         )
 
 
+_CODEGEN_TARGET_SMS = frozenset({100, 103, 107, 110})
+
+
 @lru_cache(maxsize=None)
-def compile() -> Callable:
+def compile(device) -> Callable:
+    major, minor = compute_capability(resolve_device(device))
+    sm = major * 10 + minor
+    # The device reaches the kernel only as its architecture (--gpu-arch below),
+    # so that is the key; the device object itself would make the call uncacheable.
+    _cache_key = _template_key(globals(), {"sm": sm}, "compile")
+    # This is the source-level CODEGEN domain, not the engine's advertised
+    # support contract.  The complete three-stage engine remains qualified only
+    # on SM100/SM103; SM107/SM110 targets are kept available for isolated
+    # lowering and future board qualification.  In particular SM107 needs a
+    # CuTe DSL build that recognizes sm_107a (the public 4.7 wheel does not).
+    if sm not in _CODEGEN_TARGET_SMS:
+        expected = ", ".join(f"SM{x}" for x in sorted(_CODEGEN_TARGET_SMS))
+        raise ValueError(f"SM100 SDPA bwd stage 3 has codegen targets for {expected}; got SM{sm}")
+    # The architecture-specific target is required for tcgen05/TMA. Resolve it
+    # from this function's device cache key so B200 and B300 cannot share an
+    # incompatible TVM-FFI artifact in a multi-GPU process.
+    gpu_arch = f"sm_{major}{minor}a"
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
@@ -1978,7 +1999,7 @@ def compile() -> Callable:
     # serves every sequence count either way.
     fake_meta = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
     fake_desc = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
-    return cute.compile(
+    return _compile_cached(
         _host,
         problem_size,
         fake_a_0,
@@ -1987,7 +2008,9 @@ def compile() -> Callable:
         fake_meta,
         fake_desc,
         stream=_fake_stream,
-        options=frost_compile_options,
+        options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 
@@ -2007,7 +2030,18 @@ def _permuted(t, mn_dim: int, k_dim: int, h_dim: int, b_dim: int):
     return t.permute(mn_dim, k_dim, h_dim, b_dim)
 
 
-def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, desc_words=None, grid_m: int = None):
+def matmul_bh(
+    a,
+    b,
+    out,
+    *,
+    n_head: int,
+    n_batch: int,
+    stream=None,
+    meta=None,
+    desc_words=None,
+    grid_m: int = None,
+):
     """Run one ``(batch, head)``-batched GEMM.
 
     ``a`` / ``b`` / ``out`` are already permuted to ``(M|N, K, H, B)`` /
@@ -2024,7 +2058,10 @@ def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, d
         # Required on both paths: dense never reads them, but the compiled ABI
         # has the slots and a None would fail at the call boundary.
         raise ValueError("matmul_bh needs `meta` and `desc_words` (dense may pass any 1-D dummies)")
-    fn = compile()
+    # Use FROST's framework-neutral device facts. This is the same per-ordinal
+    # DeviceInfo cache exposed by cudnn.Handle.device, without making the kernel
+    # template depend on torch.
+    fn = compile(a.device)
     # `m` sizes the GRID.  Dense: the operands' shared M.  THD: the caller
     # passes the longest sequence, because the per-sequence extents are device
     # values and A's own M is the workspace's column count, not an output row
