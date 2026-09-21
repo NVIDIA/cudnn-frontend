@@ -25,21 +25,9 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     torch-only: callers must guard this context so non-torch (e.g. JAX) code paths
     never enter it -- it imports torch and interprets ``device`` as a torch device.
     """
-    import torch
+    from cudnn._torch_stream import stream_context
 
-    if current_stream is None:
-        yield
-        return
-    handle = int(current_stream)
-    torch_current = torch.cuda.current_stream(device)
-    torch_default = torch.cuda.default_stream(device)
-    if handle == torch_current.cuda_stream:
-        launch_stream = torch_current
-    elif handle == torch_default.cuda_stream:
-        launch_stream = torch_default
-    else:
-        launch_stream = torch.cuda.ExternalStream(handle, device=device)
-    with torch.cuda.stream(launch_stream):
+    with stream_context(current_stream, device):
         yield
 
 

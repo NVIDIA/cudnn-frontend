@@ -476,7 +476,6 @@ class SlidingWindowAttention(APIBase):
             dtype=torch.uint8,
         )
         self._cudnn_swa_graph.execute(variant_pack, workspace, handle=cudnn_handle)
-        torch.cuda.synchronize()
         self._logger.debug("Executed successfully")
 
     def __call__(self, *args, **kwargs) -> None:

@@ -667,7 +667,6 @@ class DenseIndexerBackward(APIBase):
             self.max_seqlen_k = int(sample_index_k.shape[1])
         self.heads = int(heads)
         self.head_dim = int(head_dim)
-        self._uses_current_stream_pipeline = False
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -697,7 +696,6 @@ class DenseIndexerBackward(APIBase):
             return
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = dense_indexer_backward_sm90 if major == 9 else dense_indexer_backward_sm100
-        self._uses_current_stream_pipeline = major == 9
         self._compiled_kernel = kernel_factory(
             self.batch,
             self.max_seqlen_q,
@@ -730,8 +728,7 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        backend_stream = None if self._uses_current_stream_pipeline else current_stream
-        with _torch_stream_context(backend_stream):
+        with _torch_stream_context(current_stream):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
             grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 

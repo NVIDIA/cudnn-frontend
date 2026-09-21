@@ -4537,7 +4537,6 @@ class CompiledMoeGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -4566,12 +4565,12 @@ class CompiledMoeGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -4968,7 +4967,6 @@ class CompiledMoeBlockScaleGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -5002,9 +5000,10 @@ class CompiledMoeBlockScaleGemm:
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):

@@ -78,15 +78,22 @@ def test_nsa_swa_compile_execute(
 
     assert swa.check_support() is True
     swa.compile()
-    swa.execute(
-        q_tensor=Q,
-        k_tensor=K,
-        v_tensor=V,
-        seq_len_q_tensor=actual_s_q,
-        seq_len_kv_tensor=actual_s_kv,
-        o_tensor=O,
-        stats_tensor=Stats,
-    )
+    # Rule 8: execute() launches asynchronously on the handle's stream and never
+    # blocks the host; torch's sync debug mode turns a torch.cuda.synchronize()
+    # inside it into an error.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        swa.execute(
+            q_tensor=Q,
+            k_tensor=K,
+            v_tensor=V,
+            seq_len_q_tensor=actual_s_q,
+            seq_len_kv_tensor=actual_s_kv,
+            o_tensor=O,
+            stats_tensor=Stats,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
 
     check_ref_nsa_swa(
         Q,

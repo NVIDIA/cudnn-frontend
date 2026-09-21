@@ -233,9 +233,10 @@ the kernel that reads it).
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
   Map the sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
-  genuine side stream to `ExternalStream(handle, device=device)`. Reuse
-  `_torch_stream_context` (`sdpa/fwd/api_dsl.py`) or `marshal.stream_ctx`
-  (`linear_attention/hopper/`) rather than writing a fresh wrapper. Detector:
+  genuine side stream to `ExternalStream(handle, device=device)`. The one
+  implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
+  with the raw-handle fast path); every engine calls it, none writes its own
+  wrapper. Detector:
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
 

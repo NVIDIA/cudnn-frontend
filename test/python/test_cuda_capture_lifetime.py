@@ -38,7 +38,7 @@ def _native_relu(handle=None):
     return graph, x, y
 
 
-@pytest.mark.parametrize("resource", ["device_buffer", "owned_backend_graph"])
+@pytest.mark.parametrize("resource", ["device_buffer", "backend_graph"])
 def test_collect_unrelated_resources_during_capture(resource, cudnn_handle):
     """A GC-timed free must neither invalidate capture nor poison later cuDNN launches.
 
@@ -69,8 +69,9 @@ def test_collect_unrelated_resources_during_capture(resource, cudnn_handle):
         if resource == "device_buffer":
             victim = _Cycle(DeviceBuffer(256, torch.cuda.current_device()))
         else:
-            # No explicit handle: its lowered PyGraph owns cudnnDestroy as well
-            # as the backend graph / execution-plan descriptors.
+            # No explicit handle: its lowered PyGraph owns the backend graph and
+            # execution-plan descriptors (the handle is the process default and is
+            # never destroyed here -- test_handle_less_graph_borrows_default_handle).
             victim = _Cycle(_native_relu()[0])
         victim_ref = weakref.ref(victim)
         del victim
@@ -98,6 +99,25 @@ def test_collect_unrelated_resources_during_capture(resource, cudnn_handle):
         torch.cuda.set_stream(previous_stream)
         if was_enabled:
             gc.enable()
+
+
+def test_handle_less_graph_borrows_default_handle(monkeypatch):
+    """A handle-less lowering constructs the C++ graph with the process default handle
+    (one per thread and device, stream 0) instead of letting PyGraph cudnnCreate and
+    later cudnnDestroy one of its own (Rule 8)."""
+    from cudnn import _pygraph
+
+    seen = []
+    real = cudnn._pybind_module.backend_graph
+
+    def spy(**kwargs):
+        seen.append(dict(kwargs))
+        return real(**kwargs)
+
+    monkeypatch.setattr(cudnn._pybind_module, "backend_graph", spy)
+    graph, _, _ = _native_relu()
+    assert seen and seen[-1].get("handle") == _pygraph._default_backend_handle()
+    assert _pygraph._default_backend_handle() == _pygraph._default_backend_handle()  # cached per thread/device
 
 
 @pytest.mark.parametrize("free_raises", [False, True])
