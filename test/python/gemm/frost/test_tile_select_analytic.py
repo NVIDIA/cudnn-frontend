@@ -377,9 +377,9 @@ def test_joint_selection_does_not_hide_probe_bugs():
     from cudnn.gemm.frost.planning import select_strategy
 
     def probe(chain, config):
-        raise RuntimeError("broken support probe")
+        raise RuntimeError("support probe failure")
 
-    with pytest.raises(RuntimeError, match="broken support probe"):
+    with pytest.raises(RuntimeError, match="support probe failure"):
         select_strategy(_plain_strategy_chain(), select_config(128, 128, 1), device=_strategy_device(), probe=probe)
 
 
