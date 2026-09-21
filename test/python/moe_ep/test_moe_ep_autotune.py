@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
+from moe_ep.moe_ep_distributed_workers import _distributed_autotune_worker
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_weight_staging,
@@ -25,6 +29,7 @@ from moe_ep.moe_ep_test_support import (
     _moe_ep_config,
     _reference_forward,
     _replay_cuda_graph,
+    _require_distributed_sm107,
     _sm107_device,
     make_forward_inputs,
 )
@@ -169,6 +174,19 @@ def test_autotune_core_contracts(monkeypatch):
             autotune_module.verify_candidates_across_ranks((baseline,), object())
 
     with monkeypatch.context() as patch:
+        local_state = (True, False)
+        remote_state = (False, False)
+        patch.setattr(autotune_module.dist, "get_world_size", lambda group: 2)
+
+        def gather(output, value, *, group):
+            del group
+            output[:] = [value, remote_state]
+
+        patch.setattr(autotune_module.dist, "all_gather_object", gather)
+        with pytest.raises(RuntimeError, match="matching lifecycle state"):
+            autotune_module.verify_state_across_ranks(local_state, object())
+
+    with monkeypatch.context() as patch:
         local_samples = iter((1.0, 7.0, 3.0))
 
         class Event:
@@ -199,6 +217,61 @@ def test_autotune_core_contracts(monkeypatch):
         )
         assert samples == (5.0, 8.0, 4.0)
         assert latency == 5.0
+
+
+@pytest.mark.L0
+def test_autotune_lifecycle_state_excludes_rank_local_device(monkeypatch):
+    import cudnn.moe_ep._autotune as autotune_module
+    import cudnn.moe_ep.api as api_module
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    captured_states = []
+    monkeypatch.setattr(
+        autotune_module,
+        "verify_state_across_ranks",
+        lambda state, group: captured_states.append(state),
+    )
+    monkeypatch.setattr(api_module, "validate_forward", _validated_request)
+
+    op = MoeEp(_moe_ep_config(**_forward_config()))
+    state = op._execution_state
+    active_backend = SimpleNamespace(
+        resolved_config=state.resolved_config,
+        device=torch.device("cuda", 1),
+    )
+    op._execution_state = type(state)(
+        resolved_config=state.resolved_config,
+        backend=active_backend,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="cannot autotune on cuda:0"):
+            op.autotune_inference(
+                None,
+                None,
+                None,
+                None,
+                None,
+                candidates=[MoeEpTuningConfig()],
+                warmup_iters=0,
+                timed_iters=1,
+            )
+        assert captured_states.pop(0) == (True, False)
+
+        value = SimpleNamespace(device=torch.device("cuda", 0))
+        with pytest.raises(ValueError, match="cannot autotune on cuda:0"):
+            op.autotune_training_forward(
+                value,
+                None,
+                None,
+                forward_weights=object(),
+                candidates=[MoeEpTuningConfig()],
+                warmup_iters=0,
+                timed_iters=1,
+            )
+        assert captured_states.pop(0) == (True, False, "contiguous")
+        assert not captured_states
+    finally:
+        op.close()
 
 
 @pytest.mark.L0
@@ -571,6 +644,35 @@ def _print_candidate_timings(label, result) -> None:
             f"samples=[{samples}] tuning={measurement.tuning}",
             flush=True,
         )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_autotune_ep2_accepts_rank_local_cuda_ordinals(tmp_path):
+    world_size = 2
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / "autotune_rank_local_devices.init"
+    process_context = mp.spawn(
+        _distributed_autotune_worker,
+        args=(world_size, str(init_file)),
+        nprocs=world_size,
+        join=False,
+    )
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        if process_context.join(timeout=min(1.0, max(0.0, deadline - time.monotonic()))):
+            break
+    else:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in process_context.processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=30)
+        pytest.fail("distributed autotune workers did not complete")
 
 
 @pytest.mark.L1

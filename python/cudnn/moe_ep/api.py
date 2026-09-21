@@ -622,11 +622,12 @@ class MoeEp:
                 max_candidates=max_candidates,
             )
             verify_candidates_across_ranks(normalized, group)
+            # CUDA ordinals are rank-local; device binding is checked against
+            # this rank's request during preflight below.
             verify_state_across_ranks(
                 (
                     state.backend is not None,
                     self._training_state is not None,
-                    (None if state.backend is None else str(state.backend.device)),
                 ),
                 group,
             )
@@ -862,15 +863,12 @@ class MoeEp:
                 max_candidates=max_candidates,
             )
             verify_candidates_across_ranks(normalized, group)
+            # CUDA ordinals are rank-local; device binding is checked against
+            # this rank's activation during preflight below.
             verify_state_across_ranks(
                 (
                     execution_state.backend is not None,
                     self._training_state is not None,
-                    (
-                        None
-                        if execution_state.backend is None
-                        else str(execution_state.backend.device)
-                    ),
                     weight_storage_mode.value,
                 ),
                 group,

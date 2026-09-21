@@ -50,7 +50,7 @@ def _distributed_autotune_worker(
     world_size: int,
     init_file: str,
 ) -> None:
-    """Run an EP sweep and verify one rank-consistent applied winner."""
+    """Tune before and after backend creation on rank-local CUDA devices."""
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -62,8 +62,9 @@ def _distributed_autotune_worker(
         device_id=device,
         timeout=timedelta(seconds=180),
     )
+    op = None
     try:
-        from cudnn import MoeEp, MoeEpTuningConfig
+        from cudnn import MoeEp
 
         args = make_distributed_forward_inputs(rank, world_size, device)
         config = _forward_config(
@@ -72,30 +73,75 @@ def _distributed_autotune_worker(
             max_tokens_per_rank=8,
         )
         expected = _reference_forward(args, **config)
-        candidate = MoeEpTuningConfig(token_in_flag_batch=2)
-        op = MoeEp(_moe_ep_config(**config))
-        try:
+        records = []
+        for warm_backend in (False, True):
+            op = MoeEp(_moe_ep_config(**config))
+            warm_snapshot = None
+            backend_created_before_tuning = None
+            if warm_backend:
+                warm = op(*args)
+                warm_snapshot = _output_as_float(warm).clone()
+                torch.cuda.synchronize(device)
+                backend_created_before_tuning = op._execution_state.backend is not None
+
             result = op.autotune_inference(
                 *args,
-                candidates=[candidate],
-                warmup_iters=1,
-                timed_iters=2,
+                candidates=[op.inference_tuning],
+                warmup_iters=0,
+                timed_iters=1,
             )
             actual = op(*args)
+            actual_snapshot = _output_as_float(actual).clone()
             torch.cuda.synchronize(device)
             winners = [None] * world_size
             dist.all_gather_object(winners, result.winner)
-            assert all(winner == result.winner for winner in winners)
-            assert op.inference_tuning == result.winner
-            _assert_matches_reference(actual, expected)
+            records.append(
+                (
+                    warm_backend,
+                    warm_snapshot,
+                    backend_created_before_tuning,
+                    actual_snapshot,
+                    result,
+                    winners,
+                    op.inference_tuning,
+                )
+            )
+
             dist.barrier()
             op.close()
             op = None
             dist.barrier()
-        finally:
-            if op is not None:
-                op.close()
+
+        assertion_error = None
+        try:
+            for (
+                warm_backend,
+                warm_snapshot,
+                backend_created_before_tuning,
+                actual_snapshot,
+                result,
+                winners,
+                applied_tuning,
+            ) in records:
+                assert all(winner == result.winner for winner in winners)
+                assert applied_tuning == result.winner
+                if warm_backend:
+                    assert backend_created_before_tuning
+                    assert warm_snapshot is not None
+                    _assert_matches_reference(warm_snapshot, expected)
+                _assert_matches_reference(actual_snapshot, expected)
+        except BaseException as error:
+            assertion_error = error
+
+        local_error = None if assertion_error is None else (type(assertion_error).__name__, str(assertion_error))
+        rank_errors = [None] * world_size
+        dist.all_gather_object(rank_errors, local_error)
+        dist.barrier()
+        if any(error is not None for error in rank_errors):
+            raise AssertionError(f"distributed autotune assertions failed: {rank_errors}") from assertion_error
     finally:
+        if op is not None:
+            op.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 
