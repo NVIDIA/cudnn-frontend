@@ -47,6 +47,7 @@ def _moe_plan_workspace(request, monkeypatch):
         yield
         return
     import torch
+    from cudnn._torch_stream import stream_context
     from cudnn.gemm.frost.sm100 import compiler as _sm100
     from cudnn.gemm.frost.sm120 import compiler as _sm120
 
@@ -55,7 +56,9 @@ def _moe_plan_workspace(request, monkeypatch):
 
         def shim(self, variant_pack, workspace=None, stream=None, _real=real):
             if workspace is None and self.workspace_bytes:
-                workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=torch.device("cuda", self.device))
+                # Allocated on the launch stream (R1) so the allocator's reuse ordering covers the plan.
+                with stream_context(stream, self.device):
+                    workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=torch.device("cuda", self.device))
             return _real(self, variant_pack, workspace=workspace, stream=stream)
 
         monkeypatch.setattr(cls, "__call__", shim)

@@ -400,7 +400,12 @@ that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
 passed nothing. A path with no workspace contract gets one. A direct adapter
 caller (the `<op>_wrapper`, a test, downstream code constructing the class) is a
 caller: the wrapper allocates `scratch_workspace_bytes()` once per call and
-passes it; an engine never allocates because the wrapper forgot.
+passes it; an engine never allocates because the wrapper forgot. Where a
+wrapper allocates per call on the caller's behalf, it allocates under
+`stream_context(<launch stream>)` (R1): the caching allocator orders a block's
+reuse only against the stream it was allocated on, so scratch allocated on
+torch's ambient stream for a handle re-streamed to a side stream is a
+use-after-free waiting for load.
 An APIBase that
 wraps a cuDNN backend `pygraph` forwards `graph.get_workspace_size()` as
 `get_workspace_size()` and takes `workspace=` at execute, validated with

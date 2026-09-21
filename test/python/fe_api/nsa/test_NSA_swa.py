@@ -111,6 +111,7 @@ def test_nsa_swa_compile_execute(
     # Rule 8: execute() launches asynchronously on the handle's stream and never
     # blocks the host; torch's sync debug mode turns a torch.cuda.synchronize()
     # inside it into an error.
+    previous_sync_debug_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
         swa.execute(**execute_kwargs)
@@ -120,8 +121,94 @@ def test_nsa_swa_compile_execute(
             swa.execute(**execute_kwargs)
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "SlidingWindowAttention.execute allocated device memory"
     finally:
-        torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.set_sync_debug_mode(previous_sync_debug_mode)
 
+    check_ref_nsa_swa(
+        Q,
+        K,
+        V,
+        O,
+        Stats,
+        actual_s_q,
+        actual_s_kv,
+        max_s_q,
+        max_s_kv,
+        cfg,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_nsa_swa_execute_on_a_side_stream_allocates_nothing(request, monkeypatch):
+    """The handle is re-streamed to a side stream while torch stays on its default stream.
+    The caller owns the workspace (R2) and allocates it on the launch stream (R1: the caching
+    allocator orders a block's reuse only against the stream it was allocated on); execute()
+    itself allocates nothing, so there is no scratch whose lifetime the class could get wrong."""
+    try:
+        from cudnn import NSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    cfg = nsa_init(
+        request=request,
+        layout="bshd",
+        dtype=torch.float16,
+        acc_dtype=torch.float32,
+        scale_softmax=None,
+        window_size=64,
+    )
+    Q, K, V, _, actual_s_q, actual_s_kv, _, _, max_s_q, max_s_kv = allocate_input_tensors(cfg)
+    O, Stats, _, _, _ = allocate_output_tensors(cfg)
+    cudnn_handle = cudnn.create_handle()
+    swa = NSA.SlidingWindowAttention(
+        sample_q=Q,
+        sample_k=K,
+        sample_v=V,
+        sample_o=O,
+        sample_stats=Stats,
+        sample_seq_len_q=actual_s_q,
+        sample_seq_len_kv=actual_s_kv,
+        max_seq_len_q=max_s_q,
+        max_seq_len_kv=max_s_kv,
+        left_bound=cfg["window_size"],
+        right_bound=0,
+        attn_scale=cfg["scale_softmax"],
+        intermediate_data_type=cfg["acc_dtype"],
+        compute_data_type=cfg["acc_dtype"],
+        cudnn_handle=cudnn_handle,
+    )
+    assert swa.check_support() is True
+    swa.compile()
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())  # the inputs were written on the default stream
+    with torch.cuda.stream(side):  # the caller allocates on the launch stream (R1)
+        ws = torch.empty(max(swa.get_workspace_size(), 1), dtype=torch.uint8, device=Q.device)
+
+    allocations = []
+    for name in ("empty", "zeros", "ones", "empty_like", "zeros_like", "full", "tensor", "arange"):
+        real = getattr(torch, name)
+
+        def recording(*args, _real=real, _name=name, **kwargs):
+            allocations.append((_name, torch.cuda.current_stream().cuda_stream))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(torch, name, recording)
+    swa.execute(
+        q_tensor=Q,
+        k_tensor=K,
+        v_tensor=V,
+        seq_len_q_tensor=actual_s_q,
+        seq_len_kv_tensor=actual_s_kv,
+        o_tensor=O,
+        stats_tensor=Stats,
+        workspace=ws,
+        current_stream=side.cuda_stream,
+    )
+    seen = list(allocations)
+    assert not seen, f"execute() allocated {seen}; the caller owns every buffer (R2)"
+    assert cudnn.get_stream(cudnn_handle) == side.cuda_stream
+
+    torch.cuda.current_stream().wait_stream(side)
     check_ref_nsa_swa(
         Q,
         K,
