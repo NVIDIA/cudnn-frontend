@@ -65,10 +65,7 @@ def _compute_receive_capacity(
     padding_block: int,
 ) -> _ReceiveCapacity:
     raw_route_count = world_size * max_tokens_per_rank * topk
-    # Local integration ABI: the caller reverse-maps its prescribed physical
-    # receive pool to this logical route limit. Do not clamp it to the number
-    # of routes the current topology can produce.
-    logical_route_count = max_recv_size_per_rank
+    logical_route_count = min(max_recv_size_per_rank, raw_route_count)
     active_expert_count = min(experts_per_rank, logical_route_count)
     padded_block_count = active_expert_count + (logical_route_count - active_expert_count) // padding_block
     return _ReceiveCapacity(
@@ -172,6 +169,7 @@ class _MetadataPushRouter(KernelComponent):
             "topk": int,
             "max_tokens_per_rank": int,
             "max_recv_size_per_rank": int,
+            "data_token_capacity": OptionalRequirement(int),
             "apply_topk_at_fc1": bool,
         }
 
@@ -187,7 +185,10 @@ class _MetadataPushRouter(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        self.max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
+        self.data_token_capacity = problem_desc.get("data_token_capacity")
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
 
         self.token_padding_block = impl_desc["token_padding_block"]
@@ -211,7 +212,17 @@ class _MetadataPushRouter(KernelComponent):
         token_capacity = self.receive_capacity(self.token_padding_block)
         self.raw_route_count = token_capacity.raw_route_count
         self.logical_route_capacity = token_capacity.logical_route_count
-        self.worst_case_token_count = token_capacity.padded_route_count
+        required_token_capacity = token_capacity.padded_route_count
+        if self.data_token_capacity is None:
+            self.data_token_capacity = required_token_capacity
+        if self.data_token_capacity < required_token_capacity:
+            raise ValueError(
+                "data_token_capacity must cover the padded logical receive "
+                f"capacity, got P={self.data_token_capacity}, "
+                f"required={required_token_capacity} for "
+                f"L={self.logical_route_capacity}."
+            )
+        self.worst_case_token_count = self.data_token_capacity
         self.expert_count_padded = round_up(self.expert_count, 4)
         self.expert_count_with_trash = self.expert_count_padded + 1
         self.router_elements_per_lane, self.router_data_cta_count = self._router_launch_configuration()
@@ -1316,6 +1327,7 @@ class TokenCommDeterministic(KernelComponent):
             "topk": int,
             "max_tokens_per_rank": int,
             "max_recv_size_per_rank": int,
+            "data_token_capacity": OptionalRequirement(int),
             "hidden_size": int,
             "quant_kind": str,
             "combine_format": CombineFormat,
@@ -1350,7 +1362,9 @@ class TokenCommDeterministic(KernelComponent):
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        self.max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
+        self.max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], self.world_size * self.max_tokens_per_rank * self.topk
+        )
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = problem_desc["quant_kind"]
         self.combine_format = problem_desc["combine_format"]

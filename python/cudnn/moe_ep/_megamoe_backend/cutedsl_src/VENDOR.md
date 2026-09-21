@@ -46,11 +46,13 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   row-major WGrad operand ABI: fake stride `(1, 0)`, `dst_k_major=False`, and
   row-major fixed-matrix validation. This preserves `fc1_a` as
   `(pool_rows, hidden)` with stride `(hidden, 1)`.
-- MoeEP reverse-maps its prescribed physical receive-pool size to the
-  upstream logical route-limit field. The deterministic communication
-  component and the forward/backward MegaMoE entry points preserve that
-  logical limit instead of clamping it to the raw route count, so workspace
-  shapes reproduce the caller-owned physical pool exactly.
+- MoeEP supplies an optional `data_token_capacity` physical-row count
+  independently from the upstream `max_recv_size_per_rank` logical route
+  limit. The deterministic communication component defaults the new field to
+  upstream's padded logical capacity for non-MoeEP consumers, while MoeEP
+  always supplies its exact caller-prescribed pool rows. Upstream topology
+  clamps remain intact, and the component rejects physical capacity below the
+  padded requirement for the clamped logical limit.
 - The materialized Rubin training TMEM helper replaces two unused Blackwell
   swap-AB extension annotations with `Any`; the extension and its now-empty
   local `kernel_src/blackwell` package tree are omitted from the vendored

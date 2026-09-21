@@ -59,6 +59,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             "topk": int,
             "max_tokens_per_rank": int,
             "max_recv_size_per_rank": int,
+            "data_token_capacity": OptionalRequirement(int),
             "gate_up_clamp": Optional[float],
         }
 
@@ -265,6 +266,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         hidden: int,
         launch_cluster_count: int,
         drop_on_overflow: bool,
+        data_token_capacity: Optional[int] = None,
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
         epi_flag_batch: Optional[Tuple[int, int]] = (4, 2),
@@ -304,6 +306,11 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "gate_up_clamp": gate_up_clamp,
             }
         )
@@ -356,7 +363,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         local_rank = problem_desc["local_rank"]
         num_topk = problem_desc["topk"]
         max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
-        max_recv_size_per_rank = problem_desc["max_recv_size_per_rank"]
+        max_recv_size_per_rank = min(
+            problem_desc["max_recv_size_per_rank"], world_size * max_tokens_per_rank * num_topk
+        )
+        data_token_capacity = problem_desc.get("data_token_capacity")
         hidden = problem_desc["hidden_size"]
         gate_up_clamp = problem_desc["gate_up_clamp"]
         combine_format = problem_desc["combine_format"]
@@ -484,6 +494,11 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 "topk": num_topk,
                 "max_tokens_per_rank": max_tokens_per_rank,
                 "max_recv_size_per_rank": max_recv_size_per_rank,
+                **(
+                    {"data_token_capacity": data_token_capacity}
+                    if data_token_capacity is not None
+                    else {}
+                ),
                 "hidden_size": hidden,
                 "quant_kind": str(quant_kind),
                 "combine_format": combine_format,
