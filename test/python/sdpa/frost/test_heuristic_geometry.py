@@ -90,9 +90,16 @@ def test_d512_model_counts_all_roles_in_split_and_unsplit(monkeypatch):
     monkeypatch.setattr(heur, "choose_split_kv", recording)
     plans = heur.recommend("A", _facts(h_kv=1, s_q=1, s_kv=131072, d_qk=512, d_v=512), {SPEC.name: 20500})
     assert plans and seen
+    # D512 is scored twice per leg: with the physical 4-CTA cluster and with the
+    # MMA width the constants were fitted with; the physical count may only
+    # LOWER the split (the increases it asks for are unmeasured).
+    counts = {kw["ctas_per_tile"] for kw in seen}
+    assert counts == {CfgD512.CGA_M, CfgD512.CTA_MMA}, counts
     for kw in seen:
-        assert kw["ctas_per_tile"] == CfgD512.CGA_M
-        assert kw["unsplit_launch"].ctas_per_tile == CfgD512.CGA_M
+        assert kw["unsplit_launch"].ctas_per_tile == kw["ctas_per_tile"]
+    physical = [kw for kw in seen if kw["ctas_per_tile"] == CfgD512.CGA_M]
+    fitted = [kw for kw in seen if kw["ctas_per_tile"] == CfgD512.CTA_MMA]
+    assert plans[0].knobs.split_kv == min(heur.choose_split_kv(**physical[0]), heur.choose_split_kv(**fitted[0]))
     # Every scoring leg still uses the graph's output, not packed head count.
     assert all(kw["combine_rows"] == 32 for kw in seen)
 

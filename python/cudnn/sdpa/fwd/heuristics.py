@@ -872,7 +872,10 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
 
 
 def _sm100_f16(caps: Capabilities, facts) -> bool:
-    return caps.sm_lo == 100 and caps.sm_hi < 107 and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    """The Blackwell datacenter f16 rows below Rubin (the row's capability range,
+    not the device: ``sdpa_fwd_prefill_sm100`` spans cc 10.0-10.6, so B200 and
+    GB300 both take this geometry)."""
+    return 100 <= caps.sm_lo and caps.sm_hi < 107 and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
 
 
 def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
@@ -911,13 +914,17 @@ def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
     return longest
 
 
-def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int) -> _SplitKvLaunch:
+def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *, physical: bool = True) -> _SplitKvLaunch:
+    """The launch the wave-cost model sees. ``physical=False`` counts the MMA
+    width per cluster (the count the model's constants were fitted with);
+    ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga)
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
     if _sm100_f16(caps, facts):
         kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
-        ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+        if physical:
+            ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
     return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
 
 
@@ -1002,25 +1009,39 @@ def _split_points(
             if split not in points:
                 points.append(split)
         return points
-    split_launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g)
-    unsplit_launch = None
+    unsplit_pack_g = None
     if unsplit_knobs is not None:
         unsplit_pack_g = _pack_gqa_group(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.pack_gqa)
-        unsplit_launch = _split_launch(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.tile_n, unsplit_knobs.cga, unsplit_pack_g)
-    split = choose_split_kv(
-        q_tiles=split_launch.q_tiles,
-        heads_q=split_launch.heads_q,
-        batch=facts.b,
-        kv_tiles=split_launch.kv_tiles,
-        sm_count=sm_count,
-        # The combine's grid is (S_q, H, B) — the REAL head count, not the
-        # packed one: packing folds heads into Q rows for the main kernel, but
-        # the combine still reduces one block per (row, head, batch) of the
-        # graph's own output.
-        combine_rows=facts.s_q * facts.h_q * facts.b,
-        ctas_per_tile=split_launch.ctas_per_tile,
-        unsplit_launch=unsplit_launch,
-    )
+
+    def _choose(physical: bool) -> int:
+        split_launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g, physical=physical)
+        unsplit_launch = None
+        if unsplit_knobs is not None:
+            unsplit_launch = _split_launch(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.tile_n, unsplit_knobs.cga, unsplit_pack_g, physical=physical)
+        return choose_split_kv(
+            q_tiles=split_launch.q_tiles,
+            heads_q=split_launch.heads_q,
+            batch=facts.b,
+            kv_tiles=split_launch.kv_tiles,
+            sm_count=sm_count,
+            # The combine's grid is (S_q, H, B) — the REAL head count, not the
+            # packed one: packing folds heads into Q rows for the main kernel, but
+            # the combine still reduces one block per (row, head, batch) of the
+            # graph's own output.
+            combine_rows=facts.s_q * facts.h_q * facts.b,
+            ctas_per_tile=split_launch.ctas_per_tile,
+            unsplit_launch=unsplit_launch,
+        )
+
+    split = _choose(physical=True)
+    if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
+        # The physical CTA count is a one-sided correction: every measured win of
+        # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
+        # 8 -> 4 on B200); the regime where it asks for MORE splits than the
+        # MMA-width count the constants were fitted with (D512, S_q <= 128, long
+        # KV) is unmeasured and timed slower on an SM100 board, so keep the
+        # fitted answer there.
+        split = min(split, _choose(physical=False))
     if split <= 1:
         return [no_split]
     return [split, no_split]
