@@ -62,6 +62,74 @@ def test_sm120_fp8_revision_benchmark_preserves_baseline_layout(monkeypatch, cap
     assert records[0]["v_block_sizes"] == [128, 128]
     assert len(records) == 3
     assert all(all(record["bitwise_equal"]) for record in records[1:])
+    assert records[0]["configured_baseline_compile_options"] == records[0]["configured_candidate_compile_options"]
+    assert all(record["baseline_compile_options"] == record["candidate_compile_options"] for record in records[1:])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=120128)
+def test_sm120_fp8_blk128_compile_options_are_scoped_and_cached(monkeypatch):
+    """Compiler tuning must neither affect blk64 nor alias an untuned callable."""
+    BSA = _require_sm120()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    native = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    kernel = native.BlockSparseAttnForwardFp8Sm120Blk128
+    tuned_options = '--ptxas-options="--register-usage-level=2"'
+    assert getattr(kernel(v_block_size=0), "_compile_options", "") == ""
+    q = torch.randn((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 1, 16384, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.arange(128, device="cuda", dtype=torch.int32).expand(1, 1, 2, 128).contiguous()
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm120_fp8, "compile_cache", {})
+    original_compile = interface.cute.compile
+    compiled_options = []
+    executed_options = []
+
+    def record_compile(instance, *args, **kwargs):
+        if isinstance(instance, kernel):
+            compiled_options.append(kwargs.get("options", ""))
+        elif instance.__class__.__name__ == "BlockSparseAttnForwardFp8Sm120Blk64":
+            assert not kwargs.get("options", "")
+        compiled = original_compile(instance, *args, **kwargs)
+        if isinstance(instance, kernel):
+
+            def record_execute(*runtime_args):
+                executed_options.append(kwargs.get("options", ""))
+                return compiled(*runtime_args)
+
+            return record_execute
+        return compiled
+
+    monkeypatch.setattr(interface.cute, "compile", record_compile)
+    results = []
+    for options in (tuned_options, "", tuned_options):
+        monkeypatch.setattr(kernel, "_compile_options", options, raising=False)
+        results.append(interface._bsa_attn_fwd_sm120_fp8(*quantized, indices, 128, 128**-0.5, sparse_block_size=128, v_block_size=128))
+    torch.cuda.synchronize()
+    assert compiled_options == [tuned_options, ""]
+    assert executed_options == [tuned_options, "", tuned_options]
+    assert len(interface._bsa_attn_fwd_sm120_fp8.compile_cache) == 2
+    for result in results[1:]:
+        for actual, expected in zip(result, results[0]):
+            assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+
+    monkeypatch.setattr(kernel, "_compile_min_blocks", 128, raising=False)
+    for topk in (1, 127):
+        short_indices = indices[..., :topk].contiguous()
+        interface._bsa_attn_fwd_sm120_fp8(*quantized, short_indices, topk, 128**-0.5, sparse_block_size=128, v_block_size=128)
+        assert executed_options[-1] == ""
+    counts = torch.full((1, 1, 2), 128, device="cuda", dtype=torch.int32)
+    variable_result = interface._bsa_attn_fwd_sm120_fp8(*quantized, indices, 128, 128**-0.5, q2k_block_nums=counts, sparse_block_size=128, v_block_size=128)
+    assert executed_options[-1] == ""
+    for actual, expected in zip(variable_result, results[0]):
+        assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+
+    indices64 = torch.zeros((1, 1, 4, 1), device="cuda", dtype=torch.int32)
+    BSA.block_sparse_attention_fp8_forward(q, k, v, indices64, sparse_block_size=64)
+    torch.cuda.synchronize()
 
 
 @pytest.mark.L0

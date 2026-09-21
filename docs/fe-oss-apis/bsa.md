@@ -211,6 +211,14 @@ and an additional register-donating warpgroup whose first warp issues TMA
 loads. Quantization writes V directly into private KV128 tiles; no separate
 transpose/repack launch is added. Public inputs remain contiguous BF16 BHSD.
 
+Long fixed-count blocked-V loops (at least 128 selected KV blocks) use the
+private PTXAS `--register-usage-level=2` scheduling option. Short loops,
+variable per-row counts, legacy BHSD V and blk64 retain the default options.
+The compile-cache key includes the option string. This beta compiler tuning
+feature has only a small measured benefit; revalidate it after toolchain
+changes. See the [SM120 FP8 review summary](../../benchmark/bsa/SM120_FP8_REVIEW.md)
+for paired timings, accuracy evidence, NCU counters and reproduction.
+
 Quantization uses E4M3 Q with per-row scales, mean-centered E4M3 K with
 per-16-token scales (eight per KV128 tile), and E4M3 V with per-head/channel
 scales shared across batch and sequence. Softmax uses FP32; probabilities

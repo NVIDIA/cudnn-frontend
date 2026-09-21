@@ -174,6 +174,9 @@ def _online_softmax_ordered_fp8(
 # =============================================================================
 class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
     supports_blocked_v = True
+    # Tune long fixed-count loops only; short loops regress with this policy.
+    _compile_options = '--ptxas-options="--register-usage-level=2"'
+    _compile_min_blocks = 128
 
     def __init__(
         self,
@@ -191,6 +194,8 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
     ):
         assert v_block_size in (0, 128)
         self.v_block_size = v_block_size
+        if v_block_size == 0:
+            self._compile_options = ""
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         assert self.dtype is cutlass.Float8E4M3FN, "SM120 FP8 blk128 fwd requires fp8_e4m3fn"

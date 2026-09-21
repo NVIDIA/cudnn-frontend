@@ -1183,6 +1183,9 @@ def _bsa_attn_fwd_sm120_fp8(
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
     )
+    compile_options = getattr(fwd_kernel, "_compile_options", "")
+    if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
+        compile_options = ""
     compile_key = _dynamic_tensors_compile_key(
         f"sm120_fp8_blk{sparse_block_size}",
         (
@@ -1192,6 +1195,7 @@ def _bsa_attn_fwd_sm120_fp8(
             has_block_nums,
             has_block_sizes,
             block_sizes_mode,
+            compile_options,
         ),
         runtime_tensors,
         leading_dims=(1, 1, 1 if v_block_size == 128 else 0, 1, 0, 0, 0, 0, 0, 0, 0),
@@ -1207,6 +1211,7 @@ def _bsa_attn_fwd_sm120_fp8(
             fwd_kernel,
             *args,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            **({"options": compile_options} if compile_options else {}),
         )
 
     with torch.cuda.nvtx.range(f"bsa_attn_fwd_sm120_fp8_blk{sparse_block_size}_kernel"):

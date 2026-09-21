@@ -84,6 +84,9 @@ def main():
         "seed": args.seed,
         "quantized_values_bitwise_equal": True,
         "v_block_sizes": v_blocks,
+        "configured_baseline_compile_options": getattr(baseline, "_compile_options", "") if v_blocks[0] else "",
+        "configured_candidate_compile_options": getattr(candidate, "_compile_options", "") if v_blocks[1] else "",
+        "compile_min_blocks": tuple(getattr(kernel, "_compile_min_blocks", 0) for kernel in (baseline, candidate)),
         "baseline_sha256": hashlib.sha256(args.baseline_kernel.read_bytes()).hexdigest(),
         "candidate_sha256": hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest(),
         "quantizer_sha256": {
@@ -100,6 +103,10 @@ def main():
         for density in args.densities:
             num_blocks = args.sequence // 128
             topk = _rounded_topk(num_blocks, density)
+            compile_options = tuple(
+                getattr(kernel, "_compile_options", "") if v_blocks[index] and topk >= getattr(kernel, "_compile_min_blocks", 0) else ""
+                for index, kernel in enumerate((baseline, candidate))
+            )
             for pattern in args.patterns:
                 indices = _make_block_indices(args.heads, num_blocks, topk, pattern, q.device)
                 for mode in ("attention_only", "with_quantization"):
@@ -145,6 +152,8 @@ def main():
                         "topk128": topk,
                         "pattern": pattern,
                         "mode": mode,
+                        "baseline_compile_options": compile_options[0],
+                        "candidate_compile_options": compile_options[1],
                         "baseline_ms": medians[0],
                         "candidate_ms": medians[1],
                         "speedup": medians[0] / medians[1],
