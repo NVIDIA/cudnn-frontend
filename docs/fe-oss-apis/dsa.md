@@ -290,7 +290,23 @@ compressed column 0.
     weights have already been pre-scaled by `q_scale * sm_scale`.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
-- **Output** — `scores`: `(B, S_q, S_k)` FP32.
+- **Output** — `scores`: `(B, S_q, S_k)` FP32. On SM100 this is the
+  `[..., :S_k]` view over a `(B, S_q, ceil4(S_k))` (THD:
+  `(total_q, ceil4(max_seqlen_k))`) allocation: the kernel binds `out` through
+  a 16-byte-aligned layout, so the fp32 row stride must be a multiple of 4
+  elements and at least `ceil4(S_k)`. When `S_k % 4 != 0` the returned tensor
+  is therefore a strided view, not a fresh contiguous copy. A caller-provided
+  `out` must be such a view (`ValueError` otherwise); nothing is staged or
+  copied back. `IndexerForward` takes the contiguous padded
+  `(B, S_q, S_k_padded)` buffer both at construction and in `execute()`, binds
+  `out[..., :S_k]` directly, and never writes columns `[S_k, S_k_padded)`.
+- **Strided inputs** — `IndexerForward.check_support()` declines `q`/`k`/`w`
+  whose innermost stride is not 1 with `NotImplementedError` (the kernel
+  addresses them natively; nothing is repacked), and `execute()` raises
+  `ValueError` for such live tensors. `indexer_forward_wrapper` and
+  `indexer_forward_top_k_wrapper` make strided inputs contiguous on the launch
+  stream as a torch-op convenience, at the cost of one copy kernel per strided
+  tensor.
 - **Precision paths**
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
@@ -479,9 +495,11 @@ written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
 all dense score tensors that feed the same loss path.
 
 On SM100, Indexer Forward and Dense Indexer Score Recompute use the same
-unified kernel implementation: forward runs it with `compute_lse=False`, while
-dense indexer score recompute runs it with `compute_lse=True`. The shared
-implementation lives in `score_recompute`; `indexer_forward` only imports it.
+unified kernel implementation: forward runs it with `compute_lse=False` and
+passes `denom=None`, so the LSE slot is compiled out (no placeholder buffer),
+while dense indexer score recompute runs it with `compute_lse=True` and a live
+`denom`. The shared implementation lives in `score_recompute`;
+`indexer_forward` only imports it.
 Dense Attention Score Recompute has a separate MXFP8 kernel because its score
 and normalization semantics differ from the indexer path.
 
