@@ -430,6 +430,17 @@ the workspace BASE pointer — the `OperandBuffer` capsule owns its own
 shape/stride, so the memo holds no device memory; a caller rotating workspaces
 pays the conversions again and nothing else (`hopper/kda_engine.py`; detector
 `test_kda_sm90_cuda.py::test_alternating_workspaces_recarve`).
+An APIBase whose kernel needs per-execute metadata built on device (HSTU
+block-sparse CSR from `func`) plus a wide-dtype accumulator (fp32 dQ) declares
+both in `scratch_workspace_bytes()` from plan-time geometry
+(`hstu_{q2k,k2q,d256_bwd}_block_sparse_workspace_bytes`: pure ints, 128-B
+chunks in carve order) and carves them at execute with one `WorkspaceCarver`:
+`take()` the accumulator, zero it on the launch stream, hand
+`carver.remaining()` to the nested builder. `compile()` has no workspace: a
+builder in compile-only mode compiles from fakes (R11) and returns None, so
+`check_support()` computes and caches the byte count before `compile()` runs
+and the wrapper allocates from that cached value (`hstu/hstu_attention/api.py`,
+`_interface.py`, `_kernels/block_sparse_builder.py`).
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -535,6 +546,17 @@ view; the copy runs on the launch stream inside `stream_context`; a runtime
 buffer that does not match the declaration raises naming the port; the module
 docstring records it as a Rule 2 exception with the kernel change that retires
 it. It is listed under GRANDFATHERED in the audit, not cited as precedent.
+Express the native layout as a host predicate over strides and reuse it on
+both sides: `_supports_bwd_original_qkv_layout` (unit-stride D, token/head
+strides % 8, non-overlapping, 16-B base) / `_supports_bwd_direct_grad_layout`
+(+ non-zero strides) gate `check_support()` (`NotImplementedError` naming
+tensor, shape and strides) and are re-checked in `_interface` (`ValueError`).
+Route-dependent requirements (the D=256 two-kernel TMA path: all seven tensors
+contiguous) key on the dispatch ROUTE, not the head dim, so a sibling kernel
+that serves the layout natively (qlen=1 direct at D=256) is not declined
+(`HSTUBwdSm100.check_support`). Deleting a `.clone(memory_format=...)` /
+`permute().clone()` / `empty_strided` + `copy_` staging pair is the expected
+shape of an R5 patch.
 
 **R6 — something must block the host (host-planned work items, a D2H read
 of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
@@ -610,6 +632,15 @@ A multi-stage block runs the allocation assertion around BUILD as well
 "first execute of a shape inside `torch.cuda.graph`, replay bit-identical" claim
 directly (`test_block_fp8.py::test_execute_allocates_nothing_and_never_synchronizes`,
 `::test_first_execute_inside_capture`, `::test_quant_slot_is_filled_on_launch_stream_and_matches_spec`).
+For a capture-time allocation claim read `allocation.all.allocated` INSIDE the
+`torch.cuda.graph` window: on torch 2.13 `capture_begin` itself adds two
+allocations, so a before/after around the `with` is red on innocent code
+(`_capture_allocating_nothing` in `test_hstu_attention.py` /
+`test_hstu_block_sparse.py`). HSTU detectors:
+`test_hstu_attention.py::test_fwd_bwd_execute_allocates_nothing_and_never_synchronizes`,
+`::test_workspace_contract`, `::test_check_support_declines_unaligned_layouts`,
+`test_hstu_block_sparse.py::test_builder_workspace_bytes_match_carve` (the
+carver's final offset equals the bytes function for every geometry).
 
 **R10 — a launch envelope the caller already knows (max sequence length, packed
 total, batch count, top-k width).** It is a required host int at plan time (an
@@ -654,6 +685,13 @@ operands, under `torch.cuda.device(desc.device)`) and an execute-time
 `compile_allocates_nothing` has something to measure and `execute()` is a
 guaranteed cache hit (`indexer_top_k/indexer_top_k_decode_varlen.py`). Still
 lazy, tracked: `IndexerBackward`, `DenseIndexerBackward`, `IndexerForward`.
+`from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=ndim-1)` keeps
+size-1 modes dynamic (`(?,?,?):(?{i64},?{i64},1)` for `(B,1,n)` and `(1,n,L)`),
+so `make_fake_tensor(dtype, (sym_int(),)*rank, (sym_int64(),)*(rank-1)+(1,),
+assumed_align=16)` reproduces it exactly
+(`block_sparse_builder._fake_dynamic_tensor`); a divisibility the launch-time
+view guarantees goes on the fake too (`sym_int64(divisibility=8)` for the HSTU
+fp32 accumulator).
 
 
 ## Frontend-only kernel package layout
