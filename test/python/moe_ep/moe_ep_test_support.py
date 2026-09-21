@@ -227,8 +227,7 @@ def _training_graph_pattern(
             combine_format="mxfp8",
         )
     raise ValueError(
-        "training graph pattern must be 'smoke' or 'ds3_ep4_v1', "
-        f"got {name!r}"
+        "training graph pattern must be 'smoke' or 'ds3_ep4_v1', " f"got {name!r}"
     )
 
 
@@ -245,9 +244,7 @@ def _constant_mxfp8(
 
     canonical_axis = axis % len(shape)
     scale_shape = list(shape)
-    scale_shape[canonical_axis] = (
-        scale_shape[canonical_axis] + 31
-    ) // 32
+    scale_shape[canonical_axis] = (scale_shape[canonical_axis] + 31) // 32
     return BlockScaledTensor(
         data=torch.full(
             shape,
@@ -328,18 +325,14 @@ def make_training_graph_pattern_inputs(
     local_expert = (
         tokens + torch.div(slots, world_size, rounding_mode="floor")
     ) % experts_per_rank
-    topk_idx = (
-        destination_rank * experts_per_rank + local_expert
-    ).to(torch.int32)
+    topk_idx = (destination_rank * experts_per_rank + local_expert).to(torch.int32)
     topk_weights = torch.arange(
         1,
         pattern.top_k + 1,
         dtype=torch.float32,
         device=device,
     ).expand(token_count, -1)
-    topk_weights = (
-        topk_weights / topk_weights.sum(dim=1, keepdim=True)
-    ).contiguous()
+    topk_weights = (topk_weights / topk_weights.sum(dim=1, keepdim=True)).contiguous()
     return (
         activation,
         fc1_weight,
@@ -417,7 +410,12 @@ def quantize_mxfp8(tensor: torch.Tensor, *, axis: int = -1):
     )
     scale = power_of_two_scale.to(torch.float8_e8m0fnu)
     reciprocal = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
-    payload = (blocks * reciprocal.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).reshape(*moved.shape)[..., :logical_extent]
+    payload = (
+        (blocks * reciprocal.unsqueeze(-1))
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .reshape(*moved.shape)[..., :logical_extent]
+    )
 
     return BlockScaledTensor(
         data=payload.movedim(-1, axis).contiguous(),
@@ -448,11 +446,9 @@ def _training_config(**overrides):
         "intermediate_size": 256,
         "top_k": 2,
         "max_tokens_per_rank": 4,
-        "max_recv_size_per_rank": 128,
+        "physical_recv_pool_rows": 128,
         "drop_on_overflow": True,
-        "fc1_weight_layout": (
-            MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-        ),
+        "fc1_weight_layout": (MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
         **overrides,
     }
     config = _moe_ep_config(**values)
@@ -497,9 +493,7 @@ def _training_prepared_pair(config, pool_rows: int = 512):
             dfc2_recompute=False,
             dfc2_col_output=False,
             enable_grad_y2_col_quant=False,
-            max_tokens_per_rank=(
-                config.public_config.parallel.max_tokens_per_rank
-            ),
+            max_tokens_per_rank=(config.public_config.parallel.max_tokens_per_rank),
             top_k=config.public_config.model.top_k,
             weight_storage_mode="contiguous",
         ),
@@ -525,9 +519,7 @@ def _training_prepared_pair(config, pool_rows: int = 512):
             dfc2_recompute=True,
             dfc2_col_output=True,
             enable_grad_y2_col_quant=True,
-            max_tokens_per_rank=(
-                config.public_config.parallel.max_tokens_per_rank
-            ),
+            max_tokens_per_rank=(config.public_config.parallel.max_tokens_per_rank),
             top_k=config.public_config.model.top_k,
             weight_storage_mode="contiguous",
         ),
@@ -633,15 +625,13 @@ def _moe_ep_config(**values):
     parallel_names = (
         "ep_group",
         "max_tokens_per_rank",
-        "max_recv_size_per_rank",
+        "physical_recv_pool_rows",
         "drop_on_overflow",
         "token_padding_size",
         "sf_padding_size",
     )
     parallel_values = {
-        name: values.pop(name)
-        for name in parallel_names
-        if name in values
+        name: values.pop(name) for name in parallel_names if name in values
     }
     for name in ("output_format", "combine_format"):
         if name in values and not isinstance(values[name], PublicMoeFormat):
@@ -649,9 +639,7 @@ def _moe_ep_config(**values):
     if "fc1_weight_layout" in values and not isinstance(
         values["fc1_weight_layout"], MoeEpFc1WeightLayout
     ):
-        raise TypeError(
-            "test configs must use MoeEpFc1WeightLayout directly"
-        )
+        raise TypeError("test configs must use MoeEpFc1WeightLayout directly")
     data_path_names = (
         "output_format",
         "combine_format",
@@ -660,9 +648,7 @@ def _moe_ep_config(**values):
         "gate_up_clamp",
     )
     data_path_values = {
-        name: values.pop(name)
-        for name in data_path_names
-        if name in values
+        name: values.pop(name) for name in data_path_names if name in values
     }
     tuning_values = {}
     for name in (
@@ -685,8 +671,7 @@ def _moe_ep_config(**values):
         MoeEpNativeWeightStorageMode,
     ):
         raise TypeError(
-            "training_weight_storage_mode must be a "
-            "MoeEpNativeWeightStorageMode"
+            "training_weight_storage_mode must be a " "MoeEpNativeWeightStorageMode"
         )
     if values:
         raise TypeError(
@@ -805,7 +790,9 @@ def _sm107_device() -> torch.device:
         pytest.skip("Rubin MXFP8 forward requires CUDA")
     device = torch.device("cuda", 0)
     if torch.cuda.get_device_capability(device) != (10, 7):
-        pytest.skip("Rubin MXFP8 forward requires exactly SM107 (compute capability 10.7)")
+        pytest.skip(
+            "Rubin MXFP8 forward requires exactly SM107 (compute capability 10.7)"
+        )
     return device
 
 
@@ -814,8 +801,14 @@ def _require_distributed_sm107(world_size: int) -> None:
         pytest.skip("multi-GPU Rubin MXFP8 forward requires NCCL")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"multi-GPU Rubin MXFP8 forward requires {world_size} GPUs")
-    if any(torch.cuda.get_device_capability(index) != (10, 7) for index in range(world_size)):
-        pytest.skip("multi-GPU Rubin MXFP8 forward requires exactly SM107 " "(compute capability 10.7) on every rank")
+    if any(
+        torch.cuda.get_device_capability(index) != (10, 7)
+        for index in range(world_size)
+    ):
+        pytest.skip(
+            "multi-GPU Rubin MXFP8 forward requires exactly SM107 "
+            "(compute capability 10.7) on every rank"
+        )
     try:
         import nvshmem.core  # noqa: F401
     except (ImportError, OSError):
@@ -863,7 +856,12 @@ def _make_forward_case(
         / 8,
         axis=1,
     )
-    topk_idx = torch.arange(tokens * top_k, device=device).reshape(tokens, top_k).remainder(experts).to(index_dtype)
+    topk_idx = (
+        torch.arange(tokens * top_k, device=device)
+        .reshape(tokens, top_k)
+        .remainder(experts)
+        .to(index_dtype)
+    )
     topk_weights = torch.arange(
         1,
         tokens * top_k + 1,
@@ -893,7 +891,9 @@ def _stress_backend_reuse(
     assert backend is not None
     compiled = backend._compiled
     inference_workspace = backend._inference_resources._workspace
-    weight_refresh_count = backend._adapter.weight_refresh_count if check_weight_refresh else None
+    weight_refresh_count = (
+        backend._adapter.weight_refresh_count if check_weight_refresh else None
+    )
     alternate_stream = torch.cuda.Stream(device=device)
 
     for iteration in range(100):
@@ -901,16 +901,17 @@ def _stress_backend_reuse(
         args[4].copy_(original_topk_weights * float((iteration % 7) + 1) / 7.0)
         if iteration % 10 == 0:
             args[3].copy_(original_topk_idx.flip(1))
-        stream = torch.cuda.current_stream(device) if iteration % 2 == 0 else alternate_stream
+        stream = (
+            torch.cuda.current_stream(device)
+            if iteration % 2 == 0
+            else alternate_stream
+        )
         with torch.cuda.stream(stream):
             stressed = op(*args)
         stream.synchronize()
         assert torch.isfinite(_output_as_float(stressed)).all()
         assert backend._compiled is compiled
-        assert (
-            backend._inference_resources._workspace
-            is inference_workspace
-        )
+        assert backend._inference_resources._workspace is inference_workspace
         if weight_refresh_count is not None:
             assert backend._adapter.weight_refresh_count == weight_refresh_count
 
@@ -980,9 +981,15 @@ def _unpack_wgrad_scale_part_bytes(
     atom_count = row_atoms * column_atoms
     expected = padded_rows * padded_columns
     if packed.numel() != expected:
-        raise ValueError(f"packed scale part has {packed.numel()} bytes, expected {expected}")
+        raise ValueError(
+            f"packed scale part has {packed.numel()} bytes, expected {expected}"
+        )
     blocked = (
-        packed.reshape(atom_count, 32, 4, 4).transpose(1, 2).reshape(row_atoms, column_atoms, 128, 4).permute(0, 2, 1, 3).reshape(padded_rows, padded_columns)
+        packed.reshape(atom_count, 32, 4, 4)
+        .transpose(1, 2)
+        .reshape(row_atoms, column_atoms, 128, 4)
+        .permute(0, 2, 1, 3)
+        .reshape(padded_rows, padded_columns)
     )
     return blocked[:rows, :columns]
 
@@ -994,7 +1001,11 @@ def _unpack_wgrad_scale_part(
 ) -> torch.Tensor:
     """Decode one grouped-wgrad scale part as logical E8M0 values."""
 
-    return _unpack_wgrad_scale_part_bytes(packed, rows, columns).view(torch.float8_e8m0fnu).float()
+    return (
+        _unpack_wgrad_scale_part_bytes(packed, rows, columns)
+        .view(torch.float8_e8m0fnu)
+        .float()
+    )
 
 
 def _poison_training_outputs_for_test(forward_out, backward_out) -> None:
@@ -1083,10 +1094,16 @@ def _dequantize_wgrad_operand(
     scale_byte_offset = 0
     for expert, (end, valid_count) in enumerate(zip(ends, valid_counts)):
         if end < previous or end > k_capacity:
-            raise ValueError("expert offsets must be nondecreasing and fit the operand " f"K capacity ({k_capacity})")
+            raise ValueError(
+                "expert offsets must be nondecreasing and fit the operand "
+                f"K capacity ({k_capacity})"
+            )
         extent = end - previous
         if valid_count < 0 or valid_count > extent:
-            raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
+            raise ValueError(
+                f"expert {expert} valid route count {valid_count} exceeds "
+                f"its padded extent {extent}"
+            )
         if extent % 32:
             raise ValueError("each padded expert K extent must be divisible by 32")
         if extent == 0:
@@ -1110,8 +1127,12 @@ def _dequantize_wgrad_operand(
             valid_scale_columns = (valid_count + 31) // 32
             logical_scale = logical_scale[:, :valid_scale_columns]
             if k_dim == 1:
-                expanded_scale = logical_scale.repeat_interleave(32, dim=1)[:, :valid_count]
-                output[:, previous:valid_end] = data[:, previous:valid_end].float() * expanded_scale
+                expanded_scale = logical_scale.repeat_interleave(32, dim=1)[
+                    :, :valid_count
+                ]
+                output[:, previous:valid_end] = (
+                    data[:, previous:valid_end].float() * expanded_scale
+                )
             else:
                 expanded_scale = logical_scale.repeat_interleave(
                     32,
@@ -1119,7 +1140,9 @@ def _dequantize_wgrad_operand(
                 )[
                     :, :valid_count
                 ].transpose(0, 1)
-                output[previous:valid_end, :] = data[previous:valid_end, :].float() * expanded_scale
+                output[previous:valid_end, :] = (
+                    data[previous:valid_end, :].float() * expanded_scale
+                )
         previous = end
         scale_byte_offset += scale_byte_count
 
@@ -1160,7 +1183,9 @@ def _dense_wgrads_from_operands(operands):
     fc1_parts = []
     fc2_parts = []
     ends = [int(value) for value in operands.expert_offsets.detach().cpu().tolist()]
-    valid_counts = [int(value) for value in operands.valid_route_counts.detach().cpu().tolist()]
+    valid_counts = [
+        int(value) for value in operands.valid_route_counts.detach().cpu().tolist()
+    ]
     if len(ends) != len(valid_counts):
         raise ValueError("expert offsets and valid route counts must have equal size")
 
@@ -1168,10 +1193,17 @@ def _dense_wgrads_from_operands(operands):
     for expert, (end, valid_count) in enumerate(zip(ends, valid_counts)):
         extent = end - previous
         if valid_count < 0 or valid_count > extent:
-            raise ValueError(f"expert {expert} valid route count {valid_count} exceeds " f"its padded extent {extent}")
+            raise ValueError(
+                f"expert {expert} valid route count {valid_count} exceeds "
+                f"its padded extent {extent}"
+            )
         valid_end = previous + valid_count
-        fc1_parts.append(fc1_a[previous:valid_end, :].transpose(0, 1) @ fc1_b[previous:valid_end, :])
-        fc2_parts.append(fc2_a[previous:valid_end, :].transpose(0, 1) @ fc2_b[previous:valid_end, :])
+        fc1_parts.append(
+            fc1_a[previous:valid_end, :].transpose(0, 1) @ fc1_b[previous:valid_end, :]
+        )
+        fc2_parts.append(
+            fc2_a[previous:valid_end, :].transpose(0, 1) @ fc2_b[previous:valid_end, :]
+        )
         previous = end
     return torch.stack(fc1_parts), torch.stack(fc2_parts)
 
@@ -1258,12 +1290,16 @@ def _assert_grouped_wgrads_match_reference(
         expected_fp32 = expected_dw.float()
         absolute_error = (actual_fp32 - expected_fp32).abs()
         max_absolute_error = absolute_error.max().item()
-        max_relative_error = (absolute_error / expected_fp32.abs().clamp_min(1.0e-6)).max().item()
+        max_relative_error = (
+            (absolute_error / expected_fp32.abs().clamp_min(1.0e-6)).max().item()
+        )
         torch.testing.assert_close(
             actual_fp32,
             expected_fp32,
             msg=lambda default, name=name: (
-                f"{name} does not match {reference_name}; " f"max_abs_error={max_absolute_error:.6g}, " f"max_rel_error={max_relative_error:.6g}\n{default}"
+                f"{name} does not match {reference_name}; "
+                f"max_abs_error={max_absolute_error:.6g}, "
+                f"max_rel_error={max_relative_error:.6g}\n{default}"
             ),
             **close_kwargs,
         )
@@ -1277,7 +1313,7 @@ def _reference_backward(config) -> MoeEpReference:
         "ep_rank",
         "ep_size",
         "experts_per_rank",
-        "max_recv_size_per_rank",
+        "physical_recv_pool_rows",
         "sf_padding_size",
         "tuning",
     ):
@@ -1297,11 +1333,23 @@ def _fixed_training_weights(args):
 
     fc1_weight = args[1]
     fc2_weight = args[2]
-    dense_fc1 = fc1_weight if isinstance(fc1_weight, torch.Tensor) else fc1_weight.dequantize()
-    dense_fc2 = fc2_weight if isinstance(fc2_weight, torch.Tensor) else fc2_weight.dequantize()
+    dense_fc1 = (
+        fc1_weight if isinstance(fc1_weight, torch.Tensor) else fc1_weight.dequantize()
+    )
+    dense_fc2 = (
+        fc2_weight if isinstance(fc2_weight, torch.Tensor) else fc2_weight.dequantize()
+    )
     forward = MoeEpForwardWeights(
-        fc1=(_quantize_plain_mxfp8(dense_fc1, axis=1) if isinstance(fc1_weight, torch.Tensor) else fc1_weight),
-        fc2=(_quantize_plain_mxfp8(dense_fc2, axis=1) if isinstance(fc2_weight, torch.Tensor) else fc2_weight),
+        fc1=(
+            _quantize_plain_mxfp8(dense_fc1, axis=1)
+            if isinstance(fc1_weight, torch.Tensor)
+            else fc1_weight
+        ),
+        fc2=(
+            _quantize_plain_mxfp8(dense_fc2, axis=1)
+            if isinstance(fc2_weight, torch.Tensor)
+            else fc2_weight
+        ),
     )
     backward = MoeEpBackwardWeights(
         w2_transpose=_quantize_plain_mxfp8(
@@ -1399,9 +1447,7 @@ def _make_discrete_training_weights(forward, backward):
                 (size - 1) * stride
                 for size, stride in zip(source.shape, source.stride())
             )
-            storage_offset = (
-                expert_index * (expert_index + 1) // 2 * alignment_elements
-            )
+            storage_offset = expert_index * (expert_index + 1) // 2 * alignment_elements
             backing = torch.empty(
                 storage_offset + footprint + alignment_elements,
                 dtype=source.dtype,
@@ -1415,7 +1461,9 @@ def _make_discrete_training_weights(forward, backward):
             )
             view.copy_(source)
             if view.data_ptr() % 256:
-                raise RuntimeError("discrete expert weight base must be 256-byte aligned")
+                raise RuntimeError(
+                    "discrete expert weight base must be 256-byte aligned"
+                )
             views.append(view)
             backings.append(backing)
         return tuple(views), tuple(backings)
@@ -1596,7 +1644,9 @@ def _assert_backward_matches(actual, expected, topk_idx) -> None:
         torch.testing.assert_close(
             gradient.float(),
             reference,
-            msg=lambda default, name=name: (f"{name} does not match the backward reference\n{default}"),
+            msg=lambda default, name=name: (
+                f"{name} does not match the backward reference\n{default}"
+            ),
             **close_kwargs,
         )
 
@@ -1653,6 +1703,8 @@ def _assert_wgrads_match_reference(
         torch.testing.assert_close(
             actual_dw,
             expected_dw,
-            msg=lambda default, name=name: (f"{name} does not match the independent reference\n{default}"),
+            msg=lambda default, name=name: (
+                f"{name} does not match the independent reference\n{default}"
+            ),
             **_WGRAD_CLOSE_KWARGS,
         )

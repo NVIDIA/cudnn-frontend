@@ -47,7 +47,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--diagnostic-replays", type=int, default=2)
     parser.add_argument("--burst-replays", type=int, default=100)
-    parser.add_argument("--max-recv-size-per-rank", type=int)
+    parser.add_argument("--physical-recv-pool-rows", type=int)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--expect-overflow-assert", action="store_true")
@@ -64,13 +64,9 @@ def _resolve_pattern_and_capacity(
     world_size: int,
 ):
     pattern = _training_graph_pattern(args.pattern, world_size)
-    if (
-        args.dgrad_optimization == "ds3_ep4_v1"
-        and pattern.name != "ds3_ep4_v1"
-    ):
+    if args.dgrad_optimization == "ds3_ep4_v1" and pattern.name != "ds3_ep4_v1":
         raise ValueError(
-            "dgrad_optimization='ds3_ep4_v1' requires "
-            "--pattern ds3_ep4_v1"
+            "dgrad_optimization='ds3_ep4_v1' requires " "--pattern ds3_ep4_v1"
         )
     if pattern.name == "ds3_ep4_v1" and args.expect_overflow_assert:
         raise ValueError(
@@ -79,16 +75,16 @@ def _resolve_pattern_and_capacity(
         )
     physical_capacity = (
         pattern.physical_recv_pool_size
-        if args.max_recv_size_per_rank is None
-        else args.max_recv_size_per_rank
+        if args.physical_recv_pool_rows is None
+        else args.physical_recv_pool_rows
     )
-    _positive("max_recv_size_per_rank", physical_capacity)
+    _positive("physical_recv_pool_rows", physical_capacity)
     if (
         pattern.name == "ds3_ep4_v1"
-        and physical_capacity != pattern.physical_recv_pool_size
+        and physical_capacity < pattern.physical_recv_pool_size
     ):
         raise ValueError(
-            "ds3_ep4_v1 requires physical max_recv_size_per_rank="
+            "ds3_ep4_v1 requires physical_recv_pool_rows >= "
             f"{pattern.physical_recv_pool_size}, got {physical_capacity}"
         )
     return pattern, physical_capacity
@@ -171,12 +167,12 @@ def _prepare_case(
     world_size: int,
     pattern,
     dgrad_optimization: str,
-    max_recv_size_per_rank: int,
+    physical_recv_pool_rows: int,
     drop_on_overflow: bool,
 ):
     _runtime_debug(
         "probe.prepare.inputs.begin",
-        physical_capacity=max_recv_size_per_rank,
+        physical_capacity=physical_recv_pool_rows,
         drop_on_overflow=drop_on_overflow,
         pattern=pattern.name,
         dgrad_optimization=dgrad_optimization,
@@ -210,12 +206,10 @@ def _prepare_case(
             # This is a collective ABI capacity, not the rank-local token count.
             # Pattern input factories may intentionally vary local shapes.
             max_tokens_per_rank=pattern.max_tokens_per_rank,
-            max_recv_size_per_rank=max_recv_size_per_rank,
+            physical_recv_pool_rows=physical_recv_pool_rows,
             drop_on_overflow=drop_on_overflow,
             combine_format=pattern.combine_format,
-            fc1_weight_layout=(
-                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-            ),
+            fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
             training_backward_tuning=MoeEpTuningConfig(
                 dgrad_optimization=dgrad_optimization,
             ),
@@ -234,10 +228,10 @@ def _prepare_case(
             f"{backward.config.dgrad_optimization!r} != "
             f"{dgrad_optimization!r}"
         )
-    if backward.pool_token_capacity != max_recv_size_per_rank:
+    if backward.pool_token_capacity != physical_recv_pool_rows:
         raise RuntimeError(
             "training graph probe prepared the wrong physical receive pool: "
-            f"{backward.pool_token_capacity} != {max_recv_size_per_rank}"
+            f"{backward.pool_token_capacity} != {physical_recv_pool_rows}"
         )
     upstream_profile = backward.kernel.resolved_dgrad_config[
         "dgrad_optimization_profile"
@@ -255,7 +249,9 @@ def _prepare_case(
         )
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
-    forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
+    forward_staging, backward_staging = _allocate_training_weight_staging(
+        source_weights
+    )
     native_forward = op.pack_forward_weights(
         source_weights[0],
         out=forward_staging,
@@ -282,7 +278,9 @@ def _prepare_case(
     )
 
 
-def _require_all_ranks_to_overflow(op: MoeEp, topk_idx: torch.Tensor, world_size: int) -> None:
+def _require_all_ranks_to_overflow(
+    op: MoeEp, topk_idx: torch.Tensor, world_size: int
+) -> None:
     state = op._training_state
     if state is None:
         raise RuntimeError("training state is not prepared")
@@ -328,7 +326,7 @@ def _run_error_mode_assert_probe(
         world_size=world_size,
         pattern=pattern,
         dgrad_optimization=args.dgrad_optimization,
-        max_recv_size_per_rank=physical_capacity,
+        physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=False,
     )
     op, inputs, _, native_forward, _, output_pair = case
@@ -378,14 +376,19 @@ def _run_error_mode_assert_probe(
         _runtime_debug("probe.error.replay.end")
     except BaseException as error:
         error_text = str(error)
-        if "device-side assert triggered" in error_text or "Rubin MegaMoE receive route-pool overflow" in error_text:
+        if (
+            "device-side assert triggered" in error_text
+            or "Rubin MegaMoE receive route-pool overflow" in error_text
+        ):
             print(
-                f"MOE_EP_EP{world_size}_ERROR_MODE_OVERFLOW_PASS " f"rank={rank} error={type(error).__name__}",
+                f"MOE_EP_EP{world_size}_ERROR_MODE_OVERFLOW_PASS "
+                f"rank={rank} error={type(error).__name__}",
                 flush=True,
             )
             os._exit(0)
         print(
-            f"MOE_EP_EP{world_size}_ERROR_MODE_UNEXPECTED_FAILURE " f"rank={rank} error={error!r}",
+            f"MOE_EP_EP{world_size}_ERROR_MODE_UNEXPECTED_FAILURE "
+            f"rank={rank} error={error!r}",
             file=sys.stderr,
             flush=True,
         )
@@ -416,7 +419,7 @@ def _run_cycle(
         world_size=world_size,
         pattern=pattern,
         dgrad_optimization=args.dgrad_optimization,
-        max_recv_size_per_rank=physical_capacity,
+        physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=True,
     )
     op, inputs, grad_output, native_forward, native_backward, output_pair = case
@@ -476,7 +479,9 @@ def _run_cycle(
             for replay in range(replay_count):
                 graph_index = replay % len(graphs)
                 if torch.cuda.current_stream(device) != execution_stream:
-                    raise RuntimeError("training graph replay must remain on its capture stream")
+                    raise RuntimeError(
+                        "training graph replay must remain on its capture stream"
+                    )
                 graphs[graph_index].replay()
             _runtime_debug("probe.replay.enqueue.end", cycle=cycle)
             _runtime_debug("probe.replay.synchronize.begin", cycle=cycle)

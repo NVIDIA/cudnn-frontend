@@ -187,7 +187,9 @@ def test_autotune_core_contracts(monkeypatch):
         patch.setattr(
             autotune_module.dist,
             "all_reduce",
-            lambda values, **kwargs: values.copy_(torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)),
+            lambda values, **kwargs: values.copy_(
+                torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)
+            ),
         )
         latency, samples = autotune_module.benchmark_candidate(
             lambda: None,
@@ -251,9 +253,7 @@ def test_autotune_api_transactions(monkeypatch):
                 self.device = torch.device("cuda", 0)
 
             def forward(self, request):
-                calls.append(
-                    request.config.public_config.inference_tuning
-                )
+                calls.append(request.config.public_config.inference_tuning)
                 raise RuntimeError("launch failed")
 
             def close(self):
@@ -327,10 +327,7 @@ def test_autotune_api_transactions(monkeypatch):
             del device, group, timed_iters
             assert not original_backend.closed
             run()
-            tuning = (
-                active_backends[-1]
-                .resolved_config.public_config.inference_tuning
-            )
+            tuning = active_backends[-1].resolved_config.public_config.inference_tuning
             latency = 1.0 if tuning == candidate else 2.0
             return latency, (latency,)
 
@@ -473,7 +470,9 @@ def test_autotune_api_transactions(monkeypatch):
             autotune_module,
             "allocate_training_outputs",
             lambda requirements, device, symmetric: (
-                (forward_outputs, backward_outputs) if symmetric is symmetric_buffers else pytest.fail("autotune used the wrong symmetric buffers")
+                (forward_outputs, backward_outputs)
+                if symmetric is symmetric_buffers
+                else pytest.fail("autotune used the wrong symmetric buffers")
             ),
         )
         patch.setattr(
@@ -521,9 +520,7 @@ def test_autotune_api_transactions(monkeypatch):
         op = MoeEp(
             _moe_ep_config(
                 **_forward_config(),
-                fc1_weight_layout=(
-                    MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-                ),
+                fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
             )
         )
         value = SimpleNamespace(device=torch.device("cuda", 0))
@@ -560,8 +557,7 @@ def test_autotune_api_transactions(monkeypatch):
             op.prepare_training,
         ):
             assert (
-                "native_weight_storage_mode"
-                not in inspect.signature(method).parameters
+                "native_weight_storage_mode" not in inspect.signature(method).parameters
             )
         op.close()
 
@@ -571,7 +567,8 @@ def _print_candidate_timings(label, result) -> None:
     for index, measurement in enumerate(result.candidates):
         samples = ", ".join(f"{sample:.4f}" for sample in measurement.samples_ms)
         print(
-            f"  [{index}] median={measurement.latency_ms:.4f} ms " f"samples=[{samples}] tuning={measurement.tuning}",
+            f"  [{index}] median={measurement.latency_ms:.4f} ms "
+            f"samples=[{samples}] tuning={measurement.tuning}",
             flush=True,
         )
 
@@ -649,15 +646,15 @@ def test_autotune_sm107_inference_training_and_graph():
             intermediate_size=256,
             top_k=2,
             max_tokens_per_rank=training_args[0].shape[0],
-            max_recv_size_per_rank=2 * 128,
+            physical_recv_pool_rows=2 * 128,
             drop_on_overflow=True,
             combine_format="bf16",
-            fc1_weight_layout=(
-                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-            ),
+            fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
         )
     ) as op:
-        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
+        forward_staging, backward_staging = _allocate_training_weight_staging(
+            source_weights
+        )
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -721,9 +718,7 @@ def test_autotune_sm107_inference_training_and_graph():
         torch.cuda.synchronize(device)
         assert forward_result.evaluated_candidates == len(candidates) == 5
         assert forward_result.winner in candidates
-        assert backward_result.evaluated_candidates == len(
-            backward_candidates
-        )
+        assert backward_result.evaluated_candidates == len(backward_candidates)
         assert backward_result.winner in backward_candidates
         assert op.training_forward_tuning == forward_result.winner
         assert op.training_backward_tuning == backward_result.winner
@@ -767,15 +762,11 @@ def test_autotune_training_discrete_config_binds_prepare_specialization():
             intermediate_size=256,
             top_k=2,
             max_tokens_per_rank=training_args[0].shape[0],
-            max_recv_size_per_rank=256,
+            physical_recv_pool_rows=256,
             drop_on_overflow=True,
             combine_format="bf16",
-            fc1_weight_layout=(
-                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-            ),
-            training_weight_storage_mode=(
-                MoeEpNativeWeightStorageMode.DISCRETE
-            ),
+            fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
+            training_weight_storage_mode=(MoeEpNativeWeightStorageMode.DISCRETE),
         )
     ) as op:
         forward_staging, backward_staging = _allocate_training_weight_staging(

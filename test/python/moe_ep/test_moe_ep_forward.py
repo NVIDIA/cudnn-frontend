@@ -70,7 +70,7 @@ def test_reverse_capacity_preserves_the_prescribed_physical_pool(
             apply_topk_in_fc1=True,
             combine_format="bf16",
             output_format="bf16",
-            max_recv_size_per_rank=physical_capacity,
+            physical_recv_pool_rows=physical_capacity,
         ),
     ) as op:
         config = Mxfp8KernelConfig.for_inference(
@@ -92,7 +92,7 @@ def test_reverse_capacity_preserves_overprovisioned_physical_pool():
     with MoeEp(
         _moe_ep_config(
             **_forward_config(),
-            max_recv_size_per_rank=384,
+            physical_recv_pool_rows=384,
         ),
     ) as op:
         config = Mxfp8KernelConfig.for_inference(
@@ -101,7 +101,65 @@ def test_reverse_capacity_preserves_overprovisioned_physical_pool():
         )
 
     assert config.physical_recv_pool_size == 384
-    assert config.max_recv_size_per_rank == 257
+    assert config.max_recv_size_per_rank == 10
+
+
+@pytest.mark.L0
+def test_receive_capacity_is_static_with_operation_scoped_logical_limits():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        _moe_ep_config(
+            **_forward_config(),
+            token_padding_size=256,
+        ),
+    ) as op:
+        resolved = op._execution_state.resolved_config
+        inference = Mxfp8KernelConfig.for_inference(
+            resolved,
+            launch_cluster_count=16,
+        )
+        training = Mxfp8KernelConfig.for_training_forward(
+            resolved,
+            launch_cluster_count=16,
+        )
+
+        assert op.physical_recv_pool_rows == 512
+        assert inference.physical_recv_pool_size == 512
+        assert training.physical_recv_pool_size == 512
+        assert inference.max_recv_size_per_rank == 10
+        assert training.max_recv_size_per_rank == 10
+
+
+@pytest.mark.L0
+def test_explicit_pool_resolves_each_padding_domain_independently():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        _moe_ep_config(
+            **_forward_config(),
+            token_padding_size=256,
+            physical_recv_pool_rows=256,
+        ),
+    ) as op:
+        resolved = op._execution_state.resolved_config
+        inference = Mxfp8KernelConfig.for_inference(
+            resolved,
+            launch_cluster_count=16,
+        )
+        training = Mxfp8KernelConfig.for_training_forward(
+            resolved,
+            launch_cluster_count=16,
+        )
+
+    assert inference.max_recv_size_per_rank == 1
+    assert training.max_recv_size_per_rank == 10
 
 
 @pytest.mark.L0
@@ -113,9 +171,25 @@ def test_reverse_capacity_rejects_misaligned_physical_pool(physical_capacity):
         MoeEp(
             _moe_ep_config(
                 **_forward_config(),
-                max_recv_size_per_rank=physical_capacity,
+                physical_recv_pool_rows=physical_capacity,
             ),
         )
+
+
+@pytest.mark.L0
+def test_physical_pool_rejects_values_outside_kernel_index_range():
+    from cudnn import MoeEpParallelConfig
+
+    with pytest.raises(ValueError, match="Int32 route-index"):
+        MoeEpParallelConfig(physical_recv_pool_rows=1 << 31)
+
+
+@pytest.mark.L0
+def test_legacy_public_receive_capacity_name_is_not_an_alias():
+    from cudnn import MoeEpParallelConfig
+
+    with pytest.raises(TypeError, match="max_recv_size_per_rank"):
+        MoeEpParallelConfig(max_recv_size_per_rank=128)
 
 
 @pytest.mark.L0
@@ -139,7 +213,30 @@ def test_upstream_receive_capacity_applies_per_expert_padding():
 
 
 @pytest.mark.L0
-def test_upstream_receive_capacity_preserves_overprovisioned_pool():
+@pytest.mark.parametrize("logical_limit", (1, 2, 129, 257, 512))
+def test_frontend_padding_formula_matches_vendored_upstream(logical_limit):
+    from cudnn.moe_ep._config import _required_padded_rows
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        _compute_receive_capacity,
+    )
+
+    capacity = _compute_receive_capacity(
+        world_size=1,
+        max_tokens_per_rank=512,
+        topk=1,
+        experts_per_rank=2,
+        max_recv_size_per_rank=logical_limit,
+        padding_block=128,
+    )
+    assert capacity.padded_route_count == _required_padded_rows(
+        logical_limit,
+        experts_per_rank=2,
+        padding_block=128,
+    )
+
+
+@pytest.mark.L0
+def test_upstream_receive_capacity_restores_topology_clamp():
     from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
         _compute_receive_capacity,
     )
@@ -154,8 +251,52 @@ def test_upstream_receive_capacity_preserves_overprovisioned_pool():
     )
 
     assert capacity.raw_route_count == 8
-    assert capacity.logical_route_count == 257
-    assert capacity.padded_route_count == 384
+    assert capacity.logical_route_count == 8
+    assert capacity.padded_route_count == 256
+
+
+@pytest.mark.L0
+def test_router_uses_independent_exact_physical_data_capacity():
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.api import (
+        ImplDesc,
+        ProblemDesc,
+    )
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.token_comm_deterministic import (
+        _MetadataPushRouter,
+    )
+
+    problem = {
+        "world_size": 1,
+        "expert_count": 2,
+        "topk": 2,
+        "max_tokens_per_rank": 5,
+        "max_recv_size_per_rank": 257,
+        "apply_topk_at_fc1": True,
+    }
+    implementation = {
+        "token_padding_block": 128,
+        "promised_launchable_sm_count": 16,
+        "drop_on_overflow": True,
+    }
+    default_router = _MetadataPushRouter(
+        ProblemDesc(problem),
+        ImplDesc(implementation),
+    )
+    exact_router = _MetadataPushRouter(
+        ProblemDesc({**problem, "data_token_capacity": 384}),
+        ImplDesc(implementation),
+    )
+
+    assert default_router.logical_route_capacity == 10
+    assert default_router.worst_case_token_count == 256
+    assert exact_router.logical_route_capacity == 10
+    assert exact_router.worst_case_token_count == 384
+
+    with pytest.raises(ValueError, match="must cover the padded logical"):
+        _MetadataPushRouter(
+            ProblemDesc({**problem, "data_token_capacity": 128}),
+            ImplDesc(implementation),
+        )
 
 
 @pytest.mark.L0
@@ -163,7 +304,9 @@ def test_upstream_receive_capacity_preserves_overprovisioned_pool():
 def test_moe_ep_accepts_validation_modes(validation_mode):
     from cudnn import MoeEp
 
-    with MoeEp(_moe_ep_config(**_forward_config(), validation_mode=validation_mode)) as op:
+    with MoeEp(
+        _moe_ep_config(**_forward_config(), validation_mode=validation_mode)
+    ) as op:
         assert op.validation_mode == validation_mode
 
 
@@ -244,8 +387,7 @@ def test_moe_ep_config_defaults_are_frozen_and_phase_independent():
     assert independent.inference_tuning is not independent.training_forward_tuning
     assert independent.inference_tuning is not independent.training_backward_tuning
     assert (
-        independent.training_forward_tuning
-        is not independent.training_backward_tuning
+        independent.training_forward_tuning is not independent.training_backward_tuning
     )
     with MoeEp(config) as op:
         assert op.config is config
@@ -257,8 +399,7 @@ def test_moe_ep_config_defaults_are_frozen_and_phase_independent():
             is MoeEpNativeWeightStorageMode.CONTIGUOUS
         )
         assert (
-            op.training_weight_storage_mode
-            is MoeEpNativeWeightStorageMode.CONTIGUOUS
+            op.training_weight_storage_mode is MoeEpNativeWeightStorageMode.CONTIGUOUS
         )
         assert config.parallel == MoeEpParallelConfig(max_tokens_per_rank=5)
         assert config.data_path == MoeEpDataPathConfig(
@@ -828,7 +969,11 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
+    activation_scale = next(
+        region
+        for region in requirements.symmetric_regions
+        if region.name == "activation_scale"
+    )
     assert activation_scale.nbytes == 128 * 16
 
     capacity = 5
@@ -871,9 +1016,7 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
     weights = Mxfp8Weights(*(torch.empty(0) for _ in range(4)))
     from cudnn import MoeEpFc1WeightLayout
 
-    adapter = Mxfp8InputAdapter(
-        MoeEpFc1WeightLayout.GATE_THEN_UP
-    )
+    adapter = Mxfp8InputAdapter(MoeEpFc1WeightLayout.GATE_THEN_UP)
     monkeypatch.setattr(adapter_module, "_as_mxfp8", lambda _: staged_activation)
     monkeypatch.setattr(adapter, "_prepare_weights", lambda *_: weights)
 
@@ -1041,7 +1184,9 @@ def test_ep32_peer_mapping_selects_version_compatible_payload():
     assert host.offsets == offsets
     assert int(host.max_ranks) == 32
     dsl_release = Version(Version(cutlass.__version__).base_version)
-    grid_constant_width_is_free = dsl_release < Version("4.0.0") or dsl_release >= Version("4.7.0")
+    grid_constant_width_is_free = dsl_release < Version(
+        "4.0.0"
+    ) or dsl_release >= Version("4.7.0")
     expected_type = "!llvm.ptr" if grid_constant_width_is_free else "vector<32xi64>"
     assert device_type_text == expected_type
 

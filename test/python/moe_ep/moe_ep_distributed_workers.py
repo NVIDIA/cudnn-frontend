@@ -203,12 +203,17 @@ def _distributed_subgroup_output_worker(
     )
     try:
         subgroup_memberships = ((0, 2), (1, 3))
-        subgroups = [dist.new_group(list(members), backend="nccl") for members in subgroup_memberships]
+        subgroups = [
+            dist.new_group(list(members), backend="nccl")
+            for members in subgroup_memberships
+        ]
         subgroup_index = global_rank % 2
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
+        actual_global_ranks = tuple(
+            dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
+        )
 
         _run_forward_output_case(
             device=device,
@@ -302,7 +307,10 @@ def _make_distributed_uneven_backward_inputs(
     base_token_count = int(base_args[0].shape[0])
     repeats = (token_count + base_token_count - 1) // base_token_count
     activation = quantize_mxfp8(
-        base_args[0].dequantize(torch.float32).repeat((repeats, 1))[:token_count].contiguous(),
+        base_args[0]
+        .dequantize(torch.float32)
+        .repeat((repeats, 1))[:token_count]
+        .contiguous(),
         axis=1,
     )
     args = (
@@ -350,13 +358,15 @@ def _run_backward_reference_case(
             device,
         )
         max_tokens_per_rank = ep_size
-        max_recv_size_per_rank = 256
+        physical_recv_pool_rows = 256
         local_token_count = torch.tensor(
             [args[0].shape[0]],
             dtype=torch.int64,
             device=device,
         )
-        gathered_token_counts = [torch.empty_like(local_token_count) for _ in range(ep_size)]
+        gathered_token_counts = [
+            torch.empty_like(local_token_count) for _ in range(ep_size)
+        ]
         dist.all_gather(
             gathered_token_counts,
             local_token_count,
@@ -370,13 +380,17 @@ def _run_backward_reference_case(
             device,
         )
         max_tokens_per_rank = int(args[0].shape[0])
-        max_recv_size_per_rank = 128
+        physical_recv_pool_rows = 128
         token_counts = None
     num_experts = 2 * ep_size
 
     # Finish all collective reference work, including dense local dW, before
     # constructing or launching the production operator.
-    reference_grad_output = grad_output if isinstance(grad_output, torch.Tensor) else grad_output.dequantize(torch.float32)
+    reference_grad_output = (
+        grad_output
+        if isinstance(grad_output, torch.Tensor)
+        else grad_output.dequantize(torch.float32)
+    )
     expected = _fixed_training_reference(
         args,
         reference_grad_output,
@@ -385,7 +399,7 @@ def _run_backward_reference_case(
         ep_group=ep_group,
         num_experts=num_experts,
         max_tokens_per_rank=max_tokens_per_rank,
-        max_recv_size_per_rank=max_recv_size_per_rank,
+        physical_recv_pool_rows=physical_recv_pool_rows,
         drop_on_overflow=True,
     )
     expected_y, expected_dx, expected_dprob, expected_wgrads = expected
@@ -404,13 +418,11 @@ def _run_backward_reference_case(
             top_k=2,
             ep_group=ep_group,
             max_tokens_per_rank=max_tokens_per_rank,
-            max_recv_size_per_rank=max_recv_size_per_rank,
+            physical_recv_pool_rows=physical_recv_pool_rows,
             drop_on_overflow=True,
             combine_format=combine_format,
             gate_up_clamp=gate_up_clamp,
-            fc1_weight_layout=(
-                MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-            ),
+            fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
             training_weight_storage_mode=MoeEpNativeWeightStorageMode(
                 native_weight_storage_mode
             ),
