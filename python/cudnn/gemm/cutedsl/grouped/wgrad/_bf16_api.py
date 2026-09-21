@@ -426,12 +426,15 @@ class GroupedGemmWgradBf16API(APIBase):
         element_bits = _convert_to_cutlass_data_type(self.wgrad_dtype).width
         stride_bytes = get_strides(wgrad_tensor)[0] * element_bits // 8
         base_ptr = get_data_ptr(wgrad_tensor)
-        values = [base_ptr + index * stride_bytes for index in range(self.expert_cnt)]
         if is_torch_tensor(wgrad_tensor):
             import torch
 
+            # Derived on device (R4): base + arange * stride on the launch stream. Never a host
+            # list through torch.tensor(..., device=): pageable H2D + implicit sync.
             with _torch_stream_context(current_stream, wgrad_tensor.device):
-                return torch.tensor(values, dtype=torch.int64, device=wgrad_tensor.device)
+                ptrs = torch.arange(self.expert_cnt, dtype=torch.int64, device=wgrad_tensor.device)
+                return ptrs.mul_(stride_bytes).add_(base_ptr)
+        values = [base_ptr + index * stride_bytes for index in range(self.expert_cnt)]
         import jax
         import jax.numpy as jnp
         import numpy as np

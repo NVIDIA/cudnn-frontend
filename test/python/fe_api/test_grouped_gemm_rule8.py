@@ -102,6 +102,7 @@ def test_execute_never_synchronizes(discrete):
 
 
 @pytest.mark.L0
+@pytest.mark.allow_host_sync  # the debug gate blocks by design (R6); the R9 detector must not veto it
 def test_debug_validation_env_var(monkeypatch):
     from cudnn.gemm.cutedsl.grouped import backend_utils
 

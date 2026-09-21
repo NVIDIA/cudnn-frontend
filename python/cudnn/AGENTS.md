@@ -425,7 +425,11 @@ scale scalars).** R2 (carve) + fill on the launch stream with one async op
 (`cuMemsetD32Async`, `cuMemcpyHtoDAsync`, `buffers.memset_zero_async`), or make
 it a scalar kernel argument. Never `torch.tensor(values, device=...)` per execute
 (pageable H2D + implicit sync), never build it at `compile()` into a plan-owned
-tensor.
+tensor. A pointer table over a uniformly strided tensor is derived on device:
+`torch.arange(n, dtype=torch.int64, device=dev).mul_(stride_bytes).add_(base)`
+under `stream_context(launch)` (wgrad `_generate_wgrad_ptrs`) — or the kernel
+takes `(base, stride)` as scalars. The fe_api sync detector (R9) flags the host
+list on the first call, so the failure is loud, not a silent serialisation.
 
 **R5 — the input is not in the layout/dtype the kernel takes.** Decline in
 `check_support()` with a `NotImplementedError` naming the tensor and its

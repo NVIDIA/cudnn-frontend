@@ -13,6 +13,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
+from cudnn._torch_stream import stream_context
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import is_torch_tensor
@@ -590,12 +591,12 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             self._value_error_if(wgrad_tensor is None, "Provide wgrad_tensor or wgrad_ptrs in discrete mode")
             self._value_error_if(wgrad_tensor.ndim != 3, f"wgrad_tensor must be rank-3, got {tuple(wgrad_tensor.shape)}")
             self._value_error_if(not wgrad_tensor.is_cuda, f"wgrad_tensor must be a CUDA tensor, got {wgrad_tensor.device}")
-            if wgrad_tensor.shape[0] == 0:
-                wgrad_ptrs = torch.empty((0,), dtype=torch.int64, device=wgrad_tensor.device)
-            else:
-                expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
-                ptrs = [wgrad_tensor.data_ptr() + i * expert_stride_bytes for i in range(wgrad_tensor.shape[0])]
-                wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
+            # Pointer table derived on device (R4): base + arange * stride on the launch stream.
+            # Never a host list through torch.tensor(..., device=): pageable H2D + implicit sync.
+            expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
+            with stream_context(current_stream, wgrad_tensor.device):
+                wgrad_ptrs = torch.arange(wgrad_tensor.shape[0], dtype=torch.int64, device=wgrad_tensor.device)
+                wgrad_ptrs.mul_(expert_stride_bytes).add_(wgrad_tensor.data_ptr())
         _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
         self._compiled_kernel(
             a_tensor,
