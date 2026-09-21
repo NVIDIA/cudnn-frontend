@@ -171,11 +171,7 @@ def _resolve_world(config: ResolvedMoeEpConfig) -> RuntimeWorld:
     group = config.public_config.parallel.ep_group
     topology = config.topology
     if group is None:
-        if (
-            topology.ep_size != 1
-            or topology.ep_rank != 0
-            or topology.ep_global_ranks
-        ):
+        if topology.ep_size != 1 or topology.ep_rank != 0 or topology.ep_global_ranks:
             raise ValueError("ep_group=None requires ep_size=1, ep_rank=0, and no " "distributed rank membership")
         return RuntimeWorld(rank=0, size=1, group=None, global_ranks=())
 
@@ -192,10 +188,7 @@ def _resolve_world(config: ResolvedMoeEpConfig) -> RuntimeWorld:
             f"runtime=({rank}, {size})"
         )
     if global_ranks != topology.ep_global_ranks:
-        raise RuntimeError(
-            "ResolvedMoeEpConfig EP membership does not match its process "
-            f"group: config={topology.ep_global_ranks}, runtime={global_ranks}"
-        )
+        raise RuntimeError("ResolvedMoeEpConfig EP membership does not match its process " f"group: config={topology.ep_global_ranks}, runtime={global_ranks}")
     return RuntimeWorld(
         rank=rank,
         size=size,
@@ -473,9 +466,7 @@ class RuntimeManager:
         self,
         *,
         provider_factory: Callable[[], NvshmemRuntimeProvider] = (_DefaultNvshmemRuntimeProvider),
-        world_resolver: Callable[
-            [ResolvedMoeEpConfig], RuntimeWorld
-        ] = _resolve_world,
+        world_resolver: Callable[[ResolvedMoeEpConfig], RuntimeWorld] = _resolve_world,
         keep_alive: bool = False,
     ) -> None:
         self._provider_factory = provider_factory

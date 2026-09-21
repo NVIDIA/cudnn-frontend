@@ -90,43 +90,22 @@ class MoeEpTuningConfig:
             raise ValueError("group_hint must be None or one of " f"{tuple(sorted(_GROUP_HINTS))}, got {self.group_hint!r}")
         if not isinstance(self.reduce_topk_in_kernel, bool):
             raise ValueError("reduce_topk_in_kernel must be a bool, got " f"{self.reduce_topk_in_kernel!r}")
-        if (
-            not isinstance(self.dgrad_optimization, str)
-            or self.dgrad_optimization not in _DGRAD_OPTIMIZATIONS
-        ):
-            raise ValueError(
-                "dgrad_optimization must be one of "
-                f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got "
-                f"{self.dgrad_optimization!r}"
-            )
+        if not isinstance(self.dgrad_optimization, str) or self.dgrad_optimization not in _DGRAD_OPTIMIZATIONS:
+            raise ValueError("dgrad_optimization must be one of " f"{tuple(sorted(_DGRAD_OPTIMIZATIONS))}, got " f"{self.dgrad_optimization!r}")
         if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
             raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
         if self.dgrad_optimization != "ds3_ep4_v1":
             return
         if self.token_back_mode != "epi_warps":
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
-                "token_back_mode='epi_warps'"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "token_back_mode='epi_warps'")
         if self.epi_flag_batch not in ((1, 1), (4, 2)):
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
-                "epi_flag_batch=(1, 1) or (4, 2)"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "epi_flag_batch=(1, 1) or (4, 2)")
         if self.token_in_flag_batch != 1:
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
-                "token_in_flag_batch=1"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "token_in_flag_batch=1")
         if self.group_hint is not None:
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires group_hint=None"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires group_hint=None")
         if self.reduce_topk_in_kernel:
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
-                "reduce_topk_in_kernel=False"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "reduce_topk_in_kernel=False")
         object.__setattr__(self, "epi_flag_batch", (4, 2))
 
 

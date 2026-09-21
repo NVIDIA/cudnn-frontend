@@ -180,9 +180,7 @@ def launch_training_forward(
     workspace = execution.forward.workspace
     if state.weight_storage_mode == "discrete":
         if not isinstance(weights, MoeEpNativeDiscreteForwardWeights):
-            raise TypeError(
-                "discrete training requires MoeEpNativeDiscreteForwardWeights"
-            )
+            raise TypeError("discrete training requires MoeEpNativeDiscreteForwardWeights")
         kernel_weights = forward_discrete_native_to_kernel(weights)
     else:
         if not isinstance(weights, MoeEpNativeForwardWeights):
@@ -310,9 +308,7 @@ def launch_training_backward(
     workspace = execution.backward.workspace
     if state.weight_storage_mode == "discrete":
         if not isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
-            raise TypeError(
-                "discrete training requires MoeEpNativeDiscreteBackwardWeights"
-            )
+            raise TypeError("discrete training requires MoeEpNativeDiscreteBackwardWeights")
         kernel_weights = backward_discrete_native_to_kernel(weights)
     else:
         if not isinstance(weights, MoeEpNativeBackwardWeights):

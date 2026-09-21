@@ -66,28 +66,13 @@ def _resolve_pattern_and_capacity(
 ):
     pattern = _training_graph_pattern(args.pattern, world_size)
     if args.dgrad_optimization == "ds3_ep4_v1" and pattern.name != "ds3_ep4_v1":
-        raise ValueError(
-            "dgrad_optimization='ds3_ep4_v1' requires " "--pattern ds3_ep4_v1"
-        )
+        raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "--pattern ds3_ep4_v1")
     if pattern.name == "ds3_ep4_v1" and args.expect_overflow_assert:
-        raise ValueError(
-            "ds3_ep4_v1 uses the exact full route capacity and does not "
-            "support the overflow-assert probe"
-        )
-    physical_capacity = (
-        pattern.physical_recv_pool_size
-        if args.physical_recv_pool_rows is None
-        else args.physical_recv_pool_rows
-    )
+        raise ValueError("ds3_ep4_v1 uses the exact full route capacity and does not " "support the overflow-assert probe")
+    physical_capacity = pattern.physical_recv_pool_size if args.physical_recv_pool_rows is None else args.physical_recv_pool_rows
     _positive("physical_recv_pool_rows", physical_capacity)
-    if (
-        pattern.name == "ds3_ep4_v1"
-        and physical_capacity < pattern.physical_recv_pool_size
-    ):
-        raise ValueError(
-            "ds3_ep4_v1 requires physical_recv_pool_rows >= "
-            f"{pattern.physical_recv_pool_size}, got {physical_capacity}"
-        )
+    if pattern.name == "ds3_ep4_v1" and physical_capacity < pattern.physical_recv_pool_size:
+        raise ValueError("ds3_ep4_v1 requires physical_recv_pool_rows >= " f"{pattern.physical_recv_pool_size}, got {physical_capacity}")
     return pattern, physical_capacity
 
 
@@ -104,23 +89,13 @@ def _token_prefix(value, token_count: int):
 
 
 def _repeat_token_rows(value, token_count: int):
-    source_tokens = int(
-        value.logical_shape[0]
-        if isinstance(value, BlockScaledTensor)
-        else value.shape[0]
-    )
+    source_tokens = int(value.logical_shape[0] if isinstance(value, BlockScaledTensor) else value.shape[0])
     repeats = (token_count + source_tokens - 1) // source_tokens
     if not isinstance(value, BlockScaledTensor):
-        return value.repeat((repeats, *([1] * (value.ndim - 1))))[
-            :token_count
-        ].contiguous()
+        return value.repeat((repeats, *([1] * (value.ndim - 1))))[:token_count].contiguous()
     return BlockScaledTensor(
-        data=value.data.repeat(
-            (repeats, *([1] * (value.data.ndim - 1)))
-        )[:token_count].contiguous(),
-        scale=value.scale.repeat(
-            (repeats, *([1] * (value.scale.ndim - 1)))
-        )[:token_count].contiguous(),
+        data=value.data.repeat((repeats, *([1] * (value.data.ndim - 1))))[:token_count].contiguous(),
+        scale=value.scale.repeat((repeats, *([1] * (value.scale.ndim - 1))))[:token_count].contiguous(),
         format=value.format,
         logical_shape=(token_count, *value.logical_shape[1:]),
         axis=value.axis,
@@ -211,9 +186,7 @@ def _prepare_case(
     )
     if asymmetric_overflow:
         if pattern.name != "smoke" or world_size < 2:
-            raise ValueError(
-                "asymmetric overflow requires the smoke pattern with EP2+"
-            )
+            raise ValueError("asymmetric overflow requires the smoke pattern with EP2+")
         token_count = pattern.max_tokens_per_rank
         activation = _repeat_token_rows(args[0], token_count)
         topk_idx = torch.zeros(
@@ -271,35 +244,20 @@ def _prepare_case(
         raise RuntimeError("training graph probe did not prepare training state")
     backward = state.backward_prepared
     if backward.config.dgrad_optimization != dgrad_optimization:
-        raise RuntimeError(
-            "training graph probe prepared the wrong dgrad profile: "
-            f"{backward.config.dgrad_optimization!r} != "
-            f"{dgrad_optimization!r}"
-        )
+        raise RuntimeError("training graph probe prepared the wrong dgrad profile: " f"{backward.config.dgrad_optimization!r} != " f"{dgrad_optimization!r}")
     if backward.pool_token_capacity != physical_recv_pool_rows:
-        raise RuntimeError(
-            "training graph probe prepared the wrong physical receive pool: "
-            f"{backward.pool_token_capacity} != {physical_recv_pool_rows}"
-        )
-    upstream_profile = backward.kernel.resolved_dgrad_config[
-        "dgrad_optimization_profile"
-    ]
+        raise RuntimeError("training graph probe prepared the wrong physical receive pool: " f"{backward.pool_token_capacity} != {physical_recv_pool_rows}")
+    upstream_profile = backward.kernel.resolved_dgrad_config["dgrad_optimization_profile"]
     expected_upstream_profile = {
         "baseline": "explicit",
         "rolling": "optimized",
         "ds3_ep4_v1": "ds3_ep4_v1",
     }[dgrad_optimization]
     if upstream_profile != expected_upstream_profile:
-        raise RuntimeError(
-            "training graph probe did not select the requested upstream "
-            f"profile: {upstream_profile!r} != "
-            f"{expected_upstream_profile!r}"
-        )
+        raise RuntimeError("training graph probe did not select the requested upstream " f"profile: {upstream_profile!r} != " f"{expected_upstream_profile!r}")
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
-    forward_staging, backward_staging = _allocate_training_weight_staging(
-        source_weights
-    )
+    forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
     native_forward = op.pack_forward_weights(
         source_weights[0],
         out=forward_staging,
@@ -326,9 +284,7 @@ def _prepare_case(
     )
 
 
-def _require_group_overflow(
-    op: MoeEp, topk_idx: torch.Tensor, world_size: int
-) -> None:
+def _require_group_overflow(op: MoeEp, topk_idx: torch.Tensor, world_size: int) -> None:
     state = op._training_state
     if state is None:
         raise RuntimeError("training state is not prepared")
@@ -352,10 +308,7 @@ def _require_group_overflow(
         receive_counts=counts,
     )
     if not any(count > logical_limit for count in counts):
-        raise ValueError(
-            "error-mode routing must overflow at least one receiving rank: "
-            f"receive_counts={counts}, logical_limit={logical_limit}"
-        )
+        raise ValueError("error-mode routing must overflow at least one receiving rank: " f"receive_counts={counts}, logical_limit={logical_limit}")
 
 
 def _run_error_mode_assert_probe(
@@ -435,14 +388,12 @@ def _run_error_mode_assert_probe(
             )
         ):
             print(
-                f"MOE_EP_EP{world_size}_ERROR_MODE_OVERFLOW_PASS "
-                f"rank={rank} error={type(error).__name__}",
+                f"MOE_EP_EP{world_size}_ERROR_MODE_OVERFLOW_PASS " f"rank={rank} error={type(error).__name__}",
                 flush=True,
             )
             os._exit(0)
         print(
-            f"MOE_EP_EP{world_size}_ERROR_MODE_UNEXPECTED_FAILURE "
-            f"rank={rank} error={error!r}",
+            f"MOE_EP_EP{world_size}_ERROR_MODE_UNEXPECTED_FAILURE " f"rank={rank} error={error!r}",
             file=sys.stderr,
             flush=True,
         )
@@ -512,27 +463,17 @@ def _run_cycle(
             state = op._training_state
             if state is None:
                 raise RuntimeError("training state disappeared after warmup")
-            scratch = state.views(
-                token_count=int(inputs[0].shape[0])
-            ).scratch
+            scratch = state.views(token_count=int(inputs[0].shape[0])).scratch
             phase_flags = torch.cat(
                 (
                     scratch.forward_overflow,
                     scratch.backward_overflow,
                 )
             )
-            gathered_flags = [
-                torch.empty_like(phase_flags) for _ in range(world_size)
-            ]
+            gathered_flags = [torch.empty_like(phase_flags) for _ in range(world_size)]
             dist.all_gather(gathered_flags, phase_flags)
-            if any(
-                tuple(int(value) for value in flags.cpu().tolist()) != (1, 1)
-                for flags in gathered_flags
-            ):
-                raise AssertionError(
-                    "asymmetric forward/backward overflow flags were not "
-                    f"global: {[flags.cpu().tolist() for flags in gathered_flags]}"
-                )
+            if any(tuple(int(value) for value in flags.cpu().tolist()) != (1, 1) for flags in gathered_flags):
+                raise AssertionError("asymmetric forward/backward overflow flags were not " f"global: {[flags.cpu().tolist() for flags in gathered_flags]}")
 
         # Capture two graph executables over the same fixed instance resources.
         # Both capture and replay stay on one stream and execute sequentially.
@@ -560,9 +501,7 @@ def _run_cycle(
             for replay in range(replay_count):
                 graph_index = replay % len(graphs)
                 if torch.cuda.current_stream(device) != execution_stream:
-                    raise RuntimeError(
-                        "training graph replay must remain on its capture stream"
-                    )
+                    raise RuntimeError("training graph replay must remain on its capture stream")
                 graphs[graph_index].replay()
             _runtime_debug("probe.replay.enqueue.end", cycle=cycle)
             _runtime_debug("probe.replay.synchronize.begin", cycle=cycle)

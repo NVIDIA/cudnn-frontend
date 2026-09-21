@@ -205,9 +205,7 @@ def test_autotune_core_contracts(monkeypatch):
         patch.setattr(
             autotune_module.dist,
             "all_reduce",
-            lambda values, **kwargs: values.copy_(
-                torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)
-            ),
+            lambda values, **kwargs: values.copy_(torch.tensor([5.0, 8.0, 4.0], dtype=values.dtype)),
         )
         latency, samples = autotune_module.benchmark_candidate(
             lambda: None,
@@ -490,10 +488,7 @@ def test_autotune_api_transactions(monkeypatch):
             def prepare_training(self):
                 from cudnn import MoeEpNativeWeightStorageMode
 
-                assert (
-                    self.resolved_config.public_config.training_weight_storage_mode
-                    is MoeEpNativeWeightStorageMode.CONTIGUOUS
-                )
+                assert self.resolved_config.public_config.training_weight_storage_mode is MoeEpNativeWeightStorageMode.CONTIGUOUS
                 return TrainingState()
 
             def close(self):
@@ -543,9 +538,7 @@ def test_autotune_api_transactions(monkeypatch):
             autotune_module,
             "allocate_training_outputs",
             lambda requirements, device, symmetric: (
-                (forward_outputs, backward_outputs)
-                if symmetric is symmetric_buffers
-                else pytest.fail("autotune used the wrong symmetric buffers")
+                (forward_outputs, backward_outputs) if symmetric is symmetric_buffers else pytest.fail("autotune used the wrong symmetric buffers")
             ),
         )
         patch.setattr(
@@ -558,11 +551,7 @@ def test_autotune_api_transactions(monkeypatch):
             del device, group, timed_iters
             run()
             public = active_backends[-1].resolved_config.public_config
-            tuning = (
-                public.training_backward_tuning
-                if launches[-1] == "backward"
-                else public.training_forward_tuning
-            )
+            tuning = public.training_backward_tuning if launches[-1] == "backward" else public.training_forward_tuning
             latency = 1.0 if tuning == candidate else 2.0
             return latency, (latency,)
 
@@ -629,9 +618,7 @@ def test_autotune_api_transactions(monkeypatch):
             op.autotune_training_backward,
             op.prepare_training,
         ):
-            assert (
-                "native_weight_storage_mode" not in inspect.signature(method).parameters
-            )
+            assert "native_weight_storage_mode" not in inspect.signature(method).parameters
         op.close()
 
 
@@ -640,8 +627,7 @@ def _print_candidate_timings(label, result) -> None:
     for index, measurement in enumerate(result.candidates):
         samples = ", ".join(f"{sample:.4f}" for sample in measurement.samples_ms)
         print(
-            f"  [{index}] median={measurement.latency_ms:.4f} ms "
-            f"samples=[{samples}] tuning={measurement.tuning}",
+            f"  [{index}] median={measurement.latency_ms:.4f} ms " f"samples=[{samples}] tuning={measurement.tuning}",
             flush=True,
         )
 
@@ -754,9 +740,7 @@ def test_autotune_sm107_inference_training_and_graph():
             fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
         )
     ) as op:
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -774,11 +758,7 @@ def test_autotune_sm107_inference_training_and_graph():
             warmup_iters=1,
             timed_iters=2,
         )
-        backward_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.token_back_mode == "epi_warps"
-        ]
+        backward_candidates = [candidate for candidate in candidates if candidate.token_back_mode == "epi_warps"]
         backward_result = op.autotune_training_backward(
             training_args[0],
             grad_output,
@@ -871,9 +851,7 @@ def test_autotune_training_discrete_config_binds_prepare_specialization():
             training_weight_storage_mode=(MoeEpNativeWeightStorageMode.DISCRETE),
         )
     ) as op:
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         packed_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,

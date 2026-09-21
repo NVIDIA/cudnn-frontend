@@ -69,10 +69,7 @@ class Mxfp8KernelConfig:
         if self.physical_recv_pool_size <= 0:
             raise ValueError("physical_recv_pool_size must be positive")
         if self.physical_recv_pool_size % _PHYSICAL_POOL_ALIGNMENT:
-            raise ValueError(
-                "physical_recv_pool_size must satisfy P % 128 == 0, "
-                f"got P={self.physical_recv_pool_size}"
-            )
+            raise ValueError("physical_recv_pool_size must satisfy P % 128 == 0, " f"got P={self.physical_recv_pool_size}")
         if self.max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         if self.group_hint <= 0:
@@ -84,30 +81,16 @@ class Mxfp8KernelConfig:
             "rolling",
             "ds3_ep4_v1",
         ):
-            raise ValueError(
-                "dgrad_optimization must be 'baseline', 'rolling', or "
-                f"'ds3_ep4_v1', got {self.dgrad_optimization!r}"
-            )
+            raise ValueError("dgrad_optimization must be 'baseline', 'rolling', or " f"'ds3_ep4_v1', got {self.dgrad_optimization!r}")
         if self.col_quant_num_ctas == -1:
-            if (
-                self.dgrad_optimization != "ds3_ep4_v1"
-                or not self.enable_grad_y2_col_quant
-            ):
-                raise ValueError(
-                    "col_quant_num_ctas=-1 requires ds3_ep4_v1 backward "
-                    "grad-y2 column quantization"
-                )
+            if self.dgrad_optimization != "ds3_ep4_v1" or not self.enable_grad_y2_col_quant:
+                raise ValueError("col_quant_num_ctas=-1 requires ds3_ep4_v1 backward " "grad-y2 column quantization")
         elif self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
         if self.dgrad_optimization == "ds3_ep4_v1" and self.col_quant_num_ctas != -1:
-            raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires " "col_quant_num_ctas=-1"
-            )
+            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "col_quant_num_ctas=-1")
         if self.weight_storage_mode not in ("contiguous", "discrete"):
-            raise ValueError(
-                "weight_storage_mode must be 'contiguous' or 'discrete', "
-                f"got {self.weight_storage_mode!r}"
-            )
+            raise ValueError("weight_storage_mode must be 'contiguous' or 'discrete', " f"got {self.weight_storage_mode!r}")
 
     @classmethod
     def _for_phase(
@@ -130,9 +113,7 @@ class Mxfp8KernelConfig:
         if topology.ep_size < 1:
             raise ValueError("MXFP8 execution requires a positive EP size")
         if topology.ep_rank < 0 or topology.ep_rank >= topology.ep_size:
-            raise ValueError(
-                f"ep_rank {topology.ep_rank} is outside EP size " f"{topology.ep_size}"
-            )
+            raise ValueError(f"ep_rank {topology.ep_rank} is outside EP size " f"{topology.ep_size}")
         if parallel.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
         if launch_cluster_count <= 0:
@@ -177,9 +158,7 @@ class Mxfp8KernelConfig:
             token_padding_block=token_padding_block,
             sf_padding_block=sf_padding_block,
             sf_vec_size=32,
-            group_hint=(
-                launch_cluster_count if tuning.group_hint is None else tuning.group_hint
-            ),
+            group_hint=(launch_cluster_count if tuning.group_hint is None else tuning.group_hint),
             token_back_mode=tuning.token_back_mode,
             epi_flag_batch=((4, 2) if ds3 else tuning.epi_flag_batch),
             flag_batch=tuning.token_in_flag_batch,
@@ -187,11 +166,7 @@ class Mxfp8KernelConfig:
             weight_storage_mode=weight_storage_mode,
             launch_cluster_count=launch_cluster_count,
             col_quant_num_ctas=(-1 if ds3 else 2368),
-            load_balance_mode=(
-                "atomic_counter"
-                if dgrad_optimization in ("rolling", "ds3_ep4_v1")
-                else "static"
-            ),
+            load_balance_mode=("atomic_counter" if dgrad_optimization in ("rolling", "ds3_ep4_v1") else "static"),
             num_sched_stages=(2 if ds3 else None),
             dgrad_optimization=dgrad_optimization,
         )
@@ -221,9 +196,7 @@ class Mxfp8KernelConfig:
             config,
             phase="training_forward",
             launch_cluster_count=launch_cluster_count,
-            weight_storage_mode=(
-                config.public_config.training_weight_storage_mode.value
-            ),
+            weight_storage_mode=(config.public_config.training_weight_storage_mode.value),
         )
 
     @classmethod
@@ -237,9 +210,7 @@ class Mxfp8KernelConfig:
             config,
             phase="training_backward",
             launch_cluster_count=launch_cluster_count,
-            weight_storage_mode=(
-                config.public_config.training_weight_storage_mode.value
-            ),
+            weight_storage_mode=(config.public_config.training_weight_storage_mode.value),
         )
 
     @property

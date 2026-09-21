@@ -83,9 +83,7 @@ def _pre_reduced_workspace_metadata(
 
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_REGION)
     if region.buffer_space != "shared":
-        raise RuntimeError(
-            "Rubin pre_reduced_activation must reside in shared workspace"
-        )
+        raise RuntimeError("Rubin pre_reduced_activation must reside in shared workspace")
     offset = int(device_workspace.offset(_PRE_REDUCED_ACTIVATION_REGION))
     nbytes = int(device_workspace.nbytes(_PRE_REDUCED_ACTIVATION_REGION))
     wire_bits_per_element = {
@@ -95,9 +93,7 @@ def _pre_reduced_workspace_metadata(
     try:
         element_bits = wire_bits_per_element[config.combine_format]
     except KeyError as exc:
-        raise ValueError(
-            f"unsupported combine wire format {config.combine_format!r}"
-        ) from exc
+        raise ValueError(f"unsupported combine wire format {config.combine_format!r}") from exc
     wire_bits_per_token = config.top_k * config.hidden * element_bits
     if wire_bits_per_token % 8:
         raise RuntimeError("combine wire row is not byte aligned")
@@ -105,14 +101,10 @@ def _pre_reduced_workspace_metadata(
     expected_bytes = config.max_tokens_per_rank * bytes_per_token
     if nbytes != expected_bytes:
         raise RuntimeError(
-            "Rubin pre_reduced_activation size does not match "
-            f"combine_format={config.combine_format!r}: {nbytes} bytes, "
-            f"expected {expected_bytes}"
+            "Rubin pre_reduced_activation size does not match " f"combine_format={config.combine_format!r}: {nbytes} bytes, " f"expected {expected_bytes}"
         )
     if offset + nbytes > shared_bytes:
-        raise RuntimeError(
-            "Rubin pre_reduced_activation region exceeds shared workspace"
-        )
+        raise RuntimeError("Rubin pre_reduced_activation region exceeds shared workspace")
     return offset, bytes_per_token
 
 
@@ -127,17 +119,13 @@ def _pre_reduced_sf_workspace_metadata(
 
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_SF_REGION)
     if region.buffer_space != "shared":
-        raise RuntimeError(
-            "Rubin pre_reduced_activation_sf must reside in shared workspace"
-        )
+        raise RuntimeError("Rubin pre_reduced_activation_sf must reside in shared workspace")
     offset = int(device_workspace.offset(_PRE_REDUCED_ACTIVATION_SF_REGION))
     nbytes = int(device_workspace.nbytes(_PRE_REDUCED_ACTIVATION_SF_REGION))
     if nbytes % config.max_tokens_per_rank:
         raise RuntimeError("Rubin pre_reduced_activation_sf size is not token aligned")
     if offset + nbytes > shared_bytes:
-        raise RuntimeError(
-            "Rubin pre_reduced_activation_sf region exceeds shared workspace"
-        )
+        raise RuntimeError("Rubin pre_reduced_activation_sf region exceeds shared workspace")
     return offset, nbytes // config.max_tokens_per_rank
 
 
@@ -209,10 +197,7 @@ def prepare_kernel(
         ("shared", shared_zero_bytes, shared_bytes),
     ):
         if zero_bytes < 0 or zero_bytes > total_bytes:
-            raise RuntimeError(
-                f"Rubin kernel {name} zero prefix {zero_bytes} exceeds "
-                f"workspace size {total_bytes}"
-            )
+            raise RuntimeError(f"Rubin kernel {name} zero prefix {zero_bytes} exceeds " f"workspace size {total_bytes}")
     device_workspace = kernel._mega_device_workspace
     metadata_region = device_workspace.region(_TOKEN_SRC_METADATA_REGION)
     if metadata_region.buffer_space != "shared":
@@ -224,40 +209,23 @@ def prepare_kernel(
     pool_token_capacity = int(kernel.pool_token_capacity)
     if pool_token_capacity != config.physical_recv_pool_size:
         raise RuntimeError(
-            "Rubin data_token_capacity did not preserve the prescribed "
-            f"physical pool: {pool_token_capacity} != "
-            f"{config.physical_recv_pool_size}"
+            "Rubin data_token_capacity did not preserve the prescribed " f"physical pool: {pool_token_capacity} != " f"{config.physical_recv_pool_size}"
         )
     if token_src_metadata_bytes != pool_token_capacity * 8:
-        raise RuntimeError(
-            "Rubin token_src_metadata must contain one Int64 per pool token"
-        )
+        raise RuntimeError("Rubin token_src_metadata must contain one Int64 per pool token")
     col_quant_data_rows = pool_token_capacity if config.enable_col_quant else 0
-    col_quant_sf_elements = (
-        int(kernel.token_comm.worst_case_sf_token_count)
-        * (config.hidden // config.sf_vec_size)
-        if config.enable_col_quant
-        else 0
-    )
+    col_quant_sf_elements = int(kernel.token_comm.worst_case_sf_token_count) * (config.hidden // config.sf_vec_size) if config.enable_col_quant else 0
     if config.enable_col_quant:
         col_quant_sizes_region = device_workspace.region(_COL_QUANT_SIZES_REGION)
         if col_quant_sizes_region.buffer_space != "local":
-            raise RuntimeError(
-                "Rubin col-quant expert-size snapshot must reside in " "local workspace"
-            )
+            raise RuntimeError("Rubin col-quant expert-size snapshot must reside in " "local workspace")
         col_quant_sizes_offset = int(device_workspace.offset(_COL_QUANT_SIZES_REGION))
         col_quant_sizes_bytes = int(device_workspace.nbytes(_COL_QUANT_SIZES_REGION))
         expected_sizes_bytes = config.num_experts * torch.int32.itemsize
         if col_quant_sizes_bytes != expected_sizes_bytes:
-            raise RuntimeError(
-                "Rubin col-quant expert-size snapshot has "
-                f"{col_quant_sizes_bytes} bytes, expected "
-                f"{expected_sizes_bytes}"
-            )
+            raise RuntimeError("Rubin col-quant expert-size snapshot has " f"{col_quant_sizes_bytes} bytes, expected " f"{expected_sizes_bytes}")
         if col_quant_sizes_offset + col_quant_sizes_bytes > local_bytes:
-            raise RuntimeError(
-                "Rubin col-quant expert-size snapshot exceeds local workspace"
-            )
+            raise RuntimeError("Rubin col-quant expert-size snapshot exceeds local workspace")
     else:
         col_quant_sizes_offset = None
         col_quant_sizes_bytes = 0
@@ -301,9 +269,7 @@ def prepare_kernel(
         pre_reduced_activation_offset=pre_reduced_activation_offset,
         pre_reduced_activation_bytes_per_token=(pre_reduced_activation_bytes_per_token),
         pre_reduced_activation_sf_offset=pre_reduced_activation_sf_offset,
-        pre_reduced_activation_sf_bytes_per_token=(
-            pre_reduced_activation_sf_bytes_per_token
-        ),
+        pre_reduced_activation_sf_bytes_per_token=(pre_reduced_activation_sf_bytes_per_token),
         local_workspace_zero_bytes=int(local_zero_bytes),
         shared_workspace_zero_bytes=int(shared_zero_bytes),
     )
@@ -327,9 +293,7 @@ def compile_or_get(
         if cached is not None:
             return cached
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MXFP8 kernel must be compiled before CUDA graph capture"
-            )
+            raise RuntimeError("MXFP8 kernel must be compiled before CUDA graph capture")
 
         compile_kwargs = build_runtime_kwargs(
             inputs,

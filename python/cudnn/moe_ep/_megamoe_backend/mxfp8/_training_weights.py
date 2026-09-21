@@ -254,14 +254,8 @@ def materialize_forward(
 ) -> MoeEpNativeForwardWeights:
     """Materialize source forward weights into caller-owned native storage."""
 
-    if (
-        fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training materialization requires "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+    if fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training materialization requires " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     if not isinstance(weights, MoeEpForwardWeights):
         raise TypeError("weights must be a MoeEpForwardWeights")
     if not isinstance(out, MoeEpForwardWeightStaging):
@@ -362,14 +356,8 @@ def materialize_backward(
 ) -> MoeEpNativeBackwardWeights:
     """Materialize source backward weights into caller-owned native storage."""
 
-    if (
-        fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training materialization requires "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+    if fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training materialization requires " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     if not isinstance(weights, MoeEpBackwardWeights):
         raise TypeError("weights must be a MoeEpBackwardWeights")
     if not isinstance(out, MoeEpBackwardWeightStaging):

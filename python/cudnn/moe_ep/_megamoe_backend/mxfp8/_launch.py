@@ -59,9 +59,7 @@ def _to_discrete_ptr_table(tensor: torch.Tensor):
 
     address = int(tensor.data_ptr())
     if address % 8:
-        raise ValueError(
-            f"Rubin discrete pointer-table address {address:#x} is not 8-byte aligned"
-        )
+        raise ValueError(f"Rubin discrete pointer-table address {address:#x} is not 8-byte aligned")
     return make_ptr(
         cutlass.Int64,
         address,
@@ -85,10 +83,7 @@ def build_runtime_kwargs(
     elif weight_storage_mode == "discrete":
         convert_weight = _to_discrete_ptr_table
     else:
-        raise ValueError(
-            "weight_storage_mode must be 'contiguous' or 'discrete', "
-            f"got {weight_storage_mode!r}"
-        )
+        raise ValueError("weight_storage_mode must be 'contiguous' or 'discrete', " f"got {weight_storage_mode!r}")
     kwargs = {
         "activation": _to_cute(inputs.activation),
         "activation_sf": _to_cute(inputs.activation_sf),
@@ -166,10 +161,7 @@ def launch_forward(
         inputs.overflow_flag,
         drop_on_overflow=drop_on_overflow,
         overflow_ok=inputs.overflow_ok,
-        message=(
-            "Rubin MegaMoE receive route-pool overflow; the output is invalid "
-            "for this routing distribution"
-        ),
+        message=("Rubin MegaMoE receive route-pool overflow; the output is invalid " "for this routing distribution"),
     )
 
     output_data = torch.empty(

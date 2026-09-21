@@ -33,9 +33,7 @@ def _prepare_rubin_environment(
 
     import cutlass.utils as utils
 
-    launch_cluster_count = int(
-        utils.HardwareInfo().get_max_active_clusters(cluster_size)
-    )
+    launch_cluster_count = int(utils.HardwareInfo().get_max_active_clusters(cluster_size))
     if launch_cluster_count <= 0:
         raise RuntimeError("hardware occupancy query returned no launchable Rubin clusters")
     return architecture, launch_cluster_count

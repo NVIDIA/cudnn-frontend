@@ -308,9 +308,7 @@ class Mxfp8InputAdapter:
 
     def __init__(self, fc1_weight_layout: MoeEpFc1WeightLayout) -> None:
         if not isinstance(fc1_weight_layout, MoeEpFc1WeightLayout):
-            raise TypeError(
-                "fc1_weight_layout must be a MoeEpFc1WeightLayout"
-            )
+            raise TypeError("fc1_weight_layout must be a MoeEpFc1WeightLayout")
         self._fc1_weight_layout = fc1_weight_layout
         self._weight_key: tuple | None = None
         self._weights: Mxfp8Weights | None = None
@@ -356,10 +354,7 @@ class Mxfp8InputAdapter:
         fc1_weight, fc1_weight_sf = _prepare_fc1(
             fc1_source,
             config.intermediate,
-            already_interleaved=(
-                self._fc1_weight_layout
-                is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-            ),
+            already_interleaved=(self._fc1_weight_layout is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
         )
         fc2_weight, fc2_weight_sf = _prepare_fc2(fc2_source)
         weights = Mxfp8Weights(

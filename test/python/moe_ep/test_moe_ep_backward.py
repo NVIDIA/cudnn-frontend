@@ -501,14 +501,8 @@ def test_native_weight_validation_and_kernel_views_are_zero_copy():
     assert forward_kernel.fc1_weight.data_ptr() == forward.fc1.payload.data_ptr()
     assert forward_kernel.fc1_weight_sf.data_ptr() == forward.fc1.scale.data_ptr()
     assert forward_kernel.fc2_weight.data_ptr() == forward.fc2.payload.data_ptr()
-    assert (
-        backward_kernel.fc1_weight.data_ptr()
-        == backward.w2_transpose.payload.data_ptr()
-    )
-    assert (
-        backward_kernel.fc2_weight_sf.data_ptr()
-        == backward.w1_transpose.scale.data_ptr()
-    )
+    assert backward_kernel.fc1_weight.data_ptr() == backward.w2_transpose.payload.data_ptr()
+    assert backward_kernel.fc2_weight_sf.data_ptr() == backward.w1_transpose.scale.data_ptr()
 
 
 @pytest.mark.L0
@@ -738,9 +732,7 @@ def test_native_weight_storage_mode_separates_kernel_config_and_cache_key(
         launch_cluster_count=16,
     )
     discrete = factory(
-        _training_config(
-            training_weight_storage_mode=(MoeEpNativeWeightStorageMode.DISCRETE)
-        ),
+        _training_config(training_weight_storage_mode=(MoeEpNativeWeightStorageMode.DISCRETE)),
         launch_cluster_count=16,
     )
     assert contiguous != discrete
@@ -911,10 +903,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
         _dgrad_selector_kwargs,
     )
 
-    tunings = {
-        name: MoeEpTuningConfig(dgrad_optimization=name)
-        for name in ("baseline", "rolling", "ds3_ep4_v1")
-    }
+    tunings = {name: MoeEpTuningConfig(dgrad_optimization=name) for name in ("baseline", "rolling", "ds3_ep4_v1")}
     configs = {
         name: Mxfp8KernelConfig.for_training_backward(
             _qualified_ds3_training_config(tuning),
@@ -946,17 +935,12 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
         ds3.group_hint,
     ) == ("atomic_counter", 2, (4, 2), -1, 106)
 
-    assert {
-        name: config.effective_config()["dgrad_optimization"]
-        for name, config in configs.items()
-    } == {
+    assert {name: config.effective_config()["dgrad_optimization"] for name, config in configs.items()} == {
         "baseline": "baseline",
         "rolling": "rolling",
         "ds3_ep4_v1": "ds3_ep4_v1",
     }
-    assert {
-        name: _dgrad_selector_kwargs(config) for name, config in configs.items()
-    } == {
+    assert {name: _dgrad_selector_kwargs(config) for name, config in configs.items()} == {
         "baseline": {
             "enable_dgrad_optimizations": False,
             "dgrad_schedule": None,
@@ -970,10 +954,7 @@ def test_dgrad_profiles_resolve_kernel_config_cache_and_capacity():
             "dgrad_schedule": None,
         },
     }
-    compile_keys = {
-        config.compile_key(torch.device("cuda", 0), (10, 7), ())
-        for config in configs.values()
-    }
+    compile_keys = {config.compile_key(torch.device("cuda", 0), (10, 7), ()) for config in configs.values()}
     assert len(compile_keys) == 3
 
     ds3_resolved = _qualified_ds3_training_config(
@@ -1605,14 +1586,8 @@ def test_private_training_workspace_keeps_only_live_instance_scratch():
     )
     flat = WorkspaceViews(
         token_count=0,
-        symmetric={
-            region.name: torch.empty(region.nbytes, dtype=torch.uint8)
-            for region in state.requirements.symmetric_regions
-        },
-        local={
-            region.name: torch.empty(region.nbytes, dtype=torch.uint8)
-            for region in state.requirements.local_regions
-        },
+        symmetric={region.name: torch.empty(region.nbytes, dtype=torch.uint8) for region in state.requirements.symmetric_regions},
+        local={region.name: torch.empty(region.nbytes, dtype=torch.uint8) for region in state.requirements.local_regions},
         peer_mapping=object(),
     )
 
@@ -1632,22 +1607,10 @@ def test_private_training_workspace_keeps_only_live_instance_scratch():
     assert "kernel_local_workspace" in forward_workspace.local
     assert "backward_aux_data" in backward_workspace.local
     assert "backward_aux_scale" in backward_workspace.local
-    assert (
-        forward_workspace.local["topk_idx"].data_ptr()
-        == scratch.routing_topk_idx.data_ptr()
-    )
-    assert (
-        backward_workspace.local["topk_idx"].data_ptr()
-        == scratch.routing_topk_idx.data_ptr()
-    )
-    assert (
-        forward_workspace.symmetric["topk_weights"].data_ptr()
-        == scratch.routing_topk_weights.data_ptr()
-    )
-    assert (
-        backward_workspace.symmetric["topk_weights"].data_ptr()
-        == scratch.routing_topk_weights.data_ptr()
-    )
+    assert forward_workspace.local["topk_idx"].data_ptr() == scratch.routing_topk_idx.data_ptr()
+    assert backward_workspace.local["topk_idx"].data_ptr() == scratch.routing_topk_idx.data_ptr()
+    assert forward_workspace.symmetric["topk_weights"].data_ptr() == scratch.routing_topk_weights.data_ptr()
+    assert backward_workspace.symmetric["topk_weights"].data_ptr() == scratch.routing_topk_weights.data_ptr()
     names = {
         region.name
         for region in (
@@ -1667,9 +1630,7 @@ def test_private_training_workspace_keeps_only_live_instance_scratch():
         "col_quant_data",
         "col_quant_sf",
     )
-    assert not any(
-        any(name.endswith(removed_name) for removed_name in removed) for name in names
-    )
+    assert not any(any(name.endswith(removed_name) for removed_name in removed) for name in names)
     assert not any(name.startswith("lane.") for name in names)
     assert "routing.local.routing_topk_idx" in names
     assert "routing.symmetric.routing_topk_weights" in names
@@ -1758,9 +1719,7 @@ def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
     assert first["geometry"]["combine_sf_pool_rows"] == 128
     assert "max_recv_size_per_rank" not in first["geometry"]
     assert "lane_count" not in first["resources"]
-    assert first["native_weight_layouts"] == [
-        layout.value for layout in MoeEpNativeWeightLayout
-    ]
+    assert first["native_weight_layouts"] == [layout.value for layout in MoeEpNativeWeightLayout]
     assert canonical_json_sha256(first) == canonical_json_sha256(repeated)
     assert canonical_json_sha256(first) != canonical_json_sha256(changed_workspace)
     assert canonical_json_sha256(first) != canonical_json_sha256(changed_storage_mode)
@@ -1958,10 +1917,7 @@ def test_ds3_prepares_qualified_upstream_kernel(
     )
 
     assert prepared.pool_token_capacity == physical_recv_pool_rows
-    assert (
-        prepared.kernel.resolved_dgrad_config["dgrad_optimization_profile"]
-        == "ds3_ep4_v1"
-    )
+    assert prepared.kernel.resolved_dgrad_config["dgrad_optimization_profile"] == "ds3_ep4_v1"
     assert prepared.kernel.resolved_dgrad_config["dgrad_optimization_overrides"] == {}
 
 
@@ -2004,9 +1960,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
         )
     ) as op:
         requirements = op.prepare_training(device=device)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         packed_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -2029,10 +1983,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
         expected_descriptor_bytes = op.experts_per_rank * 4 * 128
         for prepared in (state.forward_prepared, state.backward_prepared):
             descriptor_region = prepared.kernel.weight_descriptor_region
-            assert (
-                prepared.kernel._mega_device_workspace.nbytes(descriptor_region)
-                == expected_descriptor_bytes
-            )
+            assert prepared.kernel._mega_device_workspace.nbytes(descriptor_region) == expected_descriptor_bytes
 
         symmetric = op.training_symmetric_buffers()
         forward_out, backward_out = _allocate_stateless_training_outputs(
@@ -2077,20 +2028,14 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
             weight_interleave_size=32,
         )
 
-        table_addresses = tuple(
-            table.data_ptr()
-            for bundle in (discrete_forward, discrete_backward)
-            for table in MoeEp._discrete_pointer_tables(bundle)
-        )
+        table_addresses = tuple(table.data_ptr() for bundle in (discrete_forward, discrete_backward) for table in MoeEp._discrete_pointer_tables(bundle))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()
         graph.replay()
         torch.cuda.synchronize(device)
         assert table_addresses == tuple(
-            table.data_ptr()
-            for bundle in (discrete_forward, discrete_backward)
-            for table in MoeEp._discrete_pointer_tables(bundle)
+            table.data_ptr() for bundle in (discrete_forward, discrete_backward) for table in MoeEp._discrete_pointer_tables(bundle)
         )
         _assert_matches_reference(captured[0], expected[0])
         _assert_backward_matches(
@@ -2314,12 +2259,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
     device = _sm107_device()
     base_args = make_forward_inputs(device)
     repeats = (token_count + base_args[0].shape[0] - 1) // base_args[0].shape[0]
-    activation = (
-        base_args[0]
-        .dequantize(input_dtype)
-        .repeat((repeats, 1))[:token_count]
-        .contiguous()
-    )
+    activation = base_args[0].dequantize(input_dtype).repeat((repeats, 1))[:token_count].contiguous()
     repeated_topk_idx = base_args[3].repeat((repeats, 1))[:token_count].contiguous()
     repeated_topk_weights = base_args[4].repeat((repeats, 1))[:token_count].contiguous()
     if routing == "topk2-balanced":
@@ -2363,9 +2303,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         alternate_topk_idx = (1 - original_topk_idx).contiguous()
 
     def expected_offsets(indices):
-        route_counts = torch.bincount(
-            indices.cpu().flatten(), minlength=args[1].shape[0]
-        )
+        route_counts = torch.bincount(indices.cpu().flatten(), minlength=args[1].shape[0])
         padded_counts = ((route_counts + 127) // 128) * 128
         return tuple(torch.cumsum(padded_counts, dim=0).tolist())
 
@@ -2397,9 +2335,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         )
     ) as op:
         requirements = op.prepare_training(device=device)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -2503,9 +2439,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             )
 
         grouped_expected = grouped_reference(expected)
-        grouped_outputs = tuple(
-            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
-        )
+        grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def run_grouped(operands):
             return _dense_wgrads_from_grouped_kernel(
@@ -2523,9 +2457,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         eager = run()
         eager_grouped = run_grouped(eager[3])
         torch.cuda.synchronize(device)
-        assert (
-            tuple(eager[3].expert_offsets.cpu().tolist()) == expected_original_offsets
-        )
+        assert tuple(eager[3].expert_offsets.cpu().tolist()) == expected_original_offsets
         assert int(eager[3].expert_offsets[-1].item()) == expected_effective_pool
         assert physical_recv_pool_rows >= expected_effective_pool
         if expected_physical_pool > expected_effective_pool:
@@ -2544,12 +2476,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             graphs.append(graph)
         assert captured is not None
         captured_token_count = int(args[0].shape[0])
-        pointers = tuple(
-            tensor.data_ptr()
-            for bundle in (forward_out, backward_out)
-            for tensor in vars(bundle).values()
-            if tensor is not None
-        )
+        pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         for replay in range(4):
             if replay % 2:
                 args[3].copy_(alternate_topk_idx)
@@ -2561,28 +2488,15 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
             graphs[replay % len(graphs)].replay()
             torch.cuda.synchronize(device)
             assert int(args[0].shape[0]) == captured_token_count
-            assert pointers == tuple(
-                tensor.data_ptr()
-                for bundle in (forward_out, backward_out)
-                for tensor in vars(bundle).values()
-                if tensor is not None
-            )
-            expected_replay_offsets = (
-                expected_alternate_offsets if replay % 2 else expected_original_offsets
-            )
-            assert (
-                tuple(captured[3].expert_offsets.cpu().tolist())
-                == expected_replay_offsets
-            )
+            assert pointers == tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
+            expected_replay_offsets = expected_alternate_offsets if replay % 2 else expected_original_offsets
+            assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_replay_offsets
             assert_matches(captured, replay_expected)
 
         args[3].copy_(original_topk_idx)
         graphs[0].replay()
         torch.cuda.synchronize(device)
-        assert (
-            tuple(captured[3].expert_offsets.cpu().tolist())
-            == expected_original_offsets
-        )
+        assert tuple(captured[3].expert_offsets.cpu().tolist()) == expected_original_offsets
         assert_matches(captured)
         # The loop above validates WGrad operands from both graph executables
         # and both routing patterns. Keep the downstream grouped-WGrad smoke on
@@ -2656,9 +2570,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
         )
     ) as op:
         requirements = op.prepare_training(device=device)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         native_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -2789,9 +2701,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         # fallback packer is used once here as a test oracle to create known-good
         # native contents, then copied into independent caller-owned tensors.
         source_weights = _fixed_training_weights(args)
-        forward_staging, backward_staging = _allocate_training_weight_staging(
-            source_weights
-        )
+        forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
         packed_forward = op.pack_forward_weights(
             source_weights[0],
             out=forward_staging,
@@ -2833,14 +2743,8 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
                 MoeEpNativeWeightLayout.BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1,
             ),
         )
-        assert (
-            native_forward.fc1.payload.data_ptr()
-            != packed_forward.fc1.payload.data_ptr()
-        )
-        assert (
-            native_backward.w1_transpose.scale.data_ptr()
-            != packed_backward.w1_transpose.scale.data_ptr()
-        )
+        assert native_forward.fc1.payload.data_ptr() != packed_forward.fc1.payload.data_ptr()
+        assert native_backward.w1_transpose.scale.data_ptr() != packed_backward.w1_transpose.scale.data_ptr()
 
         def run():
             _poison_training_outputs_for_test(forward_out, backward_out)
@@ -2887,9 +2791,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
             _interleave_fc1_wgrad(expected_fc1_wgrad),
             expected_fc2_wgrad,
         )
-        grouped_outputs = tuple(
-            torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected
-        )
+        grouped_outputs = tuple(torch.empty_like(value, dtype=torch.bfloat16) for value in grouped_expected)
 
         def assert_grouped_matches(operands):
             grouped_wgrads = _dense_wgrads_from_grouped_kernel(
@@ -2912,12 +2814,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
         with torch.cuda.graph(graph):
             captured = run()
         captured_token_count = int(activation.logical_shape[0])
-        output_pointers = tuple(
-            tensor.data_ptr()
-            for bundle in (forward_out, backward_out)
-            for tensor in vars(bundle).values()
-            if tensor is not None
-        )
+        output_pointers = tuple(tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None)
         native_weight_pointers = (
             native_forward.fc1.payload.data_ptr(),
             native_forward.fc1.scale.data_ptr(),
@@ -2933,10 +2830,7 @@ def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
             torch.cuda.synchronize(device)
             assert int(activation.logical_shape[0]) == captured_token_count
             assert output_pointers == tuple(
-                tensor.data_ptr()
-                for bundle in (forward_out, backward_out)
-                for tensor in vars(bundle).values()
-                if tensor is not None
+                tensor.data_ptr() for bundle in (forward_out, backward_out) for tensor in vars(bundle).values() if tensor is not None
             )
             assert native_weight_pointers == (
                 native_forward.fc1.payload.data_ptr(),

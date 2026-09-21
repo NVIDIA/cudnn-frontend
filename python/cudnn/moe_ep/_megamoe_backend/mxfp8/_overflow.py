@@ -27,10 +27,7 @@ def apply_overflow_policy(
         return
 
     if torch.cuda.is_current_stream_capturing():
-        raise NotImplementedError(
-            "CUDA graph capture requires torch._assert_async to surface "
-            "Rubin MegaMoE overflow"
-        )
+        raise NotImplementedError("CUDA graph capture requires torch._assert_async to surface " "Rubin MegaMoE overflow")
 
     # Preserve the existing eager-only compatibility behavior for PyTorch
     # builds without a device-side asynchronous assertion.

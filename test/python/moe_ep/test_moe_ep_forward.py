@@ -193,9 +193,7 @@ def test_inference_kernel_transport_always_uses_safe_drop(drop_on_overflow):
         Mxfp8KernelConfig,
     )
 
-    with MoeEp(
-        _moe_ep_config(**_forward_config(drop_on_overflow=drop_on_overflow))
-    ) as op:
+    with MoeEp(_moe_ep_config(**_forward_config(drop_on_overflow=drop_on_overflow))) as op:
         config = Mxfp8KernelConfig.for_inference(
             op._execution_state.resolved_config,
             launch_cluster_count=16,
@@ -436,9 +434,7 @@ def test_router_uses_independent_exact_physical_data_capacity():
 def test_moe_ep_accepts_validation_modes(validation_mode):
     from cudnn import MoeEp
 
-    with MoeEp(
-        _moe_ep_config(**_forward_config(), validation_mode=validation_mode)
-    ) as op:
+    with MoeEp(_moe_ep_config(**_forward_config(), validation_mode=validation_mode)) as op:
         assert op.validation_mode == validation_mode
 
 
@@ -518,21 +514,14 @@ def test_moe_ep_config_defaults_are_frozen_and_phase_independent():
     assert config.training_backward_tuning is not independent.training_backward_tuning
     assert independent.inference_tuning is not independent.training_forward_tuning
     assert independent.inference_tuning is not independent.training_backward_tuning
-    assert (
-        independent.training_forward_tuning is not independent.training_backward_tuning
-    )
+    assert independent.training_forward_tuning is not independent.training_backward_tuning
     with MoeEp(config) as op:
         assert op.config is config
         assert op.inference_tuning is inference_tuning
         assert op.training_forward_tuning == MoeEpTuningConfig()
         assert op.training_backward_tuning == MoeEpTuningConfig()
-        assert (
-            config.training_weight_storage_mode
-            is MoeEpNativeWeightStorageMode.CONTIGUOUS
-        )
-        assert (
-            op.training_weight_storage_mode is MoeEpNativeWeightStorageMode.CONTIGUOUS
-        )
+        assert config.training_weight_storage_mode is MoeEpNativeWeightStorageMode.CONTIGUOUS
+        assert op.training_weight_storage_mode is MoeEpNativeWeightStorageMode.CONTIGUOUS
         assert config.parallel == MoeEpParallelConfig(max_tokens_per_rank=5)
         assert config.data_path == MoeEpDataPathConfig(
             output_format=MoeFormat.BF16,
@@ -709,9 +698,7 @@ def test_inference_drop_mode_survives_yang_receive_pool_overflow():
 @pytest.mark.gpu_exclusive
 def test_inference_error_mode_fails_fast_on_yang_receive_pool_overflow():
     _sm107_device()
-    process = mp.get_context("spawn").Process(
-        target=_inference_overflow_error_mode_worker
-    )
+    process = mp.get_context("spawn").Process(target=_inference_overflow_error_mode_worker)
     process.start()
     process.join(timeout=180)
     if process.is_alive():
@@ -1031,9 +1018,7 @@ def test_single_gpu_stress_and_cuda_graph_replay(combine_format, capacity):
         assert backend._inference_resources._workspace is not None
 
         def poison_pre_reduced():
-            workspace = backend._inference_resources._workspace.views(
-                args[0].logical_shape[0]
-            )
+            workspace = backend._inference_resources._workspace.views(args[0].logical_shape[0])
             _poison_pre_reduced_for_test(
                 backend._prepared_kernel,
                 workspace.symmetric["kernel_shared_workspace"],
@@ -1117,10 +1102,7 @@ def test_inference_ep_asymmetric_overflow_policy(
 ):
     _require_distributed_sm107(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
-    init_file = tmp_path / (
-        f"asymmetric_overflow_ep{world_size}_"
-        f"drop_{int(drop_on_overflow)}.init"
-    )
+    init_file = tmp_path / (f"asymmetric_overflow_ep{world_size}_" f"drop_{int(drop_on_overflow)}.init")
     process_context = mp.spawn(
         _distributed_inference_overflow_worker,
         args=(world_size, str(init_file), drop_on_overflow),
@@ -1129,9 +1111,7 @@ def test_inference_ep_asymmetric_overflow_policy(
     )
     deadline = time.monotonic() + 240
     while time.monotonic() < deadline:
-        if process_context.join(
-            timeout=min(1.0, max(0.0, deadline - time.monotonic()))
-        ):
+        if process_context.join(timeout=min(1.0, max(0.0, deadline - time.monotonic()))):
             break
     else:
         for process in process_context.processes:
@@ -1228,11 +1208,7 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(
-        region
-        for region in requirements.symmetric_regions
-        if region.name == "activation_scale"
-    )
+    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
     assert activation_scale.nbytes == 128 * 16
 
     capacity = 5
@@ -1448,9 +1424,7 @@ def test_ep32_peer_mapping_selects_version_compatible_payload():
     assert host.offsets == offsets
     assert int(host.max_ranks) == 32
     dsl_release = Version(Version(cutlass.__version__).base_version)
-    grid_constant_width_is_free = dsl_release < Version(
-        "4.0.0"
-    ) or dsl_release >= Version("4.7.0")
+    grid_constant_width_is_free = dsl_release < Version("4.0.0") or dsl_release >= Version("4.7.0")
     expected_type = "!llvm.ptr" if grid_constant_width_is_free else "vector<32xi64>"
     assert device_type_text == expected_type
 

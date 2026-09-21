@@ -46,10 +46,7 @@ class _InferenceRuntimeWorkspaceOwner:
     ) -> None:
         max_tokens_per_rank = config.public_config.parallel.max_tokens_per_rank
         if max_tokens_per_rank != requirements.max_tokens_per_rank:
-            raise ValueError(
-                "workspace capacity must match "
-                "MoeEpParallelConfig.max_tokens_per_rank"
-            )
+            raise ValueError("workspace capacity must match " "MoeEpParallelConfig.max_tokens_per_rank")
         self.config = config
         self.device = torch.device(device)
         self.requirements = requirements

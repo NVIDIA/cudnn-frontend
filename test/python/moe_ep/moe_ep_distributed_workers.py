@@ -329,11 +329,7 @@ def _distributed_inference_overflow_worker(
         reference_config.pop("physical_recv_pool_rows")
         reference_config.pop("drop_on_overflow")
         expected = _reference_forward(overflow_args, **reference_config) if drop_on_overflow else None
-        op = MoeEp(
-            _moe_ep_config(
-                **config
-            )
-        )
+        op = MoeEp(_moe_ep_config(**config))
         op(*warmup_args)
         torch.cuda.synchronize(device)
 
@@ -346,10 +342,7 @@ def _distributed_inference_overflow_worker(
             gathered_receive_counts,
             local_receive_counts,
         )
-        host_receive_counts = [
-            sum(counts[destination] for counts in gathered_receive_counts)
-            for destination in range(world_size)
-        ]
+        host_receive_counts = [sum(counts[destination] for counts in gathered_receive_counts) for destination in range(world_size)]
         expected_overflow = any(count > 128 for count in host_receive_counts)
         assert expected_overflow
 
@@ -380,16 +373,10 @@ def _distributed_inference_overflow_worker(
         assert backend is not None
         owner = backend._inference_resources
         assert owner is not None and owner._workspace is not None
-        overflow_flag = (
-            owner._workspace.views(overflow_tokens)
-            .local["overflow_flag"][: torch.int32.itemsize]
-            .view(torch.int32)
-        )
+        overflow_flag = owner._workspace.views(overflow_tokens).local["overflow_flag"][: torch.int32.itemsize].view(torch.int32)
         gathered_flags = [torch.empty_like(overflow_flag) for _ in range(world_size)]
         dist.all_gather(gathered_flags, overflow_flag)
-        assert [int(flag.item()) for flag in gathered_flags] == [
-            int(expected_overflow)
-        ] * world_size
+        assert [int(flag.item()) for flag in gathered_flags] == [int(expected_overflow)] * world_size
 
         probe = torch.ones(1, device=device) + 1
         torch.cuda.synchronize(device)
@@ -442,9 +429,7 @@ def _distributed_inference_policy_mismatch_worker(
             except RuntimeError as exc:
                 assert "must match on every expert-parallel rank" in str(exc)
             else:
-                raise AssertionError(
-                    "rank-mismatched drop_on_overflow reached the kernel"
-                )
+                raise AssertionError("rank-mismatched drop_on_overflow reached the kernel")
         finally:
             op.close()
     finally:
@@ -471,17 +456,12 @@ def _distributed_subgroup_output_worker(
     )
     try:
         subgroup_memberships = ((0, 2), (1, 3))
-        subgroups = [
-            dist.new_group(list(members), backend="nccl")
-            for members in subgroup_memberships
-        ]
+        subgroups = [dist.new_group(list(members), backend="nccl") for members in subgroup_memberships]
         subgroup_index = global_rank % 2
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(
-            dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
-        )
+        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
 
         _run_forward_output_case(
             device=device,
@@ -575,10 +555,7 @@ def _make_distributed_uneven_backward_inputs(
     base_token_count = int(base_args[0].shape[0])
     repeats = (token_count + base_token_count - 1) // base_token_count
     activation = quantize_mxfp8(
-        base_args[0]
-        .dequantize(torch.float32)
-        .repeat((repeats, 1))[:token_count]
-        .contiguous(),
+        base_args[0].dequantize(torch.float32).repeat((repeats, 1))[:token_count].contiguous(),
         axis=1,
     )
     args = (
@@ -632,9 +609,7 @@ def _run_backward_reference_case(
             dtype=torch.int64,
             device=device,
         )
-        gathered_token_counts = [
-            torch.empty_like(local_token_count) for _ in range(ep_size)
-        ]
+        gathered_token_counts = [torch.empty_like(local_token_count) for _ in range(ep_size)]
         dist.all_gather(
             gathered_token_counts,
             local_token_count,
@@ -654,11 +629,7 @@ def _run_backward_reference_case(
 
     # Finish all collective reference work, including dense local dW, before
     # constructing or launching the production operator.
-    reference_grad_output = (
-        grad_output
-        if isinstance(grad_output, torch.Tensor)
-        else grad_output.dequantize(torch.float32)
-    )
+    reference_grad_output = grad_output if isinstance(grad_output, torch.Tensor) else grad_output.dequantize(torch.float32)
     expected = _fixed_training_reference(
         args,
         reference_grad_output,
@@ -691,9 +662,7 @@ def _run_backward_reference_case(
             combine_format=combine_format,
             gate_up_clamp=gate_up_clamp,
             fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
-            training_weight_storage_mode=MoeEpNativeWeightStorageMode(
-                native_weight_storage_mode
-            ),
+            training_weight_storage_mode=MoeEpNativeWeightStorageMode(native_weight_storage_mode),
         )
     )
     try:

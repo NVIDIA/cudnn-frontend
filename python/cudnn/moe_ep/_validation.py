@@ -126,9 +126,7 @@ def _validate_expert_ids(
 ) -> None:
     expert_ids = topk_idx.reshape(-1)
     num_experts = config.public_config.model.num_experts
-    if expert_ids.numel() > 0 and bool(
-        ((expert_ids < 0) | (expert_ids >= num_experts)).any().item()
-    ):
+    if expert_ids.numel() > 0 and bool(((expert_ids < 0) | (expert_ids >= num_experts)).any().item()):
         raise ValueError(
             "topk_idx must contain a valid global expert id in "
             f"[0, {num_experts}) for every route; negative and "
@@ -161,10 +159,7 @@ def _validate_routes(
         raise ValueError(f"topk_weights must be floating point, got {topk_weights.dtype}")
     max_tokens_per_rank = config.public_config.parallel.max_tokens_per_rank
     if max_tokens_per_rank is not None and token_count > max_tokens_per_rank:
-        raise ValueError(
-            f"token count {token_count} exceeds "
-            f"max_tokens_per_rank={max_tokens_per_rank}"
-        )
+        raise ValueError(f"token count {token_count} exceeds " f"max_tokens_per_rank={max_tokens_per_rank}")
     if validate_expert_ids:
         _validate_expert_ids(config, topk_idx)
 
@@ -185,10 +180,7 @@ def validate_forward(
     model = config.public_config.model
     layout = config.public_config.data_path.fc1_weight_layout
     if len(activation_shape) != 2 or activation_shape[1] != model.hidden_size:
-        raise ValueError(
-            f"activation logical shape must be (T, {model.hidden_size}), "
-            f"got {activation_shape}"
-        )
+        raise ValueError(f"activation logical shape must be (T, {model.hidden_size}), " f"got {activation_shape}")
     token_count = activation_shape[0]
     _validate_tensor_representation("activation", activation, activation_shape)
     _validate_tensor_representation(
@@ -209,13 +201,8 @@ def validate_forward(
             model.hidden_size,
         ),
     )
-    if layout is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32 and (
-        not isinstance(fc1_weight, BlockScaledTensor) or fc1_weight.format is not MoeFormat.MXFP8
-    ):
-        raise ValueError(
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32 requires an MXFP8 "
-            "BlockScaledTensor for fc1_weight"
-        )
+    if layout is MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32 and (not isinstance(fc1_weight, BlockScaledTensor) or fc1_weight.format is not MoeFormat.MXFP8):
+        raise ValueError("fc1_weight_layout=GATE_UP_INTERLEAVED_32 requires an MXFP8 " "BlockScaledTensor for fc1_weight")
     _validate_routes(
         config,
         token_count,
@@ -387,14 +374,8 @@ def validate_native_forward_weights(
 ) -> torch.device:
     if not isinstance(weights, MoeEpNativeForwardWeights):
         raise TypeError("weights must be a MoeEpNativeForwardWeights, " f"got {type(weights).__name__}")
-    if (
-        config.public_config.data_path.fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training weights require "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+    if config.public_config.data_path.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     experts = config.topology.experts_per_rank
     hidden = config.public_config.model.hidden_size
     intermediate = config.public_config.model.intermediate_size
@@ -432,14 +413,8 @@ def validate_native_backward_weights(
 ) -> torch.device:
     if not isinstance(weights, MoeEpNativeBackwardWeights):
         raise TypeError("weights must be a MoeEpNativeBackwardWeights, " f"got {type(weights).__name__}")
-    if (
-        config.public_config.data_path.fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training weights require "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+    if config.public_config.data_path.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     experts = config.topology.experts_per_rank
     hidden = config.public_config.model.hidden_size
     intermediate = config.public_config.model.intermediate_size
@@ -479,52 +454,32 @@ def _validate_discrete_weight(
     validate_pointees: bool,
 ) -> torch.device:
     if not isinstance(weight, MoeEpNativeDiscreteWeight):
-        raise TypeError(
-            f"{name} must be a MoeEpNativeDiscreteWeight, "
-            f"got {type(weight).__name__}"
-        )
+        raise TypeError(f"{name} must be a MoeEpNativeDiscreteWeight, " f"got {type(weight).__name__}")
     if weight.layout_id is not layout_id:
-        raise ValueError(
-            f"{name}.layout_id must be {layout_id.value!r}, "
-            f"got {weight.layout_id.value!r}"
-        )
+        raise ValueError(f"{name}.layout_id must be {layout_id.value!r}, " f"got {weight.layout_id.value!r}")
     for field_name, table in (
         ("payload_ptrs", weight.payload_ptrs),
         ("scale_ptrs", weight.scale_ptrs),
     ):
         _validate_strided(f"{name}.{field_name}", table)
         if tuple(table.shape) != (experts,):
-            raise ValueError(
-                f"{name}.{field_name} shape must be ({experts},), "
-                f"got {tuple(table.shape)}"
-            )
+            raise ValueError(f"{name}.{field_name} shape must be ({experts},), " f"got {tuple(table.shape)}")
         if table.dtype is not torch.int64:
-            raise ValueError(
-                f"{name}.{field_name} must have dtype torch.int64, "
-                f"got {table.dtype}"
-            )
+            raise ValueError(f"{name}.{field_name} must have dtype torch.int64, " f"got {table.dtype}")
         if not table.is_contiguous():
             raise ValueError(f"{name}.{field_name} must be contiguous")
         if table.device.type != "cuda":
-            raise ValueError(
-                f"{name}.{field_name} must be a CUDA tensor, got {table.device}"
-            )
+            raise ValueError(f"{name}.{field_name} must be a CUDA tensor, got {table.device}")
         if table.data_ptr() % 8:
             raise ValueError(f"{name}.{field_name} address must be 8-byte aligned")
         if device is not None and table.device != device:
-            raise ValueError(
-                f"{name}.{field_name} must be on {device}, got {table.device}"
-            )
+            raise ValueError(f"{name}.{field_name} must be on {device}, got {table.device}")
         if validate_pointees and table.numel():
             pointees = table.detach()
             if bool((pointees <= 0).any().item()):
-                raise ValueError(
-                    f"{name}.{field_name} must contain positive, non-null pointers"
-                )
+                raise ValueError(f"{name}.{field_name} must contain positive, non-null pointers")
             if bool((pointees.remainder(256) != 0).any().item()):
-                raise ValueError(
-                    f"{name}.{field_name} pointees must be 256-byte aligned"
-                )
+                raise ValueError(f"{name}.{field_name} pointees must be 256-byte aligned")
     return weight.device
 
 
@@ -538,18 +493,9 @@ def validate_native_discrete_forward_weights(
     """Validate forward pointer tables; pointee extents remain caller-owned ABI."""
 
     if not isinstance(weights, MoeEpNativeDiscreteForwardWeights):
-        raise TypeError(
-            "weights must be a MoeEpNativeDiscreteForwardWeights, "
-            f"got {type(weights).__name__}"
-        )
-    if (
-        config.public_config.data_path.fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training weights require "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+        raise TypeError("weights must be a MoeEpNativeDiscreteForwardWeights, " f"got {type(weights).__name__}")
+    if config.public_config.data_path.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     resolved = _validate_discrete_weight(
         "weights.fc1",
         weights.fc1,
@@ -578,18 +524,9 @@ def validate_native_discrete_backward_weights(
     """Validate backward pointer tables; pointee extents remain caller-owned ABI."""
 
     if not isinstance(weights, MoeEpNativeDiscreteBackwardWeights):
-        raise TypeError(
-            "weights must be a MoeEpNativeDiscreteBackwardWeights, "
-            f"got {type(weights).__name__}"
-        )
-    if (
-        config.public_config.data_path.fc1_weight_layout
-        is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32
-    ):
-        raise ValueError(
-            "native training weights require "
-            "fc1_weight_layout=GATE_UP_INTERLEAVED_32"
-        )
+        raise TypeError("weights must be a MoeEpNativeDiscreteBackwardWeights, " f"got {type(weights).__name__}")
+    if config.public_config.data_path.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training weights require " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
     resolved = _validate_discrete_weight(
         "weights.w2_transpose",
         weights.w2_transpose,
@@ -601,9 +538,7 @@ def validate_native_discrete_backward_weights(
     return _validate_discrete_weight(
         "weights.w1_transpose",
         weights.w1_transpose,
-        layout_id=(
-            MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1
-        ),
+        layout_id=(MoeEpNativeWeightLayout.BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1),
         experts=config.topology.experts_per_rank,
         device=resolved,
         validate_pointees=validate_pointees,
@@ -623,10 +558,7 @@ def validate_training_input(
     logical_shape = _logical_shape(value)
     hidden_size = config.public_config.model.hidden_size
     if len(logical_shape) != 2 or logical_shape[1] != hidden_size:
-        raise ValueError(
-            f"{name} logical shape must be (T, {hidden_size}), "
-            f"got {logical_shape}"
-        )
+        raise ValueError(f"{name} logical shape must be (T, {hidden_size}), " f"got {logical_shape}")
     _validate_tensor_representation(name, value, logical_shape)
     if isinstance(value, BlockScaledTensor):
         if value.format is not MoeFormat.MXFP8:
