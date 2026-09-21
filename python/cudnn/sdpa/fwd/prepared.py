@@ -302,7 +302,12 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         decl = spec.decl[name]
         h, d = decl[0], decl[1]
         st, sh = f.strides, f.shape
-        if len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
+        if f.numel == 0:
+            # A zero-numel operand has no geometry of its own, whatever its rank (issue #552: an all-KV-zero
+            # call may pass an empty K/V; the packed-KV clamp below binds the dummy token). It takes the
+            # plan's declared strides, as the pre-prepared path did.
+            ts, hs, es = decl[2], decl[3], decl[4]
+        elif len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
             if int(sh[0]) != b or int(sh[1]) != h or int(sh[3]) != d:
                 raise ValueError(f"cudnn.sdpa: " + (f"{name}: effective shape {tuple(sh)} must be ({b}, {h}, S, {d}) for this plan"))
             ts, hs, es = int(st[2]), int(st[1]), int(st[3])
@@ -311,10 +316,7 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
                 raise ValueError(f"cudnn.sdpa: " + (f"{name}: a packed THD buffer is (T, {h}, {d}); got {tuple(sh)}"))
             ts, hs, es = int(st[0]), int(st[1]), int(st[2])
         else:
-            if True:
-                raise ValueError(f"cudnn.sdpa: " + (f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}"))
-        if f.numel == 0:
-            ts, hs, es = decl[2], decl[3], decl[4]
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}"))
         width = _buffers.DTYPE_ITEMSIZE[spec.expect[name]]
         if es != 1:
             raise ValueError(f"cudnn.sdpa: " + (f"{name}: the head dim must be contiguous (elem stride 1); got {es}"))
