@@ -4053,7 +4053,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         import cutlass
 
         arch = f"sm_{self.compute_capability[0]}{self.compute_capability[1]}"
-        smem_capacity_bytes = cutlass.utils.get_smem_capacity_in_bytes(arch)
+        from cudnn._cutlass_compat import get_smem_capacity_in_bytes
+
+        smem_capacity_bytes = get_smem_capacity_in_bytes(arch)
 
         # General head dims round to the dtype's granule. The SMEM model also
         # promotes envelope-served dimensions to their flavor's fixed tiles;

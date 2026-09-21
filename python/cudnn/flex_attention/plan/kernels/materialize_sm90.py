@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Uint32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 import cuda.bindings.driver as cuda
 
 from cudnn.flex_attention.kernels.sm90.bwd.backward_config import make_sm90_bwd_tiled_mma_sdp
@@ -153,7 +154,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
         )
         canonical_words = (self.tile_n + 31) // 32
         canonical_stride = canonical_words + 1
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sMask = smem.allocate_tensor(
             element_type=Uint32,
             layout=cute.make_layout(
@@ -390,7 +391,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
         )
         canonical_words = (self.tile_n + 31) // 32
         canonical_stride = canonical_words + 1
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sMask = smem.allocate_tensor(
             element_type=Uint32,
             layout=cute.make_layout(

@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Int64, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 
@@ -362,7 +363,7 @@ class ForwardScheduleOrder:
     ) -> None:
         lane_idx, _, _ = cute.arch.thread_idx()
         section, _, _ = cute.arch.block_idx()
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sCost = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((32,)),

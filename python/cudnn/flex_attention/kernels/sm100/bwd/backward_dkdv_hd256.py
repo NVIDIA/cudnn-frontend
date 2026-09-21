@@ -20,6 +20,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 import cuda.bindings.driver as cuda
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
@@ -570,21 +571,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             ),
         )
 
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.Q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.K_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = LayoutEnum.from_tensor(dV).mma_major_mode()
 
-        if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError(f"The layout of q is not supported: {self.Q_major_mode}")
-        if cutlass.const_expr(self.K_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.K_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dK_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dk is not supported")
-        if cutlass.const_expr(self.V_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.V_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.dV_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dV_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dv is not supported")
 
         self._setup_attributes()
@@ -595,8 +596,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute S
         KQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             K.element_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            K.element_type,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.KQ_mma_tiler[:2],
@@ -604,8 +606,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dP
         VdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             V.element_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            V.element_type,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.VdO_mma_tiler[:2],
@@ -613,8 +616,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dV
         PdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             dO.element_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            dO.element_type,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.PdO_mma_tiler[:2],
@@ -623,8 +627,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dK
         dSQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             Q.element_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            Q.element_type,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.dSQ_mma_tiler[:2],
@@ -763,8 +768,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         num_epi_stages_dKV = (self.cta_tiler[2] // num_compute_wgs) // epi_cols_dKV
         epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
         total_epi_stages = num_compute_wgs * num_epi_stages_dKV
-        dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
-        dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
+        dK_layout_enum = LayoutEnum.from_tensor(dK)
+        dV_layout_enum = LayoutEnum.from_tensor(dV)
         sdK_epi_layout = sm100_utils.make_smem_layout_epi(
             dK.element_type,
             dK_layout_enum,
@@ -983,7 +988,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dOT)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_Q_producer, load_mma_Q_consumer = pipeline.PipelineTmaUmma.create(
@@ -1131,7 +1136,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_threads=self.threads_per_cta,
         )
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
@@ -1236,7 +1241,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
 
             self.load(
                 K_in,
@@ -1286,7 +1291,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
+            cute.arch.setmaxregister_increase(self.num_regs_mma)
 
             self.mma_2cta(
                 KQ_tiled_mma,
@@ -1323,7 +1328,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         #  Compute
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_idx >= self.compute_warp_id[0] and warp_idx <= self.compute_warp_id[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+            cute.arch.setmaxregister_increase(self.num_regs_compute)
 
             self.compute(
                 tSTtST,
@@ -1367,7 +1372,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
 
         else:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()

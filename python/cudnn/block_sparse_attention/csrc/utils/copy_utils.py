@@ -12,12 +12,12 @@ from typing import Callable, Optional, Tuple, Type
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
+from cudnn._cutlass_compat import Arch
 
 # cute.copy elects a single lane internally for raw bulk-copy atoms only on
 # cute-dsl 4.6.0 and 4.6.1; on every other version the caller must elect.

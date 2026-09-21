@@ -14,8 +14,7 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-
-from cutlass.cute import FastDivmodDivisor
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):

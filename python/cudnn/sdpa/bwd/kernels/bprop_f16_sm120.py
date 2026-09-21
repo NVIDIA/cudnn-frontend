@@ -51,6 +51,7 @@ separate ``dq2k`` kernel (``bprop_chain_f16_sm120.py``) that replaces
 not fit in device memory.
 """
 
+from cudnn._cutlass_compat import get_smem_capacity_in_bytes
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from types import SimpleNamespace
@@ -421,7 +422,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         Q_TILE, KV_TILE, D_QK, D_V = self.q_tile, self.kv_tile, self.d_qk, self.d_v
         # Double-buffer Q when SMEM allows (prefetch hides the TMA latency);
         # single-buffered Q pays an end-of-iteration rendezvous (d256's only fit).
-        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
+        cap = get_smem_capacity_in_bytes("sm_120")
         for q_stages in (2, 1):
             smem_elems = q_stages * Q_TILE * D_QK + Q_TILE * D_V + KV_TILE * D_QK + max(KV_TILE * D_V, 2 * Q_TILE * KV_TILE)
             if smem_elems * in_dtype.bytes <= cap:

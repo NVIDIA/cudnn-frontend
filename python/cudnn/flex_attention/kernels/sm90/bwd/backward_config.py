@@ -12,6 +12,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
 from cutlass import Float32, const_expr
 from cutlass.cute.nvgpu import warpgroup
+from cudnn._cutlass_compat import OperandMajorMode
 
 from cudnn.flex_attention.kernels.sm90.fwd.forward_config import sm90_native_fwd_can_implement
 
@@ -316,8 +317,8 @@ def make_sm90_bwd_tiled_mma_sdp(
     return sm90_utils_basic.make_trivial_tiled_mma(
         dtype,
         dtype,
-        warpgroup.OperandMajorMode.K,
-        warpgroup.OperandMajorMode.K,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         atom_layout_mnk=atom_layout,
         tiler_mn=(64, tiler_mn[1] if not sdp_swap_ab else tiler_mn[0]),

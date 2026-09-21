@@ -55,6 +55,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -261,7 +262,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             num_threads=32 * self.epilogue_warp_group_size,
         )
 
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -618,12 +619,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.rht_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -698,7 +699,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # to the flat output and does not TMA-copy this stage.
         self.rht_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.rht_dtype,
-            utils.LayoutEnum.COL_MAJOR if cutlass.const_expr(self.rht_quant and not self.rht_rowwise) else utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.COL_MAJOR if cutlass.const_expr(self.rht_quant and not self.rht_rowwise) else LayoutEnum.ROW_MAJOR,
             self.epi_tile,
             self.num_d_stage,
         )
@@ -1454,7 +1455,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         tidx, _, _ = cute.arch.thread_idx()
 
         # Shared memory allocation
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1540,7 +1541,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # TMEM allocator
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_act_warp_id[0],

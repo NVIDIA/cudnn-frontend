@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
+
 import math
 from typing import Optional, Tuple
 
@@ -12,6 +13,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 from cudnn.flex_attention.kernels.common.max_logit import init_max_logit, store_max_logit, update_max_logit
 from cudnn.flex_attention._compat import copy_utils
 
@@ -346,16 +348,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         grid = self.tile_scheduler_cls.get_grid_shape(self.tile_sched_params)
 
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+        self.q_major_mode = LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = LayoutEnum.from_tensor(v).mma_major_mode()
+        self.o_layout = LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -372,8 +374,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -382,6 +385,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -596,7 +600,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_leader_cta = mma_tile_coord_v == Int32(0)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
@@ -680,7 +684,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 ),
             )
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -781,7 +785,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
             if warp_idx == self.empty_warp_id[_i]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # Cluster wait
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
@@ -790,7 +794,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  LOAD Q/K
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             tile_sched = self.tile_scheduler_cls.create(tile_sched_params, clc)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -906,7 +910,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  LOAD V
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.v_load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             v_tile_sched = self.tile_scheduler_cls.create(tile_sched_params, clc)
             v_work_tile = v_tile_sched.initial_work_tile_info()
             while v_work_tile.is_valid_tile:
@@ -969,7 +973,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             tmem.allocate(self.tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
@@ -1132,7 +1136,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tile_sched = self.tile_scheduler_cls.create(tile_sched_params, clc)
@@ -1280,7 +1284,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            cute.arch.setmaxregister_decrease(self.num_regs_correction)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tile_sched = self.tile_scheduler_cls.create(tile_sched_params, clc)
@@ -1388,7 +1392,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  CLC scheduler warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.sched_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             tile_sched = self.tile_scheduler_cls.create(tile_sched_params, clc)
             work_tile = tile_sched.initial_work_tile_info()
             if is_leader_cta:

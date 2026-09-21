@@ -2,6 +2,7 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # SM90 (Hopper) forward pass for FlexAttention.
 
+
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, Optional
@@ -12,7 +13,7 @@ from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass import pipeline
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 import cuda.bindings.driver as cuda
 
@@ -310,7 +311,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         sO_empty_mbar_ptr = storage.mbar_ptr_O_empty.data_ptr()

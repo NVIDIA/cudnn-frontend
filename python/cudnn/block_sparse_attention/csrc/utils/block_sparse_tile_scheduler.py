@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 from .tile_scheduler import (
     SchedulingMode,

@@ -30,6 +30,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -140,7 +141,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.tmem_dealloc_sync_bar_id = 3
 
         self.architecture = "sm_100"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.smem_capacity = get_smem_capacity_in_bytes(self.architecture)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     # ------------------------------------------------------------------
@@ -438,9 +439,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             self.sf_dtype = self.sf_dtype_override
         else:
             self.sf_dtype = sfa_gemm.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_gemm).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_gemm).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_gemm)
+        self.a_major_mode = LayoutEnum.from_tensor(a_gemm).mma_major_mode()
+        self.b_major_mode = LayoutEnum.from_tensor(b_gemm).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c_gemm)
 
         # =================================================================
         # Step 3: Setup kernel attributes
@@ -800,7 +801,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sched_storage = storage.scheduler
 
@@ -850,7 +851,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],

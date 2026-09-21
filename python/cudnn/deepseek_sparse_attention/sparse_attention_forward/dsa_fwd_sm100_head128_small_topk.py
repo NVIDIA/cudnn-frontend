@@ -32,6 +32,7 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint8, Uint32, con
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T
+from cudnn._cutlass_compat import SmemAllocator, TmemAllocator
 
 from ..utils import copy as copy_utils
 from ._nvvm_compat import fmax_ftz_nonan
@@ -437,7 +438,7 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         is_cluster_leader = cta_rank == Int32(0)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         # Keep the pointer, rather than the local SharedStorage object, live
         # across the persistent loop for CuTe DSL 4.5 CFG flattening.
@@ -566,7 +567,7 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
         # write and its post-NamedBarrier read as a RAW hazard in this helper's
         # shared holding buffer; memcheck and synccheck are clean, and the same
         # protocol is used by the repository's 2-CTA SM100 SDPA kernel.
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.WG_MMA * 4,

@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -157,7 +158,7 @@ class ScoreGradDenseSm90:
         grad_scale_f32 = Float32(grad_scale) * Float32(mGradLoss[0])
 
         if seq_local < seqlen_q_b:
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
 
             @cute.struct
             class SharedStorage:

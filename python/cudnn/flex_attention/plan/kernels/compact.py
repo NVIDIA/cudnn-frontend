@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Uint32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.flex_attention.plan.kernels.common import (
     _ArbitraryPlanCommonSm90,
@@ -62,7 +63,7 @@ class _ArbitraryPlanQ2KCompact(_ArbitraryPlanCommonSm90):
             mCuSeqlensK,
             mCuTotalMBlocks,
         )
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((self.num_warps,)),
@@ -192,7 +193,7 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
             mCuTotalQBlocks,
             mCuTotalKBlocks,
         )
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((self.num_warps,)),

@@ -16,6 +16,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import torch
 from cutlass import Float32, cute
 from cutlass.cute.nvgpu import tcgen05
+from cudnn._cutlass_compat import OperandMajorMode
 from cudnn.flex_attention.plan.mask_plan import (
     ArbitraryPlanSignature,
     ArbitraryPlanTopology,
@@ -364,8 +365,9 @@ def make_sm100_fwd_tiled_mma_qk(
 
     return sm100_utils_basic.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         cta_group,
         (tile_m * cta_group_size, tile_n),

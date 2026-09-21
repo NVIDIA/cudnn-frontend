@@ -21,8 +21,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, CollectorOp
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -345,7 +346,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
@@ -761,12 +762,12 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -1683,7 +1684,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1759,7 +1760,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],

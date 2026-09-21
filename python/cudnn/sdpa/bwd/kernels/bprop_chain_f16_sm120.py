@@ -5,6 +5,7 @@
 ``dot`` (delta preprocess), the deterministic two-kernel dQ GEMM, the
 dQ / dBias convert kernels, the GQA dK/dV group reduce, and ``dsink``."""
 
+from cudnn._cutlass_compat import get_smem_capacity_in_bytes
 from typing import Optional, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -77,7 +78,7 @@ class SM120DetDqGemmKernel:
         self.k_tile_elems = kv_tile * head_dim
         self.ds_tile_elems = q_tile * kv_tile
         smem_bytes = self.stages * (self.k_tile_elems + self.ds_tile_elems) * in_dtype.bytes + self.stages * 8
-        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
+        cap = get_smem_capacity_in_bytes("sm_120")
         if smem_bytes > cap:
             raise ValueError(f"deterministic dQ GEMM: smem {smem_bytes} bytes exceeds the sm_120 cap of {cap} bytes")
         self.min_blocks = 1

@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Uint32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 import cuda.bindings.driver as cuda
 
 from cudnn.flex_attention.plan.kernels.common import (
@@ -201,7 +202,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                         )
             logical_row += Int32(self.num_threads)
 
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((self.num_warps,)),

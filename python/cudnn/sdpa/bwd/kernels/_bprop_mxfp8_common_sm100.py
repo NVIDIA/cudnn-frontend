@@ -579,6 +579,7 @@ def make_kq_mma_atoms(config, low_precision_type):
     """
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         low_precision_type,
+        low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
         config.sf_dtype,
@@ -588,6 +589,7 @@ def make_kq_mma_atoms(config, low_precision_type):
         tcgen05.OperandSource.TMEM,
     )
     tiled_mma_smem = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        low_precision_type,
         low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
@@ -599,6 +601,7 @@ def make_kq_mma_atoms(config, low_precision_type):
     )
     tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
         low_precision_type,
+        low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
         config.sf_dtype,
@@ -608,6 +611,7 @@ def make_kq_mma_atoms(config, low_precision_type):
         tcgen05.OperandSource.TMEM,
     )
     tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        low_precision_type,
         low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,

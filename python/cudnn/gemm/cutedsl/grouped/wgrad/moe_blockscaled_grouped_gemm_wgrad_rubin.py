@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import get_smem_capacity_in_bytes
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -86,7 +87,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.architecture = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.smem_capacity = get_smem_capacity_in_bytes(self.architecture)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     def _setup_attributes(self) -> None:

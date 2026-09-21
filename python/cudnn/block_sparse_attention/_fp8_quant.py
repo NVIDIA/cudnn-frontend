@@ -9,6 +9,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 from cutlass import BFloat16, Float8E4M3FN, Float32, Int32
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import to_cute_tensor
 
@@ -128,7 +129,7 @@ class _SageFp8Quantizer:
         group_base = group_idx * seqlen_k * self.HEAD_DIM
         local_offset = thread_idx * self.K_ELEMS_PER_THREAD
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         warp_amax = smem.allocate_tensor(
             Float32,
             cute.make_layout((self.K_WARPS,)),

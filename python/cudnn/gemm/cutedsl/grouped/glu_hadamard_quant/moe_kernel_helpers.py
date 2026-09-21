@@ -44,6 +44,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -804,9 +805,9 @@ def compute_stages(
     epi_tile: cute.Tile,
     epi_tile_c: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     d_dtype: Type[cutlass.Numeric],
-    d_layout: utils.LayoutEnum,
+    d_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -925,7 +926,7 @@ def compute_stages_wgrad(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,

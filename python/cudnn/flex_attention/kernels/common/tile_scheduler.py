@@ -14,13 +14,13 @@ from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 from cutlass.cute.typing import Boolean
 from cutlass.cutlass_dsl import (
     extract_mlir_values,
     new_from_mlir_values,
 )
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
 

@@ -4,6 +4,8 @@
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
+from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -204,7 +206,7 @@ def gemm_proj_rope_mxfp8_kernel(
     mScol: cute.Tensor,
     epi_tile: cute.Tile,
     cta_layout_vmnk: cute.Layout,
-    tile_sched_params: utils.PersistentTileSchedulerParams,
+    tile_sched_params: PersistentTileSchedulerParams,
     num_tmem_cols: cutlass.Constexpr,
     num_heads: cutlass.Constexpr,
     t2r_x8: cutlass.Constexpr,
@@ -219,7 +221,7 @@ def gemm_proj_rope_mxfp8_kernel(
     mma_warp_id = 12
     tma_warp_id = 13
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.SmemAllocator()
     storage = smem.allocate(SharedStorage)
     sA = smem.allocate_tensor(element_type=io_dtype, layout=a_smem_layout.outer, byte_alignment=128, swizzle=a_smem_layout.inner)
     sB = smem.allocate_tensor(element_type=io_dtype, layout=b_smem_layout.outer, byte_alignment=128, swizzle=b_smem_layout.inner)
@@ -249,9 +251,7 @@ def gemm_proj_rope_mxfp8_kernel(
 
     epilogue_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads_in_epilogue)
     tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
-    tmem = utils.TmemAllocator(
-        storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False
-    )
+    tmem = TmemAllocator(storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
 
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,
@@ -295,7 +295,7 @@ def gemm_proj_rope_mxfp8_kernel(
 
     num_k_tiles = cute.size(tCgA, mode=[4])
 
-    tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+    tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
     work_tile = tile_sched.initial_work_tile_info()
 
     # ================= TMA load warp =================
@@ -577,8 +577,8 @@ def gemm_proj_rope_mxfp8_host(
     k_scale_words: cutlass.Constexpr,
     stream,
 ):
-    a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
-    b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+    a_major = LayoutEnum.from_tensor(mA).mma_major_mode()
+    b_major = LayoutEnum.from_tensor(mB).mma_major_mode()
 
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         io_dtype,
@@ -608,7 +608,7 @@ def gemm_proj_rope_mxfp8_host(
     tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mB, b_smem_layout_1, mma_tiler_mnk, tiled_mma, cta_layout_vmnk.shape)
 
     cta_tile_shape_mnk = (mma_tiler_mnk[0], mma_tiler_mnk[1], mma_tiler_mnk[2])
-    c_layout_kind = utils.LayoutEnum.ROW_MAJOR
+    c_layout_kind = LayoutEnum.ROW_MAJOR
     epi_tile = utils.compute_epilogue_tile_shape(cta_tile_shape_mnk, False, c_layout_kind, cutlass.Float32)
 
     # TMEM budget is fixed for this tile config (accumulator + SFA/SFB scale factors); the kernel
@@ -616,8 +616,8 @@ def gemm_proj_rope_mxfp8_host(
     num_tmem_cols = NUM_TMEM_COLS
 
     num_ctas_mnl = (grid_m, num_heads, 1)
-    tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnk, swizzle_size, True)
-    grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+    tile_sched_params = PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnk, swizzle_size, True)
+    grid = StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
     gemm_proj_rope_mxfp8_kernel(
         tiled_mma,

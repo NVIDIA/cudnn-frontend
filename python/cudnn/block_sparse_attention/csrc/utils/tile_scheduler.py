@@ -15,8 +15,8 @@ from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 

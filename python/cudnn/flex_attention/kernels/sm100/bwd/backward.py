@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+
+
 import math
 from functools import partial
 from typing import Callable, Optional
@@ -10,7 +12,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import PipelineAsync
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 import cuda.bindings.driver as cuda
 from cudnn.flex_attention.kernels.common import barrier, copy_utils, pipeline
@@ -196,8 +198,9 @@ class FlexAttentionBackwardSm100:
         # S.T = K @ Q.T
         tiled_mma_S = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_kq[:2],
@@ -205,8 +208,9 @@ class FlexAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tiled_mma_dP = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.do_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_vdo[:2],
@@ -214,8 +218,9 @@ class FlexAttentionBackwardSm100:
         # dV += P.T @ dO --> (K, MN) major
         tiled_mma_dV = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # P_major_mode
-            tcgen05.OperandMajorMode.MN,  # dO_major_mode
+            self.do_dtype,
+            OperandMajorMode.K,  # P_major_mode
+            OperandMajorMode.MN,  # dO_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_pdo[:2],
@@ -224,8 +229,9 @@ class FlexAttentionBackwardSm100:
         # dK += dS.T @ Q
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Q_major_mode
+            self.do_dtype,
+            OperandMajorMode.K,  # dS_major_mode
+            OperandMajorMode.MN,  # Q_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsq[:2],
@@ -234,8 +240,9 @@ class FlexAttentionBackwardSm100:
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
             self.k_dtype,
-            tcgen05.OperandMajorMode.MN,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+            self.k_dtype,
+            OperandMajorMode.MN,  # dS_major_mode
+            OperandMajorMode.MN,  # Kt_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsk[:2],
@@ -465,9 +472,9 @@ class FlexAttentionBackwardSm100:
             self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
             dK_major_mode = self.mdK_layout_enum.mma_major_mode()
             dV_major_mode = self.mdV_layout_enum.mma_major_mode()
-            if const_expr(dK_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dK_major_mode != OperandMajorMode.K):
                 raise RuntimeError("The layout of mdK is wrong")
-            if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dV_major_mode != OperandMajorMode.K):
                 raise RuntimeError("The layout of mdV is wrong")
 
         if const_expr(self.use_tma_store and not self.dKV_postprocess):
@@ -969,14 +976,14 @@ class FlexAttentionBackwardSm100:
         )
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         if const_expr(self.use_2cta_instrs):
-            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
-            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
-            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
-            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
+            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr.ptr
+            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr.ptr
+            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr.ptr
+            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr.ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
@@ -1001,7 +1008,7 @@ class FlexAttentionBackwardSm100:
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         use_unaligned_tmem_barrier = const_expr(self.use_2cta_instrs)
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

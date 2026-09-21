@@ -14,7 +14,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum
 
 
 @dsl_user_op
