@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -410,11 +411,16 @@ def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
     return (bs, hs, ss, es)
 
 
+@lru_cache(maxsize=256)
 def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
     """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
     operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
     then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
-    attach the prepared launch and for the binder's per-call admission (rule 8b lockstep)."""
+    attach the prepared launch and for the binder's per-call admission (rule 8b lockstep).
+
+    Only this pure layout result is cached; the binder still checks each call's dtype,
+    device, address alignment, observed span and compiled shape envelope. The bounded
+    cache retains no buffers, pointers or per-call frames."""
     st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
     if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
         return None

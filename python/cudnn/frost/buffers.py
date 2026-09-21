@@ -18,10 +18,13 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import logging
 import re as _re
 import struct
 
 from cudnn import _pybind_module
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
@@ -214,14 +217,31 @@ class DeviceBuffer(DeviceView):
         super().__init__(int(ptr), (int(nbytes),), "uint8", device_id)
 
     def __del__(self):
-        # At interpreter teardown the context can already be gone, which makes
-        # the free fail on memory the driver has reclaimed anyway.
+        # Cyclic GC can run during someone else's CUDA graph capture. This
+        # allocation is no longer live; releasing it must not invalidate that
+        # capture. Relax only this thread's safety check, and always restore it.
         try:
             from cuda.bindings import driver as _drv
 
-            _drv.cuMemFree(self.data_ptr())
+            ptr = getattr(self, "_ptr", 0)
+            if not ptr:
+                return
+            err, previous = _drv.cuThreadExchangeStreamCaptureMode(_drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+            if int(err) != 0:
+                _LOG.warning("cudnn.frost: cannot release DeviceBuffer: capture-mode exchange failed: %s", err)
+                return
+            try:
+                (err,) = _drv.cuMemFree(ptr)
+                if int(err) == 0:
+                    self._ptr = 0
+                elif err not in (_drv.CUresult.CUDA_ERROR_DEINITIALIZED, _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED):
+                    _LOG.warning("cudnn.frost: cuMemFree failed: %s", err)
+            finally:
+                err, _ = _drv.cuThreadExchangeStreamCaptureMode(previous)
+                if int(err) != 0:
+                    _LOG.warning("cudnn.frost: restoring capture mode failed: %s", err)
         except Exception:  # noqa: BLE001
-            pass
+            pass  # Interpreter teardown may already have unloaded CUDA / logging.
 
 
 def probe(buf):

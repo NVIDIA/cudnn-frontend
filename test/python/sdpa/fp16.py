@@ -248,7 +248,7 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
 
     if cfg.is_block_mask:
         TILE_M, TILE_N = 128, 128
-        block_mask_gpu = torch.randint(0, 256, (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8), dtype=torch.uint8, device="cuda")
+        block_mask_gpu = torch.randint(0, 256, (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8), dtype=torch.uint8, device="cuda", generator=rng_data_gen)
         allocs[TensorUid.block_mask] = (block_mask_gpu, None, None)
 
     if cfg.is_dropout:

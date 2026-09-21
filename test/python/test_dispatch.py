@@ -175,6 +175,56 @@ def test_a_pinned_python_plan_runs_and_writes_the_callers_buffer(monkeypatch):
     assert _marked(c)
 
 
+@pytest.mark.parametrize("override_field", ["override_uids", "override_shapes", "override_strides", "complete"])
+def test_uid_map_plan_rejects_runtime_overrides_before_execute(monkeypatch, override_field):
+    """A legacy executor cannot receive geometry overrides; never silently drop them."""
+    g = pygraph(is_override_shape_enabled=True)
+    eng = StubEngine()
+    _offer(monkeypatch, eng)
+    out = g.matmul(torch.ones(2, 2), torch.ones(2, 2))
+    _pin(g, "stub")
+    g.build_plans()
+    result = torch.full((2, 2), -1.0)
+    overrides = {"override_uids": [out.get_uid()], "override_shapes": [[1, 2]], "override_strides": [[2, 1]]}
+    with pytest.raises(ValueError, match="does not support execute-time shape or stride overrides"):
+        g.execute({out: result}, **(overrides if override_field == "complete" else {override_field: overrides[override_field]}))
+    assert not eng.seen
+    assert torch.equal(result, torch.full_like(result, -1.0))
+    g.execute({out: result})
+    assert _marked(result)
+
+
+def test_variant_pack_plan_receives_runtime_overrides(monkeypatch):
+    """The legacy guard must preserve the normalized-plan execution contract."""
+    from unittest.mock import Mock
+
+    from cudnn.engines import CompiledPlan
+
+    seen = []
+
+    class Plan(CompiledPlan):
+        takes_variant_pack = True
+
+        def execute(self, graph, pack, ctx):
+            seen.append(pack)
+
+    g = pygraph(is_override_shape_enabled=True)
+    eng = StubEngine()
+    monkeypatch.setattr(eng, "build_plan", lambda graph, plan, ctx=None: Plan())
+    _offer(monkeypatch, eng)
+    out = g.matmul(torch.ones(2, 2), torch.ones(2, 2))
+    _pin(g, "stub")
+    g.build_plans()
+    normalized = object()
+    normalize = Mock(return_value=normalized)
+    monkeypatch.setattr(g, "_normalize", normalize)
+    result = torch.empty(2, 2)
+    uids, shapes, strides = [out.get_uid()], [[1, 2]], [[2, 1]]
+    g.execute({out: result}, override_uids=uids, override_shapes=shapes, override_strides=strides)
+    assert normalize.call_args.args[2:] == (uids, shapes, strides)
+    assert seen == [normalized]
+
+
 def test_every_node_reaches_the_engine_with_its_buffers_resolved(monkeypatch):
     """A fused matmul + bias + relu graph arrives WHOLE: every node in build
     order, each input port resolved to the caller's storage, and the virtual
@@ -1492,3 +1542,52 @@ def test_create_execution_plan_appends_a_python_plan(monkeypatch):
     g.select_plan(last)
     g.build_plans()
     g.execute({C: torch.empty(2, 2)})
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_backend_decline_does_not_retain_graph_frames(monkeypatch, caplog, chained):
+    """A saved backend diagnostic must not retain the graph through exception frames,
+    including after repeated build attempts re-raise it."""
+    import gc
+    import weakref
+    import cudnn
+
+    def decline(self):
+        if chained:
+            try:
+                raise RuntimeError("inner backend diagnostic")
+            except RuntimeError as cause:
+                raise cudnn.cudnnGraphNotSupportedError("unsupported test graph") from cause
+        raise cudnn.cudnnGraphNotSupportedError("unsupported test graph")
+
+    monkeypatch.setattr(pygraph, "_lower_backend_graph", decline)
+    graph = pygraph()
+    graph.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    # Logging handlers may retain the original error as LogRecord.args. Keep
+    # this detector scoped to the diagnostic retained by the graph itself.
+    import logging
+
+    with caplog.at_level(logging.CRITICAL, logger="cudnn.pygraph"):
+        graph._finalize_backend_layout()
+    saved = graph._backend_declined
+    assert type(saved) is cudnn.cudnnGraphNotSupportedError
+    assert str(saved) == "unsupported test graph"
+    assert saved.__traceback__ is None and saved.__cause__ is None and saved.__context__ is None
+    graph._planning_done = True
+    for _ in range(3):
+        try:
+            graph.build_plans()
+        except cudnn.cudnnGraphNotSupportedError as exc:
+            assert type(exc) is type(saved) and str(exc) == str(saved)
+        else:
+            pytest.fail("the saved backend decline was not raised")
+        assert saved.__traceback__ is None and saved.__cause__ is None and saved.__context__ is None
+    graph_ref = weakref.ref(graph)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del graph
+        assert graph_ref() is None, "backend diagnostics must not need cyclic GC to release CUDA resources"
+    finally:
+        if was_enabled:
+            gc.enable()

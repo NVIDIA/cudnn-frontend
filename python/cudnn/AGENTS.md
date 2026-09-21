@@ -44,6 +44,16 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   defined or explicitly rejected — an unhandled overlap is an untested code
   path with unspecified semantics, and "both supplied" is exactly the case
   no per-argument check catches (raised in review on PR #266).
+- **An execute-time shape/stride override must reach the executor or raise
+  before launch.** A raw uid-map plan cannot consume it; do not silently drop
+  the override triple. Filter override-enabled graphs per plan's binding capability,
+  preserving prepared plans while declining tensor-only ones. Detectors:
+  `test_uid_map_plan_rejects_runtime_overrides_before_execute` and
+  `test_override_filter_preserves_compatible_split_candidates`.
+- **Shape overrides do not enlarge the producer's storage.** Validate metadata
+  inputs against their observed span as well as their effective shape, and check
+  pointer alignment for the element type. The host-only detector is
+  `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -352,3 +362,10 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Torch custom-op implementations live with their owning operation family and may be re-exported from `experimental/ops/` while maturing (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
+
+CUDA-owning objects can be reclaimed by cyclic GC inside an unrelated graph
+capture. Keep disabled ABI slots non-owning, and scope resource destruction so it
+does not invalidate that capture; merely collecting before a test is not a
+library fix. `test_collect_unrelated_resources_during_capture` forces collection
+inside a global-mode capture and checks both replay and subsequent native cuDNN
+execution, which also detects backend-handle destruction poisoning later plans.

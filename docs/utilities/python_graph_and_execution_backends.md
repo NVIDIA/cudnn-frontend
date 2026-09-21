@@ -50,11 +50,12 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
    ├─ family_for(graph) → resolve_heuristics(family)
    │     declares none → _unranked: accepting engines, then the backend
    │
-   └─ <family>.recommend(modes, facts, offered, backend_plans)
-      │                                    e.g. sdpa/fwd/heuristics.py
+   └─ _assemble(modes, <family>.recommend(kind, facts, offered), backend_plans)
+      │                                    e.g. sdpa/fwd/heuristics.py (propose)
       ├─ A  → per eligible cell: a measured rule (_sm120_tiles) names the config,
       │       runners-up behind it; a cell with one point per axis contributes one
-      │       entry. Placed against the backend's A block by _MEASURED_BEHIND.
+      │       entry. The backend's A block goes where the family's BACKEND marker
+      │       sits (sdpa/fwd/placement.py per shard; ours first without a marker).
       ├─ FALLBACK → the config expected to build, + the backend's FALLBACK block
       ├─ OPENSOURCE → our candidates, then the delegating entry (see below)
       └─ dedup by (engine_id, knobs), first position wins
@@ -517,8 +518,10 @@ without being imported. Everything else is the engine's own `check_support()`.
   class because the gate must answer without importing the engine.
 - **A family may name a `heuristics` hook** — like `analyzer`, a
   `("module", "callable")` pair kept as strings so the coarse key stays
-  import-free. It is handed the facts, the family's offered ids and the
-  backend's entries, and what it returns IS the plan list.
+  import-free. It is handed the facts and the family's offered ids and returns
+  its proposals; a `BACKEND` marker in that list says where the backend's own
+  block goes inside each mode block (ours first when absent). The SDPA-forward
+  family decides that per measured shard (`sdpa/fwd/placement.py`).
 - **A family may name a `validator` hook** — the same import-free pair,
   `validate_graph(graph) -> bool`. When the manifest offers a python engine for
   the graph, `validate()` runs it instead of the eager C++ lowering: it applies
@@ -605,13 +608,12 @@ only to decline is why `closed_under` existed.
 
 ### Ranking and the one plan list
 
-- `create_execution_plans()` gathers the inputs — the parsed facts, the family's
-  offered ids, and the backend's own `(engine_id, knobs)` recommendation from
-  `backend_plan_entries()` — and hands all of it to the graph's family in ONE
-  call (`engines/heuristics.py::rank` → the family's `recommend`). What comes
-  back IS the plan list, position for position. There is no second merge step:
-  splitting the decision is what forced the previous design to concatenate the
-  two sides and call it ranking.
+- `create_execution_plans()` gathers the parsed facts, eligible engine ids, and
+  the backend's `(engine_id, knobs)` entries. `engines/heuristics.py::rank` calls
+  the family's hook with `(kind, facts, offered)`. The hook returns its own
+  proposals plus an optional internal `cudnn.engines.heuristics.BACKEND` marker.
+  `_assemble()` expands that marker into the mode's backend block, then strips
+  mode annotations and deduplicates to form the final `graph.plans` list.
 - **The backend's entries arrive tagged with the mode that produced them.**
   `_create_backend_plans()` asks C++ one heuristic mode at a time and records
   `get_execution_plan_count()` after each, so a family can say "the backend's
@@ -642,8 +644,9 @@ only to decline is why `closed_under` existed.
   spans.** An OPENSOURCE query registers a C++ OSS candidate without adding a
   plan, so it contributes no span; judging by spans would rethrow a later
   mode's failure and discard the delegate that successful query earned.
-- The family places the backend's entries wherever it wants; nothing rewrites
-  the list it returns, so a ranked index means what the heuristics said.
+- The family positions the backend block with its marker; without a marker,
+  its proposals precede the backend. Ranked indices address the assembled list,
+  never the marker or an unexpanded family proposal.
   `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry
   `backend_plan_entries()` appends, where the backend picks among OSS
   candidates it never exposes as plans and which therefore cannot be
@@ -901,10 +904,12 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
 - FALLBACK is one config per cell today — the smallest tile the row admits, the
   config that asks least of the device. Picking the handful that between them
   cover the plane needs measurements; the TODO is in `_mode_fallback`.
-- `_MEASURED_BEHIND` is an empty set: which side leads is meant to be a
-  measurement, and an untimed cell keeps the order this dispatch has always
-  had. A cost model that can compare a python config against a cuDNN engine on
-  a common currency (predicted time) turns that set into a number.
+- `sdpa/fwd/placement.py` places the SDPA-forward family using B200 / RTX PRO
+  6000 measurements; an untimed row keeps the order this dispatch has always
+  had. Rankings are tuned and evaluated offline; unit tests check the planner's
+  marker contract independently of workload winners. A cost model
+  that can compare a python config against a cuDNN engine on a common currency
+  (predicted time) would replace the table with a number.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own

@@ -39,6 +39,15 @@ from .nodes import Node, _row_major_stride
 _LOG = logging.getLogger("cudnn.pygraph")
 
 
+def _detached_exception(exc: Exception) -> Exception:
+    """Preserve the backend error type/message without retaining traceback frames.
+
+    Clearing only __traceback__ leaves chained exceptions pointing at the graph.
+    Never raise the stored copy either: raising attaches a new traceback to it.
+    """
+    return type(exc)(*exc.args)
+
+
 def _is_dense(dim, stride) -> bool:
     """Row-major compact."""
     expect = 1
@@ -1064,7 +1073,7 @@ class pygraph:
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
             _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             self._reset_lowered_state()
 
     def _attach_facts(self) -> None:
@@ -1181,7 +1190,7 @@ class pygraph:
             # our own translator bug and must not read as a decline.
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             # RuntimeError here is overloaded by the binding: a rejected
             # descriptor (cannot represent) and a failing device look the same.
             # Treat it as a decline so a python engine can still serve the
@@ -1201,7 +1210,7 @@ class pygraph:
         except cudnn.cudnnGraphNotSupportedError as exc:
             # Lowering succeeded, so the only decline left is "no engine for it";
             # an AttributeError here is a binding mismatch, not an absent backend.
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.debug("backend has no engine for this graph: %s", exc)
             self._backend_entries = []
             return self._backend_entries
@@ -1549,7 +1558,7 @@ class pygraph:
             others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
             if self._plan_pinned or not others:
                 raise
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
@@ -1608,7 +1617,7 @@ class pygraph:
         if self._is_built:
             return
         if self._backend_declined is not None and not failures:
-            raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
+            raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
         raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
@@ -1890,7 +1899,9 @@ class pygraph:
                        ExecutionContext; plans that need one require it)
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
-            override_uids/shapes/strides: dynamic-shape overrides (backend path)
+            override_uids/shapes/strides: runtime geometry for the backend or a
+                         compatible VariantPack plan; legacy uid-map plans raise
+                         rather than ignoring these arguments
         """
         if not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
@@ -1903,9 +1914,8 @@ class pygraph:
             self.build(ctx=caller_ctx)
 
         uid_to_data = self._uid_to_data(tensor_dict)
-        # The dynamic-shape overrides live only on the backend's uid-map
-        # overload, so a call carrying them takes that path and normalizes
-        # nothing.
+        # Backend overrides use its uid-map overload. Python plans must consume
+        # them through VariantPack; a legacy uid-map executor cannot honor them.
         overriding = override_uids is not None or override_shapes is not None or override_strides is not None
         eng = self.selected_engine
 
@@ -1929,6 +1939,8 @@ class pygraph:
                 pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
                 plan.execute(self, pack, ctx)
             else:
+                if overriding:
+                    raise ValueError(f"{eng.name}: this plan does not support execute-time shape or stride overrides")
                 plan.execute(self, uid_to_data, ctx)
             return
 

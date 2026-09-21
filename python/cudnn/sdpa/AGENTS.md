@@ -122,6 +122,14 @@ ordered after that read.**
   clears the partial-log2 flag itself, so adapter-only tests cannot detect
   a missing guard in a directly called template.
 
+**Rule S5 — Strided outputs must retain their layout through the final store.**
+
+- `make_array_view(t)[b, s, h, :]` returns a row pointer; indexing that pointer
+  by `d` assumes a unit D stride. Use full indexing (`view[b, s, h, d]`) when
+  accepting an arbitrary declared D stride, or explicitly require D-contiguous
+  storage. Test padding canaries as well as numerical output; the detector is
+  `test_pointer_combine_strided_outputs_and_dead_splits`.
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's

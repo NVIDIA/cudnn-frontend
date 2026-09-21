@@ -104,18 +104,21 @@ implementation_names   = ['cudnn.attention_implementation.AUTO', 'cudnn.attentio
 # the rng identically and a config differs between them in the sink flag alone (CPython's
 # randint rejection-samples 32-bit words, so the total weight, not the number of options,
 # fixes the consumption; checked identical over 20000 seeds).
-def _frost_engines_enabled():
-    # The frontend's own reading of CUDNN_FRONTEND_ENABLE_FROST_ENGINES ("1"/"true"/"yes"/"on").
-    from cudnn.engines.manifest import opt_in_engines_enabled
-    return opt_in_engines_enabled()
+def _frost_engines_enabled(engine="sdpa_fwd_prefill_sm100"):
+    # Whether the manifest OFFERS the row: the SM100/SM120 f16 rows are default
+    # candidates (placed per measured shard), the others still answer to
+    # CUDNN_FRONTEND_ENABLE_FROST_ENGINES.
+    from cudnn.engines.manifest import MANIFEST
+    fam = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    return engine in fam.offered_ids()
 
 def _frost_sm100_unavailable_reason(engine="sdpa_fwd_prefill_sm100"):
     """Why the FROST SM100 f16/bf16 row would NOT serve a graph here, or None when it
-    would: the engines must be opted in, the device a pre-Rubin Blackwell (cc 10.0-10.6,
+    would: the engine must be offered by the manifest, the device a pre-Rubin Blackwell (cc 10.0-10.6,
     the row's arch domain) and a CuTe DSL at the FROST floor importable (the row declines
     without one and the native backend then serves the graph)."""
-    if not _frost_engines_enabled():
-        return "CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)"
+    if not _frost_engines_enabled(engine):
+        return f"{engine} is not offered by the manifest (opt-in row without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)"
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         return f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}"
@@ -523,7 +526,12 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
     keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
     before = [frost_routing.snapshot().get(k, 0) for k in keys]
-    exec_sdpa(cfg, request, cudnn_handle)
+    # The assertion is "FROST served it": opt FROST in for the call so the placement
+    # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
+    # the backend -- the routing, not the default winner, is under test here.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        exec_sdpa(cfg, request, cudnn_handle)
     after  = [frost_routing.snapshot().get(k, 0) for k in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"

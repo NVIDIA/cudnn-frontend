@@ -21,8 +21,20 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-All FROST engines are `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`
-before `import cudnn` or the graph silently runs a cuDNN backend plan.
+`sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
+ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
+SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+`import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
+
+**Execute-time shape/stride overrides:** graphs created with
+`is_override_shape_enabled=True` retain compatible prepared SM100/SM107 f16/bf16
+plans: dense zero-copy layouts, split-KV with a non-overlapping final O layout,
+and supported unsplit THD. Each runtime override must remain inside that plan's
+compiled geometry, dtype, layout and workspace envelope. Tensor-only paths
+(including FP8/MXFP8, synthesized KV-tail padding, bias and SM120) decline;
+explicit opt-in does not bypass the contract. The same pure capability predicate
+filters candidate knobs and selects the prepared executor. Static-geometry graph
+eligibility is unchanged.
 
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in

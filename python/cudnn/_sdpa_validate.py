@@ -49,7 +49,8 @@ virtual O_v would surface as a bare ``ValueError`` out of planning
 (``create_execution_plans`` catches only the typed declines).  The native
 validator turns that into the typed not-supported with the fix in the message.
 Scope: the family's validator runs whenever a python SDPA engine is OFFERED
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
+(the SM100/SM120 f16 forward rows by default, the others with
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
 -- not only where a row serves the tail -- so the tail validates natively there
 and the backend's own verdict on it is deferred to planning, as for every
 python-validated graph.  With the engines disabled nothing changes (classic path).
