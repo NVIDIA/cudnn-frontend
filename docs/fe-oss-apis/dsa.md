@@ -526,6 +526,17 @@ indexer tower:
 3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
    dtype.
 
+The plan owns no device memory. An fp32 `d_index_k` is the accumulator itself
+(zeroed on the launch stream inside `execute`); a BF16 `d_index_k` accumulates
+into a `B * S_k * D` fp32 view carved from the caller's workspace:
+`IndexerBackward.scratch_workspace_bytes()` is the size (0 for fp32
+`d_index_k` on the default backend), `execute(..., workspace=)` takes the
+uint8 buffer on `index_q.device`, and a missing or undersized buffer raises
+`ValueError` before `attn_score` is touched. `indexer_backward_wrapper`
+allocates it per call on the launch stream and accepts the same optional
+`workspace=` keyword for reuse; executions that share one buffer must not
+overlap on the device.
+
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
 `RuntimeError` rather than silently falling back.
@@ -620,30 +631,27 @@ the complete wrapper on the target shape when those properties are required.
 - **Scratch / workspace behavior** — `attn_score` is consumed in place and left
   holding kernel 1's `grad_signal`, while `index_score` is read-only and
   preserved. `sm_scale` folds inside kernel 2 without touching either buffer.
-  The backend owns one piece of per-plan workspace — the
-  dynamic-ticket counter — allocated on first execute and reused by every
-  later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
-  accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
-  `S_k`); that one comes from PyTorch's caching allocator on every call, which
-  is a pool hit in steady state — it has to be re-zeroed per call anyway, and
-  this way it stays reclaimable via `torch.cuda.empty_cache()` instead of
-  staying pinned for as long as the plan is cached. The wrapper still
-  allocates any output buffer you do not pass in.
-- **Concurrency** — executions sharing one plan must not overlap on the
-  device (the ticket counter is per-plan workspace). One plan serves one
-  device: the workspace is device-resident, and execution rejects tensors on
-  any other device before overwriting `attn_score`. The wrapper keys its
-  plan cache on the CUDA device and on the **resolved** stream (`stream` when
-  given, otherwise `torch.cuda.current_stream()` at call time), so calls that
-  differ in device or stream get a private plan and private workspace; calls
-  that land on the same cache entry must not be allowed to overlap. The key
-  is the integer stream handle, plus the calling thread's id for the one handle
-  CUDA does not make unique across host threads: `cudaStreamPerThread`
-  is the value 2 in every thread and means "the calling thread's own stream",
-  so two threads that pass it explicitly get a private plan each. Users
-  driving `IndexerBackward` objects directly must use one object per device,
-  and one per stream wherever those streams' executions can overlap; a single
-  object may target any stream if its executions are serialized.
+  The plan owns no workspace: `scratch_workspace_bytes()` is
+  `ws_align(8)` for the dynamic-ticket counter plus, for a BF16 `d_index_k`,
+  the `B * S_k * D` fp32 accumulator (2 MiB = 2,097,152 bytes at B=1,
+  S_k=4096, D=128, growing with `S_k`); both are carved from the buffer passed
+  to `execute(..., workspace=)` — counter first — and zeroed on the launch
+  stream at every execute, so a buffer another engine used in between is
+  fine. The wrapper allocates the workspace per call on the launch stream
+  unless you pass `workspace=`, and still allocates any output buffer you do
+  not pass in.
+- **Concurrency** — executions that share one workspace buffer must not
+  overlap on the device (two in-flight launches drawing tickets from one
+  counter would interleave); a plan is bound to no device and no stream, and
+  the workspace must live on `index_q.device` (rejected before `attn_score`
+  is overwritten otherwise). The wrapper's per-call workspace makes its calls
+  independent; it additionally keys its plan cache on the CUDA device and on
+  the **resolved** stream (`stream` when given, otherwise
+  `torch.cuda.current_stream()` at call time; plus the calling thread's id
+  for `cudaStreamPerThread`, the value 2 in every thread), so one cached
+  plan's executes are stream-ordered. Users driving `IndexerBackward`
+  objects directly may share one object across streams and devices as long
+  as each in-flight execute has its own workspace.
 - **Local top-k ids** (`topk_indices_global=False`) are masked against the
   per-batch `S_k` before the batch offset is applied, in-kernel: ids `< 0` or
   `>= S_k` contribute nothing and can never alias a neighbouring batch.
@@ -676,6 +684,13 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
 - **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
+- **Scratch** — the dK reduction targets a pre-zeroed fp32 buffer: an fp32
+  `d_index_k` in place, a BF16 `d_index_k` through an fp32 accumulator carved
+  from the caller's workspace (`DenseIndexerBackward.scratch_workspace_bytes()`
+  bytes on `index_q.device`, 0 for fp32 `d_index_k`; `execute(...,
+  workspace=)`). `dense_indexer_backward_wrapper` allocates it per call on the
+  launch stream unless `workspace=` is passed; calls sharing one buffer must
+  not overlap.
 
 ```python
 grad_loss = torch.ones((), dtype=torch.float32, device=index_q.device)
