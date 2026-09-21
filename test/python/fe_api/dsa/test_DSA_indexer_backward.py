@@ -13,6 +13,7 @@ import threading
 
 from test_utils import torch_fork_set_rng
 
+from cudnn.api_base import ws_align
 from fe_api.dsa.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
 from fe_api.dsa.dsa_reference import (
     _indexer_predict_distribution,
@@ -299,6 +300,12 @@ def test_DSA_indexer_backward_fp32_dindexk_zeroed_internally():
     assert max_diff < 1.0, f"fp32 d_index_k not zeroed internally: max|nonzero-init - zero-init| = {max_diff:.3e}"
 
 
+def _workspace_for(plan, device="cuda"):
+    """The caller-owned scratch a plan carves at execute (R2): ``None`` when it needs none."""
+    nbytes = plan.scratch_workspace_bytes()
+    return torch.empty(nbytes, dtype=torch.uint8, device=device) if nbytes else None
+
+
 def _noncontiguous_like(sample):
     """A tensor with ``sample``'s shape/dtype/device but a strided (non-dense)
     layout, so its stride differs from a contiguous descriptor's."""
@@ -335,6 +342,7 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     )
     assert plan.check_support()
     plan.compile()
+    ws = _workspace_for(plan)
 
     b, s_q, _, _ = iq.shape
     topk = tk.shape[-1]
@@ -347,7 +355,9 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     aq_bad_pre = aq_bad.clone()
     isc_pre = isc.clone()
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_bad, isc, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(
+            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_bad, isc, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+        )
     torch.cuda.synchronize()
     assert torch.equal(aq_bad, aq_bad_pre), "attn_score mutated before the shape check (fail-dirty)"
     assert torch.equal(isc, isc_pre), "index_score mutated before the shape check (fail-dirty)"
@@ -358,7 +368,9 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     aq_nc_pre = aq_nc.clone()
     isc2_pre = isc2.clone()
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_nc, isc2, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(
+            iq, w, ik, torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik), aq_nc, isc2, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws
+        )
     torch.cuda.synchronize()
     assert torch.equal(aq_nc, aq_nc_pre), "attn_score mutated before the stride check (fail-dirty)"
     assert torch.equal(isc2, isc2_pre), "index_score mutated before the stride check (fail-dirty)"
@@ -370,7 +382,7 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     isc3_pre = isc3.clone()
     dw_nc = _noncontiguous_like(torch.empty_like(w))
     with pytest.raises(ValueError):
-        plan.execute(iq, w, ik, torch.empty_like(iq), dw_nc, torch.empty_like(ik), aq3, isc3, tk, grad_loss, loss_coeff=loss_coeff)
+        plan.execute(iq, w, ik, torch.empty_like(iq), dw_nc, torch.empty_like(ik), aq3, isc3, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws)
     torch.cuda.synchronize()
     assert torch.equal(aq3, aq3_pre), "attn_score mutated before the output-stride check (fail-dirty)"
     assert torch.equal(isc3, isc3_pre), "index_score mutated before the output-stride check (fail-dirty)"
@@ -534,6 +546,198 @@ def test_DSA_indexer_backward_wrong_ndim_rejected():
             sm_scale=_IDXBWD_SM_SCALE,
             block_I=128,
         )
+
+
+# ===========================================================================
+# Rule 8 detectors (python/cudnn/AGENTS.md R2 / R9): the plan owns no device
+# memory. The fp32 dK accumulator behind a bf16 d_index_k and the sm100_v2
+# ticket counter are carved from the caller's workspace; execute() allocates
+# nothing and never blocks the host.
+# ===========================================================================
+
+
+def _require_backend_gpu(backend):
+    """Skip unless the current GPU runs ``backend``: ``default`` resolves to the
+    sm90 or sm100 kernels by device, ``sm100_v2`` is exact (10, 0)."""
+    if backend == "sm100_v2":
+        _require_exact_sm100()
+        return
+    major = torch.cuda.get_device_capability()[0]
+    if major != 9 and major < 10:
+        pytest.skip("IndexerBackward requires SM90 or SM100+")
+
+
+def _build_plan(DSA, backend, dk_dtype, inputs):
+    """A checked, compiled IndexerBackward plus its output buffers (bf16 dW: the
+    default backend's kernel stores dW in bf16 only)."""
+    iq, w, ik, attn, idx, tk, _, _ = inputs
+    outputs = (torch.empty_like(iq), torch.empty_like(w), torch.empty_like(ik, dtype=dk_dtype))
+    plan = DSA.IndexerBackward(
+        sample_index_q=iq,
+        sample_weights=w,
+        sample_index_k=ik,
+        sample_d_index_q=outputs[0],
+        sample_d_weights=outputs[1],
+        sample_d_index_k=outputs[2],
+        sample_attn_score=attn,
+        sample_index_score=idx,
+        sample_topk_indices=tk,
+        sm_scale=_IDXBWD_SM_SCALE,
+        block_I=128,
+        backend=backend,
+    )
+    assert plan.check_support()
+    return plan, outputs
+
+
+_DK_DTYPE_PARAMS = pytest.mark.parametrize("dk_dtype", [torch.bfloat16, torch.float32], ids=["bf16_d_index_k", "fp32_d_index_k"])
+_BACKEND_PARAMS = pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@_BACKEND_PARAMS
+@_DK_DTYPE_PARAMS
+def test_execute_allocates_nothing_and_never_synchronizes(backend, dk_dtype, compile_allocates_nothing):
+    """R9: with the caller's workspace, three warm executes leave the torch
+    caching allocator's allocation count unchanged; the fe_api conftest arms
+    ``torch.cuda.set_sync_debug_mode("error")`` around every execute, so a
+    host sync fails the test too. ``compile()`` allocates nothing (R11)."""
+    _require_backend_gpu(backend)
+    DSA, _ = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    plan, (dq, dw, dk) = _build_plan(DSA, backend, dk_dtype, inputs)
+    compile_allocates_nothing(plan)
+    ws = _workspace_for(plan)
+    if backend == "sm100_v2" or dk_dtype == torch.bfloat16:
+        assert ws is not None, "this configuration carves scratch and must declare it"
+
+    # kernel 1 overwrites attn_score: one pristine copy per execute, all made
+    # before the allocation accounting starts
+    attns = [attn.clone() for _ in range(4)]
+
+    def run(aq):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=ws)
+
+    # warm: the factories cute.compile their kernels lazily on the first call
+    run(attns[0])
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for aq in attns[1:]:
+        run(aq)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "IndexerBackward.execute allocated device memory (Rule 8, R2)"
+    for name, t in (("d_index_q", dq), ("d_weights", dw), ("d_index_k", dk)):
+        assert torch.isfinite(t.float()).all(), f"{name} contains NaN/Inf"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@_BACKEND_PARAMS
+def test_bf16_d_index_k_requires_workspace(backend):
+    """A bf16 d_index_k needs the ``B * S_k * D`` fp32 accumulator (plus the
+    8-byte ticket counter on sm100_v2): ``scratch_workspace_bytes()`` says so,
+    ``execute(workspace=None)`` raises the WorkspaceCarver error before kernel 1
+    overwrites attn_score, and an undersized buffer is rejected the same way.
+    An fp32 d_index_k on the default backend needs no scratch at all."""
+    _require_backend_gpu(backend)
+    DSA, _ = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    b, s_k, d = ik.shape
+
+    plan, (dq, dw, dk) = _build_plan(DSA, backend, torch.bfloat16, inputs)
+    plan.compile()
+    expected = ws_align(b * s_k * d * 4) + (ws_align(8) if backend == "sm100_v2" else 0)
+    assert plan.scratch_workspace_bytes() == expected
+
+    aq = attn.clone()
+    aq_pre = aq.clone()
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=None)
+    short = torch.empty(expected - 128, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        plan.execute(iq, w, ik, dq, dw, dk, aq, idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=short)
+    torch.cuda.synchronize()
+    assert torch.equal(aq, aq_pre), "missing workspace must be rejected before kernel 1 mutates attn_score (fail-dirty)"
+
+    if backend == "default":
+        plan32, (dq32, dw32, dk32) = _build_plan(DSA, backend, torch.float32, inputs)
+        plan32.compile()
+        assert plan32.scratch_workspace_bytes() == 0
+        plan32.execute(iq, w, ik, dq32, dw32, dk32, attn.clone(), idx, tk, grad_loss, loss_coeff=loss_coeff)
+        torch.cuda.synchronize()
+        assert torch.isfinite(dk32).all()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_v2_counter_lives_in_caller_workspace():
+    """The sm100_v2 dynamic-ticket counter is the first ``ws_align(8)`` bytes of
+    the caller's workspace and is re-zeroed on every execute: a workspace
+    poisoned with 0xFF before each call still yields the serial reference, two
+    plans with private workspaces interleaved on two streams without host
+    synchronization reproduce it too, and after a call the carve order is
+    visible in the buffer (zero counter words, then the fp32 accumulator whose
+    bf16 rounding is exactly the returned d_index_k)."""
+    _require_exact_sm100()
+    DSA, cuda = _import_dsa()
+    inputs = _idxbwd_inputs()
+    iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
+    n_iters = 4
+
+    plans = [_build_plan(DSA, "sm100_v2", torch.bfloat16, inputs) for _ in range(2)]
+    for plan, _ in plans:
+        plan.compile()
+    workspaces = [_workspace_for(plan) for plan, _ in plans]
+    for ws in workspaces:
+        assert ws.numel() == ws_align(8) + ws_align(ik.numel() * 4)
+
+    # serial reference from plan 0, workspace poisoned first
+    plan0, (dq0, dw0, dk0) = plans[0]
+    workspaces[0].fill_(0xFF)
+    plan0.execute(iq, w, ik, dq0, dw0, dk0, attn.clone(), idx, tk, grad_loss, loss_coeff=loss_coeff, workspace=workspaces[0])
+    torch.cuda.synchronize()
+    ref = (dq0.clone(), dw0.clone(), dk0.clone())
+    assert torch.isfinite(ref[2].float()).all()
+    counter = workspaces[0][: ws_align(8)].view(torch.int32)
+    assert torch.equal(counter[:2], torch.zeros(2, dtype=torch.int32, device="cuda")), "the ticket counter must be zero after a completed launch"
+    accumulator = workspaces[0][ws_align(8) : ws_align(8) + ik.numel() * 4].view(torch.float32).view(ik.shape)
+    assert torch.equal(accumulator.to(torch.bfloat16), ref[2]), "the fp32 accumulator follows the counter in the workspace"
+
+    # interleave the two plans / workspaces on two streams, no host sync in the loop
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    cu_streams = [cuda.CUstream(s.cuda_stream) for s in streams]
+    attn_clones = [[attn.clone() for _ in range(n_iters)] for _ in range(2)]
+    for lane, ws in enumerate(workspaces):
+        with torch.cuda.stream(streams[lane]):
+            ws.fill_(0xFF)
+    for it in range(n_iters):
+        for lane in range(2):
+            plan, (dq, dw, dk) = plans[lane]
+            streams[lane].wait_stream(torch.cuda.current_stream())
+            plan.execute(
+                iq,
+                w,
+                ik,
+                dq,
+                dw,
+                dk,
+                attn_clones[lane][it],
+                idx,
+                tk,
+                grad_loss,
+                loss_coeff=loss_coeff,
+                current_stream=cu_streams[lane],
+                workspace=workspaces[lane],
+            )
+    torch.cuda.synchronize()
+    for lane in range(2):
+        _, (dq, dw, dk) = plans[lane]
+        assert torch.equal(dq, ref[0]), f"lane {lane}: d_index_q diverged"
+        assert torch.equal(dw, ref[1]), f"lane {lane}: d_weights diverged"
+        assert _rms_rel(dk, ref[2].double()) < _DK_ATOMIC_BAND, f"lane {lane}: d_index_k diverged"
 
 
 def _v2_call(
@@ -1454,10 +1658,12 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     with ``torch.cuda.current_stream()``, i.e. to the *ambient* stream of the
     calling context. Keying the plan cache on the ``stream`` argument alone
     therefore mapped two genuinely different execution streams onto one cached
-    plan, and so onto one per-plan workspace -- the self-resetting ticket
-    counter -- which the backend documents as single-execution-at-a-time
-    state. The committed multi-stream test only
-    passes ``stream=`` explicitly, which is the gap this covers.
+    plan. The ticket counter now lives in the wrapper's per-call workspace
+    (zeroed every execute), so sharing a plan across streams no longer shares
+    device state; the stream key is kept so one cached plan's executes stay
+    stream-ordered, and this test pins that cache-key invariant. The committed
+    multi-stream test only passes ``stream=`` explicitly, which is the gap this
+    covers.
 
     What this test asserts is the *invariant* (one plan per resolved stream),
     not gradient corruption: the two checks are (a) the two ambient streams get
@@ -1465,13 +1671,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     regression in the cache key breaks (keying the raw ``stream`` argument
     yields one entry instead of two), and (b) the interleaved executions still
     reproduce their serial results, which is a correctness guard on the keyed
-    path. (b) is not a second detector for the same bug -- a deliberately
-    shared plan does not reliably corrupt on a dedicated B200, because the v2
-    kernel is a persistent grid of one CTA per SM that still requests 207872 of
-    the 232448 B per-CTA shared-memory budget at this shape (the layout's only
-    topk-dependent part is 2 KB per 128 slots), so a second launch mostly cannot
-    get co-resident CTAs and the damage window stays closed. That is a property of this device being
-    fully available to one launch, not a guarantee the backend offers.
+    path (each call's counter and accumulator are private scratch).
 
     ``s_q``/``S_k``/topk together are deliberately different from every other
     v2 test's, so this test's plan-cache keys cannot collide with theirs
@@ -1579,8 +1779,8 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
     streams apart -- but the caller can: that handle means "the calling
     thread's stream" by definition, so the wrapper appends the calling thread's
     id to the key for that one value. Without it both threads land on one plan
-    and so on one per-plan workspace -- the self-resetting ticket counter --
-    which the backend documents as single-execution-at-a-time state.
+    (the ticket counter is per-call workspace now, so this is the stream-
+    ordering invariant of the cache key, not device-state ownership).
 
     This is the explicit-handle twin of the ``stream=None`` ambient-stream test
     above and asserts the same invariant: one plan per resolved stream. Two
@@ -1693,14 +1893,14 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
     block_I,
     request,
 ):
-    """Per-device plan/workspace ownership: the wrapper keys its plan cache
-    on the CUDA device, so same-shape default-stream calls on two devices get
-    private plans (the ticket-counter workspace is device-resident, so sharing
-    one cached plan across devices would hand device 1 the device-0 counter).
-    Run the identical input bits on each device, then interleave the devices,
-    checking dq/dw bitwise against each device's serial result and dk in the
-    fp32-atomic class; finally, executing a plan with tensors on the wrong
-    device must raise ValueError before kernel 1 overwrites attn_score."""
+    """Per-device plans: the wrapper keys its plan cache on the CUDA device,
+    so same-shape default-stream calls on two devices get private plans (the
+    descriptors and the compiled kernels are that device's). Run the identical
+    input bits on each device, then interleave the devices, checking dq/dw
+    bitwise against each device's serial result and dk in the fp32-atomic
+    class; finally, the workspace-device rule: a plan's scratch (the ticket
+    counter lives in it) must be on the tensors' device, and a workspace on
+    another device raises ValueError before kernel 1 overwrites attn_score."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda  # noqa: F401
@@ -1776,8 +1976,9 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
             assert torch.equal(r["d_weights"], refs[dev]["d_weights"]), f"device {dev} iter {it}: d_weights diverged"
             assert _rms_rel(r["d_index_k"], refs[dev]["d_index_k"].double()) < _DK_ATOMIC_BAND, f"device {dev} iter {it}: d_index_k diverged"
 
-    # direct-object contract: a plan built on device 0 must reject device-1
-    # tensors BEFORE kernel 1 overwrites attn_score
+    # direct-object contract: the scratch (ticket counter + dK accumulator)
+    # must live on the tensors' device; a device-1 workspace for device-0
+    # tensors is rejected BEFORE kernel 1 overwrites attn_score
     iq0, w0, ik0, attn0, index0, tki0 = inputs[0]
     with torch.cuda.device(0):
         plan = DSA.IndexerBackward(
@@ -1796,29 +1997,30 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
         )
         assert plan.check_support()
         plan.compile()
-    iq1, w1, ik1, attn1, index1, tki1 = inputs[1]
-    attn1 = attn1.clone()
-    index1 = index1.clone()
-    attn1_before = attn1.clone()
-    index1_before = index1.clone()
-    with torch.cuda.device(1):
+    attn0 = attn0.clone()
+    index0 = index0.clone()
+    attn0_before = attn0.clone()
+    index0_before = index0.clone()
+    wrong_device_ws = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda:1")
+    with torch.cuda.device(0):
         with pytest.raises(ValueError, match="device"):
             plan.execute(
-                iq1,
-                w1,
-                ik1,
-                torch.empty_like(iq1),
-                torch.empty_like(w1),
-                torch.empty_like(ik1),
-                attn1,
-                index1,
-                tki1,
-                grad_loss=grad_loss[1],
+                iq0,
+                w0,
+                ik0,
+                torch.empty_like(iq0),
+                torch.empty_like(w0),
+                torch.empty_like(ik0),
+                attn0,
+                index0,
+                tki0,
+                grad_loss=grad_loss[0],
                 loss_coeff=loss_coeff,
+                workspace=wrong_device_ws,
             )
         torch.cuda.synchronize()
-    assert torch.equal(attn1, attn1_before), "cross-device rejection must not mutate attn_score"
-    assert torch.equal(index1, index1_before), "cross-device rejection must not mutate index_score"
+    assert torch.equal(attn0, attn0_before), "workspace-device rejection must not mutate attn_score"
+    assert torch.equal(index0, index0_before), "workspace-device rejection must not mutate index_score"
 
 
 @pytest.mark.L0
@@ -2411,6 +2613,8 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
     d_index_q = torch.empty_like(index_q)
     d_weights = torch.empty_like(weights)
     d_index_k = torch.empty_like(index_k)
+    # bf16 d_index_k: the factory carves its fp32 accumulator from the caller's workspace (R2)
+    workspace = torch.empty(ws_align(d_index_k.numel() * 4), dtype=torch.uint8, device=device)
     for _ in range(2):
         kernel(
             index_q,
@@ -2424,6 +2628,7 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
             topk_indices,
             grad_loss,
             grad_scale,
+            workspace=workspace,
         )
     torch.cuda.synchronize()
 

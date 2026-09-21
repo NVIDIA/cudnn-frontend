@@ -13,10 +13,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .indexer_backward_sm90 import (
@@ -520,38 +517,22 @@ def _build_cute_dsl_dense_kernel(
         )
         grad_signal = idx_scores_raw
 
-        if dIndexK.dtype == torch.float32:
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK,
-                grad_signal,
-                CuSeqlensQ,
-                CuSeqlensK,
-                QCausalOffsets,
-                current_stream=current_stream,
-            )
-        else:
-            with _torch_stream_context(current_stream):
-                dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK_f32,
-                grad_signal,
-                CuSeqlensQ,
-                CuSeqlensK,
-                QCausalOffsets,
-                current_stream=current_stream,
-            )
-            with _torch_stream_context(current_stream):
-                dIndexK.copy_(dIndexK_f32)
+        # The caller (DenseIndexerBackward.execute) hands over the pre-zeroed
+        # fp32 accumulator and performs any trailing cast itself.
+        assert dIndexK.dtype == torch.float32, f"dense sm90 kernel 2 accumulates into an fp32 dIndexK, got {dIndexK.dtype}"
+        _run_gemm_only(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK,
+            grad_signal,
+            CuSeqlensQ,
+            CuSeqlensK,
+            QCausalOffsets,
+            current_stream=current_stream,
+        )
 
     _run.score_grad = _run_score_grad_only
     _run.gemm_only = _run_gemm_only
