@@ -254,15 +254,15 @@ def _fake_backward_outputs(
     weight_grad_dtype: torch.dtype,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     grad_edge = (
-        torch.empty_like(edge_features, dtype=feature_grad_dtype)
+        torch.empty_like(edge_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format)
         if edge_features is not None
         else torch.empty((0,), device=src_features.device, dtype=feature_grad_dtype)
     )
     return (
-        torch.empty_like(src_features, dtype=feature_grad_dtype),
-        torch.empty_like(dst_features, dtype=feature_grad_dtype),
+        torch.empty_like(src_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format),
+        torch.empty_like(dst_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format),
         grad_edge,
-        torch.empty_like(attn_weights, dtype=weight_grad_dtype),
+        torch.empty_like(attn_weights, dtype=weight_grad_dtype, memory_format=torch.contiguous_format),
     )
 
 
@@ -444,14 +444,14 @@ def _backward(
     )
     feature_grad_dtype, weight_grad_dtype = _validate_gradient_dtypes(src_features.dtype, feature_grad_dtype, weight_grad_dtype)
 
-    grad_src = torch.empty_like(src_features, dtype=feature_grad_dtype)
-    grad_dst = torch.empty_like(dst_features, dtype=feature_grad_dtype)
+    grad_src = torch.empty_like(src_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format)
+    grad_dst = torch.empty_like(dst_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format)
     grad_edge = (
-        torch.empty_like(edge_features, dtype=feature_grad_dtype)
+        torch.empty_like(edge_features, dtype=feature_grad_dtype, memory_format=torch.contiguous_format)
         if edge_features is not None
         else torch.empty((0,), device=offsets.device, dtype=feature_grad_dtype)
     )
-    grad_weights = torch.empty_like(attn_weights, dtype=weight_grad_dtype)
+    grad_weights = torch.empty_like(attn_weights, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
     grad_sm_scores = torch.empty_like(sm_scores)
     workspace_features = torch.empty((num_edges, dim_node), device=offsets.device, dtype=feature_grad_dtype) if deterministic else None
     workspace_weights = torch.empty((num_dst_nodes, 2 * dim_node + dim_edge), device=offsets.device, dtype=weight_grad_dtype) if deterministic else None

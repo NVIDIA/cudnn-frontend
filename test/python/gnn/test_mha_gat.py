@@ -113,7 +113,7 @@ def test_gnn_mha_gat_medium_graph(medium_reverse_csc_graph):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_gnn_mha_gat_bipartite_forward_backward(deterministic):
+def test_gnn_mha_gat_noncontiguous_bipartite_forward_backward(deterministic):
     _require_gnn_mha("gat")
     torch.manual_seed(5678)
     graph = CscGraph(
@@ -122,9 +122,12 @@ def test_gnn_mha_gat_bipartite_forward_backward(deterministic):
         num_src_nodes=4,
         map_csc_to_coo=torch.tensor([3, 0, 4, 1, 2], device="cuda", dtype=torch.int32),
     ).with_reverse_csc()
-    src_features = torch.randn((4, 8), device="cuda", requires_grad=True)
-    dst_features = torch.randn((2, 8), device="cuda", requires_grad=True)
-    edge_features = torch.randn((5, 4), device="cuda", requires_grad=True)
+    src_features = torch.randn((8, 4), device="cuda").T.detach().requires_grad_()
+    dst_features = torch.randn((8, 2), device="cuda").T.detach().requires_grad_()
+    edge_features = torch.randn((4, 5), device="cuda").T.detach().requires_grad_()
+    assert not src_features.is_contiguous()
+    assert not dst_features.is_contiguous()
+    assert not edge_features.is_contiguous()
     attn_weights = torch.randn((20,), device="cuda", requires_grad=True)
     actual_output, actual_attention = mha_gat(
         graph, (src_features, dst_features), attn_weights, edge_features=edge_features, num_heads=2, return_attention_weights=True, deterministic=deterministic
