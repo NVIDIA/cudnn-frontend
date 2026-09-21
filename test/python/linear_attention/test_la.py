@@ -2679,12 +2679,15 @@ def sm_blocker():
 
 
 def tail_wave_case(variant, schedule):
-    """``uncut``: 34 sequences at 64 heads, 2176 backward tiles, a reserved partial tail wave on 148 SMs (GDP at V=64 so its
-    own backward kernel runs); ``chain``: one 32768-token sequence at 8 heads, 16 pieces x 8 heads = 128 tiles, a single
-    partial wave that is all tail for the chain backward kernels."""
+    """``uncut``: 34 sequences at 64 heads, 2176 backward tiles, a partial last wave of the persistent CTAs on 148 or 152 SMs
+    (GDP at V=64 so its own backward kernel runs); ``chain``: one 32768-token sequence at 8 heads, 16 pieces x 8 heads = 128
+    tiles, a single partial wave that is all tail for the chain backward kernels.  Where either count is a whole multiple of
+    the SM count the head count steps up by one so the last wave stays partial."""
     if schedule == "chain":
-        return chain_case(variant, [32768], H=8, HV=8)
-    return make_case(variant, torch.bfloat16, seq_lens=TAIL_WAVE_SEQ_LENS, H=64, V=64 if variant in HOUSEHOLDER_VARIANTS else 128)
+        heads = 8 if (16 * 8) % sm_count() else 9
+        return chain_case(variant, [32768], H=heads, HV=heads)
+    heads = 64 if (len(TAIL_WAVE_SEQ_LENS) * 64) % sm_count() else 65
+    return make_case(variant, torch.bfloat16, seq_lens=TAIL_WAVE_SEQ_LENS, H=heads, V=64 if variant in HOUSEHOLDER_VARIANTS else 128)
 
 
 @pytest.mark.L0
