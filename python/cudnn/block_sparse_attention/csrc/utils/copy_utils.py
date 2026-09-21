@@ -1,6 +1,9 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 # Copyright (c) 2025-2026, QuACK team.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 #
 # Selected helpers are adapted from quack-kernels 0.4.1 (Apache-2.0) and
 # maintained locally so BSA does not require Quack at runtime.

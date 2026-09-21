@@ -94,7 +94,8 @@ CuTe DSL examples. The descriptor definitions in
 python/cudnn/hstu/hstu_attention/_kernels/mma_sm100_desc.py are ported from CUTLASS
 C++ headers. The static persistent tile scheduler under
 python/cudnn/_cutlass_helpers/ is adapted from the BSD-licensed CUTLASS example;
-its source header records the upstream commit and local changes.
+its source header records the upstream commit and local changes. The upstream
+code retains BSD-3-Clause; local modifications are licensed under Apache-2.0.
 CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
 package (optional dependency).
 
