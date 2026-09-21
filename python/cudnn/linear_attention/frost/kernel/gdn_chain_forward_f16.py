@@ -263,9 +263,9 @@ def build_chain_forward(
     chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are
     launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it
     does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
     HO = gate.shape[1]
     if not safe_gate:
         a_log = None

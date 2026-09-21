@@ -15,41 +15,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fixed compile-time constants of the GDN chunk-factor (T_inv) pass (SM100 / SM103 / SM107); the per-compile attributes live on
-``GdnTinvCfg`` in the kernel file.
+"""Fixed compile-time constants of the GDN-2 prep (SM100 / SM103 / SM107): the five per-(chunk, head) prep records
+(k_decay, q_decay, t, a, diag) of the BT = 16 schedule ahead of the prep-fed prefill, the per-channel erase gate folded
+into k_decay; the per-compile attributes live on ``Gdn2PrepCfg`` in the kernel file.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64
+    B_T: int = 16
 
-    # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_WARP_IDS: Tuple[Tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))
-    TMA_K_WARP_ID: int = 8
-    TCGEN05_MMA_WARP_ID: int = 9
-    EPILOGUE_WARP_ID: int = 10
-    LOAD_GATE_WARP_ID: int = 11
+    # --- warp assignments (4 warps = 128 threads) ---
+    COMPUTE_WARPS: int = 4
 
-    # --- register split ---
-    LAUNCH_REGS: int = 168
-    NUM_REGS_OTHER: int = 96
+    # --- occupancy (CTAS_PER_SM CTAs per SM, SMEM fit asserted by build_cfg) ---
+    CTAS_PER_SM: int = 4
+    SMEM_PER_SM_BYTES: int = 232448
+    SMEM_CTA_RESERVED_BYTES: int = 1024
 
     THREADS_PER_WARP: int = 32
 
-    # --- SMEM stage counts ---
-    SMEM_K_STAGES: int = 4
-    SMEM_TILE_STAGES: int = 4
-    SMEM_GATE_STAGES: int = 4
-
-    # --- TMEM stage counts ---
-    TMEM_ACC_STAGES: int = 4
-
     BUFFER_ALIGN_BYTES: int = 1024
+
+    # --- SMEM stage counts (raw depth by key dim) ---
+    SMEM_RAW_STAGES_D_K_64: int = 2
+    SMEM_RAW_STAGES_D_K_128: int = 1
+    SMEM_RECORD_STAGES: int = 1
 
 
 CFG = Cfg()
