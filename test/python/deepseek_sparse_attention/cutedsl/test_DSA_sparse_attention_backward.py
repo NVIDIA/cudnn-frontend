@@ -148,10 +148,12 @@ def test_DSA_sparse_attention_backward_sm100_topk_stride_specialization(max_topk
     monkeypatch.setattr(interface.cute, "sym_int", lambda: symbolic_q)
 
     def fake_compact(dtype, shape, **kwargs):
+        """Record the compile-time tensor layout requested by the backend."""
         fake_calls.append((dtype, shape, kwargs))
         return static_tensor
 
     def dynamic(tensor):
+        """Record the fallback conversion of the runtime tensor."""
         dynamic_calls.append(tensor)
         return dynamic_tensor
 
