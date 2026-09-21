@@ -3,6 +3,8 @@
 
 """Tests for grouped GEMM wgrad FE API."""
 
+import inspect
+
 import pytest
 import torch
 import cudnn
@@ -24,6 +26,79 @@ from fe_api.test_grouped_gemm_wgrad_bf16_utils import (
     grouped_gemm_wgrad_bf16_reference,
     make_grouped_gemm_wgrad_bf16_problem,
 )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("callable_obj", "legacy_positional_parameters"),
+    (
+        (
+            cudnn.GroupedGemmWgradSm100.execute,
+            (
+                "self",
+                "a_tensor",
+                "b_tensor",
+                "sfa_tensor",
+                "sfb_tensor",
+                "offsets_tensor",
+                "wgrad_tensor",
+                "wgrad_ptrs",
+                "global_scale_a",
+                "global_scale_b",
+                "current_stream",
+            ),
+        ),
+        (
+            cudnn.grouped_gemm_wgrad_wrapper_sm100,
+            (
+                "a_tensor",
+                "b_tensor",
+                "sfa_tensor",
+                "sfb_tensor",
+                "offsets_tensor",
+                "output_mode",
+                "wgrad_tensor",
+                "wgrad_ptrs",
+                "global_scale_a",
+                "global_scale_b",
+                "acc_dtype",
+                "wgrad_dtype",
+                "mma_tiler_mn",
+                "cluster_shape_mn",
+                "sf_vec_size",
+                "sf_fp8_dtype_override",
+                "accumulate_on_output",
+                "input_order",
+                "current_stream",
+            ),
+        ),
+    ),
+    ids=("facade-execute", "wrapper"),
+)
+def test_grouped_gemm_wgrad_preserves_legacy_positional_prefix(callable_obj, legacy_positional_parameters):
+    signature = inspect.signature(callable_obj)
+    parameters = signature.parameters
+    positional_parameters = tuple(
+        name for name, parameter in parameters.items() if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    assert positional_parameters == legacy_positional_parameters
+
+    descriptor_workspace = parameters["descriptor_workspace"]
+    assert descriptor_workspace.kind is inspect.Parameter.KEYWORD_ONLY
+    assert descriptor_workspace.default is None
+
+    sentinels = [object() for _ in legacy_positional_parameters]
+    bound = signature.bind(*sentinels)
+    for name, sentinel in zip(legacy_positional_parameters, sentinels):
+        assert bound.arguments[name] is sentinel
+    assert "descriptor_workspace" not in bound.arguments
+
+    workspace = object()
+    bound_with_workspace = signature.bind(*sentinels, descriptor_workspace=workspace)
+    assert bound_with_workspace.arguments["descriptor_workspace"] is workspace
+    with pytest.raises(TypeError):
+        signature.bind(*(sentinels + [workspace]))
+
 
 # ---------------------------------------------------------------------------
 # Dense mode: Class API

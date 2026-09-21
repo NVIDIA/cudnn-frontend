@@ -94,7 +94,7 @@ does not reinterpret these controls; it rejects them instead.
 
 Torch block-scaled callers in dense or discrete output mode that retain
 operations for CUDA Graph replay may provide a caller-owned
-`descriptor_workspace`. Allocate its size with
+`descriptor_workspace`; pass this extension by keyword. Allocate its size with
 `get_grouped_gemm_wgrad_workspace_size_sm100`, keep it alive for as long as the
 captured call site may replay, and do not share it between call sites that may
 overlap. This lets multiple same-signature calls share one compiled kernel

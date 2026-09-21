@@ -201,10 +201,11 @@ class GroupedGemmWgradSm100(APIBase):
         offsets_tensor: torch.Tensor,
         wgrad_tensor: Optional[torch.Tensor] = None,
         wgrad_ptrs: Optional[torch.Tensor] = None,
-        descriptor_workspace: None = None,
         *,
         global_scale_a: None = None,
         global_scale_b: None = None,
+        current_stream: Optional[cuda.CUstream] = None,
+        descriptor_workspace: None = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -218,10 +219,11 @@ class GroupedGemmWgradSm100(APIBase):
         offsets_tensor: torch.Tensor,
         wgrad_tensor: Optional[torch.Tensor] = None,
         wgrad_ptrs: Optional[torch.Tensor] = None,
-        descriptor_workspace: Optional[torch.Tensor] = None,
         *,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
+        current_stream: Optional[cuda.CUstream] = None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def execute(
@@ -233,10 +235,11 @@ class GroupedGemmWgradSm100(APIBase):
         offsets_tensor: torch.Tensor,
         wgrad_tensor: Optional[torch.Tensor] = None,
         wgrad_ptrs: Optional[torch.Tensor] = None,
-        descriptor_workspace: Optional[torch.Tensor] = None,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -302,7 +305,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
     output_mode: str = "dense",
     wgrad_tensor: Optional[torch.Tensor] = None,
     wgrad_ptrs: Optional[torch.Tensor] = None,
-    descriptor_workspace: Optional[torch.Tensor] = None,
     global_scale_a: Optional[torch.Tensor] = None,
     global_scale_b: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
@@ -314,6 +316,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     accumulate_on_output: bool = False,
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
+    *,
+    descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
     memo_dense_output_identity = None
