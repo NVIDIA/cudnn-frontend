@@ -1043,8 +1043,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    geometry at a time (tiles, CGA, sched, pack_gqa, split), recomputing split
-    for SM100 f16 geometry runners, capped at ``_MAX_SETS_PER_ENGINE``. Two
+    geometry at a time (tiles, sched, pack_gqa, split), recomputing split for
+    SM100 f16 geometry runners, capped at ``_MAX_SETS_PER_ENGINE``. Two
     axes carry a structural coupling: a packed set rides the largest tile
     that admits the ratio, and a split set rides the plain scheduler. Axis
     interactions the kernels cannot serve are the generators'/mismatch's job
@@ -1144,12 +1144,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga):
             continue
         out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
-    if _sm100_f16(caps, facts):
-        # Explicit widths can select a different supported template even when
-        # the auto-ranking prefers another one. Cost each with its own split.
-        for cga in sorted(effective_cgas(caps, facts, base.split_kv)):
-            if cga != base.cga:
-                out.append(_resplit(replace(base, cga=cga)))
+    # No explicit CGA-width runner: on SM100 f16 the width follows the d128
+    # decode-tile fit of each leg's own rows (_auto_sched_cga), and the other
+    # width is not offered (test_sdpa_fwd_decode_d128_sm100 pins this).
     # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
     # scheduler above, so an LPT runner is only a candidate without one.
     sched_host = unsplit_leg

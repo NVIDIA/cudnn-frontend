@@ -111,7 +111,9 @@ def test_each_geometry_runner_recomputes_split_and_obeys_cap(monkeypatch):
     knobs = [p.knobs for p in plans]
     assert len(knobs) == len(set(knobs)) <= heur._MAX_SETS_PER_ENGINE
     assert {k.pack_gqa for k in knobs} == {False, True}
-    assert {k.cga for k in knobs if k.pack_gqa} == {1, 2}
+    # The width follows each leg's own rows (decode-tile fit): 17 * 8 packed
+    # rows overflow one 128-row tile (cga 2); 17 unpacked rows fit (cga 1).
+    assert {k.cga for k in knobs if k.pack_gqa} == {2} and {k.cga for k in knobs if not k.pack_gqa} == {1}
     for k in knobs:
         assert mismatch(SPEC.capabilities, facts, k) is None
         group = heur._pack_gqa_group(SPEC.capabilities, facts, k.tile_m, k.pack_gqa)
