@@ -17,7 +17,11 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+from cudnn.deepseek_sparse_attention.utils.runtime import (
+    device_capability,
+    maybe_contiguous,
+    torch_stream_context as _torch_stream_context,
+)
 
 from cudnn.api_base import APIBase, TupleDict
 
@@ -36,6 +40,58 @@ def _check_score_arch(api: APIBase) -> None:
     )
 
 
+def _decline_unless_unit_innermost(api: APIBase, desc, name: str) -> None:
+    """R5: the kernels read every operand natively; a non-unit innermost stride is declined, never copied."""
+    api._not_implemented_error_if(
+        desc.shape[-1] != 1 and desc.stride[-1] != 1,
+        f"{type(api).__name__}: {name} must have a unit innermost stride (no .contiguous() copy on the execute path); got shape {desc.shape} strides {desc.stride}",
+    )
+
+
+def _decline_unless_contiguous(api: APIBase, desc, name: str) -> None:
+    if desc is None:
+        return
+    api._not_implemented_error_if(
+        not desc.is_contiguous(),
+        f"{type(api).__name__}: {name} must be contiguous (no .contiguous() copy on the execute path); got shape {desc.shape} strides {desc.stride}",
+    )
+
+
+def _require_live_tensor(api: APIBase, t: Optional[torch.Tensor], desc, name: str, *, contiguous: bool) -> None:
+    """Rule 1: execute re-validates the live tensor against its plan descriptor and raises, never converts."""
+    cls = type(api).__name__
+    api._value_error_if(t is None, f"{cls}: {name} is required at execute")
+    api._value_error_if(t.dtype != desc.dtype, f"{cls}: {name} dtype {t.dtype} does not match the plan's {desc.dtype}")
+    api._value_error_if(tuple(t.shape) != tuple(desc.shape), f"{cls}: {name} shape {tuple(t.shape)} does not match the plan's {tuple(desc.shape)}")
+    api._value_error_if(t.device != desc.device, f"{cls}: {name} device {t.device} does not match the plan's {desc.device}")
+    if contiguous:
+        api._value_error_if(not t.is_contiguous(), f"{cls}: {name} must be contiguous, got strides {tuple(t.stride())}")
+    else:
+        api._value_error_if(t.shape[-1] != 1 and t.stride(-1) != 1, f"{cls}: {name} must have a unit innermost stride, got strides {tuple(t.stride())}")
+
+
+def _require_live_optional(api: APIBase, t: Optional[torch.Tensor], desc, name: str) -> None:
+    """An optional plan operand is present at execute exactly when it was declared (Rule 1)."""
+    api._value_error_if(
+        (t is None) != (desc is None),
+        f"{type(api).__name__}: {name} {'is required by' if desc is not None else 'was not declared to'} this plan",
+    )
+    if desc is not None:
+        _require_live_tensor(api, t, desc, name, contiguous=True)
+
+
+def _require_int32_vector(api: APIBase, t: torch.Tensor, name: str, device) -> None:
+    api._value_error_if(
+        t.dtype != torch.int32 or t.ndim != 1 or not t.is_contiguous() or t.device != device,
+        f"{type(api).__name__}: {name} must be a contiguous 1-D int32 tensor on {device}; got dtype {t.dtype} shape {tuple(t.shape)} strides {tuple(t.stride())} device {t.device}",
+    )
+
+
+def _wrapper_int32_contiguous(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    # Wrapper-surface convenience only; the classes decline/raise instead (R5).
+    return None if t is None else t.to(torch.int32).contiguous()
+
+
 class _ScoreRecomputeBase(APIBase):
     """Common APIBase shell for score-recompute ops.
 
@@ -49,11 +105,10 @@ class _ScoreRecomputeBase(APIBase):
 
     def compile(self) -> None:
         self._ensure_support_checked()
-        # The score backends compile from real execute-time tensors because the
-        # compile key includes concrete layouts and some paths allocate temporary
-        # tensors. Using fake tensors here would turn compile() into a hidden
-        # kernel launch, so this API validates eagerly and lets the backend cache
-        # compile on first execute().
+        # The score backends compile from the real execute-time tensors (their
+        # plan-time-only compile caches key on dtypes/tile params/flags), so
+        # this API validates eagerly and lets the backend compile on the first
+        # execute(); compile() itself launches and allocates nothing.
         self._compiled_kernel = True
 
 
@@ -85,6 +140,10 @@ def _check_sparse_score_shapes(
     if topk_length_desc is not None:
         api._check_dtype(topk_length_desc, torch.int32, name="topk_length")
         api._value_error_if(topk_length_desc.shape != (b, s_q), f"topk_length must be shape {(b, s_q)}, got {topk_length_desc.shape}")
+    for desc, name in ((q_desc, "Q"), (k_desc, "K"), (aux_desc, aux_name)):
+        _decline_unless_unit_innermost(api, desc, name)
+    for desc, name in ((topk_desc, "topk_indices"), (topk_length_desc, "topk_length"), (out_desc, "out")):
+        _decline_unless_contiguous(api, desc, name)
 
 
 def _check_dense_score_shapes(
@@ -125,6 +184,10 @@ def _check_dense_score_shapes(
     api._value_error_if(h_kv <= 0 or h_q % h_kv != 0, f"H_q ({h_q}) must be divisible by H_kv ({h_kv})")
     if qhead_per_kv_head is not None:
         api._value_error_if(h_q != h_kv * qhead_per_kv_head, f"H_q ({h_q}) must equal H_kv ({h_kv}) * qhead_per_kv_head ({qhead_per_kv_head})")
+    for desc, name in ((q_desc, "Q"), (k_desc, "K"), (aux_desc, aux_name)):
+        _decline_unless_unit_innermost(api, desc, name)
+    for desc, name in ((out_desc, "out"), (denom_desc, "denom_out")):
+        _decline_unless_contiguous(api, desc, name)
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +250,16 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         k_indexer: torch.Tensor,
         weights: torch.Tensor,
         topk_indices: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor,
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        _require_live_tensor(self, q_indexer, self.q_desc, "q_indexer", contiguous=False)
+        _require_live_tensor(self, k_indexer, self.k_desc, "k_indexer", contiguous=False)
+        _require_live_tensor(self, weights, self.w_desc, "weights", contiguous=False)
+        _require_live_tensor(self, topk_indices, self.topk_desc, "topk_indices", contiguous=True)
+        _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
+        _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -200,7 +269,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
                 k_indexer,
                 weights,
                 topk_indices,
-                out=out,
+                out,
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
@@ -237,7 +306,18 @@ def sparse_indexer_score_recompute_wrapper(
     ``topk_indices`` are per-batch local KV ids by default. Set
     ``topk_indices_global=True`` when passing ids encoded as
     ``batch_idx * S_k + local_idx``.
+
+    Wrapper-surface convenience (the class declines instead): inputs with a
+    non-unit innermost stride are copied contiguous, ``topk_indices`` /
+    ``topk_length`` are cast to contiguous int32, and ``out`` is allocated when
+    omitted. All of it runs on ``stream``.
     """
+    with _torch_stream_context(stream):
+        q_indexer, k_indexer, weights = (maybe_contiguous(t) for t in (q_indexer, k_indexer, weights))
+        topk_indices = _wrapper_int32_contiguous(topk_indices)
+        topk_length = _wrapper_int32_contiguous(topk_length)
+        if out is None:
+            out = torch.empty((q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]), dtype=torch.float32, device=q_indexer.device)
     key = (
         q_indexer.dtype,
         q_indexer.shape,
@@ -254,22 +334,12 @@ def sparse_indexer_score_recompute_wrapper(
     )
     obj = _cache_of_SparseIndexerScoreRecomputeObjects.get(key)
     if obj is None:
-        if out is None:
-            b, s_q, _ = topk_indices.shape if topk_indices.ndim == 3 else (0, 0, 0)
-            topk = topk_indices.shape[-1]
-            out_sample = torch.empty(
-                (q_indexer.shape[0], q_indexer.shape[1], topk),
-                dtype=torch.float32,
-                device=q_indexer.device,
-            )
-        else:
-            out_sample = out
         obj = SparseIndexerScoreRecompute(
             sample_q_indexer=q_indexer,
             sample_k_indexer=k_indexer,
             sample_weights=weights,
             sample_topk_indices=topk_indices,
-            sample_out=out_sample,
+            sample_out=out,
             sample_topk_length=topk_length,
             qhead_per_kv_head=qhead_per_kv_head,
             topk_indices_global=topk_indices_global,
@@ -283,7 +353,7 @@ def sparse_indexer_score_recompute_wrapper(
         k_indexer,
         weights,
         topk_indices,
-        out=out,
+        out,
         topk_length=topk_length,
         current_stream=stream,
     )
@@ -353,11 +423,17 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         k_attn: torch.Tensor,
         lse: torch.Tensor,
         topk_indices: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor,
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        _require_live_tensor(self, q_attn, self.q_desc, "q_attn", contiguous=False)
+        _require_live_tensor(self, k_attn, self.k_desc, "k_attn", contiguous=False)
+        _require_live_tensor(self, lse, self.lse_desc, "lse", contiguous=False)
+        _require_live_tensor(self, topk_indices, self.topk_desc, "topk_indices", contiguous=True)
+        _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
+        _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         major, _ = device_capability()
         if major == 9:
@@ -369,7 +445,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
                 lse,
                 topk_indices,
                 scale,
-                out=out,
+                out,
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
@@ -408,7 +484,18 @@ def sparse_attn_score_recompute_wrapper(
     ``topk_indices`` are per-batch local KV ids by default. Set
     ``topk_indices_global=True`` when passing ids encoded as
     ``batch_idx * S_k + local_idx``.
+
+    Wrapper-surface convenience (the class declines instead): inputs with a
+    non-unit innermost stride are copied contiguous, ``topk_indices`` /
+    ``topk_length`` are cast to contiguous int32, and ``out`` is allocated when
+    omitted. All of it runs on ``stream``.
     """
+    with _torch_stream_context(stream):
+        q_attn, k_attn, lse = (maybe_contiguous(t) for t in (q_attn, k_attn, lse))
+        topk_indices = _wrapper_int32_contiguous(topk_indices)
+        topk_length = _wrapper_int32_contiguous(topk_length)
+        if out is None:
+            out = torch.empty((q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]), dtype=torch.float32, device=q_attn.device)
     key = (
         q_attn.dtype,
         q_attn.shape,
@@ -426,22 +513,12 @@ def sparse_attn_score_recompute_wrapper(
     )
     obj = _cache_of_SparseAttnScoreRecomputeObjects.get(key)
     if obj is None:
-        topk = topk_indices.shape[-1]
-        out_sample = (
-            out
-            if out is not None
-            else torch.empty(
-                (q_attn.shape[0], q_attn.shape[1], topk),
-                dtype=torch.float32,
-                device=q_attn.device,
-            )
-        )
         obj = SparseAttnScoreRecompute(
             sample_q_attn=q_attn,
             sample_k_attn=k_attn,
             sample_lse=lse,
             sample_topk_indices=topk_indices,
-            sample_out=out_sample,
+            sample_out=out,
             softmax_scale=softmax_scale,
             sample_topk_length=topk_length,
             qhead_per_kv_head=qhead_per_kv_head,
@@ -456,7 +533,7 @@ def sparse_attn_score_recompute_wrapper(
         k_attn,
         lse,
         topk_indices,
-        out=out,
+        out,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
         current_stream=stream,
@@ -574,6 +651,37 @@ def _dense_thd_execute_envelope(
     return q_env, k_env
 
 
+def _require_dense_live(api: APIBase, q, k, aux, aux_desc, aux_name: str, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets) -> None:
+    _require_live_tensor(api, q, api.q_desc, "q", contiguous=False)
+    _require_live_tensor(api, k, api.k_desc, "k", contiguous=False)
+    _require_live_tensor(api, aux, aux_desc, aux_name, contiguous=False)
+    _require_live_tensor(api, out, api.out_desc, "out", contiguous=True)
+    _require_live_tensor(api, denom_out, api.denom_desc, "denom_out", contiguous=True)
+    if api.is_thd:
+        _require_int32_vector(api, cu_seqlens_q, "cu_seqlens_q", api.q_desc.device)
+        _require_int32_vector(api, cu_seqlens_k, "cu_seqlens_k", api.q_desc.device)
+        api._value_error_if(
+            cu_seqlens_q.shape != cu_seqlens_k.shape,
+            f"{type(api).__name__}: cu_seqlens_q/cu_seqlens_k shapes differ ({tuple(cu_seqlens_q.shape)} vs {tuple(cu_seqlens_k.shape)})",
+        )
+    if q_causal_offsets is not None:
+        _require_int32_vector(api, q_causal_offsets, "q_causal_offsets", api.q_desc.device)
+
+
+def _dense_wrapper_prepare(stream, q, k, aux, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale):
+    """Wrapper-surface convenience copies/allocations, all on the launch stream (R1); the classes decline instead."""
+    with _torch_stream_context(stream):
+        q, k, aux, q_scale, k_scale = (maybe_contiguous(t) for t in (q, k, aux, q_scale, k_scale))
+        cu_seqlens_q, cu_seqlens_k = (_wrapper_int32_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k))
+        if q_causal_offsets is not None:
+            q_causal_offsets = q_causal_offsets.contiguous()
+        if out is None:
+            out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
+        if denom_out is None:
+            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=q.device)
+    return q, k, aux, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
+
+
 class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
     """Dense indexer score recompute over full KV.
 
@@ -647,8 +755,8 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         q: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        denom_out: Optional[torch.Tensor] = None,
+        out: torch.Tensor,
+        denom_out: torch.Tensor,
         sm_scale: Optional[float] = None,
         ratio: Optional[int] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -661,6 +769,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         scale = self.sm_scale if sm_scale is None else float(sm_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
         max_seqlen_q, max_seqlen_k = _dense_thd_execute_envelope(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+        _require_dense_live(self, q, k, weights, self.w_desc, "weights", out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets)
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -669,8 +778,8 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
                 q,
                 k,
                 weights,
-                out=out,
-                denom_out=denom_out,
+                out,
+                denom_out,
                 sm_scale=scale,
                 ratio=ratio_value,
                 cu_seqlens_q=cu_seqlens_q,
@@ -731,6 +840,11 @@ def dense_indexer_score_recompute_wrapper(
     one blocking device-to-host read per call that is not CUDA-graph
     capturable (a wrapper-surface convenience; the class requires both at
     plan time). The memo key includes the resulting values.
+
+    Wrapper-surface convenience (the class declines instead): inputs with a
+    non-unit innermost stride are copied contiguous, ``cu_seqlens_*`` are cast
+    to contiguous int32, and ``out`` / ``denom_out`` are allocated when
+    omitted. All of it runs on ``stream``.
     """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
@@ -739,6 +853,9 @@ def dense_indexer_score_recompute_wrapper(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+    )
+    q, k, weights, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale = _dense_wrapper_prepare(
+        stream, q, k, weights, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
     )
     precision = precision.lower()
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
@@ -788,30 +905,12 @@ def dense_indexer_score_recompute_wrapper(
     )
     obj = _cache_of_DenseIndexerScoreRecomputeObjects.get(key)
     if obj is None:
-        out_sample = (
-            out
-            if out is not None
-            else torch.empty(
-                out_shape,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
-        denom_sample = (
-            denom_out
-            if denom_out is not None
-            else torch.empty(
-                denom_shape,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
         obj = DenseIndexerScoreRecompute(
             sample_q=q,
             sample_k=k,
             sample_weights=weights,
-            sample_out=out_sample,
-            sample_denom_out=denom_sample,
+            sample_out=out,
+            sample_denom_out=denom_out,
             qhead_per_kv_head=qhead_per_kv_head,
             sm_scale=sm_scale,
             ratio=ratio,
@@ -827,8 +926,8 @@ def dense_indexer_score_recompute_wrapper(
         q,
         k,
         weights,
-        out=out,
-        denom_out=denom_out,
+        out,
+        denom_out,
         sm_scale=sm_scale,
         ratio=ratio,
         cu_seqlens_q=cu_seqlens_q,
@@ -920,8 +1019,8 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         q: torch.Tensor,
         k: torch.Tensor,
         lse: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        denom_out: Optional[torch.Tensor] = None,
+        out: torch.Tensor,
+        denom_out: torch.Tensor,
         softmax_scale: Optional[float] = None,
         ratio: Optional[int] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -934,6 +1033,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
         max_seqlen_q, max_seqlen_k = _dense_thd_execute_envelope(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+        _require_dense_live(self, q, k, lse, self.lse_desc, "lse", out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets)
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -943,8 +1043,8 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
                 k,
                 lse,
                 scale,
-                out=out,
-                denom_out=denom_out,
+                out,
+                denom_out,
                 ratio=ratio_value,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -1004,6 +1104,11 @@ def dense_attn_score_recompute_wrapper(
     one blocking device-to-host read per call that is not CUDA-graph
     capturable (a wrapper-surface convenience; the class requires both at
     plan time). The memo key includes the resulting values.
+
+    Wrapper-surface convenience (the class declines instead): inputs with a
+    non-unit innermost stride are copied contiguous, ``cu_seqlens_*`` are cast
+    to contiguous int32, and ``out`` / ``denom_out`` are allocated when
+    omitted. All of it runs on ``stream``.
     """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
@@ -1012,6 +1117,9 @@ def dense_attn_score_recompute_wrapper(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+    )
+    q, k, lse, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale = _dense_wrapper_prepare(
+        stream, q, k, lse, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
     )
     precision = precision.lower()
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
@@ -1061,30 +1169,12 @@ def dense_attn_score_recompute_wrapper(
     )
     obj = _cache_of_DenseAttnScoreRecomputeObjects.get(key)
     if obj is None:
-        out_sample = (
-            out
-            if out is not None
-            else torch.empty(
-                out_shape,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
-        denom_sample = (
-            denom_out
-            if denom_out is not None
-            else torch.empty(
-                denom_shape,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
         obj = DenseAttnScoreRecompute(
             sample_q=q,
             sample_k=k,
             sample_lse=lse,
-            sample_out=out_sample,
-            sample_denom_out=denom_sample,
+            sample_out=out,
+            sample_denom_out=denom_out,
             softmax_scale=softmax_scale,
             qhead_per_kv_head=qhead_per_kv_head,
             ratio=ratio,
@@ -1100,8 +1190,8 @@ def dense_attn_score_recompute_wrapper(
         q,
         k,
         lse,
-        out=out,
-        denom_out=denom_out,
+        out,
+        denom_out,
         softmax_scale=softmax_scale,
         ratio=ratio,
         cu_seqlens_q=cu_seqlens_q,

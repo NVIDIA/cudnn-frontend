@@ -309,6 +309,115 @@ def test_DSA_dense_score_recompute_thd_sm90_declines_in_check_support(score_type
     assert _make_dense_plan(DSA, score_type, *bshd).check_support()
 
 
+def _bshd_plan_samples(score_type: str, b: int = 2, s_q: int = 8, s_k: int = 128, heads: int = 32, d: int = 128):
+    device = torch.device("cuda")
+    q = torch.randn(b, s_q, heads, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(b, s_k, 1, d, dtype=torch.bfloat16, device=device)
+    aux = torch.randn(b, s_q, heads, dtype=torch.bfloat16 if score_type == "indexer" else torch.float32, device=device)
+    out = torch.empty(b, s_q, s_k, dtype=torch.float32, device=device)
+    denom = torch.empty(b, s_q, dtype=torch.float32, device=device)
+    return q, k, aux, out, denom
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_dense_score_recompute_output_contiguity_declined(score_type):
+    """R5: a layout the kernel cannot address natively is declined in check_support(), never copied."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Dense score recompute requires SM90+")
+
+    q, k, aux, out, denom = _bshd_plan_samples(score_type)
+    b, s_q, s_k = out.shape
+    out_t = torch.empty(b, s_k, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)
+    with pytest.raises(NotImplementedError, match="out must be contiguous"):
+        _make_dense_plan(DSA, score_type, q, k, aux, out_t, denom).check_support()
+    denom_t = torch.empty(s_q, b, dtype=torch.float32, device="cuda").transpose(0, 1)
+    with pytest.raises(NotImplementedError, match="denom_out must be contiguous"):
+        _make_dense_plan(DSA, score_type, q, k, aux, out, denom_t).check_support()
+    k_strided = torch.empty(*k.shape[:-1], 2 * k.shape[-1], dtype=k.dtype, device="cuda")[..., ::2]
+    with pytest.raises(NotImplementedError, match="K must have a unit innermost stride"):
+        _make_dense_plan(DSA, score_type, q, k_strided, aux, out, denom).check_support()
+    assert _make_dense_plan(DSA, score_type, q, k, aux, out, denom).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_dense_score_recompute_execute_requires_outputs(score_type, compile_allocates_nothing):
+    """out/denom_out are required execute arguments, re-validated live (Rule 1)."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Dense score recompute requires SM90+")
+
+    q, k, aux, out, denom = _bshd_plan_samples(score_type)
+    plan = _make_dense_plan(DSA, score_type, q, k, aux, out, denom)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    with pytest.raises(TypeError):
+        plan.execute(q, k, aux)
+    with pytest.raises(TypeError):
+        plan.execute(q, k, aux, out)
+    b, s_q, s_k = out.shape
+    out_t = torch.empty(b, s_k, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        plan.execute(q, k, aux, out_t, denom)
+    with pytest.raises(ValueError, match="denom_out shape"):
+        plan.execute(q, k, aux, out, denom[:, : s_q - 1])
+    with pytest.raises(ValueError, match="q_causal_offsets must be a contiguous 1-D int32"):
+        plan.execute(q, k, aux, out, denom, q_causal_offsets=torch.zeros(2 * b, dtype=torch.int32, device="cuda")[::2])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=9)
+def test_DSA_dense_score_recompute_execute_allocates_nothing_and_never_synchronizes(score_type, compile_allocates_nothing):
+    """R9: warm once, then three executes with caller-provided outputs allocate nothing and never block the host."""
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Dense score recompute requires SM90+")
+
+    q, k, aux, out, denom = _bshd_plan_samples(score_type)
+    softmax_scale = q.shape[-1] ** -0.5
+    if score_type == "attention":
+        aux = _dense_attn_lse(q, k, softmax_scale)
+    plan = _make_dense_plan(DSA, score_type, q, k, aux, out, denom)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    offsets = torch.full((q.shape[0],), 8, dtype=torch.int32, device="cuda")
+
+    def run():
+        plan.execute(q, k, aux, out, denom, q_causal_offsets=offsets, current_stream=stream)
+
+    run()  # warm: the score backend compiles on the first execute
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            run()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    delta = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+    if torch.cuda.get_device_capability()[0] == 9 and delta != 0:
+        pytest.xfail("SM90 keeps the per-head (B,S,H)->(B,H,S) transpose copy (Rule 8 batch item D4, deferred)")
+    assert delta == 0, f"{type(plan).__name__}.execute() made {delta} torch allocation(s) across 3 warm executes"
+    check_ref_dense_score_recompute(
+        score_type, q, k, aux, out, denom, softmax_scale=softmax_scale if score_type == "attention" else None, q_causal_offsets=offsets
+    )
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
 @torch_fork_set_rng(seed=0)
