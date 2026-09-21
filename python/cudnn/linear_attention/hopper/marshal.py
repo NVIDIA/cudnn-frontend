@@ -3,30 +3,41 @@
 
 """Operand resolution for the sm90 KDA engines: one pass, layout and dtype.
 
-The kernels index compact row-major operands from a raw address and take an
-int32 chunk table with an fp32 gate, beta and state. Callers do not always
-oblige: an ordinary fused-projection slice is padded, and FlashInfer passes
-int64 ``cu_seqlens``, a bf16 state pool and the gate at q's dtype.
+The kernels index compact row-major operands from a raw address and read the
+chunk table as ``const int*`` and the gate, beta and state as ``const float*``
+(no null checks); ``final_state`` is written as ``float*``. Production callers
+do not oblige, and cannot be asked to: FlashInfer's public ``kda()`` contract
+mandates bf16 ``g``, bf16 ``beta``, a bf16 ``initial_state`` and int32-or-int64
+``cu_seqlens`` -- int64 REQUIRED under graph capture -- and vLLM's Kimi path
+passes ``raw_g`` / ``raw_beta`` at the hidden dtype (bf16) with an fp32
+recurrent state by default. Declining those dtypes (recipe R5) would remove
+``kda_hopper_cuda`` from every production caller on sm90, and the fallback
+``kda_hopper`` declines bf16 ``g`` and int64 ``cu`` as well. Reading them
+natively is a kernel change (``kda_fused_sm90.cu`` / ``kda_bwd_sm90.cu``) and
+is deferred.
 
-Both mismatches are fixed the same way -- one ``copy_`` into a correctly shaped,
-correctly typed buffer, which converts the dtype AND compacts the layout at
-once. They are resolved TOGETHER, in a single pass per port, because doing them
-in two passes is how the address of a repacked operand got overwritten by the
-original padded one.
+So this module is an INTERIM Rule 2 exception, recorded as such: the conversion
+copies stay, but their scratch is CARVED from the caller's workspace and sized
+at BUILD from the graph's declared dtypes and strides (:func:`staging_ports`).
+Nothing is allocated, and nothing is discovered from the runtime view: a port
+the graph declared packed and of a native dtype has no staging, so a mismatched
+runtime buffer raises ``NotImplementedError`` naming it instead of being
+silently repacked (Rule 5: never adapt silently). A DECLARED padded input is
+still repacked, through its staging.
 
-Three rules this file exists to keep:
+Two rules this file keeps:
 
-* one decision per port. ``resolve_inputs`` returns the address to use, and
-  nothing downstream re-derives it.
-* every copy is issued ON THE EXECUTION STREAM. A torch op runs on torch's
-  ambient stream, which has no dependency on the stream the kernel launches on.
+* one decision per port. :func:`resolve_inputs` returns the address to use,
+  and nothing downstream re-derives it. Layout and dtype are resolved TOGETHER,
+  in a single pass per port, because resolving them separately is how the
+  address of a repacked operand got overwritten by the original padded one.
+* every copy is issued ON THE EXECUTION STREAM (recipe R1, :func:`stream_ctx`).
   A default-stream handle (0, 1, 2) maps to torch's own default stream rather
-  than an ``ExternalStream``: see :func:`stream_ctx`.
-* scratch is PER EXECUTION, never cached on the plan. Two threads may execute
-  one compiled graph concurrently with different operands; a buffer owned by
-  the plan lets one call's conversion land in the other's launch. Nothing is
-  allocated at all on the common path, where every operand is already packed
-  and already the right dtype.
+  than an ``ExternalStream``.
+
+Concurrency contract: two concurrent executes of ONE graph must pass distinct
+workspaces. The staging lives in the workspace, so a shared one would let one
+call's conversion land in the other's launch.
 """
 
 from __future__ import annotations
@@ -54,18 +65,6 @@ _INPUT_PORTS = frozenset(
 )
 
 
-# torch dtype -> the name OperandBuffer.dtype reports. Comparing names keeps the
-# no-conversion path free: reading the property is a C++ attribute access, while
-# torch.from_dlpack costs ~1.6 us per operand.
-# Ports are requested by dtype NAME, not a torch dtype: the engine module must
-# not import torch at class-definition time (the package keeps `import cudnn`
-# free of it), and OperandBuffer already reports its dtype as a name.
-def _torch_dtype(name: str):
-    import torch
-
-    return {"float32": torch.float32, "bfloat16": torch.bfloat16, "int32": torch.int32}[name]
-
-
 def stream_ctx(stream: int, device=None):
     """``torch.cuda.stream`` context for the execution stream ``stream`` (Rule 5:
     default-stream sentinels map to torch's default stream, see ``cudnn._torch_stream``)."""
@@ -82,23 +81,62 @@ def packed(dim, stride) -> bool:
     return buffers.is_contiguous(list(dim), list(stride))
 
 
+def _declared_dtype(tensor) -> Optional[str]:
+    from ..graph_analyzer import BUFFER_NAME_FROM_CUDNN
+
+    return BUFFER_NAME_FROM_CUDNN.get(tensor.get_data_type())
+
+
+def staging_ports(node, want_in: Mapping[str, str], want_out: Mapping[str, str] = ()) -> List[Tuple[str, str, Tuple[int, ...]]]:
+    """Build-time staging: ``[(port, dtype, shape)]`` for every declared INPUT
+    whose dtype or strides the kernel cannot read natively, and every declared
+    OUTPUT whose dtype it cannot write natively. Decided from the declaration
+    alone; the shape is the declared dim, the dtype what the kernel takes.
+
+    An output the graph leaves untyped follows the declared ``initial_state``
+    when there is one -- the op layer allocates it so, and ``kda_bwd`` declares
+    ``d_initial_state`` dtype-like it -- else the kernel's own dtype.
+    """
+    state0 = node.inputs.get("initial_state")
+    state_dtype = _declared_dtype(state0) if state0 is not None else None
+    ports = []
+    for port, tensor in node.inputs.items():
+        if tensor is None:
+            continue
+        target = want_in.get(port)
+        have = _declared_dtype(tensor)
+        dtype = target or have
+        if dtype is None:
+            continue
+        shape = tuple(int(d) for d in tensor.dim)
+        if (target is not None and have is not None and have != target) or not packed(shape, tensor.stride):
+            ports.append((port, dtype, shape))
+    for port, target in dict(want_out).items():
+        tensor = node.outputs.get(port)
+        if tensor is None:
+            continue
+        if (_declared_dtype(tensor) or state_dtype or target) != target:
+            ports.append((port, target, tuple(int(d) for d in tensor.dim)))
+    return ports
+
+
 def resolve_inputs(
     names: Sequence[str],
     views: Iterable,
     engine: str,
     stream: int,
     want: Optional[Mapping[str, Any]] = None,
-) -> Tuple[Dict[str, int], List]:
-    """``({port: device address}, keepalive)``, every address packed and typed.
+    staging: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, int]:
+    """``{port: device address}``, every address packed and typed.
 
-    ``want`` maps a port to the torch dtype the kernel needs; a port absent from
-    it keeps whatever the caller passed. The keepalive list holds any buffer
-    this made and MUST outlive the launch -- dropping one frees memory the
-    kernel is about to read.
+    ``want`` maps a port to the dtype NAME the kernel needs; a port absent from
+    it keeps whatever the caller passed. ``staging`` maps a port to its
+    workspace carve (any DLPack producer of the wanted dtype and declared
+    shape); a port that needs converting and has none raises.
     """
-    import torch
-
     want = want or {}
+    staging = staging or {}
     addr: Dict[str, int] = {}
     fixups = []
     for name, view in zip(names, views):
@@ -115,40 +153,50 @@ def resolve_inputs(
                 f"dtype={buffers.dtype_name(view)}. Pass a contiguous buffer of the expected "
                 f"dtype, or select another KDA engine with plan_name."
             )
-        fixups.append((name, view, target))
+        dst = staging.get(name)
+        if dst is None:
+            raise NotImplementedError(
+                f"{engine}: '{name}' was passed with shape={tuple(view.shape)} stride={tuple(view.stride())} "
+                f"dtype={buffers.dtype_name(view)}, but the graph declared it packed"
+                f"{'' if target is None else f' and {target}'}, so the plan reserved no staging for it. "
+                f"Declare the layout/dtype on the graph tensor so the plan can size its staging, "
+                f"or pass a buffer matching the declaration."
+            )
+        fixups.append((name, view, dst))
 
     if fixups:
         # One copy per port fixes layout and dtype together, on the execution
-        # stream, into a buffer this call owns.
-        keepalive: List = []
-        sources = [(name, torch.from_dlpack(view), target) for name, view, target in fixups]
-        with stream_ctx(stream, sources[0][1].device):
-            for name, source, target in sources:
-                dtype = _torch_dtype(target) if target else source.dtype
-                buf = torch.empty(source.shape, dtype=dtype, device=source.device)
-                buf.copy_(source)
-                keepalive.append(buf)
-                addr[name] = int(buf.data_ptr())
-        return addr, keepalive
-    return addr, []
+        # stream, into the carve declared at build.
+        import torch
+
+        targets = [(name, torch.from_dlpack(dst), view) for name, view, dst in fixups]
+        with stream_ctx(stream, targets[0][1].device):
+            for name, dst, view in targets:
+                dst.copy_(torch.from_dlpack(view))
+                addr[name] = int(dst.data_ptr())
+    return addr
 
 
-def stage_output(view, target, stream: int) -> Tuple[int, Optional[Any], Optional[Any]]:
-    """``(address the kernel writes, staging buffer, caller tensor)``.
+def stage_output(view, target: str, stream: int, staging=None, port: str = "") -> Tuple[int, Optional[Any], Optional[Any]]:
+    """``(address the kernel writes, staging tensor, caller tensor)``.
 
     When the caller's buffer already has the wanted dtype the kernel writes it
-    directly and both extra values are ``None``; otherwise it writes the staging
-    buffer and the caller must :func:`write_back` after the launch. The staging
-    buffer is per execution, for the same reason inputs are.
+    directly and both extra values are ``None``; otherwise it writes the
+    ``staging`` carve and the caller must :func:`write_back` on ``stream`` after
+    the launch. Nothing is written here, so no stream work is issued.
     """
-    import torch
-
     if buffers.dtype_name(view) == target:
         return int(view.data_ptr()), None, None
-    destination = torch.from_dlpack(view)
-    with stream_ctx(stream, destination.device):
-        buf = torch.empty(destination.shape, dtype=_torch_dtype(target), device=destination.device)
-    return int(buf.data_ptr()), buf, destination
+    if staging is None:
+        raise NotImplementedError(
+            f"output '{port}' was passed as {buffers.dtype_name(view)} but the graph declared no dtype the "
+            f"kernel cannot write natively, so the plan reserved no {target} staging for it. Declare the dtype "
+            f"on the graph tensor so the plan can size its staging, or pass a {target} buffer."
+        )
+    import torch
+
+    staged = torch.from_dlpack(staging)
+    return int(staged.data_ptr()), staged, torch.from_dlpack(view)
 
 
 def write_back(staged: Optional[Any], destination: Optional[Any], stream: int) -> None:
