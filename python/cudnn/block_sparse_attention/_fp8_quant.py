@@ -27,6 +27,22 @@ class _SageFp8Quantizer:
     REDUCTION_THREADS = 128
     ROWS_PER_CHUNK = 256
 
+    def __init__(self, is_sm120: bool = False, v_block_size: int = 0):
+        self.is_sm120 = is_sm120
+        self.v_block_size = v_block_size
+        if v_block_size:
+            from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.sage_v_quant import SageFp8VQuantizerSm120Blk128
+
+            self.v_quantizer = SageFp8VQuantizerSm120Blk128()
+
+    @cute.jit
+    def _warp_amax(self, value: Float32) -> Float32:
+        # SM120 does not support the SM100 floating-point redux instruction.
+        if cutlass.const_expr(self.is_sm120):
+            return cute.arch.warp_reduction_max(value)
+        else:
+            return cute.arch.warp_redux_sync(value, "fmax")
+
     @cute.kernel
     def _quantize_q_kernel(
         self,
@@ -52,7 +68,7 @@ class _SageFp8Quantizer:
                 cute.arch.fmax(value_f32, -value_f32),
             )
 
-        row_amax = cute.arch.warp_redux_sync(local_amax, "fmax")
+        row_amax = self._warp_amax(local_amax)
         row_scale = cute.math.div(
             cute.arch.fmax(row_amax, Float32(1.0e-3)),
             Float32(448.0),
@@ -161,7 +177,7 @@ class _SageFp8Quantizer:
                 cute.arch.fmax(centered_value, -centered_value),
             )
 
-        per_warp_amax = cute.arch.warp_redux_sync(local_amax, "fmax")
+        per_warp_amax = self._warp_amax(local_amax)
         if lane_idx == 0:
             warp_amax[warp_idx] = per_warp_amax
         cute.arch.barrier()
@@ -169,7 +185,7 @@ class _SageFp8Quantizer:
         cta_amax = Float32(0.0)
         if lane_idx < self.K_WARPS:
             cta_amax = warp_amax[lane_idx]
-        cta_amax = cute.arch.warp_redux_sync(cta_amax, "fmax")
+        cta_amax = self._warp_amax(cta_amax)
         if thread_idx == 0:
             block_scale[0] = cute.math.div(
                 cute.arch.fmax(cta_amax, Float32(1.0e-3)),
@@ -353,17 +369,20 @@ class _SageFp8Quantizer:
             block=(self.REDUCTION_THREADS, 1, 1),
             stream=stream,
         )
-        self._quantize_v_kernel(
-            mV,
-            mVFp8,
-            mVScale,
-            num_heads,
-            seqlen_k,
-        ).launch(
-            grid=(num_groups * seqlen_k, 1, 1),
-            block=(self.REDUCTION_THREADS, 1, 1),
-            stream=stream,
-        )
+        if cutlass.const_expr(self.v_block_size == 128):
+            self.v_quantizer(mV, mVFp8, mVScale, batch_size, num_heads, seqlen_k, stream)
+        else:
+            self._quantize_v_kernel(
+                mV,
+                mVFp8,
+                mVScale,
+                num_heads,
+                seqlen_k,
+            ).launch(
+                grid=(num_groups * seqlen_k, 1, 1),
+                block=(self.REDUCTION_THREADS, 1, 1),
+                stream=stream,
+            )
 
 
 def _to_dynamic_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
@@ -379,8 +398,12 @@ def _quantize_sage_bhsd(
     q_bhsd: torch.Tensor,
     k_bhsd: torch.Tensor,
     v_bhsd: torch.Tensor,
+    *,
+    v_block_size: int = 0,
 ):
-    """Quantize BF16 BHSD Q/K/V using private CuTe DSL kernels."""
+    """Quantize BF16 Q/K/V; optionally store V as [B, H, KV-block, D, token]."""
+    if v_block_size not in (0, 128):
+        raise ValueError("v_block_size must be 0 or 128")
     tensors = (q_bhsd, k_bhsd, v_bhsd)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError("Q, K, and V must be rank-4 BHSD tensors")
@@ -407,6 +430,8 @@ def _quantize_sage_bhsd(
     if seqlen_k < 1:
         raise ValueError("Sage FP8 quantization requires positive batch, head, and sequence counts")
     is_sm120 = torch.cuda.get_device_capability(q_bhsd.device)[0] == 12
+    if v_block_size and not is_sm120:
+        raise NotImplementedError("blocked V quantization requires SM120")
     if not is_sm120 and (seqlen_q % 64 or seqlen_k % 64):
         raise ValueError("Q and K/V sequence lengths must be multiples of 64")
 
@@ -419,7 +444,14 @@ def _quantize_sage_bhsd(
     with torch.cuda.device(device):
         q_fp8 = torch.empty_like(q_bhsd, dtype=torch.float8_e4m3fn)
         k_fp8 = torch.empty_like(k_bhsd, dtype=torch.float8_e4m3fn)
-        v_fp8 = torch.empty_like(v_bhsd, dtype=torch.float8_e4m3fn)
+        if v_block_size:
+            v_fp8 = torch.empty(
+                (batch_size, num_heads, (seqlen_k + 127) // 128, head_dim, 128),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+        else:
+            v_fp8 = torch.empty_like(v_bhsd, dtype=torch.float8_e4m3fn)
         q_scale = torch.empty(
             (batch_size, num_heads, seqlen_q),
             dtype=torch.float32,
@@ -467,9 +499,9 @@ def _quantize_sage_bhsd(
         )
         cute_tensors = tuple(_to_dynamic_cute_tensor(tensor) for tensor in runtime_tensors)
         current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-        compile_key = torch.cuda.get_device_capability(device)
+        compile_key = (torch.cuda.get_device_capability(device), v_block_size)
         if compile_key not in _quantize_sage_bhsd.compile_cache:
-            quantizer = _SageFp8Quantizer()
+            quantizer = _SageFp8Quantizer(is_sm120=is_sm120, v_block_size=v_block_size)
             _quantize_sage_bhsd.compile_cache[compile_key] = cute.compile(
                 quantizer,
                 *cute_tensors,
@@ -496,7 +528,7 @@ def _quantize_sage_bhsd(
         )
 
     if not (q_fp8.is_contiguous() and k_fp8.is_contiguous() and v_fp8.is_contiguous()):
-        raise RuntimeError("quantized Q, K, and V must remain BHSD-contiguous")
+        raise RuntimeError("quantized Q, K, and V storage must remain contiguous")
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 

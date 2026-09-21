@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local kernel experiments, measurements, and profiler metadata.
+agent/
