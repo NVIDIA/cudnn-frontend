@@ -386,10 +386,14 @@ class SdpaGraphFacts:
     dbias_t: Any = None
     dsink_t: Any = None
     # MXFP8 backward-only refs: the transposed-quantization payloads (each
-    # contraction axis needs its own 1x32 quantization), the half-precision dO,
-    # their block-scale tensors, and the (declined-by-default) amax outputs.
+    # contraction axis needs its own 1x32 quantization), explicit BF16 Q/K
+    # copies for leakage-safe sequence-reduction contractions, the
+    # half-precision dO, their block-scale tensors, and the
+    # (declined-by-default) amax outputs.
     q_T_t: Any = None
     k_T_t: Any = None
+    q_f16_t: Any = None
+    k_f16_t: Any = None
     dO_T_t: Any = None
     dO_f16_t: Any = None
     sf_q_T_t: Any = None
@@ -582,7 +586,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # first-class operands of the MXFP8 backward (each contraction axis
         # needs its own 1x32 quantization; a transposed payload is not the
         # transpose of the payload).
-        for name in ("q_T", "k_T", "dO_T", "dO_f16"):
+        for name in ("q_T", "k_T", "q_f16", "k_f16", "dO_T", "dO_f16"):
             t = rec.get(name)
             if t is None:
                 return _invalid(f"missing {name} on the sdpa_mxfp8_backward node")
@@ -676,6 +680,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     if is_mxfp8_bwd:
         if dims["q_T"] != dims["q"] or dims["k_T"] != dims["k"]:
             return _invalid("q_T / k_T must match the Q / K shapes")
+        if dims["q_f16"] != dims["q"] or dims["k_f16"] != dims["k"]:
+            return _invalid("q_f16 / k_f16 must match the Q / K shapes")
         if dims["dO_T"] != dims["dO"] or dims["dO_f16"] != dims["dO"]:
             return _invalid("dO_T / dO_f16 must match the dO shape")
     if any(x <= 0 for x in (b, h_q, h_kv, s_q, s_kv, d_qk, d_v)):
@@ -707,17 +713,18 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     _fp8_family = is_mxfp8 or is_fp8
     q_dtype = q.get_data_type() if q.get_data_type() in _KNOWN_DTYPES else None
     o_dtype = o.get_data_type() if o.get_data_type() in _KNOWN_DTYPES else None
-    # Half-precision side of a quantized graph: O (and, for the MXFP8 backward,
-    # dO_f16 / dQ / dK / dV) share one dtype that is independent of the FP8
-    # payloads. ``uniform_out_dtype`` records whether they agree; the half rows
-    # fold this into ``uniform_dtype`` (everything equals Q there).
+    # Half-precision output side of a quantized graph: O and, for MXFP8
+    # backward, dQ/dK/dV share one dtype independent of the FP8 payloads.
+    # dO_f16 is instead an explicit BF16 precision sidecar.
     uniform_out = True
     if _fp8_family:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
         _fp8_ports = [k, v] + ([rec["dO"], rec["q_T"], rec["k_T"], rec["dO_T"]] if is_mxfp8_bwd else [])
         uniform = all(t.get_data_type() == q_dtype for t in _fp8_ports)
         if is_mxfp8_bwd:
-            uniform_out = all(t.get_data_type() == o_dtype for t in (rec["dO_f16"], rec["dQ"], rec["dK"], rec["dV"]))
+            uniform_out = all(t.get_data_type() == o_dtype for t in (rec["dQ"], rec["dK"], rec["dV"]))
+            if any(rec[name].get_data_type() != cudnn.data_type.BFLOAT16 for name in ("q_f16", "k_f16", "dO_f16")):
+                return _invalid("q_f16 / k_f16 / dO_f16 must be BF16")
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
@@ -725,7 +732,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
     if is_mxfp8_bwd:
-        _layout_ports += [(dims[name], strides[name]) for name in ("q_T", "k_T", "dO_T", "dO_f16")]
+        _layout_ports += [(dims[name], strides[name]) for name in ("q_T", "k_T", "q_f16", "k_f16", "dO_T", "dO_f16")]
     # Paged pools are not BSHD tensors (an HND pool has its head stride above
     # the row stride); the BSHD fact — what the THD lowering gates on — is
     # about the ragged Q/O only.
@@ -925,6 +932,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         dsink_t=rec.get("dSink_token"),
         q_T_t=(rec.get("q_T") if is_mxfp8_bwd else None),
         k_T_t=(rec.get("k_T") if is_mxfp8_bwd else None),
+        q_f16_t=(rec.get("q_f16") if is_mxfp8_bwd else None),
+        k_f16_t=(rec.get("k_f16") if is_mxfp8_bwd else None),
         dO_T_t=(rec.get("dO_T") if is_mxfp8_bwd else None),
         dO_f16_t=(rec.get("dO_f16") if is_mxfp8_bwd else None),
         sf_q_T_t=(dsc_q_T if is_mxfp8_bwd else None),
@@ -1040,9 +1049,12 @@ class SdpaBinding:
     dv: Any = None
     dbias: Any = None
     dsink: Any = None
-    # MXFP8 backward: transposed payloads, half-precision dO, their SF tensors.
+    # MXFP8 backward: transposed payloads, leakage-safe BF16 Q/K copies,
+    # half-precision dO, and their SF tensors.
     q_T: Any = None
     k_T: Any = None
+    q_f16: Any = None
+    k_f16: Any = None
     dO_T: Any = None
     dO_f16: Any = None
     sf_q_T: Any = None
@@ -1106,6 +1118,8 @@ class SdpaBinding:
                 self.dsink,
                 self.q_T,
                 self.k_T,
+                self.q_f16,
+                self.k_f16,
                 self.dO_T,
                 self.dO_f16,
                 self.sf_q_T,

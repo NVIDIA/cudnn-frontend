@@ -1686,8 +1686,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "cga=1 on the d128 flavor selects the dense decode tile; THD (ragged) graphs run the cga2 prefill tile",
         )
         self._not_implemented_error_if(
-            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),
-            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD and split-KV are not wired)",
+            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128), (256, 256)) or self.thd or self.split_kv != 1),
+            "pv_bf16 is an experimental direct-only MXFP8 D128, D192xD128, or D256 dense specialization (THD and split-KV are not wired)",
         )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch

@@ -19,6 +19,13 @@ def _load_benchmark_module():
 
 
 @pytest.mark.L0
+def test_qwen_d256_shape_is_available_for_comparative_sweeps():
+    benchmark = _load_benchmark_module()
+
+    assert benchmark._parse_d_shapes("d256") == (("d256", 256, 256),)
+
+
+@pytest.mark.L0
 def test_cuda_graph_capture_warms_up_on_a_side_stream(monkeypatch):
     """The first kernel initialization must finish before graph capture."""
     benchmark = _load_benchmark_module()

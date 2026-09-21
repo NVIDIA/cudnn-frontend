@@ -1138,6 +1138,8 @@ class pygraph:
                 return node  # declared python-only: lowering raises by design
             if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
+            if any(port in node.inputs for port in spec_entry[1].get("python_only_inputs", ())):
+                return node  # a precision sidecar the backend cannot consume is SET: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -2458,6 +2460,7 @@ class pygraph:
                 if node.compute_data_type is not None:
                     kw["compute_data_type"] = _library_type(node.compute_data_type)
                 python_only = spec.get("python_only_attrs", ())
+                python_only_inputs = spec.get("python_only_inputs", ())
                 for pk, pv in node.params.items():
                     if pk.startswith("_") or pk.startswith("dropout_") or pk in python_only:
                         continue  # python-only attrs never reach C++ (_unlowerable_node keeps a SET one off the backend)
@@ -2465,7 +2468,7 @@ class pygraph:
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
                 for port, t in node.inputs.items():
-                    if not port.startswith("dropout_"):
+                    if not port.startswith("dropout_") and port not in python_only_inputs:
                         kw[port] = tensor_map[t.uid]
                 for port in spec.get("out_kwargs", ()):
                     if port in node.outputs:  # classic passes these descriptors as args
@@ -3576,6 +3579,10 @@ _CAPTURED_OPS = {
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
+        # FROST-only precision sidecars.  The native cuDNN graph API does not
+        # expose these ports, so lowering intentionally omits them while the
+        # Python engine can still bind them from the variant pack.
+        python_only_inputs=("q_f16", "k_f16"),
         pos=(
             "q",
             "q_T",

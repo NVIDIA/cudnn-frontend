@@ -13,12 +13,11 @@ tile shift (the ``SFA`` form). cuDNN's graph declares the canonical
 shift is an 8-byte offset inside a 512-byte SF atom and TMA cannot start a
 box mid-atom.
 
-This module bridges the two: one launch per SF tensor reads the canonical
-planes and writes the slot layout into caller-provided workspace. It is a
+This module bridges the two: one launch per canonical SF source writes both
+slot layouts into caller-provided workspace. It is a
 documented exception to Hard Rule 2 (no adapter-side layout copies), taken
 consciously to ship the kernels as validated upstream; the follow-up is to
-teach the kernels' SF path to read canonical atoms. Cost is bounded: SF bytes
-are 1/32 of the payload, and the whole repack is ~1-2% of the backward.
+teach the kernels' SF path to read canonical atoms.
 
 Layout facts (byte offsets, ``l`` = head plane, ``rt``/``ct`` = 128-row /
 4-group atom tile, ``m0``/``m1``/``k0`` = row%32 / row//32%4 / group%4):
@@ -51,7 +50,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int8, Int32
+from cutlass.cute.typing import Int8
 
 THREADS = 256
 SF_LAYOUT_SFA = "sfa"
@@ -76,86 +75,81 @@ def repack_geometry(rows: int, k_groups: int, l: int, sf_layout: str) -> tuple:
     return rest_m, rest_k, packed_rest_m, 2 * l * packed_rest_m * rest_k * 512
 
 
-class Mxfp8SfRepackSm100:
-    """Canonical F8_128x4 planes -> the D256 kernels' SFA/SFB slot layout.
+class Mxfp8SfRepackPairSm100:
+    """Build the SFA and SFB forms of one canonical tensor in one launch.
 
-    Shape-specialized (all extents are compile-time constants); one thread per
-    destination byte. Both tensors are flat ``Int8`` views.
+    One thread owns a contiguous 16-byte ``m0`` row of an F8_128x4 atom.
+    Besides halving the launch count, this decodes the atom coordinates once
+    and reuses each source byte for both consumers instead of independently
+    traversing the two expanded destinations byte by byte.
     """
 
-    def __init__(self, rows: int, k_groups: int, l: int, sf_layout: str, src_plane_major: bool = True):
-        if sf_layout not in (SF_LAYOUT_SFA, SF_LAYOUT_SFB):
-            raise ValueError(f"unsupported MXFP8 scale layout: {sf_layout}")
+    def __init__(self, rows: int, k_groups: int, l: int, src_plane_major: bool = True):
         self.rows = int(rows)
         self.k_groups = int(k_groups)
         self.l = int(l)
-        self.is_sfa = sf_layout == SF_LAYOUT_SFA
         self.src_plane_major = bool(src_plane_major)
-        self.rest_m, self.rest_k, self.packed_rest_m, self.dst_bytes = repack_geometry(rows, k_groups, l, sf_layout)
+        self.rest_m, self.rest_k, self.sfa_rest_m, self.sfa_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFA)
+        _, _, self.sfb_rest_m, self.sfb_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFB)
         self.src_bytes = self.l * self.rest_m * self.rest_k * 512
+        self.chunks = self.src_bytes // 16
 
     @cute.jit
-    def __call__(self, src: cute.Tensor, dst: cute.Tensor, stream):
-        self.kernel(src, dst).launch(
-            grid=(_ceil_div(self.dst_bytes, THREADS), 1, 1),
+    def __call__(self, src: cute.Tensor, dst_sfa: cute.Tensor, dst_sfb: cute.Tensor, stream):
+        self.kernel(src, dst_sfa, dst_sfb).launch(
+            grid=(_ceil_div(self.chunks, THREADS), 1, 1),
             block=[THREADS, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, src: cute.Tensor, dst: cute.Tensor):
+    def kernel(self, src: cute.Tensor, dst_sfa: cute.Tensor, dst_sfb: cute.Tensor):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * THREADS + tidx
-        if idx < self.dst_bytes:
-            k0 = idx % 4
-            r = idx // 4
-            m1 = r % 4
-            r = r // 4
-            m0 = r % 32
-            r = r // 32
-            ct = r % self.rest_k
-            r = r // self.rest_k
-            rt_p = r % self.packed_rest_m
-            lp = r // self.packed_rest_m
-            l_idx = lp // 2
-            slot = lp % 2
-
-            has_source = Int32(1)
-            src_m1 = m1
-            rt = rt_p
-            if cutlass.const_expr(self.is_sfa):
-                rt = rt_p // 2
-                odd = rt_p % 2
-                if slot == 0:
-                    if odd == 1 and m1 < 2:
-                        src_m1 = m1 + 2
-                else:
-                    if m1 == 1:
-                        if odd == 1:
-                            src_m1 = Int32(3)
-                    else:
-                        has_source = Int32(0)
+        chunk = bidx * THREADS + tidx
+        if chunk < self.chunks:
+            m0 = chunk % 32
+            atom = chunk // 32
+            ct = atom % self.rest_k
+            atom = atom // self.rest_k
+            if cutlass.const_expr(self.src_plane_major):
+                rt = atom % self.rest_m
+                l_idx = atom // self.rest_m
             else:
-                if slot == 1:
-                    if m1 < 2:
-                        src_m1 = m1 + 2
-                    else:
-                        has_source = Int32(0)
+                l_idx = atom % self.l
+                rt = atom // self.l
 
-            value = Int8(0)
-            if has_source == 1:
-                src_m = rt * 128 + src_m1 * 32 + m0
+            src_base = chunk * 16
+            sfb0 = (((2 * l_idx) * self.sfb_rest_m + rt) * self.rest_k + ct) * 512 + m0 * 16
+            sfb1 = ((((2 * l_idx + 1) * self.sfb_rest_m + rt) * self.rest_k + ct) * 512) + m0 * 16
+            sfa0_even = (((2 * l_idx) * self.sfa_rest_m + 2 * rt) * self.rest_k + ct) * 512 + m0 * 16
+            sfa0_odd = (((2 * l_idx) * self.sfa_rest_m + 2 * rt + 1) * self.rest_k + ct) * 512 + m0 * 16
+            sfa1_even = ((((2 * l_idx + 1) * self.sfa_rest_m + 2 * rt) * self.rest_k + ct) * 512) + m0 * 16
+            sfa1_odd = ((((2 * l_idx + 1) * self.sfa_rest_m + 2 * rt + 1) * self.rest_k + ct) * 512) + m0 * 16
+
+            for j in cutlass.range_constexpr(16):
+                m1 = j // 4
+                k0 = j % 4
+                src_m = rt * 128 + m1 * 32 + m0
                 group = ct * 4 + k0
+                value = Int8(_E8M0_ONE)
                 if src_m < self.rows and group < self.k_groups:
-                    if cutlass.const_expr(self.src_plane_major):
-                        src_atom = (l_idx * self.rest_m + rt) * self.rest_k + ct
-                    else:
-                        src_atom = (rt * self.l + l_idx) * self.rest_k + ct
-                    value = src[src_atom * 512 + m0 * 16 + src_m1 * 4 + k0]
-                else:
-                    value = Int8(_E8M0_ONE)
-            dst[idx] = value
+                    value = src[src_base + j]
+
+                dst_sfb[sfb0 + j] = value
+                dst_sfa[sfa0_even + j] = value
+
+                shifted_j = j + 8 if j < 8 else j
+                shifted_m1 = shifted_j // 4
+                shifted_m = rt * 128 + shifted_m1 * 32 + m0
+                shifted_value = Int8(_E8M0_ONE)
+                if shifted_m < self.rows and group < self.k_groups:
+                    shifted_value = src[src_base + shifted_j]
+                dst_sfa[sfa0_odd + j] = shifted_value
+
+                dst_sfb[sfb1 + j] = shifted_value if j < 8 else Int8(_E8M0_ONE)
+                dst_sfa[sfa1_even + j] = value if 4 <= j and j < 8 else Int8(_E8M0_ONE)
+                dst_sfa[sfa1_odd + j] = shifted_value if 4 <= j and j < 8 else Int8(_E8M0_ONE)
 
 
-__all__ = ["Mxfp8SfRepackSm100", "SF_LAYOUT_SFA", "SF_LAYOUT_SFB", "THREADS", "repack_geometry"]
+__all__ = ["Mxfp8SfRepackPairSm100", "SF_LAYOUT_SFA", "SF_LAYOUT_SFB", "THREADS", "repack_geometry"]
