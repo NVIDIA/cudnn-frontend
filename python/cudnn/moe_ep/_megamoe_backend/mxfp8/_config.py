@@ -17,65 +17,6 @@ _PHYSICAL_POOL_ALIGNMENT = 128
 MXFP8_CLUSTER_SHAPE_MNK = (2, 1, 1)
 
 
-def _worst_case_padded_route_count(
-    logical_route_count: int,
-    *,
-    experts_per_rank: int,
-    padding_block: int,
-) -> int:
-    """Return upstream's worst-case rows for a logical route limit."""
-
-    active_expert_count = min(experts_per_rank, logical_route_count)
-    padded_block_count = active_expert_count + (logical_route_count - active_expert_count) // padding_block
-    return padded_block_count * padding_block
-
-
-def _logical_route_limit_for_physical_pool(
-    pool_capacity_upper_bound: int,
-    *,
-    raw_route_count: int,
-    experts_per_rank: int,
-    padding_block: int,
-) -> int:
-    """Find a logical route limit whose padded pool has the requested size."""
-
-    if pool_capacity_upper_bound % _PHYSICAL_POOL_ALIGNMENT:
-        raise ValueError("max_recv_size_per_rank must satisfy P % 128 == 0, " f"got P={pool_capacity_upper_bound}")
-
-    # The physical pool is an explicit ABI capacity. It may intentionally exceed
-    # the maximum routes this topology can produce, so do not clamp this search
-    # to raw_route_count.
-    del raw_route_count
-    lower = 0
-    upper = pool_capacity_upper_bound
-    while lower < upper:
-        candidate = (lower + upper + 1) // 2
-        padded = _worst_case_padded_route_count(
-            candidate,
-            experts_per_rank=experts_per_rank,
-            padding_block=padding_block,
-        )
-        if padded <= pool_capacity_upper_bound:
-            lower = candidate
-        else:
-            upper = candidate - 1
-
-    logical_route_limit = lower
-    padded_capacity = _worst_case_padded_route_count(
-        logical_route_limit,
-        experts_per_rank=experts_per_rank,
-        padding_block=padding_block,
-    )
-    if logical_route_limit <= 0 or padded_capacity != pool_capacity_upper_bound:
-        raise ValueError(
-            "max_recv_size_per_rank cannot be represented by the upstream "
-            "padding contract: "
-            f"P={pool_capacity_upper_bound}, largest logical limit="
-            f"{logical_route_limit}, padded capacity={padded_capacity}"
-        )
-    return logical_route_limit
-
-
 @dataclass(frozen=True)
 class Mxfp8KernelConfig:
     """Fully resolved code-generation/ABI constants for one phase."""
@@ -128,7 +69,10 @@ class Mxfp8KernelConfig:
         if self.physical_recv_pool_size <= 0:
             raise ValueError("physical_recv_pool_size must be positive")
         if self.physical_recv_pool_size % _PHYSICAL_POOL_ALIGNMENT:
-            raise ValueError("physical_recv_pool_size must satisfy P % 128 == 0, " f"got P={self.physical_recv_pool_size}")
+            raise ValueError(
+                "physical_recv_pool_size must satisfy P % 128 == 0, "
+                f"got P={self.physical_recv_pool_size}"
+            )
         if self.max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         if self.group_hint <= 0:
@@ -155,13 +99,9 @@ class Mxfp8KernelConfig:
                 )
         elif self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
-        if (
-            self.dgrad_optimization == "ds3_ep4_v1"
-            and self.col_quant_num_ctas != -1
-        ):
+        if self.dgrad_optimization == "ds3_ep4_v1" and self.col_quant_num_ctas != -1:
             raise ValueError(
-                "dgrad_optimization='ds3_ep4_v1' requires "
-                "col_quant_num_ctas=-1"
+                "dgrad_optimization='ds3_ep4_v1' requires " "col_quant_num_ctas=-1"
             )
         if self.weight_storage_mode not in ("contiguous", "discrete"):
             raise ValueError(
@@ -191,8 +131,7 @@ class Mxfp8KernelConfig:
             raise ValueError("MXFP8 execution requires a positive EP size")
         if topology.ep_rank < 0 or topology.ep_rank >= topology.ep_size:
             raise ValueError(
-                f"ep_rank {topology.ep_rank} is outside EP size "
-                f"{topology.ep_size}"
+                f"ep_rank {topology.ep_rank} is outside EP size " f"{topology.ep_size}"
             )
         if parallel.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
@@ -206,51 +145,15 @@ class Mxfp8KernelConfig:
         else:
             tuning = public.training_backward_tuning
         backward = phase == "training_backward"
-        dgrad_optimization = (
-            tuning.dgrad_optimization if backward else "baseline"
-        )
-        token_padding_block = (
-            128 if training else parallel.token_padding_size
-        )
+        dgrad_optimization = tuning.dgrad_optimization if backward else "baseline"
+        token_padding_block = 128 if training else parallel.token_padding_size
         sf_padding_block = 128 if training else parallel.sf_padding_size
-        raw_route_count = (
-            topology.ep_size
-            * parallel.max_tokens_per_rank
-            * model.top_k
-        )
-        worst_case_padded_recv_size = _worst_case_padded_route_count(
-            raw_route_count,
-            experts_per_rank=topology.experts_per_rank,
-            padding_block=token_padding_block,
-        )
-        if dgrad_optimization == "ds3_ep4_v1":
-            physical_recv_pool_size = worst_case_padded_recv_size
-            requested_physical_size = parallel.max_recv_size_per_rank
-            if (
-                requested_physical_size is not None
-                and requested_physical_size != physical_recv_pool_size
-            ):
-                raise ValueError(
-                    "dgrad_optimization='ds3_ep4_v1' requires public "
-                    "max_recv_size_per_rank to be the exact physical padded "
-                    f"receive pool ({physical_recv_pool_size}), not the "
-                    f"backward kernel logical route limit; got "
-                    f"{requested_physical_size}"
-                )
-            logical_route_limit = raw_route_count
+        receive_capacity = config.receive_capacity
+        physical_recv_pool_size = receive_capacity.physical_recv_pool_rows
+        if training:
+            logical_route_limit = receive_capacity.training_logical_route_capacity
         else:
-            pool_capacity_upper_bound = (
-                worst_case_padded_recv_size
-                if parallel.max_recv_size_per_rank is None
-                else parallel.max_recv_size_per_rank
-            )
-            logical_route_limit = _logical_route_limit_for_physical_pool(
-                pool_capacity_upper_bound,
-                raw_route_count=raw_route_count,
-                experts_per_rank=topology.experts_per_rank,
-                padding_block=token_padding_block,
-            )
-            physical_recv_pool_size = pool_capacity_upper_bound
+            logical_route_limit = receive_capacity.inference_logical_route_capacity
         ds3 = dgrad_optimization == "ds3_ep4_v1"
         return cls(
             num_experts=topology.experts_per_rank,
@@ -263,9 +166,7 @@ class Mxfp8KernelConfig:
             generate_c=training,
             physical_recv_pool_size=physical_recv_pool_size,
             max_recv_size_per_rank=logical_route_limit,
-            kernel_drop_on_overflow=(
-                True if training else parallel.drop_on_overflow
-            ),
+            kernel_drop_on_overflow=(True if training else parallel.drop_on_overflow),
             enable_col_quant=training,
             dfc2_recompute=backward,
             dfc2_col_output=backward,
@@ -275,9 +176,7 @@ class Mxfp8KernelConfig:
             sf_padding_block=sf_padding_block,
             sf_vec_size=32,
             group_hint=(
-                launch_cluster_count
-                if tuning.group_hint is None
-                else tuning.group_hint
+                launch_cluster_count if tuning.group_hint is None else tuning.group_hint
             ),
             token_back_mode=tuning.token_back_mode,
             epi_flag_batch=((4, 2) if ds3 else tuning.epi_flag_batch),
@@ -368,9 +267,7 @@ class Mxfp8KernelConfig:
         result: dict[str, object] = {}
         for definition in fields(self):
             value = getattr(self, definition.name)
-            result[definition.name] = (
-                list(value) if isinstance(value, tuple) else value
-            )
+            result[definition.name] = list(value) if isinstance(value, tuple) else value
         return result
 
     def compile_key(

@@ -49,9 +49,15 @@ _ROUTING_SYMMETRIC = frozenset({"topk_weights"})
 _ROUTING_LOCAL = frozenset({"topk_idx"})
 _CALLER_OWNED_FORWARD_LOCAL = frozenset({"col_quant_data", "col_quant_sf"})
 _FORWARD_PRIVATE_SYMMETRIC = frozenset({"output_data", *_ROUTING_SYMMETRIC})
-_FORWARD_PRIVATE_LOCAL = frozenset({"overflow_flag", *_CALLER_OWNED_FORWARD_LOCAL, *_ROUTING_LOCAL})
-_BACKWARD_PRIVATE_SYMMETRIC = frozenset({"output_data", "backward_dprob", *_ROUTING_SYMMETRIC})
-_BACKWARD_PRIVATE_LOCAL = frozenset({"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL})
+_FORWARD_PRIVATE_LOCAL = frozenset(
+    {"overflow_flag", *_CALLER_OWNED_FORWARD_LOCAL, *_ROUTING_LOCAL}
+)
+_BACKWARD_PRIVATE_SYMMETRIC = frozenset(
+    {"output_data", "backward_dprob", *_ROUTING_SYMMETRIC}
+)
+_BACKWARD_PRIVATE_LOCAL = frozenset(
+    {"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL}
+)
 
 
 def _resource_name(
@@ -74,7 +80,11 @@ def _region_map(
     requirements: WorkspaceRequirements,
     space: str,
 ) -> dict[str, BufferRegion]:
-    regions = requirements.symmetric_regions if space == "symmetric" else requirements.local_regions
+    regions = (
+        requirements.symmetric_regions
+        if space == "symmetric"
+        else requirements.local_regions
+    )
     return {region.name: region for region in regions}
 
 
@@ -86,7 +96,11 @@ def _add_phase_regions(
     space: str,
     excluded_names: frozenset[str],
 ) -> None:
-    regions = requirements.symmetric_regions if space == "symmetric" else requirements.local_regions
+    regions = (
+        requirements.symmetric_regions
+        if space == "symmetric"
+        else requirements.local_regions
+    )
     for region in regions:
         if region.name in excluded_names:
             continue
@@ -111,17 +125,13 @@ def build_training_workspace_requirements(
         ("backward", backward_config),
     ):
         if not config.generate_c:
-            raise ValueError(
-                f"training {name} preparation requires generate_c=True"
-            )
+            raise ValueError(f"training {name} preparation requires generate_c=True")
         if config.token_padding_block != 128 or config.sf_padding_block != 128:
             raise ValueError(
                 f"training {name} preparation requires token/SF padding 128"
             )
         if not config.kernel_drop_on_overflow:
-            raise ValueError(
-                f"training {name} kernel requires drop_on_overflow=True"
-            )
+            raise ValueError(f"training {name} kernel requires drop_on_overflow=True")
     if not forward_config.enable_col_quant:
         raise ValueError("training forward preparation requires column quantization")
     if not (
@@ -133,7 +143,11 @@ def build_training_workspace_requirements(
             "training backward preparation requires operands specialization"
         )
     if forward.pool_token_capacity != backward.pool_token_capacity:
-        raise ValueError("forward/backward pool capacities must match, got " f"{forward.pool_token_capacity} and " f"{backward.pool_token_capacity}")
+        raise ValueError(
+            "forward/backward pool capacities must match, got "
+            f"{forward.pool_token_capacity} and "
+            f"{backward.pool_token_capacity}"
+        )
 
     forward_requirements = forward.workspace_requirements
     backward_requirements = backward.workspace_requirements
@@ -187,10 +201,17 @@ def build_training_workspace_requirements(
     forward_local = _region_map(forward_requirements, "local")
     backward_symmetric = _region_map(backward_requirements, "symmetric")
     backward_local = _region_map(backward_requirements, "local")
-    fc1_c_shape = tuple(int(extent) for extent in forward.kernel.get_aux_output_shapes()["fc1_c"])
-    backward_fc1_preact_shape = tuple(int(extent) for extent in backward.kernel.get_fc1_preact_shape())
+    fc1_c_shape = tuple(
+        int(extent) for extent in forward.kernel.get_aux_output_shapes()["fc1_c"]
+    )
+    backward_fc1_preact_shape = tuple(
+        int(extent) for extent in backward.kernel.get_fc1_preact_shape()
+    )
     if fc1_c_shape != backward_fc1_preact_shape:
-        raise ValueError("forward fc1_c and backward fc1_preact shapes differ: " f"{fc1_c_shape} != {backward_fc1_preact_shape}")
+        raise ValueError(
+            "forward fc1_c and backward fc1_preact shapes differ: "
+            f"{fc1_c_shape} != {backward_fc1_preact_shape}"
+        )
     for name in sorted(_FORWARD_PRIVATE_SYMMETRIC):
         if name in _ROUTING_SYMMETRIC:
             continue
@@ -275,9 +296,14 @@ def _harmonize_symmetric_regions(
     dist.all_reduce(minimum_count, op=dist.ReduceOp.MIN, group=runtime.group)
     dist.all_reduce(maximum_count, op=dist.ReduceOp.MAX, group=runtime.group)
     if int(minimum_count.item()) != int(maximum_count.item()):
-        raise RuntimeError("symmetric workspace region counts differ across EP ranks: " f"min={int(minimum_count.item())}, max={int(maximum_count.item())}")
+        raise RuntimeError(
+            "symmetric workspace region counts differ across EP ranks: "
+            f"min={int(minimum_count.item())}, max={int(maximum_count.item())}"
+        )
 
-    metadata = "\0".join(f"{region.name}:{region.alignment}" for region in regions).encode()
+    metadata = "\0".join(
+        f"{region.name}:{region.alignment}" for region in regions
+    ).encode()
     signature_value = int.from_bytes(
         hashlib.blake2b(metadata, digest_size=8).digest(),
         "little",
@@ -317,7 +343,9 @@ def _harmonize_symmetric_regions(
     dist.all_reduce(maximum_sizes, op=dist.ReduceOp.MAX, group=runtime.group)
     harmonized_sizes = tuple(int(value) for value in maximum_sizes.cpu().tolist())
     changes = tuple(
-        f"{region.name}:{region.nbytes}->{harmonized_size}" for region, harmonized_size in zip(regions, harmonized_sizes) if region.nbytes != harmonized_size
+        f"{region.name}:{region.nbytes}->{harmonized_size}"
+        for region, harmonized_size in zip(regions, harmonized_sizes)
+        if region.nbytes != harmonized_size
     )
     _runtime_debug(
         "training-state.symmetric-layout-harmonized",
@@ -391,8 +419,9 @@ def _build_training_abi_facts(
         source_tree_digest = source_tree_sha256(source_root)
     public = config.public_config
     topology = config.topology
+    capacity = config.receive_capacity
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_tree_sha256": source_tree_digest,
         "ep": {
             "size": topology.ep_size,
@@ -405,7 +434,11 @@ def _build_training_abi_facts(
             "intermediate": public.model.intermediate_size,
             "top_k": public.model.top_k,
             "max_tokens_per_rank": public.parallel.max_tokens_per_rank,
-            "max_recv_size_per_rank": int(forward.config.physical_recv_pool_size),
+            "physical_recv_pool_rows": capacity.physical_recv_pool_rows,
+            "logical_recv_route_capacity": (capacity.training_logical_route_capacity),
+            "required_padded_rows": capacity.training_required_padded_rows,
+            "activation_sf_pool_rows": capacity.training_sf_pool_rows,
+            "combine_sf_pool_rows": capacity.physical_recv_pool_rows,
         },
         "policy": {
             "drop_on_overflow": public.parallel.drop_on_overflow,
@@ -446,7 +479,9 @@ def _verify_training_abi_across_ranks(
     rank_digests: list[Any] = [None] * runtime.world_size
     dist.all_gather_object(rank_digests, digest, group=runtime.group)
     raise RuntimeError(
-        "MoeEp training ABI differs across expert-parallel ranks before " "workspace allocation: " f"digests={rank_digests}, local_facts={facts}"
+        "MoeEp training ABI differs across expert-parallel ranks before "
+        "workspace allocation: "
+        f"digests={rank_digests}, local_facts={facts}"
     )
 
 
@@ -524,14 +559,24 @@ class _Mxfp8TrainingState:
         with self._lock:
             if self._closed:
                 raise RuntimeError("private training state is closed")
-            if self._runtime is not None and self._workspace is not None and self._workspace.allocated:
+            if (
+                self._runtime is not None
+                and self._workspace is not None
+                and self._workspace.allocated
+            ):
                 return
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("private training state must be prepared before CUDA graph capture")
+                raise RuntimeError(
+                    "private training state must be prepared before CUDA graph capture"
+                )
             _runtime_debug(
                 "training-state.prepare.begin",
-                local_bytes=sum(region.nbytes for region in self.requirements.local_regions),
-                symmetric_bytes=sum(region.nbytes for region in self.requirements.symmetric_regions),
+                local_bytes=sum(
+                    region.nbytes for region in self.requirements.local_regions
+                ),
+                symmetric_bytes=sum(
+                    region.nbytes for region in self.requirements.symmetric_regions
+                ),
             )
             _runtime_debug("training-state.runtime-acquire.begin")
             runtime = self._runtime_manager.acquire(
@@ -544,7 +589,9 @@ class _Mxfp8TrainingState:
             )
             self._runtime = runtime
             try:
-                layout_watchdog = _RuntimeWatchdog("training-state.symmetric-layout-harmonize")
+                layout_watchdog = _RuntimeWatchdog(
+                    "training-state.symmetric-layout-harmonize"
+                )
                 layout_watchdog.start()
                 _runtime_debug("training-state.symmetric-layout-harmonize.begin")
                 try:
@@ -591,7 +638,9 @@ class _Mxfp8TrainingState:
                     symmetric_bytes=workspace.symmetric_layout.total_bytes,
                 )
                 self._workspace = workspace
-                allocation_watchdog = _RuntimeWatchdog("training-state.workspace-allocate")
+                allocation_watchdog = _RuntimeWatchdog(
+                    "training-state.workspace-allocate"
+                )
                 allocation_watchdog.start()
                 try:
                     workspace.ensure_allocated()
@@ -602,7 +651,9 @@ class _Mxfp8TrainingState:
                     # Symmetric-root zeroing is asynchronous. No rank may
                     # enter the first device barrier until every peer has
                     # completed allocation and root initialization.
-                    stream_watchdog = _RuntimeWatchdog("training-state.stream-synchronize")
+                    stream_watchdog = _RuntimeWatchdog(
+                        "training-state.stream-synchronize"
+                    )
                     stream_watchdog.start()
                     _runtime_debug("training-state.stream-synchronize.begin")
                     try:
@@ -644,14 +695,20 @@ class _Mxfp8TrainingState:
         local = {}
         for region in requirements.symmetric_regions:
             if region.name in _ROUTING_SYMMETRIC:
-                symmetric[region.name] = flat.symmetric[_resource_name("routing", "symmetric", "routing_topk_weights")]
+                symmetric[region.name] = flat.symmetric[
+                    _resource_name("routing", "symmetric", "routing_topk_weights")
+                ]
                 continue
-            symmetric[region.name] = flat.symmetric[_resource_name(phase, "symmetric", region.name)]
+            symmetric[region.name] = flat.symmetric[
+                _resource_name(phase, "symmetric", region.name)
+            ]
         for region in requirements.local_regions:
             if phase == "forward" and region.name in _CALLER_OWNED_FORWARD_LOCAL:
                 continue
             if region.name in _ROUTING_LOCAL:
-                local[region.name] = flat.local[_resource_name("routing", "local", "routing_topk_idx")]
+                local[region.name] = flat.local[
+                    _resource_name("routing", "local", "routing_topk_idx")
+                ]
                 continue
             local[region.name] = flat.local[_resource_name(phase, "local", region.name)]
         return WorkspaceViews(
@@ -667,7 +724,10 @@ class _Mxfp8TrainingState:
     ) -> Mxfp8TrainingScratch:
         public = self.resolved_config.public_config
         capacity = int(public.parallel.max_tokens_per_rank)
-        bwd_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
+        bwd_shapes = {
+            name: tuple(int(extent) for extent in shape)
+            for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()
+        }
 
         def local_bytes(name: str) -> torch.Tensor:
             return flat.local[_resource_name("routing", "local", name)]
@@ -798,8 +858,14 @@ class _Mxfp8TrainingState:
         model = public.model
         capacity = int(public.parallel.max_tokens_per_rank)
         pool_rows = int(self.forward_prepared.pool_token_capacity)
-        forward_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.forward_prepared.kernel.get_aux_output_shapes().items()}
-        backward_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
+        forward_shapes = {
+            name: tuple(int(extent) for extent in shape)
+            for name, shape in self.forward_prepared.kernel.get_aux_output_shapes().items()
+        }
+        backward_shapes = {
+            name: tuple(int(extent) for extent in shape)
+            for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()
+        }
         fc1_sfa_rows = round_up(model.hidden_size, 128)
         fc1_sfa_elements = math.prod(forward_shapes["col_quant_sf"])
         if fc1_sfa_elements % fc1_sfa_rows:
@@ -904,7 +970,9 @@ class _Mxfp8TrainingState:
         with self._lock:
             col_quant_sizes_offset = self.forward_prepared.col_quant_sizes_offset
             if col_quant_sizes_offset is None:
-                raise RuntimeError("training preparation requires a persistent col-quant expert-size snapshot")
+                raise RuntimeError(
+                    "training preparation requires a persistent col-quant expert-size snapshot"
+                )
             flat = self._flat_views(token_count)
             forward_workspace = self._phase_workspace(
                 flat,
@@ -999,7 +1067,9 @@ class _Mxfp8TrainingState:
         if not self.resolved_config.public_config.parallel.drop_on_overflow:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
-                raise RuntimeError("drop_on_overflow=False training requires torch._assert_async")
+                raise RuntimeError(
+                    "drop_on_overflow=False training requires torch._assert_async"
+                )
             overflow_ok = _typed_view(
                 flat.local[
                     _resource_name(
@@ -1014,7 +1084,8 @@ class _Mxfp8TrainingState:
             torch.eq(global_overflow, 0, out=overflow_ok)
             assert_async(
                 overflow_ok,
-                f"Rubin MegaMoE receive route-pool overflow; the {phase} " "outputs are invalid",
+                f"Rubin MegaMoE receive route-pool overflow; the {phase} "
+                "outputs are invalid",
             )
         _runtime_debug("training-overflow.end", phase=phase)
         return global_overflow

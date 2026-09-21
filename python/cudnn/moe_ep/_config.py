@@ -16,6 +16,9 @@ import torch.distributed as dist
 from ._tuning import MoeEpTuningConfig
 from ._types import MoeEpNativeWeightStorageMode, MoeFormat
 
+_PHYSICAL_RECV_POOL_ALIGNMENT = 128
+_MAX_KERNEL_ROUTE_INDEX = (1 << 31) - 1
+
 
 class MoeEpFc1WeightLayout(str, Enum):
     """Logical gate/up ordering supplied by FC1 source weights."""
@@ -59,7 +62,7 @@ class MoeEpParallelConfig:
 
     ep_group: dist.ProcessGroup | None = None
     max_tokens_per_rank: int | None = None
-    max_recv_size_per_rank: int | None = None
+    physical_recv_pool_rows: int | None = None
     drop_on_overflow: bool = False
     token_padding_size: int = 128
     sf_padding_size: int = 128
@@ -80,21 +83,30 @@ class MoeEpParallelConfig:
             raise ValueError(
                 "max_tokens_per_rank must be a non-negative integer or None"
             )
-        if self.max_recv_size_per_rank is not None and (
-            isinstance(self.max_recv_size_per_rank, bool)
-            or not isinstance(self.max_recv_size_per_rank, int)
-            or self.max_recv_size_per_rank <= 0
+        if self.physical_recv_pool_rows is not None and (
+            isinstance(self.physical_recv_pool_rows, bool)
+            or not isinstance(self.physical_recv_pool_rows, int)
+            or self.physical_recv_pool_rows <= 0
         ):
             raise ValueError(
-                "max_recv_size_per_rank must be a positive integer or None"
+                "physical_recv_pool_rows must be a positive integer or None"
             )
         if (
-            self.max_recv_size_per_rank is not None
-            and self.max_recv_size_per_rank % 128
+            self.physical_recv_pool_rows is not None
+            and self.physical_recv_pool_rows % _PHYSICAL_RECV_POOL_ALIGNMENT
         ):
             raise ValueError(
-                "max_recv_size_per_rank must satisfy P % 128 == 0, "
-                f"got P={self.max_recv_size_per_rank}"
+                "physical_recv_pool_rows must satisfy P % 128 == 0, "
+                f"got P={self.physical_recv_pool_rows}"
+            )
+        if (
+            self.physical_recv_pool_rows is not None
+            and self.physical_recv_pool_rows > _MAX_KERNEL_ROUTE_INDEX
+        ):
+            raise ValueError(
+                "physical_recv_pool_rows exceeds the kernel Int32 route-index "
+                f"limit ({_MAX_KERNEL_ROUTE_INDEX}), got "
+                f"{self.physical_recv_pool_rows}"
             )
         if not isinstance(self.drop_on_overflow, bool):
             raise ValueError("drop_on_overflow must be a bool")
@@ -244,12 +256,194 @@ class _ResolvedMoeEpTopology:
     experts_per_rank: int
 
 
+def _required_padded_rows(
+    logical_route_capacity: int,
+    *,
+    experts_per_rank: int,
+    padding_block: int,
+) -> int:
+    """Mirror the upstream deterministic-router padding formula."""
+
+    active_expert_count = min(experts_per_rank, logical_route_capacity)
+    padded_block_count = (
+        active_expert_count
+        + (logical_route_capacity - active_expert_count) // padding_block
+    )
+    return padded_block_count * padding_block
+
+
+def _max_safe_logical_route_capacity(
+    physical_rows: int,
+    *,
+    raw_route_count: int,
+    experts_per_rank: int,
+    padding_block: int,
+) -> int:
+    """Return the largest topology-valid L whose padded rows fit in P."""
+
+    lower = 0
+    upper = raw_route_count
+    while lower < upper:
+        candidate = (lower + upper + 1) // 2
+        required_rows = _required_padded_rows(
+            candidate,
+            experts_per_rank=experts_per_rank,
+            padding_block=padding_block,
+        )
+        if required_rows <= physical_rows:
+            lower = candidate
+        else:
+            upper = candidate - 1
+    if lower <= 0:
+        raise ValueError(
+            "physical_recv_pool_rows cannot hold any positive logical route "
+            f"capacity with padding_block={padding_block}: P={physical_rows}"
+        )
+    return lower
+
+
+@dataclass(frozen=True)
+class _ResolvedMoeEpReceiveCapacity:
+    """Static exact-P contract plus operation-scoped logical capacities."""
+
+    raw_route_count: int
+    physical_recv_pool_rows: int
+    training_logical_route_capacity: int
+    inference_logical_route_capacity: int
+    training_required_padded_rows: int
+    inference_required_padded_rows: int
+    training_sf_pool_rows: int
+    inference_sf_pool_rows: int
+
+
+def _resolve_receive_capacity(
+    config: MoeEpConfig,
+    topology: _ResolvedMoeEpTopology,
+) -> _ResolvedMoeEpReceiveCapacity:
+    parallel = config.parallel
+    max_tokens_per_rank = parallel.max_tokens_per_rank
+    if max_tokens_per_rank is None or max_tokens_per_rank <= 0:
+        raise ValueError(
+            "resolving receive capacity requires a positive " "max_tokens_per_rank"
+        )
+
+    raw_route_count = topology.ep_size * max_tokens_per_rank * config.model.top_k
+    if raw_route_count > _MAX_KERNEL_ROUTE_INDEX:
+        raise ValueError(
+            "raw route count exceeds the kernel Int32 route-index limit: "
+            f"R={raw_route_count}, limit={_MAX_KERNEL_ROUTE_INDEX}"
+        )
+
+    training_padding = _PHYSICAL_RECV_POOL_ALIGNMENT
+    inference_padding = parallel.token_padding_size
+    if parallel.physical_recv_pool_rows is None:
+        canonical_rows = max(
+            _required_padded_rows(
+                raw_route_count,
+                experts_per_rank=topology.experts_per_rank,
+                padding_block=training_padding,
+            ),
+            _required_padded_rows(
+                raw_route_count,
+                experts_per_rank=topology.experts_per_rank,
+                padding_block=inference_padding,
+            ),
+        )
+        physical_rows = (
+            (canonical_rows + _PHYSICAL_RECV_POOL_ALIGNMENT - 1)
+            // _PHYSICAL_RECV_POOL_ALIGNMENT
+            * _PHYSICAL_RECV_POOL_ALIGNMENT
+        )
+    else:
+        physical_rows = parallel.physical_recv_pool_rows
+    if physical_rows > _MAX_KERNEL_ROUTE_INDEX:
+        raise ValueError(
+            "resolved physical receive pool exceeds the kernel Int32 "
+            f"route-index limit: P={physical_rows}"
+        )
+
+    training_logical = _max_safe_logical_route_capacity(
+        physical_rows,
+        raw_route_count=raw_route_count,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=training_padding,
+    )
+    inference_logical = _max_safe_logical_route_capacity(
+        physical_rows,
+        raw_route_count=raw_route_count,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=inference_padding,
+    )
+    training_required = _required_padded_rows(
+        training_logical,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=training_padding,
+    )
+    inference_required = _required_padded_rows(
+        inference_logical,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=inference_padding,
+    )
+
+    if config.training_backward_tuning.dgrad_optimization == "ds3_ep4_v1":
+        required_for_all_routes = _required_padded_rows(
+            raw_route_count,
+            experts_per_rank=topology.experts_per_rank,
+            padding_block=training_padding,
+        )
+        if physical_rows < required_for_all_routes:
+            raise ValueError(
+                "dgrad_optimization='ds3_ep4_v1' requires "
+                "physical_recv_pool_rows >= the padded full-topology "
+                f"capacity ({required_for_all_routes}), got {physical_rows}"
+            )
+        training_logical = raw_route_count
+        training_required = required_for_all_routes
+
+    training_sf_required = _required_padded_rows(
+        training_logical,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=_PHYSICAL_RECV_POOL_ALIGNMENT,
+    )
+    inference_sf_required = _required_padded_rows(
+        inference_logical,
+        experts_per_rank=topology.experts_per_rank,
+        padding_block=parallel.sf_padding_size,
+    )
+    training_sf_rows = max(physical_rows, training_sf_required)
+    inference_sf_rows = max(physical_rows, inference_sf_required)
+    if max(training_sf_rows, inference_sf_rows) > _MAX_KERNEL_ROUTE_INDEX:
+        raise ValueError(
+            "resolved scale-factor row capacity exceeds the kernel Int32 "
+            "route-index limit: "
+            f"training={training_sf_rows}, inference={inference_sf_rows}"
+        )
+    return _ResolvedMoeEpReceiveCapacity(
+        raw_route_count=raw_route_count,
+        physical_recv_pool_rows=physical_rows,
+        training_logical_route_capacity=training_logical,
+        inference_logical_route_capacity=inference_logical,
+        training_required_padded_rows=training_required,
+        inference_required_padded_rows=inference_required,
+        training_sf_pool_rows=training_sf_rows,
+        inference_sf_pool_rows=inference_sf_rows,
+    )
+
+
 @dataclass(frozen=True)
 class ResolvedMoeEpConfig:
     """Private operator contract after EP topology resolution."""
 
     public_config: MoeEpConfig
     topology: _ResolvedMoeEpTopology
+    receive_capacity: _ResolvedMoeEpReceiveCapacity = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "receive_capacity",
+            _resolve_receive_capacity(self.public_config, self.topology),
+        )
 
 
 def resolve_moe_ep_config(config: MoeEpConfig) -> ResolvedMoeEpConfig:

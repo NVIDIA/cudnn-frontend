@@ -86,13 +86,9 @@ def _dgrad_selector_kwargs(
     """Map the public MoeEP profile to upstream selector flags."""
 
     return {
-        "enable_dgrad_optimizations": (
-            config.dgrad_optimization == "ds3_ep4_v1"
-        ),
+        "enable_dgrad_optimizations": (config.dgrad_optimization == "ds3_ep4_v1"),
         "dgrad_schedule": (
-            "optimized"
-            if config.dgrad_optimization == "rolling"
-            else None
+            "optimized" if config.dgrad_optimization == "rolling" else None
         ),
     }
 
@@ -166,6 +162,7 @@ def prepare_backward_kernel(
         num_topk=config.top_k,
         max_tokens_per_rank=config.max_tokens_per_rank,
         max_recv_size_per_rank=config.max_recv_size_per_rank,
+        data_token_capacity=config.physical_recv_pool_size,
         hidden=config.hidden,
         launch_cluster_count=config.launch_cluster_count,
         drop_on_overflow=config.kernel_drop_on_overflow,
@@ -190,7 +187,9 @@ def prepare_backward_kernel(
     pool_capacity = int(kernel.pool_token_capacity)
     if pool_capacity != config.physical_recv_pool_size:
         raise RuntimeError(
-            "Rubin logical receive limit did not reproduce the prescribed " f"physical pool: {pool_capacity} != " f"{config.physical_recv_pool_size}"
+            "Rubin data_token_capacity did not preserve the prescribed "
+            f"physical pool: {pool_capacity} != "
+            f"{config.physical_recv_pool_size}"
         )
     fc1_preact_shape = tuple(int(extent) for extent in kernel.get_fc1_preact_shape())
     expected_preact_shape = (
@@ -198,8 +197,14 @@ def prepare_backward_kernel(
         2 * config.intermediate,
     )
     if fc1_preact_shape != expected_preact_shape:
-        raise RuntimeError("Rubin dGLU fc1_preact shape mismatch: " f"{fc1_preact_shape} != {expected_preact_shape}")
-    aux_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in kernel.get_aux_output_shapes().items()}
+        raise RuntimeError(
+            "Rubin dGLU fc1_preact shape mismatch: "
+            f"{fc1_preact_shape} != {expected_preact_shape}"
+        )
+    aux_shapes = {
+        name: tuple(int(extent) for extent in shape)
+        for name, shape in kernel.get_aux_output_shapes().items()
+    }
     dprob_bytes = math.prod(aux_shapes["dprob"]) * torch.float32.itemsize
     aux_data_bytes = (
         max(
@@ -231,11 +236,15 @@ def prepare_backward_kernel(
         shared_bytes,
     )
     if pre_reduced_offset is None or pre_reduced_bytes_per_token <= 0:
-        raise RuntimeError("Rubin MXFP8 backward requires standalone pre-reduced activation")
-    pre_reduced_sf_offset, pre_reduced_sf_bytes_per_token = _pre_reduced_sf_workspace_metadata(
-        device_workspace,
-        config,
-        shared_bytes,
+        raise RuntimeError(
+            "Rubin MXFP8 backward requires standalone pre-reduced activation"
+        )
+    pre_reduced_sf_offset, pre_reduced_sf_bytes_per_token = (
+        _pre_reduced_sf_workspace_metadata(
+            device_workspace,
+            config,
+            shared_bytes,
+        )
     )
     return PreparedMxfp8BackwardKernel(
         config=config,
@@ -258,8 +267,13 @@ def prepare_backward_kernel(
 
 
 def _layout_signature(inputs: Mxfp8BackwardLaunchInputs) -> tuple:
-    tensors = tuple(value for value in inputs.__dict__.values() if isinstance(value, torch.Tensor))
-    return tuple((tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in tensors)
+    tensors = tuple(
+        value for value in inputs.__dict__.values() if isinstance(value, torch.Tensor)
+    )
+    return tuple(
+        (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+        for tensor in tensors
+    )
 
 
 def build_backward_runtime_kwargs(
@@ -333,7 +347,9 @@ def build_backward_runtime_kwargs(
         ),
         "local_workspace": _to_cute_ptr(inputs.local_workspace),
         "shared_workspace": _to_cute_ptr(inputs.shared_workspace),
-        "peer_rank_ptr_mapper_host": (resources.workspace.peer_mapping.to_sym_buffer_host()),
+        "peer_rank_ptr_mapper_host": (
+            resources.workspace.peer_mapping.to_sym_buffer_host()
+        ),
         "stream": cuda.CUstream(stream.cuda_stream),
     }
 
