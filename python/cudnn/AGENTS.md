@@ -480,6 +480,20 @@ state ownership (`indexer_backward_v2_sm100`; detector
 poisons the workspace with 0xFF before each execute). The same rule zeroes an
 absent optional state port (the Hopper KDA seed) on every execute, so capture
 records a memset node that replays.
+Plan-time scalar constants a kernel reads from memory (FP8 `alpha` / `scale` /
+`descale`) are R4 too: declare ONE slot LAST in the workspace layout
+(`gated_attention_block/api.py` `_Intermediates.quant`, `_QUANT_WORDS` order,
+`_align_up(4 * n)`), fill each present word at execute with
+`fill_word_async(ws.data_ptr() + off + 4*i, 1, init_word("fp32", v), stream)`
+before the first stage that reads it, and hand kernels
+`_view(ws, off, (n,), float32)[i:i+1]` slices (a `[0:4]` slice serves a kernel
+that takes a short vector). Never `torch.tensor(...)` / `torch.full(...,
+device=)` at `compile()` — the plan-owned tensor is the #1151 class — and never a
+per-execute host list. Detectors:
+`test_block_fp8.py::test_fill_quant_slot_writes_the_nine_words_on_the_given_stream`
+(0xFF-poisoned workspace, side stream, sync-debug armed, allocation delta 0,
+nothing outside the slot written), `::test_quant_slot_is_the_last_workspace_slot`,
+`test_block_mxfp8.py::test_mxfp8_quant_slot_holds_only_the_out_projection_pair`.
 
 **R5 — the input is not in the layout/dtype the kernel takes.** Decline in
 `check_support()` with a `NotImplementedError` naming the tensor and its
@@ -545,6 +559,19 @@ layers: the per-device cached handle re-streamed to torch's current stream
 before every call (`linear_attention/ops/common.py::get_handle`,
 `ops/norm/_common.py`). Never `cudnn.create_handle()` inside a plan, engine or
 C++ graph object.
+A torch-facing block that drives a backend `pygraph` keeps ONE process-lifetime
+handle per device (`gated_attention_block/kernels/proj_gemm.py::graph_handle`:
+`with torch.cuda.device(idx): cudnn.create_handle()`, memoised by device index,
+never destroyed), obtains it at `compile()` so `cudnnCreate` never runs inside a
+captured execute, and re-streams it with `cudnn.set_stream(handle, stream)`
+immediately before every `graph.execute(vp, ws, handle)` (`cudnnSetStream` is
+host-only handle state, capture-legal; `_pygraph.execute` reads the stream off
+the handle). Never one handle per (device, stream) created lazily at execute.
+Re-streaming is single-threaded: concurrent threads on one device pass their own
+`handle=`. Detector:
+`test_block_end_to_end.py::test_graph_route_handle_is_per_device_and_restreamed`
+(monkeypatch `cudnn.create_handle` to fail, execute on two streams, same handle,
+stream follows).
 
 **R8 — you own a CUDA resource whose release can be GC-timed (only tests and
 the C++ PyGraph may).** Release inside `cuThreadExchangeStreamCaptureMode(RELAXED)`
@@ -578,6 +605,11 @@ shows up there
 and over the output-dtype axis: an fp32 output that needs 0 bytes must run with
 `workspace=None`, a bf16 one must raise `requires a \d+-byte workspace` before
 any in-place stage mutates anything (`test_DSA_indexer_backward.py`).
+A multi-stage block runs the allocation assertion around BUILD as well
+(`compile_allocates_nothing` covers every sub-engine's compile) and proves the
+"first execute of a shape inside `torch.cuda.graph`, replay bit-identical" claim
+directly (`test_block_fp8.py::test_execute_allocates_nothing_and_never_synchronizes`,
+`::test_first_execute_inside_capture`, `::test_quant_slot_is_filled_on_launch_stream_and_matches_spec`).
 
 **R10 — a launch envelope the caller already knows (max sequence length, packed
 total, batch count, top-k width).** It is a required host int at plan time (an
