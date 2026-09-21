@@ -87,12 +87,17 @@ explicitly; `scaling_seqlen=None` then uses the supplied `max_seqlen_q` without
 inspecting `cu_seqlens_q` on the host.
 
 Each tensor's strides must not map multiple logical elements to the same address,
-and its base pointer must be 16-byte aligned. The wrapper can adapt some otherwise
-non-contiguous packed views, but naturally aligned THD tensors with a contiguous
-last dimension avoid an internal layout copy. Paged-KV storage itself must be
-contiguous. The API does not compare storage spans across distinct tensors;
-callers must ensure that output writes do not overwrite live inputs or the same
-logical output element.
+and its base pointer must be 16-byte aligned. The kernels read and write the
+packed tensors in place, so `check_support()` either serves a layout natively or
+declines it with `NotImplementedError` naming the tensor and its strides; nothing
+is copied or repacked. `q`, `k`, `v`, and `do` need a unit-stride head dimension
+and token/head strides that are multiples of 8 elements (packed QKV views such as
+`qkv[:, 0]` qualify); `dq`, `dk`, and `dv` additionally need non-zero token/head
+strides. The head-dimension-256 backward moves every operand through TMA and
+requires all seven of `q`, `k`, `v`, `do`, `dq`, `dk`, and `dv` to be contiguous.
+`out` must be contiguous, and paged-KV storage itself must be contiguous. The API
+does not compare storage spans across distinct tensors; callers must ensure that
+output writes do not overwrite live inputs or the same logical output element.
 
 ## High-level functions
 
@@ -153,9 +158,8 @@ kernel; subsequent calls reuse the in-process compile cache. Execution follows
 the current PyTorch CUDA stream through TVM FFI.
 
 Head dimension 256 backward uses dedicated two-CTA kernels, launching the dQ
-kernel before the dK/dV kernel. Inputs with non-compact strides are materialized
-into compact temporary buffers for this path, and preallocated gradient views
-are copied back without changing the public tensor-layout contract.
+kernel before the dK/dV kernel; it accepts only contiguous operands (see
+[Tensor layout](#tensor-layout)).
 
 ## Class APIs
 
@@ -167,11 +171,23 @@ preallocated outputs:
    mask configuration.
 2. Call `check_support()` to validate dtype, shape, layout, architecture, and
    feature combinations.
-3. Call `compile()` before a latency-sensitive region or CUDA Graph capture.
-4. Call `execute()` with runtime tensors that match the compiled descriptors.
+3. Call `scratch_workspace_bytes()` and allocate that many bytes as a contiguous
+   `torch.uint8` CUDA tensor on `q`'s device (16-byte aligned). The size is
+   fixed per instance: the fused D32/D64/D128 backward needs its FP32 dQ
+   accumulator (`4 * H * (T_q + pad) * D` bytes, `pad = B * 128` on the 2-CTA
+   D128 schedule), and every `func_tensor` configuration adds the block
+   metadata for the batch. Zero means `workspace` may stay `None`.
+4. Call `compile()` before a latency-sensitive region or CUDA Graph capture.
+   `compile()` allocates no device memory.
+5. Call `execute(..., workspace=...)` with runtime tensors that match the
+   compiled descriptors. `execute()` carves all of its scratch from `workspace`
+   and never allocates, so the first execute of a shape may run inside a CUDA
+   Graph capture; a missing or undersized workspace raises `ValueError` naming
+   the required size. Executions that share one workspace buffer must not
+   overlap on different streams.
 
 The allocating functions above are the recommended entry point for common
-usage.
+usage; they allocate the workspace once per call on the caller's stream.
 
 ## Mask support
 
