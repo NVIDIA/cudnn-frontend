@@ -129,3 +129,12 @@ ordered after that read.**
   accepting an arbitrary declared D stride, or explicitly require D-contiguous
   storage. Test padding canaries as well as numerical output; the detector is
   `test_pointer_combine_strided_outputs_and_dead_splits`.
+
+## Heuristic geometry regressions
+
+When changing tile, packing, CGA or split candidates, spy on the chooser's
+inputs for both split and unsplit legs: physical CTA count can differ from
+public MMA width, and masked KV work depends on the candidate Q span and tile
+alignment. Compare masked bounds with an independent visible-key oracle and
+verify every alternative is rescored, deduplicated and within the candidate
+cap. An exact winning-rank golden alone does not detect stale model inputs.
