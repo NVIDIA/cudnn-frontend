@@ -398,15 +398,16 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
     graph.check_support()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
     if torch.cuda.get_device_capability() == (10, 7) and s_q == 1:
-        # On sm_107 the backend fails to NVRTC-compile the unified decode kernel that writes Stats
-        # (CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED at build_plans) with cuDNN 9.26 GA, 9.27 and the
-        # 9.28 nightlies alike; the s_q == 2 control builds. A backend that builds it is an XPASS that
-        # asks us to retire this marker.
+        # NVBug 6813175: the native decode codegen does not reduce the Q tile for ragged s_q == 1 graphs
+        # and emits a TMEM Stats round-trip wider than the ISA allows, so build_plans fails NVRTC
+        # (cuDNN 9.26 GA through the 9.28 nightlies; the s_q == 2 control builds). The plan is also
+        # broken on SM100, but only the Rubin heuristic ranks it first. A backend that builds it is an
+        # XPASS that asks us to retire this marker.
         request.node.add_marker(
             pytest.mark.xfail(
                 strict=True,
                 raises=cudnn.cudnnGraphNotSupportedError,
-                reason="sm_107: the unified decode kernel with Stats (ragged or padded) fails NVRTC compilation (cuDNN 9.26-9.28)",
+                reason="Rubin ranks the native ragged-decode plan first and it fails NVRTC (NVBug 6813175, cuDNN 9.26-9.28)",
             )
         )
     graph.build_plans()
