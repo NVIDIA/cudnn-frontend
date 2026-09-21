@@ -299,6 +299,62 @@ DSL satisfies your kernel.**
   same way on a since-dropped 4.5.x lane, reported as "install optional
   dependencies".
 
+**Rule 8 — the graph API owns no device memory and never blocks the host: at
+build AND at execute.**
+
+Rules 1 and 3 say this for `execute()` in torch vocabulary. This rule closes
+the two gaps that produced the #1151 sm103 red: plan build, and the driver-API
+spellings the torch vocabulary does not name.
+
+- **No plan- or engine-owned device allocation, ever.** Not `cuMemAlloc` /
+  `cudaMalloc`, not `torch.empty` / `torch.zeros`, not `frost.buffers.DeviceBuffer`,
+  at build or at execute, cached or not. Execute scratch — per-batch metadata,
+  on-device TMA descriptors, an output the kernel always writes but the graph
+  did not request — is carved from the caller's workspace and declared through
+  `get_workspace_size()` (`prepared.py`: `meta_ptr = workspace_ptr`,
+  `o_desc_ptr = workspace_ptr + off_o_desc`). A path with no workspace contract
+  (the direct `jit_from_cudnn_graph` MoE call) gets one; it does not get an
+  allocation. Owned device memory has a GC-timed release, and a cyclic
+  collection inside someone else's `torch.cuda.graph` window turned three
+  per-plan dummies into `cuMemFree -> 900` and an invalidated capture (#1151 on
+  sm103). #1152's relaxed-mode guard on the two remaining finalizers is defence
+  in depth, not a licence.
+- **A dead ABI slot is compiled out, or bound to `0`, or borrowed — never
+  allocated.** Prefer `cutlass.const_expr` on `None` so the operand does not
+  exist. Otherwise `0` is a legitimate address for a slot the kernel never
+  dereferences: `cuTensorMapEncodeTiled` accepts a NULL global address (only
+  misalignment is rejected), the DSL rejects only negative pointer addresses
+  and ships `cute.runtime.nullptr`, and the tvm-ffi positional entry carries
+  `cute.Pointer` parameters as plain integers — 12 prepared THD launches with
+  `sinks_ptr = 0` pass bit-exact. A dead slot that turns out to be live then
+  faults loudly instead of reading garbage. Borrowing an aligned address the
+  contract already guarantees (`sinks_ptr = q.ptr` when `HAS_SINK` is off,
+  descriptor-only THD rows aliasing live Q/O storage) is the other acceptable
+  form. A cached `torch.zeros` dummy is not: Rule 1's `_dummy` exemption is
+  grandfathered for `sdpa/fwd/api_dsl.py` and closed for new code.
+- **No host-blocking call, build or execute.** `cuStreamSynchronize`,
+  `cuCtxSynchronize`, `cudaDeviceSynchronize`, `cuEventSynchronize`, the
+  synchronous `cuMemcpy*` / `cuMemsetD*` forms, `torch.cuda.synchronize()`,
+  `.item()`. Build is lazy — it runs on the first execute of a shape, which in
+  a serving stack is inside a stream capture (a FlashInfer graph-cache miss) —
+  so build is held to the execute standard: uploads via `cuMemcpyHtoDAsync` on
+  the launch stream, fills via `cuMemsetD32Async`, constants baked into the
+  kernel image or written by a setup kernel. `cuMemAlloc` + `cuMemsetD32` +
+  `cuStreamSynchronize(0)` at build was the #1151 anti-pattern.
+- **An engine that cannot be async declines; it does not sync.** The CAKE KDA
+  route plans its work items on the host (`cuMemcpyDtoHAsync` +
+  `cuStreamSynchronize`) and therefore checks `cuStreamIsCapturing` and raises
+  under capture (`linear_attention/cake/compiler.py::check_not_capturing`).
+  That is the only legal shape of an exception: declared in the engine, loud,
+  never on a captured stream.
+- **Detectors.** `test_execute_allocates_nothing_and_never_synchronizes`
+  (`torch.cuda.set_sync_debug_mode("error")` plus allocator accounting around
+  a prepared execute) — run the same assertion around the BUILD;
+  `test_collect_unrelated_resources_during_capture` (GC inside a global-mode
+  capture window, then replay and a native cuDNN launch); and a capture test
+  whose first execute of a shape happens inside `torch.cuda.graph`, so the lazy
+  build runs under capture.
+
 
 ## Frontend-only kernel package layout
 
@@ -380,9 +436,4 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
 
-CUDA-owning objects can be reclaimed by cyclic GC inside an unrelated graph
-capture. Keep disabled ABI slots non-owning, and scope resource destruction so it
-does not invalidate that capture; merely collecting before a test is not a
-library fix. `test_collect_unrelated_resources_during_capture` forces collection
-inside a global-mode capture and checks both replay and subsequent native cuDNN
-execution, which also detects backend-handle destruction poisoning later plans.
+CUDA-owning objects, GC-timed release and stream capture: Rule 8.
