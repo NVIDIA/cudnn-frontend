@@ -292,20 +292,20 @@ class FlexAttentionFwd(APIBase):
             return
         dispatch = self._prepare(self._sample_q, self._sample_k, self._sample_v, self._sample_mask_plan)
         cu_q, cu_k, _, _ = _sequence_args(self._sample_mask_plan)
-        scheduler = torch.empty((1,), dtype=torch.int32, device=self._sample_q.device) if dispatch.arch == 90 else None
-        self._compiled_kernel = _compile_flex_attn_fwd(
-            dispatch,
-            self._sample_q,
-            self._sample_k,
-            self._sample_v,
-            self._sample_o,
-            self._sample_lse,
-            1.0 / math.sqrt(dispatch.head_dim),
-            cu_q,
-            cu_k,
-            scheduler,
-            max_logit=self._sample_max_logit,
-        )
+        # CuTe DSL compiles for the current CUDA device; the fake operands carry none, so pin the sample's device.
+        with torch.cuda.device(self.q_desc.device):
+            self._compiled_kernel = _compile_flex_attn_fwd(
+                dispatch,
+                self._sample_q,
+                self._sample_k,
+                self._sample_v,
+                self._sample_o,
+                self._sample_lse,
+                1.0 / math.sqrt(dispatch.head_dim),
+                cu_q,
+                cu_k,
+                max_logit=self._sample_max_logit,
+            )
         self._sample_q = self._sample_k = self._sample_v = None
         self._sample_o = self._sample_lse = self._sample_max_logit = self._sample_mask_plan = None
 
@@ -465,18 +465,19 @@ class FlexAttentionBwd(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        _, _, _, compiled = self._call_dispatch(
-            compile_only=True,
-            compile_outputs=(self._sample_dq, self._sample_dk, self._sample_dv),
-            q=self._sample_q,
-            k=self._sample_k,
-            v=self._sample_v,
-            o=self._sample_o,
-            do=self._sample_do,
-            lse=self._sample_lse,
-            dlse=self._sample_dlse,
-            mask_plan=self._sample_mask_plan,
-        )
+        with torch.cuda.device(self.q_desc.device):
+            _, _, _, compiled = self._call_dispatch(
+                compile_only=True,
+                compile_outputs=(self._sample_dq, self._sample_dk, self._sample_dv),
+                q=self._sample_q,
+                k=self._sample_k,
+                v=self._sample_v,
+                o=self._sample_o,
+                do=self._sample_do,
+                lse=self._sample_lse,
+                dlse=self._sample_dlse,
+                mask_plan=self._sample_mask_plan,
+            )
         self._compiled_kernel = compiled
         self.workspace_size = _workspace_bytes(compiled.workspace_specs)
         for name in ("q", "k", "v", "o", "do", "lse", "dq", "dk", "dv", "dlse"):
