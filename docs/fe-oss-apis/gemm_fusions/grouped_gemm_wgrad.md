@@ -15,7 +15,7 @@ pip install nvidia-cudnn-frontend
 
 Supports **JAX arrays** on the BF16 backend: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The block-scaled backend's layouts are not expressible as JAX arrays and raise a clear error. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). Under tracing the per-group offsets *values* cannot be host-validated; the external buffers must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). The per-group offsets values follow the device-data contract in the BF16 section; the external buffers must stay alive and unmoved across every execution of the traced computation.
 
 ## Operation
 
@@ -48,6 +48,16 @@ The BF16 backend accepts:
 (`offsets[e] - offsets[e - 1]`) must be a multiple of 256, and the final offset
 must equal `tokens_sum`. Inputs, metadata, and outputs must reside on the same
 CUDA device and satisfy the API's alignment checks.
+
+`offsets_tensor` values and `wgrad_ptrs` entries are a **device-data contract**: the kernel
+reads them on device, and neither `check_support()` nor `execute()` copies them to
+the host (a blocking read would serialize the launch stream and is illegal under
+CUDA-graph capture). Malformed values (a decreasing offset, a group that is not a
+multiple of 256, a last offset other than `tokens_sum`, a null or misaligned pointer) are
+undefined behaviour, as for any raw-pointer interface. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`; that mode raises
+`RuntimeError` when the launch stream is capturing instead of syncing.
 
 BF16 uses FP32 accumulation and requires `sf_vec_size=16`. Pass `None` for
 `sfa_tensor`, `sfb_tensor`, `global_scale_a`, and `global_scale_b`. BF16 rejects
@@ -229,8 +239,10 @@ and B while retaining static dimensions, layouts, dtypes, output descriptors,
 tiling, cluster shape, input order, and accumulation mode in its key. A changed
 static contract creates a different cached operator or fails validation.
 
-The APIs reject unsupported dtypes or layouts, malformed/unaligned offsets or
-pointers, mixed devices, forbidden BF16 scale controls, unsupported tiling, use
-before `compile()`, unavailable CUDA, and devices below SM100. Support and
-validation errors are reported as `ValueError` or `RuntimeError`; callers should
-not rely on this experimental API remaining source-compatible across releases.
+The APIs reject unsupported dtypes or layouts, mis-shaped or misaligned offset
+and pointer tensors, mixed devices, forbidden BF16 scale controls, unsupported
+tiling, use before `compile()`, unavailable CUDA, and devices below SM100. Offset
+and pointer *values* are the device-data contract above and are not host-checked.
+Support and validation errors are reported as `ValueError` or `RuntimeError`;
+callers should not rely on this experimental API remaining source-compatible
+across releases.

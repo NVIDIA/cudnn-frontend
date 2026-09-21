@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import weakref
 from typing import Literal, Optional, Tuple, Union
 
 import cutlass
@@ -17,7 +16,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -30,12 +29,10 @@ from cudnn.tensor_adapter import (
     get_device,
     get_shape,
     get_strides,
-    get_version,
     is_torch_tensor,
-    to_host_list,
 )
 
-from ..backend_utils import _torch_stream_context
+from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 
@@ -120,11 +117,6 @@ class GroupedGemmWgradBf16API(APIBase):
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
         self._live_wgrad_ptrs = None
-        self._validated_offsets: dict[int, tuple] = {}
-        self._validated_pointer_values: dict[int, tuple] = {}
-        self._sample_offset_values = self._copy_values_to_host(sample_offsets)
-        self._sample_offsets_ref = weakref.ref(sample_offsets)
-        self._sample_offsets_version = get_version(sample_offsets)
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -139,58 +131,6 @@ class GroupedGemmWgradBf16API(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self.a_major: Optional[str] = None
         self.b_major: Optional[str] = None
-
-    @staticmethod
-    def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in to_host_list(tensor))
-
-    @staticmethod
-    def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
-        cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
-
-    @staticmethod
-    def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
-        key = id(tensor)
-
-        def discard(_reference, *, cache=cache, key=key):
-            cache.pop(key, None)
-
-        cache[key] = (weakref.ref(tensor, discard), get_version(tensor), extra)
-
-    @staticmethod
-    def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tokens_sum: int) -> Tuple[int, ...]:
-        if len(values) != expert_cnt:
-            raise ValueError(f"sample_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
-        groups = []
-        previous = 0
-        for index, value in enumerate(values):
-            if value < previous:
-                raise ValueError("sample_offsets must be a non-decreasing cumulative sum; " f"index {index} is {value} after {previous}")
-            group_k = value - previous
-            if group_k % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
-                raise ValueError(f"sample_offsets group {index} must be 256-aligned, got {group_k}")
-            groups.append(group_k)
-            previous = value
-        if not values or values[-1] != tokens_sum:
-            raise ValueError(f"sample_offsets last value must equal total tokens {tokens_sum}, " f"got {values[-1] if values else None}")
-        return tuple(groups)
-
-    def _validate_offsets_once(self, offsets: torch.Tensor, *, tokens_sum: int) -> None:
-        extra = (self.expert_cnt, tokens_sum)
-        if self._is_validation_cached(self._validated_offsets, offsets, extra):
-            return
-        values = self._copy_values_to_host(offsets)
-        self._validate_offset_sequence(values, expert_cnt=self.expert_cnt, tokens_sum=tokens_sum)
-        self._remember_validation(self._validated_offsets, offsets, extra)
-
-    def _validate_pointer_values_once(self, pointers: torch.Tensor) -> None:
-        if self._is_validation_cached(self._validated_pointer_values, pointers, self.expert_cnt):
-            return
-        values = _pointer_values(pointers)
-        if any(value == 0 or value % 16 != 0 for value in values):
-            raise ValueError("wgrad_ptrs entries must be non-null and 16-byte aligned")
-        self._remember_validation(self._validated_pointer_values, pointers, self.expert_cnt)
 
     @staticmethod
     def _validate_pointer_array_alignment(tensor: torch.Tensor) -> None:
@@ -297,21 +237,8 @@ class GroupedGemmWgradBf16API(APIBase):
             if pointer % alignment:
                 raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
 
-        groups = self._validate_offset_sequence(
-            self._sample_offset_values,
-            expert_cnt=self.expert_cnt,
-            tokens_sum=tokens_sum,
-        )
-        sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
-            self._remember_validation(
-                self._validated_offsets,
-                sample_offsets,
-                (self.expert_cnt, tokens_sum),
-            )
-        elif sample_offsets is not None:
-            self._validate_offsets_once(sample_offsets, tokens_sum=tokens_sum)
-
+        # Per-group token counts live on device (a device-data contract); can_implement
+        # checks every rule that does not depend on the split from the packed total alone.
         if not self._kernel.can_implement(
             cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.wgrad_dtype),
@@ -321,12 +248,13 @@ class GroupedGemmWgradBf16API(APIBase):
             self.cluster_shape_mn,
             m,
             n,
-            list(groups),
+            None,
             self.expert_cnt,
             self.a_major,
             self.b_major,
             self.weight_mode,
             self.input_order,
+            tokens_sum=tokens_sum,
         ):
             raise ValueError("Unsupported BF16 grouped GEMM wgrad configuration: check mma_tiler, cluster, and alignment")
         if not cuda_is_available():
@@ -524,9 +452,15 @@ class GroupedGemmWgradBf16API(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        """Launch on ``current_stream`` (torch: the caller's current stream; JAX: the legacy default stream).
+
+        ``offsets_tensor`` values (non-decreasing cumulative ends, every group a multiple of 256,
+        last ``== tokens_sum``) and ``wgrad_ptrs`` entries (non-null, 16-byte aligned) are a
+        device-data contract: the kernel reads them on device and this method never copies them
+        to the host. Set ``CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1`` for blocking debug
+        checks; that mode raises ``RuntimeError`` under CUDA-graph capture instead of syncing.
+        """
         if current_stream is None:
-            # torch inputs stay ordered with the caller's current torch stream;
-            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
             current_stream = default_stream(detect_framework(a_tensor))
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -549,7 +483,7 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError("offsets_tensor must be a contiguous rank-1 int32 tensor with one entry per expert")
         if offsets_desc.device != self.a_desc.device:
             raise ValueError(f"offsets_tensor device mismatch: expected {self.a_desc.device}, got {offsets_desc.device}")
-        self._validate_offsets_once(offsets_tensor, tokens_sum=tokens_sum)
+        debug_validate_offsets(offsets_tensor, expert_cnt=self.expert_cnt, limit=tokens_sum, mode="wgrad", stream=current_stream, name="offsets_tensor")
         self._validate_data_alignment(a_tensor, "a_tensor")
         self._validate_data_alignment(b_tensor, "b_tensor")
         self._validate_data_alignment(offsets_tensor, "offsets_tensor", 4)
@@ -574,7 +508,7 @@ class GroupedGemmWgradBf16API(APIBase):
                 raise ValueError(f"wgrad_ptrs must be on {self.a_desc.device}, got {get_device(wgrad_ptrs)}")
             self._validate_pointer_array_alignment(wgrad_ptrs)
             if not generated_wgrad_ptrs:
-                self._validate_pointer_values_once(wgrad_ptrs)
+                debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
             self._record_pointer_stream(wgrad_ptrs, current_stream)
             output = wgrad_ptrs
         self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream)

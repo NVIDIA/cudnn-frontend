@@ -141,6 +141,11 @@ none is precedent:
   the graph's envelope `S_max` and turns the per-batch lengths into
   `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
   violation on the wrapper surface (a caller contract, documented there).
+- wgrad discrete `execute()` called with `wgrad_tensor` but no `wgrad_ptrs`
+  builds the per-expert pointer table with `torch.tensor(values, device=...)`
+  per call (`gemm/cutedsl/grouped/wgrad/_bf16_api.py::_generate_wgrad_ptrs`,
+  pageable H2D + implicit sync). Pass `wgrad_ptrs` to avoid it; the follow-up
+  PR moves the derivation to the wrapper layer (R4) and requires the table.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -425,6 +430,12 @@ of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
 raise before doing it (`linear_attention/cake/compiler.py::check_not_capturing`),
 and say so in its docstring. Never a silent `cuStreamSynchronize` /
 `torch.cuda.synchronize()` / `.item()` on a build or execute path.
+A host check of device VALUES (an offsets table, a pointer array) never earns a
+sync: the default path trusts the documented device-data contract, and the
+check lives behind one env var read once at import, runs `cuStreamIsCapturing`
+FIRST and raises under capture, and is never memoized
+(`gemm/cutedsl/grouped/backend_utils.py::debug_validate_offsets`,
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES`).
 
 **R7 — you need a cuDNN handle and the caller gave none.** Graph API lowering:
 `_pygraph._backend_handle_for_lowering` (process default, one per thread and
@@ -448,7 +459,10 @@ executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_
 capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
 window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
-(`test_torch_stream.py`).
+(`test_torch_stream.py`). Feed the sync detector tensors the plan has never
+seen (a fresh `.clone()` of the offsets / pointer table per execute): an
+id-keyed validation memo hid a per-tensor D2H from every warm test
+(`fe_api/test_grouped_gemm_rule8.py::test_execute_never_synchronizes`).
 
 
 ## Frontend-only kernel package layout

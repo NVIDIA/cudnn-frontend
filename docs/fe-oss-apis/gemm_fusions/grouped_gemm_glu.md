@@ -6,7 +6,7 @@
 
 Supports **JAX arrays** on the BF16 backend in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense `b_tensor` (expert-outermost strides), column-major `bias_tensor`, and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
@@ -57,6 +57,16 @@ experts, BF16 uses:
 - optional bias: `(N, L)`, stride `(1, N)`, BF16/FP16/FP32;
 - `C`: `(M, N, 1)`, stride `(N, 1, M*N)`;
 - `D`: `(M, N/2, 1)`, stride `(N/2, 1, M*N/2)`.
+
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device, and neither `check_support()` nor `execute()` copies them to
+the host (a blocking read would serialize the launch stream and is illegal under
+CUDA-graph capture). Malformed values (a decreasing or unaligned offset, a last
+offset outside `(0, M]`, a null or misaligned pointer) are
+undefined behaviour, as for any raw-pointer interface. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`; that mode raises
+`RuntimeError` when the launch stream is capturing instead of syncing.
 
 For expert `g`, first compute
 

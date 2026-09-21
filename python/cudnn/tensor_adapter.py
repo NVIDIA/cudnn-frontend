@@ -189,20 +189,6 @@ def get_data_ptr(tensor: Any) -> int:
     raise ValueError(f"Cannot extract a device pointer from {type(tensor)!r}")
 
 
-def get_version(tensor: Any) -> int:
-    """Mutation counter for validation caching: torch's ._version, 0 for immutable arrays (JAX)."""
-    return int(getattr(tensor, "_version", 0))
-
-
-def to_host_list(tensor: Any) -> list:
-    """Copy a small device tensor to host and return its values as a flat Python list."""
-    if is_torch_tensor(tensor):
-        return tensor.detach().cpu().flatten().tolist()
-    import numpy as np
-
-    return np.asarray(tensor).flatten().tolist()
-
-
 def allocate_byte_workspace(framework: str, nbytes: int, device: Any) -> Any:
     """Allocate an internal uint8 workspace buffer in the caller's framework allocator.
 

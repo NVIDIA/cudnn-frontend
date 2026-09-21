@@ -112,7 +112,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             tokens_sum_a != tokens_sum_b,
             f"sample_a and sample_b token dimensions must match, got {tokens_sum_a} and {tokens_sum_b}",
         )
-        self._offset_values = self._validate_offsets(sample_offsets, tokens_sum_a, name="sample_offsets")
+        self._check_offsets_rank(self.offsets_desc, name="sample_offsets")
         self._scale_cols = _round_up(ceil_div(tokens_sum_a, self.sf_vec_size), 4)
 
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -156,27 +156,10 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
         self._workspace = None
 
-    def _validate_offsets(self, offsets_tensor: torch.Tensor, tokens_sum: int, name: str) -> Tuple[int, ...]:
-        self._value_error_if(offsets_tensor.ndim != 1, f"{name} must be rank-1, got shape {tuple(offsets_tensor.shape)}")
-
-        offset_values = tuple(int(offset) for offset in offsets_tensor.detach().cpu().tolist())
-        prev_offset = 0
-        for idx, offset in enumerate(offset_values):
-            self._value_error_if(
-                offset < prev_offset,
-                f"{name} must be a non-decreasing cumulative sum, but index {idx} has {offset} after {prev_offset}",
-            )
-            prev_offset = offset
-
-        if offset_values:
-            self._value_error_if(
-                offset_values[-1] > tokens_sum,
-                f"{name} last value must not exceed total tokens {tokens_sum}, got {offset_values[-1]}",
-            )
-        else:
-            self._value_error_if(tokens_sum != 0, f"{name} cannot be empty when total tokens is {tokens_sum}")
-
-        return offset_values
+    def _check_offsets_rank(self, offsets_desc: TensorDesc, name: str) -> None:
+        # Metadata only: the offset VALUES are a device-data contract read in-kernel
+        # (non-decreasing cumulative ends, last <= tokens_sum); no host copy at build.
+        self._value_error_if(offsets_desc.ndim != 1, f"{name} must be rank-1, got shape {offsets_desc.shape}")
 
     def _check_rubin_quantization_support(self) -> None:
         import torch
