@@ -476,6 +476,8 @@ def _uses_thd(cu_seqlens_q: Optional[torch.Tensor], cu_seqlens_k: Optional[torch
 
 
 def _max_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> int:
+    # Wrapper-surface convenience only (documented on the wrappers): one blocking
+    # D2H read per call. The classes take the envelope as plan-time host ints.
     if cu_seqlens.ndim != 1:
         raise ValueError(f"{name} must be a 1D cumulative sequence length tensor")
     if cu_seqlens.numel() <= 1:
@@ -504,8 +506,92 @@ def _dense_sample_shapes(
     return False, q.shape[1], k.shape[1], (q.shape[0], q.shape[1], k.shape[1]), (q.shape[0], q.shape[1])
 
 
+_SM90_THD_DECLINE = (
+    "{name}: THD (cu_seqlens_q/cu_seqlens_k) dense score recompute is not supported on SM90 -- the SM90 kernel is "
+    "BSHD-native and serving THD would need a host copy of cu_seqlens per call (Rule 3/8). "
+    "Use BSHD on SM90, or THD on SM100+."
+)
+
+
+def _dense_thd_plan_envelope(is_thd: bool, max_seqlen_q: Optional[int], max_seqlen_k: Optional[int], out_desc) -> tuple[Optional[int], Optional[int]]:
+    """Plan-time launch envelope as host ints; ``max_seqlen_k`` defaults to ``sample_out.shape[1]`` for THD."""
+    q_env = None if max_seqlen_q is None else int(max_seqlen_q)
+    k_env = None if max_seqlen_k is None else int(max_seqlen_k)
+    if is_thd and k_env is None and out_desc is not None and out_desc.ndim == 2:
+        k_env = int(out_desc.shape[1])
+    return q_env, k_env
+
+
+def _check_dense_thd_plan(api: APIBase) -> None:
+    """THD plan checks shared by the two dense score classes.
+
+    The envelope is a required host int, never read back from ``cu_seqlens``
+    (Rule 3/8). SM90 is declined: its kernel is BSHD-native and the former
+    adapter drove one launch per batch from a host copy of ``cu_seqlens``.
+    """
+    name = type(api).__name__
+    if not api.is_thd:
+        api._value_error_if(
+            api.max_seqlen_q is not None or api.max_seqlen_k is not None,
+            f"{name}: max_seqlen_q/max_seqlen_k are THD-only plan parameters; a BSHD plan takes its envelope from the sample shapes",
+        )
+        return
+    api._value_error_if(
+        api.max_seqlen_q is None,
+        f"{name}: THD dense score requires max_seqlen_q at plan time (the launch envelope); pass it to __init__ -- "
+        "it is not read back from cu_seqlens_q (Rule 3/8)",
+    )
+    out_k = int(api.out_desc.shape[1])
+    api._value_error_if(
+        api.max_seqlen_k != out_k,
+        f"{name}: max_seqlen_k ({api.max_seqlen_k}) must equal sample_out.shape[1] ({out_k})",
+    )
+    major, _ = torch.cuda.get_device_capability()
+    api._not_implemented_error_if(major == 9, _SM90_THD_DECLINE.format(name=name))
+
+
+def _dense_thd_execute_envelope(
+    api: APIBase,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Resolve the execute-time envelope from the plan; never from a device read."""
+    name = type(api).__name__
+    has_cu = cu_seqlens_q is not None or cu_seqlens_k is not None
+    api._value_error_if(has_cu and not api.is_thd, f"{name}: cu_seqlens_q/cu_seqlens_k passed to a plan built with is_thd=False")
+    if not api.is_thd:
+        return max_seqlen_q, max_seqlen_k
+    api._value_error_if(cu_seqlens_q is None or cu_seqlens_k is None, f"{name}: a THD plan requires both cu_seqlens_q and cu_seqlens_k at execute")
+    q_env = api.max_seqlen_q if max_seqlen_q is None else int(max_seqlen_q)
+    k_env = api.max_seqlen_k if max_seqlen_k is None else int(max_seqlen_k)
+    api._value_error_if(
+        q_env != api.max_seqlen_q or k_env != api.max_seqlen_k,
+        f"{name}: execute max_seqlen_q/max_seqlen_k ({q_env}, {k_env}) must match the plan's ({api.max_seqlen_q}, {api.max_seqlen_k}); "
+        "build a new plan for a different envelope",
+    )
+    return q_env, k_env
+
+
 class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
-    """Dense indexer score recompute over full KV."""
+    """Dense indexer score recompute over full KV.
+
+    ``S[b, q, t] = sm_scale * sum_h ReLU(Q_h . K_t^T) * W_h`` under the
+    ratio-causal mask; returns ``(out, denom)`` with ``denom = logsumexp(S)``.
+
+    Layouts: BSHD (``is_thd=False``) on SM90 and SM100+; THD packed
+    (``is_thd=True``, ``cu_seqlens_q``/``cu_seqlens_k`` at execute) on SM100+
+    only. SM90 declines THD in ``check_support()`` with ``NotImplementedError``:
+    its kernel is BSHD-native and serving THD would need a host copy of
+    ``cu_seqlens`` per call.
+
+    THD launch envelope: ``max_seqlen_q`` is required at ``__init__`` and
+    ``max_seqlen_k`` defaults to (and must equal) ``sample_out.shape[1]``.
+    Both are plan-time host ints; ``execute()`` never derives them from
+    ``cu_seqlens`` and rejects caller-passed values that differ from the
+    plan's. A BSHD plan rejects them.
+    """
 
     def __init__(
         self,
@@ -518,6 +604,8 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         sm_scale: float = 1.0,
         ratio: int = 1,
         is_thd: bool = False,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -529,6 +617,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         self.sm_scale = float(sm_scale)
         self.ratio = int(ratio)
         self.is_thd = bool(is_thd)
+        self.max_seqlen_q, self.max_seqlen_k = _dense_thd_plan_envelope(self.is_thd, max_seqlen_q, max_seqlen_k, self.out_desc)
 
     def check_support(self) -> bool:
         _check_score_arch(self)
@@ -549,6 +638,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
             self.is_thd,
             self.qhead_per_kv_head,
         )
+        _check_dense_thd_plan(self)
         self._is_supported = True
         return True
 
@@ -570,11 +660,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
     ):
         scale = self.sm_scale if sm_scale is None else float(sm_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
-        if cu_seqlens_q is not None:
-            if max_seqlen_q is None:
-                max_seqlen_q = _max_from_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
-            if max_seqlen_k is None:
-                max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
+        max_seqlen_q, max_seqlen_k = _dense_thd_execute_envelope(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -637,6 +723,15 @@ def dense_indexer_score_recompute_wrapper(
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    """High-level wrapper. Returns ``{'out': scores, 'denom': logsumexp}``.
+
+    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) is SM100+ only; SM90 raises
+    ``NotImplementedError``. Pass ``max_seqlen_q`` and ``max_seqlen_k``: when
+    either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
+    one blocking device-to-host read per call that is not CUDA-graph
+    capturable (a wrapper-surface convenience; the class requires both at
+    plan time). The memo key includes the resulting values.
+    """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
         k,
@@ -721,6 +816,8 @@ def dense_indexer_score_recompute_wrapper(
             sm_scale=sm_scale,
             ratio=ratio,
             is_thd=is_thd,
+            max_seqlen_q=max_q if is_thd else None,
+            max_seqlen_k=max_k if is_thd else None,
         )
         assert obj.check_support()
         obj.compile()
@@ -750,7 +847,24 @@ def dense_indexer_score_recompute_wrapper(
 
 
 class DenseAttnScoreRecompute(_ScoreRecomputeBase):
-    """Dense attention score recompute over full KV."""
+    """Dense attention score recompute over full KV.
+
+    ``P[b, q, h, t] = exp(Q_h . K_t^T * scale - LSE_h)``, ``out = sum_h P``
+    under the ratio-causal mask; returns ``(out, denom)`` with
+    ``denom = sum_t out`` (L1 norm).
+
+    Layouts: BSHD (``is_thd=False``) on SM90 and SM100+; THD packed
+    (``is_thd=True``, ``cu_seqlens_q``/``cu_seqlens_k`` at execute) on SM100+
+    only. SM90 declines THD in ``check_support()`` with ``NotImplementedError``:
+    its kernel is BSHD-native and serving THD would need a host copy of
+    ``cu_seqlens`` per call.
+
+    THD launch envelope: ``max_seqlen_q`` is required at ``__init__`` and
+    ``max_seqlen_k`` defaults to (and must equal) ``sample_out.shape[1]``.
+    Both are plan-time host ints; ``execute()`` never derives them from
+    ``cu_seqlens`` and rejects caller-passed values that differ from the
+    plan's. A BSHD plan rejects them.
+    """
 
     def __init__(
         self,
@@ -763,6 +877,8 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         qhead_per_kv_head: Optional[int] = None,
         ratio: int = 1,
         is_thd: bool = False,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -774,6 +890,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         self.qhead_per_kv_head = qhead_per_kv_head
         self.ratio = int(ratio)
         self.is_thd = bool(is_thd)
+        self.max_seqlen_q, self.max_seqlen_k = _dense_thd_plan_envelope(self.is_thd, max_seqlen_q, max_seqlen_k, self.out_desc)
 
     def check_support(self) -> bool:
         _check_score_arch(self)
@@ -794,6 +911,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
             self.is_thd,
             self.qhead_per_kv_head,
         )
+        _check_dense_thd_plan(self)
         self._is_supported = True
         return True
 
@@ -815,11 +933,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
     ):
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
-        if cu_seqlens_q is not None:
-            if max_seqlen_q is None:
-                max_seqlen_q = _max_from_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
-            if max_seqlen_k is None:
-                max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
+        max_seqlen_q, max_seqlen_k = _dense_thd_execute_envelope(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -882,6 +996,15 @@ def dense_attn_score_recompute_wrapper(
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    """High-level wrapper. Returns ``{'out': scores, 'denom': l1norm}``.
+
+    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) is SM100+ only; SM90 raises
+    ``NotImplementedError``. Pass ``max_seqlen_q`` and ``max_seqlen_k``: when
+    either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
+    one blocking device-to-host read per call that is not CUDA-graph
+    capturable (a wrapper-surface convenience; the class requires both at
+    plan time). The memo key includes the resulting values.
+    """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
         k,
@@ -966,6 +1089,8 @@ def dense_attn_score_recompute_wrapper(
             qhead_per_kv_head=qhead_per_kv_head,
             ratio=ratio,
             is_thd=is_thd,
+            max_seqlen_q=max_q if is_thd else None,
+            max_seqlen_k=max_k if is_thd else None,
         )
         assert obj.check_support()
         obj.compile()

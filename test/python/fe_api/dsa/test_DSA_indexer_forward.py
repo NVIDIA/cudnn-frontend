@@ -317,6 +317,8 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
         _require_sm90()
     elif torch.cuda.get_device_capability()[0] not in (9, 10):
         pytest.skip("Requires Hopper or Blackwell")
+    if recompute and torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("Dense score recompute declines THD on SM90 (BSHD-native kernel); see test_DSA_dense_score_recompute.py")
     device = torch.device("cuda")
     shapes = [(1, 1), (3, 7), (7, 67), (11, 70)]
     h_kv, d = 1, 128
