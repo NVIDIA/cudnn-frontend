@@ -412,6 +412,24 @@ wraps a cuDNN backend `pygraph` forwards `graph.get_workspace_size()` as
 `WorkspaceCarver(workspace, bytes, label)` (construct only, no `take`);
 `pygraph.execute(workspace=None)` lowers to a null pointer, so None is legal
 only when the size is 0 (`native_sparse_attention/sliding_window_attention`).
+A staged output the kernel accumulates in a wider dtype than the caller's buffer
+(a bf16 `d_index_k` behind an fp32 atomic epilogue) is R2 scratch, not an
+allocation: carve the wide view, zero it with R4 (skip when the kernel's own
+prologue clears it — one clear, in-kernel), launch, `copy_` into the caller's
+buffer on the launch stream; the fp32-output path writes the caller's buffer
+directly. The real fix is a native-dtype epilogue store
+(`deepseek_sparse_attention/indexer_backward/`). A CuTe-DSL adapter that
+launches on the TVM-FFI environment stream still carves from the caller's
+workspace and `record_stream`s EVERY tensor the launch touches, the workspace
+included, on `as_torch_stream(current_stream, device)`: the launch is invisible
+to the caching allocator (`indexer_top_k/api.py`); when the kernel's fake
+declares `assumed_align` above the carver's 16 B, `execute()` checks the carved
+chunk's `data_ptr()` against it and raises. Descriptors over a carve (CuTe
+tensors, `DeviceView`s) are host objects and may be memoized per plan keyed on
+the workspace BASE pointer — the `OperandBuffer` capsule owns its own
+shape/stride, so the memo holds no device memory; a caller rotating workspaces
+pays the conversions again and nothing else (`hopper/kda_engine.py`; detector
+`test_kda_sm90_cuda.py::test_alternating_workspaces_recarve`).
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -424,6 +442,22 @@ bytes from the workspace via R2 (`sdpa/bwd/api_dsl.py` dense `seq_kv` /
 (a live read then reads Q bytes silently instead of faulting). `0` is legal at
 every layer: `cuTensorMapEncodeTiled` accepts NULL, the DSL rejects only negative
 addresses, the tvm-ffi positional entry carries pointers as ints.
+An Optional operand is Optional through the WHOLE chain: the jit `__call__`
+parameter, every `@cute.kernel` parameter and every `@cute.jit` helper that
+forwards it carry `cute.Tensor | None`, and every re-layout of it — host-side
+(`cute.make_tensor(m.iterator, ...)`) and in-kernel
+(`seqlen.offset_batch_Q(m, ...)`) — sits under `cutlass.const_expr(m is not
+None)`; guarding only the final writes leaves a `None.iterator` trace error one
+refactor away. Put a compile-time tripwire in the `else` branch (`assert not
+self.compute_lse`) so `None` handed to a live specialization fails at
+`cute.compile`, never as a silently skipped write; the flag that decides `None`
+is in the compile key. Detector: allocation delta 0 across three warm executes
+with the flag off, plus the compile key carrying it (`mDenom` in
+`score_recompute/dense_score_recompute_sm100.py` ->
+`indexer_score_unified_sm100(_mxfp8).py`; `mTopkLength` in
+`sparse_score_recompute_sm100.py`;
+`test_DSA_indexer_forward.py::test_denom_slot_compiled_out`,
+`test_DSA_sparse_score_recompute.py::..._sm100_topk_length_none_compiles_out`).
 
 **R4 — a live per-batch table the caller did not give you (lengths, offsets,
 scale scalars).** R2 (carve) + fill on the launch stream with one async op
@@ -435,6 +469,17 @@ tensor. A pointer table over a uniformly strided tensor is derived on device:
 under `stream_context(launch)` (wgrad `_generate_wgrad_ptrs`) — or the kernel
 takes `(base, stride)` as scalars. The fe_api sync detector (R9) flags the host
 list on the first call, so the failure is loud, not a silent serialisation.
+A device-side scheduler counter / ticket / semaphore the kernel self-resets is
+still caller scratch: carve it (R2) and `memset_zero_async` it on the launch
+stream EVERY execute, not once — the buffer is shared scratch another engine may
+have used, and a launch killed mid-way leaves it dirty. The contract this buys is
+"executions sharing one workspace buffer must not overlap", never "one plan per
+device/stream"; a wrapper that allocates per call needs no stream/device key for
+state ownership (`indexer_backward_v2_sm100`; detector
+`test_DSA_indexer_backward.py::test_v2_counter_lives_in_caller_workspace`
+poisons the workspace with 0xFF before each execute). The same rule zeroes an
+absent optional state port (the Hopper KDA seed) on every execute, so capture
+records a memset node that replays.
 
 **R5 — the input is not in the layout/dtype the kernel takes.** Decline in
 `check_support()` with a `NotImplementedError` naming the tensor and its
@@ -446,6 +491,36 @@ operand's stride (the NSA Top-K LSE, read through a fixed `(1, s_q)` layout),
 `check_support()` validates the FULL stride tuple of the normalised view, not
 just `stride[-1] == 1`, and `execute()` re-checks the live tensor and raises
 `ValueError` (never `.contiguous()`).
+A size-1 innermost dim has no observable stride: `stride[-1] == 1` checks exempt
+`shape[-1] == 1` (the SM90 `(B, 1, H).transpose(1, 2)` singleton view is
+contiguous with stride `(H, 1, H)`), or a correct layout is declined (12 SM90
+reds in the score-recompute batch).
+An output the kernel needs padded or aligned is never staged into scratch and
+copied back (two hidden launches plus a per-call allocation): require the
+caller's tensor to already be the view with the padded stride (`out[..., :S_k]`
+over `(..., ceil4(S_k))`), validate the FULL stride tuple plus base alignment at
+execute (`ValueError` naming the allocation to make), let the wrapper allocate
+the padded buffer on the launch stream (R1) and return the view, and keep the
+APIBase descriptor on the padded allocation with `is_contiguous()` in
+`check_support()` (`indexer_forward/_interface.py::_validate_out_view`; detector
+`test_DSA_indexer_forward.py::test_padded_out_is_bound_directly`).
+Wrapper-layer convenience (`.contiguous()`, `.to(int32)`, padded output
+allocation) lives only in `<op>_wrapper`, never in an `_interface*.py` the
+engine shares; it runs BEFORE the memo key and plan build (so the plan sees the
+tensors it will execute) and under `stream_context(<launch stream>)`, and it
+never copies an OUTPUT (a `.contiguous()` on `out` returns a temp the caller
+never sees — the old SM90 score-recompute path did exactly that).
+R5 interim clause (named and dated, 2026-09): when a production contract forces
+a dtype/layout the kernel cannot read natively and declining would leave the
+arch with no engine (sm90 KDA: FlashInfer's `kda()` mandates bf16 g/beta/state
+and int64 cu under capture; the kernels read `const float*` / `const int*`),
+the conversion may stay ONLY as a BUILD-declared staging carve: sized in
+`__init__` from the graph's declared dtypes and strides
+(`linear_attention/hopper/marshal.py::staging_ports`), never from the runtime
+view; the copy runs on the launch stream inside `stream_context`; a runtime
+buffer that does not match the declaration raises naming the port; the module
+docstring records it as a Rule 2 exception with the kernel change that retires
+it. It is listed under GRANDFATHERED in the audit, not cited as precedent.
 
 **R6 — something must block the host (host-planned work items, a D2H read
 of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
@@ -496,6 +571,13 @@ Feed the sync detector tensors the plan has never
 seen (a fresh `.clone()` of the offsets / pointer table per execute): an
 id-keyed validation memo hid a per-tensor D2H from every warm test
 (`fe_api/test_grouped_gemm_rule8.py::test_execute_never_synchronizes`).
+Run the allocation detector over the CONVERTED-dtype graphs too (bf16 gate /
+int64 cu / bf16 state), not just the native one — a staging allocation only
+shows up there
+(`test_kda_sm90_cuda.py::test_execute_allocates_nothing_and_never_synchronizes[...bf16_gate_int64_cu_bf16_state]`);
+and over the output-dtype axis: an fp32 output that needs 0 bytes must run with
+`workspace=None`, a bf16 one must raise `requires a \d+-byte workspace` before
+any in-place stage mutates anything (`test_DSA_indexer_backward.py`).
 
 **R10 — a launch envelope the caller already knows (max sequence length, packed
 total, batch count, top-k width).** It is a required host int at plan time (an
@@ -531,6 +613,15 @@ it with a CPU `from_dlpack` parity test next to the builder
 Wrap `cute.compile` in `with torch.cuda.device(desc.device)`: fakes carry no
 device. Prove the build with R9 around `check_support()` + `compile()`
 (`test_flex_attention.py::test_explicit_api_compile_allocates_nothing_and_never_synchronizes`).
+A `compile()` that only "primes" a lazily-compiling launcher (the real
+`cute.compile` runs at the first `execute()` against live tensors) is a Rule 4
+miss as well as an R11 blind spot: split the launcher into a plan-time
+`compile_<op>_kernel(dtype, shape envelope, flags)` (module cache, fake
+operands, under `torch.cuda.device(desc.device)`) and an execute-time
+`launch_<op>_kernel(compiled, <caller tensors>, <carved scratch>)`, so
+`compile_allocates_nothing` has something to measure and `execute()` is a
+guaranteed cache hit (`indexer_top_k/indexer_top_k_decode_varlen.py`). Still
+lazy, tracked: `IndexerBackward`, `DenseIndexerBackward`, `IndexerForward`.
 
 
 ## Frontend-only kernel package layout
