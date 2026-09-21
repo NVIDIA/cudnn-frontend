@@ -388,11 +388,16 @@ def execute(self, graph, variant_pack, ctx):
     meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
 ```
 (APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
-in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
+in `api_base.py`, re-exported by `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
 that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
-passed nothing. A path with no workspace contract gets one.
+passed nothing. A path with no workspace contract gets one. An APIBase that
+wraps a cuDNN backend `pygraph` forwards `graph.get_workspace_size()` as
+`get_workspace_size()` and takes `workspace=` at execute, validated with
+`WorkspaceCarver(workspace, bytes, label)` (construct only, no `take`);
+`pygraph.execute(workspace=None)` lowers to a null pointer, so None is legal
+only when the size is 0 (`native_sparse_attention/sliding_window_attention`).
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -418,7 +423,11 @@ tensor.
 strides/dtype (`_thd_check_strides_native` in `sdpa/fwd/api_dsl.py`), so the
 Router picks another engine. Not `.contiguous()`, not `.to(dtype)`, not a
 repack/copy-back — even into the workspace (Rule 2). If the engine is meant to
-serve that input, the kernel reads it natively.
+serve that input, the kernel reads it natively. When a kernel hard-codes an
+operand's stride (the NSA Top-K LSE, read through a fixed `(1, s_q)` layout),
+`check_support()` validates the FULL stride tuple of the normalised view, not
+just `stride[-1] == 1`, and `execute()` re-checks the live tensor and raises
+`ValueError` (never `.contiguous()`).
 
 **R6 — something must block the host (host-planned work items, a D2H read
 of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
@@ -448,7 +457,21 @@ executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_
 capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
 window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
-(`test_torch_stream.py`).
+(`test_torch_stream.py`). Rule 8 holds build to the execute standard, so wrap
+`__init__` + `check_support()` + `compile()` in `set_sync_debug_mode("error")`
+as well (`test_NSA_topk_reduction.py`, `test_NSA_swa.py`,
+`test_NSA_compression_attention.py`).
+
+**R10 — a launch envelope the caller already knows (max sequence length,
+packed total, batch count).** It is a required host int at plan time (an
+`__init__` argument or graph attribute), validated against the sample shapes
+that already encode it (`q.shape[0] >= cum[-1]`, `sample_out.shape[1] ==
+max_seqlen_k`); never `cu_seqlens.diff().max().item()` at build or execute
+(`TopKReduction`, `CompressionAttention` take the packed total from
+`sample_q.shape[0]`). A WRAPPER may keep a documented `.item()` fallback on its
+own surface only, must key its memo on the resulting value, and must say in its
+docstring that omitting the hint costs one blocking read per call and is not
+capturable (`csa_compressor_forward_wrapper(total_comp=None)`).
 
 
 ## Frontend-only kernel package layout
