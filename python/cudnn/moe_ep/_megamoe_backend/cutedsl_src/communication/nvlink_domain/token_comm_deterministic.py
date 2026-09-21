@@ -959,20 +959,42 @@ class _MetadataPushRouter(KernelComponent):
         iket.range_push("router.apply_receive_limit")
         if self._router_thread_idx == Int32(0):
             warp_totals[0] = Int32(0)
+            warp_totals[1] = Int32(0)
         cute.arch.sync_threads()
-        thread_local_total = Int32(0)
-        local_expert_rounds = ceil_div(self.experts_per_rank, block_thread_count)
-        for expert_round in cutlass.range_constexpr(local_expert_rounds):
-            local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
-            if local_expert < Int32(self.experts_per_rank):
-                thread_local_total = thread_local_total + sizes[owner_expert_begin + local_expert]
-        if thread_local_total > Int32(0):
-            cute.arch.atomic_add(warp_totals.iterator, thread_local_total, scope="cta")
+
+        # sizes[] contains the same pre-truncation, all-source expert totals on
+        # every rank once raw_sizes_ready_target has been observed.  Compute
+        # the group-wide policy bit locally so no post-kernel collective is
+        # needed.  Slot 0 counts overflowing destinations; slot 1 records this
+        # rank's destination bit for local-only truncation.
+        rank_round_count = ceil_div(self.world_size, block_thread_count)
+        for rank_round in cutlass.range_constexpr(rank_round_count):
+            destination_rank = Int32(rank_round * block_thread_count) + self._router_thread_idx
+            if destination_rank < Int32(self.world_size):
+                destination_expert_begin = destination_rank * Int32(self.experts_per_rank)
+                raw_destination_total = Int32(0)
+                for local_expert in cutlass.range_constexpr(self.experts_per_rank):
+                    raw_destination_total = (
+                        raw_destination_total
+                        + sizes[destination_expert_begin + Int32(local_expert)]
+                    )
+                destination_overflow = Int32(
+                    raw_destination_total > Int32(self.max_recv_size_per_rank)
+                )
+                if destination_overflow:
+                    cute.arch.atomic_add(
+                        warp_totals.iterator,
+                        Int32(1),
+                        scope="cta",
+                    )
+                if destination_rank == Int32(self._router_local_rank):
+                    warp_totals[1] = destination_overflow
         cute.arch.sync_threads()
-        raw_local_total = warp_totals[0]
-        did_overflow = Int32(raw_local_total > Int32(self.max_recv_size_per_rank))
+        global_did_overflow = Int32(warp_totals[0] > Int32(0))
+        local_did_overflow = warp_totals[1]
 
         if cutlass.const_expr(self.drop_on_overflow):
+            local_expert_rounds = ceil_div(self.experts_per_rank, block_thread_count)
             for expert_round in cutlass.range_constexpr(local_expert_rounds):
                 local_expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
                 if local_expert < Int32(self.experts_per_rank):
@@ -982,17 +1004,22 @@ class _MetadataPushRouter(KernelComponent):
                     remaining_capacity = Int32(self.worst_case_token_count) - pool_expert_base[local_expert]
                     if remaining_capacity > Int32(0):
                         retained_size = cutlass.min(raw_size, remaining_capacity)
-                    if did_overflow:
+                    if local_did_overflow:
                         sizes[owner_expert_begin + local_expert] = retained_size
 
         if self._router_thread_idx == Int32(0):
-            cute.arch.store(self._overflow_flag.iterator, did_overflow, sem="relaxed", scope="sys")
+            cute.arch.store(
+                self._overflow_flag.iterator,
+                global_did_overflow,
+                sem="relaxed",
+                scope="sys",
+            )
         cute.arch.sync_threads()
 
         if cutlass.const_expr(self.drop_on_overflow):
             self._publish_push_table_and_sizes_ready(sizes_ready)
         else:
-            if did_overflow:
+            if global_did_overflow:
                 if self._router_thread_idx == Int32(0):
                     cute.arch.fence_acq_rel_sys()
                     _device_trap()

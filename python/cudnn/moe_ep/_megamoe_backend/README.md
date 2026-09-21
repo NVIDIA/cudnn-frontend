@@ -82,8 +82,10 @@ legal transpose views without physical transpose copies.
 ## Overflow and distributed ordering
 
 Each phase keeps overflow state private and applies the configured policy
-before returning. EP2+ performs the scalar MAX needed for a rank-consistent
-decision. There is no public `finalize_overflow`.
+before returning. The transport always truncates safely and derives the same
+group-wide overflow bit on every rank from the route totals already exchanged
+by the kernel, without a separate scalar collective. There is no public
+`finalize_overflow`.
 
 One `MoeEp` instance supports only sequential work on one CUDA stream. The
 implementation does not bind or validate that stream, and stable symmetric

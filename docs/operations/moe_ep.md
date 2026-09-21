@@ -619,11 +619,17 @@ Overflow is private per-launch state. Each forward and backward applies the
 `drop_on_overflow` policy before returning; there is no public overflow tensor
 and no separate finalize step.
 
-`drop_on_overflow=True` discards routes beyond the pool capacity. The default
-`False` instead fires a device-side assertion, which surfaces asynchronously
-and requires `torch._assert_async`. EP2+ reduces the overflow flag with a
-scalar MAX across the group before applying the policy, so every rank reaches
-the same decision.
+The transport kernel always discards routes beyond the receiving rank's pool
+capacity and completes its ready/tail protocol. Each rank derives the same
+group-wide overflow bit from the per-expert route totals already exchanged by
+the router; no additional scalar collective is launched for this policy.
+
+`drop_on_overflow=True` returns after that safe truncation. The default
+`False` instead applies `torch._assert_async` after the communication protocol
+has completed, so every EP rank reaches the same fatal decision without
+leaving peers in a ready-counter wait. A real error-mode overflow can leave
+every rank's CUDA context in a sticky error state; restart the whole EP worker
+group rather than continuing or restarting only the receiving rank.
 
 Results are numerically usable only when no overflow occurs. A launch that
 overflows may raise or drop work according to `drop_on_overflow`, but its

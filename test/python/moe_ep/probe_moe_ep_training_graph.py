@@ -51,6 +51,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--expect-overflow-assert", action="store_true")
+    parser.add_argument("--asymmetric-overflow", action="store_true")
     return parser.parse_args()
 
 
@@ -96,6 +97,30 @@ def _token_prefix(value, token_count: int):
     return BlockScaledTensor(
         data=value.data[:token_count],
         scale=value.scale[:token_count],
+        format=value.format,
+        logical_shape=(token_count, *value.logical_shape[1:]),
+        axis=value.axis,
+    )
+
+
+def _repeat_token_rows(value, token_count: int):
+    source_tokens = int(
+        value.logical_shape[0]
+        if isinstance(value, BlockScaledTensor)
+        else value.shape[0]
+    )
+    repeats = (token_count + source_tokens - 1) // source_tokens
+    if not isinstance(value, BlockScaledTensor):
+        return value.repeat((repeats, *([1] * (value.ndim - 1))))[
+            :token_count
+        ].contiguous()
+    return BlockScaledTensor(
+        data=value.data.repeat(
+            (repeats, *([1] * (value.data.ndim - 1)))
+        )[:token_count].contiguous(),
+        scale=value.scale.repeat(
+            (repeats, *([1] * (value.scale.ndim - 1)))
+        )[:token_count].contiguous(),
         format=value.format,
         logical_shape=(token_count, *value.logical_shape[1:]),
         axis=value.axis,
@@ -169,6 +194,7 @@ def _prepare_case(
     dgrad_optimization: str,
     physical_recv_pool_rows: int,
     drop_on_overflow: bool,
+    asymmetric_overflow: bool = False,
 ):
     _runtime_debug(
         "probe.prepare.inputs.begin",
@@ -183,6 +209,28 @@ def _prepare_case(
         world_size,
         device,
     )
+    if asymmetric_overflow:
+        if pattern.name != "smoke" or world_size < 2:
+            raise ValueError(
+                "asymmetric overflow requires the smoke pattern with EP2+"
+            )
+        token_count = pattern.max_tokens_per_rank
+        activation = _repeat_token_rows(args[0], token_count)
+        topk_idx = torch.zeros(
+            (token_count, pattern.top_k),
+            dtype=args[3].dtype,
+            device=device,
+        )
+        if rank == 0:
+            topk_idx.reshape(-1)[0] = pattern.num_experts // world_size
+        topk_weights = args[4][:1].expand(token_count, -1).contiguous()
+        args = (
+            activation,
+            args[1],
+            args[2],
+            topk_idx,
+            topk_weights,
+        )
     grad_output = _grad_output(
         device,
         args[0].shape[0],
@@ -278,7 +326,7 @@ def _prepare_case(
     )
 
 
-def _require_all_ranks_to_overflow(
+def _require_group_overflow(
     op: MoeEp, topk_idx: torch.Tensor, world_size: int
 ) -> None:
     state = op._training_state
@@ -303,10 +351,9 @@ def _require_all_ranks_to_overflow(
         logical_limit=logical_limit,
         receive_counts=counts,
     )
-    if any(count <= logical_limit for count in counts):
+    if not any(count > logical_limit for count in counts):
         raise ValueError(
-            "error-mode routing must overflow on every rank to avoid a "
-            "partial-rank device assertion: "
+            "error-mode routing must overflow at least one receiving rank: "
             f"receive_counts={counts}, logical_limit={logical_limit}"
         )
 
@@ -328,12 +375,13 @@ def _run_error_mode_assert_probe(
         dgrad_optimization=args.dgrad_optimization,
         physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=False,
+        asymmetric_overflow=args.asymmetric_overflow,
     )
     op, inputs, _, native_forward, _, output_pair = case
     forward_out = output_pair[0]
 
     try:
-        _require_all_ranks_to_overflow(op, inputs[3], world_size)
+        _require_group_overflow(op, inputs[3], world_size)
         _runtime_debug("probe.error.warm.forward.begin")
         op.training_forward(
             _token_prefix(inputs[0], 0),
@@ -376,9 +424,15 @@ def _run_error_mode_assert_probe(
         _runtime_debug("probe.error.replay.end")
     except BaseException as error:
         error_text = str(error)
-        if (
-            "device-side assert triggered" in error_text
-            or "Rubin MegaMoE receive route-pool overflow" in error_text
+        if any(
+            expected in error_text
+            for expected in (
+                "device-side assert triggered",
+                "Rubin MegaMoE receive route-pool overflow",
+                "unspecified launch failure",
+                "cudaErrorLaunchFailure",
+                "CUDA_ERROR_LAUNCH_FAILED",
+            )
         ):
             print(
                 f"MOE_EP_EP{world_size}_ERROR_MODE_OVERFLOW_PASS "
@@ -421,6 +475,7 @@ def _run_cycle(
         dgrad_optimization=args.dgrad_optimization,
         physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=True,
+        asymmetric_overflow=args.asymmetric_overflow,
     )
     op, inputs, grad_output, native_forward, native_backward, output_pair = case
     forward_out, backward_out = output_pair
@@ -452,6 +507,32 @@ def _run_cycle(
         _runtime_debug("probe.warm.synchronize.begin", cycle=cycle)
         execution_stream.synchronize()
         _runtime_debug("probe.warm.synchronize.end", cycle=cycle)
+
+        if args.asymmetric_overflow:
+            state = op._training_state
+            if state is None:
+                raise RuntimeError("training state disappeared after warmup")
+            scratch = state.views(
+                token_count=int(inputs[0].shape[0])
+            ).scratch
+            phase_flags = torch.cat(
+                (
+                    scratch.forward_overflow,
+                    scratch.backward_overflow,
+                )
+            )
+            gathered_flags = [
+                torch.empty_like(phase_flags) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_flags, phase_flags)
+            if any(
+                tuple(int(value) for value in flags.cpu().tolist()) != (1, 1)
+                for flags in gathered_flags
+            ):
+                raise AssertionError(
+                    "asymmetric forward/backward overflow flags were not "
+                    f"global: {[flags.cpu().tolist() for flags in gathered_flags]}"
+                )
 
         # Capture two graph executables over the same fixed instance resources.
         # Both capture and replay stay on one stream and execute sequentially.

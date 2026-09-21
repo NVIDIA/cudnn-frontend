@@ -166,7 +166,9 @@ class Mxfp8KernelConfig:
             generate_c=training,
             physical_recv_pool_size=physical_recv_pool_size,
             max_recv_size_per_rank=logical_route_limit,
-            kernel_drop_on_overflow=(True if training else parallel.drop_on_overflow),
+            # Token communication must always complete its publish/tail protocol.
+            # The public policy is applied after the kernel returns.
+            kernel_drop_on_overflow=True,
             enable_col_quant=training,
             dfc2_recompute=backward,
             dfc2_col_output=backward,

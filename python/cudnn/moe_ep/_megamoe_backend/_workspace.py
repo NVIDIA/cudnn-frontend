@@ -201,6 +201,7 @@ class WorkspaceRequirements:
         local_regions = (
             BufferRegion("topk_idx", tokens * top_k * 4),
             BufferRegion("overflow_flag", 4),
+            BufferRegion("overflow_ok", torch.bool.itemsize, alignment=16),
             *col_quant_regions,
             *backward_local_regions,
             BufferRegion("kernel_local_workspace", kernel_local_workspace_bytes),

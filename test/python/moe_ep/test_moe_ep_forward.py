@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import inspect
 import sys
+import time
 from dataclasses import FrozenInstanceError, replace
 from types import ModuleType, SimpleNamespace
 
@@ -18,6 +19,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from moe_ep.moe_ep_distributed_workers import (
+    _distributed_inference_overflow_worker,
+    _distributed_inference_policy_mismatch_worker,
     _distributed_output_worker,
     _distributed_subgroup_output_worker,
 )
@@ -42,6 +45,84 @@ from moe_ep.moe_ep_reference import (
     forward_combine_round_trip,
     quantize_blockwise,
 )
+
+
+def _inference_overflow_config(*, drop_on_overflow: bool):
+    return _moe_ep_config(
+        **_forward_config(
+            num_experts=1,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=1,
+            max_tokens_per_rank=129,
+            physical_recv_pool_rows=128,
+            drop_on_overflow=drop_on_overflow,
+        )
+    )
+
+
+def _inference_overflow_args(device: torch.device, tokens: int):
+    return _make_forward_case(
+        device,
+        experts=1,
+        tokens=tokens,
+        hidden=128,
+        intermediate=256,
+        top_k=1,
+        index_dtype=torch.int32,
+        weight_dtype=torch.bfloat16,
+    )
+
+
+def _inference_overflow_prefix(args, tokens: int):
+    from cudnn import BlockScaledTensor
+
+    activation = args[0]
+    prefix = BlockScaledTensor(
+        data=activation.data[:tokens],
+        scale=activation.scale[:tokens],
+        format=activation.format,
+        logical_shape=(tokens, *activation.logical_shape[1:]),
+        axis=activation.axis,
+    )
+    return (
+        prefix,
+        args[1],
+        args[2],
+        args[3][:tokens],
+        args[4][:tokens],
+    )
+
+
+def _inference_overflow_error_mode_worker(graph_mode: bool = False) -> None:
+    try:
+        from cudnn import MoeEp
+
+        device = _sm107_device()
+        overflow_args = _inference_overflow_args(device, 129)
+        with MoeEp(_inference_overflow_config(drop_on_overflow=False)) as op:
+            op(*_inference_overflow_prefix(overflow_args, 128))
+            torch.cuda.synchronize(device)
+            if graph_mode:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    op(*overflow_args)
+                graph.replay()
+            else:
+                op(*overflow_args)
+            torch.cuda.synchronize(device)
+    except BaseException as exc:
+        message = str(exc).lower()
+        expected_errors = (
+            "device-side assert",
+            "unspecified launch failure",
+            "cudaerrorlaunchfailure",
+            "cuda_error_launch_failed",
+            "receive route-pool overflow",
+        )
+        os._exit(0 if any(error in message for error in expected_errors) else 2)
+    os._exit(1)
+
 
 # Public API, capability, layout, and workspace contracts.
 
@@ -102,6 +183,57 @@ def test_reverse_capacity_preserves_overprovisioned_physical_pool():
 
     assert config.physical_recv_pool_size == 384
     assert config.max_recv_size_per_rank == 10
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("drop_on_overflow", [False, True])
+def test_inference_kernel_transport_always_uses_safe_drop(drop_on_overflow):
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        _moe_ep_config(**_forward_config(drop_on_overflow=drop_on_overflow))
+    ) as op:
+        config = Mxfp8KernelConfig.for_inference(
+            op._execution_state.resolved_config,
+            launch_cluster_count=16,
+        )
+
+    assert config.kernel_drop_on_overflow is True
+
+
+@pytest.mark.L0
+def test_overflow_policy_honors_drop_mode(monkeypatch):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._overflow import (
+        apply_overflow_policy,
+    )
+
+    assertions = []
+
+    def fake_assert_async(condition, message):
+        assertions.append((bool(condition.item()), message))
+
+    monkeypatch.setattr(torch, "_assert_async", fake_assert_async)
+    overflow_flag = torch.tensor([1], dtype=torch.int32)
+    overflow_ok = torch.empty(1, dtype=torch.bool)
+
+    apply_overflow_policy(
+        overflow_flag,
+        drop_on_overflow=True,
+        overflow_ok=overflow_ok,
+        message="overflow",
+    )
+    assert assertions == []
+
+    apply_overflow_policy(
+        overflow_flag,
+        drop_on_overflow=False,
+        overflow_ok=overflow_ok,
+        message="overflow",
+    )
+    assert assertions == [(False, "overflow")]
 
 
 @pytest.mark.L0
@@ -557,6 +689,79 @@ def test_mxfp8_combine_matches_direct_fp32_training_reference():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
+def test_inference_drop_mode_survives_yang_receive_pool_overflow():
+    from cudnn import MoeEp
+
+    device = _sm107_device()
+    with MoeEp(_inference_overflow_config(drop_on_overflow=True)) as op:
+        op(*_inference_overflow_args(device, 128))
+        torch.cuda.synchronize(device)
+        actual = op(*_inference_overflow_args(device, 129))
+        torch.cuda.synchronize(device)
+
+    assert actual.shape == (129, 128)
+    probe = torch.ones(1, device=device) + 1
+    torch.cuda.synchronize(device)
+    assert float(probe.item()) == 2.0
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_inference_error_mode_fails_fast_on_yang_receive_pool_overflow():
+    _sm107_device()
+    process = mp.get_context("spawn").Process(
+        target=_inference_overflow_error_mode_worker
+    )
+    process.start()
+    process.join(timeout=180)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=30)
+        pytest.fail("inference overflow error mode did not fail fast")
+    assert process.exitcode == 0
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_inference_drop_mode_graph_survives_receive_pool_overflow():
+    from cudnn import MoeEp
+
+    device = _sm107_device()
+    overflow_args = _inference_overflow_args(device, 129)
+    with MoeEp(_inference_overflow_config(drop_on_overflow=True)) as op:
+        op(*_inference_overflow_prefix(overflow_args, 128))
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = op(*overflow_args)
+        graph.replay()
+        torch.cuda.synchronize(device)
+
+    assert graph_output.shape == (129, 128)
+    probe = torch.ones(1, device=device) + 1
+    torch.cuda.synchronize(device)
+    assert float(probe.item()) == 2.0
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_inference_error_mode_graph_fails_fast_on_receive_pool_overflow():
+    _sm107_device()
+    process = mp.get_context("spawn").Process(
+        target=_inference_overflow_error_mode_worker,
+        args=(True,),
+    )
+    process.start()
+    process.join(timeout=180)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=30)
+        pytest.fail("inference graph overflow error mode did not fail fast")
+    assert process.exitcode == 0
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
     ("plain_mask", "plain_dtype"),
     [
@@ -903,6 +1108,60 @@ def test_mxfp8_forward_multi_gpu_matches_reference(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("drop_on_overflow", [True, False])
+def test_inference_ep_asymmetric_overflow_policy(
+    tmp_path,
+    world_size,
+    drop_on_overflow,
+):
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / (
+        f"asymmetric_overflow_ep{world_size}_"
+        f"drop_{int(drop_on_overflow)}.init"
+    )
+    process_context = mp.spawn(
+        _distributed_inference_overflow_worker,
+        args=(world_size, str(init_file), drop_on_overflow),
+        nprocs=world_size,
+        join=False,
+    )
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        if process_context.join(
+            timeout=min(1.0, max(0.0, deadline - time.monotonic()))
+        ):
+            break
+    else:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in process_context.processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=30)
+        pytest.fail("asymmetric overflow workers did not complete")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_inference_ep2_rejects_overflow_policy_mismatch(tmp_path):
+    world_size = 2
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / "overflow_policy_mismatch.init"
+    mp.spawn(
+        _distributed_inference_policy_mismatch_worker,
+        args=(world_size, str(init_file)),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
 def test_mxfp8_forward_noncontiguous_ep_subgroups(tmp_path):
     global_world_size = 4
     _require_distributed_sm107(global_world_size)
@@ -989,6 +1248,7 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
     local = {
         "topk_idx": torch.empty(capacity * top_k * 4, dtype=torch.uint8),
         "overflow_flag": torch.empty(4, dtype=torch.uint8),
+        "overflow_ok": torch.empty(1, dtype=torch.uint8),
         "kernel_local_workspace": torch.empty(128, dtype=torch.uint8),
     }
     request = SimpleNamespace(
@@ -1036,6 +1296,9 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
 
     assert launch.activation_sf.shape == (capacity, 16)
     assert launch.activation_sf.data_ptr() == symmetric["activation_scale"].data_ptr()
+    assert launch.overflow_ok is not None
+    assert launch.overflow_ok.dtype is torch.bool
+    assert launch.overflow_ok.data_ptr() == local["overflow_ok"].data_ptr()
 
 
 @pytest.mark.L0
@@ -1060,6 +1323,7 @@ def test_column_requant_workspace_is_allocated_only_when_enabled():
     disabled_names = {region.name for region in disabled.local_regions}
     assert "col_quant_data" not in disabled_names
     assert "col_quant_sf" not in disabled_names
+    assert "overflow_ok" in disabled_names
     enabled_sizes = {region.name: region.nbytes for region in enabled.local_regions}
     assert enabled_sizes["col_quant_data"] == 640
     assert enabled_sizes["col_quant_sf"] == 80

@@ -135,6 +135,8 @@ class Mxfp8Backend:
             raise RuntimeError(
                 "distributed MXFP8 launch requires a " "torch.distributed process group"
             )
+        public = self.resolved_config.public_config
+        topology = self.resolved_config.topology
         capacity = self.resolved_config.receive_capacity
         signature = (
             prepared.config.tuning_signature(),
@@ -143,6 +145,14 @@ class Mxfp8Backend:
             capacity.inference_sf_pool_rows,
             prepared.config.token_padding_block,
             prepared.config.sf_padding_block,
+            public.parallel.drop_on_overflow,
+            topology.ep_size,
+            topology.experts_per_rank,
+            public.model.num_experts,
+            public.model.hidden_size,
+            public.model.intermediate_size,
+            public.model.top_k,
+            public.parallel.max_tokens_per_rank,
         )
         rank_signatures = [None] * self.resolved_config.topology.ep_size
         dist.all_gather_object(
@@ -152,8 +162,9 @@ class Mxfp8Backend:
         )
         if any(item != rank_signatures[0] for item in rank_signatures[1:]):
             raise RuntimeError(
-                "MoeEp inference capacity and tuning must match on every "
-                "expert-parallel rank; effective signatures by rank: "
+                "MoeEp inference configuration, capacity, policy, and tuning "
+                "must match on every expert-parallel rank; effective "
+                "signatures by rank: "
                 f"{rank_signatures}"
             )
         self._ep_config_agreed = True
@@ -262,6 +273,9 @@ class Mxfp8Backend:
                         self._compiled,
                         inputs,
                         resources,
+                        drop_on_overflow=(
+                            self.resolved_config.public_config.parallel.drop_on_overflow
+                        ),
                     )
                 except (ImportError, OSError) as exc:
                     raise BackendUnavailableError(

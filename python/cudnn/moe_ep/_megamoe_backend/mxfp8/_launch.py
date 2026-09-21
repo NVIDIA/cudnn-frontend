@@ -11,6 +11,7 @@ import torch
 
 from .._plan import PreparedResources
 from ._adapter import Mxfp8LaunchInputs
+from ._overflow import apply_overflow_policy
 
 
 def _to_cute(
@@ -150,28 +151,26 @@ def layout_signature(inputs: Mxfp8LaunchInputs) -> tuple:
     return tuple(None if tensor is None else (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in tensors)
 
 
-def _check_overflow(overflow_flag: torch.Tensor) -> None:
-    message = "Rubin MegaMoE receive route-pool overflow; the output is invalid for " "this routing distribution"
-    assert_async = getattr(torch, "_assert_async", None)
-    if assert_async is not None:
-        assert_async(overflow_flag == 0, message)
-        return
-    if torch.cuda.is_current_stream_capturing():
-        raise NotImplementedError("CUDA graph capture requires torch._assert_async to surface " "Rubin MegaMoE overflow")
-    # Compatibility fallback for PyTorch builds without a device-side assert.
-    value = int(overflow_flag.item())
-    if value != 0:
-        raise RuntimeError(f"{message} (overflow_flag={value})")
-
-
 def launch_forward(
     compiled,
     inputs: Mxfp8LaunchInputs,
     resources: PreparedResources,
+    *,
+    drop_on_overflow: bool,
 ) -> torch.Tensor:
     runtime_kwargs = build_runtime_kwargs(inputs, resources)
     compiled.callable(**runtime_kwargs)
-    _check_overflow(inputs.overflow_flag)
+    if inputs.overflow_ok is None:
+        raise RuntimeError("inference launch requires a prepared overflow_ok buffer")
+    apply_overflow_policy(
+        inputs.overflow_flag,
+        drop_on_overflow=drop_on_overflow,
+        overflow_ok=inputs.overflow_ok,
+        message=(
+            "Rubin MegaMoE receive route-pool overflow; the output is invalid "
+            "for this routing distribution"
+        ),
+    )
 
     output_data = torch.empty(
         (inputs.token_count, inputs.output_data.shape[1]),

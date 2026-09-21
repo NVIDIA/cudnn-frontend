@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 
 import torch
@@ -35,6 +36,8 @@ from moe_ep.moe_ep_test_support import (
 __all__ = [
     "_distributed_autotune_worker",
     "_distributed_backward_worker",
+    "_distributed_inference_overflow_worker",
+    "_distributed_inference_policy_mismatch_worker",
     "_distributed_output_worker",
     "_distributed_subgroup_output_worker",
     "_run_backward_reference_case",
@@ -179,6 +182,225 @@ def _distributed_output_worker(
             combine_format=combine_format,
             expected_global_ranks=tuple(range(world_size)),
         )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _distributed_inference_overflow_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    drop_on_overflow: bool,
+) -> None:
+    """Exercise one-destination overflow with identical raw flags on all ranks."""
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=180),
+    )
+    op = None
+    try:
+        from cudnn import MoeEp
+
+        non_overflow_tokens = 128 // world_size
+        overflow_tokens = non_overflow_tokens + 1
+        generator = torch.Generator(device=device).manual_seed(20260921 + rank)
+        fc1_weight = quantize_mxfp8(
+            torch.randn(
+                1,
+                128,
+                512,
+                generator=generator,
+                device=device,
+            )
+            / 8,
+            axis=1,
+        )
+        fc2_weight = quantize_mxfp8(
+            torch.randn(
+                1,
+                256,
+                128,
+                generator=generator,
+                device=device,
+            )
+            / 8,
+            axis=1,
+        )
+
+        def make_args(tokens: int):
+            activation = quantize_mxfp8(
+                torch.randn(
+                    tokens,
+                    128,
+                    generator=generator,
+                    device=device,
+                ),
+                axis=1,
+            )
+            topk_idx = torch.zeros(
+                (tokens, 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            if rank == 0:
+                # Keep one under-capacity route to rank 1 while rank 0
+                # overflows, making local-only truncation observable.
+                topk_idx[0, 0] = 1
+            topk_weights = torch.ones(
+                (tokens, 1),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            return (
+                activation,
+                fc1_weight,
+                fc2_weight,
+                topk_idx,
+                topk_weights,
+            )
+
+        config = _forward_config(
+            num_experts=world_size,
+            hidden_size=128,
+            intermediate_size=256,
+            top_k=1,
+            ep_group=dist.group.WORLD,
+            max_tokens_per_rank=overflow_tokens,
+            physical_recv_pool_rows=128,
+            drop_on_overflow=drop_on_overflow,
+        )
+        warmup_args = make_args(non_overflow_tokens)
+        overflow_args = make_args(overflow_tokens)
+        reference_config = dict(config)
+        reference_config.pop("physical_recv_pool_rows")
+        reference_config.pop("drop_on_overflow")
+        expected = _reference_forward(overflow_args, **reference_config) if drop_on_overflow else None
+        op = MoeEp(
+            _moe_ep_config(
+                **config
+            )
+        )
+        op(*warmup_args)
+        torch.cuda.synchronize(device)
+
+        local_receive_counts = [overflow_tokens] + [0] * (world_size - 1)
+        if rank == 0:
+            local_receive_counts[0] -= 1
+            local_receive_counts[1] += 1
+        gathered_receive_counts = [None] * world_size
+        dist.all_gather_object(
+            gathered_receive_counts,
+            local_receive_counts,
+        )
+        host_receive_counts = [
+            sum(counts[destination] for counts in gathered_receive_counts)
+            for destination in range(world_size)
+        ]
+        expected_overflow = any(count > 128 for count in host_receive_counts)
+        assert expected_overflow
+
+        if not drop_on_overflow:
+            try:
+                op(*overflow_args)
+                torch.cuda.synchronize(device)
+            except BaseException as exc:
+                message = str(exc).lower()
+                expected_errors = (
+                    "device-side assert",
+                    "unspecified launch failure",
+                    "cudaerrorlaunchfailure",
+                    "cuda_error_launch_failed",
+                    "receive route-pool overflow",
+                )
+                os._exit(0 if any(error in message for error in expected_errors) else 2)
+            os._exit(1)
+
+        actual = op(*overflow_args)
+        torch.cuda.synchronize(device)
+        assert actual.shape == (overflow_tokens, 128)
+        if rank == 0:
+            assert expected is not None
+            _assert_matches_reference(actual[:1], expected[:1])
+
+        backend = op._execution_state.backend
+        assert backend is not None
+        owner = backend._inference_resources
+        assert owner is not None and owner._workspace is not None
+        overflow_flag = (
+            owner._workspace.views(overflow_tokens)
+            .local["overflow_flag"][: torch.int32.itemsize]
+            .view(torch.int32)
+        )
+        gathered_flags = [torch.empty_like(overflow_flag) for _ in range(world_size)]
+        dist.all_gather(gathered_flags, overflow_flag)
+        assert [int(flag.item()) for flag in gathered_flags] == [
+            int(expected_overflow)
+        ] * world_size
+
+        probe = torch.ones(1, device=device) + 1
+        torch.cuda.synchronize(device)
+        assert float(probe.item()) == 2.0
+        dist.barrier()
+        op.close()
+        op = None
+        dist.barrier()
+    finally:
+        if op is not None:
+            op.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _distributed_inference_policy_mismatch_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> None:
+    """Reject a public overflow-policy mismatch before entering the kernel."""
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        from cudnn import MoeEp
+
+        args = make_distributed_forward_inputs(rank, world_size, device)
+        op = MoeEp(
+            _moe_ep_config(
+                **_forward_config(
+                    num_experts=2 * world_size,
+                    ep_group=dist.group.WORLD,
+                    max_tokens_per_rank=8,
+                    drop_on_overflow=bool(rank % 2),
+                )
+            )
+        )
+        try:
+            try:
+                op(*args)
+            except RuntimeError as exc:
+                assert "must match on every expert-parallel rank" in str(exc)
+            else:
+                raise AssertionError(
+                    "rank-mismatched drop_on_overflow reached the kernel"
+                )
+        finally:
+            op.close()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

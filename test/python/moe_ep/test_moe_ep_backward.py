@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import subprocess
+import sys
 from dataclasses import fields, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import cudnn
@@ -1747,7 +1750,7 @@ def test_training_abi_fingerprint_covers_workspace_and_native_layouts():
         source_tree_digest="source",
     )
 
-    assert first["schema_version"] == 5
+    assert first["schema_version"] == 6
     assert first["geometry"]["physical_recv_pool_rows"] == 128
     assert first["geometry"]["logical_recv_route_capacity"] == 16
     assert first["geometry"]["required_padded_rows"] == 128
@@ -1842,6 +1845,73 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
         match="fc1_weight_layout=GATE_UP_INTERLEAVED_32",
     ):
         conventional.prepare_training()
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
+    _require_distributed_sm107(2)
+    env = os.environ.copy()
+    env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            "--nproc-per-node=2",
+            str(probe),
+            "--pattern=smoke",
+            "--cycles=1",
+            "--timeout-seconds=180",
+            "--expect-overflow-assert",
+            "--asymmetric-overflow",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 0, combined_output
+    assert combined_output.count("MOE_EP_EP2_ERROR_MODE_OVERFLOW_PASS") == 2
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_training_graph_drop_mode_overflow_completes_forward_and_backward():
+    _require_distributed_sm107(2)
+    env = os.environ.copy()
+    env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    probe = Path(__file__).with_name("probe_moe_ep_training_graph.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            "--nproc-per-node=2",
+            str(probe),
+            "--pattern=smoke",
+            "--cycles=1",
+            "--diagnostic-replays=1",
+            "--burst-replays=1",
+            "--timeout-seconds=180",
+            "--asymmetric-overflow",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 0, combined_output
+    assert "stateless MoeEP training graph probe passed" in combined_output
 
 
 @pytest.mark.L1

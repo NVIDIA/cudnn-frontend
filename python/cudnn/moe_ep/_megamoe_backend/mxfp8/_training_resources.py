@@ -40,6 +40,7 @@ from ._adapter import _typed_view
 from ._backward_compile import PreparedMxfp8BackwardKernel
 from ._compile import PreparedMxfp8Kernel
 from ._fingerprint import canonical_json_sha256, source_tree_sha256
+from ._overflow import apply_overflow_policy
 from ._training_stage import Mxfp8TrainingStager
 
 _DATA_DTYPE = torch.float8_e4m3fn
@@ -50,13 +51,19 @@ _ROUTING_LOCAL = frozenset({"topk_idx"})
 _CALLER_OWNED_FORWARD_LOCAL = frozenset({"col_quant_data", "col_quant_sf"})
 _FORWARD_PRIVATE_SYMMETRIC = frozenset({"output_data", *_ROUTING_SYMMETRIC})
 _FORWARD_PRIVATE_LOCAL = frozenset(
-    {"overflow_flag", *_CALLER_OWNED_FORWARD_LOCAL, *_ROUTING_LOCAL}
+    {"overflow_flag", "overflow_ok", *_CALLER_OWNED_FORWARD_LOCAL, *_ROUTING_LOCAL}
 )
 _BACKWARD_PRIVATE_SYMMETRIC = frozenset(
     {"output_data", "backward_dprob", *_ROUTING_SYMMETRIC}
 )
 _BACKWARD_PRIVATE_LOCAL = frozenset(
-    {"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL}
+    {
+        "overflow_flag",
+        "overflow_ok",
+        "backward_aux_data",
+        "backward_aux_scale",
+        *_ROUTING_LOCAL,
+    }
 )
 
 
@@ -156,11 +163,6 @@ def build_training_workspace_requirements(
 
     local_regions.extend(
         (
-            BufferRegion(
-                _resource_name("finalizer", "local", "global_overflow"),
-                torch.int32.itemsize,
-                16,
-            ),
             BufferRegion(
                 _resource_name("finalizer", "local", "overflow_ok"),
                 torch.bool.itemsize,
@@ -421,7 +423,7 @@ def _build_training_abi_facts(
     topology = config.topology
     capacity = config.receive_capacity
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "source_tree_sha256": source_tree_digest,
         "ep": {
             "size": topology.ep_size,
@@ -1031,17 +1033,6 @@ class _Mxfp8TrainingState:
             raise ValueError(f"phase must be 'forward' or 'backward', got {phase!r}")
         _runtime_debug("training-overflow.begin", phase=phase)
         flat = self._flat_views(0)
-        global_overflow = _typed_view(
-            flat.local[
-                _resource_name(
-                    "finalizer",
-                    "local",
-                    "global_overflow",
-                )
-            ],
-            torch.int32,
-            (1,),
-        )
         flag = _typed_view(
             flat.local[
                 _resource_name(
@@ -1053,42 +1044,30 @@ class _Mxfp8TrainingState:
             torch.int32,
             (1,),
         )
-        global_overflow.copy_(flag)
-        _runtime_debug("training-overflow.copy.end", phase=phase)
-        assert self._runtime is not None
-        if self._runtime.world_size > 1:
-            _runtime_debug("training-overflow.all-reduce.begin", phase=phase)
-            dist.all_reduce(
-                global_overflow,
-                op=dist.ReduceOp.MAX,
-                group=self._runtime.group,
-            )
-            _runtime_debug("training-overflow.all-reduce.end", phase=phase)
-        if not self.resolved_config.public_config.parallel.drop_on_overflow:
-            assert_async = getattr(torch, "_assert_async", None)
-            if assert_async is None:
-                raise RuntimeError(
-                    "drop_on_overflow=False training requires torch._assert_async"
+        overflow_ok = _typed_view(
+            flat.local[
+                _resource_name(
+                    "finalizer",
+                    "local",
+                    "overflow_ok",
                 )
-            overflow_ok = _typed_view(
-                flat.local[
-                    _resource_name(
-                        "finalizer",
-                        "local",
-                        "overflow_ok",
-                    )
-                ],
-                torch.bool,
-                (1,),
-            )
-            torch.eq(global_overflow, 0, out=overflow_ok)
-            assert_async(
-                overflow_ok,
+            ],
+            torch.bool,
+            (1,),
+        )
+        apply_overflow_policy(
+            flag,
+            drop_on_overflow=(
+                self.resolved_config.public_config.parallel.drop_on_overflow
+            ),
+            overflow_ok=overflow_ok,
+            message=(
                 f"Rubin MegaMoE receive route-pool overflow; the {phase} "
-                "outputs are invalid",
-            )
+                "outputs are invalid"
+            ),
+        )
         _runtime_debug("training-overflow.end", phase=phase)
-        return global_overflow
+        return flag
 
 
 __all__ = [

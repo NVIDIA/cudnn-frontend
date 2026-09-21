@@ -97,14 +97,6 @@ def _validate_training_assert_capability(
             "drop_on_overflow=False training requires callable "
             "torch._assert_async before CUDA Graph capture"
         )
-    if config.topology.ep_size <= 1:
-        return
-    backend = dist.get_backend(parallel.ep_group)
-    if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
-        raise NotImplementedError(
-            "drop_on_overflow=False EP2+ training requires an NCCL "
-            "process group for the captured scalar global overflow OR"
-        )
 
 
 def _resolve_training_device(

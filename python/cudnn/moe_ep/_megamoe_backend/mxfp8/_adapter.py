@@ -300,6 +300,7 @@ class Mxfp8LaunchInputs:
     local_workspace: torch.Tensor
     shared_workspace: torch.Tensor
     token_count: int
+    overflow_ok: torch.Tensor | None = None
 
 
 class Mxfp8InputAdapter:
@@ -452,6 +453,11 @@ class Mxfp8InputAdapter:
             torch.int32,
             (1,),
         )
+        overflow_ok = _typed_view(
+            local["overflow_ok"],
+            torch.bool,
+            (1,),
+        )
         if config.enable_col_quant:
             if col_quant_data_rows <= 0 or col_quant_sf_elements <= 0:
                 raise ValueError("enabled column requant requires positive output capacities")
@@ -536,6 +542,7 @@ class Mxfp8InputAdapter:
             local_workspace=local_workspace,
             shared_workspace=shared_workspace,
             token_count=token_count,
+            overflow_ok=overflow_ok,
         )
 
     def close(self) -> None:
