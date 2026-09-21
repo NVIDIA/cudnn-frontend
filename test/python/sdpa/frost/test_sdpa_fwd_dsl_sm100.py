@@ -183,8 +183,8 @@ def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
 
 # Feature coverage — mask / sink / GQA. _ref_sdpa_full below encodes the kernel's
 # exact mask + sink semantics (masks OR-ed; sink = one extra softmax column, V=0).
-_FLAVORS = [512, 256, 128]
-_FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128"]
+_FLAVORS = [512, 256, 128, 64]
+_FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128", "gptoss_d64"]
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
@@ -2811,7 +2811,7 @@ def _combo_cases():
             ids.append(
                 "-".join(
                     [
-                        {512: "dsv4", 256: "qwen", 128: "llama"}[flavor],
+                        {512: "dsv4", 256: "qwen", 128: "llama", 64: "gptoss"}[flavor],
                         "fp16" if dtype == torch.float16 else "bf16",
                         heads,
                         "sink" if sink else "nosink",
