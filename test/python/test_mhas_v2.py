@@ -396,8 +396,20 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
         pytest.skip("no unified backend plan on this device")
     graph.select_plan(backend_plans[0])
     graph.check_support()
-    graph.build_plans()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1:
+        # On sm_107 the backend fails to NVRTC-compile the unified decode kernel that writes Stats
+        # (CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED at build_plans) with cuDNN 9.26 GA, 9.27 and the
+        # 9.28 nightlies alike; the s_q == 2 control builds. A backend that builds it is an XPASS that
+        # asks us to retire this marker.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                raises=cudnn.cudnnGraphNotSupportedError,
+                reason="sm_107: the unified decode kernel with Stats (ragged or padded) fails NVRTC compilation (cuDNN 9.26-9.28)",
+            )
+        )
+    graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
     graph.execute(pack, workspace, handle=cudnn_handle)
