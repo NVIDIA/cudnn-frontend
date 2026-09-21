@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from typing import NamedTuple, Optional
 
 import torch
@@ -9,7 +10,9 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Float16, BFloat16
+from cutlass.cute.typing import Int32, Float16, BFloat16, Float32
+
+from cudnn.api_base import WorkspaceCarver, ws_align
 
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
@@ -17,8 +20,11 @@ from ._kernels.hstu_bwd_q1 import HSTUAttentionBackwardQlen1Sm100
 from ._kernels.block_sparse_builder import (
     build_hstu_k2q_block_sparse,
     build_hstu_q2k_block_sparse,
+    fake_block_sparse_tensors,
+    hstu_d256_bwd_block_sparse_workspace_bytes,
+    hstu_k2q_block_sparse_workspace_bytes,
+    hstu_q2k_block_sparse_workspace_bytes,
 )
-from ._kernels.block_sparsity import HSTUBlockSparseTensors
 
 
 def _cutlass_dsl_version() -> tuple[int, int, int]:
@@ -104,41 +110,28 @@ def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
     return _mark_dynamic_tensor(tensor, tensor.ndim - 1)
 
 
-def _mark_block_sparse_tensors(tensors):
-    if tensors is None:
-        return None
-    return HSTUBlockSparseTensors(*(_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in tensors[:6]))
-
-
 def _runtime_block_sparse_tensors(tensors):
     if tensors is None:
         return None
     return tuple(tensors[:6])
 
 
-def _is_head_major_compact(t: torch.Tensor) -> bool:
-    if t.dim() != 3:
-        return False
-    total_tokens, _, head_dim = t.shape
-    return t.stride() == (head_dim, total_tokens * head_dim, 1)
-
-
-def _as_bwd_compact_layout(t: torch.Tensor) -> torch.Tensor:
-    if _is_head_major_compact(t):
-        head_major = t.permute(1, 0, 2)
-    else:
-        head_major = t.permute(1, 0, 2).clone(memory_format=torch.contiguous_format)
-    return head_major.permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
-
-
-def _empty_bwd_compact_layout_like(t: torch.Tensor) -> torch.Tensor:
-    total_tokens, num_heads, head_dim = t.shape
-    head_major = torch.empty(
-        (num_heads, total_tokens, head_dim),
-        dtype=t.dtype,
-        device=t.device,
+def _fake_fp32_accumulator():
+    """R11 stand-in for the fused backward's (H, T + pad, D8) fp32 dQ accumulator carved at execute."""
+    return cute.runtime.make_fake_tensor(
+        Float32,
+        (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+        (cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8), 1),
+        assumed_align=16,
     )
-    return head_major.permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
+
+
+def _require_native_layout(name: str, tensor: torch.Tensor, supported: bool) -> None:
+    if not supported:
+        raise ValueError(
+            f"HSTU SM100 cannot address {name} natively: shape {tuple(tensor.shape)}, strides {tuple(tensor.stride())} "
+            "(unit-stride head dim, 8-element-aligned non-zero token/head strides and a 16-byte base are required)"
+        )
 
 
 def _as_bwd_original_qkv_layout(t: torch.Tensor) -> torch.Tensor:
@@ -232,21 +225,12 @@ def _hstu_varlen_bwd_q1_direct(
     window_size_right: int,
     split_kv: int,
     rows_per_warp: int,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     *,
     _compile_only: bool,
 ):
-    no_preallocated_grads = dq is None and dk is None and dv is None
-    if not no_preallocated_grads and (dq is None or dk is None or dv is None):
-        raise ValueError("dq, dk, and dv must either all be supplied or all be omitted")
-    if no_preallocated_grads:
-        dq, dk, dv = [torch.empty_like(tensor, memory_format=torch.preserve_format) for tensor in (q, k, v)]
-    assert dq is not None and dk is not None and dv is not None
-    if dq.shape != q.shape or dk.shape != k.shape or dv.shape != v.shape:
-        raise ValueError("HSTU gradient outputs must match their corresponding inputs")
-
     batch_size = cu_seqlens_q.shape[0] - 1
     capability = _get_q1_device_capability(q.device)
     num_heads = q.shape[1]
@@ -288,7 +272,7 @@ def _hstu_varlen_bwd_q1_direct(
             is_local=is_local,
         )
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"), torch.cuda.device(q.device):
             _hstu_varlen_bwd_q1_direct.compile_cache[compile_key] = cute.compile(
                 kernel,
                 q_tensor,
@@ -470,28 +454,42 @@ def _select_q1_bwd_split_kv(
     return split_kv
 
 
-def hstu_varlen_fwd_100(
+class _FwdDispatch(NamedTuple):
+    """Host-side forward dispatch derived from plan-time metadata only (Rule 4)."""
+
+    head_dim: int
+    batch_size: int
+    window_size_left: int
+    window_size_right: int
+    is_causal: bool
+    is_local: bool
+    is_arbitrary: bool
+    is_paged: bool
+    func_num: int
+    is_q_len_one: bool
+    q1_dynamic_thd: bool
+    q1_fwd_config: _Q1FwdKernelConfig
+    use_2cta_instrs: bool
+    use_clc_descriptor: bool
+    q2k_block_size: Optional[tuple[int, int]]
+    compile_key: tuple
+
+
+def _fwd_dispatch(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     window_size_left: int,
     window_size_right: int,
-    alpha: float,
-    func: torch.Tensor,
-    paged_kv: Optional[torch.Tensor] = None,
-    page_ids: Optional[torch.Tensor] = None,
-    page_indptrs: Optional[torch.Tensor] = None,
-    scaling_seqlen: Optional[float] = None,
-    *,
-    out: Optional[torch.Tensor] = None,
-    _compile_only: bool = False,
-    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
-):
-    scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
+    func: Optional[torch.Tensor],
+    paged_kv: Optional[torch.Tensor],
+    page_ids: Optional[torch.Tensor],
+    page_indptrs: Optional[torch.Tensor],
+    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig],
+) -> _FwdDispatch:
     q_dtype = q.dtype
     assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
     assert k.dtype == q_dtype, "k and q must have the same dtype"
@@ -528,11 +526,6 @@ def hstu_varlen_fwd_100(
     kBlockN = q1_fwd_config.block_n
     q1_split_kv = q1_fwd_config.split_kv
     q1_single_warp_epilogue = q1_fwd_config.single_warp_epilogue
-    q1_m64_silu_warps = q1_fwd_config.m64_silu_warps
-    q1_m64_inplace_silu = q1_fwd_config.m64_inplace_silu
-    q1_m64_16dp_silu = q1_fwd_config.m64_16dp_silu
-    q1_m64_tail_branch = q1_fwd_config.m64_tail_branch
-    q1_m64_kv_stage = q1_fwd_config.m64_kv_stage
     # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
     # launch; larger batches have enough query-head CTAs and favor one CTA.
     use_2cta_instrs = (
@@ -559,17 +552,6 @@ def hstu_varlen_fwd_100(
         assert page_ids is not None and page_indptrs is not None, "Paged KV is True, but page metadata is missing."
         assert paged_kv.dim() == 5 and paged_kv.shape[0] > 0 and paged_kv.shape[2] == 128, "Only accept a non-empty 5-D paged KV table with page_size=128"
 
-    # Keep the public output in the standard contiguous (T, H, D) layout so
-    # downstream callers can flatten it with view() without an extra copy.
-    if out is None:
-        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    else:
-        if out.shape != q.shape:
-            raise ValueError(f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}")
-        if out.dtype != q.dtype or out.device != q.device:
-            raise ValueError("out must have the same dtype and device as q")
-        if not out.is_contiguous():
-            raise ValueError("out must be contiguous")
     if q1_split_kv > 1 and not q1_split_supported:
         raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if kBlockM == 64 and not q1_m64_supported:
@@ -598,135 +580,240 @@ def hstu_varlen_fwd_100(
         q.shape[1],
         is_q_len_one,
         q1_single_warp_epilogue,
-        q1_m64_silu_warps,
-        q1_m64_inplace_silu,
-        q1_m64_16dp_silu,
-        q1_m64_tail_branch,
-        q1_m64_kv_stage,
+        q1_fwd_config.m64_silu_warps,
+        q1_fwd_config.m64_inplace_silu,
+        q1_fwd_config.m64_16dp_silu,
+        q1_fwd_config.m64_tail_branch,
+        q1_fwd_config.m64_kv_stage,
+    )
+    q2k_block_size = None
+    if use_auto_block_metadata:
+        q2k_block_size = (kBlockM if head_dim == 256 or is_q_len_one else 2 * kBlockM, kBlockN)
+    return _FwdDispatch(
+        head_dim=head_dim,
+        batch_size=batch_size,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        is_causal=is_causal,
+        is_local=is_local,
+        is_arbitrary=is_arbitrary,
+        is_paged=is_paged,
+        func_num=func_num,
+        is_q_len_one=is_q_len_one,
+        q1_dynamic_thd=q1_dynamic_thd,
+        q1_fwd_config=q1_fwd_config,
+        use_2cta_instrs=use_2cta_instrs,
+        use_clc_descriptor=use_clc_descriptor,
+        q2k_block_size=q2k_block_size,
+        compile_key=compile_key,
     )
 
-    block_sparse_tensors = None
-    if use_auto_block_metadata:
-        q2k_block_size = (
-            kBlockM if head_dim == 256 or is_q_len_one else 2 * kBlockM,
-            kBlockN,
+
+def hstu_varlen_fwd_100_scratch_bytes(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    func: Optional[torch.Tensor],
+    paged_kv: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
+    page_indptrs: Optional[torch.Tensor] = None,
+    scaling_seqlen: Optional[float] = None,
+    *,
+    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
+) -> int:
+    """Workspace bytes ``hstu_varlen_fwd_100`` carves at execute: the Q2K block metadata when ``func`` is given, else 0."""
+    dispatch = _fwd_dispatch(
+        q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, func, paged_kv, page_ids, page_indptrs, _q1_fwd_tuning_config
+    )
+    if dispatch.q2k_block_size is None:
+        return 0
+    return hstu_q2k_block_sparse_workspace_bytes(dispatch.batch_size, max_seqlen_q, max_seqlen_k, dispatch.q2k_block_size)
+
+
+def _compile_fwd(
+    dispatch: _FwdDispatch,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    alpha: float,
+    scaling_seqlen: float,
+    func: Optional[torch.Tensor],
+    paged_kv_flat: Optional[torch.Tensor],
+    page_ids: Optional[torch.Tensor],
+    page_indptrs: Optional[torch.Tensor],
+) -> None:
+    if dispatch.q1_dynamic_thd:
+        total_q = cute.sym_int(divisibility=1)
+        total_k = cute.sym_int(divisibility=1)
+        batch_plus_one = cute.sym_int(divisibility=1)
+        q_tensor = _make_q1_dynamic_thd_tensor(q, total_q)
+        k_tensor = _make_q1_dynamic_thd_tensor(k, total_k)
+        v_tensor = _make_q1_dynamic_thd_tensor(v, total_k)
+        o_tensor = _make_q1_dynamic_thd_tensor(out, total_q)
+        for tensor in (cu_seqlens_q, cu_seqlens_k):
+            if tensor.data_ptr() % 16 != 0:
+                raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
+        cu_seqlens_q_tensor = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (batch_plus_one,),
+            stride_order=(0,),
+            assumed_align=16,
         )
-        with torch.cuda.nvtx.range("hstu_q2k_block_sparse_builder"):
-            block_sparse_tensors = build_hstu_q2k_block_sparse(
+        cu_seqlens_k_tensor = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (batch_plus_one,),
+            stride_order=(0,),
+            assumed_align=16,
+        )
+    else:
+        q_tensor, k_tensor, v_tensor, o_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)]
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
+    func_tensor = _mark_optional_tensor(func)
+    paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [_mark_optional_tensor(tensor) for tensor in (paged_kv_flat, page_ids, page_indptrs)]
+    # The block metadata is execute-time scratch carved from the caller's workspace (R2/R11).
+    block_sparse_cute = fake_block_sparse_tensors() if dispatch.is_arbitrary else None
+    compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    config = dispatch.q1_fwd_config
+    hstu_fwd_sm100 = HSTUAttentionForwardSm100(
+        head_dim=dispatch.head_dim,
+        is_causal=dispatch.is_causal,
+        is_local=dispatch.is_local,
+        is_arbitrary=dispatch.is_arbitrary,
+        is_paged=dispatch.is_paged,
+        func_num=dispatch.func_num,
+        kBlockM=config.block_m,
+        kBlockN=config.block_n,
+        use_auto_block_metadata=dispatch.is_arbitrary,
+        use_2cta_instrs=dispatch.use_2cta_instrs,
+        use_clc_descriptor=dispatch.use_clc_descriptor,
+        is_q_len_one=dispatch.is_q_len_one and not dispatch.use_2cta_instrs,
+        q1_split_kv=config.split_kv,
+        q1_single_warp_epilogue=config.single_warp_epilogue,
+        q1_m64_silu_warps=config.m64_silu_warps,
+        q1_m64_inplace_silu=config.m64_inplace_silu,
+        q1_m64_16dp_silu=config.m64_16dp_silu,
+        q1_m64_tail_branch=config.m64_tail_branch,
+        q1_m64_kv_stage=config.m64_kv_stage,
+    )
+    with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"), torch.cuda.device(q.device):
+        hstu_varlen_fwd_100.compile_cache[dispatch.compile_key] = cute.compile(
+            hstu_fwd_sm100,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            Int32(max_seqlen_q),
+            Int32(max_seqlen_k),
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            alpha,
+            scaling_seqlen,
+            compile_stream,
+            dispatch.window_size_left,
+            dispatch.window_size_right,
+            func_tensor,
+            paged_kv_tensor,
+            page_ids_tensor,
+            page_indptrs_tensor,
+            block_sparse_cute,
+            options="--enable-tvm-ffi",
+        )
+
+
+def hstu_varlen_fwd_100(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    func: torch.Tensor,
+    paged_kv: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
+    page_indptrs: Optional[torch.Tensor] = None,
+    scaling_seqlen: Optional[float] = None,
+    *,
+    out: torch.Tensor,
+    workspace: Optional[torch.Tensor] = None,
+    _compile_only: bool = False,
+    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
+):
+    """Run (or, with ``_compile_only``, just compile) the SM100 HSTU forward into ``out``.
+
+    ``workspace`` must hold ``hstu_varlen_fwd_100_scratch_bytes(...)`` bytes at execute
+    when ``func`` is given; it is not touched in compile-only mode.
+    """
+    scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
+    dispatch = _fwd_dispatch(
+        q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, func, paged_kv, page_ids, page_indptrs, _q1_fwd_tuning_config
+    )
+
+    # Keep the public output in the standard contiguous (T, H, D) layout so
+    # downstream callers can flatten it with view() without an extra copy.
+    if out.shape != q.shape:
+        raise ValueError(f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}")
+    if out.dtype != q.dtype or out.device != q.device:
+        raise ValueError("out must have the same dtype and device as q")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    # q/k/v are read through mark_layout_dynamic(leading_dim=ndim-1) with 128-bit copies; anything
+    # else is declined in HSTUFwdSm100.check_support (R5), never staged here.
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
+
+    paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1]) if dispatch.is_paged else None
+    if dispatch.compile_key not in hstu_varlen_fwd_100.compile_cache:
+        _compile_fwd(
+            dispatch, q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, alpha, scaling_seqlen, func, paged_kv_flat, page_ids, page_indptrs
+        )
+
+    block_sparse_tensors = None
+    if dispatch.q2k_block_size is not None:
+        if _compile_only:
+            build_hstu_q2k_block_sparse(
                 func,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                block_size=q2k_block_size,
-                compile_only=_compile_only,
-            )
-
-    if _compile_only and compile_key in hstu_varlen_fwd_100.compile_cache:
-        return out, None
-
-    # The forward kernel only needs a contiguous last dim (q/k/v are passed via
-    # mark_layout_dynamic(leading_dim=ndim-1)); full contiguity is not required.
-    # When the (T,H,D) inputs already have a unit-stride last dim and 128-bit
-    # aligned token/head strides, feed them in their original layout and skip the
-    # contiguous copy. Non-aligned execution inputs use a real D2D clone; a
-    # compile-only miss only needs matching empty layout samples.
-    needs_contiguous_inputs = not (_supports_bwd_original_qkv_layout(q) and _supports_bwd_original_qkv_layout(k) and _supports_bwd_original_qkv_layout(v))
-    if needs_contiguous_inputs:
-        if _compile_only:
-            q, k, v = [torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device) for tensor in (q, k, v)]
-        else:
-            q = q.clone(memory_format=torch.contiguous_format)
-            k = k.clone(memory_format=torch.contiguous_format)
-            v = v.clone(memory_format=torch.contiguous_format)
-
-    paged_kv_flat = None
-    if is_paged:
-        paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
-
-    if compile_key not in hstu_varlen_fwd_100.compile_cache:
-        if q1_dynamic_thd:
-            total_q = cute.sym_int(divisibility=1)
-            total_k = cute.sym_int(divisibility=1)
-            batch_plus_one = cute.sym_int(divisibility=1)
-            q_tensor = _make_q1_dynamic_thd_tensor(q, total_q)
-            k_tensor = _make_q1_dynamic_thd_tensor(k, total_k)
-            v_tensor = _make_q1_dynamic_thd_tensor(v, total_k)
-            o_tensor = _make_q1_dynamic_thd_tensor(out, total_q)
-            for tensor in (cu_seqlens_q, cu_seqlens_k):
-                if tensor.data_ptr() % 16 != 0:
-                    raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
-            cu_seqlens_q_tensor = cute.runtime.make_fake_compact_tensor(
-                Int32,
-                (batch_plus_one,),
-                stride_order=(0,),
-                assumed_align=16,
-            )
-            cu_seqlens_k_tensor = cute.runtime.make_fake_compact_tensor(
-                Int32,
-                (batch_plus_one,),
-                stride_order=(0,),
-                assumed_align=16,
+                block_size=dispatch.q2k_block_size,
+                compile_only=True,
             )
         else:
-            q_tensor, k_tensor, v_tensor, o_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)]
-            cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
-        func_tensor = _mark_optional_tensor(func)
-        paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [_mark_optional_tensor(tensor) for tensor in (paged_kv_flat, page_ids, page_indptrs)]
-        block_sparse_cute = _mark_block_sparse_tensors(block_sparse_tensors)
-        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        hstu_fwd_sm100 = HSTUAttentionForwardSm100(
-            head_dim=head_dim,
-            is_causal=is_causal,
-            is_local=is_local,
-            is_arbitrary=is_arbitrary,
-            is_paged=is_paged,
-            func_num=func_num,
-            kBlockM=kBlockM,
-            kBlockN=kBlockN,
-            use_auto_block_metadata=use_auto_block_metadata,
-            use_2cta_instrs=use_2cta_instrs,
-            use_clc_descriptor=use_clc_descriptor,
-            is_q_len_one=is_q_len_one and not use_2cta_instrs,
-            q1_split_kv=q1_split_kv,
-            q1_single_warp_epilogue=q1_single_warp_epilogue,
-            q1_m64_silu_warps=q1_m64_silu_warps,
-            q1_m64_inplace_silu=q1_m64_inplace_silu,
-            q1_m64_16dp_silu=q1_m64_16dp_silu,
-            q1_m64_tail_branch=q1_m64_tail_branch,
-            q1_m64_kv_stage=q1_m64_kv_stage,
-        )
-        with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-            hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
-                hstu_fwd_sm100,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                Int32(max_seqlen_q),
-                Int32(max_seqlen_k),
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                alpha,
-                scaling_seqlen,
-                compile_stream,
-                window_size_left,
-                window_size_right,
-                func_tensor,
-                paged_kv_tensor,
-                page_ids_tensor,
-                page_indptrs_tensor,
-                block_sparse_cute,
-                options="--enable-tvm-ffi",
-            )
+            with torch.cuda.nvtx.range("hstu_q2k_block_sparse_builder"):
+                block_sparse_tensors = build_hstu_q2k_block_sparse(
+                    func,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    block_size=dispatch.q2k_block_size,
+                    workspace=workspace,
+                )
 
     if _compile_only:
         return out, None
 
     with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-        if q1_split_kv > 1:
+        if dispatch.q1_fwd_config.split_kv > 1:
             out.zero_()
-        compiled_fwd = hstu_varlen_fwd_100.compile_cache[compile_key]
+        compiled_fwd = hstu_varlen_fwd_100.compile_cache[dispatch.compile_key]
         compiled_fwd(
             q,
             k,
@@ -738,8 +825,8 @@ def hstu_varlen_fwd_100(
             cu_seqlens_k,
             alpha,
             scaling_seqlen,
-            window_size_left,
-            window_size_right,
+            dispatch.window_size_left,
+            dispatch.window_size_right,
             func,
             paged_kv_flat,
             page_ids,
@@ -753,7 +840,28 @@ def hstu_varlen_fwd_100(
 hstu_varlen_fwd_100.compile_cache = {}
 
 
-def hstu_varlen_bwd_100(
+class _BwdDispatch(NamedTuple):
+    """Host-side backward routing derived from plan-time metadata only (Rule 4)."""
+
+    route: str  # "q1_direct" | "d256" | "fused"
+    head_dim: int
+    num_heads: int
+    batch_size: int
+    window_size_left: int
+    window_size_right: int
+    is_causal: bool
+    is_local: bool
+    is_arbitrary: bool
+    func_num: int
+    m_block_size: int
+    n_block_size: int
+    use_2cta_instrs: bool
+    q1_split_kv: int
+    q1_rows_per_warp: int
+    compile_key: Optional[tuple]  # fused route only
+
+
+def _bwd_dispatch(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -762,23 +870,17 @@ def hstu_varlen_bwd_100(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     window_size_left: int,
     window_size_right: int,
-    alpha: float,
-    func: torch.Tensor,
+    func: Optional[torch.Tensor],
     deterministic: bool,
-    scaling_seqlen: Optional[float] = None,
-    *,
-    _compile_only: bool = False,
-    _q1_bwd_algorithm: str = "auto",
-):
-    scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
+    _q1_bwd_algorithm: str,
+) -> _BwdDispatch:
     if deterministic:
         raise NotImplementedError("deterministic HSTU backward is not supported")
-    # asserts
     q_dtype = q.dtype
     assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
     assert k.dtype == q_dtype, "k and q must have the same dtype"
@@ -797,6 +899,8 @@ def hstu_varlen_bwd_100(
     assert k.shape[2] == head_dim, "k and q must have the same head_dim"
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
     assert do.shape == q.shape, "do and q must have the same shape"
+    if dq.shape != q.shape or dk.shape != k.shape or dv.shape != v.shape:
+        raise ValueError("HSTU gradient outputs must match their corresponding inputs")
 
     is_q_len_one_supported = max_seqlen_q == 1 and head_dim in (64, 128, 256)
     m_block_size = 128
@@ -809,9 +913,7 @@ def hstu_varlen_bwd_100(
     func_num = func.shape[-2] if func is not None else 0
     use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_supported
     q1_inputs_direct = all(_supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
-    q1_outputs_direct = (dq is None and dk is None and dv is None) or (
-        dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
-    )
+    q1_outputs_direct = all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS)
     if _q1_bwd_algorithm not in q1_bwd_algorithms:
         raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
@@ -820,22 +922,241 @@ def hstu_varlen_bwd_100(
         raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal or local qlen=1 with D=64/128/256 and direct layouts")
     if _Q1_BWD_DIRECT_SPLITS.get(_q1_bwd_algorithm, 1) > 1 and q_dtype != torch.bfloat16:
         raise ValueError("The split-KV qlen=1 backward algorithms currently require BF16")
-    capability = _get_q1_device_capability(q.device)
-    q1_split_supported = q1_direct_supported and q_dtype == torch.bfloat16
-    q1_bwd_split_kv = _select_q1_bwd_split_kv(
-        _q1_bwd_algorithm,
-        capability,
-        q1_split_supported,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        total_kv=k.shape[0],
-        head_dim=head_dim,
-    )
+
+    route = "fused"
+    q1_split_kv = 1
+    q1_rows_per_warp = 1
+    compile_key = None
     if q1_direct_supported:
+        route = "q1_direct"
+        q1_split_kv = _select_q1_bwd_split_kv(
+            _q1_bwd_algorithm,
+            _get_q1_device_capability(q.device),
+            q_dtype == torch.bfloat16,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            total_kv=k.shape[0],
+            head_dim=head_dim,
+        )
         selected_q1_bwd_algorithm = "direct-pair" if _q1_bwd_algorithm == "auto" else _q1_bwd_algorithm
         # Keep every lane on one aligned 128-bit vector. A warp consequently packs
         # four D64 rows, two D128 rows, or one D256 row.
         q1_rows_per_warp = 256 // head_dim if selected_q1_bwd_algorithm.startswith("direct-pair") else 1
+    elif head_dim == 256:
+        # The fused one-CTA kernel's live TMEM ranges exceed the SM100
+        # 512-column capacity at D=256. Use the dedicated two-kernel path:
+        # dQ first, followed by dK/dV.
+        route = "d256"
+    else:
+        compile_key = (
+            q.device,
+            q_dtype,
+            head_dim,
+            m_block_size,
+            n_block_size,
+            is_causal,
+            is_local,
+            is_arbitrary,
+            func_num,
+            is_arbitrary,  # use_auto_block_metadata
+            use_2cta_instrs,
+        )
+    return _BwdDispatch(
+        route=route,
+        head_dim=head_dim,
+        num_heads=num_heads,
+        batch_size=batch_size,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        is_causal=is_causal,
+        is_local=is_local,
+        is_arbitrary=is_arbitrary,
+        func_num=func_num,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        use_2cta_instrs=use_2cta_instrs,
+        q1_split_kv=q1_split_kv,
+        q1_rows_per_warp=q1_rows_per_warp,
+        compile_key=compile_key,
+    )
+
+
+def _fused_bwd_accumulator_shape(dispatch: _BwdDispatch, total_q: int) -> tuple[int, int, int]:
+    """(H, T + pad, D8) fp32 dQ accumulator; the 2-CTA schedule pads one M tile per sequence."""
+    padding_rows = dispatch.batch_size * dispatch.m_block_size if dispatch.use_2cta_instrs else 0
+    return (dispatch.num_heads, int(total_q) + padding_rows, (dispatch.head_dim + 7) // 8 * 8)
+
+
+def _bwd_scratch_bytes(dispatch: _BwdDispatch, total_q: int, max_seqlen_q: int, max_seqlen_k: int) -> int:
+    if dispatch.route == "q1_direct":
+        return 0
+    if dispatch.route == "d256":
+        if not dispatch.is_arbitrary:
+            return 0
+        return hstu_d256_bwd_block_sparse_workspace_bytes(dispatch.batch_size, max_seqlen_q, max_seqlen_k)
+    nbytes = ws_align(4 * math.prod(_fused_bwd_accumulator_shape(dispatch, total_q)))
+    if dispatch.is_arbitrary:
+        nbytes += hstu_k2q_block_sparse_workspace_bytes(dispatch.batch_size, max_seqlen_q, max_seqlen_k, (dispatch.m_block_size, dispatch.n_block_size))
+    return nbytes
+
+
+def hstu_varlen_bwd_100_scratch_bytes(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    func: Optional[torch.Tensor],
+    deterministic: bool,
+    scaling_seqlen: Optional[float] = None,
+    *,
+    _q1_bwd_algorithm: str = "auto",
+) -> int:
+    """Workspace bytes ``hstu_varlen_bwd_100`` carves at execute.
+
+    qlen=1 direct: 0. D=256 two-kernel: the paired block metadata when ``func`` is given.
+    Fused D32/D64/D128: the fp32 dQ accumulator plus the K2Q block metadata when ``func`` is given.
+    """
+    dispatch = _bwd_dispatch(
+        do,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dq,
+        dk,
+        dv,
+        window_size_left,
+        window_size_right,
+        func,
+        deterministic,
+        _q1_bwd_algorithm,
+    )
+    return _bwd_scratch_bytes(dispatch, q.shape[0], max_seqlen_q, max_seqlen_k)
+
+
+def _compile_fused_bwd(
+    dispatch: _BwdDispatch,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    do: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    func: Optional[torch.Tensor],
+    alpha: float,
+    scaling_seqlen: float,
+    problem_shape,
+) -> None:
+    q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
+        _mark_dynamic_tensor(tensor, 1, compact=False) for tensor in (q, k, v, do, dq, dk, dv)
+    ]
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
+    func_tensor = _mark_optional_tensor(func)
+    # The accumulator and the block metadata are execute-time scratch carved from the caller's workspace (R2/R11).
+    block_sparse_cute = fake_block_sparse_tensors() if dispatch.is_arbitrary else None
+    compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
+        element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
+        head_dim=dispatch.head_dim,
+        tile_m=dispatch.m_block_size,
+        tile_n=dispatch.n_block_size,
+        is_causal=dispatch.is_causal,
+        is_local=dispatch.is_local,
+        is_arbitrary=dispatch.is_arbitrary,
+        func_num=dispatch.func_num,
+        use_auto_block_metadata=dispatch.is_arbitrary,
+        use_2cta_instrs=dispatch.use_2cta_instrs,
+    )
+    with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"), torch.cuda.device(q.device):
+        hstu_varlen_bwd_100.compile_cache[dispatch.compile_key] = cute.compile(
+            hstu_bwd_sm100,
+            problem_shape,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            dq_tensor,
+            dk_tensor,
+            dv_tensor,
+            do_tensor,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            Int32(dispatch.window_size_left),
+            Int32(dispatch.window_size_right),
+            func_tensor,
+            alpha,
+            scaling_seqlen,
+            _fake_fp32_accumulator(),
+            block_sparse_cute,
+            compile_stream,
+            options="--enable-tvm-ffi",
+        )
+
+
+def hstu_varlen_bwd_100(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+    func: torch.Tensor,
+    deterministic: bool,
+    scaling_seqlen: Optional[float] = None,
+    *,
+    workspace: Optional[torch.Tensor] = None,
+    _compile_only: bool = False,
+    _q1_bwd_algorithm: str = "auto",
+):
+    """Run (or, with ``_compile_only``, just compile) the SM100 HSTU backward into ``dq``/``dk``/``dv``.
+
+    ``workspace`` must hold ``hstu_varlen_bwd_100_scratch_bytes(...)`` bytes at execute;
+    it is not touched in compile-only mode. Layouts the kernels cannot address natively
+    raise ``ValueError`` here and are declined by ``HSTUBwdSm100.check_support`` (R5).
+    """
+    scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
+    dispatch = _bwd_dispatch(
+        do,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dq,
+        dk,
+        dv,
+        window_size_left,
+        window_size_right,
+        func,
+        deterministic,
+        _q1_bwd_algorithm,
+    )
+    if dispatch.route == "q1_direct":
         return _hstu_varlen_bwd_q1_direct(
             do,
             q,
@@ -845,20 +1166,17 @@ def hstu_varlen_bwd_100(
             cu_seqlens_k,
             alpha,
             scaling_seqlen,
-            is_local,
-            window_size_left,
-            window_size_right,
-            q1_bwd_split_kv,
-            q1_rows_per_warp,
+            dispatch.is_local,
+            dispatch.window_size_left,
+            dispatch.window_size_right,
+            dispatch.q1_split_kv,
+            dispatch.q1_rows_per_warp,
             dq,
             dk,
             dv,
             _compile_only=_compile_only,
         )
-    if head_dim == 256:
-        # The fused one-CTA kernel's live TMEM ranges exceed the SM100
-        # 512-column capacity at D=256. Use the dedicated two-kernel path:
-        # dQ first, followed by dK/dV.
+    if dispatch.route == "d256":
         from ._kernels.hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
 
         return hstu_varlen_bwd_256_cute(
@@ -873,17 +1191,52 @@ def hstu_varlen_bwd_100(
             dq,
             dk,
             dv,
-            window_size_left,
-            window_size_right,
+            dispatch.window_size_left,
+            dispatch.window_size_right,
             alpha,
             scaling_seqlen,
             func=func,
+            workspace=workspace,
             _compile_only=_compile_only,
         )
 
-    use_auto_block_metadata = is_arbitrary
+    for name, tensor in (("q", q), ("k", k), ("v", v), ("do", do)):
+        _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
+    for name, tensor in (("dq", dq), ("dk", dk), ("dv", dv)):
+        _require_native_layout(name, tensor, _supports_bwd_direct_grad_layout(tensor))
+
+    total_q = q.shape[0]
+    dq_out, dk_out, dv_out = dq, dk, dv
+    q, k, v, do, dq, dk, dv = [_as_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do, dq, dk, dv)]
+    accumulator_shape = _fused_bwd_accumulator_shape(dispatch, total_q)
+    block_size = (dispatch.m_block_size, dispatch.n_block_size)
+    problem_shape = (
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        Int32(dispatch.head_dim),
+        ((Int32(1), Int32(dispatch.num_heads)), Int32(dispatch.batch_size)),
+    )
+    if dispatch.compile_key not in hstu_varlen_bwd_100.compile_cache:
+        _compile_fused_bwd(dispatch, q, k, v, do, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, func, alpha, scaling_seqlen, problem_shape)
+
+    if _compile_only:
+        if dispatch.is_arbitrary:
+            build_hstu_k2q_block_sparse(
+                func,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                block_size=block_size,
+                compile_only=True,
+            )
+        return dq_out, dk_out, dv_out
+
+    carver = WorkspaceCarver(workspace, _bwd_scratch_bytes(dispatch, total_q, max_seqlen_q, max_seqlen_k), "HSTUBwdSm100")
+    accumulator = carver.take(math.prod(accumulator_shape), torch.float32).view(accumulator_shape)
+    accumulator.zero_()
     block_sparse_tensors = None
-    if use_auto_block_metadata:
+    if dispatch.is_arbitrary:
         # Build on every execution so in-place func updates, including CUDA
         # Graph replay updates, are visible to the consumer.  The private K2Q
         # layout is fixed by the fused D32/D64/D128 backward tile contract.
@@ -893,179 +1246,12 @@ def hstu_varlen_bwd_100(
             cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            block_size=(m_block_size, n_block_size),
-            compile_only=_compile_only,
+            block_size=block_size,
+            workspace=carver.remaining(),
         )
-
-    q_orig, k_orig, v_orig = q, k, v
-    dq_orig, dk_orig, dv_orig = dq, dk, dv
-    use_original_qkv_layout = _supports_bwd_original_qkv_layout(q) and _supports_bwd_original_qkv_layout(k) and _supports_bwd_original_qkv_layout(v)
-    use_original_do_layout = _supports_bwd_original_qkv_layout(do)
-    no_preallocated_grads = dq is None and dk is None and dv is None
-    implicit_direct_grads = no_preallocated_grads and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (q_orig, k_orig, v_orig))
-    preallocated_direct_grads = (
-        dq is not None
-        and dk is not None
-        and dv is not None
-        and _supports_bwd_direct_grad_layout(dq)
-        and _supports_bwd_direct_grad_layout(dk)
-        and _supports_bwd_direct_grad_layout(dv)
-    )
-    # Gradient stores are independent of whether q/k/v use their original
-    # layouts or compact read-only staging buffers.
-    use_original_grad_layout = implicit_direct_grads or preallocated_direct_grads
-    compile_key = (
-        q_orig.device,
-        q_dtype,
-        head_dim,
-        m_block_size,
-        n_block_size,
-        use_original_qkv_layout,
-        use_original_do_layout,
-        use_original_grad_layout,
-        is_causal,
-        is_local,
-        is_arbitrary,
-        func_num,
-        use_auto_block_metadata,
-        use_2cta_instrs,
-    )
-    if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
-        if no_preallocated_grads:
-            dq_orig, dk_orig, dv_orig = [torch.empty_like(tensor, memory_format=torch.preserve_format) for tensor in (q_orig, k_orig, v_orig)]
-        return dq_orig, dk_orig, dv_orig
-
-    if use_original_qkv_layout:
-        q = _as_bwd_original_qkv_layout(q)
-        k = _as_bwd_original_qkv_layout(k)
-        v = _as_bwd_original_qkv_layout(v)
-    elif _compile_only:
-        q, k, v = [_empty_bwd_compact_layout_like(tensor) for tensor in (q, k, v)]
-    else:
-        q = _as_bwd_compact_layout(q)
-        k = _as_bwd_compact_layout(k)
-        v = _as_bwd_compact_layout(v)
-
-    # Preserve an aligned dO layout and avoid a compact staging copy.
-    if use_original_do_layout:
-        do = _as_bwd_original_qkv_layout(do)
-    elif _compile_only:
-        do = _empty_bwd_compact_layout_like(do)
-    else:
-        do = _as_bwd_compact_layout(do)
-
-    if use_original_grad_layout:
-        if no_preallocated_grads:
-            dq_orig, dk_orig, dv_orig = [
-                torch.empty_strided(
-                    tensor.shape,
-                    tensor.stride(),
-                    dtype=tensor.dtype,
-                    device=tensor.device,
-                )
-                for tensor in (q_orig, k_orig, v_orig)
-            ]
-        dq, dk, dv = [_as_bwd_original_qkv_layout(tensor) for tensor in (dq_orig, dk_orig, dv_orig)]
-    elif use_original_qkv_layout:
-        dq = _empty_bwd_compact_layout_like(q_orig)
-        dk = _empty_bwd_compact_layout_like(k_orig)
-        dv = _empty_bwd_compact_layout_like(v_orig)
-    else:
-        dq = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
-        dk = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
-        dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
-
-    workspace_head_dim = (head_dim + 7) // 8 * 8
-    # Allocate and initialize the accumulation workspace directly on the GPU.
-    workspace_padding_rows = batch_size * m_block_size if use_2cta_instrs else 0
-    workspace_torch = torch.empty(
-        (
-            num_heads,
-            q.shape[0] + workspace_padding_rows,
-            workspace_head_dim,
-        ),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    if not _compile_only:
-        workspace_torch.zero_()
-    problem_shape = (
-        Int32(max_seqlen_q),
-        Int32(max_seqlen_k),
-        Int32(head_dim),
-        ((Int32(1), Int32(num_heads)), Int32(batch_size)),
-    )
-    if compile_key not in hstu_varlen_bwd_100.compile_cache:
-        q_tensor, k_tensor, v_tensor = [
-            _mark_dynamic_tensor(
-                tensor,
-                1,
-                compact=not use_original_qkv_layout,
-            )
-            for tensor in (q, k, v)
-        ]
-        do_tensor = _mark_dynamic_tensor(
-            do,
-            1,
-            compact=not use_original_do_layout,
-        )
-        dq_tensor, dk_tensor, dv_tensor = [
-            _mark_dynamic_tensor(
-                tensor,
-                1,
-                compact=not use_original_grad_layout,
-            )
-            for tensor in (dq, dk, dv)
-        ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
-        func_tensor = _mark_optional_tensor(func)
-        workspace = _mark_dynamic_tensor(
-            workspace_torch,
-            workspace_torch.ndim - 1,
-        )
-        block_sparse_cute = _mark_block_sparse_tensors(block_sparse_tensors)
-        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
-            element_dtype=Float16 if q_dtype == torch.float16 else BFloat16,
-            head_dim=head_dim,
-            tile_m=m_block_size,
-            tile_n=n_block_size,
-            is_causal=is_causal,
-            is_local=is_local,
-            is_arbitrary=is_arbitrary,
-            func_num=func_num,
-            use_auto_block_metadata=use_auto_block_metadata,
-            use_2cta_instrs=use_2cta_instrs,
-        )
-        with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
-            hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(
-                hstu_bwd_sm100,
-                problem_shape,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                dq_tensor,
-                dk_tensor,
-                dv_tensor,
-                do_tensor,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                Int32(window_size_left),
-                Int32(window_size_right),
-                func_tensor,
-                alpha,
-                scaling_seqlen,
-                workspace,
-                block_sparse_cute,
-                compile_stream,
-                options="--enable-tvm-ffi",
-            )
-
-    if _compile_only:
-        return dq_orig, dk_orig, dv_orig
 
     with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
-        compiled_bwd = hstu_varlen_bwd_100.compile_cache[compile_key]
+        compiled_bwd = hstu_varlen_bwd_100.compile_cache[dispatch.compile_key]
         compiled_bwd(
             problem_shape,
             q,
@@ -1077,33 +1263,15 @@ def hstu_varlen_bwd_100(
             do,
             cu_seqlens_q,
             cu_seqlens_k,
-            Int32(window_size_left),
-            Int32(window_size_right),
+            Int32(dispatch.window_size_left),
+            Int32(dispatch.window_size_right),
             func,
             alpha,
             scaling_seqlen,
-            workspace_torch,
+            accumulator,
             _runtime_block_sparse_tensors(block_sparse_tensors),
         )
-
-    if use_original_grad_layout:
-        return dq_orig, dk_orig, dv_orig
-
-    dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)
-    dk = dk.squeeze(4).squeeze(2).permute(0, 2, 1)
-    dv = dv.squeeze(4).squeeze(2).permute(0, 2, 1)
-
-    if dq_orig is not None:
-        dq_orig.copy_(dq)
-        dq = dq_orig
-    if dk_orig is not None:
-        dk_orig.copy_(dk)
-        dk = dk_orig
-    if dv_orig is not None:
-        dv_orig.copy_(dv)
-        dv = dv_orig
-
-    return dq, dk, dv
+    return dq_out, dk_out, dv_out
 
 
 hstu_varlen_bwd_100.compile_cache = {}

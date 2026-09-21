@@ -25,7 +25,10 @@ from .hstu_bwd_256_cute_dkdv import (
 from .hstu_bwd_256_cute_dq import (
     BlackwellFusedMultiHeadAttentionBackwardDQKernel,
 )
-from .block_sparse_builder import build_hstu_d256_bwd_block_sparse
+from .block_sparse_builder import (
+    build_hstu_d256_bwd_block_sparse,
+    fake_block_sparse_tensors,
+)
 from .block_sparsity import HSTUBlockSparseTensors
 
 
@@ -165,64 +168,10 @@ def _dynamic_optional_tensor(
     return None if tensor is None else _dynamic_tensor(tensor, tensor.ndim - 1)
 
 
-def _dynamic_block_sparse_tensors(
-    tensors,
-) -> Optional[HSTUBlockSparseTensors]:
-    if tensors is None:
-        return None
-    return HSTUBlockSparseTensors(*(_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in tensors[:6]))
-
-
 def _runtime_block_sparse_tensors(tensors):
     if tensors is None:
         return None
     return tuple(tensors[:6])
-
-
-def _copy_to_optional_output(
-    work: torch.Tensor,
-    output: Optional[torch.Tensor],
-) -> torch.Tensor:
-    if output is None:
-        return work
-    assert output.shape == work.shape
-    assert output.dtype == work.dtype
-    assert output.device == work.device
-    if output.data_ptr() == work.data_ptr():
-        return output
-    output.copy_(work)
-    return output
-
-
-def _native_output_buffer(
-    output: Optional[torch.Tensor],
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    if (
-        output is not None
-        and output.shape == reference.shape
-        and output.dtype == reference.dtype
-        and output.device == reference.device
-        and output.is_contiguous()
-    ):
-        return output
-    return torch.empty_like(reference)
-
-
-def _compact_input_buffer(
-    tensor: torch.Tensor,
-    *,
-    compile_only: bool,
-) -> torch.Tensor:
-    if tensor.is_contiguous():
-        return tensor
-    if compile_only:
-        return torch.empty(
-            tensor.shape,
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-    return tensor.contiguous()
 
 
 def hstu_varlen_bwd_256_cute(
@@ -234,21 +183,25 @@ def hstu_varlen_bwd_256_cute(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
     window_size_left: int,
     window_size_right: int,
     alpha: float,
     scaling_seqlen: float,
     *,
     func: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compile and run the native CuTe DSL D=256 path.
 
     Native predicates cover unmasked, causal, local, and arbitrary-interval
-    attention.
+    attention. The dedicated kernels take fully compact TMA operands, so all
+    seven data tensors must be contiguous (declined upstream by
+    ``HSTUBwdSm100.check_support``, R5). With ``func``, ``workspace`` holds the
+    paired block metadata (``hstu_d256_bwd_block_sparse_workspace_bytes``).
     """
     assert q.ndim == k.ndim == v.ndim == do.ndim == 3
     assert q.is_cuda and k.is_cuda and v.is_cuda and do.is_cuda
@@ -256,6 +209,10 @@ def hstu_varlen_bwd_256_cute(
     assert q.dtype == k.dtype == v.dtype == do.dtype
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == do.shape[-1] == 256
     assert q.shape[1] == k.shape[1] == v.shape[1] == do.shape[1]
+    assert dq.shape == q.shape and dk.shape == k.shape and dv.shape == v.shape
+    assert dq.dtype == dk.dtype == dv.dtype == q.dtype
+    for tensor in (q, k, v, do, dq, dk, dv):
+        assert tensor.is_contiguous(), "HSTU D=256 backward requires contiguous q/k/v/do/dq/dk/dv"
     assert cu_seqlens_q.dtype == cu_seqlens_k.dtype == torch.int32
     assert cu_seqlens_q.numel() == cu_seqlens_k.numel()
     assert max_seqlen_q > 0 and max_seqlen_k > 0
@@ -276,21 +233,6 @@ def hstu_varlen_bwd_256_cute(
         assert func_num > 0 and func_num % 2 == 1
 
     use_auto_block_metadata = is_arbitrary
-    q2k_block_sparse_tensors = None
-    k2q_block_sparse_tensors = None
-    if use_auto_block_metadata:
-        (
-            q2k_block_sparse_tensors,
-            k2q_block_sparse_tensors,
-        ) = build_hstu_d256_bwd_block_sparse(
-            func,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            compile_only=_compile_only,
-        )
-
     batch_size = cu_seqlens_q.numel() - 1
     # Full tiles may skip predicates only when no semantic mask remains.
     skip_residual_mask = (
@@ -314,29 +256,16 @@ def hstu_varlen_bwd_256_cute(
         skip_residual_mask,
         use_auto_block_metadata,
     )
-    if _compile_only and compile_key in hstu_varlen_bwd_256_cute.compile_cache:
-        return tuple(
-            output if output is not None else torch.empty_like(reference, memory_format=torch.preserve_format)
-            for output, reference in ((dq, q), (dk, k), (dv, v))
-        )
-
-    # The dedicated kernels require fully compact TMA operands. Preserve the
-    # public layout contract by materializing compact inputs when necessary.
-    q_work = _compact_input_buffer(q, compile_only=_compile_only)
-    k_work = _compact_input_buffer(k, compile_only=_compile_only)
-    v_work = _compact_input_buffer(v, compile_only=_compile_only)
-    do_work = _compact_input_buffer(do, compile_only=_compile_only)
-    dq_work = _native_output_buffer(dq, q_work)
-    dk_work = _native_output_buffer(dk, k_work)
-    dv_work = _native_output_buffer(dv, v_work)
     normalization_scale = 1.0 / scaling_seqlen
     if compile_key not in hstu_varlen_bwd_256_cute.compile_cache:
-        q_tensor, k_tensor, v_tensor, do_tensor = [_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q_work, k_work, v_work, do_work)]
-        dq_tensor, dk_tensor, dv_tensor = [_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (dq_work, dk_work, dv_work)]
+        q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
+            _dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, do, dq, dk, dv)
+        ]
         cu_q_tensor, cu_k_tensor = [_dynamic_tensor(tensor, 0) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         func_tensor = _dynamic_optional_tensor(func)
-        q2k_block_sparse_cute = _dynamic_block_sparse_tensors(q2k_block_sparse_tensors)
-        k2q_block_sparse_cute = _dynamic_block_sparse_tensors(k2q_block_sparse_tensors)
+        # Both CSR orientations are execute-time scratch carved from the caller's workspace (R2/R11).
+        q2k_block_sparse_cute = fake_block_sparse_tensors() if use_auto_block_metadata else None
+        k2q_block_sparse_cute = fake_block_sparse_tensors() if use_auto_block_metadata else None
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = HSTUAttentionBackwardSm100D256(
             is_causal=is_causal,
@@ -347,40 +276,62 @@ def hstu_varlen_bwd_256_cute(
             skip_residual_mask=skip_residual_mask,
             use_auto_block_metadata=use_auto_block_metadata,
         )
-        hstu_varlen_bwd_256_cute.compile_cache[compile_key] = cute.compile(
-            kernel,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            do_tensor,
-            dq_tensor,
-            dk_tensor,
-            dv_tensor,
-            cu_q_tensor,
-            cu_k_tensor,
-            func_tensor,
-            Int32(max_seqlen_q),
-            Int32(max_seqlen_k),
-            alpha,
-            normalization_scale,
-            q2k_block_sparse_cute,
-            k2q_block_sparse_cute,
-            compile_stream,
-            options="--enable-tvm-ffi",
-        )
+        with torch.cuda.device(q.device):
+            hstu_varlen_bwd_256_cute.compile_cache[compile_key] = cute.compile(
+                kernel,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                do_tensor,
+                dq_tensor,
+                dk_tensor,
+                dv_tensor,
+                cu_q_tensor,
+                cu_k_tensor,
+                func_tensor,
+                Int32(max_seqlen_q),
+                Int32(max_seqlen_k),
+                alpha,
+                normalization_scale,
+                q2k_block_sparse_cute,
+                k2q_block_sparse_cute,
+                compile_stream,
+                options="--enable-tvm-ffi",
+            )
 
     if _compile_only:
-        return tuple(output if output is not None else work for output, work in ((dq, dq_work), (dk, dk_work), (dv, dv_work)))
+        if use_auto_block_metadata:
+            build_hstu_d256_bwd_block_sparse(
+                func,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                compile_only=True,
+            )
+        return dq, dk, dv
+
+    q2k_block_sparse_tensors = None
+    k2q_block_sparse_tensors = None
+    if use_auto_block_metadata:
+        q2k_block_sparse_tensors, k2q_block_sparse_tensors = build_hstu_d256_bwd_block_sparse(
+            func,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            workspace=workspace,
+        )
 
     compiled = hstu_varlen_bwd_256_cute.compile_cache[compile_key]
     compiled(
-        q_work,
-        k_work,
-        v_work,
-        do_work,
-        dq_work,
-        dk_work,
-        dv_work,
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
         cu_seqlens_q,
         cu_seqlens_k,
         func,
@@ -391,11 +342,7 @@ def hstu_varlen_bwd_256_cute(
         _runtime_block_sparse_tensors(q2k_block_sparse_tensors),
         _runtime_block_sparse_tensors(k2q_block_sparse_tensors),
     )
-    return (
-        _copy_to_optional_output(dq_work, dq),
-        _copy_to_optional_output(dk_work, dk),
-        _copy_to_optional_output(dv_work, dv),
-    )
+    return dq, dk, dv
 
 
 hstu_varlen_bwd_256_cute.compile_cache = {}
