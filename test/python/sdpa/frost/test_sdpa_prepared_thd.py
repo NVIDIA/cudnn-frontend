@@ -25,11 +25,16 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
-def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True):
+def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
     stride (the declaration's span is then far below the buffer's)."""
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=override_enabled,
+    )
     q_bs = ragged_batch_stride if ragged_batch_stride is not None else ql * hq * d
     kv_bs = ragged_batch_stride if ragged_batch_stride is not None else kl * hk * d
     tq = g.tensor(dim=[b, hq, ql, d], stride=[q_bs, d, hq * d, 1], data_type=cudnn.data_type.BFLOAT16, name="q")
@@ -480,7 +485,7 @@ def test_bounded_override_through_graph_execute():
     nor the compiler run. An override outside the domain (more sequences than declared) is
     rejected before any output seed or launch."""
     b, ql, kl, hq, hk, d = 8, 4, 64, 8, 2, 128
-    g, t = _thd_graph(b, ql, kl, hq, hk, d)
+    g, t = _thd_graph(b, ql, kl, hq, hk, d, override_enabled=True)
     plan = _plan(g)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     spec = plan._prepared.spec
@@ -612,11 +617,17 @@ def _dense_graph(
     stats=True,
     stats_log2=False,
     o_stride=None,
+    override_enabled=False,
 ):
     """A dense bf16 graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
     repacks and the prepared launch therefore declines)."""
     d_v = d if d_v is None else d_v
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=override_enabled,
+    )
 
     def st(hh, s, dd):
         return [s * hh * dd, dd, hh * dd, 1] if bshd_storage else [hh * s * dd, s * dd, dd, 1]
@@ -1083,3 +1094,34 @@ def test_prepared_split_survives_collecting_another_plan_during_capture(d):
         torch.cuda.set_stream(previous_stream)
         if was_enabled:
             gc.enable()
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("split", [1, 2])
+def test_override_enabled_dense_plan_honors_bounded_kv(d, split):
+    """Override admission preserves prepared plans, including split-KV and Stats."""
+    b, h, hk, sq, sk = 1, 8, 2, 4, 2048
+    graph, t = _dense_graph(b, h, hk, sq, sk, d, causal=False, split_kv=split, override_enabled=True)
+    plan = _plan(graph)
+    assert isinstance(plan._prepared, prep_mod.PreparedDenseLaunch)
+    bufs = _dense_buffers(b, h, hk, sq, sk, d, seed=19)
+    bufs["q"].zero_()
+    bufs["k"].zero_()
+    bufs["v"].fill_(9)
+    bufs["v"][:, :, :1024].fill_(1)
+    bufs["o"].fill_(float("nan"))
+    bufs["lse"].fill_(float("nan"))
+    ws = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device=DEV)
+    with _Tripwire():
+        graph.execute(
+            _dense_pack(t, bufs),
+            ws,
+            override_uids=[t[n].get_uid() for n in ("k", "v")],
+            override_shapes=[[b, hk, 1024, d]] * 2,
+            override_strides=[bufs[n].stride() for n in ("k", "v")],
+        )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(bufs["o"], torch.ones_like(bufs["o"]), atol=0, rtol=0)
+    torch.testing.assert_close(bufs["lse"], torch.full_like(bufs["lse"], math.log(1024)), atol=2e-6, rtol=0)

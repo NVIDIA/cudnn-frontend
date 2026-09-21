@@ -44,6 +44,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   defined or explicitly rejected — an unhandled overlap is an untested code
   path with unspecified semantics, and "both supplied" is exactly the case
   no per-argument check catches (raised in review on PR #266).
+- **An execute-time shape/stride override must reach the executor or raise
+  before launch.** A raw uid-map plan cannot consume it; do not silently drop
+  the override triple. Filter override-enabled graphs per plan's binding capability,
+  preserving prepared plans while declining tensor-only ones. Detectors:
+  `test_uid_map_plan_rejects_runtime_overrides_before_execute` and
+  `test_override_filter_preserves_compatible_split_candidates`.
 - **Shape overrides do not enlarge the producer's storage.** Validate metadata
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is

@@ -1899,7 +1899,9 @@ class pygraph:
                        ExecutionContext; plans that need one require it)
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
-            override_uids/shapes/strides: dynamic-shape overrides (backend path)
+            override_uids/shapes/strides: runtime geometry for the backend or a
+                         compatible VariantPack plan; legacy uid-map plans raise
+                         rather than ignoring these arguments
         """
         if not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
@@ -1912,9 +1914,8 @@ class pygraph:
             self.build(ctx=caller_ctx)
 
         uid_to_data = self._uid_to_data(tensor_dict)
-        # The dynamic-shape overrides live only on the backend's uid-map
-        # overload, so a call carrying them takes that path and normalizes
-        # nothing.
+        # Backend overrides use its uid-map overload. Python plans must consume
+        # them through VariantPack; a legacy uid-map executor cannot honor them.
         overriding = override_uids is not None or override_shapes is not None or override_strides is not None
         eng = self.selected_engine
 
@@ -1938,6 +1939,8 @@ class pygraph:
                 pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
                 plan.execute(self, pack, ctx)
             else:
+                if overriding:
+                    raise ValueError(f"{eng.name}: this plan does not support execute-time shape or stride overrides")
                 plan.execute(self, uid_to_data, ctx)
             return
 

@@ -437,11 +437,11 @@ def test_d512_mxfp8_primary_uses_measured_scheduler():
 
 @pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
-    """Placement is the SHARED layer's job (engines/heuristics._assemble):
-    proposals lead the backend's entries inside each mode block by standing
-    assumption, the delegating entry never leads an OPENSOURCE block, one
-    config repeated across blocks keeps its first position, and no final
-    entry carries a mode."""
+    """Placement is the SHARED layer's job (engines/heuristics._assemble): a
+    list WITHOUT the BACKEND marker keeps the historical order (ours lead the
+    backend's entries inside each mode block), the delegating entry never
+    leads an OPENSOURCE block, one config repeated across blocks keeps its
+    first position, and no final entry carries a mode."""
     ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
     backend = [
         PlanConfig(-1, None),  # delegating (mode None)
@@ -457,6 +457,36 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     # OPENSOURCE: ours + delegating, and never the backend's own entries.
     oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: ours, backend)
     assert [p.engine_id for p in oss] == [20500, 20500, -1]
+
+
+@pytest.mark.L0
+def test_assemble_places_the_backend_block_where_the_marker_sits():
+    """The BACKEND marker: ``[BACKEND, ours]`` puts the delegating entry and the
+    mode's backend entries ahead of ours; ``[ours, BACKEND]`` is the historical
+    order; the marker itself never reaches the list, a repeat is dropped, an
+    OPENSOURCE block ignores it (python-only + delegating), FALLBACK expands to
+    the FALLBACK entries, and with no backend entries the block is empty."""
+    from cudnn.engines.heuristics import BACKEND, is_backend_block
+
+    ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
+    backend = [
+        PlanConfig(-1, None),
+        PlanConfig(7, {"k": 1}, cpp_index=0, mode=cudnn.heur_mode.A),
+        PlanConfig(8, {"k": 2}, cpp_index=1, mode=cudnn.heur_mode.FALLBACK),
+    ]
+    trail = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in trail] == [-1, 7, 20500, 20500]
+    lead = _assemble([cudnn.heur_mode.A], lambda kind: ours + [BACKEND], backend)
+    assert [p.engine_id for p in lead] == [20500, 20500, -1, 7]
+    assert not any(is_backend_block(p) for p in trail + lead)
+    twice = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND, ours[0], BACKEND, ours[1]], backend)
+    assert [p.engine_id for p in twice] == [-1, 7, 20500, 20500]
+    oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in oss] == [20500, 20500, -1], "OPENSOURCE stays python-only + delegating"
+    both = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [BACKEND] + ours if kind == "A" else [BACKEND, ours[0]], backend)
+    assert [p.engine_id for p in both] == [-1, 7, 20500, 20500, 8], "FALLBACK block expands to the FALLBACK entries; dedup keeps first positions"
+    alone = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, [])
+    assert [p.engine_id for p in alone] == [20500, 20500], "no backend entries: the block is empty and ours stay"
 
 
 @pytest.mark.L0

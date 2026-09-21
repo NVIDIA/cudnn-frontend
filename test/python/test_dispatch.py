@@ -175,6 +175,56 @@ def test_a_pinned_python_plan_runs_and_writes_the_callers_buffer(monkeypatch):
     assert _marked(c)
 
 
+@pytest.mark.parametrize("override_field", ["override_uids", "override_shapes", "override_strides", "complete"])
+def test_uid_map_plan_rejects_runtime_overrides_before_execute(monkeypatch, override_field):
+    """A legacy executor cannot receive geometry overrides; never silently drop them."""
+    g = pygraph(is_override_shape_enabled=True)
+    eng = StubEngine()
+    _offer(monkeypatch, eng)
+    out = g.matmul(torch.ones(2, 2), torch.ones(2, 2))
+    _pin(g, "stub")
+    g.build_plans()
+    result = torch.full((2, 2), -1.0)
+    overrides = {"override_uids": [out.get_uid()], "override_shapes": [[1, 2]], "override_strides": [[2, 1]]}
+    with pytest.raises(ValueError, match="does not support execute-time shape or stride overrides"):
+        g.execute({out: result}, **(overrides if override_field == "complete" else {override_field: overrides[override_field]}))
+    assert not eng.seen
+    assert torch.equal(result, torch.full_like(result, -1.0))
+    g.execute({out: result})
+    assert _marked(result)
+
+
+def test_variant_pack_plan_receives_runtime_overrides(monkeypatch):
+    """The legacy guard must preserve the normalized-plan execution contract."""
+    from unittest.mock import Mock
+
+    from cudnn.engines import CompiledPlan
+
+    seen = []
+
+    class Plan(CompiledPlan):
+        takes_variant_pack = True
+
+        def execute(self, graph, pack, ctx):
+            seen.append(pack)
+
+    g = pygraph(is_override_shape_enabled=True)
+    eng = StubEngine()
+    monkeypatch.setattr(eng, "build_plan", lambda graph, plan, ctx=None: Plan())
+    _offer(monkeypatch, eng)
+    out = g.matmul(torch.ones(2, 2), torch.ones(2, 2))
+    _pin(g, "stub")
+    g.build_plans()
+    normalized = object()
+    normalize = Mock(return_value=normalized)
+    monkeypatch.setattr(g, "_normalize", normalize)
+    result = torch.empty(2, 2)
+    uids, shapes, strides = [out.get_uid()], [[1, 2]], [[2, 1]]
+    g.execute({out: result}, override_uids=uids, override_shapes=shapes, override_strides=strides)
+    assert normalize.call_args.args[2:] == (uids, shapes, strides)
+    assert seen == [normalized]
+
+
 def test_every_node_reaches_the_engine_with_its_buffers_resolved(monkeypatch):
     """A fused matmul + bias + relu graph arrives WHOLE: every node in build
     order, each input port resolved to the caller's storage, and the virtual

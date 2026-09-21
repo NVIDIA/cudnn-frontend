@@ -454,6 +454,7 @@ class SdpaGraphFacts:
     # instead of admitting a plan that dies in the lowering (rule 8b).  Mirrors
     # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
+    shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
 
 
 _SDPA_NODE_TYPES = (
@@ -979,6 +980,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     if node is None:
         return None
     facts = _extract_facts(_record_from_node(node, tail))
+    if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
+        facts = replace(facts, shape_overrides=True)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see

@@ -28,7 +28,10 @@ def _native_relu(handle=None):
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    x = graph.tensor(dim=[1, 1, 32, 32], stride=[1024, 1024, 32, 1], data_type=cudnn.data_type.FLOAT)
+    # 3-D: the runtime-fusion engine serves this on every arch. A 4-D [1, 1, 32, 32]
+    # tensor is refused before SM100 (getDimA()[1] == 1) and only the SM10x-only
+    # TensorIR MemBound engine accepted it.
+    x = graph.tensor(dim=[1, 32, 32], stride=[1024, 32, 1], data_type=cudnn.data_type.FLOAT)
     y = graph.relu(x).set_output(True).set_data_type(cudnn.data_type.FLOAT)
     graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     assert graph.selected_engine is None and graph._lowered_graph is not None
@@ -45,7 +48,7 @@ def test_collect_unrelated_resources_during_capture(resource, cudnn_handle):
     from cuda.bindings import driver
 
     graph, tx, ty = _native_relu(cudnn_handle)
-    x = torch.linspace(-2, 2, 1024, device="cuda").reshape(1, 1, 32, 32)
+    x = torch.linspace(-2, 2, 1024, device="cuda").reshape(1, 32, 32)
     y = torch.empty_like(x)
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     backend_stream = torch.cuda.ExternalStream(cudnn_handle.stream)
