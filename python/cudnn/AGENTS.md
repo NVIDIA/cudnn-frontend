@@ -440,7 +440,7 @@ and restore in `finally` (`frost/buffers.py DeviceBuffer.__del__`,
 `pygraph.h CaptureModeGuard`). Production plans and engines reach this recipe
 only if R2/R7 were skipped — fix that instead.
 
-**R9 — proving it.** Around a warm `build()` + `execute()`:
+**R9 — proving it.** Around a warm `check_support()`/`compile()`/`build()` + `execute()`:
 `torch.cuda.set_sync_debug_mode("error")` (no sync), and
 `torch.cuda.memory_stats()["allocation.all.allocated"]` unchanged across three
 executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_nothing_and_never_synchronizes`,
@@ -449,6 +449,27 @@ capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
 window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
 (`test_torch_stream.py`).
+
+**R10 — compile() needs an operand the kernel only sees at execute (scratch,
+semaphore, scheduler counter, an output the caller passes later).** Never
+`torch.empty`/`torch.zeros` a stand-in and never `from_dlpack` a plan-owned
+tensor at build. Build the ABI from metadata: tensor slot ->
+`cute.runtime.make_fake_tensor(dtype, sym-shape, stride=..., assumed_align=...)`
+or `make_fake_compact_tensor(dtype, sym-shape, stride_order=..., assumed_align=...)`
+(APIBase: `_make_fake_cute_tensor_from_desc(desc)` when a TensorDesc exists —
+`causal_conv1d_update_sm100/api.py`, `hstu/hstu_lmsd/api.py` workspace descs;
+module-level: `flex_attention/dispatch.py::_make_fake_bwd_aux_tensors`,
+`_make_fake_fp32_scratch`, `_make_fake_semaphore`, `_make_fake_scheduler_counter`);
+pointer slot -> `cute.runtime.make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align)`
+(`_FakeTensor.iterator` is rejected by the DSL). The fake must reproduce the
+layout the launch-time conversion yields — dynamic extents, static leading
+stride 1, the compact path's divisibility, and a static stride 0 on a size-1
+mode where `from_dlpack` canonicalizes it (flex semaphores with stage 1) — prove
+it with a CPU `from_dlpack` parity test next to the builder
+(`test_flex_attention_contracts.py::test_compile_fakes_match_dlpack_layouts`).
+Wrap `cute.compile` in `with torch.cuda.device(desc.device)`: fakes carry no
+device. Prove the build with R9 around `check_support()` + `compile()`
+(`test_flex_attention.py::test_explicit_api_compile_allocates_nothing_and_never_synchronizes`).
 
 
 ## Frontend-only kernel package layout
