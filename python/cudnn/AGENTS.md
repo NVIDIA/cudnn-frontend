@@ -488,14 +488,6 @@ resulting value, and must say in its docstring that omitting the hint costs one
 blocking read per call and is not capturable (`csa_compressor_forward_wrapper(total_comp=None)`).
 
 **R11 — compile() needs an operand the kernel only sees at execute (scratch,
-semaphore, scheduler counter, an output the caller passes later).** Build a fake
-cute tensor of the declared dtype/shape/stride (`APIBase._make_fake_cute_tensor`
-/ `_make_fake_cute_tensor_from_desc`, or `cute.runtime.make_fake_compact_tensor`)
-and compile against it; never `torch.empty` / `torch.zeros` a stand-in, never
-memset at compile. `compile()` touches no device memory: the deviceless AOT
-path depends on it, and a GiB-scale transient at compile is a real OOM.
-
-**R10 — compile() needs an operand the kernel only sees at execute (scratch,
 semaphore, scheduler counter, an output the caller passes later).** Never
 `torch.empty`/`torch.zeros` a stand-in and never `from_dlpack` a plan-owned
 tensor at build. Build the ABI from metadata: tensor slot ->
