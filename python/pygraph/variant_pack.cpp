@@ -168,6 +168,22 @@ struct Operand {
     int32_t observed_device_id   = -1;
 };
 
+// Emit effective strides into either a native vector or a Python tuple without
+// materializing an intermediate container. Empty producer strides mean compact.
+template <typename Store>
+void
+write_effective_strides(const Operand &operand, Store &&store) {
+    if (!operand.stride.empty()) {
+        for (size_t d = 0; d < operand.stride.size(); ++d) store(d, operand.stride[d]);
+        return;
+    }
+    int64_t running = 1;
+    for (int d = operand.ndim - 1; d >= 0; --d) {
+        store(d, running);
+        if (d > 0) running *= operand.shape[d];
+    }
+}
+
 // Slots from the base to one past the last addressed slot.
 int64_t
 span_of(const std::vector<int64_t> &shape, const std::vector<int64_t> &stride) {
@@ -882,21 +898,34 @@ class VariantPackNative {
         return operands_.at(index).observed_bytes;
     }
 
-    // Every fact an engine binds from, for several operands, in ONE crossing:
-    // (pointer, dtype_code, dtype_bits, device_type, device_id, observed_bytes, shape, stride) per index.
+    // Build the consumer's immutable records in one native crossing, without
+    // intermediate Python lists or a second observation/validation path.
+    // Effective dtype/geometry and observed producer span/device remain separate.
     py::list
-    facts(const std::vector<size_t> &indices) const {
-        py::list out;
-        for (size_t index : indices) {
+    facts_as(const std::vector<size_t> &indices, const py::object &constructor, const py::dict &dtype_names) const {
+        py::list out(indices.size());
+        const py::str unknown_dtype("");
+        for (size_t i = 0; i < indices.size(); ++i) {
+            const size_t index     = indices[i];
             const Operand &operand = operands_.at(index);
-            out.append(py::make_tuple(reinterpret_cast<int64_t>(pointers_.at(index)),
-                                      static_cast<int>(operand.dtype.code),
-                                      static_cast<int>(operand.dtype.bits),
-                                      operand.observed_device_type,
-                                      operand.observed_device_id,
-                                      operand.observed_bytes,
-                                      operand.shape,
-                                      stride(index)));
+            py::tuple shape(operand.shape.size());
+            for (size_t d = 0; d < operand.shape.size(); ++d) shape[d] = py::int_(operand.shape[d]);
+
+            py::tuple strides(operand.stride.empty() ? operand.shape.size() : operand.stride.size());
+            write_effective_strides(operand, [&strides](size_t d, int64_t value) { strides[d] = py::int_(value); });
+            const auto dtype_key =
+                py::make_tuple(static_cast<int>(operand.dtype.code), static_cast<int>(operand.dtype.bits));
+            PyObject *dtype = PyDict_GetItem(dtype_names.ptr(), dtype_key.ptr());
+            // Match the facts consumer: producer bytes in the EFFECTIVE element width.
+            const int64_t width = std::max<int64_t>(1, (static_cast<int64_t>(operand.dtype.bits) + 7) / 8);
+            const int64_t span  = operand.observed_bytes < 0 ? -1 : operand.observed_bytes / width;
+            out[i] =
+                constructor(reinterpret_cast<int64_t>(pointers_.at(index)),
+                            dtype == nullptr ? py::object(unknown_dtype) : py::reinterpret_borrow<py::object>(dtype),
+                            py::make_tuple(operand.observed_device_type, operand.observed_device_id),
+                            span,
+                            shape,
+                            strides);
         }
         return out;
     }
@@ -917,7 +946,7 @@ class VariantPackNative {
         const Operand &operand = operands_.at(index);
         if (!operand.stride.empty()) return operand.stride;
         std::vector<int64_t> dense(operand.ndim, 1);
-        for (int d = operand.ndim - 2; d >= 0; d--) dense[d] = dense[d + 1] * operand.shape[d + 1];
+        write_effective_strides(operand, [&dense](size_t d, int64_t value) { dense[d] = value; });
         return dense;
     }
 
@@ -1211,7 +1240,7 @@ its parts.
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
         .def("observed_bytes", &VariantPackNative::observed_bytes)
-        .def("facts", &VariantPackNative::facts)
+        .def("_facts_as", &VariantPackNative::facts_as)
         .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)

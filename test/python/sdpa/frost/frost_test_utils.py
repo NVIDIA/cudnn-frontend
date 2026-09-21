@@ -173,9 +173,10 @@ def launch_f16(
     stream=None,
     host=None,
 ):
-    """Drive an EXPLICIT_ABI f16 prefill host from BSHD torch tensors: the same operand
+    """Drive an EXPLICIT_ABI f16 host from BSHD torch tensors: the same operand
     list the old tensor entry took, translated to pointers plus (batch, seq, head) strides.
-    Dense (padded) only — THD goes through the adapter."""
+    Dense (padded) only — THD goes through the adapter. Direct tests must honor the
+    compiled head packing and decode tile; production validates these in the binder."""
     import inspect
 
     import cutlass
@@ -189,6 +190,13 @@ def launch_f16(
 
     paged = block_table_tensor is not None
     b, h, kh, sq, skv, _ = problem_size
+    if host is not None:
+        namespace = inspect.unwrap(host).__globals__
+        cfg = namespace["CFG"]
+        if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
+            raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
+        if "N_Q" in namespace and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+            raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
         k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))

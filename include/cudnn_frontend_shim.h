@@ -347,6 +347,11 @@ cuda_graph_begin_capture(cudaStream_t stream, cudaStreamCaptureMode mode) {
     NV_FE_CALL_TO_CUDA(cuda_graph_begin_capture, cudaStreamBeginCapture, stream, mode);
 }
 
+inline CUresult
+cu_thread_exchange_stream_capture_mode(CUstreamCaptureMode *mode) {
+    NV_FE_CALL_TO_CU(cu_thread_exchange_stream_capture_mode, cuThreadExchangeStreamCaptureMode, mode);
+}
+
 inline cudaError_t
 cuda_stream_is_capturing(cudaStream_t stream, cudaStreamCaptureStatus *capture_status) {
     NV_FE_CALL_TO_CUDA(cuda_stream_is_capturing, cudaStreamIsCapturing, stream, capture_status);
