@@ -400,8 +400,8 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
     if torch.cuda.get_device_capability() == (10, 7) and s_q == 1:
         # NVBug 6813175: the native decode codegen does not reduce the Q tile for ragged s_q == 1 graphs
         # and emits a TMEM Stats round-trip wider than the ISA allows, so build_plans fails NVRTC
-        # (cuDNN 9.26 GA through the 9.28 nightlies; the s_q == 2 control builds). The plan is also
-        # broken on SM100, but only the Rubin heuristic ranks it first. A backend that builds it is an
+        # (cuDNN 9.26 GA through the 9.28 nightlies; the s_q == 2 control builds). The plan also fails
+        # on SM100, but only the Rubin heuristic ranks it first. A backend that builds it is an
         # XPASS that asks us to retire this marker.
         request.node.add_marker(
             pytest.mark.xfail(
