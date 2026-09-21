@@ -102,7 +102,7 @@ config = MoeEpConfig(
     parallel=MoeEpParallelConfig(
         ep_group=ep_group,
         max_tokens_per_rank=max_tokens,
-        max_recv_size_per_rank=None,
+        physical_recv_pool_rows=None,
         drop_on_overflow=False,
         token_padding_size=128,
         sf_padding_size=128,
@@ -766,11 +766,12 @@ EP2+ execution requires:
 - consistent rank ordering, buffer schemas, tuning, instance selection, and launch
   ordering across the group.
 
-`max_recv_size_per_rank` is the physical receive-pool capacity in token rows,
+`physical_recv_pool_rows` is the exact physical receive-pool capacity in token rows,
 including per-expert padding.
 
-When omitted it defaults to the worst case, in which every active expert owns
-its own padded segment:
+When omitted it resolves once to a 128-row-aligned canonical capacity covering
+the worst-case inference and training padding policies. For one padding block,
+the required rows are:
 
 ```text
 raw      = ep_size * max_tokens_per_rank * top_k
@@ -781,12 +782,13 @@ capacity = (active + (raw - active) // token_padding_size) * token_padding_size
 `raw` above is the unbounded raw-route limit; the padded capacity is
 deliberately not the same as rounding that route count once.
 
-An explicit capacity `P` must satisfy `P % 128 == 0`. The frontend reverse-maps
-`P` to the largest logical route limit whose worst-case padded capacity is
-exactly `P`, and rejects any `P` that cannot be represented exactly. Because
-that logical limit is conservative, a favorable expert distribution that would
-in fact fit in `P` can still be refused; this early overflow is what keeps any
-distribution the kernel accepts from exceeding the prescribed pool. On
+An explicit capacity `P` must satisfy `P % 128 == 0`. For each operation
+padding policy, the frontend resolves the largest logical route limit `L`
+bounded by `raw` whose worst-case padded requirement is at most `P`. The
+kernel receives `L` and exact `P` independently, so overprovisioned tail rows
+remain part of the strict tensor/workspace ABI without becoming work items.
+Because `L` is conservative, a favorable expert distribution that would in
+fact fit in `P` can still be refused. On
 overflow the launch may raise or drop work according to `drop_on_overflow`,
 and its numerical outputs are not guaranteed usable.
 
@@ -800,10 +802,8 @@ logical = ep_size * max_tokens_per_rank * top_k
 ```
 
 Per-expert padding expands that limit to a physical receive pool of `131968`
-rows. Therefore public `max_recv_size_per_rank` must be omitted (automatic) or
-set to `131968`; `131072` is the kernel's logical limit and is not a valid
-public physical-pool spelling for DS3. Smaller capacities and additional
-overprovision are rejected. Training forward keeps the generic reverse-map
-and obtains logical `131079` from the same physical `131968` pool. Its extra
-seven logical slots exceed the topology's maximum raw route count and are
-unreachable, so forward/backward overflow behavior remains consistent.
+rows. Therefore public `physical_recv_pool_rows` must be omitted (automatic)
+or set to a 128-row-aligned value of at least `131968`; `131072` is the
+kernel's logical limit and is not a valid public physical-pool spelling for
+DS3. Larger physical pools are accepted as exact ABI capacity. Training
+forward and backward both use logical `L=131072`.
