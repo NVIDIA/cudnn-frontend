@@ -13,6 +13,9 @@ range:
   - dense_indexer_score_recompute:  dense index scores + LSE denom (3-WG)
   - dense_attn_score_recompute:     dense attention scores + L1-norm denom (3-WG)
 
+The dense kernel is BSHD-native; THD (``cu_seqlens``) is declined with
+``NotImplementedError`` until a THD-native SM90 kernel exists.
+
 The underlying kernel objects are ``SparseScoreRecomputeSm90`` / ``DenseScoreRecomputeSm90``.
 The dense kernel is now the 3-WG pingpong implementation by default and no
 longer exposes the legacy 1-WG/2-WG dense variants.
@@ -443,101 +446,10 @@ def _dense_score_recompute(
     return out, denom_out
 
 
-def _dense_score_recompute_varlen(
-    q: torch.Tensor,  # (total_q, n_heads_q, head_dim)
-    kv: torch.Tensor,  # (total_k, n_heads_kv, head_dim)
-    weights_or_lse: torch.Tensor,  # (total_q, n_heads_q)
-    is_index_scores: bool,
-    softmax_scale: float,
-    out: Optional[torch.Tensor],
-    denom_out: Optional[torch.Tensor],
-    num_threads: int,
-    nvtx_range_name: str,
-    ratio: int,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    q_causal_offsets: Optional[torch.Tensor] = None,
-    current_stream: Optional[cuda.CUstream] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """THD packed dense score via per-batch BSHD SM90 launches.
-
-    The SM90 dense score kernel is BSHD-native. This adapter preserves the
-    public THD API by slicing each batch's packed Q/K/per-head tensors,
-    launching the existing BSHD kernel, then copying results back into the
-    packed ``(total_q, max_seqlen_k)`` output layout.
-    """
-    compute_capability = _get_device_capability()
-    assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
-    assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
-    assert q.ndim == 3 and kv.ndim == 3 and weights_or_lse.ndim == 2
-    current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
-    with _torch_stream_context(current_stream):
-        cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
-        cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
-    assert cu_seqlens_q.is_cuda and cu_seqlens_k.is_cuda
-    batch_size = cu_seqlens_q.shape[0] - 1
-    q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
-
-    total_q = q.shape[0]
-    if max_seqlen_k is None:
-        with _torch_stream_context(current_stream):
-            k_lens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-            max_seqlen_k = int(k_lens.max().item())
-    if out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty((total_q, int(max_seqlen_k)), dtype=torch.float32, device=q.device)
-    else:
-        if not out.is_contiguous():
-            with _torch_stream_context(current_stream):
-                out = out.contiguous()
-    if denom_out is None:
-        with _torch_stream_context(current_stream):
-            denom_out = torch.empty((total_q,), dtype=torch.float32, device=q.device)
-    else:
-        if not denom_out.is_contiguous():
-            with _torch_stream_context(current_stream):
-                denom_out = denom_out.contiguous()
-
-    cu_q_host = cu_seqlens_q.detach().cpu().tolist()
-    cu_k_host = cu_seqlens_k.detach().cpu().tolist()
-    # Native THD uses the same block-skipping kernel; prefill so skipped
-    # masked/padding columns do not retain caller-provided values.
-    with _torch_stream_context(current_stream):
-        out.fill_(float("-inf"))
-    with torch.cuda.nvtx.range(nvtx_range_name + "_thd"):
-        for b in range(len(cu_q_host) - 1):
-            qs, qe = cu_q_host[b], cu_q_host[b + 1]
-            ks, ke = cu_k_host[b], cu_k_host[b + 1]
-            sq_b = qe - qs
-            sk_b = ke - ks
-            if sq_b == 0 or sk_b == 0:
-                continue
-            with _torch_stream_context(current_stream):
-                q_b = q[qs:qe].unsqueeze(0).contiguous()
-                kv_b = kv[ks:ke].unsqueeze(0).contiguous()
-                per_head_bhs = weights_or_lse[qs:qe].unsqueeze(0).transpose(1, 2).contiguous()
-            q_causal_offsets_b = q_causal_offsets[b : b + 1] if q_causal_offsets is not None else None
-            out_b, denom_b = _dense_score_recompute(
-                q_b,
-                kv_b,
-                per_head_bhs,
-                is_index_scores=is_index_scores,
-                softmax_scale=softmax_scale,
-                out=None,
-                denom_out=None,
-                num_threads=num_threads,
-                nvtx_range_name=nvtx_range_name + "_bshd_slice",
-                ratio=ratio,
-                q_causal_offsets=q_causal_offsets_b,
-                current_stream=current_stream,
-            )
-            with _torch_stream_context(current_stream):
-                out[qs:qe, :sk_b].copy_(out_b[0])
-                denom_out[qs:qe].copy_(denom_b[0])
-    return out, denom_out
+_THD_NOT_SUPPORTED_SM90 = (
+    "SM90 dense score recompute is BSHD-native: THD (cu_seqlens_q/cu_seqlens_k) is not supported on SM90. "
+    "Serving it would need a host copy of cu_seqlens per call (Rule 3/8); use BSHD on SM90 or THD on SM100+."
+)
 
 
 _dense_score_recompute.compile_cache = {}
@@ -567,28 +479,13 @@ def dense_indexer_score_recompute(
     sm_scale is applied to the fp32 head-reduced score inside the kernel
     (preserves precision vs pre-multiplying onto bf16 weights on the host).
     Defaults to 1.0 (identity).
+
+    BSHD only. ``cu_seqlens_q``/``cu_seqlens_k`` (THD) raise
+    ``NotImplementedError``; ``max_seqlen_q``/``max_seqlen_k`` are accepted for
+    signature parity with the SM100 interface and unused.
     """
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
-        if cu_seqlens_q is None or cu_seqlens_k is None:
-            raise ValueError("THD requires both cu_seqlens_q and cu_seqlens_k")
-        return _dense_score_recompute_varlen(
-            q_indexer,
-            k_indexer,
-            weights,
-            is_index_scores=True,
-            softmax_scale=sm_scale,
-            out=out,
-            denom_out=denom_out,
-            num_threads=num_threads,
-            nvtx_range_name="dense_indexer_score_recompute",
-            ratio=ratio,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            q_causal_offsets=q_causal_offsets,
-            current_stream=current_stream,
-        )
+        raise NotImplementedError(_THD_NOT_SUPPORTED_SM90)
     with _torch_stream_context(current_stream):
         w_bhs = weights.transpose(1, 2).contiguous()
     return _dense_score_recompute(
@@ -628,28 +525,13 @@ def dense_attn_score_recompute(
         S[b,q,t]   = sum_h P[b,q,h,t]
         denom      = sum(S, dim=-1)   (L1-norm)
     Returns (scores, l1norm_denom).
+
+    BSHD only. ``cu_seqlens_q``/``cu_seqlens_k`` (THD) raise
+    ``NotImplementedError``; ``max_seqlen_q``/``max_seqlen_k`` are accepted for
+    signature parity with the SM100 interface and unused.
     """
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
-        if cu_seqlens_q is None or cu_seqlens_k is None:
-            raise ValueError("THD requires both cu_seqlens_q and cu_seqlens_k")
-        return _dense_score_recompute_varlen(
-            q_attn,
-            k_attn,
-            lse,
-            is_index_scores=False,
-            softmax_scale=softmax_scale,
-            out=out,
-            denom_out=denom_out,
-            num_threads=num_threads,
-            nvtx_range_name="dense_attn_score_recompute",
-            ratio=ratio,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            q_causal_offsets=q_causal_offsets,
-            current_stream=current_stream,
-        )
+        raise NotImplementedError(_THD_NOT_SUPPORTED_SM90)
     with _torch_stream_context(current_stream):
         lse_bhs = lse.transpose(1, 2).contiguous()
     return _dense_score_recompute(

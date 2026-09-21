@@ -485,6 +485,19 @@ implementation lives in `score_recompute`; `indexer_forward` only imports it.
 Dense Attention Score Recompute has a separate MXFP8 kernel because its score
 and normalization semantics differ from the indexer path.
 
+- **Layouts** — BSHD on SM90 and SM100+. THD packed (`cu_seqlens_q`/`cu_seqlens_k`
+  with `q`: `(total_q, H_q, D)`, `out`: `(total_q, max_seqlen_k)`) on SM100+ only:
+  SM90 declines THD in `check_support()` with `NotImplementedError` because its
+  kernel is BSHD-native and serving THD would need a host copy of `cu_seqlens`
+  per call.
+- **THD launch envelope** — `DenseIndexerScoreRecompute` / `DenseAttnScoreRecompute`
+  take `max_seqlen_q` and `max_seqlen_k` as plan-time ints in `__init__`:
+  `max_seqlen_q` is required and `max_seqlen_k` defaults to (and must equal)
+  `sample_out.shape[1]`. `execute()` never derives them from `cu_seqlens`, and
+  caller-passed values must match the plan's. The wrappers derive them from
+  `cu_seqlens` when omitted, at the cost of one blocking device-to-host read per
+  call (not CUDA-graph capturable); pass both.
+
 ### 9. Indexer Backward
 
 Three-stage sparse top-K pipeline that produces the training gradients for the
@@ -681,8 +694,10 @@ result = DSA.dense_indexer_backward_wrapper(
 - **Architecture support** — Sparse Attention Forward supports the mapped
   SM100-family capabilities 10.0, 10.3, and 10.7 only.
   Sparse Attention Backward, Score Recompute, Indexer Forward, Indexer Top-K,
-  and Indexer Backward support SM90 and SM100. The combined compressed-logits
-  + Top-K forward is SM100-only; the standalone Indexer Top-K remains SM90+.
+  and Indexer Backward support SM90 and SM100. Dense score recompute in the THD
+  (`cu_seqlens`) layout is SM100+ only; SM90 serves BSHD. The combined
+  compressed-logits + Top-K forward is SM100-only; the standalone Indexer Top-K
+  remains SM90+.
 - **Forward scope** — only the 11 supported Prefill instances described above;
   no SM90, regular H128, FP8 cache, decode, or split-KV forward path.
 - **Sparse gather path** — the public CuTe facade does not yet expose the TMA
