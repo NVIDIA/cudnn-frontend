@@ -1969,11 +1969,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         former ``compile()`` prologue; requires ``check_support()``.
         """
         self._ensure_support_checked()
-        # MXFP8 on cc10.3+ fuses the S_acc row-max into the LDTM (the fp8/f16 kernels
-        # don't read this flag). Auto-set from the device capability so an SM103 run
+        # cc10.3 has the fused LDTM.STAT row-max: MXFP8 has used it since its
+        # bring-up; per-tensor FP8 takes the same path (its kernel reads the
+        # flag identically — the SM107 sibling bakes it). cc10.0 lacks the
+        # instruction and keeps the manual reduction; the f16 kernels do not
+        # read the flag. Auto-set from the device capability so an SM103 run
         # picks the fused path with no user action.
-        mxfp8 = self._fp8 and not self._pertensor
-        fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        fused_ldtm_stat = self._fp8 and self._device_cc == (10, 3)
         # None = the standalone-wrapper tier stated no preference: derive the
         # causal-balancing policy here. The graph path never hits this branch —
         # the heuristic emits an explicit policy (the same primary this
