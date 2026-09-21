@@ -392,7 +392,12 @@ in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
 that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
-passed nothing. A path with no workspace contract gets one.
+passed nothing. A path with no workspace contract gets one. Where a wrapper
+allocates per call on the caller's behalf, it allocates under
+`stream_context(<launch stream>)` (R1): the caching allocator orders a block's
+reuse only against the stream it was allocated on, so scratch allocated on
+torch's ambient stream for a handle re-streamed to a side stream is a
+use-after-free waiting for load.
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
