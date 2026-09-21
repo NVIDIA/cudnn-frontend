@@ -141,6 +141,11 @@ none is precedent:
   the graph's envelope `S_max` and turns the per-batch lengths into
   `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
   violation on the wrapper surface (a caller contract, documented there).
+- wgrad discrete `execute()` called with `wgrad_tensor` but no `wgrad_ptrs`
+  builds the per-expert pointer table with `torch.tensor(values, device=...)`
+  per call (`gemm/cutedsl/grouped/wgrad/_bf16_api.py::_generate_wgrad_ptrs`,
+  pageable H2D + implicit sync). Pass `wgrad_ptrs` to avoid it; the follow-up
+  PR moves the derivation to the wrapper layer (R4) and requires the table.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -442,6 +447,12 @@ host needs that the caller already knows is a required host argument, never
 inferred by a device read (R10); a device-data table the kernel consumes
 (offsets, pointer arrays) is a documented contract validated from host metadata
 (dtype, shape, alignment, device), not read back to check its values.
+A host check of device VALUES (an offsets table, a pointer array) never earns a
+sync: the default path trusts the documented device-data contract, and the
+check lives behind one env var read once at import, runs `cuStreamIsCapturing`
+FIRST and raises under capture, and is never memoized
+(`gemm/cutedsl/grouped/backend_utils.py::debug_validate_offsets`,
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES`).
 
 **R7 — you need a cuDNN handle and the caller gave none.** Graph API lowering:
 `_pygraph._backend_handle_for_lowering` (process default, one per thread and
@@ -472,6 +483,10 @@ holds build to the execute standard, so a family's own tests also wrap
 `__init__` + `check_support()` + `compile()` in `set_sync_debug_mode("error")`
 (`test_NSA_topk_reduction.py`, `test_NSA_swa.py`, `test_NSA_compression_attention.py`).
 The `compile_allocates_nothing` fixture in the fe_api conftest is the R11 detector.
+Feed the sync detector tensors the plan has never
+seen (a fresh `.clone()` of the offsets / pointer table per execute): an
+id-keyed validation memo hid a per-tensor D2H from every warm test
+(`fe_api/test_grouped_gemm_rule8.py::test_execute_never_synchronizes`).
 
 **R10 — a launch envelope the caller already knows (max sequence length, packed
 total, batch count, top-k width).** It is a required host int at plan time (an

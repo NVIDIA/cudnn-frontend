@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import weakref
 from typing import Optional, Tuple
 
 import cutlass
@@ -18,7 +17,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -30,11 +29,10 @@ from cudnn.tensor_adapter import (
     get_device,
     get_shape,
     get_strides,
-    get_version,
     is_torch_tensor,
-    to_host_list,
 )
 
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
 
@@ -97,9 +95,6 @@ class GroupedGemmGluBf16API(APIBase):
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
 
-        self._sample_offset_values = self._copy_values_to_host(sample_padded_offsets)
-        self._sample_offsets_ref = weakref.ref(sample_padded_offsets)
-        self._sample_offsets_version = get_version(sample_padded_offsets)
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -133,8 +128,6 @@ class GroupedGemmGluBf16API(APIBase):
         self._workspace: Optional[torch.Tensor] = None
         self._live_b_ptrs = None
         self._compile_b_ptrs = None
-        self._validated_offsets: dict[int, tuple] = {}
-        self._validated_pointer_values: dict[int, tuple] = {}
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     @staticmethod
@@ -151,54 +144,6 @@ class GroupedGemmGluBf16API(APIBase):
     def _expect_device(desc: TensorDesc, device: torch.device, name: str) -> None:
         if desc.device != device:
             raise ValueError(f"{name} must be on {device}, got {desc.device}")
-
-    @staticmethod
-    def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in to_host_list(tensor))
-
-    @staticmethod
-    def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
-        cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
-
-    @staticmethod
-    def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
-        key = id(tensor)
-
-        def discard(_reference, *, cache=cache, key=key):
-            cache.pop(key, None)
-
-        cache[key] = (weakref.ref(tensor, discard), get_version(tensor), extra)
-
-    @staticmethod
-    def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tensor_m: int) -> None:
-        if len(values) != expert_cnt:
-            raise ValueError(f"padded_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
-        previous = 0
-        for index, value in enumerate(values):
-            if value < previous:
-                raise ValueError("padded_offsets must be a non-decreasing cumulative sum; " f"index {index} is {value} after {previous}")
-            if value % MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE != 0:
-                raise ValueError(f"padded_offsets[{index}] must be 256-aligned, got {value}")
-            previous = value
-        if not values or values[-1] <= 0 or values[-1] > tensor_m:
-            raise ValueError(f"padded_offsets last value must be in [1, {tensor_m}], got " f"{values[-1] if values else None}")
-
-    def _validate_offsets_once(self, offsets: torch.Tensor, *, tensor_m: int) -> None:
-        extra = (self.expert_cnt, tensor_m)
-        if self._is_validation_cached(self._validated_offsets, offsets, extra):
-            return
-        values = self._copy_values_to_host(offsets)
-        self._validate_offset_sequence(values, expert_cnt=self.expert_cnt, tensor_m=tensor_m)
-        self._remember_validation(self._validated_offsets, offsets, extra)
-
-    def _validate_pointer_values_once(self, b_ptrs: torch.Tensor) -> None:
-        if self._is_validation_cached(self._validated_pointer_values, b_ptrs, self.expert_cnt):
-            return
-        pointer_values = _pointer_values(b_ptrs)
-        if any(value == 0 or value % 16 != 0 for value in pointer_values):
-            raise ValueError("b_ptrs entries must be non-null and 16-byte aligned")
-        self._remember_validation(self._validated_pointer_values, b_ptrs, self.expert_cnt)
 
     @staticmethod
     def _validate_data_alignment(tensor: torch.Tensor, name: str) -> None:
@@ -316,21 +261,6 @@ class GroupedGemmGluBf16API(APIBase):
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
         if tensor_m % 256 != 0:
             raise ValueError(f"sample_a M dimension must be 256-aligned, got {tensor_m}")
-
-        self._validate_offset_sequence(
-            self._sample_offset_values,
-            expert_cnt=self.expert_cnt,
-            tensor_m=tensor_m,
-        )
-        sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
-            self._remember_validation(
-                self._validated_offsets,
-                sample_offsets,
-                (self.expert_cnt, tensor_m),
-            )
-        elif sample_offsets is not None:
-            self._validate_offsets_once(sample_offsets, tensor_m=tensor_m)
 
         if not self._kernel.can_implement(
             cutlass.BFloat16,
@@ -570,7 +500,7 @@ class GroupedGemmGluBf16API(APIBase):
         self._expect_stride(c_desc, (n, 1, tensor_m * n), "c_tensor")
         self._expect_stride(d_desc, (n_out, 1, tensor_m * n_out), "d_tensor")
         self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
-        self._validate_offsets_once(padded_offsets, tensor_m=tensor_m)
+        debug_validate_offsets(padded_offsets, expert_cnt=self.expert_cnt, limit=tensor_m, mode="padded", stream=current_stream)
 
         for tensor, name in (
             (a_tensor, "a_tensor"),
@@ -603,7 +533,7 @@ class GroupedGemmGluBf16API(APIBase):
                 raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {get_device(b_ptrs)}")
             if get_data_ptr(b_ptrs) % 8 != 0:
                 raise ValueError("b_ptrs data pointer must be 8-byte aligned")
-            self._validate_pointer_values_once(b_ptrs)
+            debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
 
         self._compiled_kernel(
