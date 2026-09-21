@@ -221,6 +221,23 @@ the kernel that reads it).
   argument is a contract: validate device-residency and dtype (a CUDA int64
   tensor, not a host tensor) before handing its address to a kernel — both
   flagged in review on PR #517.
+- **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
+  Every eager caller on torch's default stream hands us a default-stream
+  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
+  lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
+  Torch work issued in that context is unordered with a kernel launched on
+  `CUstream(0)`: on an idle GPU the copies win the race and every isolated
+  test passes; under xdist load the kernel reads stale conversion buffers and
+  a staged output is copied back before it is written (the qa sm90
+  `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
+  Map the sentinels and torch's own default stream to
+  `torch.cuda.default_stream(device)`, the current stream to itself, and only a
+  genuine side stream to `ExternalStream(handle, device=device)`. Reuse
+  `_torch_stream_context` (`sdpa/fwd/api_dsl.py`) or `marshal.stream_ctx`
+  (`linear_attention/hopper/`) rather than writing a fresh wrapper. Detector:
+  monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
+  with handle 0 (`test_hopper_marshal_stream.py`).
 
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
