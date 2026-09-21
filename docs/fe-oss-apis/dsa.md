@@ -458,6 +458,15 @@ Computes softmax over top-K entries of the indexer score:
   default; pass `topk_indices_global=True` when using ids encoded as
   `batch_idx * S_k + local_idx`.
 - **Output** — `predict`: `(B, S_q, topk)` FP32.
+- **Layout contract (class vs wrapper)** — `SparseIndexerScoreRecompute.execute()`
+  takes `out` as a required, contiguous FP32 tensor matching `sample_out`;
+  `q_indexer` / `k_indexer` / `weights` need a unit innermost stride and
+  `topk_indices` / `topk_length` must be contiguous int32. `check_support()`
+  declines anything else with `NotImplementedError` naming the tensor and its
+  strides, and `execute()` re-validates the live tensors with `ValueError`;
+  nothing is copied, cast, or allocated on the execute path. The wrapper keeps
+  the convenience: it copies strided inputs contiguous, casts the index tensors
+  to int32, and allocates `out` when omitted, all on `stream`.
 
 ### 7. Sparse Attn Score Recompute
 
@@ -470,6 +479,12 @@ L1-normalised head-summed softmax over top-K entries:
   `batch_idx * S_k + local_idx`.
 - **Output** — `target`: `(B, S_q, topk)` FP32.
 - Note: the wrapper handles the `-log2(e) * lse` preprocessing internally.
+- **Layout contract** — as in §6: the class requires a contiguous `out` at
+  `execute()`, declines strided `q_attn` / `k_attn` / `lse` and non-contiguous
+  or non-int32 `topk_indices` / `topk_length` in `check_support()`, and never
+  copies; the wrapper keeps the convenience copies and allocates `out` when
+  omitted. On SM100 a plan built without `topk_length` compiles the
+  `mTopkLength` operand out entirely (no placeholder tensor).
 
 ### 8. Dense Indexer / Dense Attn Score Recompute
 
@@ -497,6 +512,17 @@ and normalization semantics differ from the indexer path.
   caller-passed values must match the plan's. The wrappers derive them from
   `cu_seqlens` when omitted, at the cost of one blocking device-to-host read per
   call (not CUDA-graph capturable); pass both.
+- **Layout contract (class vs wrapper)** — `execute()` takes `out` and
+  `denom_out` as required, contiguous FP32 tensors matching the samples;
+  `q` / `k` / `weights` (or `lse`) need a unit innermost stride, and
+  `cu_seqlens_q` / `cu_seqlens_k` / `q_causal_offsets` must be contiguous 1-D
+  int32. `check_support()` declines strided samples with `NotImplementedError`
+  naming the tensor and its strides; `execute()` re-validates the live tensors
+  with `ValueError`. Nothing is copied, cast, or allocated on the execute path
+  (the SM90 kernel's per-head `(B,S,H)->(B,H,S)` operand transpose is the one
+  remaining copy, tracked as a deferred kernel change). The wrappers keep the
+  convenience: strided inputs are copied contiguous, `cu_seqlens_*` are cast to
+  int32, and `out` / `denom_out` are allocated when omitted, all on `stream`.
 
 ### 9. Indexer Backward
 

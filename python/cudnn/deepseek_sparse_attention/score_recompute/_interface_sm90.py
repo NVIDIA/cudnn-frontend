@@ -37,11 +37,11 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
-    maybe_contiguous,
     resolve_stream as _resolve_stream,
     torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
 )
+from ._interface_sm100 import _require_fp32_output, _require_int32_contiguous, _require_unit_innermost
 from .sparse_score_recompute_sm90 import SparseScoreRecomputeSm90
 from .dense_score_recompute_sm90 import DenseScoreRecomputeSm90
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
@@ -78,17 +78,13 @@ def _compute_tile_m(qhead_per_kvhead: int) -> tuple[int, int]:
     return tile_m, num_head_tiles
 
 
-def _validate_and_prepare_common(
+def _validate_common(
     q: torch.Tensor,
     kv: torch.Tensor,
     weights_or_lse: torch.Tensor,
     is_index_scores: bool,
-    stream: Optional[cuda.CUstream] = None,
-):
-    """Common validation + strided-contiguous pass for q, kv, weights_or_lse.
-
-    Returns (q, kv, weights_or_lse) after maybe_contiguous.
-    """
+) -> None:
+    """Common dtype/layout validation for q, kv, weights_or_lse; raises, never copies (Rule 1 / R5)."""
     assert q.dtype in [torch.float16, torch.bfloat16], f"q dtype must be half precision, got {q.dtype}"
     assert q.dtype == kv.dtype, f"q/kv dtype mismatch: q={q.dtype}, kv={kv.dtype}"
     if is_index_scores:
@@ -96,7 +92,8 @@ def _validate_and_prepare_common(
     else:
         assert weights_or_lse.dtype == torch.float32, f"lse must be float32, got {weights_or_lse.dtype}"
     assert all(t.is_cuda for t in (q, kv, weights_or_lse))
-    return [maybe_contiguous(t, stream) for t in (q, kv, weights_or_lse)]
+    for t, name in ((q, "q"), (kv, "kv"), (weights_or_lse, "weights_or_lse")):
+        _require_unit_innermost(t, name)
 
 
 # =============================================================================
@@ -108,11 +105,11 @@ def _sparse_score_recompute(
     q: torch.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim)
     kv: torch.Tensor,  # (bs, seqlen_k, n_heads_kv, head_dim) — 4D, n_heads_kv=1
     weights_or_lse: torch.Tensor,  # (bs, n_heads_q, seqlen_q) — already transposed to (B,H,S)
-    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32
+    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32, contiguous
     is_index_scores: bool,
     softmax_scale: float,
     topk_length: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
+    out: torch.Tensor,  # (bs, seqlen_q, topk) fp32, contiguous, required
     output_log_probs: bool,
     nvtx_range_name: str,
     topk_indices_global: bool = True,
@@ -120,12 +117,13 @@ def _sparse_score_recompute(
 ) -> torch.Tensor:
     """Compile + launch sparse score kernel. Internal helper used by the four
     public entry points; they own the ``(k, weights_or_lse)`` layout conversion
-    so the kernel sees the legacy SM90 layout (kv 4D + weights (B,H,S))."""
+    so the kernel sees the legacy SM90 layout (kv 4D + weights (B,H,S)).
+    Layout/dtype mismatches raise ``ValueError``; nothing is copied or cast here."""
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
 
     current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
+    _validate_common(q, kv, weights_or_lse, is_index_scores)
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
@@ -134,24 +132,15 @@ def _sparse_score_recompute(
 
     tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
 
-    with _torch_stream_context(current_stream):
-        topk_indices = topk_indices.to(torch.int32).contiguous()
-    assert topk_indices.is_cuda
+    _require_int32_contiguous(topk_indices, "topk_indices")
     topk_max = topk_indices.shape[-1]
 
-    if topk_length is not None:
-        with _torch_stream_context(current_stream):
-            topk_length = topk_length.to(torch.int32).contiguous()
-        assert topk_length.shape == (batch_size, seqlen_q)
     has_topk_length = topk_length is not None
+    if has_topk_length:
+        _require_int32_contiguous(topk_length, "topk_length")
+        assert topk_length.shape == (batch_size, seqlen_q)
 
-    if out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty((batch_size, seqlen_q, topk_max), dtype=torch.float32, device=q.device)
-    else:
-        if not out.is_contiguous():
-            with _torch_stream_context(current_stream):
-                out = out.contiguous()
+    _require_fp32_output(out, "out", (batch_size, seqlen_q, topk_max))
 
     dtype = torch2cute_dtype_map[q.dtype]
     # Sparse path: num_threads fixed at 256 (1 producer WG + 1 consumer WG).
@@ -237,8 +226,8 @@ def sparse_indexer_score_recompute(
     q_indexer: torch.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim) half
     k_indexer: torch.Tensor,  # (bs, seqlen_k, head_dim) half — MQA, 3D
     weights: torch.Tensor,  # (bs, seqlen_q, n_heads_q) half
-    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32
-    out: Optional[torch.Tensor] = None,
+    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32, contiguous
+    out: torch.Tensor,  # (bs, seqlen_q, topk) fp32, contiguous, required
     topk_length: Optional[torch.Tensor] = None,
     output_log_probs: bool = False,
     sm_scale: float = 1.0,
@@ -254,6 +243,9 @@ def sparse_indexer_score_recompute(
     Defaults to 1.0 (identity).
     """
     kv = k_indexer.unsqueeze(2)
+    # Deferred (Rule 8 batch item D4): the SM90 kernel reads the per-head operand
+    # with S as the unit stride, so this (B,S,H)->(B,H,S) copy stays until the
+    # kernel takes the (B,S,H) stride or SM90 declines in check_support().
     with _torch_stream_context(current_stream):
         w_bhs = weights.transpose(1, 2).contiguous()
     return _sparse_score_recompute(
@@ -276,9 +268,9 @@ def sparse_attn_score_recompute(
     q_attn: torch.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim) half
     k_attn: torch.Tensor,  # (bs, seqlen_k, head_dim) half — MQA, 3D
     lse: torch.Tensor,  # (bs, seqlen_q, n_heads_q) float32
-    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32
+    topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32, contiguous
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor,  # (bs, seqlen_q, topk) fp32, contiguous, required
     topk_length: Optional[torch.Tensor] = None,
     topk_indices_global: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
@@ -289,6 +281,7 @@ def sparse_attn_score_recompute(
     target     = S / sum(S)  (L1-norm over topk)
     """
     kv = k_attn.unsqueeze(2)
+    # Deferred (Rule 8 batch item D4): per-head operand transpose copy, see sparse_indexer_score_recompute.
     with _torch_stream_context(current_stream):
         lse_bhs = lse.transpose(1, 2).contiguous()
     return _sparse_score_recompute(
@@ -318,22 +311,22 @@ def _dense_score_recompute(
     weights_or_lse: torch.Tensor,  # (bs, n_heads_q, seqlen_q) — transposed to (B,H,S)
     is_index_scores: bool,
     softmax_scale: float,
-    out: Optional[torch.Tensor],
-    denom_out: Optional[torch.Tensor],
+    out: torch.Tensor,  # (bs, seqlen_q, seqlen_k) fp32, contiguous, required
+    denom_out: torch.Tensor,  # (bs, seqlen_q) fp32, contiguous, required
     num_threads: int,
     nvtx_range_name: str,
     ratio: int = 1,
     q_causal_offsets: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compile + launch the dense 3-WG score kernel."""
+    """Compile + launch the dense 3-WG score kernel. Layout/dtype mismatches raise ``ValueError``."""
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
     assert num_threads == _DENSE_NUM_THREADS, f"SM90 dense score is 3-WG-only (num_threads={_DENSE_NUM_THREADS}); got {num_threads}."
 
     current_stream = _resolve_stream(current_stream)
-    q, kv, weights_or_lse = _validate_and_prepare_common(q, kv, weights_or_lse, is_index_scores, current_stream)
+    _validate_common(q, kv, weights_or_lse, is_index_scores)
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
@@ -348,20 +341,8 @@ def _dense_score_recompute(
 
     tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
 
-    if out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty((batch_size, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device)
-    else:
-        if not out.is_contiguous():
-            with _torch_stream_context(current_stream):
-                out = out.contiguous()
-    if denom_out is None:
-        with _torch_stream_context(current_stream):
-            denom_out = torch.zeros((batch_size, seqlen_q), dtype=torch.float32, device=q.device)
-    else:
-        if not denom_out.is_contiguous():
-            with _torch_stream_context(current_stream):
-                denom_out = denom_out.contiguous()
+    _require_fp32_output(out, "out", (batch_size, seqlen_q, seqlen_k))
+    _require_fp32_output(denom_out, "denom_out", (batch_size, seqlen_q))
 
     dtype = torch2cute_dtype_map[q.dtype]
     # Dense path never consumes topk_idxs / topk_length; pass topk_max = seqlen_k
@@ -459,8 +440,8 @@ def dense_indexer_score_recompute(
     q_indexer: torch.Tensor,  # BSHD (bs, seqlen_q, n_heads_q, head_dim) or THD (total_q, n_heads_q, head_dim)
     k_indexer: torch.Tensor,  # BSHD (bs, seqlen_k, n_heads_kv, head_dim) or THD (total_k, n_heads_kv, head_dim)
     weights: torch.Tensor,  # BSH (bs, seqlen_q, n_heads_q) or TH (total_q, n_heads_q)
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
+    out: torch.Tensor,  # (bs, seqlen_q, seqlen_k) fp32, contiguous, required
+    denom_out: torch.Tensor,  # (bs, seqlen_q) fp32, contiguous, required
     num_threads: int = _DENSE_NUM_THREADS,
     sm_scale: float = 1.0,
     ratio: int = 1,
@@ -486,6 +467,7 @@ def dense_indexer_score_recompute(
     """
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
         raise NotImplementedError(_THD_NOT_SUPPORTED_SM90)
+    # Deferred (Rule 8 batch item D4): per-head operand transpose copy, see sparse_indexer_score_recompute.
     with _torch_stream_context(current_stream):
         w_bhs = weights.transpose(1, 2).contiguous()
     return _dense_score_recompute(
@@ -509,8 +491,8 @@ def dense_attn_score_recompute(
     k_attn: torch.Tensor,  # BSHD (bs, seqlen_k, n_heads_kv, head_dim) or THD (total_k, n_heads_kv, head_dim)
     lse: torch.Tensor,  # BSH (bs, seqlen_q, n_heads_q) or TH (total_q, n_heads_q) float32
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
+    out: torch.Tensor,  # (bs, seqlen_q, seqlen_k) fp32, contiguous, required
+    denom_out: torch.Tensor,  # (bs, seqlen_q) fp32, contiguous, required
     num_threads: int = _DENSE_NUM_THREADS,
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -532,6 +514,7 @@ def dense_attn_score_recompute(
     """
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
         raise NotImplementedError(_THD_NOT_SUPPORTED_SM90)
+    # Deferred (Rule 8 batch item D4): per-head operand transpose copy, see sparse_indexer_score_recompute.
     with _torch_stream_context(current_stream):
         lse_bhs = lse.transpose(1, 2).contiguous()
     return _dense_score_recompute(
@@ -556,6 +539,5 @@ __all__ = [
     "dense_indexer_score_recompute",
     "dense_attn_score_recompute",
     "to_cute_tensor",
-    "maybe_contiguous",
     "torch2cute_dtype_map",
 ]
