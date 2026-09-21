@@ -12,6 +12,8 @@ that must block declares it (recipe R6) and its tests carry
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 import torch
 
@@ -41,6 +43,7 @@ def _execute_never_blocks_the_host(request, monkeypatch):
         return
 
     def guard(real):
+        @functools.wraps(real)  # signature-stability tests inspect execute()
         def guarded(self, *args, **kwargs):
             previous = torch.cuda.get_sync_debug_mode()
             torch.cuda.set_sync_debug_mode("error")
