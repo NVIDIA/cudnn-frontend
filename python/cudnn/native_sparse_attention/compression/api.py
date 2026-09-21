@@ -54,8 +54,10 @@ class CompressionAttention(APIBase):
         self.enable_lse = sample_lse is not None
         self.cum_seqlen_q_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q"), 1, "sample_cum_seqlen_q")
         self.cum_seqlen_k_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k"), 1, "sample_cum_seqlen_k")
-        self.max_cum_seqlen_q = int(sample_cum_seqlen_q.max().item()) if sample_cum_seqlen_q is not None else None
-        self.max_cum_seqlen_k = int(sample_cum_seqlen_k.max().item()) if sample_cum_seqlen_k is not None else None
+        # T,H,D compile envelope: the packed token total the sample already carries (>= cum_seqlen[-1]; the kernel
+        # reads the real per-sequence extents from cum_seqlen). Never read back from the device at build (Rule 8).
+        self.max_cum_seqlen_q = int(self.q_desc.shape[0]) if (sample_cum_seqlen_q is not None and self.q_desc.ndim == 3) else None
+        self.max_cum_seqlen_k = int(self.k_desc.shape[0]) if (sample_cum_seqlen_k is not None and self.k_desc.ndim == 3) else None
 
         # Types and kernel configuration
         self.qk_acc_dtype_torch = qk_acc_dtype

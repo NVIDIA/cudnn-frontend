@@ -349,6 +349,8 @@ result = NSA.sliding_window_attention_wrapper(
     v_tensor=v,
     seq_len_q_tensor=seq_len_q,      # Required for T,H,D layout
     seq_len_kv_tensor=seq_len_kv,    # Required for T,H,D layout
+    max_seq_len_q=1024,              # Required for T,H,D layout (plan-time envelope, never read from seq_len_q)
+    max_seq_len_kv=1024,             # Required for T,H,D layout
     left_bound=512,
     right_bound=0,  # Causal: no looking ahead
     is_infer=True,  # Set False to output stats for training
@@ -381,6 +383,12 @@ swa = NSA.SlidingWindowAttention(
     right_bound=0,
     sample_seq_len_q=seq_len_q,
     sample_seq_len_kv=seq_len_kv,
+    # Optional for T,H,D: int64 (b+1,1,1,1) samples, validated only (the graph descriptors are built from the batch shape)
+    sample_q_ragged_offset=q_off,
+    sample_k_ragged_offset=k_off,
+    sample_v_ragged_offset=v_off,
+    sample_o_ragged_offset=o_off,
+    sample_stats_ragged_offset=stats_off,
     max_seq_len_q=1024,
     max_seq_len_kv=1024,
     attn_scale=None,
@@ -390,6 +398,10 @@ swa = NSA.SlidingWindowAttention(
 )
 assert swa.check_support()
 swa.compile()
+# The caller owns the backend workspace: allocate it once, reuse it across executes.
+ws = torch.empty(max(swa.get_workspace_size(), 1), dtype=torch.uint8, device=q.device)
+# T,H,D: ragged offsets are REQUIRED at execute. For a fully packed batch build them once per batch:
+q_off, k_off, v_off, o_off, stats_off = NSA.packed_thd_ragged_offsets(seq_len_q, seq_len_kv, q, k, v, o, stats)
 swa.execute(
     q_tensor=q,
     k_tensor=k,
@@ -398,6 +410,12 @@ swa.execute(
     stats_tensor=stats,
     seq_len_q_tensor=seq_len_q,
     seq_len_kv_tensor=seq_len_kv,
+    q_ragged_offset_tensor=q_off,
+    k_ragged_offset_tensor=k_off,
+    v_ragged_offset_tensor=v_off,
+    o_ragged_offset_tensor=o_off,
+    stats_ragged_offset_tensor=stats_off,
+    workspace=ws,
     current_stream=stream,
 )
 ```
@@ -412,14 +430,17 @@ swa.execute(
 | `is_infer` | `bool` | Inference mode (no stats output) | `False` |
 | `intermediate_data_type` | `torch.dtype` | Intermediate computation dtype | `torch.float32` |
 | `compute_data_type` | `torch.dtype` | Compute dtype | `torch.float32` |
-| `max_seq_len_q` | `int` | Maximum sequence length for queries | Required for T,H,D |
+| `max_seq_len_q` | `int` | Maximum sequence length for queries (plan-time envelope; the wrapper requires it too) | Required for T,H,D |
 | `max_seq_len_kv` | `int` | Maximum sequence length for keys/values | Required for T,H,D |
 | `cudnn_handle` | `cudnn.handle \| None` | cuDNN handle (recommended to reuse) | Creates new handle |
+| `workspace` (execute) | `torch.Tensor \| None` | Caller-owned backend workspace: `get_workspace_size()` bytes, `uint8`, on the graph's device; may be `None` only when that size is 0 | Required when size > 0 |
+
+`get_workspace_size()` is available after `compile()`; the class never allocates the workspace itself (the wrapper allocates one per call).
 
 #### Constraints
 
 - Supports both `B,H,S,D` (batched) and `T,H,D` (variable-length) layouts
-- For `T,H,D` layout, requires `seq_len_q` and `seq_len_kv` (and optionally ragged offset tensors, otherwise fully packed layout is assumed)
+- For `T,H,D` layout, requires `seq_len_q` and `seq_len_kv`; the `q/k/v/o` (and `stats` in training mode) ragged offset tensors -- int64, `(b+1, 1, 1, 1)` -- are required at `execute()` and are never derived by the engine. For a fully packed batch build them once per batch with `NSA.packed_thd_ragged_offsets(seq_len_q, seq_len_kv, q, k, v, o, stats)`; the wrapper does this per call when none are given
 - `cudnn_handle` should be reused across calls for performance
 
 ---
@@ -464,8 +485,8 @@ result = NSA.topk_reduction_wrapper(
     lse_tensor=lse,
     cum_seqlen_q_tensor=cum_seqlen_q,  # For T,H,D layout
     cum_seqlen_k_tensor=cum_seqlen_k,  # For T,H,D layout
-    max_s_q=1024,  # Optional for T,H,D (inferred from cum_seqlen_q if omitted)
-    max_s_k=1024,  # Optional for T,H,D (inferred from cum_seqlen_k if omitted)
+    max_s_q=1024,  # Required for T,H,D (plan-time envelope, never read from cum_seqlen_q)
+    max_s_k=1024,  # Required for T,H,D
     acc_dtype=torch.float32,
     k_value=16,  # Number of blocks to select
     selection_block_size=64,
@@ -527,13 +548,14 @@ topk.execute(
 | `mma_tiler_mn` | `Tuple[int, int]` | Kernel tile size | `(128, 128)` |
 | `scale_softmax` | `float \| None` | Softmax scaling factor | `1/sqrt(head_dim)` |
 | `acc_dtype` | `torch.dtype` | Accumulator dtype | `torch.float32` |
-| `max_s_q` | `int \| None` | Maximum query sequence length (optional for `T,H,D`, inferred from `cum_seqlen_q`) | `None` |
-| `max_s_k` | `int \| None` | Maximum key sequence length (optional for `T,H,D`, inferred from `cum_seqlen_k`) | `None` |
+| `max_s_q` | `int` | Maximum query sequence length (plan-time launch envelope; never read back from `cum_seqlen_q`) | Required for `T,H,D` |
+| `max_s_k` | `int` | Maximum key sequence length | Required for `T,H,D` |
 
 #### Constraints
 
 - Input dtype for Q/K must match
 - LSE dtype must match `acc_dtype`
+- LSE must be `(B, H_q, S_q)` row-major, or for `T,H,D` `(T, H_q)` with the T axis at unit stride (the transposed view of a contiguous `(H_q, T)` buffer): the kernel reads LSE through a fixed `(1, S_q)` stride. Other layouts are declined in `check_support()` (`NotImplementedError`) and rejected at `execute()` -- the LSE is never made contiguous on the caller's behalf
 - `topk_indices` must be `int32`
 - Requires SM100+ (Blackwell or newer)
 

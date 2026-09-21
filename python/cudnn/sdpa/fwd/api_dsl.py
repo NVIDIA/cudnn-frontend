@@ -19,7 +19,15 @@ import torch
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+# WorkspaceCarver / ws_align / _WS_ALIGN live in api_base.py and are re-exported here for the bwd/engines importers.
+from cudnn.api_base import (  # noqa: F401
+    APIBase,
+    TensorDesc,
+    TupleDict,
+    WorkspaceCarver,
+    _WS_ALIGN,
+    ws_align,
+)
 from cudnn._device import ensure_current_context as _ensure_current_context
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import (
@@ -207,12 +215,6 @@ _SM120_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 
-# Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is
-# used so the per-sequence O TMA descriptors carved for the THD path satisfy
-# the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
-# 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
-_WS_ALIGN = 128
-
 
 @contextmanager
 def _torch_stream_context(
@@ -268,62 +270,6 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
-
-
-def ws_align(nbytes: int) -> int:
-    """Round a scratch-chunk size up to the carve alignment (128 B)."""
-    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
-
-
-class WorkspaceCarver:
-    """Carves fixed-size, aligned scratch views out of the CALLER's workspace.
-
-    FROST executor contract (see ``engine._FrostSdpaFwdPlan``): an executor that
-    records a non-zero ``workspace_bytes`` is handed the caller's workspace
-    buffer (``ExecutionContext.workspace``) at execute and
-    carves its per-execute scratch from it instead of allocating. Chunks are
-    dealt sequentially at 128-byte relative alignment and never reach beyond
-    the buffer; an absent, non-torch, or undersized buffer raises immediately
-    with the required size in the message (never silent corruption).
-    """
-
-    def __init__(self, workspace, required: int, owner: str):
-        if workspace is None:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace but execute() "
-                f"received none; allocate graph.get_workspace_size() bytes (uint8, on the "
-                f"graph's device) and pass the buffer to execute()"
-            )
-        if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
-            raise TypeError(f"cudnn.sdpa: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
-        flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.reshape(-1)
-        if flat.numel() < required:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace; the provided "
-                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
-            )
-        if flat.data_ptr() % 16 != 0:
-            raise ValueError(f"cudnn.sdpa: {owner} workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
-        self._flat = flat
-        self._off = 0
-        self._owner = owner
-
-    def take(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
-        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
-        nbytes = int(numel) * dtype.itemsize
-        start, end = self._off, self._off + nbytes
-        if end > self._flat.numel():
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
-        self._off = start + ws_align(nbytes)
-        try:
-            return self._flat[start:end].view(dtype)
-        except RuntimeError as exc:
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
-
-    def remaining(self) -> torch.Tensor:
-        """The unconsumed tail (uint8) — handed down to a nested carver."""
-        return self._flat[self._off :]
 
 
 def _flavor_tag(flavor: tuple[int, int]) -> str:

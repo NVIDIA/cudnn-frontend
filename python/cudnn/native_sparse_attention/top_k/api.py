@@ -16,6 +16,13 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict
 
 
+def _lse_stride_mismatch(shape, stride) -> bool:
+    """True when a (B,H_q,S_q) LSE view is not row-major; extent-1 axes are never stepped and are ignored."""
+    b, h_q, s_q = shape
+    expected = (h_q * s_q, s_q, 1)
+    return any(n > 1 and st != e for n, st, e in zip(shape, stride, expected))
+
+
 class TopKReduction(APIBase):
     """
     Top-K Reduction for Native Sparse Attention.
@@ -26,6 +33,14 @@ class TopKReduction(APIBase):
     Note:
         The returned values calculated by the kernel exclude the first block and neighboring blocks from the reduction.
         As a result, it is expected to see rows of all -inf values and -1 values in the final topk_scores and topk_indices output tensors, respectively.
+
+    Contract (Rule 8: no device read at build, no hidden copy at execute):
+        * ``T,H,D`` layout: ``max_s_q`` and ``max_s_k`` are REQUIRED plan-time ints (the launch envelope);
+          they are never inferred from ``cum_seqlen_q`` / ``cum_seqlen_k``.
+        * ``sample_lse`` must be ``(B, H_q, S_q)`` row-major (``T,H,D``: ``(T, H_q)`` with T at unit stride, i.e. the
+          transposed view of a contiguous ``(H_q, T)`` buffer). The kernel reads LSE through a fixed ``(1, S_q)``
+          stride, so any other layout is declined in ``check_support()`` and rejected at ``execute()`` -- it is
+          not made contiguous on the caller's behalf.
     """
 
     def __init__(
@@ -61,14 +76,13 @@ class TopKReduction(APIBase):
         self.cum_seqlen_q_desc = self._make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q")
         self.cum_seqlen_k_desc = self._make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k")
 
-        self.max_s_q = max_s_q
-        if self.max_s_q is None and sample_cum_seqlen_q is not None:
-            self._logger.warning("max_s_q not provided, inferring from cum_seqlen_q")
-            self.max_s_q = (sample_cum_seqlen_q[1:] - sample_cum_seqlen_q[:-1]).max().item()
-        self.max_s_k = max_s_k
-        if self.max_s_k is None and sample_cum_seqlen_k is not None:
-            self._logger.warning("max_s_k not provided, inferring from cum_seqlen_k")
-            self.max_s_k = (sample_cum_seqlen_k[1:] - sample_cum_seqlen_k[:-1]).max().item()
+        if (sample_cum_seqlen_q is not None or sample_cum_seqlen_k is not None) and (max_s_q is None or max_s_k is None):
+            raise ValueError(
+                "TopKReduction: max_s_q and max_s_k are required for the T,H,D layout (plan-time launch envelope); "
+                f"they are not inferred from cum_seqlen (a device read at build, Rule 8). Got max_s_q={max_s_q}, max_s_k={max_s_k}"
+            )
+        self.max_s_q = None if max_s_q is None else int(max_s_q)
+        self.max_s_k = None if max_s_k is None else int(max_s_k)
         self.acc_dtype = acc_dtype
         self.k_value = k_value
         self.selection_block_size = selection_block_size
@@ -105,9 +119,14 @@ class TopKReduction(APIBase):
         self._check_tensor_shape(self.k_desc, (b, h_k, s_k, d), name="K")
         self.lse_desc = self._unpad_tensor_to_ndim(self.lse_desc, 3, "sample_lse")
         self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
-        if self.lse_desc.stride[-1] != 1:
-            self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
-            self.lse_desc = self.lse_desc.contiguous()
+        # The kernel hard-codes the LSE layout as (s_q, h_r, h_k, b) with stride (1, s_q*h_k, s_q, s_q*h_q), i.e. a
+        # row-major (b, h_q, s_q) view. Any other layout is declined (R5), never repacked.
+        self._not_implemented_error_if(
+            _lse_stride_mismatch(self.lse_desc.shape, self.lse_desc.stride),
+            "TopKReduction: sample_lse must be laid out (B,H_q,S_q) / (T,H_q) with the S axis at unit stride and heads "
+            f"S_q apart (kernel reads LSE through a fixed (1, S_q) stride); got shape {tuple(self.lse_desc.shape)} "
+            f"stride {tuple(self.lse_desc.stride)} after normalisation to (B,H_q,S_q)",
+        )
         self._check_tensor_shape(self.topk_scores_desc, (b, h_k, s_q, self.k_value), name="TopK Scores")
         self._check_tensor_shape(self.topk_indices_desc, (b, h_k, s_q, self.k_value), name="TopK Indices")
 
@@ -214,9 +233,11 @@ class TopKReduction(APIBase):
                     topk_scores_tensor = topk_scores_tensor.unsqueeze(0).transpose(1, 2)
                     topk_indices_tensor = topk_indices_tensor.unsqueeze(0).transpose(1, 2)
             lse_tensor = self._unpad_tensor_to_ndim(lse_tensor, 3, "lse_tensor")
-            if lse_tensor.stride(-1) != 1:
-                self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
-                lse_tensor = lse_tensor.contiguous()
+            if _lse_stride_mismatch(tuple(lse_tensor.shape), tuple(lse_tensor.stride())):
+                raise ValueError(
+                    "TopKReduction.execute: lse_tensor layout differs from the plan's sample_lse (S axis must be unit-stride, "
+                    f"heads S_q apart); got shape {tuple(lse_tensor.shape)} stride {tuple(lse_tensor.stride())} after normalisation to (B,H_q,S_q)"
+                )
 
             return _compiled_kernel(
                 problem_size,
@@ -308,7 +329,14 @@ def topk_reduction_wrapper(
     _logger.debug("topk_reduction_wrapper: Entering topk_reduction_wrapper")
     topk_scores_tensor, topk_indices_tensor = None, None
     if cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None:  # T,H,D
-        total_seq_len_q = cum_seqlen_q_tensor[-1].item()
+        if max_s_q is None or max_s_k is None:
+            raise ValueError(
+                "topk_reduction_wrapper: max_s_q and max_s_k are required for the T,H,D layout (plan-time launch envelope); "
+                f"they are not inferred from cum_seqlen (a device read, Rule 8). Got max_s_q={max_s_q}, max_s_k={max_s_k}"
+            )
+        # Packed T,H,D: the output leads with q's token extent (== cum_seqlen_q[-1] when fully packed; a slack tail
+        # is never written). Reading cum_seqlen_q[-1] back would be a blocking D2H copy per call.
+        total_seq_len_q = q_tensor.shape[0]
         h_k = k_tensor.shape[1]
         topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
         topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
