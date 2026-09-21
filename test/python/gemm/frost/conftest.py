@@ -36,6 +36,32 @@ def _frost_opt_in(monkeypatch):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
 
 
+@pytest.fixture(autouse=True)
+def _moe_plan_workspace(request, monkeypatch):
+    """A compiled MoE plan owns no workspace (Rule 8): called without one it raises
+    the contract error. This suite calls the direct ``jit_from_cudnn_graph`` plans
+    in 180+ places, so the HARNESS supplies ``workspace_bytes`` here -- per test,
+    through monkeypatch, so the plan classes themselves stay strict. Opt out with
+    ``@pytest.mark.no_workspace_shim`` to test the contract error itself."""
+    if request.node.get_closest_marker("no_workspace_shim"):
+        yield
+        return
+    import torch
+    from cudnn.gemm.frost.sm100 import compiler as _sm100
+    from cudnn.gemm.frost.sm120 import compiler as _sm120
+
+    for cls in (_sm100.CompiledMoeGemm, _sm100.CompiledMoeBlockScaleGemm, _sm120.CompiledMoeGemm, _sm120.CompiledMoeBlockScaleGemm):
+        real = cls.__call__
+
+        def shim(self, variant_pack, workspace=None, stream=None, _real=real):
+            if workspace is None and self.workspace_bytes:
+                workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=torch.device("cuda", self.device))
+            return _real(self, variant_pack, workspace=workspace, stream=stream)
+
+        monkeypatch.setattr(cls, "__call__", shim)
+    yield
+
+
 # A template family that does not run on the active GPU -- or that this
 # process's arch tree does not render -- is a capability gap, not a defect.
 # Every frost jit path declines it with one of two messages:

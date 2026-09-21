@@ -470,6 +470,7 @@ def test_moe_grouped_matmul_fwd_e2e(group_sizes, offset_cudnn_dt, offset_torch_d
 
 
 @requires_sm100
+@pytest.mark.no_workspace_shim
 def test_moe_grouped_matmul_fwd_direct_call_requires_workspace() -> None:
     """Rule 8: the plan owns no workspace. A direct call without one is a contract
     error naming the byte count; the test harness supplies ``workspace_bytes``."""
