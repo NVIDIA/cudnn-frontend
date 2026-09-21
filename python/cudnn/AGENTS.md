@@ -392,7 +392,10 @@ in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
 that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
-passed nothing. A path with no workspace contract gets one.
+passed nothing. A path with no workspace contract gets one. A direct adapter
+caller (the `<op>_wrapper`, a test, downstream code constructing the class) is a
+caller: the wrapper allocates `scratch_workspace_bytes()` once per call and
+passes it; an engine never allocates because the wrapper forgot.
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -424,7 +427,11 @@ serve that input, the kernel reads it natively.
 of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
 raise before doing it (`linear_attention/cake/compiler.py::check_not_capturing`),
 and say so in its docstring. Never a silent `cuStreamSynchronize` /
-`torch.cuda.synchronize()` / `.item()` on a build or execute path.
+`torch.cuda.synchronize()` / `.item()` on a build or execute path. A value the
+host needs that the caller already knows is a required host argument, never
+inferred by a device read (R10); a device-data table the kernel consumes
+(offsets, pointer arrays) is a documented contract validated from host metadata
+(dtype, shape, alignment, device), not read back to check its values.
 
 **R7 — you need a cuDNN handle and the caller gave none.** Graph API lowering:
 `_pygraph._backend_handle_for_lowering` (process default, one per thread and
@@ -448,7 +455,26 @@ executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_
 capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
 window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
-(`test_torch_stream.py`).
+(`test_torch_stream.py`). Every `fe_api` test already runs each `APIBase`
+`execute()` under `set_sync_debug_mode("error")` (`test/python/fe_api/conftest.py`);
+an R6 engine's tests carry `@pytest.mark.allow_host_sync` and say why. The
+`compile_allocates_nothing` fixture there is the R11 detector.
+
+**R10 — a launch envelope the caller already knows (max sequence length, packed
+total, batch count, top-k width).** It is a required host int at plan time (an
+`__init__` argument or a graph attribute), validated against the sample shapes;
+never `cu_seqlens.diff().max().item()` or `.cpu().tolist()` at build or execute.
+When absent, raise `ValueError` naming the argument; when the kernel cannot
+serve a layout without reading it back (a host-driven per-batch loop), decline
+in `check_support()` (R5) until a native kernel exists.
+
+**R11 — compile() needs an operand the kernel only sees at execute (scratch,
+semaphore, scheduler counter, an output the caller passes later).** Build a fake
+cute tensor of the declared dtype/shape/stride (`APIBase._make_fake_cute_tensor`
+/ `_make_fake_cute_tensor_from_desc`, or `cute.runtime.make_fake_compact_tensor`)
+and compile against it; never `torch.empty` / `torch.zeros` a stand-in, never
+memset at compile. `compile()` touches no device memory: the deviceless AOT
+path depends on it, and a GiB-scale transient at compile is a real OOM.
 
 
 ## Frontend-only kernel package layout
