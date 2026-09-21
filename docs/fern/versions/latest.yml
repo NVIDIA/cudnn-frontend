@@ -128,7 +128,7 @@ navigation:
                 slug: agg_simple
               - page: GAT and GATv2 attention
                 path: ../../operations/gnn/mha_gat.md
-                slug: mha
+                slug: mha_gat
       - section: Utilities
         slug: utilities
         contents:
