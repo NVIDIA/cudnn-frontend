@@ -101,3 +101,14 @@ loads kernel templates by absolute path via `spec_from_file_location`, so the
 template that serves a config may come from elsewhere too. To find out which
 template a test actually compiles, log `path` at the top of `load_template` —
 do not infer it from `_pick_flavor` by reading the source.
+
+
+### Pending-consumer lifetime probes
+
+A CUDA stream wait on an event that has never been recorded is a no-op; recording
+it later does not retroactively block the consumer. Do not use an unrecorded event
+as a host-released latch. A bounded delayed-consumer probe must assert that its
+completion event is still pending after the producer/churn work. If the delay
+expires, fail the setup instead of accepting a lifetime result without overlap.
+Use a bounded byte consumer for recycled-storage negative controls, never a real
+kernel on a deliberately invalidated workspace.

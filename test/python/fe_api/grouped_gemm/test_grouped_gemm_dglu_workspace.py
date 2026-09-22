@@ -101,6 +101,9 @@ def test_dglu_jax_workspace_overlapping_consumers(monkeypatch):
         with torch.cuda.stream(streams[i]):
             assert cuda.cuMemsetD8Async(ptr, 17 + i, nbytes, launch_stream)[0] == cuda.CUresult.CUDA_SUCCESS
             initialized[i].record()
+            # Keep the delay bounded. Waiting on an unrecorded CUDA event is
+            # a no-op, so it cannot serve as a host-released gate. The pending
+            # assertion below proves overlap; an expired window fails the setup.
             torch.cuda._sleep(600_000_000)
             assert cuda.cuMemcpyDtoDAsync(observed[i].data_ptr(), ptr, nbytes, launch_stream)[0] == cuda.CUresult.CUDA_SUCCESS
             done[i].record()

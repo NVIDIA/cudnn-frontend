@@ -21,6 +21,7 @@ import ctypes
 import logging
 import re as _re
 import struct
+import sys
 
 from cudnn import _pybind_module
 
@@ -272,6 +273,21 @@ def _dlpack_geometry(buf):
     set to None when the buffer IS readable but its dtype has no name in
     ``DTYPES``; dim and stride are real in that case and worth keeping.
     """
+    # The common scratch buffer is a plain CUDA uint8 Tensor. Its public
+    # metadata already contains the CAI facts, without constructing/parsing an
+    # interface dictionary. Do not import torch or bypass a subclass's protocol.
+    torch = sys.modules.get("torch")
+    if (
+        torch is not None
+        and type(buf) is torch.Tensor
+        and not torch.overrides.has_torch_function_unary(buf)
+        and buf.dtype is torch.uint8
+        and buf.is_cuda
+        and buf.layout is torch.strided
+    ):
+        ptr = buf.data_ptr() if buf.numel() else 0  # CAI's empty-buffer convention
+        strides = None if buf.is_contiguous() else tuple(buf.stride())
+        return ptr, tuple(buf.shape), strides, "uint8", buf.device.index
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
