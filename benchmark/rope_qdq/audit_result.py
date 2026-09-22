@@ -6,6 +6,10 @@ This read-only audit does not establish GPU isolation or admit performance.
 It requires the recorded source, traces and generated artifacts to be present.
 """
 
+# Source, numerical and admission checks below rely on assertions.
+if not __debug__:
+    raise RuntimeError("This benchmark/auditor requires Python assertions; run without -O/-OO or PYTHONOPTIMIZE.")
+
 import argparse
 import hashlib
 import json

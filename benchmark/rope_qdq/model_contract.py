@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed-source window/DSpark RoPE + FP8 QDQ workloads, not packed-cache tests."""
 
+# Source, numerical and admission checks below rely on assertions.
+if not __debug__:
+    raise RuntimeError("This benchmark/auditor requires Python assertions; run without -O/-OO or PYTHONOPTIMIZE.")
+
 import ast
 import hashlib
 import json
