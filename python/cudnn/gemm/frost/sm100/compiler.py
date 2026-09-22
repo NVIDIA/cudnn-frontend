@@ -4957,9 +4957,11 @@ class CompiledMoeBlockScaleGemm:
         128-aligned); the scheduler tracks each group's start SF-block.
       * ``output`` — (1, S, N) row-major.
 
-    The per-CTA A-descriptor workspace is allocated/owned here; its size follows
-    the FIXED persistent grid (shape-independent), so one allocation serves every
-    problem size (override-shape needs no workspace accounting)."""
+    The per-CTA A-descriptor workspace is the CALLER's (``workspace_bytes`` sizes
+    it, ``execute(workspace=)`` passes it; a call without one is a contract error,
+    Rule 8); its size follows the FIXED persistent grid (shape-independent), so
+    one buffer serves every problem size (override-shape needs no workspace
+    accounting)."""
 
     chain: FusionChain
     config: TileConfig
@@ -4997,8 +4999,7 @@ class CompiledMoeBlockScaleGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA dynamic-descriptor workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` covers every dynamic descriptor. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
             raise ValueError(
                 f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "

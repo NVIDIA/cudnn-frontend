@@ -62,6 +62,7 @@ def test_nsa_compression_compile_execute(
 
     # Rule 8 holds BUILD to the execute standard: the T,H,D compile envelope comes from the
     # sample shape, never from a cum_seqlen .max().item() read at __init__.
+    previous_sync_debug_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
         comp_attn = NSA.CompressionAttention(
@@ -86,7 +87,7 @@ def test_nsa_compression_compile_execute(
         assert comp_attn.check_support()
         comp_attn.compile()
     finally:
-        torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.set_sync_debug_mode(previous_sync_debug_mode)
     comp_attn.execute(
         q_tensor=Q,
         k_tensor=K,
