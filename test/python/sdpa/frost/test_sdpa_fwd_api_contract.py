@@ -79,7 +79,9 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     passes check_support and compile, then fails every block-scaled draw at
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
-    for fn in (api_cls.execute, api_cls._execute_fp8):
+    # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
+    fns = (api_cls.execute, api_cls._execute_fp8) + ((api_cls._execute_mxfp8,) if hasattr(api_cls, "_execute_mxfp8") else ())
+    for fn in fns:
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
         assert params["sf_o"].default is None

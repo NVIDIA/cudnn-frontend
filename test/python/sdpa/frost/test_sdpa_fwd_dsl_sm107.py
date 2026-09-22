@@ -133,7 +133,7 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
     ("f16", (128, 128)): (True, 31, 11),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
-    ("mxfp8", (128, 128)): (True, 35, 13),
+    ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 31, 11),
     ("fp8", (192, 128)): (True, 42, 12),
     ("mxfp8", (192, 128)): (True, 35, 13),
@@ -1316,12 +1316,21 @@ def test_sm107_gate_accepts_every_dtype_member():
     mxfp8 = _caps(_GATE_ROWS[2])
     assert mxfp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert mxfp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert mxfp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert mxfp8.out_dtypes == frozenset(
+        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+    )
+    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), its own O store:
+    # never gated, so the gate matrix runs over the other members.
     for dt in sorted(mxfp8.dtypes, key=int):
-        for dto in sorted(mxfp8.out_dtypes, key=int):
+        for dto in sorted(mxfp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
             assert engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
+    # ...and the two epilogues decline each other on this row too.
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
+    assert why is not None and "block-scaled" in why, why
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert why is not None and "epilogue gate" in why, why
     why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.FP8_E4M3))
     assert why is not None and "gate dtype" in why, why
 
