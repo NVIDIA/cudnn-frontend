@@ -17,7 +17,7 @@
 
 """KDA fused state-summary kernel config: fixed compile-time constants of the BT=16 schedule (H and M recurrences in
 lockstep on one 16-warp CTA per (piece, head)).  Derived SMEM / TMEM sizes and offsets are stamped by ``build_cfg`` in
-``kda_summary_f16.py``.  Target arch: Blackwell SM100 / SM103.
+``kda_summary_f16.py``.  Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass
