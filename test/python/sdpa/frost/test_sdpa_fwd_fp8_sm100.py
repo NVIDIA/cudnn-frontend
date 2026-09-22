@@ -1403,6 +1403,31 @@ def test_fp8_thd_declared_totals():
 
 
 @pytest.mark.L0
+@pytest.mark.no_workspace_shim
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_execute_requires_a_workspace():
+    """R2 on the FP8 THD arm (``_thd_pack``): scratch is carved from the
+    caller's workspace; a direct caller that passes none gets the contract
+    error, never a hidden allocation (the suite's autouse shim is off here)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 128, 128
+    dev = "cuda"
+    q8, dq = _quant(torch.randn(b, s, h, d, device=dev) * 0.5, "e4m3")
+    q = q8.permute(0, 2, 1, 3)  # logical BHSD over compact BSHD storage (the packed THD contract)
+    k, v = q.clone(), q.clone()
+    o = torch.empty(b, s, h, d, device=dev, dtype=torch.float16).permute(0, 2, 1, 3)
+    dsc = torch.tensor([dq], dtype=torch.float32, device=dev)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, pertensor_fp8=True, dtype_o=torch.float16, thd=True)
+    assert api.check_support()
+    api.compile()
+    assert api.scratch_workspace_bytes() > 0
+    lens = torch.full((b,), s, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, descale_q=dsc, descale_k=dsc, descale_v=dsc, seq_q_lens=lens, seq_kv_lens=lens)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
