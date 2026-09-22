@@ -2581,7 +2581,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
             if ws.numel * workspace.element_size() < required:
                 raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
-            frame, combine_args = bind_dense_split(spec, facts, ws.ptr, current_stream, stream_int)
+            bound = bind_dense_split(spec, facts, ws.ptr, current_stream, stream_int)
+            if bound is None:
+                self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
+                return
+            frame, combine_args = bound
         else:
             frame = bind_dense(spec, facts, current_stream, stream_int)
         if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:

@@ -997,7 +997,8 @@ def _split_points(
     # O dtype whatever it is, and the combine performs the only cast down to it.
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
-        return [no_split]
+        # The ragged-Q leg has no unsplit form: keep a legal split without the SM count.
+        return [2] if ragged_decode else [no_split]
     decode_pack_g = _decode_tile_pack_g(facts, pack_g)
     if _d256_decode_tile_selected(caps, facts, decode_pack_g):
         # The decode tile is a different machine from the one the prefill model

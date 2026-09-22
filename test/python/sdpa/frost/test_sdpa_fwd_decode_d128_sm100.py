@@ -1049,11 +1049,16 @@ def test_ragged_q_leg_predicate_and_heuristics():
     assert "decode tile" in (engines.mismatch(caps, _ragged_paged_facts(s_q=2), K(cga=1, split_kv=2)) or ""), "MTP-THD keeps the prefill tile"
 
 
-def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, P=16, max_pages=20, stats=True):
+def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, P=16, max_pages=20, stats=True, out_cap=None, empty_outputs=False):
     """Build + run the FlashInfer-shaped ragged paged graph at S_q(max) == 1 and check
     it end to end: routing (decode tile, split, PackGQA, prepared launch), a
     zero-length sequence whose rows are never written, per-sequence numerics
-    (O and packed token-major Stats at the ragged offsets), Rule 3 (no host read)."""
+    (O and packed token-major Stats at the ragged offsets), Rule 3 (no host read).
+
+    ``out_cap``: the O / Stats buffers hold this many packed tokens (default T + 3,
+    a poisoned tail past the packed total); a capacity BELOW T checks that the
+    combine's stores are bounded by it.  ``empty_outputs``: zero-element O / Stats
+    producers -- the THD contract launches nothing for them."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
@@ -1073,8 +1078,9 @@ def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, 
     # neither read it into a live row nor write past T (the empty sequence has no row).
     cap = T + 3
     q_pk = torch.randn(cap, H, d, device=dev, dtype=torch.float32, generator=gen).to(dtype)
-    o_pk = torch.full((cap, H, d), float("nan"), device=dev, dtype=dtype)
-    st_pk = torch.full((cap, H), float("nan"), device=dev, dtype=torch.float32)
+    out_rows = 0 if empty_outputs else (cap if out_cap is None else out_cap)
+    o_pk = torch.full((out_rows, H, d), float("nan"), device=dev, dtype=dtype)
+    st_pk = torch.full((out_rows, H), float("nan"), device=dev, dtype=torch.float32)
     stride_q = (H * d, d, H * d, 1)  # the graph's (B, H, S_max=1, d) declaration; batch stride == token stride (never stepped)
     tdt = torch.int32 if offset_dtype == cudnn.data_type.INT32 else torch.int64
     ro_q = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d).to(tdt).view(B + 1, 1, 1, 1)
@@ -1131,10 +1137,12 @@ def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, 
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
+    if empty_outputs:
+        return plan  # nothing addressable: the binder skipped both launches (a null-pointer store would have faulted)
     o_out = o_pk.float()
     for b in range(B):
-        if q_lens[b] == 0:
-            continue
+        if q_lens[b] == 0 or cu[b] >= out_rows:
+            continue  # no row, or a row past the short buffer's capacity (never written)
         ref_o, ref_lse = _ref(q_pk[cu[b] : cu[b] + 1], _gather_kv(k_pool, bt[b], kv_lens[b], hnd), _gather_kv(v_pool, bt[b], kv_lens[b], hnd), 1, scale)
         got = o_out[cu[b] : cu[b] + 1]
         assert not torch.isnan(got).any(), f"batch {b}: NaN in O"
@@ -1148,6 +1156,31 @@ def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, 
     # Nothing written past the packed total (the empty sequence owns no row).
     assert torch.isnan(o_pk[T:].float()).all() and (not stats or torch.isnan(st_pk[T:]).all())
     return plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats", [True, False], ids=["stats", "no_stats"])
+def test_graph_thd_paged_decode_empty_outputs_launch_nothing(stats):
+    """The THD contract for a producer with no addressable token: zero-element O
+    (and Stats) buffers launch neither the decode kernel nor the combine -- the
+    binder returns no frame instead of scheduling a store through a null pointer
+    (codex review on #1191)."""
+    import cudnn
+
+    _thd_decode_graph(
+        dtype=torch.bfloat16, offset_dtype=cudnn.data_type.INT32, hnd=False, q_lens=[1, 1, 1], kv_lens=[64, 300, 17], stats=stats, empty_outputs=True
+    )
+
+
+@pytest.mark.L0
+def test_graph_thd_paged_decode_short_outputs_are_bounded():
+    """O / Stats buffers holding fewer packed tokens than the sequences address:
+    the combine skips every row at or past the buffer's capacity (rows below it
+    are correct), so a short buffer or an out-of-range offset never writes
+    outside the caller's bytes."""
+    import cudnn
+
+    _thd_decode_graph(dtype=torch.bfloat16, offset_dtype=cudnn.data_type.INT64, hnd=True, q_lens=[1, 1, 1, 1, 1], kv_lens=[40, 300, 17, 129, 8], out_cap=2)
 
 
 @pytest.mark.L0

@@ -80,6 +80,11 @@ def _combine_kernel(
     ragged_q_div: cutlass.Int32 = 1,
     ragged_o_div: cutlass.Int32 = 1,
     ragged_lse_div: cutlass.Int32 = 1,
+    # Packed token capacities of the final O and Stats buffers (ragged only): a
+    # row whose ragged placement lands at or past them is not written, so a
+    # short buffer or a bad offset can never store outside the caller's bytes.
+    ragged_o_cap: cutlass.Int32 = 0,
+    ragged_lse_cap: cutlass.Int32 = 0,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     q_row = cute.arch.block_idx()[0]
@@ -97,18 +102,22 @@ def _combine_kernel(
     lse_batch = batch
     lse_tok = q_row
     row_live = cutlass.Int32(1) == cutlass.Int32(1)
+    lse_live = row_live
     if cutlass.const_expr(ragged_q is not None):
         # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
         # buffer's element offset can exceed 2^31) and keep the token index in 32.
         rq = cutlass.make_array_view(ragged_q)
         q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
         q_len = cutlass.Int32(cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base)
-        row_live = q_row < q_len
+        in_seq = q_row < q_len
         o_batch = cutlass.Int32(0)
         o_tok = cutlass.Int32(cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div)) + q_row
+        row_live = in_seq & (o_tok < ragged_o_cap)
+        lse_live = row_live
         if cutlass.const_expr(ragged_lse is not None):
             lse_batch = cutlass.Int32(0)
             lse_tok = cutlass.Int32(cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div)) + q_row
+            lse_live = in_seq & (lse_tok < ragged_lse_cap)
 
     # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
     # Every lane redundantly walks the (very short) split axis; the values are
@@ -181,7 +190,7 @@ def _combine_kernel(
 
     # --- the recombined LSE (only when the caller asked for Stats) ---
     if cutlass.const_expr(lse_out is not None):
-        if (tidx == cutlass.Int32(0)) & row_live:
+        if (tidx == cutlass.Int32(0)) & lse_live:
             lo = cutlass.make_array_view(lse_out)
             lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
@@ -207,11 +216,33 @@ def _host(
     n_splits: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
-    ragged_q: Optional[cute.Tensor] = None,
-    ragged_o: Optional[cute.Tensor] = None,
-    ragged_lse: Optional[cute.Tensor] = None,
-    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32] = (1, 1, 1),
 ) -> None:
+    """Tensor ABI (dense placement). The runtime signature is the one every
+    positional ``_combine_kernel`` call site in api_dsl matches."""
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _launch_combine(
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_out: cute.Tensor,
+    lse_out: Optional[cute.Tensor],
+    amax_o: Optional[cute.Tensor],
+    scale_o: Optional[cute.Tensor],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
+    ragged_q: Optional[cute.Tensor],
+    ragged_o: Optional[cute.Tensor],
+    ragged_lse: Optional[cute.Tensor],
+    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """One launch for both ABIs: dense placement (ragged tensors None) or the
+    ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
+    token capacities."""
     B, H, SQ, D = problem_size
     _combine_kernel(
         o_partial,
@@ -230,6 +261,8 @@ def _host(
         cutlass.Int32(ragged_divs[0]),
         cutlass.Int32(ragged_divs[1]),
         cutlass.Int32(ragged_divs[2]),
+        cutlass.Int32(ragged_caps[0]),
+        cutlass.Int32(ragged_caps[1]),
     ).launch(
         grid=(SQ, H, B),
         block=[THREADS, 1, 1],
@@ -251,6 +284,7 @@ def _host_ptr(
     ragged_o_ptr: Optional[cute.Pointer],
     ragged_lse_ptr: Optional[cute.Pointer],
     ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -281,21 +315,8 @@ def _host_ptr(
         ragged_o = cute.make_tensor(ragged_o_ptr, cute.make_layout((n_off,), stride=(1,)))
         if cutlass.const_expr(ragged_lse_ptr is not None):
             ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
-    _host(
-        o_partial,
-        lse_partial,
-        o_out,
-        lse_out,
-        None,
-        None,
-        problem_size,
-        n_splits,
-        stats_log2,
-        stream=stream,
-        ragged_q=ragged_q,
-        ragged_o=ragged_o,
-        ragged_lse=ragged_lse,
-        ragged_divs=ragged_divs,
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, ragged_q, ragged_o, ragged_lse, ragged_divs, ragged_caps, stream
     )
 
 
@@ -344,6 +365,7 @@ def compile_ptr(
         P(off_t) if ragged else None,
         P(off_t) if (ragged and has_lse) else None,
         (cutlass.Int32(1),) * 3,
+        (cutlass.Int32(0),) * 2,
         bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
