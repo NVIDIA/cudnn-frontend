@@ -292,6 +292,12 @@ DSL satisfies your kernel.**
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- **MLIR argument widths are part of a DSL API migration.**
+  `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
+  while its predecessor carried one. Custom `__new_from_mlir_values__` methods
+  must slice by the lengths recorded during extraction, rather than assuming
+  one value per field. Static coordinates can contribute zero values, too.
+  `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
