@@ -1029,7 +1029,7 @@ def test_grouped_gemm_wgrad_workspace_size_matches_plan(output_mode):
     op = cudnn.GroupedGemmWgradSm100(**kw)
     try:
         supported = op.check_support()
-    except (ValueError, NotImplementedError, RuntimeError) as e:
+    except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
     if not supported:
         pytest.skip("Unsupported testcase")

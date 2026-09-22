@@ -99,17 +99,15 @@ def record_streams(tensors, stream, device=None) -> None:
     enqueued on ``stream`` (R1): ``tensor.record_stream(as_torch_stream(stream, device))``
     for every CUDA tensor in ``tensors`` (``None`` entries skipped).
 
-    A no-op when ``stream`` is None or torch's current stream on ``device``: there the
-    allocation stream already orders reuse (the caller's own contract), so nothing is
-    recorded and no ``Stream`` object is built.
+    A no-op only when ``stream`` is None (the work runs on torch's current stream under the
+    caller's own context). A launch stream that happens to be torch's current stream is still
+    recorded: the allocator orders reuse against the tensor's ALLOCATION stream, which may be
+    another one when the caller entered a side-stream context before calling.
     """
     if stream is None:
         return
     import torch
 
-    handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
-    if handle not in DEFAULT_STREAM_HANDLES and handle == _raw_current_stream(torch, device):
-        return
     consumer = None
     for tensor in tensors:
         if tensor is None or not tensor.is_cuda:
@@ -134,3 +132,12 @@ def contiguous_on_stream(tensor, stream, device=None):
     record_streams((tensor,), stream, device)
     with stream_context(stream, device):
         return tensor.contiguous()
+
+
+def copy_into_on_stream(dst, src, stream, device=None) -> None:
+    """``dst.copy_(src)`` on ``stream`` with ``dst`` recorded there first: the wrapper copy-back into a
+    caller-owned buffer is asynchronous too, and a caller that releases ``dst`` right after the call
+    must not see its block reused under the pending write."""
+    record_streams((dst,), stream, device)
+    with stream_context(stream, device):
+        dst.copy_(src)
