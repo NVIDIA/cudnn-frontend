@@ -22,6 +22,9 @@ dependencies required by the pinned DeepSeek source. The benchmark uses
 PyTorch's `emulate_precision_casts` compiler option. A toolkit able to compile
 SM100 kernels is required; missing controls fail the run.
 
+Run these scripts and auditors without `-O`, `-OO`, or `PYTHONOPTIMIZE`;
+they reject optimized Python so source, numerical, and audit checks stay enabled.
+
 ```bash
 python benchmark/rope_qdq/bench_compkv.py \
   --deepseek-source /path/to/DeepSeek-V4.1-Flash/inference \

@@ -8,6 +8,10 @@ Synthetic activations and exact source frequency/configuration are explicit.
 Every sample starts from restored input; no repeated quantization drift.
 """
 
+# Source, numerical and admission checks below rely on assertions.
+if not __debug__:
+    raise RuntimeError("This benchmark/auditor requires Python assertions; run without -O/-OO or PYTHONOPTIMIZE.")
+
 import argparse
 import ast
 from datetime import datetime, timezone
@@ -110,7 +114,7 @@ def main():
     import triton
     import flashinfer
     import cudnn
-    from cudnn.rope import api as rope_api
+    from cudnn.rope import qdq as rope_api
     from flashinfer.quantization.fp4_quantization import get_fp4_kv_dequantization_module
     from references_compkv import fused_inplace, quant_inplace, omitted_rounding_control, unpack_nvfp4_inplace
     from references_compkv import fused_snap_inplace, fused_fma_snap_inplace, quant_snap_inplace
