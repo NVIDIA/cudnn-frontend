@@ -137,6 +137,9 @@ def main():
             a, b = actual.double(), expected.double()
             relative = float((a - b).norm() / b.norm().clamp_min(1e-300))
             maximum = float((a - b).abs().max() / b.abs().max().clamp_min(1e-300))
+            # Finite inputs can still overflow diagnostics against a zero reference.
+            relative = relative if math.isfinite(relative) else None
+            maximum = maximum if math.isfinite(maximum) else None
         else:
             relative, maximum = None, None
         return dict(passed=finite and count == 0, finite=finite, differing_bf16_bits=count, elements=actual.numel(), relative_l2=relative, max_scaled=maximum)
@@ -374,9 +377,10 @@ def main():
                         for index, actual in enumerate(buffers):
                             key = f"{tag}/{name}/{role}/{mode}/{index}"
                             metrics = compare(actual, expected)
-                            assert bool((storage[index][:64] == 123).all() and (storage[index][-64:] == 123).all())
-                            metrics["guards_unchanged"] = True
+                            metrics["guards_unchanged"] = bool((storage[index][:64] == 123).all() and (storage[index][-64:] == 123).all())
                             result["checks"][key] = metrics
+                            if not metrics["guards_unchanged"]:
+                                raise RuntimeError(f"Guard region modified: {key}")
                             passed[role] &= metrics["passed"]
                             if not metrics["passed"] and role not in case["failures"]:
                                 path = args.output.with_name(args.output.stem + "." + tag + "." + role + ".failure.pt")
