@@ -22,8 +22,10 @@ def sha(path):
 def validate_metric(metric):
     assert metric["passed"] == (metric["finite"] and metric["differing_bf16_bits"] == 0)
     assert 0 <= metric["differing_bf16_bits"] <= metric["elements"]
-    if metric["finite"]:
-        assert all(math.isfinite(metric[key]) and metric[key] >= 0 for key in ("relative_l2", "max_scaled"))
+    if metric["passed"]:
+        assert metric["relative_l2"] == metric["max_scaled"] == 0.0
+    elif metric["finite"]:
+        assert all(metric[key] is None or (math.isfinite(metric[key]) and metric[key] >= 0) for key in ("relative_l2", "max_scaled"))
 
 
 def validate_trace(item, role, calls, quantization):
