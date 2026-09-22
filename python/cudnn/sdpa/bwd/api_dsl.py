@@ -27,7 +27,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     padded_head_dim as _sm120_padded_head_dim,
     padded_head_dims as _sm120_padded_head_dims,
 )
-from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
+from cudnn.sdpa.fwd.api_dsl import _WS_ALIGN, WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
 _SM120_KERNEL_FILE = "bprop_f16_sm120.py"
@@ -3247,7 +3247,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
 
         stream = self._get_default_stream(current_stream)
         with _torch_stream_context(current_stream, q_tensor.device):
-            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_thd")
+            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_thd", align=_WS_ALIGN)  # stage-2/3 TMA descriptors live here
             t_q_cap, t_kv_cap = self._t_q_cap, self._t_kv_cap
             t_dot = -(-t_q_cap // 128) * 128
             delta = carver.take(h * t_dot, torch.float32).reshape(1, h, t_dot)

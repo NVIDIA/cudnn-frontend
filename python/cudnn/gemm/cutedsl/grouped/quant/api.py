@@ -35,7 +35,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import allocate_wrapper_workspace, rubin_single_group_offsets_kwarg
+from ..backend_utils import allocate_wrapper_workspace, rubin_single_group_offsets_kwarg, retain_workspace
 from cutlass.cute.nvgpu import OperandMajorMode
 
 _JAX_SF_LAYOUT_ERROR = (
@@ -1240,6 +1240,7 @@ class GroupedGemmQuantSm100(APIBase):
             )
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         self._logger.debug("Executing grouped_gemm_quant kernel")
         if self.weight_mode == MoEWeightMode.DENSE:
