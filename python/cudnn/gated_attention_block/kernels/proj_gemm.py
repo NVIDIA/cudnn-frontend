@@ -819,8 +819,9 @@ _LOG = logging.getLogger(__name__)
 # with ``cudnn.set_stream`` before every launch (``cudnnSetStream`` is host-only handle
 # state and capture-legal; ``_pygraph.execute`` reads the stream off the handle).  The
 # re-stream + execute pair is serialised per device by ``_graph_handle_lock`` (a
-# cuDNN handle must not be used by two threads at once); a caller that passes its
-# own ``handle=`` bypasses both the shared handle and the lock.
+# cuDNN handle must not be used by two threads at once) -- also when a caller hands
+# the shared handle back in as ``handle=``; an independently owned ``handle=``
+# bypasses both the shared handle and the lock.
 _GRAPH_HANDLE_BY_DEVICE: dict = {}
 _GRAPH_HANDLE_LOCKS: dict = {}
 _GRAPH_HANDLE_REGISTRY_LOCK = threading.Lock()
@@ -855,6 +856,12 @@ def _graph_handle_lock(device) -> threading.Lock:
         if lock is None:
             lock = _GRAPH_HANDLE_LOCKS[idx] = threading.Lock()
     return lock
+
+
+def _shared_handle_device(handle) -> Optional[int]:
+    """The device index whose shared ``graph_handle`` is ``handle`` (by identity); None for a caller-owned handle."""
+    with _GRAPH_HANDLE_REGISTRY_LOCK:
+        return next((idx for idx, h in _GRAPH_HANDLE_BY_DEVICE.items() if h is handle), None)
 
 
 @dataclass
@@ -1362,17 +1369,20 @@ def run_proj_gemm(
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
     # The graph route names its stream through the handle: the plan's engine
     # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
-    if handle is not None:
+    # The shared per-device handle must not be driven by two threads at once
+    # (cuDNN: a handle is not thread-safe while in use): re-stream + execute
+    # are one critical section per device, whether the handle is looked up here
+    # or handed back in by the caller. A caller-owned `handle=` skips the lock
+    # (its owner serialises it).
+    lock_device = _device_index(out.device) if handle is None else _shared_handle_device(handle)
+    if lock_device is None:
         plan.graph.execute(vp, workspace, handle)
         return
     import cudnn
 
-    # The shared per-device handle must not be driven by two threads at once
-    # (cuDNN: a handle is not thread-safe while in use): re-stream + execute
-    # are one critical section per device. A caller with its own `handle=`
-    # skips the lock.
-    handle = graph_handle(out.device)
-    with _graph_handle_lock(out.device):
+    if handle is None:
+        handle = graph_handle(out.device)
+    with _graph_handle_lock(lock_device):
         cudnn.set_stream(handle=handle, stream=stream)
         plan.graph.execute(vp, workspace, handle)
 

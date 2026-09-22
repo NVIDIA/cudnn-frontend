@@ -288,29 +288,35 @@ def test_graph_route_handle_is_per_device_and_restreamed(monkeypatch):
     execute records no resource creation).  Runs on any device: a stand-in graph
     records the handle it is executed with; no kernel launches."""
     import cudnn
-    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, graph_handle, run_proj_gemm
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, _graph_handle_lock, graph_handle, run_proj_gemm
 
     dev = torch.device("cuda", torch.cuda.current_device())
     h = graph_handle(dev)
     assert graph_handle(torch.device("cuda")) is h and graph_handle(dev) is h, "one handle per device, whichever spelling names it"
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    own = cudnn.create_handle()  # a caller-owned handle, made before cudnnCreate is forbidden below
+    cudnn.set_stream(handle=own, stream=s2.cuda_stream)
 
     seen = []
 
-    class _Graph:  # the plan's graph, standing in for the backend: records (handle, its stream) per execute
+    class _Graph:  # the plan's graph, standing in for the backend: records (handle, its stream, lock held?) per execute
         def execute(self, vp, workspace, handle):
-            seen.append((handle, int(cudnn.get_stream(handle))))
+            seen.append((handle, int(cudnn.get_stream(handle)), _graph_handle_lock(dev).locked()))
 
     plan = ProjGemmPlan(graph=_Graph(), a="a", b="b", c="c", m=1, k=1, n=1, label="probe")  # route None -> the graph route, no JIT
     x = torch.zeros(1, 1, device="cuda")
-    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
     monkeypatch.setattr(cudnn, "create_handle", lambda: pytest.fail("run_proj_gemm called cudnnCreate: the per-device handle must already exist"))
     run_proj_gemm(plan, x, x, x, x, stream=s1.cuda_stream)
-    assert seen[-1] == (h, s1.cuda_stream) and cudnn.get_stream(h) == s1.cuda_stream
+    assert seen[-1] == (h, s1.cuda_stream, True) and cudnn.get_stream(h) == s1.cuda_stream
     run_proj_gemm(plan, x, x, x, x, stream=s2.cuda_stream)
-    assert seen[-1] == (h, s2.cuda_stream) and cudnn.get_stream(h) == s2.cuda_stream, "the same handle, re-streamed"
+    assert seen[-1] == (h, s2.cuda_stream, True) and cudnn.get_stream(h) == s2.cuda_stream, "the same handle, re-streamed"
     run_proj_gemm(plan, x, x, x, x)  # no stream: torch's current stream on out.device
-    assert seen[-1] == (h, torch.cuda.current_stream().cuda_stream)
-    assert len(seen) == 3
+    assert seen[-1] == (h, torch.cuda.current_stream().cuda_stream, True)
+    run_proj_gemm(plan, x, x, x, x, h)  # the shared handle handed back in: same lock, the stream it is bound to
+    assert seen[-1] == (h, torch.cuda.current_stream().cuda_stream, True), "the shared handle passed explicitly is serialised like the implicit one"
+    run_proj_gemm(plan, x, x, x, x, own)  # a caller-owned handle: its own stream, no lock
+    assert seen[-1] == (own, s2.cuda_stream, False)
+    assert len(seen) == 5
 
 
 # ---------------------------------------------------------------------------

@@ -608,8 +608,9 @@ captured execute, and re-streams it with `cudnn.set_stream(handle, stream)`
 immediately before every `graph.execute(vp, ws, handle)` (`cudnnSetStream` is
 host-only handle state, capture-legal; `_pygraph.execute` reads the stream off
 the handle). Never one handle per (device, stream) created lazily at execute.
-Re-streaming is single-threaded: concurrent threads on one device pass their own
-`handle=`. Detector:
+Re-stream + execute are one critical section per device (`_graph_handle_lock`),
+also when the shared handle is handed back in as `handle=`; concurrent threads
+that want no lock pass their own handle. Detector:
 `test_block_end_to_end.py::test_graph_route_handle_is_per_device_and_restreamed`
 (monkeypatch `cudnn.create_handle` to fail, execute on two streams, same handle,
 stream follows).
