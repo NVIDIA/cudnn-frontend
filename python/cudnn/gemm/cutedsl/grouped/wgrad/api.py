@@ -249,11 +249,17 @@ def wgrad_expert_ptrs(wgrad_tensor, current_stream: Optional[cuda.CUstream] = No
     shape = get_shape(wgrad_tensor)
     if len(shape) != 3:
         raise ValueError(f"wgrad_tensor must be rank-3 (num_experts, hidden, intermediate), got shape {shape}")
-    experts = int(shape[0])
-    stride_bytes = int(get_strides(wgrad_tensor)[0]) * _convert_to_cutlass_data_type(wgrad_tensor.dtype).width // 8
+    experts, hidden, intermediate = (int(x) for x in shape)
+    strides = tuple(int(x) for x in canonicalize_unit_dim_strides(shape, get_strides(wgrad_tensor)))
+    # The discrete kernels read every address through one contiguous (hidden, intermediate) descriptor.
+    if strides[1:] != tuple(canonicalize_unit_dim_strides((hidden, intermediate), (intermediate, 1))):
+        raise ValueError(
+            f"each wgrad expert slice must be a contiguous (hidden, intermediate) block; got shape {shape} strides {tuple(get_strides(wgrad_tensor))}"
+        )
+    if experts > 1 and strides[0] < hidden * intermediate:
+        raise ValueError(f"wgrad expert slices must not overlap: expert stride {strides[0]} elements < {hidden * intermediate}")
+    stride_bytes = strides[0] * _convert_to_cutlass_data_type(wgrad_tensor.dtype).width // 8
     base = int(get_data_ptr(wgrad_tensor))
-    if experts > 1 and stride_bytes <= 0:
-        raise ValueError(f"wgrad_tensor expert stride must be positive, got {stride_bytes} bytes")
     if is_torch_tensor(wgrad_tensor):
         import torch
 
@@ -268,7 +274,7 @@ def wgrad_expert_ptrs(wgrad_tensor, current_stream: Optional[cuda.CUstream] = No
     import numpy as np
 
     values = np.arange(experts, dtype=np.int64) * np.int64(stride_bytes) + np.int64(base)
-    return jax.block_until_ready(jnp.asarray(values.view(np.uint8)))
+    return jax.block_until_ready(jnp.asarray(values.view(np.uint8), device=wgrad_tensor.device))
 
 
 def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
