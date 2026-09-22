@@ -16,3 +16,10 @@ DTYPE_E4M3 = 0
 DTYPE_E5M2 = 1
 DTYPE_BF16 = 2
 DTYPE_FP16 = 3
+# Output-only block-scaled codes (per-tensor FP8 fprop epilogue): the data
+# dtype plus a scale-factor tensor written alongside O.
+DTYPE_O_NVFP4 = 4  # E2M1 data (2 per byte) + E4M3 scale per 16 d-elements
+DTYPE_O_MXFP8 = 5  # E4M3 data + UE8M0 scale per 32 d-elements
+
+# Scale-factor block along d for each output code; 0 = no block scaling.
+O_BLOCK_SCALE_BY_DTYPE = {DTYPE_E4M3: 0, DTYPE_E5M2: 0, DTYPE_BF16: 0, DTYPE_FP16: 0, DTYPE_O_NVFP4: 16, DTYPE_O_MXFP8: 32}

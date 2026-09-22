@@ -130,6 +130,33 @@ ordered after that read.**
   storage. Test padding canaries as well as numerical output; the detector is
   `test_pointer_combine_strided_outputs_and_dead_splits`.
 
+**Rule S6 — A kernel feature lands on every arch line's test file, and its
+other-arch lowerings are smoke-compiled from whatever GPU you have.**
+
+- Each FROST fwd arch line has its own test file and marker:
+  `test_sdpa_fwd_fp8_sm100.py` runs under `requires_blackwell` (SM 100..119,
+  the Rubin lane included — `_D128_ARCH` picks the kernel), the sm120 line
+  under `requires_blackwell_geforce` (120..129) in `test_sdpa_fwd_fp8_sm120.py`,
+  sm80 in its own file. A test added to one file never runs on the other lanes,
+  and `_skip_on_rubin` is a d192/d256-flavor statement, not a default decorator
+  to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
+  the cases (the block-scaled O review found SM120 FP4 declining itself
+  and the Rubin lane skipping the epilogue entirely).
+- The DSL traces the kernel in Python before any arch-specific codegen, so a
+  lowering for an arch you do not have still fails or passes its trace here:
+  `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
+  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
+  `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
+  template variant you touched before pushing.
+- Inside a `def` nested in a kernel body, do not touch a free variable
+  (attribute access, store through it) inside a dynamic `if`: the DSL's region
+  rewrite yields and rebinds the names it sees written there, which makes the
+  free variable an unbound closure-local — it reads as `None` at trace time,
+  or `UnboundLocalError` if you print it at the closure's top. Hoist what the
+  closure needs into a local before the `def` (`o_ptr = o.iterator.raw_ptr()`,
+  `sfo_base_ptr`) and let the closure add offsets only.
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's

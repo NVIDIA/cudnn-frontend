@@ -539,6 +539,31 @@ def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
         assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
 
 
+def test_sm107_block_scaled_o_is_wired_only_for_per_tensor_fp8_d128():
+    """config_sm107 admits a block-scaled O (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output)
+    for the ONE Rubin kernel that carries the epilogue, prefill_d128_fp8, and
+    refuses it for every sibling: the d192xd128 and MXFP8 flavors share the d128
+    config FAMILY (and "sm107 d192xd128" contains "d128"), so the gate must key
+    on the kernel the family builds, not on the flavor name."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    unwired = [
+        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8),
+        ("d192xd128", cfg.make_cfg_d192),
+        ("d192xd128 mxfp8", cfg.make_cfg_d192_mxfp8),
+        ("d256", cfg.make_cfg_d256),
+        ("d512", cfg.make_cfg_d512),
+    ]
+    for dtype_o in (4, 5):
+        assert cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o)) is not None
+        for name, make in unwired:
+            with pytest.raises(ValueError, match="wired in the per-tensor FP8 d128 kernel only"):
+                make(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o))
+        # Half inputs never carry a block-scaled O, whichever kernel.
+        with pytest.raises(ValueError, match="requires FP8 inputs"):
+            cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_BF16_OUT, dtype_o=dtype_o))
+
+
 def test_sm107_split_matches_unsplit_on_rubin():
     """End-to-end split numerics on cc10.7 silicon.
 
