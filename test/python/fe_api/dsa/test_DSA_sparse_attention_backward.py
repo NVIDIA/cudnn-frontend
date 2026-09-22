@@ -102,7 +102,8 @@ def _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outpu
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def execute():
-        return plan.execute(*inputs, *outputs, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream)
+        dq, dkv, d_sink = outputs
+        return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
 
     execute()  # warm: the non-D576 routes compile on their first execute
     torch.cuda.synchronize()
@@ -270,11 +271,11 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
             topk_idxs,
             dq,
             dkv,
-            d_sink,
             topk_length=topk_length,
             softmax_scale=softmax_scale,
             workspace=workspace,
             current_stream=stream,
+            d_sink=d_sink,
         )
         torch.cuda.synchronize()
         assert result[0] is dq and result[1] is dkv and result[2] is d_sink
@@ -2997,7 +2998,10 @@ def test_DSA_sparse_attention_backward_execute_requires_preallocated_outputs(num
         provided = dict(dq=dq, dkv=dkv, d_sink=d_sink)
         provided[missing] = None
         with pytest.raises(ValueError, match=rf"{missing} must be preallocated"):
-            plan.execute(*inputs, provided["dq"], provided["dkv"], provided["d_sink"], softmax_scale=softmax_scale, workspace=workspace)
-    # The outputs are positional-required: omitting them is a signature error, not a silent allocation.
+            plan.execute(*inputs, provided["dq"], provided["dkv"], softmax_scale=softmax_scale, workspace=workspace, d_sink=provided["d_sink"])
+    # dq/dkv are positional-required and d_sink keyword-only required: omitting any is a signature
+    # error, not a silent allocation -- and the pre-existing positional order (topk_length after dkv) holds.
     with pytest.raises(TypeError):
         plan.execute(*inputs, softmax_scale=softmax_scale, workspace=workspace)
+    with pytest.raises(TypeError, match="d_sink"):
+        plan.execute(*inputs, dq, dkv, softmax_scale=softmax_scale, workspace=workspace)

@@ -254,7 +254,8 @@ reuse it across calls; the launch sequence re-initializes the accumulators on
 every execution (in-kernel on SM100, and with one stream-ordered memset for the
 SM90 dKV accumulator and for `d_sink` on the routes that accumulate it
 atomically). `execute(q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv,
-d_sink, ...)` requires caller-provided `dq`, `dkv`, and `d_sink` on every
+..., d_sink=...)` requires caller-provided `dq`, `dkv`, and the keyword-only
+`d_sink` on every
 backend and never allocates or copies during execution; the H128/D576 two-CTA
 plan additionally compiles in `compile()`, while the other routes compile on
 their first execution. The high-level wrapper allocates the outputs and the

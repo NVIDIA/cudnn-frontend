@@ -238,18 +238,20 @@ class SparseAttentionBackward(APIBase):
         topk_idxs: torch.Tensor,
         dq: torch.Tensor,
         dkv: torch.Tensor,
-        d_sink: torch.Tensor,
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
+        *,
+        d_sink: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dispatch one validated execution to the active GPU architecture.
 
         Every backend requires ``dq``, ``dkv``, ``d_sink`` and (when
         ``scratch_workspace_bytes()`` is non-zero) ``workspace`` to be
-        caller-provided; execute never allocates. The H128/D576 two-CTA route
-        additionally never compiles here.
+        caller-provided; execute never allocates. ``d_sink`` is keyword-only so
+        the positional order of the pre-existing parameters is unchanged. The
+        H128/D576 two-CTA route additionally never compiles here.
         """
         for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
             if not isinstance(tensor, torch.Tensor):
@@ -425,10 +427,10 @@ def sparse_attention_backward_wrapper(
         topk_idxs,
         dq,
         dkv,
-        d_sink,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
         workspace=workspace,
         current_stream=launch_stream,
+        d_sink=d_sink,
     )
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)
