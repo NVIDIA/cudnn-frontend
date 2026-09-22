@@ -728,7 +728,7 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        with _torch_stream_context(current_stream):
+        with _torch_stream_context(current_stream, index_q.device):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
             grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
@@ -760,7 +760,7 @@ class DenseIndexerBackward(APIBase):
         )
 
         if d_index_k_f32 is not d_index_k_target:
-            with _torch_stream_context(current_stream):
+            with _torch_stream_context(current_stream, d_index_k_target.device):
                 d_index_k_target.copy_(d_index_k_f32)
 
 
@@ -862,7 +862,7 @@ def indexer_backward_wrapper(
         raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
     if topk_indices.ndim != 3:
         raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
-    with _torch_stream_context(stream):
+    with _torch_stream_context(stream, index_q.device):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
         if d_weights is None:
@@ -1014,7 +1014,7 @@ def dense_indexer_backward_wrapper(
     """
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q.device):
         cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
         cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
 
@@ -1126,7 +1126,7 @@ def dense_indexer_backward_wrapper(
         q_causal_offsets=q_causal_offsets,
         current_stream=current_stream,
     )
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q_exec.device):
         _copy_back_if_needed(attn_score_exec, attn_score_original)
         _copy_back_if_needed(index_score_exec, index_score_original)
         _copy_back_if_needed(d_index_q_exec, d_index_q_original)
