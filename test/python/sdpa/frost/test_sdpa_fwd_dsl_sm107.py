@@ -119,6 +119,76 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
     assert not re.search(r"desc_version=[01]\b", code), f"{mod.__name__}: a re-literalled desc_version bypasses DESC_VERSION"
 
 
+# ------------------------------------------------------------------ ring-wait retry form: ONE module constant per kernel
+# ``tile_dsl.barrier.wait(spin=True)`` is the hint-less uniform spin (USYNCS.PHASECHK / BRA.U on sm_107a) in place of the DSL's
+# time_limit form (per-lane SYNCS.PHASECHK + NANOSLEEP.SYNCS).  Whether the per-KV-iteration RING waits of a kernel take it is a
+# MEASURED per-kernel fact, not a shape-derived one -- the same form is +4.9 % on d128 bf16 and -5.8 % on d128 per-tensor fp8 --
+# so, like DESC_VERSION, each sm107 prefill kernel spells the decision ONCE as ``SPIN_RING_WAITS`` and every ring site passes
+# ``spin=SPIN_RING_WAITS``; the waits a warp parks in for a whole tile (the scheduler payload wait of every role, mb_tmem_dealloc,
+# the TMA-STG's mb_o_full / mb_tma_o_full / mb_tmastg_go) and the end-of-kernel drains keep the default.  The site counts below are
+# the RING / IDLE halves of the wait-form study's 521-site classification (370 ring + 151 idle, of which 4 sit in
+# tile_dsl/scheduler.py and stay on the default); pinning them is what keeps a re-classified, re-literalled or newly added site from
+# drifting in silently.  Flipping a kernel's constant is the whole experiment; the SASS twin of this check is
+# test_sm107_ring_wait_form_sass_pins.
+_SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
+    ("f16", (128, 128)): (True, 31, 11),
+    ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("mxfp8", (128, 128)): (True, 35, 13),
+    ("f16", (192, 128)): (True, 31, 11),
+    ("fp8", (192, 128)): (True, 42, 12),
+    ("mxfp8", (192, 128)): (True, 35, 13),
+    ("f16", (256, 256)): (False, 29, 11),
+    ("fp8", (256, 256)): (False, 29, 11),
+    ("mxfp8", (256, 256)): (False, 29, 11),
+    ("f16", (512, 512)): (True, 22, 14),
+    ("fp8", (512, 512)): (True, 22, 14),
+    ("mxfp8", (512, 512)): (False, 22, 14),
+}
+_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go")
+
+
+def _wait_sites(code):
+    """Every mbarrier wait call site of a kernel source: (target, balanced argument text).  Line-anchored like the study's
+    classifier (``<bars.>mb_X[...].wait(`` or the bare ``wait(sched.mb_...`` payload wait), so docstring prose that spells
+    ``wait(...)`` is not a site; the argument text is paren-matched because black wraps some calls over several lines."""
+    import re
+
+    out = []
+    for m in re.finditer(r"^\s*(?:(?:bars\.)?(mb_\w+)(?:\[[^\]]*\])*\.wait\(|wait\((sched\.mb_\w+))", code, re.M):
+        target = m.group(1) or m.group(2)
+        i, depth = m.end(), 1
+        while depth:
+            depth += (code[i] == "(") - (code[i] == ")")
+            i += 1
+        out.append((target, code[m.end() : i - 1]))
+    return out
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
+    """SPIN_RING_WAITS holds the measured per-kernel value (the module's own constant, not a source grep), it is defined exactly
+    once, no wait site carries a ``spin=True`` / ``spin=False`` literal, every RING site (and only those: the pinned count) passes
+    ``spin=SPIN_RING_WAITS``, and no whole-tile idle target does.  A kernel that gains from the spin but regresses to the sleeping
+    form at one site, or a loser that leaks the spin onto one ring, changes the count here before it costs 2-6 % on the node."""
+    import re
+
+    want, n_ring, n_idle = _SPIN_RING_WAITS[(kind, flavor)]
+    mod = _load(flavor, rubin=True, **load_kw)
+    assert isinstance(mod.SPIN_RING_WAITS, bool) and mod.SPIN_RING_WAITS is want, f"{mod.__name__}: SPIN_RING_WAITS={mod.SPIN_RING_WAITS}, expected {want}"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    assert len(re.findall(r"^SPIN_RING_WAITS: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one SPIN_RING_WAITS definition"
+    assert not re.search(r"spin=(?:True|False)\b", code), f"{mod.__name__}: a spin= literal at a call site bypasses SPIN_RING_WAITS"
+    sites = _wait_sites(code)
+    spun = [t for t, args in sites if "spin=SPIN_RING_WAITS" in args]
+    assert len(spun) == n_ring, f"{mod.__name__}: {len(spun)} ring waits pass spin=SPIN_RING_WAITS, the classification says {n_ring}"
+    assert len(sites) == n_ring + n_idle, f"{mod.__name__}: {len(sites)} wait sites, expected {n_ring} ring + {n_idle} idle"
+    leaked = [t for t in spun if t.startswith(_IDLE_WAIT_TARGETS) or t.startswith("sched.")]
+    assert not leaked, f"{mod.__name__}: whole-tile idle waits must keep the sleeping form: {leaked}"
+    assert code.count("spin=") == n_ring, f"{mod.__name__}: a spin= outside a .wait( call"
+
+
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_sm107_f16_thd_specialization_matches_the_ported_flavors(flavor):
     """A THD config must TRACE for a ported f16 flavor and be REFUSED for the
@@ -790,9 +860,10 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     appended ``sample_amax_o``, ``pv_bf16`` and ``stats_log2``; the fused
     epilogue gate then appended ``sample_gate`` and ``has_amax_o`` after those,
     and the SM100 adapter's ``execute`` gained a trailing ``gate`` after
-    ``block_table_v``.  The pin moves with the tail: every addition must sit
-    after the prefix in landing order, so a positional caller of any earlier
-    signature still binds where it always did."""
+    ``block_table_v``; the block-scaled O then appended ``sample_sf_o`` to the
+    constructor and ``sf_o`` to ``execute``.  The pin moves with the tail: every
+    addition must sit after the prefix in landing order, so a positional caller
+    of any earlier signature still binds where it always did."""
     import inspect
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
@@ -806,15 +877,16 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
-    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o"], params[extension_start:]
+    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o", "sample_sf_o"], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
     # Both gate parameters default OFF, so every pre-gate call site is untouched.
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    assert exec_params[-2:] == ["block_table_v", "gate"], exec_params[-3:]
+    assert exec_params[-3:] == ["block_table_v", "gate", "sf_o"], exec_params[-4:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
+    assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
 
 
 # --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------
@@ -1221,12 +1293,21 @@ def test_sm107_gate_accepts_every_dtype_member():
     fp8 = _caps(_GATE_ROWS[1])
     assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert fp8.out_dtypes == frozenset(
+        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+    )
+    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), which is its own
+    # O store: it is never gated, so the gate matrix runs over the other members.
     for dt in sorted(fp8.dtypes, key=int):
-        for dto in sorted(fp8.out_dtypes, key=int):
+        for dto in sorted(fp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
+    # ...and the two epilogues decline each other, each naming the block-scaled O.
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
+    assert why is not None and "block-scaled" in why, why
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert why is not None and "epilogue gate" in why, why
 
     # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
     # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
@@ -2617,3 +2698,92 @@ def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o,
     assert (
         stats["STL"] <= spill_max and stats["LDL"] <= spill_max
     ), f"the {quant} d={d} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
+
+
+# ============================================================================ Rubin SASS pins: the ring-wait retry form
+# The hint-less ``wait(spin=True)`` is visible only in the SASS: on sm_107a the DSL's time_limit form costs 2 divergent
+# SYNCS.PHASECHK + 1 NANOSLEEP per wait instantiation, the spin form 2 uniform USYNCS.PHASECHK and no sleep.  One opted-in kernel
+# (d192x128 mxfp8, SPIN_RING_WAITS=True: the largest measured win, +9.4 % at S=32K) and one opted-out kernel (d128 per-tensor fp8,
+# SPIN_RING_WAITS=False: -5.8 % at S=2K when its ring waits spin) are compiled at the production geometry (cga2, dense S=8K, LSE on)
+# and their wait opcodes pinned to the counts measured on the shipped tree (2026-09-19; the develop counts before the opt-in are
+# in the comments).  The 8 divergent SYNCS.PHASECHK + 6 NANOSLEEP that every kernel keeps are the DSL's tcgen05.alloc lock
+# waits in tile_dsl/tmem.py, not ring waits; the rest of the residue on the opted-in row is its idle sites (2 per instantiation).
+# A leak of the spin onto the opted-out kernel moves its divergent count by -2 per ring instantiation (-84 here); one ring site of
+# the opted-in kernel falling back to the sleeping form moves its count by +2 per instantiation of that site.  Slack 4 tolerates
+# unrelated ptxas drift and still catches a single site.
+_SM107_WAIT_FORM_PROBE = textwrap.dedent("""
+    import glob, inspect, os, subprocess, sys
+    dump, quant, d_qk, d_v, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    (cta_mma,) = supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
+    mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
+    kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
+    kw = {k: v for k, v in kw.items() if k in inspect.signature(mod.compile).parameters}
+    mod.compile(**kw)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
+    print("SASS USYNCS_PHASECHK", sum(1 for ln in sass if "USYNCS.PHASECHK" in ln))
+    print("SASS NANOSLEEP", sum(1 for ln in sass if "NANOSLEEP" in ln))
+    print("SASS LINES", len(sass))
+    """)
+
+# Per-counter bounds, each BELOW the change one ring-wait instantiation makes when it falls back from the spin to the sleeping
+# form (measured on the d192x128 mxfp8 kernel, 42 instantiations: SYNCS.PHASECHK 142 -> 58 = -2 per site, USYNCS.PHASECHK
+# 75 -> 117 = +1 per site, NANOSLEEP 73 -> 31 = -1 per site), so a single site regressing fails all three assertions. The counts
+# are deterministic for a given DSL + ptxas (the same cubin md5 across compiles); a toolchain change that moves them shows up
+# as a pin failure with the new values printed, and is re-pinned deliberately, never by widening these.
+_WAIT_FORM_SLACK = {"SYNCS_PHASECHK": 1, "USYNCS_PHASECHK": 0, "NANOSLEEP": 0}
+_SM107_WAIT_FORM_PIN_ROWS = [
+    # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
+    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
+    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 117, 31, id="mxfp8-d192x128-spin"),
+    # == develop's 160 / 84 / 82: the opt-out must leave every wait opcode where it was
+    pytest.param("fp8", 128, 128, _E4M3, False, 160, 84, 82, id="fp8-d128-sleep"),
+]
+
+
+@pytest.mark.parametrize("quant, d_qk, d_v, dtype_o, spin, n_syncs, n_usyncs, n_sleep", _SM107_WAIT_FORM_PIN_ROWS)
+def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spin, n_syncs, n_usyncs, n_sleep):
+    """The ring waits of an opted-in kernel lower to the uniform USYNCS.PHASECHK spin (its divergent SYNCS.PHASECHK count drops to
+    the idle-site residue and NANOSLEEP to the tmem.py lock waits), and an opted-out kernel keeps develop's counts exactly.
+    Cross-checked against the module constant so the row cannot pin a value the kernel does not hold."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    mod = _load((d_qk, d_v), rubin=True, fp8=True, pertensor=(quant == "fp8"), dtype_qkv=_E4M3, dtype_o=dtype_o, cta_mma=2)
+    assert mod.SPIN_RING_WAITS is spin, f"{mod.__name__}: SPIN_RING_WAITS={mod.SPIN_RING_WAITS}, this row pins the {spin} form"
+    dump = tmp_path / f"sm107a_waitform_{quant}_d{d_qk}x{d_v}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_WAIT_FORM_PROBE, str(dump), quant, str(d_qk), str(d_v), str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d_qk}x{d_v} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    print(f"\nsm107 {quant} d={d_qk}x{d_v} SPIN_RING_WAITS={spin} sm_107a SASS: {stats}")
+    for name, want in (("SYNCS_PHASECHK", n_syncs), ("USYNCS_PHASECHK", n_usyncs), ("NANOSLEEP", n_sleep)):
+        slack = _WAIT_FORM_SLACK[name]
+        assert abs(stats[name] - want) <= slack, f"{name} = {stats[name]}, pinned {want} +- {slack} for SPIN_RING_WAITS={spin}"
