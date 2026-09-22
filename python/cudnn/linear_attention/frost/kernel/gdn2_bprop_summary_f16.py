@@ -118,14 +118,8 @@ L2_NORM_EPS: float = 1.0e-12
 class Gdn2BpropSummaryBars(NamedTuple):
     """Every inter-warp handoff as an ``MBarrier`` over its ring."""
 
-    mb_q_ready: MBarrier
-    mb_q_done: MBarrier
-    mb_k_ready: MBarrier
-    mb_k_done: MBarrier
-    mb_gate_ready: MBarrier
-    mb_gate_done: MBarrier
-    mb_beta_ready: MBarrier
-    mb_beta_done: MBarrier
+    mb_raw_ready: MBarrier
+    mb_raw_done: MBarrier
     mb_do_ready: MBarrier
     mb_do_mma_done: MBarrier
 
@@ -166,14 +160,8 @@ def make_bars(cfg) -> Gdn2BpropSummaryBars:
     MMA = 1
 
     return Gdn2BpropSummaryBars(
-        mb_q_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_q_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0, producer=Producer.THREAD),
-        mb_k_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_k_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0, producer=Producer.THREAD),
-        mb_gate_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_gate_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0, producer=Producer.THREAD),
-        mb_beta_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_beta_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0, producer=Producer.THREAD),
+        mb_raw_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
+        mb_raw_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0, producer=Producer.THREAD),
         mb_do_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
         mb_do_mma_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_k_decay_inv_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
@@ -854,33 +842,19 @@ def tmaldg_warp(
             chunk_idx = compute_end - cutlass.Int32(1) - rev_idx
             chunk_start = chunk_idx * cfg.b_t
 
-            # ---- Q load --------------------------------------------------------------
-            bars.mb_q_done[raw_index.idx].wait(raw_index.phase)
+            # ---- Q / K / Gate / Beta loads: one transaction barrier per stage ---------
+            bars.mb_raw_done[raw_index.idx].wait(raw_index.phase)
             if elect_one:
-                bars.mb_q_ready[raw_index.idx].arrive(n_bytes=q_tx_bytes)
+                bars.mb_raw_ready[raw_index.idx].arrive(n_bytes=q_tx_bytes + k_tx_bytes + gate_tx_bytes + beta_tx_bytes)
+            raw_ready_ptr = bars.mb_raw_ready[raw_index.idx].smem_ptr
             q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, chunk_start)
-            tma_load_tile(sQ_tma[raw_index.idx], q_slice, bars.mb_q_ready[raw_index.idx].smem_ptr, acquire=False)
-
-            # ---- K load --------------------------------------------------------------
-            bars.mb_k_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_k_ready[raw_index.idx].arrive(n_bytes=k_tx_bytes)
+            tma_load_tile(sQ_tma[raw_index.idx], q_slice, raw_ready_ptr, acquire=False)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, chunk_start)
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, bars.mb_k_ready[raw_index.idx].smem_ptr, acquire=False)
-
-            # ---- Gate load: GMEM -> SMEM ---------------------------------------------
-            bars.mb_gate_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_gate_ready[raw_index.idx].arrive(n_bytes=gate_tx_bytes)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr, acquire=False)
             gate_slice = tma_slice_runtime_desc(desc_gate_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr, acquire=False)
-
-            # ---- Beta load: GMEM -> SMEM ---------------------------------------------
-            bars.mb_beta_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_beta_ready[raw_index.idx].arrive(n_bytes=beta_tx_bytes)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr, acquire=False)
             beta_slice = tma_slice_runtime_desc(desc_beta_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sBeta_tma[raw_index.idx], beta_slice, bars.mb_beta_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sBeta_tma[raw_index.idx], beta_slice, raw_ready_ptr, acquire=False)
 
             # ---- dO load -------------------------------------------------------------
             bars.mb_do_mma_done[raw_index.idx].wait(raw_index.phase)
@@ -979,10 +953,7 @@ def compute0_warp_group(
             sQ_decay_ptr = sQ_decay_raw.data_ptr() + decay_stage * (cfg.d_k * cfg.b_t)
             sDecay_scale_ptr = sDecay_scale_raw.data_ptr() + decay_stage * cfg.d_k
 
-            bars.mb_gate_ready[raw_stage].wait((gc // cfg.smem_raw_stages) % 2)
-            bars.mb_q_ready[raw_stage].wait((gc // cfg.smem_raw_stages) % 2)
-            bars.mb_k_ready[raw_stage].wait((gc // cfg.smem_raw_stages) % 2)
-            bars.mb_beta_ready[raw_stage].wait((gc // cfg.smem_raw_stages) % 2)
+            bars.mb_raw_ready[raw_stage].wait((gc // cfg.smem_raw_stages) % 2)
 
             row_group_start = cg0_warp * (cfg.b_t // len(cfg.compute_group_0_warp_ids))
             lane_row_group = lane_idx // 8
@@ -1140,11 +1111,6 @@ def compute0_warp_group(
                             qk1_lo, qk1_hi = ffma2(q_val, k_val, q_val, k_val, qk1_lo, qk1_hi)
 
             nvvm.fence_proxy("async.shared", space="cta")
-            if cutlass.const_expr(not cfg.beta_guard):
-                bars.mb_q_done[raw_stage].arrive()
-            bars.mb_k_done[raw_stage].arrive()
-            if cutlass.const_expr(not cfg.beta_guard):
-                bars.mb_beta_done[raw_stage].arrive()
 
             q_inv_norm = opaque_f32_zero() + cutlass.Float32(1.0)
             k_inv_norm = opaque_f32_zero() + cutlass.Float32(1.0)
@@ -1198,9 +1164,8 @@ def compute0_warp_group(
                     exp_g_regs[f32_reg_base + 2] = exp_g_frag[2]
                     exp_g_regs[f32_reg_base + 3] = exp_g_frag[3]
             nvvm.fence_proxy("async.shared", space="cta")
-            bars.mb_gate_done[raw_stage].arrive()
-            if cutlass.const_expr(cfg.beta_guard):
-                bars.mb_beta_done[raw_stage].arrive()
+            if cutlass.const_expr(not cfg.beta_guard):
+                bars.mb_raw_done[raw_stage].arrive()
 
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
@@ -1276,7 +1241,7 @@ def compute0_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_q_decay_ready[decay_stage].arrive()
             if cutlass.const_expr(cfg.beta_guard):
-                bars.mb_q_done[raw_stage].arrive()
+                bars.mb_raw_done[raw_stage].arrive()
         gbase += sk_nt
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1856,14 +1821,8 @@ def frost_gdn2_bprop_summary(
     if warp_idx == cfg.tma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_raw_stages):
-                bars.mb_q_ready[stage].init()
-                bars.mb_q_done[stage].init()
-                bars.mb_k_ready[stage].init()
-                bars.mb_k_done[stage].init()
-                bars.mb_gate_ready[stage].init()
-                bars.mb_gate_done[stage].init()
-                bars.mb_beta_ready[stage].init()
-                bars.mb_beta_done[stage].init()
+                bars.mb_raw_ready[stage].init()
+                bars.mb_raw_done[stage].init()
                 bars.mb_do_ready[stage].init()
                 bars.mb_do_mma_done[stage].init()
     elif warp_idx == cfg.tcgen05_mma_warp_id:

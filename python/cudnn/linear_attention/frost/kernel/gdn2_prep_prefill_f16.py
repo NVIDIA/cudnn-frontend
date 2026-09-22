@@ -100,13 +100,8 @@ L2_NORM_EPS: float = 1.0e-12
 class Gdn2PrefillBars(NamedTuple):
     """Every inter-warp handoff as an ``MBarrier`` over its ring."""
 
-    mb_v_ready: MBarrier
-    mb_v_done: MBarrier
-    mb_w_ready: MBarrier
-    mb_w_done: MBarrier
-
-    mb_gate_ready: MBarrier
-    mb_gate_done: MBarrier
+    mb_raw_ready: MBarrier
+    mb_raw_done: MBarrier
 
     mb_o_acc_ready: MBarrier
     mb_o_acc_done: MBarrier
@@ -145,12 +140,8 @@ def make_bars(cfg) -> Gdn2PrefillBars:
     CG1_WARPS = len(cfg.compute_group_1_warp_ids)
 
     return Gdn2PrefillBars(
-        mb_v_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), try_wait=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_v_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG2_WARPS, producer=Producer.THREAD),
-        mb_w_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), try_wait=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_w_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG2_WARPS, producer=Producer.THREAD),
-        mb_gate_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), try_wait=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_gate_done=MBarrier(
+        mb_raw_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), try_wait=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
+        mb_raw_done=MBarrier(
             alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0_WARPS + CG2_WARPS, producer=Producer.THREAD
         ),
         mb_o_acc_ready=MBarrier(
@@ -733,19 +724,15 @@ def tmaldg_warp(
         for chunk_idx in cutlass.range(compute_start, write_end, 1, unroll=1):
             chunk_start = chunk_idx * cfg.b_t
 
-            # ---- V load --------------------------------------------------------------
-            bars.mb_v_done[raw_index.idx].wait(raw_index.phase)
+            # ---- V + W + diag record: one transaction barrier per stage --------------
+            bars.mb_raw_done[raw_index.idx].wait(raw_index.phase)
             if elect_one:
-                bars.mb_v_ready[raw_bar_index.idx].arrive(n_bytes=cfg.tma_v_bytes)
+                bars.mb_raw_ready[raw_bar_index.idx].arrive(n_bytes=cfg.tma_v_bytes + cfg.tma_w_bytes + cfg.tma_gate_bytes)
+            raw_ready_ptr = bars.mb_raw_ready[raw_bar_index.idx].smem_ptr
             v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, chunk_start)
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_bar_index.idx].smem_ptr, acquire=False)
-
-            # ---- W load --------------------------------------------------------------
-            bars.mb_w_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_w_ready[raw_bar_index.idx].arrive(n_bytes=cfg.tma_w_bytes)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr, acquire=False)
             w_slice = tma_slice_runtime_desc(desc_w_slot, v_offset, head_o, chunk_start)
-            tma_load_tile(sW_tma[raw_index.idx], w_slice, bars.mb_w_ready[raw_bar_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sW_tma[raw_index.idx], w_slice, raw_ready_ptr, acquire=False)
 
             chunk_count = cutlass.Uint32(cum_chunk_base + (chunk_idx - compute_start))
             decay_stage = cutlass.Int32(chunk_count % cfg.smem_decay_stages)
@@ -754,11 +741,8 @@ def tmaldg_warp(
             intermediate_free_parity = cutlass.Int32(((chunk_count // cfg.smem_intermediate_stages) + 1) % 2)
 
             # ---- diag record into the gate stage -------------------------------------
-            bars.mb_gate_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_gate_ready[raw_bar_index.idx].arrive(n_bytes=cfg.tma_gate_bytes)
             diag_slice = tma_slice_runtime_desc(desc_diag_slot, cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sGate_tma[raw_index.idx], diag_slice, bars.mb_gate_ready[raw_bar_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], diag_slice, raw_ready_ptr, acquire=False)
 
             # ---- k_decay, q_decay, T, A records on the decay stage's one barrier -------------
             bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
@@ -864,7 +848,7 @@ def compute0_warp_group(
             raw_bar_parity = cutlass.Int32((chunk_count // cfg.smem_raw_bar_stages) % 2)
             sGate_exchange_ptr = sGate_exchange_raw.data_ptr() + raw_stage * cfg.d_k
 
-            bars.mb_gate_ready[raw_bar_stage].wait(raw_bar_parity)
+            bars.mb_raw_ready[raw_bar_stage].wait(raw_bar_parity)
 
             # ---- state stage, left key half: pack, publish, fp32 decay ---------------
             if global_chunk > 0:
@@ -981,7 +965,7 @@ def compute0_warp_group(
                         if nvvm.elect_sync():
                             bars.mb_checkpoint_tmastg_ready[checkpoint_row_stage].arrive()
             if nvvm.elect_sync():
-                bars.mb_gate_done[raw_stage].arrive()
+                bars.mb_raw_done[raw_stage].arrive()
                 bars.mb_u_input_ready.arrive()
         if cutlass.const_expr(cfg.enable_checkpoints):
             if num_tile_chunks > 0:
@@ -1192,7 +1176,7 @@ def compute2_warp_group(
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
                     seed_vw = 16 // (mState_init.element_type.width // 8)
                     seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, state_gmem_row + v_offset, 0))).raw_ptr()
-                    bars.mb_gate_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
+                    bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
                     seed_exchange_ptr = sGate_exchange_raw.data_ptr() + raw_index.idx * cfg.d_k
                     if cutlass.const_expr(cfg.enable_checkpoints):
                         seed_stage_base = checkpoint_stage * (cfg.d_k * cfg.d_v)
@@ -1310,7 +1294,7 @@ def compute2_warp_group(
                     checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
             # ---- Y stage: Y = W*V - state*(Beta*K) -----------------------------------
-            bars.mb_v_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
+            bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             projection_col_id = tmem_col + cfg.tmem_state_k_acc_offset
             input_col_id = y_dst_col_id
 
@@ -1332,7 +1316,6 @@ def compute2_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            bars.mb_w_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             raw_w_frag_lo = nvvm.ldmatrix(
                 sW_ptr
                 + (value_dim_base + ov_col_offset) // 64 * (cfg.b_t * 64)
@@ -1387,9 +1370,7 @@ def compute2_warp_group(
                 nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
             nvvm.tcgen05_wait("store")
             if nvvm.elect_sync():
-                bars.mb_v_done[raw_index.idx].arrive()
-                bars.mb_w_done[raw_index.idx].arrive()
-                bars.mb_gate_done[raw_index.idx].arrive()
+                bars.mb_raw_done[raw_index.idx].arrive()
                 bars.mb_u_input_ready.arrive()
 
             if cutlass.const_expr(cfg.enable_checkpoints):
@@ -1407,8 +1388,7 @@ def compute2_warp_group(
             sV_ptr = sV_raw.data_ptr() + raw_stage * (cfg.d_v * cfg.b_t)
             sW_ptr = sW_raw.data_ptr() + raw_stage * (cfg.d_v * cfg.b_t)
             raw_bar_phase = raw_bar_index.phase
-            bars.mb_v_ready[raw_bar_stage].wait(raw_bar_phase)
-            bars.mb_w_ready[raw_bar_stage].wait(raw_bar_phase)
+            bars.mb_raw_ready[raw_bar_stage].wait(raw_bar_phase)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
             raw_bar_index = advance(raw_bar_index, cfg.smem_raw_bar_stages)
 
@@ -1442,7 +1422,6 @@ def compute2_warp_group(
                 nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + packed_col_id + cfg.d_k // 4, cutlass.Int8), packed_right[0 : cfg.d_k // 8])
 
             # ---- fp32 decay of the right key half: state *= exp2(g last) -------------
-            bars.mb_gate_ready[raw_bar_stage].wait(raw_bar_phase)
             sGate_exchange_ptr = sGate_exchange_raw.data_ptr() + raw_stage * cfg.d_k
             if cutlass.const_expr(cfg.d_v == 128):
                 scaled_blocks = []
@@ -1578,9 +1557,7 @@ def compute2_warp_group(
             state_k_acc_index = advance(state_k_acc_index, 1)
             if nvvm.elect_sync():
                 bars.mb_u_input_ready.arrive()
-                bars.mb_v_done[raw_stage].arrive()
-                bars.mb_w_done[raw_stage].arrive()
-                bars.mb_gate_done[raw_stage].arrive()
+                bars.mb_raw_done[raw_stage].arrive()
 
             # ---- checkpoint row, right key half: the packed operand words ------------
             if cutlass.const_expr(cfg.enable_checkpoints):
@@ -2284,13 +2261,9 @@ def frost_gdn2_prep_prefill(
     if warp_idx == cfg.tma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_raw_bar_stages):
-                bars.mb_gate_ready[stage].init()
-                bars.mb_v_ready[stage].init()
-                bars.mb_w_ready[stage].init()
+                bars.mb_raw_ready[stage].init()
             for stage in cutlass.range_constexpr(cfg.smem_raw_stages):
-                bars.mb_gate_done[stage].init()
-                bars.mb_v_done[stage].init()
-                bars.mb_w_done[stage].init()
+                bars.mb_raw_done[stage].init()
     elif warp_idx == cfg.tcgen05_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.tmem_q_state_acc_stages):

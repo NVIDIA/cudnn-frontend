@@ -78,10 +78,7 @@ L2_NORM_EPS: float = 1.0e-12
 class Gdn2PrepBars(NamedTuple):
     """Every inter-warp handoff as an ``MBarrier`` over its ring."""
 
-    mb_q_ready: MBarrier
-    mb_k_ready: MBarrier
-    mb_gate_ready: MBarrier
-    mb_beta_ready: MBarrier
+    mb_raw_ready: MBarrier
 
 
 def make_bars(cfg) -> Gdn2PrepBars:
@@ -93,10 +90,7 @@ def make_bars(cfg) -> Gdn2PrepBars:
         return cutlass.Array(cutlass.Int64, n, space=cutlass.AddressSpace.smem, alignment=16)
 
     return Gdn2PrepBars(
-        mb_q_ready=MBarrier(alloc(RS), try_wait=True, stages=RS, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_k_ready=MBarrier(alloc(RS), try_wait=True, stages=RS, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_gate_ready=MBarrier(alloc(RS), try_wait=True, stages=RS, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_beta_ready=MBarrier(alloc(RS), try_wait=True, stages=RS, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_raw_ready=MBarrier(alloc(RS), try_wait=True, stages=RS, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
     )
 
 
@@ -234,28 +228,30 @@ def compute_warp_group(
                 load_head_q = load_head // q_ratio
                 load_head_k = load_head // k_ratio
                 if nvvm.elect_sync():
-                    bars.mb_q_ready[load_stage].arrive(n_bytes=cfg.tma_q_bytes)
-                    bars.mb_k_ready[load_stage].arrive(n_bytes=cfg.tma_k_bytes)
-                    bars.mb_gate_ready[load_stage].arrive(n_bytes=cfg.tma_gate_bytes)
+                    bars.mb_raw_ready[load_stage].arrive(n_bytes=cfg.tma_q_bytes + cfg.tma_k_bytes + cfg.tma_gate_bytes + cfg.tma_beta_bytes)
                 tma_load_tile(
-                    sQ_tma[load_stage], tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token), bars.mb_q_ready[load_stage].smem_ptr, acquire=False
+                    sQ_tma[load_stage],
+                    tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token),
+                    bars.mb_raw_ready[load_stage].smem_ptr,
+                    acquire=False,
                 )
                 tma_load_tile(
-                    sK_tma[load_stage], tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token), bars.mb_k_ready[load_stage].smem_ptr, acquire=False
+                    sK_tma[load_stage],
+                    tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token),
+                    bars.mb_raw_ready[load_stage].smem_ptr,
+                    acquire=False,
                 )
                 tma_load_tile(
                     sGate_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_gate, zero, load_head, load_token),
-                    bars.mb_gate_ready[load_stage].smem_ptr,
+                    bars.mb_raw_ready[load_stage].smem_ptr,
                     acquire=False,
                 )
                 load_desc_beta = (desc_beta_base + load_batch).tospace(cutlass.AddressSpace.generic)
-                if nvvm.elect_sync():
-                    bars.mb_beta_ready[load_stage].arrive(n_bytes=cfg.tma_beta_bytes)
                 tma_load_tile(
                     sBeta_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_beta, zero, load_head, load_token),
-                    bars.mb_beta_ready[load_stage].smem_ptr,
+                    bars.mb_raw_ready[load_stage].smem_ptr,
                     acquire=False,
                 )
         if warp_local == 1:
@@ -296,7 +292,7 @@ def compute_warp_group(
         if cutlass.const_expr(mDt_bias is not None):
             dt_bias_value = mDt_bias[head_idx, channel_dim].to(cutlass.Float32)
 
-        bars.mb_gate_ready[raw_stage].wait(raw_parity)
+        bars.mb_raw_ready[raw_stage].wait(raw_parity)
 
         # ---- Gate prefix scan ----------------------------------------------------
         gate_raw = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
@@ -352,9 +348,6 @@ def compute_warp_group(
         # ---- diag record: exp2(g[15, d]) per key channel ---------------------------
         mDiag[tile_row, head_idx, channel_dim] = g_prefix_regs[cfg.b_t - 1]
 
-        bars.mb_q_ready[raw_stage].wait(raw_parity)
-        bars.mb_k_ready[raw_stage].wait(raw_parity)
-        bars.mb_beta_ready[raw_stage].wait(raw_parity)
         k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
         k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
         raw_q_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
@@ -551,28 +544,30 @@ def compute_warp_group(
                 load_head_q = load_head // q_ratio
                 load_head_k = load_head // k_ratio
                 if nvvm.elect_sync():
-                    bars.mb_q_ready[load_stage].arrive(n_bytes=cfg.tma_q_bytes)
-                    bars.mb_k_ready[load_stage].arrive(n_bytes=cfg.tma_k_bytes)
-                    bars.mb_gate_ready[load_stage].arrive(n_bytes=cfg.tma_gate_bytes)
+                    bars.mb_raw_ready[load_stage].arrive(n_bytes=cfg.tma_q_bytes + cfg.tma_k_bytes + cfg.tma_gate_bytes + cfg.tma_beta_bytes)
                 tma_load_tile(
-                    sQ_tma[load_stage], tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token), bars.mb_q_ready[load_stage].smem_ptr, acquire=False
+                    sQ_tma[load_stage],
+                    tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token),
+                    bars.mb_raw_ready[load_stage].smem_ptr,
+                    acquire=False,
                 )
                 tma_load_tile(
-                    sK_tma[load_stage], tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token), bars.mb_k_ready[load_stage].smem_ptr, acquire=False
+                    sK_tma[load_stage],
+                    tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token),
+                    bars.mb_raw_ready[load_stage].smem_ptr,
+                    acquire=False,
                 )
                 tma_load_tile(
                     sGate_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_gate, zero, load_head, load_token),
-                    bars.mb_gate_ready[load_stage].smem_ptr,
+                    bars.mb_raw_ready[load_stage].smem_ptr,
                     acquire=False,
                 )
                 load_desc_beta = (desc_beta_base + load_batch).tospace(cutlass.AddressSpace.generic)
-                if nvvm.elect_sync():
-                    bars.mb_beta_ready[load_stage].arrive(n_bytes=cfg.tma_beta_bytes)
                 tma_load_tile(
                     sBeta_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_beta, zero, load_head, load_token),
-                    bars.mb_beta_ready[load_stage].smem_ptr,
+                    bars.mb_raw_ready[load_stage].smem_ptr,
                     acquire=False,
                 )
 
@@ -1036,10 +1031,7 @@ def frost_gdn2_prep(
     # ---- mbarrier init (thread 0) ----------------------------------------------------
     if tidx == 0:
         for s in range(RS):
-            bars.mb_q_ready[s].init()
-            bars.mb_k_ready[s].init()
-            bars.mb_gate_ready[s].init()
-            bars.mb_beta_ready[s].init()
+            bars.mb_raw_ready[s].init()
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
