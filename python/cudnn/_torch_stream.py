@@ -135,9 +135,9 @@ def contiguous_on_stream(tensor, stream, device=None):
 
 
 def copy_into_on_stream(dst, src, stream, device=None) -> None:
-    """``dst.copy_(src)`` on ``stream`` with ``dst`` recorded there first: the wrapper copy-back into a
-    caller-owned buffer is asynchronous too, and a caller that releases ``dst`` right after the call
-    must not see its block reused under the pending write."""
-    record_streams((dst,), stream, device)
+    """``dst.copy_(src)`` on ``stream`` with both tensors recorded there first: the wrapper copy-back
+    into a caller-owned buffer is asynchronous too, so neither a ``dst`` the caller releases right
+    after the call nor a ``src`` allocated on another stream may be reused under the pending copy."""
+    record_streams((src, dst), stream, device)
     with stream_context(stream, device):
         dst.copy_(src)
