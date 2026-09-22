@@ -164,7 +164,7 @@ class _CompiledProjection:
         if switch:
             _checked(cu.cuCtxSetCurrent(self._primary), "cuCtxSetCurrent")
         try:
-            # CUDA Tile's required-block sentinel lets the driver use the
+            # The required-block sentinel lets the driver use the
             # compiler's block dimensions and shared memory requirements.
             _checked(cu.cuLaunchKernel(self.partial, 80, 8, 1, 1, 1, 1, 0, cu.CUstream(stream), ctypes.addressof(arguments), 0), "cuLaunchKernel")
             # The precompiled pointer parameter is FP32; the workspace's
