@@ -7,6 +7,7 @@ import importlib.metadata
 
 import torch
 
+from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, TupleDict
 
 _M, _N, _K, _SPLITS = 4096, 24, 20480, 8
@@ -170,14 +171,7 @@ def mhc_projection_backward(x, weight, grad_proj, grad_r, r, *, allow_tf32=False
         raise ValueError("mHC projection backward requires CUDA tensors")
     device = x.device.index
     with torch.cuda.device(device):
-        if current_stream is None:
-            stream = torch.cuda.current_stream(device)
-        elif isinstance(current_stream, torch.cuda.Stream):
-            stream = current_stream
-            if stream.device.index != device:
-                raise ValueError("mHC projection backward: stream and tensors must use the same device")
-        else:
-            stream = torch.cuda.ExternalStream(int(current_stream), device=device)
+        stream = torch.cuda.current_stream(device) if current_stream is None else as_torch_stream(current_stream, device)
         with torch.cuda.stream(stream):
             plan = _wrapper_plan(device)
             dx = torch.empty((_M, _K), dtype=torch.bfloat16, device=device)

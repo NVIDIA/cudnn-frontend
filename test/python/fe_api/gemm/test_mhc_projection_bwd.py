@@ -184,3 +184,53 @@ def test_mhc_projection_wrapper(mhc_api):
     dx, dw = result
     assert dx is result["dx"] and dw is result["dweight"]
     _check(result, reference)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stream_kind", ["zero", "legacy", "per_thread", "current", "side"])
+def test_mhc_projection_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
+    # Emulate the older-Torch ExternalStream(0) behavior. This checks the real
+    # allocation/launch boundary; the prepared kernel itself is replaced below.
+    import cudnn.gemm.mhc_projection_bwd.api as api
+
+    device = torch.cuda.current_device()
+    caller, side, wrong = (torch.cuda.Stream(device=device) for _ in range(3))
+    default = torch.cuda.default_stream(device)
+    handles = {"zero": 0, "legacy": 1, "per_thread": 2, "current": caller.cuda_stream, "side": side.cuda_stream}
+    requested = handles[stream_kind]
+    expected = caller if stream_kind == "current" else side if stream_kind == "side" else default
+    original_external = torch.cuda.ExternalStream
+    monkeypatch.setattr(
+        torch.cuda,
+        "ExternalStream",
+        lambda handle, **kwargs: wrong if int(handle) in (0, 1, 2) else original_external(handle, **kwargs),
+    )
+    allocations, launches = [], []
+    x = torch.empty((1, 128), device=device, dtype=torch.bfloat16)
+    original_allocate = torch.empty
+
+    def allocate(*args, **kwargs):
+        allocations.append(torch.cuda.current_stream(device).cuda_stream)
+        return original_allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    # Keep the boundary probe small; the plan's fixed geometry/math is covered
+    # by the existing execution tests and is intentionally not exercised here.
+    monkeypatch.setattr(api, "_M", 1)
+    monkeypatch.setattr(api, "_K", 128)
+    monkeypatch.setattr(api, "_N", 2)
+
+    class Plan:
+        def scratch_workspace_bytes(self):
+            return 128
+
+        def execute(self, *args, current_stream):
+            launches.append(current_stream.cuda_stream)
+
+    monkeypatch.setattr(api, "_wrapper_plan", lambda device: Plan())
+    with torch.cuda.stream(caller):
+        result = api.mhc_projection_backward(x, x, x, x, x, allow_tf32=True, current_stream=requested)
+        assert result["dx"].shape == x.shape
+        assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+    assert allocations and set(allocations) == {expected.cuda_stream}
+    assert launches == [expected.cuda_stream]
