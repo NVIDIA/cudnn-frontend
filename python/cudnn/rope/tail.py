@@ -18,6 +18,7 @@ _require_cute()
 import cuda.bindings.driver as cuda
 import torch
 
+from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
 
@@ -160,13 +161,9 @@ def tail_rope(x, cosine, sine, *, backend="frost", stream=None):
     if x.device.type != "cuda":
         raise ValueError("Frost tail RoPE requires CUDA tensors")
     with torch.cuda.device(x.device):
-        context = (
-            torch.cuda.stream(torch.cuda.ExternalStream(int(stream), device=x.device))
-            if stream is not None
-            else torch.cuda.stream(torch.cuda.current_stream(x.device))
-        )
-        with context:
+        resolved_stream = torch.cuda.current_stream(x.device) if stream is None else as_torch_stream(stream, x.device)
+        with torch.cuda.stream(resolved_stream):
             out = torch.empty_like(x, memory_format=torch.contiguous_format)
             plan = TailRoPEForward(x, cosine, sine, out, backend=backend)
             plan.compile()
-            return plan.execute(x, cosine, sine, out, current_stream=stream)
+            return plan.execute(x, cosine, sine, out, current_stream=resolved_stream.cuda_stream)

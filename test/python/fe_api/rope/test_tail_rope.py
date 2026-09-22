@@ -275,3 +275,52 @@ def test_signed_i64_extent_beyond_two_billion():
     plan.compile()
     plan.execute(x, cosine, sine, out)
     assert torch.equal(out.view(torch.int16), x.view(torch.int16))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stream_kind", ["zero", "legacy", "per_thread", "current", "side"])
+def test_tail_rope_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
+    # Emulate the older-Torch ExternalStream(0) behavior. This checks the real
+    # allocation/launch boundary; the prepared kernel itself is replaced below.
+    import cudnn.rope.tail as api
+
+    device = torch.cuda.current_device()
+    caller, side, wrong = (torch.cuda.Stream(device=device) for _ in range(3))
+    default = torch.cuda.default_stream(device)
+    handles = {"zero": 0, "legacy": 1, "per_thread": 2, "current": caller.cuda_stream, "side": side.cuda_stream}
+    requested = handles[stream_kind]
+    expected = caller if stream_kind == "current" else side if stream_kind == "side" else default
+    original_external = torch.cuda.ExternalStream
+    monkeypatch.setattr(
+        torch.cuda,
+        "ExternalStream",
+        lambda handle, **kwargs: wrong if int(handle) in (0, 1, 2) else original_external(handle, **kwargs),
+    )
+    allocations, launches = [], []
+    x = torch.empty((1, 128), device=device, dtype=torch.bfloat16)
+    original_allocate = torch.empty_like
+
+    def allocate(*args, **kwargs):
+        allocations.append(torch.cuda.current_stream(device).cuda_stream)
+        return original_allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_like", allocate)
+
+    class Plan:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def compile(self):
+            pass
+
+        def execute(self, x, cosine, sine, out, *, current_stream):
+            launches.append(int(current_stream))
+            return {"out": out}
+
+    monkeypatch.setattr(api, "TailRoPEForward", Plan)
+    with torch.cuda.stream(caller):
+        result = api.tail_rope(x, x, x, stream=requested)
+        assert result["out"].shape == x.shape
+        assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+    assert allocations and set(allocations) == {expected.cuda_stream}
+    assert launches == [expected.cuda_stream]
