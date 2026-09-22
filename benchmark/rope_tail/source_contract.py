@@ -18,9 +18,11 @@ import torch
 
 def source_functions(source):
     path = Path(source) / "model.py"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    model_bytes = path.read_bytes()
+    if hashlib.sha256(model_bytes).hexdigest() != "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65":
+        raise ValueError("model.py does not match the pinned DSv4.1 source")
     names = {"precompute_freqs_cis", "apply_rotary_emb"}
-    nodes = [node for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef) and node.name in names]
+    nodes = [node for node in ast.parse(model_bytes).body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in nodes} == names
     # A fresh namespace gives each owner its own source lru_cache. The source
     # signature has no device argument, so its cache must not span devices.
@@ -35,8 +37,10 @@ def source_table(source, capacity, *, compressed, device):
     if type(capacity) is not int or capacity < 1 or type(compressed) is not bool:
         raise ValueError("positive capacity and explicit compressed mode required")
     config_path = Path(source) / "config.json"
-    assert hashlib.sha256(config_path.read_bytes()).hexdigest() == "2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809"
-    config = json.loads(config_path.read_text())
+    config_bytes = config_path.read_bytes()
+    if hashlib.sha256(config_bytes).hexdigest() != "2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809":
+        raise ValueError("config.json does not match the pinned DSv4.1 source")
+    config = json.loads(config_bytes)
     precompute, apply = source_functions(source)
     with torch.device(device):
         table = precompute(
