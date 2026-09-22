@@ -57,7 +57,7 @@ CHAIN_MIN_PIECES_REVERSE = 2
 CHAIN_MAX_PIECES = 16
 LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
-CU_DTYPES = ("int32", "int64")
+DV_SPLIT_TILES = 2
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -82,6 +82,15 @@ def dtype_name(dtype) -> str:
 # ---- piece rule -----------------------------------------------------------------------------------
 
 
+def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+    """The one-wave slot budget of a plan without ``batch_invariant``: ``num_sm // tiles`` capped at ``CHAIN_MAX_PIECES``
+    and at ``CHAIN_MIN_UNITS_PER_PIECE`` units of ``unit_chunks`` chunks per piece."""
+    num_seqs = max(1, int(num_seqs))
+    tiles = num_seqs * max(1, int(heads_out))
+    total_chunks = -(-(int(total_tokens) * max(1, int(expand_num))) // int(b_t))
+    return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
+
+
 def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
@@ -103,13 +112,22 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
-    num_seqs = max(1, int(num_seqs))
-    tiles = num_seqs * max(1, int(heads_out))
-    total_chunks = -(-(int(total_tokens) * expand_num) // b_t)
-    pieces = min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * unit_chunks))
+    pieces = piece_budget(
+        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+    )
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
     return 0, unit_chunks
+
+
+def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+    """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
+    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
+    is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
+    budget = piece_budget(
+        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+    )
+    return budget == DV_SPLIT_TILES and int(dim_v) == 128
 
 
 # ---- piece table ----------------------------------------------------------------------------------
@@ -139,13 +157,8 @@ def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTable
     return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, num_seqs * int(pieces) * int(heads_out), nbytes)
 
 
-def piece_table_workspace_bytes(num_seqs: int, pieces: int, heads_out: int) -> int:
-    """Total bytes of the piece-table workspace (``piece_table_layout(...).nbytes``)."""
-    return piece_table_layout(num_seqs, pieces, heads_out).nbytes
-
-
 @cute.jit
-def span_chunks_of(unit_chunks: cutlass.Constexpr[int], total_chunks, slots):
+def chunks_per_slot(unit_chunks: cutlass.Constexpr[int], total_chunks, slots):
     """Chunks per slot when ``total_chunks`` are shared by ``slots`` slots: ``ceil(total_chunks / slots)`` rounded up to a
     whole number of ``unit_chunks``, at least one unit."""
     span = (total_chunks + slots - cutlass.Int32(1)) // slots
@@ -200,24 +213,6 @@ def piece_span(
 
 
 @cute.jit
-def cta_sum(value, sWarp, lane, warp, num_warps: cutlass.Constexpr[int]):
-    """CTA-wide sum of one Int32 per thread, returned to every thread; ``sWarp`` holds ``num_warps`` words and is free
-    again on return (two CTA barriers)."""
-    incl = value
-    for off in [1, 2, 4, 8, 16]:
-        other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, incl, off, 0, kind=nvvm.Shfl.UP))
-        incl = incl + (other if lane >= cutlass.Int32(off) else cutlass.Int32(0))
-    if lane == cutlass.Int32(31):
-        sWarp[warp] = incl
-    nvvm.barrier_cta_sync()
-    total = cutlass.Int32(0)
-    for w in cutlass.range_constexpr(num_warps):
-        total = total + sWarp[w]
-    nvvm.barrier_cta_sync()
-    return total
-
-
-@cute.jit
 def piece_table_body(
     n_threads: cutlass.Constexpr[int],
     pieces: cutlass.Int32,
@@ -258,7 +253,7 @@ def piece_table_body(
     # ---- the slot span: one wave shared by the whole batch, guarded against the per-sequence ceilings ----------------
     total_chunks = (total_tokens * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
     wave = num_seqs * cutlass.Int32(pieces)
-    span_chunks = span_chunks_of(unit_chunks, total_chunks, wave)
+    span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave)
     if cutlass.const_expr(not length_rule):
         if num_seqs > cutlass.Int32(1):
             taken = cutlass.Int32(0)
@@ -271,10 +266,22 @@ def piece_table_body(
                     b_read = b if valid else num_seqs - cutlass.Int32(1)
                     length = cutlass.Int32(mCu[b_read + 1]) - cutlass.Int32(mCu[b_read])
                 count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks)
-                taken = taken + cta_sum(count if valid else cutlass.Int32(0), sWarpMain, lane, warp, num_warps)
+                # ---- CTA sum of the counts: warp scan, lane 31 parks the warp total, every thread adds the words ----
+                inclusive = count if valid else cutlass.Int32(0)
+                for offset in [1, 2, 4, 8, 16]:
+                    other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, inclusive, offset, 0, kind=nvvm.Shfl.UP))
+                    inclusive = inclusive + (other if lane >= cutlass.Int32(offset) else cutlass.Int32(0))
+                if lane == cutlass.Int32(31):
+                    sWarpMain[warp] = inclusive
+                nvvm.barrier_cta_sync()
+                total = cutlass.Int32(0)
+                for i in cutlass.range_constexpr(num_warps):
+                    total = total + sWarpMain[i]
+                nvvm.barrier_cta_sync()
+                taken = taken + total
                 probe_start = probe_start + cutlass.Int32(n_threads)
             if taken > wave:
-                span_chunks = span_chunks_of(unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1))
+                span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1))
 
     running_main = cutlass.Int32(0)
     running_summary = cutlass.Int32(0)

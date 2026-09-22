@@ -306,7 +306,7 @@ def test_undeclared_padded_input_raises():
 
     packed = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)
     sliced = kimi_delta_attention(_padded_q(q), k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)
-    for a, b in zip(packed, sliced):
+    for a, b in zip(packed, sliced, strict=True):
         assert torch.equal(a, b), "the op layer repacks a fused-projection slice; the answer is the packed one"
 
 
