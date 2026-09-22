@@ -391,7 +391,7 @@ resolve to `torch.cuda.default_stream(device)`.
 caller that releases its own right after the call returns the block to the allocator's
 pool for the caller's stream while the copy is still queued. Record the ORIGINAL first:
 ```python
-from cudnn._torch_stream import contiguous_on_stream, record_streams
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
 
 t = contiguous_on_stream(t, stream, device)          # None / contiguous -> t itself
 record_streams((t,), stream, device)                 # then any other copy (.to, clone(memory_format=...))
