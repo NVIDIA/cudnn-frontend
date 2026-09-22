@@ -141,9 +141,7 @@ def make_bars(cfg) -> Gdn2PrefillBars:
 
     return Gdn2PrefillBars(
         mb_raw_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), try_wait=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_raw_done=MBarrier(
-            alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0_WARPS + CG2_WARPS, producer=Producer.THREAD
-        ),
+        mb_raw_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0_WARPS + CG2_WARPS, producer=Producer.THREAD),
         mb_o_acc_ready=MBarrier(
             alloc(cfg.tmem_q_state_acc_stages), try_wait=True, stages=cfg.tmem_q_state_acc_stages, init_count=1, producer=Producer.MMA_COMMIT
         ),
@@ -157,9 +155,7 @@ def make_bars(cfg) -> Gdn2PrefillBars:
         mb_intermediate_done=MBarrier(
             alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=1, producer=Producer.MMA_COMMIT
         ),
-        mb_k_decay_inv_cg0_ready=MBarrier(
-            alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.TMA_LOAD
-        ),
+        mb_k_decay_inv_cg0_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.TMA_LOAD),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_k_restore_acc_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_state_acc_cg0_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),

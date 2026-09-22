@@ -40,6 +40,7 @@ def wait_try(mb, phase):
     while not nvvm.mbarrier_wait_parity(mb, phase, nvvm.MBarrierWait.TRY):
         pass
 
+
 @cute.jit
 def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
     """Spin on ``mb`` until its phase parity differs from ``phase``.

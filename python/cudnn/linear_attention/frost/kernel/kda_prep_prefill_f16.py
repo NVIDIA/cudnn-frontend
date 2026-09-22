@@ -141,12 +141,8 @@ def make_bars(cfg) -> KdaPrefillBars:
 
     return KdaPrefillBars(
         mb_raw_ready=MBarrier(alloc(cfg.smem_raw_bar_stages), spin=True, stages=cfg.smem_raw_bar_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_raw_done=MBarrier(
-            alloc(cfg.smem_raw_stages), spin=True, stages=cfg.smem_raw_stages, init_count=CG0_WARPS + CG2_WARPS, producer=Producer.THREAD
-        ),
-        mb_o_acc_ready=MBarrier(
-            alloc(cfg.tmem_q_state_acc_stages), spin=True, stages=cfg.tmem_q_state_acc_stages, init_count=1, producer=Producer.MMA_COMMIT
-        ),
+        mb_raw_done=MBarrier(alloc(cfg.smem_raw_stages), spin=True, stages=cfg.smem_raw_stages, init_count=CG0_WARPS + CG2_WARPS, producer=Producer.THREAD),
+        mb_o_acc_ready=MBarrier(alloc(cfg.tmem_q_state_acc_stages), spin=True, stages=cfg.tmem_q_state_acc_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_o_acc_done=MBarrier(
             alloc(cfg.tmem_q_state_acc_stages), spin=True, stages=cfg.tmem_q_state_acc_stages, init_count=CG1_WARPS, producer=Producer.THREAD
         ),
@@ -154,12 +150,8 @@ def make_bars(cfg) -> KdaPrefillBars:
         mb_state_input_cg2_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=CG2_WARPS, producer=Producer.THREAD),
         mb_state_input_cg0_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=CG0_WARPS, producer=Producer.THREAD),
         mb_u_input_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=CG2_WARPS + CG0_WARPS, producer=Producer.THREAD),
-        mb_a_done=MBarrier(
-            alloc(cfg.smem_intermediate_stages), spin=True, stages=cfg.smem_intermediate_stages, init_count=1, producer=Producer.MMA_COMMIT
-        ),
-        mb_k_decay_inv_cg0_ready=MBarrier(
-            alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.TMA_LOAD
-        ),
+        mb_a_done=MBarrier(alloc(cfg.smem_intermediate_stages), spin=True, stages=cfg.smem_intermediate_stages, init_count=1, producer=Producer.MMA_COMMIT),
+        mb_k_decay_inv_cg0_ready=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.TMA_LOAD),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_k_restore_done=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_state_acc_cg0_done=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
