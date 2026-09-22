@@ -248,6 +248,35 @@ def test_nsa_topk_reduction_wrapper_accepts_row_major_lse(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_nsa_topk_reduction_wrapper_lse_staging_outlives_the_released_original(request):
+    """R1 staging: the row-major LSE copy on an explicit side stream reads the caller's tensor
+    asynchronously; the wrapper records the original there, so releasing it right after the call
+    and reusing its block (poisoned here) on the caller's stream cannot corrupt the copy."""
+    from cuda.bindings import driver as cuda
+
+    NSA, _, kwargs, tensors = _thd_topk_case(request)
+    ref = NSA.topk_reduction_wrapper(**_wrapper_kwargs(kwargs, tensors))
+    row_major = tensors["LSE"].contiguous()
+    assert row_major.stride(0) != 1
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000_000)  # the wrapper's staging copy queues behind this
+    got = NSA.topk_reduction_wrapper(**dict(_wrapper_kwargs(kwargs, tensors), lse_tensor=row_major, current_stream=cuda.CUstream(side.cuda_stream)))
+    shape, dtype = row_major.shape, row_major.dtype
+    del row_major  # the caller releases its reference while the copy is still pending
+    poison = torch.empty(shape, dtype=dtype, device="cuda")
+    # Same size as the released block: with the original recorded, the allocator defers the block's reuse
+    # (or waits for the pending copy first) instead of letting this fill race it.
+    poison.fill_(float("nan"))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got["topk_indices_tensor"], ref["topk_indices_tensor"])
+    torch.testing.assert_close(got["topk_scores_tensor"], ref["topk_scores_tensor"], equal_nan=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 def test_nsa_topk_reduction_declines_row_major_lse(request):
     """R5: a natural row-major (T, H_q) LSE is declined in check_support (the kernel hard-codes a (1, S_q) stride)."""
     NSA, _, kwargs, tensors = _thd_topk_case(request)

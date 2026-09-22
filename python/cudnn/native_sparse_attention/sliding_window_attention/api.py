@@ -9,7 +9,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import contiguous_on_stream, stream_context
 from typing import Optional
 
 from ..utils import make_tensor_strided_like
@@ -637,7 +637,9 @@ def sliding_window_attention_wrapper(
                     v_ragged_offset_tensor,
                     o_ragged_offset_tensor,
                     stats_ragged_offset_tensor,
-                ) = (None if t is None else t.contiguous() for t in ragged_given)
+                ) = (
+                    contiguous_on_stream(t, launch, q_tensor.device) for t in ragged_given
+                )  # R1 staging: originals recorded first
 
     def allocate_workspace(obj: SlidingWindowAttention) -> torch.Tensor:
         with torch.cuda.device(q_tensor.device), stream_context(launch, q_tensor.device):

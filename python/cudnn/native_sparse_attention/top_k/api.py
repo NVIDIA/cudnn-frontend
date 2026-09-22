@@ -14,7 +14,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import record_streams, stream_context
 
 
 def _lse_stride_mismatch(shape, stride) -> bool:
@@ -24,14 +24,16 @@ def _lse_stride_mismatch(shape, stride) -> bool:
     return any(n > 1 and st != e for n, st, e in zip(shape, stride, expected))
 
 
-def _stage_lse(lse: torch.Tensor, is_thd: bool) -> torch.Tensor:
+def _stage_lse(lse: torch.Tensor, is_thd: bool, stream, device) -> torch.Tensor:
     """``lse`` itself when ``TopKReduction`` accepts its layout, else a copy in the accepted layout
-    (``(B,H_q,S_q)`` row-major; ``T,H,D``: ``(T,H_q[,1])`` with T at unit stride). Runs on the current torch stream."""
+    (``(B,H_q,S_q)`` row-major; ``T,H,D``: ``(T,H_q[,1])`` with T at unit stride). Call inside the
+    launch-stream context; the original is record_stream'ed on ``stream`` before the copy reads it (R1)."""
     view = lse.unsqueeze(0).transpose(1, 2) if is_thd else lse
     while view.ndim > 3:
         view = view.squeeze(-1)
     if not _lse_stride_mismatch(tuple(view.shape), tuple(view.stride())):
         return lse
+    record_streams((lse,), stream, device)
     return lse.transpose(0, 1).contiguous().transpose(0, 1) if is_thd else lse.contiguous()
 
 
@@ -364,7 +366,7 @@ def topk_reduction_wrapper(
                 _logger.warning("topk_reduction_wrapper: max_s_k not provided, inferring from cum_seqlen_k (device sync)")
                 cum = cum_seqlen_k_tensor.reshape(-1)
                 max_s_k = int((cum[1:] - cum[:-1]).max().item())
-        lse_tensor = _stage_lse(lse_tensor, is_thd)
+        lse_tensor = _stage_lse(lse_tensor, is_thd, current_stream, q_tensor.device)
 
         if is_thd:
             total_seq_len_q = q_tensor.shape[0]
