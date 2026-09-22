@@ -94,6 +94,12 @@ $$
 tensor is stream-recorded; every pointed allocation must remain alive and
 unchanged until the launch stream completes.
 
+Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(never 0); the API allocates nothing and the wrapper allocates it per call on the
+launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
+
 The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
 `amax_tensor`, `sfd_row_tensor`, `sfd_col_tensor`. On BF16,
 `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and `sfd_col_tensor` are
@@ -271,10 +277,12 @@ op = cudnn.GroupedGemmGluSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 op.execute(
     a_tensor=a, c_tensor=c, d_tensor=d, sfa_tensor=None,
     padded_offsets=padded_offsets, alpha_tensor=alpha,
     b_tensor=b, sfb_tensor=None, prob_tensor=prob,
+    workspace=workspace,
 )
 ```
 
@@ -394,6 +402,7 @@ api = GroupedGemmGluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_tensor=d,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
@@ -401,6 +410,7 @@ api.execute(
     d_col_tensor=d_col, sfd_row_tensor=sfd_row, sfd_col_tensor=sfd_col,
     amax_tensor=amax, norm_const_tensor=norm_const, prob_tensor=prob,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 
@@ -427,12 +437,14 @@ api = GroupedGemmGluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_tensor=d,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
     b_ptrs=b_ptrs, sfb_ptrs=sfb_ptrs,
     d_col_tensor=d_col, prob_tensor=prob,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 

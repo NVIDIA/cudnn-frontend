@@ -9,6 +9,7 @@ import cudnn
 
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
     _skip_unless_e5m3_supported,
     grouped_gemm_wgrad_init,
@@ -115,6 +116,7 @@ def _test_grouped_gemm_wgrad_dense_compile_execute(
         wgrad_tensor=wgrad_tensor,
         global_scale_a=inputs["global_scale_a"],
         global_scale_b=inputs["global_scale_b"],
+        workspace=ws(op),
     )
     torch.cuda.synchronize()
     check_ref_grouped_gemm_wgrad(wgrad_tensor, inputs["ref_result"], cfg["tolerance"])
@@ -341,8 +343,10 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         sfb_tensor=inputs["sfb_tensor"],
         offsets_tensor=inputs["offsets_tensor"],
         wgrad_tensor=wgrad_tensor,
+        wgrad_ptrs=cudnn.wgrad_expert_ptrs(wgrad_tensor),
         global_scale_a=inputs["global_scale_a"],
         global_scale_b=inputs["global_scale_b"],
+        workspace=ws(op),
     )
     torch.cuda.synchronize()
     check_ref_grouped_gemm_wgrad(wgrad_tensor, expected, cfg["tolerance"])
@@ -631,8 +635,10 @@ def _test_grouped_gemm_wgrad_dynamic_tokens_compile_execute(
         sfb_tensor=runtime_inputs["sfb_tensor"],
         offsets_tensor=runtime_inputs["offsets_tensor"],
         wgrad_tensor=runtime_wgrad,
+        wgrad_ptrs=cudnn.wgrad_expert_ptrs(runtime_wgrad) if output_mode == "discrete" else None,
         global_scale_a=runtime_inputs["global_scale_a"],
         global_scale_b=runtime_inputs["global_scale_b"],
+        workspace=ws(op),
     )
     torch.cuda.synchronize()
     check_ref_grouped_gemm_wgrad(runtime_wgrad, runtime_inputs["ref_result"], runtime_cfg["tolerance"])
@@ -725,6 +731,8 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "scratch_workspace_bytes", lambda self: 128)
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "wgrad_expert_ptrs", lambda wgrad_tensor, current_stream=None: None)  # host tensors
     monkeypatch.setattr(
         grouped_gemm_wgrad_api,
         "select_grouped_gemm_backend",
@@ -775,6 +783,7 @@ def test_grouped_gemm_wgrad_wrapper_input_order_cache_key(monkeypatch):
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "scratch_workspace_bytes", lambda self: 128)
     monkeypatch.setattr(
         grouped_gemm_wgrad_api,
         "select_grouped_gemm_backend",
@@ -915,6 +924,43 @@ def test_grouped_gemm_wgrad_e5m3_is_not_cached_as_e4m3():
     assert not torch.equal(
         w_e4m3, w_e5m3
     ), "e5m3 and e4m3 produced identical output from identical scale-factor bytes; sf_fp8_dtype_override is likely missing from the compile cache key"
+
+
+@pytest.mark.L0
+def test_wgrad_can_implement_without_groups():
+    """Host-only: ``can_implement`` accepts the packed total alone (``group_k_list=None``) so
+    ``check_support()`` never reads the per-expert split off the device (Rule 3)."""
+    from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode, WGradInputOrder
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+    import cutlass
+
+    def can(**overrides):
+        kwargs = dict(
+            ab_dtype=cutlass.BFloat16,
+            out_dtype=cutlass.BFloat16,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=False,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            m=128,
+            n=128,
+            group_k_list=None,
+            expert_cnt=3,
+            a_major="k",
+            b_major="k",
+            weight_mode=MoEWeightMode.DENSE,
+            input_order=WGradInputOrder.Tensor2D,
+            tokens_sum=512,
+        )
+        kwargs.update(overrides)
+        return MoEGroupedGemmWgradBF16Kernel.can_implement(**kwargs)
+
+    assert can() is True
+    assert can(tokens_sum=None) is False  # neither the split nor the total: undecidable
+    assert can(tokens_sum=4) is False  # 4 bf16 tokens is 8 bytes: below the 16-byte TMA alignment
+    assert can(group_k_list=[256, 0, 256]) is True
+    assert can(group_k_list=[256, 0, 256], tokens_sum=256) is False  # split and total disagree
+    assert can(group_k_list=[256, 8, 248]) is False  # per-group 256-alignment still enforced when the split is known
 
 
 @pytest.mark.L0

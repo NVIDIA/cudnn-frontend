@@ -19,6 +19,7 @@ from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
 )
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_dswiglu_utils import (
     GROUPED_GEMM_DSWIGLU_COMMON_MARKS,
@@ -722,6 +723,7 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     torch.cuda.synchronize()
@@ -969,6 +971,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_m_cache_behavior(request, monk
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "scratch_workspace_bytes", lambda self: 128)
 
     d_dtype = torch.float8_e4m3fn if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else torch.bfloat16
     cfg = grouped_gemm_swiglu_init(
@@ -1067,6 +1070,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_nk_cache_behavior(request, mon
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "scratch_workspace_bytes", lambda self: 128)
 
     cfg = grouped_gemm_swiglu_init(
         request=request,
@@ -1374,6 +1378,7 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     torch.cuda.synchronize()

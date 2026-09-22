@@ -81,7 +81,7 @@ stacked `wgrad_tensor`. `wgrad_ptrs` is forbidden.
 With `output_mode="discrete"`, either:
 
 - omit both output arguments and let the wrapper allocate a stacked tensor and
-  construct an internal pointer array; or
+  derive its pointer table with `wgrad_expert_ptrs` (below); or
 - provide a CUDA `torch.int64` `wgrad_ptrs` array containing one non-null,
   16-byte-aligned output address per expert.
 
@@ -93,6 +93,26 @@ lifetime of allocations represented only by integer addresses.
 
 The wrapper always returns `TupleDict(wgrad_tensor=...)`; it contains exactly
 one item and supports either keyed access or tuple unpacking.
+
+### `wgrad_expert_ptrs`
+
+The class API's discrete `execute()` **requires** `wgrad_ptrs`; it never derives
+the table from `wgrad_tensor` itself. `cudnn.wgrad_expert_ptrs(wgrad_tensor,
+current_stream=None)` builds it once per stacked `(num_experts, hidden,
+intermediate)` output: for torch it is one `arange` fill on the launch stream
+(no host list, no host-to-device copy, no synchronization, CUDA-graph
+capturable), for JAX (eager wrapper only) the packed little-endian uint8 form.
+Reuse the table across executes while the output buffer stays put; a
+`num_experts` of 0 or 1 yields an empty or single-entry table.
+
+### Workspace
+
+Class-API `execute()` also requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(a multiple of 128, never 0) for the per-expert TMA-descriptor slots; the API
+allocates nothing and the wrapper allocates it per call on the launch stream.
+See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+`sample_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
 
 ## Block-scaled contract
 
@@ -176,6 +196,7 @@ op = cudnn.GroupedGemmWgradSm100(
 )
 op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a_tensor.device)
 op.execute(
     a_tensor=a_tensor,
     b_tensor=b_tensor,
@@ -183,12 +204,14 @@ op.execute(
     sfb_tensor=None,
     offsets_tensor=offsets_tensor,
     wgrad_tensor=wgrad_tensor,
+    workspace=workspace,
 )
 ```
 
 For a discrete class instance, replace `sample_wgrad` with
 `sample_wgrad_expert=expert_outputs[0]`, `num_experts`, `wgrad_shape`, and
-`wgrad_dtype`, then pass `wgrad_ptrs` to `execute`.
+`wgrad_dtype`, then pass `wgrad_ptrs` to `execute` -- your own table, or
+`cudnn.wgrad_expert_ptrs(stacked_wgrad_tensor)` for a stacked output.
 
 ### Block-scaled
 
@@ -221,6 +244,7 @@ op = cudnn.GroupedGemmWgradSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a_tensor.device)
 op.execute(
     a_tensor=a_tensor,
     b_tensor=b_tensor,
@@ -228,6 +252,7 @@ op.execute(
     sfb_tensor=sfb_tensor,
     offsets_tensor=offsets_tensor,
     wgrad_tensor=wgrad_tensor,
+    workspace=workspace,
 )
 ```
 

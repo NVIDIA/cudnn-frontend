@@ -25,6 +25,7 @@ import math
 from ..backend_utils import (
     GroupedGemmBackend,
     _torch_stream_context,
+    allocate_wrapper_workspace,
     backend_cache_key,
     block_scaled_sfd_tensors,
     select_grouped_gemm_backend,
@@ -306,6 +307,12 @@ class GroupedGemmDgluSm100(APIBase):
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
 
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires."""
+        if self._implementation is None:
+            self.check_support()
+        return self._implementation.scratch_workspace_bytes()
+
     # BF16 implementation
     @overload
     def execute(
@@ -328,6 +335,7 @@ class GroupedGemmDgluSm100(APIBase):
         sfd_col_tensor: None = None,
         amax_tensor: None = None,
         norm_const_tensor: None = None,
+        workspace: Any = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -352,6 +360,7 @@ class GroupedGemmDgluSm100(APIBase):
         sfd_col_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
+        workspace: Any = None,
     ) -> None: ...
 
     def execute(
@@ -376,6 +385,8 @@ class GroupedGemmDgluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace: Any = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -407,6 +418,7 @@ class GroupedGemmDgluSm100(APIBase):
                 dbias_tensor=dbias_tensor,
                 linear_offset=self.linear_offset,
                 current_stream=current_stream,
+                workspace=workspace,
             )
         else:
             self._implementation.execute(
@@ -430,6 +442,7 @@ class GroupedGemmDgluSm100(APIBase):
                 amax_tensor=amax_tensor,
                 norm_const_tensor=norm_const_tensor,
                 current_stream=current_stream,
+                workspace=workspace,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -886,6 +899,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         amax_tensor=outputs["amax_tensor"],
         norm_const_tensor=call.norm_const_tensor,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
     return outputs
 
@@ -1199,6 +1213,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         dbias_tensor=dbias_tensor,
         linear_offset=call.linear_offset,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
     return TupleDict(
         d_row_tensor=d_row_tensor,
@@ -1323,6 +1338,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             dbias_tensor=dbias_tensor,
             linear_offset=resolved_linear_offset,
             current_stream=current_stream,
+            workspace=allocate_wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream),
         )
         return TupleDict(
             d_row_tensor=d_row_tensor,

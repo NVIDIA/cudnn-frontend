@@ -120,6 +120,12 @@ $$
 pointer-array tensor is stream-recorded, while every pointed allocation must
 remain alive and unchanged until that stream completes.
 
+Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(never 0); the API allocates nothing and the wrapper allocates it per call on the
+launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
+
 The wrapper return order is exactly `d_row_tensor`, `d_col_tensor`,
 `dprob_tensor`, `dbias_tensor`, `amax_tensor`, `sfd_row_tensor`,
 `sfd_col_tensor`. On BF16, `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and
@@ -298,6 +304,7 @@ op = cudnn.GroupedGemmDgluSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 dprob.zero_()
 dbias.zero_()
 op.execute(
@@ -305,6 +312,7 @@ op.execute(
     sfa_tensor=None, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     dbias_tensor=dbias, b_tensor=b, sfb_tensor=None,
+    workspace=workspace,
 )
 ```
 
@@ -426,6 +434,7 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
@@ -434,6 +443,7 @@ api.execute(
     sfd_row_tensor=sfd_row, sfd_col_tensor=sfd_col,
     amax_tensor=amax, norm_const_tensor=norm_const,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 
@@ -464,12 +474,14 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     b_ptrs=b_ptrs, sfb_ptrs=sfb_ptrs,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 

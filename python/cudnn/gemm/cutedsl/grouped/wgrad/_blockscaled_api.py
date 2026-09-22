@@ -10,15 +10,18 @@ from typing import Literal, Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace, align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import is_torch_tensor
 
+from ._bf16_api import WGRAD_PTRS_REQUIRED
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from ..backend_utils import debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
@@ -155,7 +158,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self.cluster_shape_mn = cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1))
         self.accumulate_on_output = accumulate_on_output
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
-        self._workspace = None
+        self._kernel_obj = None
 
     def _check_offsets_rank(self, offsets_desc: TensorDesc, name: str) -> None:
         # Metadata only: the offset VALUES are a device-data contract read in-kernel
@@ -297,42 +300,53 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self._is_supported = True
         return True
 
-    def compile(self) -> None:
-        import torch
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+                sf_fp8_dtype_override=self.sf_fp8_dtype_override,
+            )
+        return self._kernel_obj
 
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
+        TMA-descriptor slots, 128-byte aligned, never 0."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
+    def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            accumulate_on_output=self.accumulate_on_output,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            input_order=self.input_order,
-            sf_fp8_dtype_override=self.sf_fp8_dtype_override,
-        )
+        kernel = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device=self.a_desc.device)
+        # The kernel's workspace is a cute.Tensor: its fake matches the uint8 view carved at
+        # execute (R11). interpret_uint8_as_fp4x2 is this API's default and must not apply.
+        workspace_fake = self._make_fake_cute_tensor(cutlass.Uint8, (self.scratch_workspace_bytes(),), (1,), assumed_align=128, interpret_uint8_as_fp4x2=False)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._compile_dense(kernel, max_active_clusters, fake_stream)
+            self._compile_dense(kernel, max_active_clusters, fake_stream, workspace_fake)
         else:
-            self._compile_discrete(kernel, max_active_clusters, fake_stream)
+            self._compile_discrete(kernel, max_active_clusters, fake_stream, workspace_fake)
 
         if self.sample_a_tensor is not None:
             del self.sample_a_tensor
         if self.sample_b_tensor is not None:
             del self.sample_b_tensor
 
-    def _compile_dense(self, kernel, max_active_clusters, fake_stream) -> None:
+    def _compile_dense(self, kernel, max_active_clusters, fake_stream, workspace_fake) -> None:
         a_fake = (
             from_dlpack(self.sample_a_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
                 mode=1,
@@ -383,7 +397,6 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         )
         wgrad_fake = self._make_fake_cute_tensor_from_desc(self.wgrad_desc, assumed_align=16)
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
-        workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
         gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
 
@@ -404,8 +417,6 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
@@ -413,6 +424,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor: torch.Tensor,
             wgrad_tensor: torch.Tensor,
             offsets_tensor: torch.Tensor,
+            workspace,
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
@@ -424,7 +436,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_tensor,
                 offsets_tensor,
-                cached_workspace,
+                workspace,
                 stream,
                 global_scale_a,
                 global_scale_b,
@@ -433,7 +445,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         self._compiled_kernel = tensor_api
 
-    def _compile_discrete(self, kernel, max_active_clusters, fake_stream) -> None:
+    def _compile_discrete(self, kernel, max_active_clusters, fake_stream, workspace_fake) -> None:
         import torch
 
         a_fake = (
@@ -485,11 +497,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             divisibility=4,
         )
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
-        workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
         gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
-        wgrad_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device=self.a_desc.device)
-        wgrad_ptrs_fake = from_dlpack(wgrad_ptrs_placeholder, assumed_align=8, enable_tvm_ffi=True).iterator
+        wgrad_ptrs_fake = make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
         single_expert_fake = self._make_fake_cute_tensor(
             dtype=self.single_expert_wgrad_desc.dtype,
             shape=self.single_expert_wgrad_desc.shape,
@@ -514,7 +524,6 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         single_expert_placeholder = torch.empty_strided(
             self.single_expert_wgrad_desc.shape,
             self.single_expert_wgrad_desc.stride,
@@ -534,6 +543,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor: torch.Tensor,
             wgrad_ptrs: torch.Tensor,
             offsets_tensor: torch.Tensor,
+            workspace,
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
@@ -545,7 +555,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_ptrs.data_ptr(),
                 offsets_tensor,
-                cached_workspace,
+                workspace,
                 stream,
                 global_scale_a,
                 global_scale_b,
@@ -566,14 +576,19 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
-        import torch
-
+        """``workspace``: caller-owned, 128-byte-aligned, contiguous device buffer of at least
+        ``scratch_workspace_bytes()`` bytes; never allocated here. Discrete mode requires
+        ``wgrad_ptrs`` (see :func:`cudnn.gemm.cutedsl.grouped.wgrad.api.wgrad_expert_ptrs`)."""
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
+        nbytes = self.scratch_workspace_bytes()
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
+            ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
             self._compiled_kernel(
                 a_tensor,
                 b_tensor,
@@ -581,23 +596,19 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_tensor,
                 offsets_tensor,
+                ws_view,
                 current_stream,
                 global_scale_a,
                 global_scale_b,
             )
             return
 
-        if wgrad_ptrs is None:
-            self._value_error_if(wgrad_tensor is None, "Provide wgrad_tensor or wgrad_ptrs in discrete mode")
-            self._value_error_if(wgrad_tensor.ndim != 3, f"wgrad_tensor must be rank-3, got {tuple(wgrad_tensor.shape)}")
-            self._value_error_if(not wgrad_tensor.is_cuda, f"wgrad_tensor must be a CUDA tensor, got {wgrad_tensor.device}")
-            # Pointer table derived on device (R4): base + arange * stride on the launch stream.
-            # Never a host list through torch.tensor(..., device=): pageable H2D + implicit sync.
-            expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
-            with stream_context(current_stream, wgrad_tensor.device):
-                wgrad_ptrs = torch.arange(wgrad_tensor.shape[0], dtype=torch.int64, device=wgrad_tensor.device)
-                wgrad_ptrs.mul_(expert_stride_bytes).add_(wgrad_tensor.data_ptr())
+        self._value_error_if(wgrad_ptrs is None, WGRAD_PTRS_REQUIRED)
         _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
+        debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
+        if is_torch_tensor(wgrad_ptrs):
+            wgrad_ptrs.record_stream(as_torch_stream(int(current_stream), wgrad_ptrs.device))
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
         self._compiled_kernel(
             a_tensor,
             b_tensor,
@@ -605,6 +616,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor,
             wgrad_ptrs,
             offsets_tensor,
+            ws_view,
             current_stream,
             global_scale_a,
             global_scale_b,

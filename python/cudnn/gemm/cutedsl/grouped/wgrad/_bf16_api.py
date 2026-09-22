@@ -11,14 +11,14 @@ from typing import Literal, Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace, align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     canonicalize_unit_dim_strides,
     cuda_is_available,
     default_stream,
@@ -27,14 +27,18 @@ from cudnn.tensor_adapter import (
     get_compute_capability,
     get_data_ptr,
     get_device,
-    get_shape,
-    get_strides,
     is_torch_tensor,
 )
 
-from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+
+WGRAD_PTRS_REQUIRED = (
+    "Discrete execution requires wgrad_ptrs; derive them once per output with "
+    "cudnn.gemm.cutedsl.grouped.wgrad.api.wgrad_expert_ptrs(wgrad_tensor, current_stream) "
+    "or pass your own int64 device table"
+)
 
 
 def _output_dtypes():
@@ -113,8 +117,7 @@ class GroupedGemmWgradBf16API(APIBase):
             sample_global_scale_b,
         )
         self._kernel = MoEGroupedGemmWgradBF16Kernel
-        self._workspace: Optional[torch.Tensor] = None
-        self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
+        self._kernel_obj = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
         self._live_wgrad_ptrs = None
         self._sample_data_ptrs = {
@@ -126,7 +129,7 @@ class GroupedGemmWgradBf16API(APIBase):
                 ("sample_wgrad", sample_wgrad),
                 ("sample_wgrad_expert", sample_wgrad_expert),
             )
-            if tensor is not None
+            if tensor is not None and not isinstance(tensor, TensorDesc)
         }
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self.a_major: Optional[str] = None
@@ -288,29 +291,38 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError(f"single expert placeholder layout {desc.stride} is not expressible as a C-contiguous JAX array")
         self._single_expert_placeholder = jax.block_until_ready(jnp.empty(desc.shape, dtype=framework_dtype(desc.dtype, "jax")))
 
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                accumulate_on_output=self.accumulate_on_output,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                input_order=self.input_order,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
+        TMA-descriptor slots, 128-byte aligned, never 0."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
     def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        kernel = self._kernel(
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            accumulate_on_output=self.accumulate_on_output,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            input_order=self.input_order,
-        )
+        kernel = self._kernel_instance()
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be > 0 after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, kernel.get_workspace_bytes(), self.a_desc.device)
-        self._validate_data_alignment(self._workspace, "workspace", 128)
-        workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
+        # Compile-time stand-ins carry type, extent and alignment only (R11); the kernel's
+        # workspace is a cute.Tensor, so its fake matches the uint8 view carved at execute.
+        workspace_fake = self._make_fake_cute_tensor(cutlass.Uint8, (self.scratch_workspace_bytes(),), (1,), assumed_align=128)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         a_fake = self._make_fake_cute_compact_tensor(
             dtype=self.a_desc.dtype,
@@ -333,14 +345,7 @@ class GroupedGemmWgradBf16API(APIBase):
             out_fake = self._make_fake_cute_tensor_from_desc(self.wgrad_desc, assumed_align=16)
             single_expert_fake = None
         else:
-            # Compile-time placeholder for the pointer-array argument: real device bytes
-            # (fake tensors have dummy iterators) allocated in the caller's framework,
-            # retyped to Int64 via the element_type override.
-            self._compile_wgrad_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-            self._validate_pointer_array_alignment(self._compile_wgrad_ptrs)
-            placeholder = from_dlpack(self._compile_wgrad_ptrs, assumed_align=8)
-            placeholder.element_type = cutlass.Int64
-            out_fake = placeholder.iterator
+            out_fake = make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
             single_expert_fake = self._make_fake_cute_tensor_from_desc(self.single_expert_wgrad_desc, assumed_align=16)
         raw_compiled = cute.compile(
             kernel,
@@ -354,7 +359,6 @@ class GroupedGemmWgradBf16API(APIBase):
             single_expert_fake,
             options="--enable-tvm-ffi",
         )
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         if self.weight_mode == MoEWeightMode.DISCRETE:
             self._allocate_single_expert_placeholder()
             self._validate_data_alignment(self._single_expert_placeholder, "single expert placeholder")
@@ -366,14 +370,14 @@ class GroupedGemmWgradBf16API(APIBase):
         else:
             cached_single_expert = None
 
-        def tensor_api(a_tensor, b_tensor, output, offsets, stream) -> None:
+        def tensor_api(a_tensor, b_tensor, output, offsets, workspace, stream) -> None:
             out_arg = output if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(output))
             raw_compiled(
                 a_tensor,
                 b_tensor,
                 out_arg,
                 offsets,
-                cached_workspace,
+                workspace,
                 stream,
                 cached_single_expert,
             )
@@ -421,27 +425,6 @@ class GroupedGemmWgradBf16API(APIBase):
         if desc.device != self.a_desc.device:
             raise ValueError(f"wgrad_tensor device mismatch: expected {self.a_desc.device}, got {desc.device}")
 
-    def _generate_wgrad_ptrs(self, wgrad_tensor: torch.Tensor, current_stream: cuda.CUstream):
-        """Derive the per-expert pointer array from a rank-3 wgrad tensor."""
-        element_bits = _convert_to_cutlass_data_type(self.wgrad_dtype).width
-        stride_bytes = get_strides(wgrad_tensor)[0] * element_bits // 8
-        base_ptr = get_data_ptr(wgrad_tensor)
-        if is_torch_tensor(wgrad_tensor):
-            import torch
-
-            # Derived on device (R4): base + arange * stride on the launch stream. Never a host
-            # list through torch.tensor(..., device=): pageable H2D + implicit sync.
-            with _torch_stream_context(current_stream, wgrad_tensor.device):
-                ptrs = torch.arange(self.expert_cnt, dtype=torch.int64, device=wgrad_tensor.device)
-                return ptrs.mul_(stride_bytes).add_(base_ptr)
-        values = [base_ptr + index * stride_bytes for index in range(self.expert_cnt)]
-        import jax
-        import jax.numpy as jnp
-        import numpy as np
-
-        # Packed little-endian uint8 pointer bytes: JAX truncates int64 without x64 mode.
-        return jax.block_until_ready(jnp.asarray(np.asarray(values, dtype=np.int64).view(np.uint8)))
-
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -454,8 +437,16 @@ class GroupedGemmWgradBf16API(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Launch on ``current_stream`` (torch: the caller's current stream; JAX: the legacy default stream).
+
+        ``workspace`` is a caller-owned, 128-byte-aligned, contiguous device buffer of at least
+        ``scratch_workspace_bytes()`` bytes (torch tensor or any DLPack buffer); this API never
+        allocates scratch itself. Discrete mode requires ``wgrad_ptrs`` (see
+        :func:`cudnn.gemm.cutedsl.grouped.wgrad.api.wgrad_expert_ptrs`); a ``wgrad_tensor``
+        passed alongside is validated only.
 
         ``offsets_tensor`` values (non-decreasing cumulative ends, every group a multiple of 256,
         last ``== tokens_sum``) and ``wgrad_ptrs`` entries (non-null, 16-byte aligned) are a
@@ -501,17 +492,15 @@ class GroupedGemmWgradBf16API(APIBase):
             if wgrad_tensor is not None:
                 self._validate_live_output(wgrad_tensor)
                 self._validate_data_alignment(wgrad_tensor, "wgrad_tensor")
-            generated_wgrad_ptrs = wgrad_ptrs is None
             if wgrad_ptrs is None:
-                if wgrad_tensor is None:
-                    raise ValueError("Discrete execution requires wgrad_tensor or wgrad_ptrs")
-                wgrad_ptrs = self._generate_wgrad_ptrs(wgrad_tensor, current_stream)
+                raise ValueError(WGRAD_PTRS_REQUIRED)
             _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
             if get_device(wgrad_ptrs) != self.a_desc.device:
                 raise ValueError(f"wgrad_ptrs must be on {self.a_desc.device}, got {get_device(wgrad_ptrs)}")
             self._validate_pointer_array_alignment(wgrad_ptrs)
-            if not generated_wgrad_ptrs:
-                debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
+            debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
             self._record_pointer_stream(wgrad_ptrs, current_stream)
             output = wgrad_ptrs
-        self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream)
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, ws_view, current_stream)

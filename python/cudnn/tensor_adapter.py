@@ -189,31 +189,6 @@ def get_data_ptr(tensor: Any) -> int:
     raise ValueError(f"Cannot extract a device pointer from {type(tensor)!r}")
 
 
-def allocate_byte_workspace(framework: str, nbytes: int, device: Any) -> Any:
-    """Allocate an internal uint8 workspace buffer in the caller's framework allocator.
-
-    The buffer is written by kernels through its raw pointer and never surfaced as a
-    framework array, so allocating it as a (zero-initialized, for JAX) framework tensor
-    is safe; the caller must keep a reference alive for the compiled kernel's lifetime.
-    """
-    nbytes = max(int(nbytes), 1)
-    if framework == "torch":
-        import torch
-
-        return torch.empty(nbytes, dtype=torch.uint8, device=device)
-    if framework == "jax":
-        import jax
-        import jax.numpy as jnp
-
-        if isinstance(device, Device):
-            # Canonical descriptor device -> the corresponding jax device
-            device = jax.devices("gpu")[device.index or 0] if device.type == "cuda" else None
-        buffer = jnp.zeros((nbytes,), dtype=jnp.uint8, device=device)
-        # Materialize before anyone reads its pointer
-        return jax.block_until_ready(buffer)
-    raise ValueError(f"Cannot allocate a workspace for framework '{framework}'")
-
-
 def pad_to_ndim(tensor: Any, ndim: int) -> Any:
     """Append size-1 dims up to ndim; works for any framework tensor exposing reshape."""
     shape = get_shape(tensor)

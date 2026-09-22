@@ -73,7 +73,18 @@ The tensor parameters are type-erased: torch tensors and JAX arrays are both acc
 - The eager path launches on the **CUDA legacy default stream** (XLA does not track it): `jax.block_until_ready(...)` your inputs before calling, and synchronize the device (or the stream you passed) before reading the outputs.
 - For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_jax_sm100(a_tensor, padded_offsets, alpha_tensor, b_ptrs, n, prob_tensor, ...)` (built on `cudnn.jax.call`; discrete mode, no bias): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, and no manual synchronization is needed. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract above, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
-Internal workspaces are allocated in the caller's framework allocator (torch caching allocator or XLA's pool) and written through raw pointers; they are never surfaced as arrays.
+## Workspace contract
+
+The class API owns no device memory: `execute()` takes `workspace=`, a
+caller-owned, contiguous, 128-byte-aligned device buffer (a torch tensor or any
+DLPack buffer) of at least `op.scratch_workspace_bytes()` bytes, and carves the
+per-expert TMA-descriptor slots and the dynamic-scheduler counter out of it.
+`scratch_workspace_bytes()` is a multiple of 128 and never 0, so `workspace` is
+always required; passing `None`, an undersized or a misaligned buffer raises
+`ValueError` before launch. The buffer carries no state across launches, so it
+may be reused across executes and shared between operators as long as executions
+that share it do not overlap. The wrapper allocates it per call in the caller's
+framework allocator (torch caching allocator or XLA's pool) on the launch stream.
 
 ## Wrapper API
 
@@ -141,6 +152,7 @@ op = cudnn.GroupedGemmSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 op.execute(
     a_tensor=a,
     c_tensor=c,
@@ -150,6 +162,7 @@ op.execute(
     b_tensor=b,
     bias_tensor=bias,
     prob_tensor=prob,
+    workspace=workspace,
 )
 ```
 
@@ -157,14 +170,20 @@ For a discrete class instance, replace `sample_b` with
 `num_experts=L`, `b_shape=(N, K)`, `b_dtype=torch.bfloat16`, and pass
 `b_ptrs` to `execute()`.
 
+`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`
+(int32, shape `(L,)`, stride `(1,)`, on `A`'s device): construction,
+`check_support()` and `compile()` read no offset values, so no offsets buffer
+has to exist before the first `execute()`. The path is CUDA-graph capturable,
+including the first `execute()` of a shape.
+
 ## Scheduling, caching, and errors
 
 - `use_dynamic_sched=False` uses the static scheduler.
 - `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
-  compatible M values; discrete mode also allocates the per-expert tensor-map
-  workspace. Wrapper cache keys retain dtype, layout, expert count, optional
-  features, scheduler choice, output policy, tile/cluster shape, and overlap
-  margin.
+  compatible M values; discrete mode also carves the per-expert tensor-map
+  slots from the caller's workspace. Wrapper cache keys retain dtype, layout,
+  expert count, optional features, scheduler choice, output policy,
+  tile/cluster shape, and overlap margin.
 - Dense and discrete weight arguments are mutually exclusive. Invalid shapes,
   strides, dtypes, devices, data-pointer alignment, pointer-array length, output
   descriptors, tiles/clusters, or a target below SM100 raise `ValueError` or
