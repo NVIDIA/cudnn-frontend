@@ -30,10 +30,11 @@ from typing import Literal, Tuple, Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
+from cudnn.frost.workspace import Workspace, align_up
 
 
 def _get_rubin_kernel():
@@ -274,9 +275,49 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
-        self._workspace = None
+        self._kernel_obj = None
 
         self._logger.debug("__init__ completed")
+
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_sfd=self.generate_sfd,
+                discrete_col_sfd=self.discrete_col_sfd,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                act_func=self.act_func,
+                enable_bias=self._has_bias,
+                use_dynamic_sched=self.use_dynamic_sched,
+                **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+                **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
+                # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
+                # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
+                # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
+                # that internal-only type is never named outside the Rubin module.
+                **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
+    @staticmethod
+    def _fake_workspace_ptr():
+        # Compile-time placeholder: type and alignment only; execute() passes the caller's address.
+        return cute.runtime.make_ptr(cutlass.Uint8, 128, cute.AddressSpace.gmem, assumed_align=128)
+
+    @staticmethod
+    def _fake_pointer_table():
+        return cute.runtime.make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
 
     # --------------------------------------------------------------------- #
     #  check_support
@@ -661,8 +702,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
-        import torch
-
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -672,29 +711,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self._logger.debug("sample valid_m is zero, skipping kernel compilation")
             return
 
-        # ---- Instantiate the unified kernel ----
-        gemm_glu = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            generate_sfd=self.generate_sfd,
-            discrete_col_sfd=self.discrete_col_sfd,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            act_func=self.act_func,
-            enable_bias=self._has_bias,
-            use_dynamic_sched=self.use_dynamic_sched,
-            **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
-            **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
-            # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
-            # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
-            # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
-            # that internal-only type is never named outside the Rubin module.
-            **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
-        )
+        gemm_glu = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -704,10 +721,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        # ---- Allocate workspace ----
-        workspace_bytes = gemm_glu.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_glu, max_active_clusters, fake_stream)
@@ -722,10 +735,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         """Compile for dense (contiguous) weight mode."""
         use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
-        fake_workspace_ptr = cute.runtime.nullptr(
-            dtype=cutlass.Uint8,
-            assumed_align=128,
-        )
+        fake_workspace_ptr = self._fake_workspace_ptr()
 
         if not use_full_dynamic:
             valid_m = cute.sym_int(divisibility=256)
@@ -936,9 +946,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
         _compiled_kernel = cute.compile(gemm_glu, **compile_kwargs)
 
-        # Cache workspace pointer for the tensor_api closure
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
@@ -955,6 +962,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             alpha_tensor: torch.Tensor,
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
+            workspace_ptr: int,
             stream: cuda.CUstream,
             linear_offset: float = 0.0,
             geglu_alpha: float = 1.702,
@@ -971,7 +979,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 cutlass.Int32(0),
                 cutlass.Int32(0),
                 cutlass.Int64(0),
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_tensor,
                 d_col_tensor,
@@ -1005,8 +1013,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def _compile_discrete(self, gemm_glu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
-        import torch
-
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -1090,13 +1096,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
         bias_tensor = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
-        # Compile-time pointer placeholders
-        b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        b_ptrs_cute = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
-        sfb_ptrs_cute = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
-
-        workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
+        b_ptrs_cute = self._fake_pointer_table()
+        sfb_ptrs_cute = self._fake_pointer_table()
+        workspace_ptr_cute = self._fake_workspace_ptr()
 
         # linear_offset is runtime on both paths; clamp/alpha tuning kwargs are SM100-only.
         self._logger.debug("Compiling discrete grouped GEMM GLU kernel")
@@ -1145,7 +1147,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self._b_stride_size = b_stride_size
 
         # Cache constant values for execute() closure
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
         cached_n = cutlass.Int32(self._n)
         cached_k = cutlass.Int32(self._k)
         cached_b_stride = cutlass.Int64(self._b_stride_size)
@@ -1166,6 +1167,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             alpha_tensor: torch.Tensor,
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
+            workspace_ptr: int,
             stream: cuda.CUstream,
             linear_offset: float = 0.0,
             geglu_alpha: float = 1.702,
@@ -1185,7 +1187,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 cached_n,
                 cached_k,
                 cached_b_stride,
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_tensor,
                 d_col_tensor,
@@ -1248,6 +1250,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1293,6 +1297,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param situ_beta1: Gate tanh scale for SiTU-GLU. Default ``4.0``.
         :param situ_beta2: Up-branch tanh scale for SiTU-GLU. Default ``25.0``.
         :param current_stream: CUDA stream
+        :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
+            128-byte aligned, that the launch carves (recipe R2). Required.
         """
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
@@ -1336,6 +1342,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 bias_tensor is None,
                 "bias_tensor must be provided at execute() when the API was compiled with sample_bias",
             )
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(
@@ -1354,6 +1362,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor=alpha_tensor,
                 bias_tensor=bias_tensor,
                 prob_tensor=prob_tensor,
+                workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,
@@ -1379,6 +1388,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor=alpha_tensor,
                 prob_tensor=prob_tensor,
                 bias_tensor=bias_tensor,
+                workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,

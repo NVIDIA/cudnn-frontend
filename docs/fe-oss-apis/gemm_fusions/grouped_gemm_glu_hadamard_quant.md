@@ -192,6 +192,7 @@ op = GroupedGemmGluHadamardQuantSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
 op.execute(
     a_tensor=a,
     b_tensor=b,
@@ -209,8 +210,11 @@ op.execute(
     norm_const=norm_const,
     rht_norm_const=rht_norm_const,
     current_stream=None,
+    workspace=workspace,
 )
 ```
+
+`execute()` requires `workspace=`: a contiguous device buffer (a torch tensor, a JAX array, or any object exposing `__cuda_array_interface__` / `__dlpack__`) on the API's device, at least `scratch_workspace_bytes()` bytes long and 128-byte aligned. The API never allocates it -- the `*_wrapper_sm100` functions allocate one per call on the launch stream -- and `None`, an undersized buffer, or a misaligned one raises `ValueError` before the launch. The buffer is per-execute scratch (the per-expert TMA descriptor slots and the dynamic-scheduler counter, rewritten on every launch); its contents are not preserved between calls, and executions sharing one buffer must not overlap.
 
 ### Discrete weight mode
 
