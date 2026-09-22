@@ -80,22 +80,43 @@ def test_staging_helpers_pass_through_and_noop_on_the_current_stream():
     assert copy.is_contiguous() and copy.shape == (8, 4)
 
 
-@pytest.mark.L0
-def test_copy_into_on_stream_keeps_the_released_destination_until_the_copy_lands():
-    """The copy-back twin: a caller buffer released right after the call is not handed to a same-size
-    allocation on the caller's stream while the side-stream write is still pending."""
+def _delayed_copy_back_then_release(copy_back):
+    """Queue a long kernel on a side stream, run ``copy_back(dst, src, side)``, release ``dst`` entirely,
+    allocate and fill a same-size ``other`` on the current stream, synchronize. Returns ``(other, reused)``:
+    with ``dst`` recorded, the pending write can never land in ``other``'s block."""
     side = torch.cuda.Stream()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     src = torch.arange(_ROWS * _COLS, dtype=torch.float32, device="cuda").view(_ROWS, _COLS)
     dst = torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda")
+    dst_ptr = dst.data_ptr()
     torch.cuda.synchronize()
     with torch.cuda.stream(side):
         torch.cuda._sleep(1_000_000_000)
-    copy_into_on_stream(dst, src, side.cuda_stream, dst.device)
-    keep = dst  # the caller keeps ITS handle; the wrapper's reference is what is dropped
-    del dst
+    copy_back(dst, src, side)
+    del dst  # the caller releases its buffer while the copy-back is still pending
     other = torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda")
+    reused = other.data_ptr() == dst_ptr
     other.fill_(-1.0)
     torch.cuda.synchronize()
-    assert torch.equal(keep, src) and other.data_ptr() != keep.data_ptr()
+    return other, reused
+
+
+@pytest.mark.L0
+def test_copy_into_on_stream_never_writes_into_the_released_destinations_new_owner():
+    other, _ = _delayed_copy_back_then_release(lambda dst, src, side: copy_into_on_stream(dst, src, side.cuda_stream, dst.device))
+    assert torch.all(other == -1.0)
+
+
+@pytest.mark.L0
+def test_bare_copy_under_a_side_stream_context_writes_into_the_reused_block():
+    """Control for the copy-back detector: without the recording the pending write lands in ``other``."""
+
+    def copy_back(dst, src, side):
+        with torch.cuda.stream(side):
+            dst.copy_(src)
+
+    other, reused = _delayed_copy_back_then_release(copy_back)
+    if not reused:
+        pytest.skip("the caching allocator did not hand the released block to the next same-size allocation")
+    assert not torch.all(other == -1.0)

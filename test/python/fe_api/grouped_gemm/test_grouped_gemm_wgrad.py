@@ -1026,6 +1026,8 @@ def test_grouped_gemm_wgrad_workspace_size_matches_plan(output_mode):
         kw.update(num_experts=cfg["l"], wgrad_shape=(cfg["m"], cfg["n"]), wgrad_dtype=cfg["wgrad_dtype"])
     else:
         kw.update(sample_wgrad=allocate_grouped_gemm_wgrad_output(cfg))
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("GroupedGemmWgradSm100 needs an SM100+ GPU")
     op = cudnn.GroupedGemmWgradSm100(**kw)
     try:
         supported = op.check_support()
