@@ -83,6 +83,8 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypatch):
     from cudnn.gemm.cutedsl.grouped.dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
 
+    from cudnn.gemm.cutedsl.grouped.dglu import _blockscaled_api as blockscaled_module
+
     api = object.__new__(GroupedGemmDgluBlockScaledAPI)
     api._logger = Mock()
     api._get_default_stream = lambda stream: stream
@@ -90,6 +92,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     api._has_dbias = False
     api.weight_mode = None
     api._compiled_kernel = Mock()
+    api.scratch_workspace_bytes = lambda: 128  # the workspace contract (R2) is stubbed: this test is about pointer streams
 
     recorded = []
     monkeypatch.setattr(
@@ -98,11 +101,15 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
         staticmethod(lambda pointers, stream: recorded.append((pointers, stream))),
         raising=False,
     )
+    carved = Mock()
+    carved.take.return_value.data_ptr.return_value = 0
+    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner: carved)
 
     b_ptrs = object()
     sfb_ptrs = object()
     stream = object()
     api.execute(
+        workspace=object(),
         a_tensor=torch.ones(1),
         c_tensor=object(),
         d_row_tensor=object(),
