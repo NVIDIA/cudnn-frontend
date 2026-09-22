@@ -405,8 +405,8 @@ class SlidingWindowAttention(APIBase):
     def _check_ragged_offset(self, tensor: torch.Tensor, name: str, b: int) -> None:
         if tensor.dtype != torch.int64:
             raise ValueError(f"SlidingWindowAttention: {name} must be int64, got {tensor.dtype}")
-        if not tensor.is_cuda:
-            raise ValueError(f"SlidingWindowAttention: {name} must be a CUDA tensor, got device {tensor.device}")
+        if not tensor.is_cuda or tensor.device != self.sample_q.device:
+            raise ValueError(f"SlidingWindowAttention: {name} must be on the plan's device {self.sample_q.device}, got {tensor.device}")
         if tuple(tensor.shape) != (b + 1, 1, 1, 1):
             raise ValueError(f"SlidingWindowAttention: {name} must have shape (b+1, 1, 1, 1) = {(b + 1, 1, 1, 1)}, got {tuple(tensor.shape)}")
         if not tensor.is_contiguous():  # the graph declares stride (1, 1, 1, 1); a strided view would be read as packed
@@ -553,10 +553,15 @@ def sliding_window_attention_wrapper(
     if q_tensor.ndim == 3:  # thd
         if seq_len_q_tensor is None or seq_len_kv_tensor is None:
             raise ValueError("sliding_window_attention_wrapper: seq_len_q_tensor and seq_len_kv_tensor are required for the T,H,D layout")
-        if max_seq_len_q is None:
-            max_seq_len_q = int(seq_len_q_tensor.max().item())
-        if max_seq_len_kv is None:
-            max_seq_len_kv = int(seq_len_kv_tensor.max().item())
+        if max_seq_len_q is None or max_seq_len_kv is None:
+            # The reductions read tensors the caller may have produced asynchronously on `stream`: run them on the
+            # launch stream (`stream`, else the handle's) so they see the final lengths.
+            envelope_stream = stream if stream is not None else cudnn.get_stream(cudnn_handle) if cudnn_handle is not None else None
+            with torch.cuda.device(q_tensor.device), stream_context(envelope_stream, q_tensor.device):
+                if max_seq_len_q is None:
+                    max_seq_len_q = int(seq_len_q_tensor.max().item())
+                if max_seq_len_kv is None:
+                    max_seq_len_kv = int(seq_len_kv_tensor.max().item())
         _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor o for thd layout")
         t, h_q, d = q_tensor.shape
         _, h_k, d_v = v_tensor.shape
