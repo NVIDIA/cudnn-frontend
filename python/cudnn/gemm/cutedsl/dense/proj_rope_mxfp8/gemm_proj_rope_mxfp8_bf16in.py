@@ -170,7 +170,7 @@ def gemm_proj_rope_mxfp8_kernel(
     mma_warp_id = 12
     tma_warp_id = 13
 
-    smem = cutlass.SmemAllocator()
+    smem = SmemAllocator()
     storage = smem.allocate(SharedStorage)
     sA = smem.allocate_tensor(element_type=io_dtype, layout=a_smem_layout.outer, byte_alignment=128, swizzle=a_smem_layout.inner)
     sB = smem.allocate_tensor(element_type=io_dtype, layout=b_smem_layout.outer, byte_alignment=128, swizzle=b_smem_layout.inner)
