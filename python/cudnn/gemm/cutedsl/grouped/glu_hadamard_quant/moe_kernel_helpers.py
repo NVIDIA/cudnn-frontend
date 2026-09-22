@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT and BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -44,6 +47,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -804,9 +808,9 @@ def compute_stages(
     epi_tile: cute.Tile,
     epi_tile_c: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     d_dtype: Type[cutlass.Numeric],
-    d_layout: utils.LayoutEnum,
+    d_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -925,7 +929,7 @@ def compute_stages_wgrad(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,

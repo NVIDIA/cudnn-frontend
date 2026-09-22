@@ -560,7 +560,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     else:
         if sinks is not None:
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a sink; construct the API with has_sink"))
-        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
+        frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
     if workspace_ptr % _ALIGN_TMA != 0:
         raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
@@ -950,7 +950,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     else:
         if sinks is not None:
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
-        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
+        frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
     def lens(name: str) -> int:
         f = facts.get(name)
@@ -966,9 +966,9 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
-    # meta and only THD reads o_desc. Bind live storage instead of owning dummies.
-    frame[ix["o_desc_ptr"]] = q.ptr
-    frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else q.ptr
+    # meta and only THD reads o_desc (both compile-time flags): dead slots are 0.
+    frame[ix["o_desc_ptr"]] = 0
+    frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else 0
     if spec.seq_q_present:
         frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
 

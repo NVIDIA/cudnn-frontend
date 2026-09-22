@@ -849,7 +849,7 @@ def _sdpa_kernel(
     # O accumulator — m_blocks * SV_N_FRAGS * 4 fp32 per lane, m-block major.
     # mma_step indexes acc as ``acc[m_block * SV_N_FRAGS*4 + n_frag*4 + i]``.
     O_acc = cutlass.Array(cutlass.Float32, m_blocks * SV_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-    for i in cutlass.range_constexpr(m_blocks * SV_N_FRAGS * 4):
+    for i in cutlass.range(m_blocks * SV_N_FRAGS * 4, unroll_full=True):
         O_acc[i] = cutlass.Float32(0.0)
 
     # ---- Online-softmax per-lane state ------------------------------------

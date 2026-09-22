@@ -1,5 +1,10 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
+
+
 import math
 from typing import Callable, NamedTuple, Optional, Tuple
 from functools import partial
@@ -9,10 +14,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, Int64, const_expr
-from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.block_sparse_attention.csrc.utils import layout_utils
 from cudnn.block_sparse_attention.csrc.utils import kernel_utils as utils
@@ -837,14 +842,14 @@ class BlockSparseAttnBackwardSm100Blk128:
         )
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
