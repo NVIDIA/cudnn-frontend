@@ -740,6 +740,14 @@ def _sg0_softmax_kv_iter(
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
+        # Pin the loads AHEAD of this iteration's `mb_s_acc_empty` arrive.  `tcgen05.ld` is asynchronous and
+        # the arrive (below) has no data dependency on the loaded registers, so without this wait ptxas is free to
+        # schedule the arrive between the two chunk loads -- and on the sm107 twin it did, once the mask code got
+        # shorter (the "bits" form): the parked MMA then overwrites the S parity slot under the still-pending
+        # second read, which shows as a two-launch delta on O.  The dense arm is ordered by its own wait(LOAD)
+        # right after tmem_load_tile; the d128 / d192 / d256 kernels by their P `tcgen05.st` + `wait(STORE)`
+        # data dependency.  One instruction per masked KV tile.
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
             apply_mask_chunk_form(
