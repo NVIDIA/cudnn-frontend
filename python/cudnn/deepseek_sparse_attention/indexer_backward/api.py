@@ -833,7 +833,7 @@ class DenseIndexerBackward(APIBase):
         )
 
         if d_index_k_f32 is not d_index_k:
-            with _torch_stream_context(current_stream):
+            with _torch_stream_context(current_stream, d_index_k.device):
                 d_index_k.copy_(d_index_k_f32)
 
 
@@ -937,7 +937,7 @@ def indexer_backward_wrapper(
         raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
     if topk_indices.ndim != 3:
         raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
-    with _torch_stream_context(stream):
+    with _torch_stream_context(stream, index_q.device):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
         if d_weights is None:
@@ -1104,7 +1104,7 @@ def dense_indexer_backward_wrapper(
     """
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q.device):
         cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
         cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
 
@@ -1224,7 +1224,7 @@ def dense_indexer_backward_wrapper(
         current_stream=current_stream,
         workspace=workspace,
     )
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q_exec.device):
         _copy_back_if_needed(attn_score_exec, attn_score_original)
         _copy_back_if_needed(index_score_exec, index_score_original)
         _copy_back_if_needed(d_index_q_exec, d_index_q_original)

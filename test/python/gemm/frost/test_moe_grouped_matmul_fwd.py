@@ -491,6 +491,32 @@ def test_moe_grouped_matmul_fwd_direct_call_requires_workspace() -> None:
     torch.testing.assert_close(output[0], _ref_f32(token, weight, _offsets(group_sizes, S), S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@requires_sm100
+@pytest.mark.no_workspace_shim
+def test_moe_grouped_matmul_fwd_missing_workspace_leaves_outputs_untouched() -> None:
+    """Rule 8: the workspace contract is checked before the reduction outputs are
+    seeded with their identity, so a rejected call leaves every buffer as it was."""
+    E, N, K = 4, 256, 128
+    group_sizes = [64, 0, 120, 72]
+    S = sum(group_sizes)
+    compiled = _plan(
+        _build_graph(E, S, N, K, reduction_mode=cudnn.reduction_mode.AMAX, reduction_dims=(1, 1, N), num_groups=len(group_sizes)),
+        config=by_name(_CFG),
+    )
+    assert compiled.workspace_bytes > 0
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    output = torch.full((1, S, N), -3.0, dtype=torch.bfloat16, device="cuda")
+    red = torch.full((1, 1, N), -7.0, dtype=torch.float32, device="cuda")
+    vp = _vp_moe(compiled, token, weight, _offsets(group_sizes, S), [output, red])
+    with pytest.raises(ValueError, match="workspace"):
+        compiled._compiled(vp)
+    torch.cuda.synchronize()
+    assert torch.equal(red, torch.full_like(red, -7.0)), "the reduction output was seeded before the workspace contract was checked"
+    assert torch.equal(output, torch.full_like(output, -3.0))
+
+
 def test_analyzer_detects_n_major_weight() -> None:
     chain = analyze(_build_graph(8, 768, 256, 128, weight_major="n"))
     assert chain.matmul.a_major == "k" and chain.matmul.b_major == "n"
