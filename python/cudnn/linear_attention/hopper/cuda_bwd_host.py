@@ -28,7 +28,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 from cuda.bindings import driver as cu
 from cuda.bindings import nvrtc
@@ -269,9 +269,24 @@ def _chunk_slots(total_tokens: int, n_seqs: int) -> int:
     return raw if raw > 0 else 1
 
 
-def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
-    """The workspace arena, in the artifact's exact order. Returns the sub-buffer
-    addresses and the total size."""
+def _layout(
+    workspace: int,
+    total_tokens: int,
+    n_heads: int,
+    n_seqs: int,
+    *,
+    zero_s0: bool = False,
+    zero_dfs: bool = False,
+    scratch_dis: bool = False,
+    staging: Sequence[Tuple[str, int, int]] = (),
+):
+    """The workspace arena, in the artifact's exact order, then the plan's own
+    regions (Rule 8: the plan owns no device memory): an fp32 zero seed for an
+    absent ``initial_state`` / ``d_final_state``, scratch for an unrequested
+    ``d_initial_state``, and one region per marshal staging entry
+    ``(name, count, itemsize)``. Returns the sub-buffer addresses, the chunk-slot
+    count and the total size. ``launch`` calls this with the defaults; the extra
+    regions sit after everything it reads."""
     ncs = _chunk_slots(total_tokens, n_seqs)
     a = _Arena(workspace)
     cs_t0 = a.take(ncs, _I32)
@@ -289,32 +304,36 @@ def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
     hst = a.take(ncs * n_heads * DH * DH, _BF16)
     dhst = a.take(ncs * n_heads * DH * DH, _BF16)
     pmat = a.take(ncs * n_heads * DH * DH, _BF16)
-    return (
-        dict(
-            cs_t0=cs_t0,
-            cs_len=cs_len,
-            seq_c0=seq_c0,
-            seq_nc=seq_nc,
-            gn2=gn2,
-            amat=amat,
-            wneg=wneg,
-            uu=uu,
-            kg=kg,
-            dvl=dvl,
-            vnew=vnew,
-            dv2=dv2,
-            hst=hst,
-            dhst=dhst,
-            pmat=pmat,
-        ),
-        ncs,
-        a.off,
+    regions = dict(
+        cs_t0=cs_t0,
+        cs_len=cs_len,
+        seq_c0=seq_c0,
+        seq_nc=seq_nc,
+        gn2=gn2,
+        amat=amat,
+        wneg=wneg,
+        uu=uu,
+        kg=kg,
+        dvl=dvl,
+        vnew=vnew,
+        dv2=dv2,
+        hst=hst,
+        dhst=dhst,
+        pmat=pmat,
     )
+    state = n_seqs * n_heads * DH * DH
+    for name, wanted in (("s0_zero", zero_s0), ("dfs_zero", zero_dfs), ("dinit_scratch", scratch_dis)):
+        if wanted:
+            regions[name] = a.take(state, _F32)
+    for name, count, itemsize in staging:
+        regions[name] = a.take(count, itemsize)
+    return regions, ncs, a.off
 
 
-def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int) -> int:
-    """Scratch the backward needs, mirroring ``kda_bwd_workspace_bytes``."""
-    _, _, size = _layout(0, total_tokens, n_heads, n_seqs)
+def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int, **flags) -> int:
+    """Scratch the backward needs: the artifact's ``kda_bwd_workspace_bytes`` plus
+    the plan's regions selected by ``_layout``'s keyword flags."""
+    _, _, size = _layout(0, total_tokens, n_heads, n_seqs, **flags)
     return size
 
 

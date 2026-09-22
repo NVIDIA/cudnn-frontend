@@ -19,7 +19,15 @@ import torch
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+# WorkspaceCarver / ws_align / _WS_ALIGN live in api_base.py and are re-exported here for the bwd/engines importers.
+from cudnn.api_base import (  # noqa: F401
+    APIBase,
+    TensorDesc,
+    TupleDict,
+    WorkspaceCarver,
+    _WS_ALIGN,
+    ws_align,
+)
 from cudnn._device import ensure_current_context as _ensure_current_context
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import (
@@ -227,12 +235,6 @@ _SM120_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 
-# Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is
-# used so the per-sequence O TMA descriptors carved for the THD path satisfy
-# the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
-# 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
-_WS_ALIGN = 128
-
 
 @contextmanager
 def _torch_stream_context(
@@ -288,62 +290,6 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
-
-
-def ws_align(nbytes: int) -> int:
-    """Round a scratch-chunk size up to the carve alignment (128 B)."""
-    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
-
-
-class WorkspaceCarver:
-    """Carves fixed-size, aligned scratch views out of the CALLER's workspace.
-
-    FROST executor contract (see ``engine._FrostSdpaFwdPlan``): an executor that
-    records a non-zero ``workspace_bytes`` is handed the caller's workspace
-    buffer (``ExecutionContext.workspace``) at execute and
-    carves its per-execute scratch from it instead of allocating. Chunks are
-    dealt sequentially at 128-byte relative alignment and never reach beyond
-    the buffer; an absent, non-torch, or undersized buffer raises immediately
-    with the required size in the message (never silent corruption).
-    """
-
-    def __init__(self, workspace, required: int, owner: str):
-        if workspace is None:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace but execute() "
-                f"received none; allocate graph.get_workspace_size() bytes (uint8, on the "
-                f"graph's device) and pass the buffer to execute()"
-            )
-        if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
-            raise TypeError(f"cudnn.sdpa: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
-        flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.reshape(-1)
-        if flat.numel() < required:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace; the provided "
-                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
-            )
-        if flat.data_ptr() % 16 != 0:
-            raise ValueError(f"cudnn.sdpa: {owner} workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
-        self._flat = flat
-        self._off = 0
-        self._owner = owner
-
-    def take(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
-        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
-        nbytes = int(numel) * dtype.itemsize
-        start, end = self._off, self._off + nbytes
-        if end > self._flat.numel():
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
-        self._off = start + ws_align(nbytes)
-        try:
-            return self._flat[start:end].view(dtype)
-        except RuntimeError as exc:
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
-
-    def remaining(self) -> torch.Tensor:
-        """The unconsumed tail (uint8) — handed down to a nested carver."""
-        return self._flat[self._off :]
 
 
 def _flavor_tag(flavor: tuple[int, int]) -> str:
@@ -985,10 +931,16 @@ class SdpaFwdDsl(APIBase):
         """The device address of the caller's per-execute scratch, validated
         against ``scratch_workspace_bytes()`` (size and 16-byte alignment).
         FROST executor contract (``engine._FrostSdpaFwdPlan``): scratch is fixed
-        offsets into the caller's buffer, never a per-execute allocation."""
-        nbytes = workspace.numel() * workspace.element_size()
+        offsets into the caller's buffer, never a per-execute allocation. A
+        missing buffer raises the R2 contract error (``WorkspaceCarver``'s text)."""
         if required is None:
             required = self.scratch_workspace_bytes()
+        if workspace is None:
+            raise ValueError(
+                f"cudnn.sdpa: {label} requires a {required}-byte workspace but execute() received none; "
+                "allocate graph.get_workspace_size() bytes (uint8, on the graph's device) and pass the buffer to execute()"
+            )
+        nbytes = workspace.numel() * workspace.element_size()
         if nbytes < required:
             raise ValueError(
                 f"cudnn.sdpa: {label} requires a {required}-byte workspace; the provided buffer has {nbytes} bytes (size it with graph.get_workspace_size())"
@@ -1332,16 +1284,10 @@ class SdpaFwdDsl(APIBase):
             return "e5m2" if o_dtype == torch.float8_e5m2 else "e4m3"
         return "bf16" if o_dtype == torch.bfloat16 else "f16"
 
-    def _split_partials(self, workspace, device, current_stream=None):
+    def _split_partials(self, workspace, device):
         """The split-major (O, LSE) partial buffers, carved from the caller's
-        workspace when there is one and torch-allocated otherwise (standalone
-        use, matching what the rest of this adapter does).
-
-        The allocation happens ON the launch stream: the caching allocator tags
-        a block with the stream it was allocated on, and the kernels that write
-        and read these buffers run on ``current_stream``. Allocating on torch's
-        current stream instead would leave a later free/reuse unordered against
-        those launches."""
+        workspace; ``WorkspaceCarver`` raises the R2 contract error without one
+        (a direct caller allocates ``scratch_workspace_bytes()`` and passes it)."""
         rows = self.split_kv * self.batch_size
         o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
         lse_shape = (rows, self.h_q, self.s_q_max)
@@ -1349,12 +1295,6 @@ class SdpaFwdDsl(APIBase):
         # which stay wide (fp32 on SM100, half on SM120) so the reduction runs
         # wider than the final cast.
         o_dtype = self._partial_torch_dtype()
-        if workspace is None:
-            with _torch_stream_context(current_stream, device):
-                return (
-                    torch.empty(o_shape, dtype=o_dtype, device=device),
-                    torch.empty(lse_shape, dtype=torch.float32, device=device),
-                )
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), f"{type(self).__name__} (KV split)")
         o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_dtype).view(o_shape)
         lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
@@ -1381,7 +1321,11 @@ class SdpaFwdDsl(APIBase):
         (``lower_dsl_prefill`` in ``fwd/engines.py``), which drives every
         adapter through one ``execute_kwargs`` dict: the arguments above are
         always passed by keyword, and ``workspace`` is included iff
-        ``scratch_workspace_bytes()`` is non-zero. Subclasses may extend the
+        ``scratch_workspace_bytes()`` is non-zero. ``workspace`` is REQUIRED
+        whenever ``scratch_workspace_bytes()`` is non-zero: a missing one
+        raises the R2 contract error (``requires a N-byte workspace but
+        execute() received none``) — no adapter allocates on a caller's
+        behalf; the standalone wrappers allocate it and pass it. Subclasses may extend the
         signature only with additional optional keyword arguments; an adapter
         whose engine capabilities accept FP8/MXFP8 graphs must also accept the
         FP8 operand set the lowering adds for those graphs (``sf_q/sf_k/sf_v``,
@@ -2468,15 +2412,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             gate=facts_of_tensor(G.transpose(1, 2)) if G is not None else None,
         )
         if self.split_kv > 1:
-            required = self.scratch_workspace_bytes()
-            if workspace is None:
-                # Preserve the standalone workspace-less API; graph execution always supplies scratch.
-                workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device)
+            self._scratch_base(workspace, "SdpaFwdDslSm100 (KV split)", self.scratch_workspace_bytes())
             ws = facts_of_tensor(workspace)
             if ws.device != (2, int(q_tensor.device.index or 0)) or not ws.contiguous:
                 raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
-            if ws.numel * workspace.element_size() < required:
-                raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
             frame, combine_args = bind_dense_split(spec, facts, ws.ptr, current_stream, stream_int)
         else:
             frame = bind_dense(spec, facts, current_stream, stream_int)
@@ -2508,9 +2447,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         the path allocates nothing per execute. This is the api-level share of
         a FROST executor's ``workspace_bytes`` (the engine lowering adds its
         own chunks — synthesized seq_len_kv — on top; see
-        ``engines.lower_dsl_prefill``). When ``execute()`` is called WITHOUT a
-        workspace (standalone API use), these buffers are torch-allocated per
-        execute instead — the carve path is what the FROST dispatch uses.
+        ``engines.lower_dsl_prefill``). ``execute()`` REQUIRES the buffer
+        whenever this is non-zero (R2) and never allocates on the caller's behalf.
         """
         self._ensure_support_checked()
         b, qh = self.batch_size, self.h_q
@@ -2579,11 +2517,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
 
-        ``workspace``: optional caller-provided scratch buffer (uint8, at
-        least ``scratch_workspace_bytes()`` bytes). When given, every
-        per-execute scratch buffer (the THD metadata / O-descriptor buffers)
-        is carved from it — zero per-execute allocations. When None
-        (standalone use), those buffers are torch-allocated as before.
+        ``workspace``: the caller's scratch buffer (uint8, at least
+        ``scratch_workspace_bytes()`` bytes, 16-byte aligned, on the plan's
+        device), REQUIRED whenever ``scratch_workspace_bytes()`` is non-zero:
+        every per-execute scratch buffer (THD metadata / O descriptors, the
+        split partials) is carved from it, and a missing one raises the R2
+        contract error.
 
         ``block_table`` / ``block_table_v``: paged KV only — ``(B, max_pages)``
         int32 device tensors (``block_table_v`` defaults to ``block_table``);
@@ -2962,9 +2901,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         writes/loads never step past the real per-sequence lengths the kernel
         reads from the device metadata, so the over-claim only widens the TMA
         descriptors' bound. The FP8/MXFP8 packed contract declares compact
-        strides, so the same views ARE the packed ones. With a ``workspace``
-        every scratch chunk is carved from it (zero per-execute allocations);
-        torch allocations run on the LAUNCH stream. The prefix-sum invariants
+        strides, so the same views ARE the packed ones. Every scratch chunk is
+        carved from the caller's ``workspace`` (``WorkspaceCarver`` raises the
+        R2 error without one); the one cached dummy left (the zero-KV V stub)
+        is bound on the LAUNCH stream. The prefix-sum invariants
         are caller contract (a validation that needs a device read is not a
         validation — AGENTS.md Rule 3).
 
@@ -2974,9 +2914,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         dev = q_buf.device
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
-        with _torch_stream_context(current_stream, dev):
-            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label)
+        meta = carver.take(4 * b + 4, torch.int32)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -2993,12 +2932,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # descriptor (then patches address/extent) before the fence and
         # before any consumer read, so stale bytes never survive — a fill
         # here is a wasted kernel launch on the execute hot path (Rule 1).
-        with _torch_stream_context(current_stream, dev):
-            # +2 past the pad slot: the packed-total-clamped K/V runtime
-            # descriptors the setup kernel writes. Every THD flavor carries
-            # them now, not just FP8/MXFP8 (issue #624).
-            o_desc_slots = b + 3
-            o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
+        # +2 past the pad slot: the packed-total-clamped K/V runtime
+        # descriptors the setup kernel writes. Every THD flavor carries
+        # them now, not just FP8/MXFP8 (issue #624).
+        o_desc_slots = b + 3
+        o_desc = carver.take(o_desc_slots * 16, torch.int64)
         # The plan-time envelope bounds the possible unit count. Persistent THD
         # kernels cap the launch at what the device can hold
         # resident (one cluster per CGA_SIZE SMs) instead of the plan-time
@@ -3065,13 +3003,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if sinks is not None:
             sinks_t = self._checked_sinks_1d(sinks)
         else:
-            # Dummy sinks bound on the launch stream (ordering vs the kernel).
-            with _torch_stream_context(current_stream, dev):
-                if carver is not None:
-                    sinks_t = carver.take(qh, torch.float32)
-                    sinks_t.zero_()
-                else:
-                    sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
+            # Dead slot: HAS_SINK=0 compiles the read out, so the carve is bound unfilled (R3 borrow).
+            sinks_t = carver.take(qh, torch.float32)
         return SimpleNamespace(
             meta=meta,
             o_desc=o_desc,
@@ -3167,14 +3100,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
         _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
-        if workspace is not None:
-            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
-        else:
-            # standalone use without a workspace: GPU-written scratch is per INVOCATION (never shared
-            # through the spec), allocated on the launch stream
-            with _torch_stream_context(current_stream, q_buf.device):
-                scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
-            ws_ptr = scratch.data_ptr()
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
         frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
         if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
@@ -3431,7 +3357,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # caller's O/LSE and owns the recombined amax.
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
-            O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
+            O_dst, lse_dst = self._split_partials(workspace, device)
         dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
@@ -3653,7 +3579,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # the recombined amax.
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
-            O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
+            O_dst, lse_dst = self._split_partials(workspace, device)
         dense_q_lens_args = (_q_lens_addr(seq_q_t),) if self._quantized_q_lens_abi else ()
         self._compiled_kernel(
             Q,
@@ -3888,6 +3814,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
         scale_softmax=scale_softmax,
     )
 
+    ws_bytes = sdpa_fwd.scratch_workspace_bytes()  # 0 for the dense plans built here; the wrapper is the caller (R2)
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -3897,6 +3824,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
         scale_softmax=scale_softmax,
         sinks=sinks,
         seq_kv_lens=seq_kv_lens,
+        workspace=torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None,
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -4488,7 +4416,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # the shared combine reduces them into the caller's O/LSE.
         o_dst, lse_dst = o, lse
         if self.split_kv > 1:
-            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device, current_stream)
+            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device)
         self._compiled_kernel(
             q,
             k,
@@ -4679,7 +4607,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # combine below owns both the reduction and the amax.
         o_dst, lse_dst = o, lse
         if self.split_kv > 1:
-            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device, current_stream)
+            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device)
 
         fn = self._compiled_kernel
         if pack is not None:
@@ -4797,15 +4725,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         device metadata; ``lse_tokens_cap`` joins the Q/O floor when the LSE
         shares their dynamic token symbol), and ``max_sq`` is the PLAN-TIME
         declared S_q envelope that sizes the per-sequence grid — tiles past
-        a sequence's real length drain without loads or stores. The torch
-        allocation runs on ``current_stream`` — the LAUNCH stream — so it is
-        ordered against the kernels that consume it.
+        a sequence's real length drain without loads or stores. Scratch is
+        carved from the caller's ``workspace`` (carve order [meta | v_stub]);
+        ``WorkspaceCarver`` raises the R2 error without one.
 
         Returns ``None`` when no Q token is addressable (zero capacity)."""
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         dev = q_buf.device
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label)
 
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1)] — bound as the kernel's
         # seq_kv_lens tensor; the leading B words alias the per-sequence KV
@@ -4814,8 +4742,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # contract (a validation that needs a device read is not a
         # validation — AGENTS.md Rule 3; cu prefixes are normalized by the
         # setup kernel).
-        with _torch_stream_context(current_stream, dev):
-            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
+        meta = carver.take(4 * b + 4, torch.int32)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -4855,15 +4782,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # type, and kh*d_qk <= t_q*qh*d_qk); V must carry the INPUT
             # element type, which no output buffer guarantees (O's dtype is
             # independent), and Q's storage is not always large enough for
-            # kh*d_v — so V binds a cached zero stub (allocated once, off the
-            # execute hot path). All-zero LENGTHS over live storage launch
-            # normally through the dead-row path.
+            # kh*d_v — so V borrows the never-read v_stub chunk of the
+            # caller's workspace (R3 borrow, unfilled: no K/V load is ever
+            # issued). All-zero LENGTHS over live storage launch normally
+            # through the dead-row path.
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
-            with _torch_stream_context(current_stream, dev):
-                V = self._dummy(f"thd_v_stub_{d_v}", dev, lambda: torch.zeros(kh * d_v, dtype=q_buf.dtype, device=dev)).as_strided(
-                    (1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), 0
-                )
+            V = carver.take(kh * d_v, q_buf.dtype).view(1, 1, kh, d_v)
         else:
             K = _view(k_buf, self.k_desc, t_kv, kh, d_qk)
             V = _view(v_buf, self.v_desc, t_kv, kh, d_v)
@@ -4994,8 +4919,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return n
 
     def scratch_workspace_bytes(self) -> int:
+        self._ensure_support_checked()
         if self.thd:
-            # [meta(seq_kv, cu_q, cu_k)].
+            # [meta(seq_kv, cu_q, cu_k) | v_stub].
             # No packed-LSE chunk: with a Stats output the kernel writes the
             # caller's ragged Stats buffer directly (token-major (T, H) or
             # head-major (H, head_stride)); without one it compiles with
@@ -5004,8 +4930,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # kernel (issue #552). No sinks-dummy chunk: the kernel None-specializes
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
+            # v_stub: the one-token, never-read V view the all-KV-zero clamp
+            # binds (input dtype).
             b = self.batch_size
-            return ws_align((4 * b + 4) * 4)
+            return ws_align((4 * b + 4) * 4) + ws_align(self.h_kv * self.head_dim_v * self.dtype.itemsize)
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.
@@ -5083,6 +5011,7 @@ def sdpa_fwd_wrapper_dsl_sm120(
         tile_m=q_tile,
         tile_n=kv_tile,
     )
+    ws_bytes = sdpa_fwd.scratch_workspace_bytes()  # 0 for the dense plans built here; the wrapper is the caller (R2)
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -5093,6 +5022,7 @@ def sdpa_fwd_wrapper_dsl_sm120(
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
+        workspace=torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None,
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -5229,6 +5159,18 @@ def _sm80_load_kernel_module(flavor: str, params):
 
 def _sm80_sched_policy_int(token: str) -> int:
     return {"default": SCHED_NATURAL, "lpt": SCHED_LPT, "lpt_l2": SCHED_LPT_L2}[token]
+
+
+def _sm80_rope_table(rope_freqs: torch.Tensor, d2: int, device: torch.device) -> torch.Tensor:
+    """The SM80 kernels' ``(max_s, d_qk//2, 2)`` fp32 ``(cos, sin)`` table from
+    the caller's ``(max_s, ...)`` angle table. Wrapper-tier work (the engine row
+    never admits RoPE), built per call on the launch stream; ``execute`` binds
+    the result as-is."""
+    rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
+    if rf.shape[1] < d2:
+        raise ValueError(f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+    angles = rf[:, :d2]
+    return torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
 
 
 def _sm80_call(
@@ -5629,8 +5571,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        rope_freqs: Optional[torch.Tensor] = None,
+        rope_cs: Optional[torch.Tensor] = None,
     ) -> None:
+        """``workspace`` is REQUIRED whenever ``scratch_workspace_bytes()`` is
+        non-zero (R2). ``rope_cs`` is the kernel's pre-built
+        ``(rope_max_s, d_qk//2, 2)`` fp32 ``(cos, sin)`` table
+        (``_sm80_rope_table``), bound as-is."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
@@ -5641,7 +5587,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._value_error_if(p.has_lse and lse_tensor is None, "compiled with a Stats output but execute() got no lse_tensor")
         self._value_error_if(not p.has_lse and lse_tensor is not None, "lse_tensor provided but the plan compiled the LSE store out")
         self._value_error_if(p.has_bias != (bias_tensor is not None), "bias presence must match the compiled specialization")
-        self._value_error_if((p.has_rope) != (rope_freqs is not None), "rope_freqs presence must match the compiled specialization")
+        self._value_error_if(p.has_rope != (rope_cs is not None), "rope_cs presence must match the compiled specialization")
         self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
         self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
         self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
@@ -5654,11 +5600,16 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = q_tensor.device
         launch_stream = self._get_default_stream(current_stream)
 
-        # Per-execute scratch: carved from the caller's workspace when one is
-        # provided (the engine lowering passes one sized by
-        # scratch_workspace_bytes(); issue #514), otherwise allocated (the
-        # standalone wrapper path). Carve order mirrors the sizing order.
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm80") if workspace is not None else None
+        # Per-execute scratch is carved from the caller's workspace (R2; sized
+        # by scratch_workspace_bytes(), issue #514) in the sizing order. A chunk
+        # the sizing did not declare is a bug, never an allocation.
+        required = self.scratch_workspace_bytes()
+        carver = WorkspaceCarver(workspace, required, "SdpaFwdDslSm80") if required else None
+
+        def _carve(numel: int, dtype: torch.dtype, what: str) -> torch.Tensor:
+            if carver is None:
+                raise ValueError(f"cudnn.sdpa: SdpaFwdDslSm80 sizing bug: {what} needs scratch but scratch_workspace_bytes() reported 0")
+            return carver.take(numel, dtype)
 
         with _torch_stream_context(current_stream, device):
             pad_v = self.head_dim_v < self.flavor_d_v
@@ -5670,33 +5621,23 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 view = t.transpose(1, 2)
                 if view.is_contiguous():
                     return view
-                if carver is None:
-                    return view.contiguous()
-                dst = carver.take(t.numel(), t.dtype).view(view.shape)
+                dst = _carve(t.numel(), t.dtype, "the BSHD gather").view(view.shape)
                 dst.copy_(view)
                 return dst
 
             def _kv_operand(t: torch.Tensor, fd: Optional[int]) -> torch.Tensor:
                 """K/V kernel operand: layout gather, GQA head expansion, and
-                the head-dim pad in ONE carved buffer (allocating fallbacks on
-                the wrapper path)."""
+                the head-dim pad in ONE carved buffer."""
                 view = t.transpose(1, 2)  # (b, s, h_kv, d)
                 bb, ss, hh, dd = view.shape
                 fd = dd if fd is None else fd
                 if not gqa and fd == dd:
                     return _gather_bshd(t)
-                if carver is not None:
-                    dst = carver.take(bb * ss * self.h_q * fd, t.dtype).view(bb, ss, hh, reps, fd)
-                    if fd != dd:
-                        dst[..., dd:].zero_()
-                    dst[..., :dd].copy_(view.unsqueeze(3))
-                    return dst.view(bb, ss, self.h_q, fd)
-                out = view.repeat_interleave(reps, dim=2) if gqa else view
+                dst = _carve(bb * ss * self.h_q * fd, t.dtype, "the K/V head expansion / pad").view(bb, ss, hh, reps, fd)
                 if fd != dd:
-                    out = _sm80_pad_last_dim(out, fd)
-                elif not out.is_contiguous():
-                    out = out.contiguous()
-                return out
+                    dst[..., dd:].zero_()
+                dst[..., :dd].copy_(view.unsqueeze(3))
+                return dst.view(bb, ss, self.h_q, fd)
 
             Q = _gather_bshd(q_tensor)
             K = _kv_operand(k_tensor, None)
@@ -5705,32 +5646,18 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             # Output binding: the compiled O ABI is (B, SQ, H, flavor_d_v).
             # Direct-bind the caller's BSHD view when it matches; the padded-V
             # envelope and dense_flex cases go through carved staging +
-            # copy-back.
+            # copy-back. No O/LSE pre-fill: the dense epilogue stores every
+            # in-bounds row and writes O := 0 / LSE := -inf past seq_len_q.
             o_view = o_tensor.transpose(1, 2)
             o_needs_copyback = pad_v or not o_view.is_contiguous()
             if pad_v:
-                if carver is not None:
-                    o_kernel = carver.take(self.batch_size * self.s_q_max * self.h_q * self.flavor_d_v, q_tensor.dtype)
-                    o_kernel = o_kernel.view(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v)
-                    o_kernel.zero_()
-                else:
-                    o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
+                o_kernel = _carve(self.batch_size * self.s_q_max * self.h_q * self.flavor_d_v, q_tensor.dtype, "the padded O staging")
+                o_kernel = o_kernel.view(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v)
+                o_kernel.zero_()
             elif o_needs_copyback:
-                if carver is not None:
-                    o_kernel = carver.take(o_tensor.numel(), o_tensor.dtype).view(o_view.shape)
-                else:
-                    o_kernel = torch.empty_like(o_view, memory_format=torch.contiguous_format)
+                o_kernel = _carve(o_tensor.numel(), o_tensor.dtype, "the O staging").view(o_view.shape)
             else:
                 o_kernel = o_view
-
-            # DEFENSIVE zero-fill, not load-bearing: the dense epilogue stores
-            # every in-bounds row unconditionally; kept so a bound buffer can
-            # never surface uninitialized memory if a future path skips rows.
-            # (The pad_v staging above is zeroed already.)
-            if (seq_q_lens is not None or seq_kv_lens is not None) and not pad_v:
-                o_kernel.zero_()
-                if lse_tensor is not None:
-                    lse_tensor.zero_()
 
             # Dummies fill compiled-out ABI slots (Rule 1); the kernel never
             # dereferences them.  Base-class ``_dummy`` (key, device, factory).
@@ -5747,12 +5674,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
                 # (the kernels consume log2 units), into carved scratch.
-                checked_sinks = self._checked_sinks_1d(sinks)
-                if carver is not None:
-                    sinks_b = carver.take(self.h_q, torch.float32)
-                    torch.mul(checked_sinks, _LOG2E, out=sinks_b)
-                else:
-                    sinks_b = (checked_sinks * _LOG2E).contiguous()
+                sinks_b = _carve(self.h_q, torch.float32, "the sinks log2 rescale")
+                torch.mul(self._checked_sinks_1d(sinks), _LOG2E, out=sinks_b)
             else:
                 sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             if bias_tensor is not None:
@@ -5769,18 +5692,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             else:
                 bias_dt = q_tensor.dtype
                 bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
-            if rope_freqs is not None:
-                # (cos, sin) table build — wrapper-only fusion (the engine row
-                # never admits RoPE); per-execute by contract, like the caller
-                # passing fresh angle tables.
-                d2 = self.flavor_d_qk // 2
-                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
-                self._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+            if rope_cs is not None:
+                want = (self._rope_max_s, self.flavor_d_qk // 2, 2)
                 self._value_error_if(
-                    rf.shape[0] != self._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({self._rope_max_s})"
+                    tuple(rope_cs.shape) != want or rope_cs.dtype != torch.float32 or not rope_cs.is_contiguous() or rope_cs.device != device,
+                    f"rope_cs must be a contiguous fp32 {want} (cos, sin) table on {device}; got {tuple(rope_cs.shape)} {rope_cs.dtype} on {rope_cs.device}",
                 )
-                angles = rf[:, :d2]
-                rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+                rope_b = rope_cs
             else:
                 rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
@@ -6033,8 +5951,8 @@ def sdpa_fwd_wrapper_sm80(
         rope_max_s,
         q_tensor.device,
     )
-    api = _sm80_wrapper_cache.get(cache_key)
-    if api is None:
+    entry = _sm80_wrapper_cache.get(cache_key)
+    if entry is None:
         api = SdpaFwdDslSm80(
             sample_q=q_tensor,
             sample_k=k_tensor,
@@ -6056,7 +5974,13 @@ def sdpa_fwd_wrapper_sm80(
         )
         api.check_support()
         api.compile()
-        _sm80_wrapper_cache[cache_key] = api
+        entry = _sm80_wrapper_cache[cache_key] = (api, api.scratch_workspace_bytes())
+    api, ws_bytes = entry
+    # The wrapper is the caller (R2): it allocates the adapter's scratch and
+    # builds the RoPE table, both on the launch stream (R1).
+    with _torch_stream_context(current_stream, q_tensor.device):
+        workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None
+        rope_cs = _sm80_rope_table(rope_freqs, api.flavor_d_qk // 2, q_tensor.device) if rope_freqs is not None else None
     api.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -6067,8 +5991,9 @@ def sdpa_fwd_wrapper_sm80(
         seq_q_lens=seq_len_q,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
+        workspace=workspace,
         current_stream=current_stream,
         bias_tensor=bias_tensor,
-        rope_freqs=rope_freqs,
+        rope_cs=rope_cs,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)

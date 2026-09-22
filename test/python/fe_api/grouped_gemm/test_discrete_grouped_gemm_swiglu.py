@@ -11,6 +11,7 @@ activation (SwiGLU/GeGLU) for MoE (Mixture of Experts) workloads.
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import (
     discrete_grouped_gemm_init,
@@ -290,6 +291,7 @@ def _test_discrete_grouped_gemm_compile_execute(
         prob_tensor=inputs.get("prob_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     check_ref_discrete_grouped_gemm(
@@ -648,6 +650,7 @@ def test_discrete_vs_contiguous_match(ab_dtype, d_dtype, sf_vec_size, sf_dtype, 
         norm_const_tensor=norm_const_tensor,
         prob_tensor=prob_tensor,
         current_stream=stream,
+        workspace=ws(discrete_api),
     )
 
     torch.cuda.synchronize()

@@ -6,7 +6,7 @@
 
 Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
@@ -65,6 +65,16 @@ For padded rows `M`, reduction dimension `K`, compact gradient width `N`, and
 - `D_row`: `(M, 2N, 1)`, stride `(2N, 1, 2M*N)`, BF16/FP16/FP32;
 - caller-zeroed optional `dbias`: `(L, 2N, 1)`, stride `(2N, 1, 1)`, BF16.
 
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device, and neither `check_support()` nor `execute()` copies them to
+the host (a blocking read would serialize the launch stream and is illegal under
+CUDA-graph capture). Malformed values (a decreasing or unaligned offset, a last
+offset outside `(0, M]`, a null or misaligned pointer) are
+undefined behaviour, as for any raw-pointer interface. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`; that mode raises
+`RuntimeError` when the launch stream is capturing instead of syncing.
+
 For expert `g`, the compact GEMM gradient and scaled forward activation are
 
 $$
@@ -114,6 +124,12 @@ $$
 `dbias` is the per-expert row reduction of interleaved `D_row`. The
 pointer-array tensor is stream-recorded, while every pointed allocation must
 remain alive and unchanged until that stream completes.
+
+Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(never 0); the API allocates nothing and the wrapper allocates it per call on the
+launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
 
 The wrapper return order is exactly `d_row_tensor`, `d_col_tensor`,
 `dprob_tensor`, `dbias_tensor`, `amax_tensor`, `sfd_row_tensor`,
@@ -333,6 +349,7 @@ op = cudnn.GroupedGemmDgluSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 dprob.zero_()
 dbias.zero_()
 op.execute(
@@ -340,6 +357,7 @@ op.execute(
     sfa_tensor=None, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     dbias_tensor=dbias, b_tensor=b, sfb_tensor=None,
+    workspace=workspace,
 )
 ```
 
@@ -461,6 +479,7 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
@@ -469,6 +488,7 @@ api.execute(
     sfd_row_tensor=sfd_row, sfd_col_tensor=sfd_col,
     amax_tensor=amax, norm_const_tensor=norm_const,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 
@@ -499,12 +519,14 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     b_ptrs=b_ptrs, sfb_ptrs=sfb_ptrs,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 

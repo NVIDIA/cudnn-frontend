@@ -1026,6 +1026,27 @@ def test_dsl_sm100_execute_sink_lse_contract():
 
 
 @pytest.mark.L0
+@pytest.mark.no_workspace_shim
+def test_dsl_sm100_thd_execute_requires_a_workspace():
+    """R2: THD scratch is carved from the caller's workspace; a direct caller
+    that passes none gets the contract error, never a hidden allocation (the
+    suite's autouse workspace shim is off here)."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    assert api.scratch_workspace_bytes() > 0
+    lens = torch.full((b,), s, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("length_device", ["cpu", "meta"])
 def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
     """A dense Q-length buffer becomes a raw address: reject host/meta storage before launch."""

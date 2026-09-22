@@ -24,6 +24,7 @@ import math
 
 from ..backend_utils import (
     GroupedGemmBackend,
+    allocate_wrapper_workspace,
     backend_cache_key,
     block_scaled_sfd_tensors,
     select_grouped_gemm_backend,
@@ -283,6 +284,12 @@ class GroupedGemmGluSm100(APIBase):
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
 
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires."""
+        if self._implementation is None:
+            self.check_support()
+        return self._implementation.scratch_workspace_bytes()
+
     # BF16 implementation
     @overload
     def execute(
@@ -302,6 +309,7 @@ class GroupedGemmGluSm100(APIBase):
         sfd_col_tensor: None = None,
         amax_tensor: None = None,
         norm_const_tensor: None = None,
+        workspace: Any = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -323,6 +331,7 @@ class GroupedGemmGluSm100(APIBase):
         sfd_col_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
+        workspace: Any = None,
     ) -> None: ...
 
     def execute(
@@ -351,6 +360,8 @@ class GroupedGemmGluSm100(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace: Any = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -391,6 +402,7 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 linear_offset=linear_offset,
                 current_stream=current_stream,
+                workspace=workspace,
             )
         else:
             self._implementation.execute(
@@ -418,6 +430,7 @@ class GroupedGemmGluSm100(APIBase):
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
                 current_stream=current_stream,
+                workspace=workspace,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -841,6 +854,7 @@ def glu_block_scaled_run(api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dt
         situ_beta1=call.situ_beta1,
         situ_beta2=call.situ_beta2,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
     return outputs
 
@@ -1138,6 +1152,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         glu_clamp_max=call.glu_clamp_max,
         glu_clamp_min=call.glu_clamp_min,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
     return TupleDict(
         c_tensor=c_tensor if call.generate_c else None,
@@ -1262,6 +1277,7 @@ def grouped_gemm_glu_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             current_stream=current_stream,
+            workspace=allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream),
         )
         return TupleDict(
             c_tensor=c_out if generate_c else None,

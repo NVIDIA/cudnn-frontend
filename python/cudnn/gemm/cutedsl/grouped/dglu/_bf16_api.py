@@ -6,21 +6,20 @@
 from __future__ import annotations
 
 import os
-import weakref
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import make_fake_stream, make_ptr
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
+from cudnn.frost.workspace import Workspace, align_up
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     canonicalize_unit_dim_strides,
     cuda_is_available,
     default_stream,
@@ -30,11 +29,10 @@ from cudnn.tensor_adapter import (
     get_device,
     get_shape,
     get_strides,
-    get_version,
     is_torch_tensor,
-    to_host_list,
 )
 
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
 
@@ -99,9 +97,6 @@ class GroupedGemmDgluBf16API(APIBase):
         self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
         self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias", canonical=True)
 
-        self._sample_offset_values = self._copy_values_to_host(sample_padded_offsets)
-        self._sample_offsets_ref = weakref.ref(sample_padded_offsets)
-        self._sample_offsets_version = get_version(sample_padded_offsets)
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -116,7 +111,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 ("sample_dprob", sample_dprob),
                 ("sample_dbias", sample_dbias),
             )
-            if tensor is not None
+            if tensor is not None and not isinstance(tensor, TensorDesc)
         }
 
         self.expert_cnt = self.b_desc.shape[2] if self.weight_mode == MoEWeightMode.DENSE and self.b_desc.ndim == 3 else int(num_experts or 0)
@@ -133,11 +128,8 @@ class GroupedGemmDgluBf16API(APIBase):
         self.use_dynamic_sched = use_dynamic_sched
         self._has_dbias = self.dbias_desc is not None
         self._kernel = MoEGroupedGemmDgluDbiasBf16Kernel
-        self._workspace: Optional[torch.Tensor] = None
+        self._kernel_obj = None
         self._live_b_ptrs = None
-        self._compile_b_ptrs = None
-        self._validated_offsets: dict[int, tuple] = {}
-        self._validated_pointer_values: dict[int, tuple] = {}
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     @staticmethod
@@ -154,54 +146,6 @@ class GroupedGemmDgluBf16API(APIBase):
     def _expect_device(desc: TensorDesc, device: torch.device, name: str) -> None:
         if desc.device != device:
             raise ValueError(f"{name} must be on {device}, got {desc.device}")
-
-    @staticmethod
-    def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in to_host_list(tensor))
-
-    @staticmethod
-    def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
-        cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
-
-    @staticmethod
-    def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
-        key = id(tensor)
-
-        def discard(_reference, *, cache=cache, key=key):
-            cache.pop(key, None)
-
-        cache[key] = (weakref.ref(tensor, discard), get_version(tensor), extra)
-
-    @staticmethod
-    def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tensor_m: int) -> None:
-        if len(values) != expert_cnt:
-            raise ValueError(f"padded_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
-        previous = 0
-        for index, value in enumerate(values):
-            if value < previous:
-                raise ValueError("padded_offsets must be a non-decreasing cumulative sum; " f"index {index} is {value} after {previous}")
-            if value % MoEGroupedGemmDgluDbiasBf16Kernel.FIX_PAD_SIZE != 0:
-                raise ValueError(f"padded_offsets[{index}] must be 256-aligned, got {value}")
-            previous = value
-        if not values or values[-1] <= 0 or values[-1] > tensor_m:
-            raise ValueError(f"padded_offsets last value must be in [1, {tensor_m}], got " f"{values[-1] if values else None}")
-
-    def _validate_offsets_once(self, offsets: torch.Tensor, *, tensor_m: int) -> None:
-        extra = (self.expert_cnt, tensor_m)
-        if self._is_validation_cached(self._validated_offsets, offsets, extra):
-            return
-        values = self._copy_values_to_host(offsets)
-        self._validate_offset_sequence(values, expert_cnt=self.expert_cnt, tensor_m=tensor_m)
-        self._remember_validation(self._validated_offsets, offsets, extra)
-
-    def _validate_pointer_values_once(self, b_ptrs: torch.Tensor) -> None:
-        if self._is_validation_cached(self._validated_pointer_values, b_ptrs, self.expert_cnt):
-            return
-        values = _pointer_values(b_ptrs)
-        if any(value == 0 or value % 16 != 0 for value in values):
-            raise ValueError("b_ptrs entries must be non-null and 16-byte aligned")
-        self._remember_validation(self._validated_pointer_values, b_ptrs, self.expert_cnt)
 
     @staticmethod
     def _validate_data_alignment(tensor: torch.Tensor, name: str) -> None:
@@ -318,13 +262,6 @@ class GroupedGemmDgluBf16API(APIBase):
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
 
-        self._validate_offset_sequence(self._sample_offset_values, expert_cnt=self.expert_cnt, tensor_m=tensor_m)
-        sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
-            self._remember_validation(self._validated_offsets, sample_offsets, (self.expert_cnt, tensor_m))
-        elif sample_offsets is not None:
-            self._validate_offsets_once(sample_offsets, tensor_m=tensor_m)
-
         if not self._kernel.can_implement(
             cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.c_desc.dtype),
@@ -354,34 +291,42 @@ class GroupedGemmDgluBf16API(APIBase):
         self._is_supported = True
         return True
 
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                use_dynamic_sched=self.use_dynamic_sched,
+                act_func=self.act_func,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
+        TMA-descriptor slots and the dynamic-scheduler counter, 128-byte aligned, never 0."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
     def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._kernel(
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            use_dynamic_sched=self.use_dynamic_sched,
-            act_func=self.act_func,
-        )
+        kernel = self._kernel_instance()
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be > 0 after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
 
-        workspace_bytes = kernel.get_workspace_bytes()
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
-        if get_data_ptr(self._workspace) % 128 != 0:
-            raise RuntimeError("workspace allocation must be 128-byte aligned")
-        workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        # Compile-time stand-ins carry type and alignment only (R11); the live addresses
+        # arrive at execute as plain ints.
+        gmem = cute.AddressSpace.gmem
+        workspace_fake = make_ptr(cutlass.Uint8, 128, gmem, assumed_align=128)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         a_fake = self._make_fake_cute_compact_tensor(
@@ -416,14 +361,7 @@ class GroupedGemmDgluBf16API(APIBase):
             b_stride = cutlass.Int64(0)
             b_major_mode = OperandMajorMode.K
         else:
-            # Compile-time placeholder for the pointer-array argument: real device bytes
-            # (fake tensors have dummy iterators) allocated in the caller's framework,
-            # retyped to Int64 via the element_type override.
-            self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-            self._validate_pointer_array_alignment(self._compile_b_ptrs)
-            placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
-            placeholder.element_type = cutlass.Int64
-            b_fake = placeholder.iterator
+            b_fake = make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
             n, k = self.b_shape[:2]
             n_value = cutlass.Int32(n)
             k_value = cutlass.Int32(k)
@@ -438,7 +376,7 @@ class GroupedGemmDgluBf16API(APIBase):
             k=k_value,
             b_stride_size=b_stride,
             b_major_mode=b_major_mode,
-            workspace_ptr=workspace_ptr,
+            workspace_ptr=workspace_fake,
             c=c_fake,
             d=d_fake,
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc),
@@ -466,6 +404,7 @@ class GroupedGemmDgluBf16API(APIBase):
             b_tensor,
             b_ptrs,
             dbias_tensor,
+            workspace_ptr,
             stream,
             linear_offset,
         ) -> None:
@@ -530,7 +469,11 @@ class GroupedGemmDgluBf16API(APIBase):
         dbias_tensor: Optional[torch.Tensor] = None,
         linear_offset: float = 0.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
+        """``workspace``: caller-owned, 128-byte-aligned, contiguous device buffer of at least
+        ``scratch_workspace_bytes()`` bytes (torch tensor or any DLPack buffer); never allocated here."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -560,7 +503,7 @@ class GroupedGemmDgluBf16API(APIBase):
         self._expect_stride(d_desc, (two_n, 1, tensor_m * two_n), "d_row_tensor")
         self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
         self._expect_stride(dprob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "dprob_tensor")
-        self._validate_offsets_once(padded_offsets, tensor_m=tensor_m)
+        debug_validate_offsets(padded_offsets, expert_cnt=self.expert_cnt, limit=tensor_m, mode="padded", stream=current_stream)
 
         for tensor, name in (
             (a_tensor, "a_tensor"),
@@ -595,9 +538,11 @@ class GroupedGemmDgluBf16API(APIBase):
                 raise ValueError(f"b_ptrs must be on the same device as a_tensor ({self.a_desc.device}), got {get_device(b_ptrs)}")
             if get_data_ptr(b_ptrs) % 8 != 0:
                 raise ValueError("b_ptrs data pointer must be 8-byte aligned")
-            self._validate_pointer_values_once(b_ptrs)
+            debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
 
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
         self._compiled_kernel(
             a_tensor,
             c_tensor,
@@ -610,6 +555,7 @@ class GroupedGemmDgluBf16API(APIBase):
             b_tensor,
             b_ptrs,
             dbias_tensor,
+            ws_view.data_ptr(),
             current_stream,
             linear_offset,
         )
