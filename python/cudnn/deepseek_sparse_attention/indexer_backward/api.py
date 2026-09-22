@@ -28,7 +28,7 @@ import cuda.bindings.driver as cuda
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
-from cudnn._torch_stream import contiguous_on_stream
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn.frost.buffers import memset_zero_async
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
@@ -91,9 +91,9 @@ def _contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[tor
     return torch.empty_like(tensor, memory_format=torch.contiguous_format), tensor
 
 
-def _copy_back_if_needed(tensor: torch.Tensor, original: Optional[torch.Tensor]) -> None:
+def _copy_back_if_needed(tensor: torch.Tensor, original: Optional[torch.Tensor], stream) -> None:
     if original is not None:
-        original.copy_(tensor)
+        copy_into_on_stream(original, tensor, stream, original.device)  # R1 staging: the destination is recorded first
 
 
 def _max_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> int:
@@ -835,8 +835,7 @@ class DenseIndexerBackward(APIBase):
         )
 
         if d_index_k_f32 is not d_index_k:
-            with _torch_stream_context(current_stream, d_index_k.device):
-                d_index_k.copy_(d_index_k_f32)
+            copy_into_on_stream(d_index_k, d_index_k_f32, current_stream, d_index_k.device)
 
 
 _cache_of_IndexerBackwardObjects: dict = {}
@@ -1227,10 +1226,10 @@ def dense_indexer_backward_wrapper(
         workspace=workspace,
     )
     with _torch_stream_context(current_stream, index_q_exec.device):
-        _copy_back_if_needed(attn_score_exec, attn_score_original)
-        _copy_back_if_needed(index_score_exec, index_score_original)
-        _copy_back_if_needed(d_index_q_exec, d_index_q_original)
-        _copy_back_if_needed(d_weights_exec, d_weights_original)
-        _copy_back_if_needed(d_index_k_exec, d_index_k_original)
+        _copy_back_if_needed(attn_score_exec, attn_score_original, current_stream)
+        _copy_back_if_needed(index_score_exec, index_score_original, current_stream)
+        _copy_back_if_needed(d_index_q_exec, d_index_q_original, current_stream)
+        _copy_back_if_needed(d_weights_exec, d_weights_original, current_stream)
+        _copy_back_if_needed(d_index_k_exec, d_index_k_original, current_stream)
 
     return TupleDict(d_index_q=d_index_q_result, d_weights=d_weights_result, d_index_k=d_index_k_result)

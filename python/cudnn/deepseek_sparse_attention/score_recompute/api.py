@@ -23,7 +23,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
 )
 
-from cudnn._torch_stream import contiguous_on_stream, record_streams
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
@@ -110,8 +110,7 @@ def _wrapper_stage_output(t: Optional[torch.Tensor], shape, dtype: torch.dtype, 
 def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor]) -> torch.Tensor:
     if user is None:
         return staged
-    with _torch_stream_context(stream, user.device):
-        user.copy_(staged)
+    copy_into_on_stream(user, staged, stream, user.device)  # R1 staging: the destination is recorded first
     return user
 
 

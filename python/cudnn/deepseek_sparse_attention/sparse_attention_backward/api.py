@@ -18,7 +18,7 @@ import cuda.bindings.driver as cuda
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
 from cudnn.api_base import APIBase, TupleDict
-from cudnn._torch_stream import contiguous_on_stream
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
 from . import _interface_sm100 as _iface_sm100
@@ -444,12 +444,11 @@ def sparse_attention_backward_wrapper(
         current_stream=launch_stream,
         d_sink=d_sink,
     )
-    if (dq_user is not None and dq_user is not dq_out) or (dkv_user is not None and dkv_user is not dkv_out):
-        with torch.cuda.device(q.device), torch_stream_context(launch_stream):
-            if dq_user is not None and dq_user is not dq_out:
-                dq_user.copy_(dq_out)
-                dq_out = dq_user
-            if dkv_user is not None and dkv_user is not dkv_out:
-                dkv_user.copy_(dkv_out)
-                dkv_out = dkv_user
+    # Copy-back into the caller's strided outputs: the destination is recorded on the launch stream first (R1 staging).
+    if dq_user is not None and dq_user is not dq_out:
+        copy_into_on_stream(dq_user, dq_out, launch_stream, q.device)
+        dq_out = dq_user
+    if dkv_user is not None and dkv_user is not dkv_out:
+        copy_into_on_stream(dkv_user, dkv_out, launch_stream, q.device)
+        dkv_out = dkv_user
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)

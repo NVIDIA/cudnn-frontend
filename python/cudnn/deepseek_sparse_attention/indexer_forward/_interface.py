@@ -22,6 +22,7 @@ import cutlass.cute as cute
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from .indexer_fwd_sm100_mxfp8 import IndexerForwardSm100Mxfp8
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+from cudnn._torch_stream import copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
     maybe_contiguous as _maybe_contiguous,
@@ -389,7 +390,7 @@ def _finish_dense_out(
     """Copy a staged result back into the caller's ``out`` (identity kept) or make an allocated padded view contiguous."""
     with _torch_stream_context(current_stream):
         if out_orig is not None and out_orig is not out:
-            out_orig.copy_(out)
+            copy_into_on_stream(out_orig, out, current_stream, out_orig.device)  # R1 staging: the destination is recorded first
             return out_orig
         if out_orig is None and need_pad:
             return out.contiguous()
