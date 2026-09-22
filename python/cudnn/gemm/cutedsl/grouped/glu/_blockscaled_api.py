@@ -20,7 +20,7 @@ Discrete mode
 from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg, retain_workspace
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import math
@@ -1328,6 +1328,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

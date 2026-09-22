@@ -35,7 +35,7 @@ from .moe_blockscaled_grouped_gemm_srelu_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
     EpilogueType,
 )
-from ..backend_utils import allocate_wrapper_workspace
+from ..backend_utils import allocate_wrapper_workspace, retain_workspace
 from ..moe_utils import MoEWeightMode
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
@@ -1130,6 +1130,7 @@ class GroupedGemmSreluSm100(APIBase):
             )
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         self._logger.debug("Executing grouped_gemm_srelu kernel")
         if self.weight_mode == MoEWeightMode.DENSE:

@@ -169,7 +169,7 @@ api = GroupedGemmQuantSm100(
 )
 assert api.check_support()
 api.compile()
-workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a,
     b_tensor=b,

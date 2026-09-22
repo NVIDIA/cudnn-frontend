@@ -30,7 +30,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.frost.workspace import Workspace, align_up
-from cudnn.gemm.cutedsl.grouped.backend_utils import allocate_wrapper_workspace
+from cudnn.gemm.cutedsl.grouped.backend_utils import allocate_wrapper_workspace, retain_workspace
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -877,10 +877,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             )
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        if not is_torch_tensor(workspace):
-            # Immutable frameworks (JAX) have no record_stream: keep the caller's buffer referenced
-            # until the next execute so it outlives the asynchronous launch (same as _live_ptrs).
-            self._live_workspace = workspace
+        retain_workspace(self, workspace, current_stream)
 
         self._compiled_kernel(
             a_tensor=a_tensor,

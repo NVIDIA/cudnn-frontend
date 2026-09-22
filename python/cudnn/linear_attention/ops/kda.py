@@ -398,6 +398,9 @@ def run_kda_fwd(
     ):
         if tensor is not None and tensor.device != device:
             raise ValueError(f"kimi_delta_attention: {tensor_name} must be on q's device ({device}); got {tensor.device}")
+    # The graph declares packed operands (no strides), and the plan reserves no repack staging: a
+    # fused-projection slice or any other non-contiguous view is repacked here, in the torch-op layer.
+    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     state0 = initial_state if initial_state is not None else None
     checkpoint = int(checkpoint_every_n_tokens)
 
@@ -904,6 +907,9 @@ def kda_bwd(
     ):
         if tensor is not None and tensor.device != device:
             raise ValueError(f"kimi_delta_attention: {tensor_name} must be on q's device ({device}); got {tensor.device}")
+    # The graph declares packed operands (no strides), and the plan reserves no repack staging: a
+    # fused-projection slice or any other non-contiguous view is repacked here, in the torch-op layer.
+    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
     state0 = initial_state if initial_state is not None else None
     dstate_in = d_final_state if d_final_state is not None else None
 
