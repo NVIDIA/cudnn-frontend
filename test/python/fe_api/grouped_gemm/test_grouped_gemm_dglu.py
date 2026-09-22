@@ -111,6 +111,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     carved = Mock()
     carved.take.return_value.data_ptr.return_value = 0
     monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner, *, device: carved)
+    monkeypatch.setattr(blockscaled_module, "validate_workspace_aliases", lambda *args, **kwargs: None)  # isolated pointer-stream test
 
     b_ptrs = object()
     sfb_ptrs = object()

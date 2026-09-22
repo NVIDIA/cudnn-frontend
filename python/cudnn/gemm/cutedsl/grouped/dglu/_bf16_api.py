@@ -23,6 +23,7 @@ from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, align_up
+from ._workspace import validate_workspace_aliases
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -641,7 +642,6 @@ class GroupedGemmDgluBf16API(APIBase):
                     "dprob_tensor": dprob_tensor,
                     "dbias_tensor": dbias_tensor,
                     "b_ptrs": b_ptrs,
-                    "workspace": workspace,
                 },
             )
         elif activation_tensor is not None:
@@ -665,6 +665,22 @@ class GroupedGemmDgluBf16API(APIBase):
 
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
+        validate_workspace_aliases(
+            ws_view.data_ptr(),
+            nbytes,
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            dbias_tensor=dbias_tensor,
+            activation_tensor=activation_tensor,
+        )
         self._compiled_kernel(
             a_tensor,
             c_tensor,

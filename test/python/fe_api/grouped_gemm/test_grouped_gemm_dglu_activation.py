@@ -404,7 +404,7 @@ def test_dglu_activation_caller_workspace_and_first_capture(discrete, compile_al
         with pytest.raises(ValueError, match="workspace"):
             run(invalid)
     overlapping = auxiliary.view(-1).view(torch.uint8)[: scratch.numel()]
-    with pytest.raises(ValueError, match="activation output must not overlap workspace"):
+    with pytest.raises(ValueError, match="workspace must not overlap activation_tensor"):
         run(overlapping)
     auxiliary.fill_(float("nan"))
     graph = torch.cuda.CUDAGraph()

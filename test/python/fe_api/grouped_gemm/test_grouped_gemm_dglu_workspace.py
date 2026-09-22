@@ -163,3 +163,128 @@ def test_jax_wrapper_scratch_stream_capture():
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(observed, torch.full_like(observed, 37), rtol=0, atol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "discrete,operand",
+    [(False, x) for x in ("a_tensor", "c_tensor", "d_row_tensor", "padded_offsets", "alpha_tensor", "beta_tensor", "prob_tensor", "dprob_tensor", "b_tensor")]
+    + [(True, "b_ptrs")],
+)
+def test_dglu_bf16_workspace_alias_rejected_before_launch(discrete, operand, monkeypatch):
+    p = problem(discrete)
+    op = make_plan(p, True, None)
+    op.check_support()
+    nbytes = op.scratch_workspace_bytes()
+    args = dict(
+        a_tensor=p["a"],
+        c_tensor=p["c"],
+        d_row_tensor=p["d"],
+        d_col_tensor=None,
+        sfa_tensor=None,
+        padded_offsets=p["offsets"],
+        alpha_tensor=p["alpha"],
+        beta_tensor=p["beta"],
+        prob_tensor=p["prob"],
+        dprob_tensor=p["dp"],
+        **p["bind"],
+    )
+    tensor = args[operand]
+    elements = 1 + sum((extent - 1) * stride for extent, stride in zip(tensor.shape, tensor.stride()))
+    storage = torch.empty(nbytes + elements * tensor.element_size() + 128, dtype=torch.uint8, device=tensor.device)
+
+    # Legal adjacent slices share an allocation and must not be rejected.
+    def view(offset):
+        return storage[offset : offset + elements * tensor.element_size()].view(tensor.dtype).as_strided(tensor.shape, tensor.stride())
+
+    seen = []
+    monkeypatch.setattr(op._implementation, "_compiled_kernel", lambda *a, **k: seen.append((a, k)))
+    args[operand] = view(nbytes)
+    op.execute(**args, workspace=storage[:nbytes])
+    assert len(seen) == 1
+    seen.clear()
+    args[operand] = view(0)
+    # Never let deliberately aliased scratch reach a real kernel.
+    with pytest.raises(ValueError, match="workspace must not overlap " + operand):
+        op.execute(**args, workspace=storage[:nbytes])
+    assert not seen
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "discrete,operand",
+    [
+        (False, x)
+        for x in (
+            "a_tensor",
+            "c_tensor",
+            "d_row_tensor",
+            "d_col_tensor",
+            "sfa_tensor",
+            "padded_offsets",
+            "alpha_tensor",
+            "beta_tensor",
+            "prob_tensor",
+            "dprob_tensor",
+            "b_tensor",
+            "sfb_tensor",
+            "dbias_tensor",
+            "sfd_row_tensor",
+            "sfd_col_tensor",
+            "amax_tensor",
+            "norm_const_tensor",
+        )
+    ]
+    + [(True, "b_ptrs"), (True, "sfb_ptrs")],
+)
+def test_dglu_blockscaled_workspace_alias_rejected_before_launch(discrete, operand, monkeypatch):
+    from unittest.mock import Mock
+    from cudnn.gemm.cutedsl.grouped.dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
+    from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
+
+    # Exercise the real execute gate, intercepting only the compiled consumer.
+    op = object.__new__(GroupedGemmDgluBlockScaledAPI)
+    op._logger = Mock()
+    op._get_default_stream = lambda stream: stream
+    op._has_dbias = True
+    op.a_desc = Mock(device=torch.device("cuda", torch.cuda.current_device()))
+    op.weight_mode = MoEWeightMode.DISCRETE if discrete else MoEWeightMode.DENSE
+    op._compiled_kernel = Mock()
+    op.scratch_workspace_bytes = lambda: 128
+    monkeypatch.setattr(op, "_record_pointer_stream", lambda *a: None)
+    names = [
+        "a_tensor",
+        "c_tensor",
+        "d_row_tensor",
+        "d_col_tensor",
+        "sfa_tensor",
+        "padded_offsets",
+        "alpha_tensor",
+        "beta_tensor",
+        "prob_tensor",
+        "dprob_tensor",
+        "dbias_tensor",
+        "sfd_row_tensor",
+        "sfd_col_tensor",
+        "amax_tensor",
+        "norm_const_tensor",
+    ]
+    names += ["b_ptrs", "sfb_ptrs"] if discrete else ["b_tensor", "sfb_tensor"]
+    # Packed FP4 A is a raw uint8 tensor. FP8 scale buffers must work too.
+    args = {
+        name: torch.empty(
+            128, dtype=torch.uint8 if name == "a_tensor" else torch.float8_e4m3fn if name in ("sfa_tensor", "sfb_tensor") else torch.float32, device="cuda"
+        )
+        for name in names
+    }
+    storage = torch.empty(1024, dtype=torch.uint8, device="cuda")
+    dtype = args[operand].dtype
+    args[operand] = storage[128:640].view(dtype)
+    op.execute(**args, workspace=storage[:128])
+    assert op._compiled_kernel.call_count == 1
+    op._compiled_kernel.reset_mock()
+    # Begin inside the operand's strided byte span, rather than at its pointer.
+    args[operand] = storage[:512].view(dtype)[::2]
+    with pytest.raises(ValueError, match="workspace must not overlap " + operand):
+        op.execute(**args, workspace=storage[128:256])
+    op._compiled_kernel.assert_not_called()

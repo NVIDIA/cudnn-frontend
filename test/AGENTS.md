@@ -112,3 +112,12 @@ completion event is still pending after the producer/churn work. If the delay
 expires, fail the setup instead of accepting a lifetime result without overlap.
 Use a bounded byte consumer for recycled-storage negative controls, never a real
 kernel on a deliberately invalidated workspace.
+
+### Caller workspace alias regressions
+
+Check the carved scratch byte range against operand byte spans, including packed
+uint8 FP4 storage, strided views, optional outputs, and device pointer tables.
+Intercept the compiled consumer for negative tests so intentional aliasing never
+reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
+allocation so rejecting shared ownership does not substitute for checking overlap.
+Device pointer-table contents remain a caller contract, not a reason for a D2H read.
