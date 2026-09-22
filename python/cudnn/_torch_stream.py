@@ -92,3 +92,45 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
             return
     with torch.cuda.stream(as_torch_stream(stream, device)):
         yield
+
+
+def record_streams(tensors, stream, device=None) -> None:
+    """Order the caching allocator's reuse of each tensor's block behind the work already
+    enqueued on ``stream`` (R1): ``tensor.record_stream(as_torch_stream(stream, device))``
+    for every CUDA tensor in ``tensors`` (``None`` entries skipped).
+
+    A no-op when ``stream`` is None or torch's current stream on ``device``: there the
+    allocation stream already orders reuse (the caller's own contract), so nothing is
+    recorded and no ``Stream`` object is built.
+    """
+    if stream is None:
+        return
+    import torch
+
+    handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
+    if handle not in DEFAULT_STREAM_HANDLES and handle == _raw_current_stream(torch, device):
+        return
+    consumer = None
+    for tensor in tensors:
+        if tensor is None or not tensor.is_cuda:
+            continue
+        if consumer is None:
+            consumer = as_torch_stream(stream, device if device is not None else tensor.device)
+        tensor.record_stream(consumer)
+
+
+def contiguous_on_stream(tensor, stream, device=None):
+    """``tensor`` itself when it is None or contiguous; otherwise a contiguous copy made on
+    ``stream`` after ``record_streams((tensor,), stream, device)``.
+
+    The recording is what makes the copy safe to rebind over: a wrapper doing
+    ``t = t.contiguous()`` under ``stream_context(side)`` drops the caller's reference while
+    the copy kernel is still queued on ``side``; if the caller also releases ``t``, its block
+    returns to the allocator's pool for the caller's stream and the next same-size allocation
+    there overwrites what the copy has yet to read.
+    """
+    if tensor is None or tensor.is_contiguous():
+        return tensor
+    record_streams((tensor,), stream, device)
+    with stream_context(stream, device):
+        return tensor.contiguous()
