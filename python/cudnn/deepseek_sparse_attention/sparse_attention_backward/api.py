@@ -97,17 +97,18 @@ class SparseAttentionBackward(APIBase):
         # ``_interface_sm100.flash_attn_bwd_sm100``), so a placement mismatch
         # must fail the support gate here rather than compile/launch and crash.
         ref_device = self.q_desc.device
-        descriptors = [
-            self.q_desc,
-            self.kv_desc,
-            self.out_desc,
-            self.dout_desc,
-            self.lse_desc,
-            self.attn_sink_desc,
-            self.topk_idxs_desc,
+        named_descriptors = [
+            ("q", self.q_desc),
+            ("kv", self.kv_desc),
+            ("out", self.out_desc),
+            ("dout", self.dout_desc),
+            ("lse", self.lse_desc),
+            ("attn_sink", self.attn_sink_desc),
+            ("topk_idxs", self.topk_idxs_desc),
         ]
         if self.topk_length_desc is not None:
-            descriptors.append(self.topk_length_desc)
+            named_descriptors.append(("topk_length", self.topk_length_desc))
+        descriptors = [desc for _, desc in named_descriptors]
         self._value_error_if(
             any(desc.device != ref_device for desc in descriptors),
             f"All inputs must share Q's device {ref_device}, got {[desc.device for desc in descriptors]}",
@@ -180,6 +181,14 @@ class SparseAttentionBackward(APIBase):
             self._two_cta_split_count = _iface_d576._split_count(
                 total_s_q, self.topk_idxs_desc.shape[1], torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
             )
+        else:
+            # The kernels read the declared layout natively and execute never
+            # repacks (R5); the D576 route already rejects strides at execute.
+            for name, desc in named_descriptors:
+                self._not_implemented_error_if(
+                    not desc.is_contiguous(),
+                    f"SparseAttentionBackward addresses only contiguous {name}; got shape {desc.shape} strides {desc.stride}",
+                )
 
         self._is_supported = True
         return True
@@ -204,10 +213,12 @@ class SparseAttentionBackward(APIBase):
         """Return reusable per-execution scratch for the selected backend."""
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
-        if major == 9:
-            return 0
         total_s_q, num_heads, head_dim = self.q_desc.shape
         total_s_kv = self.kv_desc.shape[0]
+        if major == 9:
+            from . import _interface_sm90 as _iface_sm90
+
+            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(total_s_q, total_s_kv, head_dim, num_heads)
         return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
             total_s_q,
             total_s_kv,
@@ -225,19 +236,24 @@ class SparseAttentionBackward(APIBase):
         lse: torch.Tensor,
         attn_sink: torch.Tensor,
         topk_idxs: torch.Tensor,
-        dq: Optional[torch.Tensor] = None,
-        dkv: Optional[torch.Tensor] = None,
+        dq: torch.Tensor,
+        dkv: torch.Tensor,
+        d_sink: torch.Tensor,
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
-        d_sink: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dispatch one validated execution to the active GPU architecture.
 
-        The H128/D576 two-CTA route requires every output and the scratch
-        workspace to be caller-provided; it neither compiles nor allocates here.
+        Every backend requires ``dq``, ``dkv``, ``d_sink`` and (when
+        ``scratch_workspace_bytes()`` is non-zero) ``workspace`` to be
+        caller-provided; execute never allocates. The H128/D576 two-CTA route
+        additionally never compiles here.
         """
+        for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if self._backend == _iface_d576.BACKEND:
             if self._compiled_kernel is None:
@@ -276,8 +292,6 @@ class SparseAttentionBackward(APIBase):
                 self._two_cta_split_count,
                 current_stream,
             )
-        if d_sink is not None:
-            raise ValueError("a caller-provided d_sink is supported only by the H128 D576 two-CTA backend")
         # Resolve the architecture from Q's device rather than the ambient current
         # device, and launch under that device context, matching check_support().
         major, _ = device_capability(q.device)
@@ -291,13 +305,14 @@ class SparseAttentionBackward(APIBase):
                     out,
                     dout,
                     lse,
-                    attn_sink=attn_sink,
-                    topk_idxs=topk_idxs,
+                    attn_sink,
+                    topk_idxs,
+                    dq,
+                    dkv,
+                    d_sink,
+                    workspace,
                     softmax_scale=scale,
                     topk_length=topk_length,
-                    dq=dq,
-                    dkv=dkv,
-                    need_d_sink=True,
                     current_stream=current_stream,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
@@ -312,6 +327,7 @@ class SparseAttentionBackward(APIBase):
                 topk_length=topk_length,
                 dq=dq,
                 dkv=dkv,
+                d_sink=d_sink,
                 deterministic=self.deterministic,
                 workspace=workspace,
                 current_stream=current_stream,
@@ -347,9 +363,8 @@ def sparse_attention_backward_wrapper(
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
     """
-    # SM100 routing depends on contiguity (the two-CTA plan launches without
-    # copies), so a plan built from strided inputs must not be reused for
-    # contiguous ones or vice versa; the exact strides do not matter beyond that.
+    # check_support() declines strided inputs, so a strided call must build its
+    # own plan (and be declined there) rather than reuse a cached contiguous one.
     all_inputs_contiguous = all(t.is_contiguous() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) if t is not None)
     key = (
         q.device,
@@ -386,22 +401,19 @@ def sparse_attention_backward_wrapper(
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
 
-    d_sink = None
     with torch.cuda.device(q.device):
         launch_stream = resolve_stream(stream)
+        # execute() never allocates: outputs and scratch are provided here, ordered with the launch stream (R2).
         with torch_stream_context(launch_stream):
             if workspace is None:
                 workspace_bytes = obj.scratch_workspace_bytes()
                 if workspace_bytes:
                     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
-            if obj._backend == _iface_d576.BACKEND:
-                # The two-CTA plan's execute() never allocates: provide its
-                # outputs here, ordered with the launch stream.
-                if dq is None:
-                    dq = torch.empty_like(q)
-                if dkv is None:
-                    dkv = torch.empty_like(kv)
-                d_sink = torch.empty_like(attn_sink)
+            if dq is None:
+                dq = torch.empty_like(q)
+            if dkv is None:
+                dkv = torch.empty_like(kv)
+            d_sink = torch.empty_like(attn_sink)
 
     dq_out, dkv_out, d_sink_out = obj.execute(
         q,
@@ -411,12 +423,12 @@ def sparse_attention_backward_wrapper(
         lse,
         attn_sink,
         topk_idxs,
-        dq=dq,
-        dkv=dkv,
+        dq,
+        dkv,
+        d_sink,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
         workspace=workspace,
         current_stream=launch_stream,
-        d_sink=d_sink,
     )
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)

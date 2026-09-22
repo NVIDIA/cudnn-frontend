@@ -427,6 +427,13 @@ the workspace BASE pointer — the `OperandBuffer` capsule owns its own
 shape/stride, so the memo holds no device memory; a caller rotating workspaces
 pays the conversions again and nothing else (`hopper/kda_engine.py`; detector
 `test_kda_sm90_cuda.py::test_alternating_workspaces_recarve`).
+When an adapter's execute has several required outputs the kernel always
+writes (DSA `SparseAttentionBackward`: `dq`, `dkv`, `d_sink`), make ALL of them
+positional-required on every backend and raise `ValueError("<name> must be
+preallocated; use <op>_wrapper for automatic output allocation")` on `None`;
+the wrapper allocates the full set under `stream_context(launch)`. Never let one
+backend require an output the others allocate — the "d_sink only for D576" split
+hid a per-execute `torch.zeros_like` on every other route.
 A direct adapter caller (a standalone `<op>_wrapper`, a test, downstream code
 constructing `SdpaFwdDsl*` itself) is a caller: it allocates
 `scratch_workspace_bytes()` and passes it (`sdpa_fwd_wrapper_sm80` does, under
@@ -543,7 +550,12 @@ state ownership (`indexer_backward_v2_sm100`; detector
 `test_DSA_indexer_backward.py::test_v2_counter_lives_in_caller_workspace`
 poisons the workspace with 0xFF before each execute). The same rule zeroes an
 absent optional state port (the Hopper KDA seed) on every execute, so capture
-records a memset node that replays.
+records a memset node that replays. An output the kernel accumulates atomically
+(DSA `d_sink` via `sum_dSink`, SM90 `dkv_accum`) is zeroed the same way, after
+`resolve_stream()` and before the launch; an output whose finalizer overwrites
+every element (the dKV `convert` kernels) gets no reset at all — verify the
+finalizer's row/column coverage by reading it, and say so in the comment
+(`sparse_attention_backward/_interface_sm100.py`).
 Plan-time scalar constants a kernel reads from memory (FP8 `alpha` / `scale` /
 `descale`) are R4 too: declare ONE slot LAST in the workspace layout
 (`gated_attention_block/api.py` `_Intermediates.quant`, `_QUANT_WORDS` order,
@@ -572,7 +584,14 @@ just `stride[-1] == 1`, and `execute()` re-checks the live tensor and raises
 A size-1 innermost dim has no observable stride: `stride[-1] == 1` checks exempt
 `shape[-1] == 1` (the SM90 `(B, 1, H).transpose(1, 2)` singleton view is
 contiguous with stride `(H, 1, H)`), or a correct layout is declined (12 SM90
-reds in the score-recompute batch).
+reds in the score-recompute batch). Contiguity-only kernels: `check_support()`
+loops every descriptor with `_not_implemented_error_if(not desc.is_contiguous(),
+f"<Op> addresses only contiguous {name}; got shape {desc.shape} strides
+{desc.stride}")`, and the interface re-checks `tensor.is_contiguous()` at
+execute with `ValueError` (`sparse_attention_backward/api.py`,
+`_interface_sm90.py`, `_interface_sm100.py`); a wrapper's plan cache keys on
+the contiguity so a strided call builds its own plan and is declined at
+`check_support()` instead of hitting a cached contiguous plan at execute.
 An output the kernel needs padded or aligned is never staged into scratch and
 copied back (two hidden launches plus a per-call allocation): require the
 caller's tensor to already be the view with the padded stride (`out[..., :S_k]`
