@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 from __future__ import annotations
 
@@ -8,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
+from cudnn._cutlass_compat import OperandMajorMode
 
 from . import mma_sm100_desc as sm100_desc
 
@@ -256,7 +260,7 @@ def _gemm_ptx_w_idx_impl(
                     sA_layout[0],
                 ),
                 sA_swizzle,
-                (sm100_desc.Major.K if cutlass.const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN),
+                (sm100_desc.Major.K if cutlass.const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN),
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -267,7 +271,7 @@ def _gemm_ptx_w_idx_impl(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            (sm100_desc.Major.K if cutlass.const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN),
+            (sm100_desc.Major.K if cutlass.const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN),
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
@@ -434,7 +438,7 @@ def gemm_ptx_partial(
             sm100_desc.make_smem_desc_base(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
-                (sm100_desc.Major.K if cutlass.const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN),
+                (sm100_desc.Major.K if cutlass.const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN),
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -447,7 +451,7 @@ def gemm_ptx_partial(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            (sm100_desc.Major.K if cutlass.const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN),
+            (sm100_desc.Major.K if cutlass.const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN),
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)

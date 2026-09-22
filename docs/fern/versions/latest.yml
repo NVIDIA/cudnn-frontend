@@ -177,9 +177,15 @@ navigation:
           - page: CSA Fused Compressor
             path: ../../fe-oss-apis/csa.md
             slug: csa
+          - page: Tail RoPE + Microscaled QDQ
+            path: ../../fe-oss-apis/rope_qdq.md
+            slug: rope-qdq
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../fe-oss-apis/dsa.md
             slug: dsa
+          - page: Engram Saved-State Gate
+            path: ../../fe-oss-apis/engram_saved_gate.md
+            slug: engram_saved_gate
           - page: FLA Integration Shims
             path: ../../fe-oss-apis/fla.md
             slug: fla

@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """Architecture-neutral stable compaction for arbitrary-mask plan rows."""
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Uint32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.flex_attention.plan.kernels.common import (
     _ArbitraryPlanCommonSm90,
@@ -62,7 +66,7 @@ class _ArbitraryPlanQ2KCompact(_ArbitraryPlanCommonSm90):
             mCuSeqlensK,
             mCuTotalMBlocks,
         )
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((self.num_warps,)),
@@ -192,7 +196,7 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
             mCuTotalQBlocks,
             mCuTotalKBlocks,
         )
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((self.num_warps,)),

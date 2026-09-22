@@ -122,10 +122,11 @@ class ExecConfig:
     is_dropout: bool = None
     is_determin: bool = None
     is_mxfp8: bool = False
-    # Per-tensor FP8 forward only: block-scaled O epilogue (sdpa_fp8 sf_o output).
-    # 0 = plain O, 16 = FP4_E2M1 O + E4M3 scale per 16 d, 32 = FP8_E4M3 O +
-    # UE8M0 scale per 32 d. Applied only where the FROST d128 epilogue serves
-    # the config (dense, d_qk = d_v = 128); exec_sdpa_fp8 folds it to 0 otherwise.
+    # FP8 / MXFP8 forward only: block-scaled O epilogue (the sdpa_fp8 / sdpa_mxfp8
+    # sf_o output). 0 = plain O, 16 = FP4_E2M1 O + E4M3 scale per 16 d, 32 =
+    # FP8_E4M3 O + UE8M0 scale per 32 d. Applied only where the FROST d128
+    # epilogue serves the config (dense, d_qk = d_v = 128); exec_sdpa_fp8 /
+    # exec_sdpa_mxfp8 fold it to 0 otherwise.
     o_block_scale: int = 0
 
     with_score_max: bool = False

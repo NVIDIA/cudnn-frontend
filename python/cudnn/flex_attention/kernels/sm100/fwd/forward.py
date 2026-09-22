@@ -1,8 +1,12 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # SM100/SM103 arbitrary interval-mask forward kernel for FP16/BF16 MHA/GQA/MQA.
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
+
 
 import math
 from functools import partial
@@ -14,11 +18,11 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as cutlass_pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import Float32, Int32, Int64, Uint32, const_expr, pipeline
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from cudnn._cutlass_compat import Arch, LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 import cuda.bindings.driver as cuda
 
@@ -283,11 +287,11 @@ class _FlexAttentionForwardSm100Base:
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        v_major_mode = tcgen05.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        v_major_mode = OperandMajorMode.MN
+        self.o_layout = LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         # Keep the consumer and payload materializer on the same 1CTA layout.
         tiled_mma_qk = make_sm100_fwd_tiled_mma_qk(
             self.q_dtype,
@@ -296,6 +300,7 @@ class _FlexAttentionForwardSm100Base:
             self.cta_group_size,
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             v_major_mode,
@@ -581,7 +586,7 @@ class _FlexAttentionForwardSm100Base:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -589,7 +594,7 @@ class _FlexAttentionForwardSm100Base:
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

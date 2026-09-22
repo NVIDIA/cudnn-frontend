@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -579,6 +582,7 @@ def make_kq_mma_atoms(config, low_precision_type):
     """
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         low_precision_type,
+        low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
         config.sf_dtype,
@@ -588,6 +592,7 @@ def make_kq_mma_atoms(config, low_precision_type):
         tcgen05.OperandSource.TMEM,
     )
     tiled_mma_smem = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        low_precision_type,
         low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
@@ -599,6 +604,7 @@ def make_kq_mma_atoms(config, low_precision_type):
     )
     tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
         low_precision_type,
+        low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
         config.sf_dtype,
@@ -608,6 +614,7 @@ def make_kq_mma_atoms(config, low_precision_type):
         tcgen05.OperandSource.TMEM,
     )
     tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        low_precision_type,
         low_precision_type,
         OperandMajorMode.K,
         OperandMajorMode.K,
