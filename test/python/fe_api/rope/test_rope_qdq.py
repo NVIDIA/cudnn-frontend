@@ -17,20 +17,24 @@ def supported_device():
         pytest.skip("FROST RoPE QDQ requires SM100")
 
 
-def reference(x, cache, positions, quantization):
-    """Source FMA -> BF16 -> group32 UE8M0 QDQ, including signed zeros."""
-    logical = x if quantization == "fp4" else x.view(-1, 1, 512)
+def reference(x, cache, positions, quantization, group_size=32):
+    """Source FMA -> BF16 -> RN-division QDQ, including signed zeros."""
+    logical = x if quantization == "fp4" and group_size == 32 else x.view(-1, 1, 512)
     cosine, sine = cache[positions.long()].split(32, dim=-1)
     cosine, sine = cosine[:, None, :], sine[:, None, :]
     a, b = logical[..., -64:].float().unflatten(-1, (32, 2)).unbind(-1)
     negative_bs = ((b * sine).view(torch.int32) ^ -2147483648).view(torch.float32)
     tail = torch.stack((torch.addcmul(negative_bs, a, cosine), torch.addcmul(a * sine, b, cosine)), dim=-1).flatten(-2)
     rotated = torch.cat((logical[..., :-64].float(), tail.to(torch.bfloat16).float()), dim=-1)
-    groups = rotated.reshape(*logical.shape[:-1], logical.shape[-1] // 32, 32)
+    groups = rotated.reshape(*logical.shape[:-1], logical.shape[-1] // group_size, group_size)
     limit, floor = (6.0, 6 * 2.0**-126) if quantization == "fp4" else (448.0, 1e-4)
-    bits = (groups.abs().amax(-1).clamp_min(floor) * (1.0 / limit)).view(torch.int32)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    scale = (exponent << 23).view(torch.float32)
+    if group_size == 16:
+        ratio = groups.abs().amax(-1).clamp_min(6 * 2.0**-9) / 6.0
+        scale = ratio.clamp_max(448).to(torch.float8_e4m3fn).float()
+    else:
+        bits = (groups.abs().amax(-1).clamp_min(floor) * (1.0 / limit)).view(torch.int32)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+        scale = (exponent << 23).view(torch.float32)
     normalized = (groups / scale[..., None]).clamp(-limit, limit)
     if quantization == "fp4":
         magnitude = normalized.abs()
@@ -51,9 +55,9 @@ def reference(x, cache, positions, quantization):
     return (q * scale[..., None]).to(torch.bfloat16).reshape(x.shape)
 
 
-def inputs(shape, dtype=torch.int32, offsets=(0, 0, 0), quantization="fp4", generation=0):
+def inputs(shape, dtype=torch.int32, offsets=(0, 0, 0), quantization="fp4", generation=0, group_size=32):
     torch.manual_seed(907 + generation)
-    n = shape[0] if quantization == "fp4" else math.prod(shape[:-1])
+    n = shape[0] if quantization == "fp4" and group_size == 32 else math.prod(shape[:-1])
     parent = torch.full((math.prod(shape) + offsets[0] + 8,), -37, dtype=torch.bfloat16, device="cuda")
     x = parent[offsets[0] : offsets[0] + math.prod(shape)].view(shape)
     x.copy_(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * (1 + generation))
@@ -73,15 +77,15 @@ def assert_bits(actual, expected):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("quantization,heads", [("fp4", 1), ("fp4", 4), ("fp4", 32), ("fp8", 1)])
+@pytest.mark.parametrize("quantization,heads,group_size", [("fp4", 1, 32), ("fp4", 4, 32), ("fp4", 32, 32), ("fp8", 1, 32), ("fp4", 1, 16)])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_prepared_dynamic_length_alignment_and_guards(quantization, heads, dtype, monkeypatch):
+def test_prepared_dynamic_length_alignment_and_guards(quantization, heads, group_size, dtype, monkeypatch):
     import triton
     from cudnn.rope import qdq as api
 
-    dim = 128 if quantization == "fp4" else 512
-    initial = inputs((1, heads, dim), dtype, quantization=quantization)
-    op = cudnn.RopeQDQInplace(*initial[:3], quantization=quantization)
+    dim = 128 if quantization == "fp4" and group_size == 32 else 512
+    initial = inputs((1, heads, dim), dtype, quantization=quantization, group_size=group_size)
+    op = cudnn.RopeQDQInplace(*initial[:3], quantization=quantization, group_size=group_size, scale_format="e4m3" if group_size == 16 else "ue8m0")
     assert op.check_support()
     op.compile()
     assert op.scratch_workspace_bytes() == 0
@@ -93,8 +97,8 @@ def test_prepared_dynamic_length_alignment_and_guards(quantization, heads, dtype
 
     monkeypatch.setattr(triton, "compile", unexpected_compile)
     for generation, (n, offsets) in enumerate(((1, (0, 0, 0)), (5, (1, 1, 1)), (17, (2, 1, 1)), (64, (8, 0, 0)))):
-        x, cache, positions, parent, cp, pp = inputs((n, heads, dim), dtype, offsets, quantization, generation)
-        expected = reference(x, cache, positions, quantization)
+        x, cache, positions, parent, cp, pp = inputs((n, heads, dim), dtype, offsets, quantization, generation, group_size)
+        expected = reference(x, cache, positions, quantization, group_size)
         expected_parent, cache_before, pos_before = parent.clone(), cp.clone(), pp.clone()
         expected_parent[offsets[0] : offsets[0] + x.numel()].copy_(expected.flatten())
         result = op.execute(x, cache, positions)
@@ -121,17 +125,18 @@ def test_exact_midpoints_and_signed_zero(quantization):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("quantization", ["fp4", "fp8"])
-def test_graph_changed_inputs_no_tensor_work_on_execute(quantization):
+@pytest.mark.parametrize("quantization,group_size", [("fp4", 32), ("fp8", 32), ("fp4", 16)])
+def test_graph_changed_inputs_no_tensor_work_on_execute(quantization, group_size):
     from torch.utils._python_dispatch import TorchDispatchMode
 
     class NoTensorWork(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             raise AssertionError(f"unexpected tensor operation on execute: {func}")
 
-    args = inputs((17, 1, 128 if quantization == "fp4" else 512), offsets=(1, 1, 1), quantization=quantization)
+    dim = 128 if quantization == "fp4" and group_size == 32 else 512
+    args = inputs((17, 1, dim), offsets=(1, 1, 1), quantization=quantization, group_size=group_size)
     x, cache, positions = args[:3]
-    op = cudnn.RopeQDQInplace(x, cache, positions, quantization=quantization)
+    op = cudnn.RopeQDQInplace(x, cache, positions, quantization=quantization, group_size=group_size, scale_format="e4m3" if group_size == 16 else "ue8m0")
     op.compile()
     launch = torch.cuda.Stream()
     launch.wait_stream(torch.cuda.current_stream())
@@ -141,8 +146,8 @@ def test_graph_changed_inputs_no_tensor_work_on_execute(quantization):
             op.execute(x, cache, positions, current_stream=launch.cuda_stream)
     last = None
     for generation in (1, 2):
-        new = inputs(tuple(x.shape), offsets=(1, 1, 1), quantization=quantization, generation=generation)
-        expected = reference(*new[:3], quantization)
+        new = inputs(tuple(x.shape), offsets=(1, 1, 1), quantization=quantization, generation=generation, group_size=group_size)
+        expected = reference(*new[:3], quantization, group_size)
         launch.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(launch):
             x.copy_(new[0])
@@ -208,4 +213,136 @@ def test_model_shaped_fp8(batch, sequence):
     x, cache, positions, *_ = inputs((batch, sequence, 512), quantization="fp8")
     expected = reference(x, cache, positions, "fp8")
     cudnn.rope_qdq_inplace(x, cache, positions, quantization="fp8")
+    assert_bits(x, expected)
+
+
+@pytest.mark.L0
+def test_group16_non_power_of_two_scale_midpoints():
+    # These exact BF16 values include x=0.03662109375, scale=0.029296875.
+    # RN division gives the E2M1 midpoint 1.25; reciprocal multiplication
+    # without the FP16 normalization boundary moves it above that midpoint.
+    scales = torch.tensor([0.029296875, 0.05859375, 0.234375, 0.46875, 1.875, 7.5], device="cuda")
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="cuda")
+    values = (scales[:, None] * midpoints[None, :]).flatten().to(torch.bfloat16)
+    scale = scales.repeat_interleave(midpoints.numel())
+    below = torch.nextafter(values, torch.full_like(values, -float("inf")))
+    above = torch.nextafter(values, torch.full_like(values, float("inf")))
+    group = torch.stack(
+        (
+            torch.zeros_like(values),
+            -torch.zeros_like(values),
+            values,
+            -values,
+            below,
+            -below,
+            above,
+            -above,
+            (6 * scale).to(torch.bfloat16),
+            (-6 * scale).to(torch.bfloat16),
+            values,
+            -values,
+            below,
+            -below,
+            above,
+            -above,
+        ),
+        dim=-1,
+    )
+    x, cache, positions, *_ = inputs((group.shape[0], 512), group_size=16)
+    x.copy_(group.repeat(1, 32))
+    cache[:, :32].fill_(1)
+    cache[:, 32:].zero_()
+    expected = reference(x, cache, positions, "fp4", 16)
+    # A negative control proves the data detects the reciprocal error itself.
+    divided = group.float() / scale[:, None]
+    multiplied = group.float() * torch.reciprocal(scale[:, None])
+    tie = divided.abs() == 1.25
+    assert torch.any(tie & (multiplied.abs() > 1.25)).item()
+    assert_bits((scale.to(torch.float8_e4m3fn).float() * 6).to(torch.bfloat16), group[:, 8])
+    cudnn.rope_qdq_inplace(x, cache, positions, quantization="fp4", group_size=16, scale_format="e4m3")
+    assert_bits(x, expected)
+
+
+@pytest.mark.L0
+def test_group16_floor_saturation_and_leading_dimensions():
+    args = inputs((2, 3, 512), group_size=16)
+    x, cache, positions = args[:3]
+    cache[:, :32].fill_(1)
+    cache[:, 32:].zero_()
+    tiny = torch.finfo(torch.bfloat16).tiny
+    pattern = torch.tensor(
+        [0.0, -0.0, tiny, -tiny, 2**-10, -(2**-10), 2688, -2688, 1e10, -1e10, 3e38, -3e38, 0.25, -0.25, 6, -6], device="cuda", dtype=torch.bfloat16
+    )
+    x.flatten().copy_(pattern.repeat(x.numel() // pattern.numel()))
+    expected = reference(x, cache, positions, "fp4", 16)
+    op = cudnn.RopeQDQInplace(x, cache, positions, quantization="fp4", group_size=16, scale_format="e4m3")
+    op.compile()
+    op.execute(x.view(6, 512), cache, positions)
+    assert_bits(x, expected)
+    x.zero_()
+    x[..., 0] = tiny
+    x[..., 1] = -tiny
+    expected = reference(x, cache, positions, "fp4", 16)
+    op.execute(x.view(1, 2, 3, 512), cache, positions)
+    assert_bits(x, expected)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "quantization,group_size,scale_format",
+    [
+        ("fp4", 16, "ue8m0"),
+        ("fp8", 16, "e4m3"),
+        ("fp4", 32, "e4m3"),
+        ("fp8", 32, "e4m3"),
+        ("fp4", 8, "e4m3"),
+        ("fp4", 16.0, "e4m3"),
+    ],
+)
+def test_unsupported_format_combinations(quantization, group_size, scale_format):
+    args = inputs((2, 512), group_size=16)
+    with pytest.raises(ValueError, match="supported .*quantization, group_size, scale_format"):
+        cudnn.RopeQDQInplace(*args[:3], quantization=quantization, group_size=group_size, scale_format=scale_format).check_support()
+
+
+@pytest.mark.L0
+def test_group16_runtime_contract_and_separate_compilation():
+    x, cache, positions, *_ = inputs((5, 512), group_size=16)
+    kwargs = dict(quantization="fp4", group_size=16, scale_format="e4m3")
+    op = cudnn.RopeQDQInplace(x, cache, positions, **kwargs)
+    op.compile()
+    fp8 = cudnn.RopeQDQInplace(x, cache, positions, quantization="fp8")
+    fp8.compile()
+    assert fp8._compiled_kernel is not op._compiled_kernel
+    for shape in ((5, 128), (512,), (0, 512)):
+        with pytest.raises(ValueError):
+            cudnn.RopeQDQInplace(torch.empty(shape, dtype=x.dtype, device=x.device), cache, positions, **kwargs).check_support()
+    with pytest.raises(NotImplementedError, match="strides"):
+        cudnn.RopeQDQInplace(x.t(), cache, positions, **kwargs).check_support()
+    with pytest.raises(ValueError, match="positions"):
+        op.execute(x, cache, positions.to(torch.int64))
+    with pytest.raises(ValueError, match="overlap"):
+        op.execute(x, x.view(torch.float32).view(-1, 64), positions)
+    with pytest.raises(ValueError, match="overlap"):
+        op.execute(x, cache, x.view(torch.int32).flatten()[:5])
+    with pytest.raises(ValueError, match="autograd"):
+        op.execute(x.detach().requires_grad_(), cache, positions)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("source_sequence,ratio", [(4096, 1), (4096, 2), (16384, 1), (16384, 2), (1, 1), (1, 2)])
+def test_model_shaped_compressed_kv(batch, source_sequence, ratio):
+    latent_sequence = source_sequence // ratio if source_sequence > 1 else 1
+    x, _, _, *_ = inputs((batch, latent_sequence, 512), group_size=16)
+    angles = torch.arange(max(source_sequence, 4097), device="cuda")[:, None].float() * torch.linspace(0.0003, 0.13, 32, device="cuda")[None, :]
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    positions = (torch.arange(latent_sequence, device="cuda", dtype=torch.int64) * ratio).repeat(batch)
+    if source_sequence == 1:
+        # _compress_kv emits one latent at position 4096 for start_pos 4096
+        # (ratio 1) or 4097 (ratio 2).
+        positions.fill_(4096)
+    expected = reference(x, cache, positions, "fp4", 16)
+    result = cudnn.rope_qdq_inplace(x, cache, positions, quantization="fp4", group_size=16, scale_format="e4m3")
+    assert result["out"] is x
     assert_bits(x, expected)
