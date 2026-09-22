@@ -1164,10 +1164,12 @@ class WorkspaceCarver:
     undersized buffer raises immediately with the required size in the message
     (never silent corruption). Constructing the carver without taking a chunk
     is the validation step for a backend graph that consumes the workspace
-    whole (``pygraph.execute(variant_pack, workspace)``).
+    whole (``pygraph.execute(variant_pack, workspace)``). ``align`` is the base
+    alignment the consumer needs: 16 bytes by default; a path that carves TMA
+    descriptors out of the buffer asks for ``_WS_ALIGN`` (cuTensorMap wants 64).
     """
 
-    def __init__(self, workspace, required: int, owner: str):
+    def __init__(self, workspace, required: int, owner: str, *, align: int = 16):
         if workspace is None:
             raise ValueError(
                 f"cudnn: {owner} requires a {required}-byte workspace but execute() "
@@ -1177,15 +1179,18 @@ class WorkspaceCarver:
         if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
             raise TypeError(f"cudnn: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
         torch = _torch()
+        if not workspace.is_contiguous():
+            # reshape(-1) would copy a strided view: a hidden allocation carved into instead of the caller's buffer.
+            raise ValueError(f"cudnn: {owner} workspace must be contiguous; got shape {tuple(workspace.shape)} strides {tuple(workspace.stride())}")
         flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.reshape(-1)
+        flat = flat.view(-1)
         if flat.numel() < required:
             raise ValueError(
                 f"cudnn: {owner} requires a {required}-byte workspace; the provided "
                 f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
             )
-        if flat.data_ptr() % 16 != 0:
-            raise ValueError(f"cudnn: {owner} workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
+        if flat.data_ptr() % align != 0:
+            raise ValueError(f"cudnn: {owner} workspace must be at least {align}-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
         self._flat = flat
         self._off = 0
         self._owner = owner

@@ -139,6 +139,27 @@ def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stre
     return jax.block_until_ready(jnp.empty((nbytes,), dtype=jnp.uint8, device=device))
 
 
+def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) -> None:
+    """Keep the caller's workspace alive across the asynchronous launch that reads it (R2 lifetime).
+
+    torch: ``record_stream`` on the launch stream, so a buffer allocated or last used on
+    another stream is not recycled by the caching allocator before the kernel is done.
+    Immutable frameworks (JAX) have no record_stream: the API holds the reference until its
+    next execute, the same way it holds its pointer tables.
+    """
+    if workspace is None:
+        return
+    if is_torch_tensor(workspace):
+        import torch
+
+        from cudnn._torch_stream import as_torch_stream
+
+        stream = as_torch_stream(int(current_stream), workspace.device) if current_stream is not None else torch.cuda.current_stream(workspace.device)
+        workspace.record_stream(stream)
+        return
+    api._live_workspace = workspace
+
+
 def wrapper_operand_meta(tensor):
     """Everything a wrapper's derivation reads off an operand, and nothing else.
 
