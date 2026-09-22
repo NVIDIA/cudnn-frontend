@@ -180,6 +180,9 @@ navigation:
           - page: Tail RoPE + Microscaled QDQ
             path: ../../fe-oss-apis/rope_qdq.md
             slug: rope-qdq
+          - page: Prepared BF16 Tail RoPE
+            path: ../../fe-oss-apis/rope_tail.md
+            slug: rope-tail
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../fe-oss-apis/dsa.md
             slug: dsa
