@@ -55,6 +55,23 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+# Lowering of the CLC scheduler's credit arrive (``tile_dsl.scheduler.read_tile_id_arrive``, every call site below): False =
+# the lane-compare BRANCH form, True = the single predicated arrive of PR #1169.  Both land the same arrives from the same
+# lanes (READ_TILE_ARRIVERS unchanged), so this is a per-SPECIALIZATION tuning constant, keyed on the compile-time mask bits
+# that select the dense and the masked softmax arms (``CFG.MASK_FLAGS == 0`` is this kernel's dense gate): the branch form on
+# the UNMASKED specialization, the predicated form (develop's) wherever a mask arm -- causal / SWA / padded -- is compiled in.
+# MEASURED on B200 (A/B/A x3, CUPTI medians, O / Stats / Amax_O bit-identical, 2026-09-22), stacked on this branch's exp2
+# split; branch form vs predicated form:
+#   B=1 H=24/8 S=16K dense (MASK_FLAGS == 0), NATURAL          +8.14 % (ctrl 0.15)  -> branch form here (False)
+#   B=1 H=24/8 S=16K top_left causal, LPT (the proposed plan)  -5.13 % (ctrl 0.10)  -> predicated form kept (True)
+#   the same causal cell with NATURAL pinned                   -0.84 % (ctrl 0.09)
+#   d192x128 MXFP8 sibling, H=128 S=8K dense                   +6.84 % (ctrl 0.04)  -> branch form there too
+# Mechanism OPEN: a kernel-wide ptxas reschedule of the softmax body (the predicated form sinks the dense arm's alpha / stats
+# publish to the end of the exp burst; the branch form is what loses on the masked body).  Per-specialization tuning
+# constant; re-measure before changing.  Pinned by test_sdpa_fwd_mxfp8_sm100.py: the source scan (this exact expression,
+# every site passes it), the module value per specialization, and the sm_100a BSSY / SYNCS.ARRIVE counts of both.
+PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
+
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
 Cfg = type(CFG)
@@ -1079,7 +1096,7 @@ def _tmaldg_warp_group(
     V_SF_EXPECT_BYTES = 0 if CFG.PV_BF16 else SF_SMEM_SIZE_V * CFG.CTA_MMA
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         # Empty-kv tile: MMA's empty-mainloop branch handles the matching mbar phases.
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1318,7 +1335,7 @@ def _tmastg_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         q_row_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
         # KV split: partials are stacked split-major on the workspace BATCH axis
@@ -1407,7 +1424,7 @@ def _mma_warp_quiet(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -1625,7 +1642,7 @@ def _mma_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
             # Empty mainloop — keep softmax/correction phase trackers in lockstep with non-empty path.
@@ -2208,7 +2225,7 @@ def _softmax_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
-            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
         bars.mb_o_empty[0].wait(epilogue_state)
@@ -2283,7 +2300,7 @@ def _softmax_warp_group(
                     leader_cta_id,
                 )
             if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
-                read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+                read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
                     True,
@@ -2410,7 +2427,7 @@ def _correction_warp_group(
     bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx)
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         # Iter-0 skip — MMA's iter-0 BMM2 uses init_d=False to overwrite O, no α-rescale needed.
         if bounds.right > bounds.left:
             for qs in cutlass.range_constexpr(CFG.TILES_Q):

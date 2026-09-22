@@ -10,6 +10,7 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -254,7 +255,10 @@ def launch_f16(
 # SKIPS (never fails) when no nvdisasm decodes the cubin; a compile failure IS a failure.
 
 # Opcode -> the substrings a listing line must all contain.  The leading space on the packed ops keeps `FFMA2` from
-# matching a hypothetical `XFFMA2`; `MUFU.EX2` also matches `MUFU.EX2.F16x2`-style variants on purpose.
+# matching a hypothetical `XFFMA2`; `MUFU.EX2` also matches `MUFU.EX2.F16x2`-style variants on purpose.  `BSSY` and the
+# per-lane ` SYNCS.ARRIVE` (the leading space excludes the uniform `USYNCS.ARRIVE`) are the two opcodes that tell the
+# scheduler credit arrive's lowerings apart: the lane-compare branch form costs one BSSY reconverge and `cga_size` arrives
+# per call site, the predicated form none and one (`tile_dsl/scheduler.py::read_tile_id_arrive`).
 SASS_OPCODE_COUNTS = {
     "MUFU_EX2": ("MUFU.EX2",),
     "FFMA2": (" FFMA2",),
@@ -264,6 +268,8 @@ SASS_OPCODE_COUNTS = {
     "FMNMX3": ("FMNMX3",),
     "STL": ("STL",),
     "LDL": ("LDL",),
+    "BSSY": ("BSSY",),
+    "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
 }
 
 _SASS_PROBE_TEMPLATE = """
@@ -347,7 +353,9 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"{arch}_{tag}"
+    # One dump dir per (arch, tag, params): two probes of the same kernel that differ only in ``params`` (the dense and the
+    # causal specialization of one pin) must not share a dir, or the second compile trips over the first's.
+    dump = tmp_path / f"{arch}_{tag}_{hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()[:8]}"
     dump.mkdir()
     argv = [sys.executable, "-c", probe_src, str(dump), arch, json.dumps(params), *cands]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)

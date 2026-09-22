@@ -26,6 +26,7 @@ Skips cleanly otherwise.
 """
 
 import math
+import re
 from typing import NamedTuple, Optional
 
 import pytest
@@ -2178,10 +2179,18 @@ _CC100_D128_MXFP8_PARAMS = {"fused_ldtm_stat": False, "exp2_fma_split": True}
 _CC103_D128_MXFP8_PARAMS = {"fused_ldtm_stat": True, "exp2_fma_split": False}
 
 
+_D128_MXFP8_SASS_PROBES: dict = {}  # (arch, params) -> SassProbe: one trace-compile per cubin per session, however many pins read it
+
+
 def _d128_mxfp8_sass_probe(tmp_path, arch: str, params: dict):
     """Trace-compile the d128 MXFP8 kernel for ``arch`` with the per-cc ``params`` and return (stats, expect):
-    the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state)."""
-    probe = run_sass_probe(tmp_path, probe_src=_SM100_D128_MXFP8_SASS_PROBE, arch=arch, params=params, tag="mxfp8_d128")
+    the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state).  Memoized per
+    (arch, params): the exp2-split pin and the dense credit-arrive pin below read the SAME sm_100a cubin, so it is compiled once;
+    the causal credit-arrive pin (``window_right=0`` in ``params``) is its own compile."""
+    key = (arch, tuple(sorted(params.items())))
+    if key not in _D128_MXFP8_SASS_PROBES:
+        _D128_MXFP8_SASS_PROBES[key] = run_sass_probe(tmp_path, probe_src=_SM100_D128_MXFP8_SASS_PROBE, arch=arch, params=params, tag="mxfp8_d128")
+    probe = _D128_MXFP8_SASS_PROBES[key]
     return probe.stats, probe.expect
 
 
@@ -2230,6 +2239,147 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
         stats["FSETP"] <= _SM103_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
     ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
     assert stats["STL"] <= _SM103_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM103_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
+
+
+# ============================================================================ sm100 MXFP8: the scheduler credit arrive's lowering is a PER-SPECIALIZATION constant (PREDICATED_CREDIT_ARRIVE = CFG.MASK_FLAGS != 0)
+# PR #1169 turned `tile_dsl.scheduler.read_tile_id_arrive` into ONE predicated arrive per warp.  On B200 that re-lowering is a
+# kernel-wide ptxas reschedule whose sign is per kernel AND per mask specialization (A/B/A x3, CUPTI medians, O / Stats / Amax_O
+# bit-identical): +3.1 % on per-tensor fp8 d128, +1.3 % on bf16 d192x128, neutral on bf16 d128 and fp8 d192x128; on the two MXFP8
+# prefill kernels the BRANCH form wins the UNMASKED specialization (stacked on this branch's exp2 split: d128 +8.14 % at B=1
+# H=24/8 S=16K dense, d192x128 +6.84 % at H=128 S=8K dense) and LOSES the d128 kernel's causal one (-5.13 % at the same shape,
+# top_left, under the LPT plan the heuristics propose; -0.84 % with NATURAL pinned).  So those two spell
+# `PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0` once -- the same compile-time bits that select the dense vs the masked
+# softmax arms -- and pass it at EVERY `read_tile_id_arrive` site: the branch form on the dense specialization (its sm_100a cubin
+# is the pre-#1169 one), develop's predicated form wherever a mask arm (causal / SWA / padded) is compiled in (that cubin is
+# develop's).  No other sm100 kernel passes the kwarg.  Three tripwires: the source scan (this exact expression, defined once,
+# every site passes it, no literal, no leak into a sibling); the module VALUE under a dense, a causal and a padded
+# TemplateParams; and the sm_100a SASS of BOTH d128 specializations -- the branch form costs one BSSY reconverge and `cga_size`
+# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 / SYNCS.ARRIVE 55 on
+# the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
+# form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
+# like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
+_CREDIT_ARRIVE_SITES = {(128, 128): 7, (192, 128): 7}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the two softmax mask arms
+_SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
+_PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
+# The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
+_CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
+# d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
+_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
+    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 55}),  # the branch form; the predicated form read 8 / 48 here
+    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 56}),  # the predicated form (develop's cubin); the branch form read 15 / 63 here
+}
+
+
+def _code_lines(src):
+    """Source with whole-line comments dropped -- the prose in these modules quotes the spellings the scans look for."""
+    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _credit_arrive_sites(code):
+    """Every ``read_tile_id_arrive(`` call site of a kernel source, as its balanced argument text (black wraps some calls, so
+    the kwarg is not necessarily on the ``read_tile_id_arrive(`` line)."""
+    out = []
+    for m in re.finditer(r"\bread_tile_id_arrive\(", code):
+        i, depth = m.end(), 1
+        while depth:
+            depth += (code[i] == "(") - (code[i] == ")")
+            i += 1
+        out.append(code[m.end() : i - 1])
+    return out
+
+
+def _sm100_kernel_dir():
+    import pathlib
+
+    import cudnn.sdpa.fwd.kernels.sm100 as _sm100
+
+    return pathlib.Path(_sm100.__file__).parent
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flavor", sorted(_CREDIT_ARRIVE_SITES), ids=lambda f: f"d{f[0]}" if f[0] == f[1] else f"d{f[0]}x{f[1]}")
+def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
+    """The kernel's ``PREDICATED_CREDIT_ARRIVE`` is the mask-derived expression ``CFG.MASK_FLAGS != 0`` (the module's own value,
+    checked under a dense, a causal and a padded TemplateParams: False on the unmasked specialization, True wherever a mask arm
+    is compiled in), defined exactly once and never as a literal, no call site carries a ``predicated=True`` / ``False``
+    literal, and EVERY ``read_tile_id_arrive`` site -- the pinned count -- passes ``predicated=PREDICATED_CREDIT_ARRIVE``.  One
+    site dropping the kwarg re-lowers that warp role to the predicated arrive on the dense specialization and hands the
+    -5.5 % / -6.3 % back; a literal ``False`` re-lowers the causal specialization to the branch form and hands its -5.1 % back --
+    both with O / Stats / Amax_O bit-identical, so only this scan (and the SASS pins below) sees it."""
+    from cudnn.frost.tile_dsl.constants import MASK_NONE
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    cta_mma = max(supported_cgas_for(flavor, fp8=True, device_cc=(10, 0), pertensor=False))
+    mods = {}
+    for name, (extra, want) in _CREDIT_ARRIVE_SPECIALIZATIONS.items():
+        mod = _load_sm100_kernel_module(flavor, TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, **extra), fp8=True, pertensor=False, rubin=False)
+        assert (mod.CFG.MASK_FLAGS == MASK_NONE) == (
+            name == "dense"
+        ), f"{mod.__name__} [{name}]: MASK_FLAGS={mod.CFG.MASK_FLAGS}, the probe params select the wrong specialization"
+        assert (
+            isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool) and mod.PREDICATED_CREDIT_ARRIVE is want
+        ), f"{mod.__name__} [{name}, MASK_FLAGS={mod.CFG.MASK_FLAGS}]: PREDICATED_CREDIT_ARRIVE={mod.PREDICATED_CREDIT_ARRIVE!r}, want {want}"
+        mods[name] = mod
+    assert len({m.__file__ for m in mods.values()}) == 1, "the three specializations must come from one kernel file"
+    with open(mods["dense"].__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    defs = re.findall(r"^PREDICATED_CREDIT_ARRIVE\b.*$", code, re.M)
+    assert defs == [
+        _PREDICATED_CREDIT_ARRIVE_DEF
+    ], f"{mods['dense'].__name__}: PREDICATED_CREDIT_ARRIVE must be defined exactly once as `{_PREDICATED_CREDIT_ARRIVE_DEF}`, found {defs}"
+    assert not re.search(
+        r"predicated=(?:True|False)\b", code
+    ), f"{mods['dense'].__name__}: a predicated= literal at a call site bypasses PREDICATED_CREDIT_ARRIVE"
+    sites = _credit_arrive_sites(code)
+    assert (
+        len(sites) == _CREDIT_ARRIVE_SITES[flavor]
+    ), f"{mods['dense'].__name__}: {len(sites)} read_tile_id_arrive sites, the pin says {_CREDIT_ARRIVE_SITES[flavor]}"
+    bare = [args for args in sites if "predicated=PREDICATED_CREDIT_ARRIVE" not in args]
+    assert not bare, f"{mods['dense'].__name__}: {len(bare)} read_tile_id_arrive site(s) take the default (predicated) lowering: {bare}"
+    assert code.count("predicated=") == len(sites), f"{mods['dense'].__name__}: a predicated= outside a read_tile_id_arrive call"
+
+
+@pytest.mark.L0
+def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
+    """Every OTHER sm100 kernel takes ``read_tile_id_arrive``'s default (the predicated arrive: +3.1 % on fp8 d128, +1.3 % on
+    bf16 d192x128, neutral elsewhere): no ``predicated=`` kwarg and no ``PREDICATED_CREDIT_ARRIVE`` constant anywhere else under
+    ``kernels/sm100/``.  Widening the opt-out to a third kernel is a MEASURED, per-specialization decision that adds its file to
+    ``_SM100_MXFP8_OPTED_OUT`` (and a row to ``_CREDIT_ARRIVE_SITES``), never a copy-paste."""
+    kdir = _sm100_kernel_dir()
+    files = sorted(p.name for p in kdir.glob("*.py") if p.name != "__init__.py")
+    assert set(_SM100_MXFP8_OPTED_OUT) <= set(files), f"opted-out kernels missing from {kdir}: {files}"
+    leaked = {}
+    for name in files:
+        if name in _SM100_MXFP8_OPTED_OUT:
+            continue
+        code = _code_lines((kdir / name).read_text(encoding="utf-8"))
+        hits = [tok for tok in ("predicated=", "PREDICATED_CREDIT_ARRIVE") if tok in code]
+        if hits:
+            leaked[name] = hits
+    assert not leaked, f"sm100 kernels other than the two MXFP8 prefill kernels touch the credit-arrive lowering: {leaked}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
+def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
+    """On the sm_100a cubin at the production geometry the 7 credit arrives lower to the form the specialization selects: the
+    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
+    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
+    form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
+    (derived from the module) and 2 x 194 == 388 on the causal one, whose warpgroups each trace the softmax body twice (the
+    unmasked segment's and the masked one's, shared by the left- and right-masked segments).  The dense case reads the SAME
+    cubin as test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins (memoized probe); the causal one is a second compile."""
+    extra, pins = _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS[specialization]
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", {**_CC100_D128_MXFP8_PARAMS, **extra})
+    for key, want in pins.items():
+        assert (
+            stats[key] == want
+        ), f"[{specialization}] {key} {stats[key]} != {want}: a credit-arrive site lowered to the other form (or PREDICATED_CREDIT_ARRIVE no longer follows CFG.MASK_FLAGS): {stats}"
+    bodies = 1 if specialization == "dense" else 2
+    assert (
+        stats["MUFU_EX2"] == bodies * expect["EXPECT_MUFU_EX2"] == bodies * 194
+    ), f"[{specialization}] MUFU.EX2 {stats['MUFU_EX2']}: the credit-arrive lowering must not touch the exp2 split"
 
 
 # ============================================================================ sm100 d128 MXFP8: Stats is the exact fp32 log-sum-exp (fp64 reference), with the exp2 split in place
