@@ -185,6 +185,9 @@ def stage_output(view, target: str, stream: int, staging=None, port: str = "") -
     ``staging`` carve and the caller must :func:`write_back` on ``stream`` after
     the launch. Nothing is written here, so no stream work is issued.
     """
+    if not packed(view.shape, view.stride()):
+        # The kernel writes packed row-major storage; a padded caller buffer would be silently misfilled.
+        raise NotImplementedError(f"output '{port}' must be packed row-major, but it was passed with shape={tuple(view.shape)} stride={tuple(view.stride())}")
     if buffers.dtype_name(view) == target:
         return int(view.data_ptr()), None, None
     if staging is None:

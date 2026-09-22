@@ -373,6 +373,9 @@ import cudnn
 
 handle = cudnn.create_handle()  # Reuse across calls
 
+# T,H,D: ragged offsets are REQUIRED at execute. For a fully packed batch build them once per batch:
+q_off, k_off, v_off, o_off, stats_off = NSA.packed_thd_ragged_offsets(seq_len_q, seq_len_kv, q, k, v, o, stats)
+
 swa = NSA.SlidingWindowAttention(
     sample_q=q,
     sample_k=k,
@@ -400,8 +403,6 @@ assert swa.check_support()
 swa.compile()
 # The caller owns the backend workspace: allocate it once, reuse it across executes.
 ws = torch.empty(max(swa.get_workspace_size(), 1), dtype=torch.uint8, device=q.device)
-# T,H,D: ragged offsets are REQUIRED at execute. For a fully packed batch build them once per batch:
-q_off, k_off, v_off, o_off, stats_off = NSA.packed_thd_ragged_offsets(seq_len_q, seq_len_kv, q, k, v, o, stats)
 swa.execute(
     q_tensor=q,
     k_tensor=k,
