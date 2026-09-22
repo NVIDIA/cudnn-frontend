@@ -2682,3 +2682,30 @@ def test_wrappers_normalise_layouts_the_plan_declines(monkeypatch):
     for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
         torch.testing.assert_close(actual_grads[name], expected_grads[name], rtol=1e-2, atol=1e-2)
     assert actual_grads["dk_tensor"].is_contiguous() and actual_grads["dv_tensor"].is_contiguous()
+
+
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_hstu_attention_forward_staging_outlives_the_released_original():
+    """R1 staging: the wrapper clones a non-native q on an explicit side stream and records the
+    original there, so a caller that releases it right after the call, while the clone is still
+    queued, cannot hand the block to its next same-size allocation (poisoned here) first."""
+    q, k, v, _, cu = _inputs()
+    ref = hstu_attention_forward(q, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128)["o_tensor"]
+    storage = torch.empty(q.shape[0], q.shape[1], 2 * q.shape[2], dtype=q.dtype, device=q.device)
+    storage[..., ::2] = q
+    q_strided = storage[..., ::2]
+    assert _api._needs_staging(q_strided, _api._input_layout_accepted(q_strided, False))
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000_000)  # the wrapper's staging clone queues behind this
+    got = hstu_attention_forward(q_strided, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128, stream=side)["o_tensor"]
+    shape, dtype = storage.shape, storage.dtype
+    del storage, q_strided  # the caller releases its references while the clone is still pending
+    poison = torch.empty(shape, dtype=dtype, device=q.device)
+    # Same size as the released block: with the original recorded, the allocator defers the block's reuse
+    # (or waits for the pending copy first) instead of letting this fill race it.
+    poison.fill_(float("nan"))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got, ref, atol=0.0, rtol=0.0)

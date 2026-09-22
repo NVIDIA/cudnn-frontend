@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from cuda.bindings import driver as cuda
 import torch
 
-from cudnn._torch_stream import as_torch_stream
+from cudnn._torch_stream import as_torch_stream, record_streams
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 
@@ -131,18 +131,7 @@ def _as_torch_stream(
     return as_torch_stream(stream, device)
 
 
-def _record_streams(
-    tensors: Tuple[Optional[torch.Tensor], ...],
-    stream: Optional[cuda.CUstream | torch.cuda.Stream],
-    device: torch.device,
-) -> None:
-    """Keep raw-pointer operands alive until an explicit-stream launch completes."""
-    if stream is None:
-        return
-    consumer = _as_torch_stream(stream, device)
-    for tensor in tensors:
-        if tensor is not None and tensor.is_cuda:
-            tensor.record_stream(consumer)
+_record_streams = record_streams  # R1: keep raw-pointer operands alive until an explicit-stream launch completes
 
 
 def _empty_grad_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -174,8 +163,10 @@ def _needs_staging(tensor: torch.Tensor, accepted: bool) -> bool:
     return not accepted and tensor.is_cuda and tensor.ndim == 3 and tensor.data_ptr() % 16 == 0
 
 
-def _stage_input(tensor: torch.Tensor, contiguous_only: bool) -> torch.Tensor:
+def _stage_input(tensor: torch.Tensor, contiguous_only: bool, stream, device: torch.device) -> torch.Tensor:
+    """Call inside the launch-stream context; the original is record_stream'ed on ``stream`` before the clone reads it (R1)."""
     if _needs_staging(tensor, _input_layout_accepted(tensor, contiguous_only)):
+        record_streams((tensor,), stream, device)
         return tensor.clone(memory_format=torch.contiguous_format)
     return tensor
 
@@ -950,7 +941,7 @@ def hstu_attention_forward(
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
     with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
-        q_tensor, k_tensor, v_tensor = (_stage_input(tensor, False) for tensor in (q_tensor, k_tensor, v_tensor))
+        q_tensor, k_tensor, v_tensor = (_stage_input(tensor, False, stream, q_tensor.device) for tensor in (q_tensor, k_tensor, v_tensor))
         o_tensor = torch.empty(
             q_tensor.shape,
             dtype=q_tensor.dtype,
@@ -1045,7 +1036,9 @@ def hstu_attention_backward(
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
     contiguous_only = _bwd_requires_contiguous(q_tensor, resolved_max_q, resolved_max_k, window_size, func_tensor)
     with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
-        do_tensor, q_tensor, k_tensor, v_tensor = (_stage_input(tensor, contiguous_only) for tensor in (do_tensor, q_tensor, k_tensor, v_tensor))
+        do_tensor, q_tensor, k_tensor, v_tensor = (
+            _stage_input(tensor, contiguous_only, stream, q_tensor.device) for tensor in (do_tensor, q_tensor, k_tensor, v_tensor)
+        )
         dq_tensor, dq_caller = _stage_grad(dq_tensor, q_tensor, contiguous_only)
         dk_tensor, dk_caller = _stage_grad(dk_tensor, k_tensor, contiguous_only)
         dv_tensor, dv_caller = _stage_grad(dv_tensor, v_tensor, contiguous_only)
