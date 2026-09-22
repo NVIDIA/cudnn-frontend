@@ -194,7 +194,7 @@ def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
 # tile's instructions serialized ahead of the exp burst) and "bits" = one keep-word per 32 columns from two
 # saturating shifts, then a register-to-predicate `R2P` + one `FSEL` per cell (1.4-1.6 per cell, independent
 # of the number of active terms).  Same masked set, same sentinel -> O / LSE bitwise identical; the forms differ
-# ONLY in instruction count (frost_dev/mask_sass/P1.md: masked body -208 (1 term) / -466 (2 terms) / -904 (the
+# ONLY in instruction count (sm_107a listings, 2026-09-22: masked body -208 (1 term) / -466 (2 terms) / -903 (the
 # mxfp8 d512 SWA build, whose 128 live i1 values had spilled to P2R/LOP3) instructions per KV tile per lane).
 # Every sm107 kernel picks the form with ONE module constant, `MASK_FORM`, the way it picks `DESC_VERSION`.
 _MASK_FORM_EXPECTED = "bits"
@@ -2740,7 +2740,7 @@ def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
     return {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
 
 
-# The masked softmax arm's SASS pin (frost_dev/mask_sass/P1.md).  Under MASK_FORM="bits" every masked KV-tile body carries
+# The masked softmax arm's SASS pin (sm_107a listings of both forms, 2026-09-22).  Under MASK_FORM="bits" every masked KV-tile body carries
 # 4 R2P per 32-column word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and 1 ISETP per cell per mask term
 # (611-764 ISETP whole-kernel on these two builds vs 107-108 now), and the mxfp8 d512 causal+SWA build ran out of predicate
 # registers (152 P2R, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask spec, ISETP ceiling, P2R ceiling, spill ceiling); the

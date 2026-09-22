@@ -85,7 +85,8 @@ def apply_mask_chunk(
 # compare), one ISETP per term and one FSEL per term (the i1 OR lowers to nested
 # selects), so a causal+SWA tile costs 5 instructions per cell and a padded
 # causal+SWA one 7 -- 51-72 % of a masked softmax tile's instructions, serialized
-# in front of the exp burst (frost_dev/mask_sass/Q1_SASS.md).  The information
+# in front of the exp burst (sm_107a listings, 2026-09-22: a masked KV tile ran
+# 805-1602 instructions per lane against 358-451 for a dense one).  The information
 # content of any of these masks is one or two band EDGES per row, so the form
 # below spends its instructions there instead:
 #
@@ -97,8 +98,9 @@ def apply_mask_chunk(
 #      `apply_mask_chunk` uses.  ptxas turns 32 consecutive bit tests into
 #      `R2P` (register -> 7 predicates) + one `FSEL` per cell, so the per-cell
 #      cost is 1.4-1.6 instructions regardless of how many mask terms are on
-#      (frost_dev/mask_sass/Q2_LOWERING.md, Q3_INTREE_IDIOM.md; the same idiom
-#      the block-sparse-attention SM90 backward uses, `predicate_bitmask_below`).
+#      (sm_107a / sm_100a micro-kernel listings, 2026-09-22, against 3.0-7.6 for
+#      the per-cell form; the same idiom the block-sparse-attention SM90 backward
+#      uses, `predicate_bitmask_below`).
 #
 # Semantics contract (shared with `apply_mask_chunk`, bitwise):
 #   - a masked cell becomes `mask_value` (default: the finite fp32-min sentinel;
@@ -117,6 +119,13 @@ MASK_FORM_BITS = "bits"  # apply_mask_chunk_bits: keep-word + register-to-predic
 MASK_FORMS = (MASK_FORM_CELLS, MASK_FORM_BITS)
 
 MASK_WORD_COLS = 32  # columns per keep-word = bits per register
+
+# The band arithmetic (`lo - kv_col_base`, `hi - kv_col_base`, the per-word shift count) is Int32.
+# With every absolute row / column index below 2**28 (a TMA coordinate keeps S far under that) a
+# window bound below this limit cannot wrap it; a bound at or past it can, and a wrapped `lo` makes
+# the bits form mask EVERYTHING where `apply_mask_chunk` masks nothing.  Enforced at trace time on
+# the Python-int bounds (no instruction); pinned by `test_bits_form_domain_guard`.
+MASK_BOUND_LIMIT = 1 << 30
 
 
 def keep_below_word(hi_rel, s: int):
@@ -157,8 +166,10 @@ def band_mask_words(lo, hi, kv_col_base, n_cols: int):
     ``lo`` / ``hi`` are per-lane Int32 absolute column bounds (``hi`` exclusive), or ``None``
     for a side no mask term defines -- that side folds out at trace time (one shift per word
     for a one-sided mask, two for a band), never an INT_MIN/INT_MAX sentinel, so ``lo - base``
-    cannot wrap.  Returns a tuple of ``ceil(n_cols / 32)`` ``Uint32`` words.  Trace-time
-    helper (plain Python over traced values), like :func:`apply_mask_chunk`."""
+    cannot wrap as long as the caller keeps every bound within ``MASK_BOUND_LIMIT`` of the chunk
+    (:func:`apply_mask_chunk_bits` refuses a wider window).  Returns a tuple of
+    ``ceil(n_cols / 32)`` ``Uint32`` words.  Trace-time helper (plain Python over traced
+    values), like :func:`apply_mask_chunk`."""
     if lo is None and hi is None:
         raise ValueError("band_mask_words: at least one of lo / hi must be given (a mask with no edge is no mask)")
     n_words = (n_cols + MASK_WORD_COLS - 1) // MASK_WORD_COLS
@@ -223,9 +234,18 @@ def apply_mask_chunk_bits(
     - SWA masks ``kv < q_minus_w``  ->  ``lo = q_minus_w`` (the same bottom-right anchor).
 
     A side no term defines is ``None`` and folds out.  Fully-masked rows, the sentinel and
-    the caller's tile-level trimming are exactly as for :func:`apply_mask_chunk`."""
+    the caller's tile-level trimming are exactly as for :func:`apply_mask_chunk`.
+
+    Domain: a compile-time ``window_left`` / ``window_right`` at or past ``MASK_BOUND_LIMIT``
+    raises at trace time (see the constant); the per-cell form has no such limit because it
+    never subtracts the chunk base."""
     if cutlass.const_expr(mask_flags == MASK_NONE):
         return reg_S
+
+    if (mask_flags & MASK_SWA) and isinstance(window_left, int) and window_left >= MASK_BOUND_LIMIT:
+        raise ValueError(f"apply_mask_chunk_bits: window_left must be < {MASK_BOUND_LIMIT} (got {window_left}); the Int32 band arithmetic would wrap")
+    if (mask_flags & MASK_CAUSAL) and isinstance(window_right, int) and window_right >= MASK_BOUND_LIMIT:
+        raise ValueError(f"apply_mask_chunk_bits: window_right must be < {MASK_BOUND_LIMIT} (got {window_right}); the Int32 band arithmetic would wrap")
 
     lo = None
     hi = None

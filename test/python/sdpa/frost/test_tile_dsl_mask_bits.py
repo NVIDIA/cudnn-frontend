@@ -15,9 +15,11 @@ saturated shift), a fully-masked and a fully-unmasked row, NaN / +-inf / +-0 / t
 itself as payload.  Bitwise (`view(int32)`) so a NaN payload is compared as a bit pattern.
 
 Device-independent: the emulation below mirrors `tile_dsl/mask.py` line by line in torch int64
-arithmetic (the values are int32-range, so int64 never wraps where int32 would not).  The GPU
-half -- the real kernels, `MASK_FORM` cells vs bits, O / LSE bitwise -- is the A/B probe
-`frost_dev/mask_sass/bitwise_ab.py` recorded in `frost_dev/mask_sass/P1.md`.
+arithmetic and wraps the intermediates the device computes in Int32 (`lo - kv_col_base`, the
+per-word shift count), so the reason for `MASK_BOUND_LIMIT` is visible here too.  The GPU half --
+the real kernels, `MASK_FORM` cells vs bits -- was pinned by dumping O / LSE from develop and
+from the branch on a Rubin GPU (82 kernel x mask x shape cases bitwise, 2026-09-22); the
+lowering itself is pinned by `test_sm107_masked_softmax_sass_is_register_to_predicate`.
 """
 
 import itertools
@@ -26,12 +28,17 @@ import pytest
 import torch
 
 from cudnn.frost.tile_dsl.constants import MASK_CAUSAL, MASK_PADDED, MASK_SWA
-from cudnn.frost.tile_dsl.mask import _NEG_INF_BITS, MASK_FORM_BITS, MASK_FORM_CELLS, MASK_FORMS, MASK_WORD_COLS
+from cudnn.frost.tile_dsl.mask import _NEG_INF_BITS, MASK_BOUND_LIMIT, MASK_FORM_BITS, MASK_FORM_CELLS, MASK_FORMS, MASK_WORD_COLS, apply_mask_chunk_bits
 
 pytestmark = [pytest.mark.L0]
 
 _ALL_ONES = (1 << 32) - 1
 _SENTINELS = [_NEG_INF_BITS, float("-inf")]
+
+
+def _i32(x):
+    """Two's-complement wrap to Int32: the width the device computes the band bounds and shift counts in."""
+    return ((x + (1 << 31)) & _ALL_ONES) - (1 << 31)
 
 
 def _f32(value):
@@ -50,9 +57,9 @@ def _band(q_abs, seq_kv_len, window_left, mask_flags, bottom_right, causal_diag,
     lo = hi = None
     diag = causal_diag if bottom_right else torch.zeros_like(q_abs)
     if mask_flags & MASK_SWA:
-        lo = q_abs + diag - window_left
+        lo = _i32(q_abs + diag - window_left)
     if mask_flags & MASK_CAUSAL:
-        hi = q_abs + diag + window_right + 1
+        hi = _i32(q_abs + diag + window_right + 1)
     if mask_flags & MASK_PADDED:
         hi = seq_kv_len.clone() if hi is None else torch.minimum(hi, seq_kv_len)
     return lo, hi
@@ -73,10 +80,10 @@ def _keep_words(lo, hi, kv_col_base, n_cols):
     for s in range(n_words):
         word = None
         if hi is not None:
-            n_masked = MASK_WORD_COLS * (s + 1) - (hi - kv_col_base)
+            n_masked = _i32(MASK_WORD_COLS * (s + 1) - _i32(hi - kv_col_base))
             word = _shift_sat(ones, n_masked, left=torch.zeros_like(n_masked, dtype=torch.bool))
         if lo is not None:
-            n_masked = (lo - kv_col_base) - MASK_WORD_COLS * s
+            n_masked = _i32(_i32(lo - kv_col_base) - MASK_WORD_COLS * s)
             above = _shift_sat(ones, n_masked, left=torch.ones_like(n_masked, dtype=torch.bool))
             word = above if word is None else (word & above)
         words.append(word)
@@ -107,10 +114,10 @@ def mask_cells(S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, botto
     if mask_flags & MASK_PADDED:
         masked |= kv >= seq_kv_len[:, None]
     if mask_flags & MASK_CAUSAL:
-        q_caus_lim = q_abs + diag + window_right
+        q_caus_lim = _i32(q_abs + diag + window_right)
         masked |= kv > q_caus_lim[:, None]
     if mask_flags & MASK_SWA:
-        q_minus_w = q_abs + diag - window_left
+        q_minus_w = _i32(q_abs + diag - window_left)
         masked |= kv < q_minus_w[:, None]
     return torch.where(masked, _fill(S, mask_value), S)
 
@@ -201,6 +208,38 @@ def test_bits_form_masks_the_same_cells_at_word_edges(mask_flags, n_cols):
                 saw_untouched |= bool((ref.view(torch.int32) == S.view(torch.int32)).all(dim=1).any())
     assert saw_fully_masked, "no fully-masked row anywhere in the sweep"
     assert saw_untouched, "no fully-unmasked row anywhere in the sweep"
+
+
+def test_bits_form_domain_guard():
+    """The band arithmetic is Int32.  A window bound at or past `MASK_BOUND_LIMIT` can wrap `lo - kv_col_base`, and the
+    bits form then masks EVERYTHING where the per-cell form masks nothing.  Three pins: the two forms agree at the largest
+    in-domain window with every index below 2**28 (the documented domain); the Int32-faithful emulation shows the
+    divergence just past it (why the guard exists, not a claim about the device); and `apply_mask_chunk_bits` refuses such
+    a window at trace time, before it touches a register (Python ints, so the check costs no instruction)."""
+    gen = torch.Generator().manual_seed(0xD0A1)
+    rows, n_cols = 256, 128
+    q_abs = torch.randint(0, 1 << 28, (rows,), generator=gen)
+    kv_col_base = torch.randint(0, (1 << 28) // n_cols, (rows,), generator=gen) * n_cols
+    seq_kv_len = torch.randint(0, 1 << 28, (rows,), generator=gen)
+    causal_diag = torch.randint(-(1 << 27), 1 << 27, (rows,), generator=gen)
+    for mask_flags in (MASK_SWA, MASK_CAUSAL | MASK_SWA, MASK_CAUSAL | MASK_SWA | MASK_PADDED):
+        for bottom_right in (0, 1):
+            S = _payload(rows, n_cols, gen)
+            args = (q_abs, kv_col_base, seq_kv_len, MASK_BOUND_LIMIT - 1, mask_flags, bottom_right, causal_diag, _NEG_INF_BITS, MASK_BOUND_LIMIT - 1)
+            _assert_same(mask_cells(S, *args), mask_bits(S, *args), f"largest in-domain window flags={mask_flags} br={bottom_right}")
+    # Just past the domain: q row 0 with the widest Int32 window keeps every column under the per-cell form (nothing is
+    # 2**31 - 1 columns back), while `lo - kv_col_base` wraps positive for any chunk past column 0 and the bits form masks
+    # the whole chunk.  This is the emulated hazard the guard closes.
+    S = _payload(rows, n_cols, gen)
+    zero = torch.zeros(rows, dtype=torch.int64)
+    base = torch.full((rows,), n_cols, dtype=torch.int64)
+    args = (zero, base, zero, (1 << 31) - 1, MASK_SWA, 0, zero, _NEG_INF_BITS, 0)
+    _assert_same(mask_cells(S, *args), S, "per-cell form with the widest window leaves the chunk untouched")
+    _assert_same(mask_bits(S, *args), _fill(S, _NEG_INF_BITS), "bits form with the widest window masks the whole chunk")
+    with pytest.raises(ValueError, match="window_left must be <"):
+        apply_mask_chunk_bits(None, None, None, None, MASK_BOUND_LIMIT, MASK_SWA)
+    with pytest.raises(ValueError, match="window_right must be <"):
+        apply_mask_chunk_bits(None, None, None, None, 0, MASK_CAUSAL, window_right=MASK_BOUND_LIMIT)
 
 
 def test_mask_form_vocabulary():
