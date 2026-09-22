@@ -354,6 +354,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
+    "vision_rope_backward_wrapper": (".rope", "vision_rope_backward_wrapper"),
     "RopeQDQInplace": (".rope", "RopeQDQInplace"),
     "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
     "EngramGateSavedForward": (".engram", "EngramGateSavedForward"),
