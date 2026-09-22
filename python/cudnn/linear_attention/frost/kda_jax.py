@@ -79,7 +79,20 @@ def make_launcher(plan, names):
                 use_initial_state=chain or state is not None,
                 **flags,
             ),
-            recompute_cfg=None,
+            recompute_cfg=(
+                recompute.build_cfg(
+                    io_dtype,
+                    ct.Float32 if chain or coarse else state_dtype,
+                    gate_dtype,
+                    use_initial_state=not coarse and (chain or state is not None),
+                    store_final_state=False,
+                    enable_checkpoints=True,
+                    seed_checkpoints=coarse,
+                    **flags,
+                )
+                if needs_recompute
+                else None
+            ),
             recompute=needs_recompute,
             recompute_orders=not coarse,
             recompute_order_gen=not coarse and not split,
@@ -89,24 +102,14 @@ def make_launcher(plan, names):
             seed_span_chunks=span // 16,
             seed_every_n=checkpoint if coarse else 0,
         )
-        if needs_recompute:
-            config["recompute_cfg"] = recompute.build_cfg(
-                io_dtype,
-                ct.Float32 if chain or coarse else state_dtype,
-                gate_dtype,
-                use_initial_state=not coarse and (chain or state is not None),
-                store_final_state=False,
-                enable_checkpoints=True,
-                seed_checkpoints=coarse,
-                **flags,
-            )
     else:
         prefill = prep_fwd if plan.prep else fwd
+        prep_flags = {name: value for name, value in flags.items() if name not in ("max_active_clusters", "d_v")}
         config.update(
             order_gen=not split,
             tiles_per_head=plan.tiles_per_head,
             prep=plan.prep,
-            prep_cfg=None,
+            prep_cfg=prep.build_cfg(io_dtype, gate_dtype, num_sm=plan.num_sm, **prep_flags) if plan.prep else None,
             prefill_cfg=prefill.build_cfg(
                 io_dtype,
                 ct.Float32 if chain else state_dtype,
@@ -118,19 +121,6 @@ def make_launcher(plan, names):
                 **dict(flags, d_v=dv // plan.tiles_per_head),
             ),
         )
-        if plan.prep:
-            config["prep_cfg"] = prep.build_cfg(
-                io_dtype,
-                gate_dtype,
-                num_sm=plan.num_sm,
-                l2norm=plan.use_qk_l2norm,
-                safe_gate=safe_gate,
-                gate_scale_log2=flags["gate_scale_log2"],
-                log_gate=log_gate,
-                beta_sigmoid=plan.use_beta_sigmoid,
-                allow_neg_eigval=plan.allow_neg_eigval,
-                d_k=dk,
-            )
     if chain:
         config.update(
             unit_chunks=plan.unit_chunks,

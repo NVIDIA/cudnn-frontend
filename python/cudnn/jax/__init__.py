@@ -38,6 +38,11 @@ __all__ = [
     "neg_inf_init",
     "grouped_gemm_swiglu",
     "grouped_gemm_dswiglu",
+    "kimi_delta_attention",
+    "kimi_delta_attention_fwd",
+    "kimi_delta_attention_bwd",
+    "KdaResidual",
+    "KdaGradients",
 ]
 
 
@@ -70,12 +75,3 @@ def __getattr__(name):
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ += [
-    "kimi_delta_attention",
-    "kimi_delta_attention_fwd",
-    "kimi_delta_attention_bwd",
-    "KdaResidual",
-    "KdaGradients",
-]

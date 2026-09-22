@@ -200,10 +200,11 @@ and capture guarantees. The composite CuTe path is the smallest working bridge.
 
 Before production release, qualify customer shapes, CUDA/JAX/CuTeDSL versions,
 SM103, true independent-stream stress and long-sequence numerical limits. The
-10–20 us CPU target needs warm dispatch measurements separately from blocking
-end-to-end latency and GPU kernel time. Compare against the same Frost schedule
-and checkpoint policy. This draft does not assert that target for every shape.
-BSA and quantized grouped GEMM are separate work.
+10–20 us CPU dispatch target and JAX/native kernel-performance parity are not
+yet qualified: measure warm dispatch separately from blocking end-to-end latency
+and GPU kernel time, against the same Frost schedule and checkpoint policy.
+Numerical tests alone do not establish either target. BSA and quantized grouped
+GEMM are separate work.
 
 Run coverage with:
 
@@ -251,10 +252,3 @@ gradients, repeated calls, changing packed boundaries, recurrent scans,
 command-buffer replay, concurrent dispatch and torch-free import/execution.
 Native regressions additionally check compiled-host reuse across token/head
 counts and strided gradient destinations, including untouched output padding.
-
-## Performance qualification
-
-The previous launch implementation's measurements do not qualify this adapter.
-The 10–20 us CPU dispatch target and JAX/native kernel-performance parity still
-need qualification on the intended deployment stack. Numerical tests alone do
-not establish either target.

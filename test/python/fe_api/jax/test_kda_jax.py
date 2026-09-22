@@ -113,6 +113,23 @@ def run(args, cu, **options):
     )
 
 
+@pytest.fixture
+def built_plans(monkeypatch):
+    from cudnn.linear_attention import jax_api
+    from cudnn.linear_attention.frost import kda_engine
+
+    build = kda_engine.build_kda
+    plans = []
+
+    def record(graph):
+        plans.append(build(graph))
+        return plans[-1]
+
+    jax_api.build_call.cache_clear()
+    monkeypatch.setattr(kda_engine, "build_kda", record)
+    return plans
+
+
 def assert_close(actual, expected, tol=0.04):
     actual, expected = np.asarray(actual, dtype=np.float64), np.asarray(expected, dtype=np.float64)
     assert np.all(np.isfinite(actual))
@@ -187,21 +204,7 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
         ((128, 64), (1, 2, 2), (0, 129, 129, 768), False, jnp.float32, False),
     ],
 )
-def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, gates, state_dtype, with_state, monkeypatch):
-    from cudnn.linear_attention import jax_api
-    from cudnn.linear_attention.frost import kda_engine
-
-    build = kda_engine.build_kda
-    schedules = []
-
-    def checked_build(graph, **kwargs):
-        plan = build(graph, **kwargs)
-        assert plan.chain, "JAX must preserve Frost's automatic piece-chain selection"
-        schedules.append(plan.node.node_type.name)
-        return plan
-
-    jax_api.build_call.cache_clear()
-    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
+def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, gates, state_dtype, with_state, built_plans):
     args, cu = inputs(*dims, *heads, bounds=bounds, gates=gates, state_dtype=state_dtype)
     if not with_state:
         args = (*args[:5], None, *args[6:])
@@ -227,7 +230,8 @@ def test_long_sequence_forward_and_gradients(checkpoint, dims, heads, bounds, ga
     expected_grads = jax.jit(jax.grad(partial(loss, reference_mode=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
-    assert "KDA" in schedules and "KDA_BWD" in schedules
+    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
+    assert all(plan.chain for plan in built_plans), "JAX must preserve Frost's automatic piece-chain selection"
 
 
 @pytest.mark.parametrize("total", [35, 768])
@@ -431,22 +435,7 @@ def test_bad_metadata():
     ],
     ids=["int64", "linear", "coarse_safe", "combined", "linear_fp32"],
 )
-def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, monkeypatch):
-    from cudnn.linear_attention import jax_api
-    from cudnn.linear_attention.frost import kda_engine
-
-    build = kda_engine.build_kda
-    plans = []
-
-    def checked_build(graph):
-        plan = build(graph)
-        assert plan.chain == (schedule == "chain")
-        assert plan.split == (schedule == "warmup")
-        plans.append(plan.node.node_type.name)
-        return plan
-
-    jax_api.build_call.cache_clear()
-    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
+def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, built_plans):
     bounds = dict(uncut=(0, 81, 81, 177), warmup=(0, 49, 49, 97), chain=(0, 129, 129, 3073))[schedule]
     dtype = jnp.float16 if domain == "linear" and offset_dtype == jnp.int64 else jnp.bfloat16
     args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
@@ -497,30 +486,17 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
         for got, want in zip(jax.tree.leaves(repeated), jax.tree.leaves(expected_repeated)):
             assert_close(got, want, 0.06)
         assert differentiated._cache_size() == 1
-    assert "KDA" in plans and "KDA_BWD" in plans
+    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
+    for plan in built_plans:
+        assert plan.chain == (schedule == "chain")
+        assert plan.split == (schedule == "warmup")
 
 
 @pytest.mark.parametrize("prep", [False, True], ids=["direct", "prep"])
 @pytest.mark.parametrize("checkpoint", [0, 48])
-def test_value_split_forward_and_gradients(prep, checkpoint, monkeypatch):
+def test_value_split_forward_and_gradients(prep, checkpoint, built_plans):
     from cudnn.frost.device import multiprocessor_count
-    from cudnn.linear_attention import jax_api
-    from cudnn.linear_attention.frost import kda_engine
 
-    build = kda_engine.build_kda
-    plans = []
-
-    def checked_build(graph):
-        plan = build(graph)
-        if plan.node.node_type.name == "KDA":
-            assert plan.dv_split and not plan.chain and not plan.split
-            assert plan.prep == prep
-            assert plan.tiles_per_head == 2
-        plans.append(plan.node.node_type.name)
-        return plan
-
-    jax_api.build_call.cache_clear()
-    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
     heads = 1 if prep else multiprocessor_count(0) // 2
     span = 128 * max(1, checkpoint // 16)
     bounds = (0, span, span, 3 * span + 1) if prep else (0, span + 1)
@@ -542,4 +518,9 @@ def test_value_split_forward_and_gradients(prep, checkpoint, monkeypatch):
     expected_grads = jax.jit(jax.grad(partial(loss, ref=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
-    assert "KDA" in plans and "KDA_BWD" in plans
+    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
+    for plan in built_plans:
+        if plan.node.node_type.name == "KDA":
+            assert plan.dv_split and not plan.chain and not plan.split
+            assert plan.prep == prep
+            assert plan.tiles_per_head == 2
