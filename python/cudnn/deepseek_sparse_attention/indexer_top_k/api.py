@@ -247,8 +247,12 @@ def indexer_top_k_wrapper(
     ``values`` is ``None`` when ``return_val=False``. The outputs and the
     :meth:`IndexerTopK.scratch_workspace_bytes` workspace are allocated here
     per call, on ``stream``; use the class API with caller-owned buffers to
-    avoid the allocations.
+    avoid the allocations. Strided ``input_values`` / ``seq_lens`` are copied
+    contiguous here (the class declines them in ``check_support()``).
     """
+    with torch.cuda.device(input_values.device), _torch_stream_context(stream):
+        input_values = input_values.contiguous()
+        seq_lens = seq_lens.contiguous()
     cache_key = (
         input_values.dtype,
         int(input_values.shape[0]),  # n_rows affects wrapper validation and output shape

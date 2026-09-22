@@ -365,9 +365,16 @@ def sparse_attention_backward_wrapper(
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
     """
-    # check_support() declines strided inputs, so a strided call must build its
-    # own plan (and be declined there) rather than reuse a cached contiguous one.
-    all_inputs_contiguous = all(t.is_contiguous() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length) if t is not None)
+    # The plan addresses contiguous tensors only (check_support declines the rest, R5).
+    # The wrapper is the eager torch-op layer: it normalises strided inputs here, on the
+    # launch stream, as it always did, and stages a strided caller output so the
+    # caller's tensor keeps its identity.
+    with torch.cuda.device(q.device):
+        launch_stream = resolve_stream(stream)
+        with torch_stream_context(launch_stream):
+            q, kv, out, dout, lse, attn_sink, topk_idxs = (t.contiguous() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs))
+            if topk_length is not None:
+                topk_length = topk_length.contiguous()
     key = (
         q.device,
         q.dtype,
@@ -382,7 +389,6 @@ def sparse_attention_backward_wrapper(
         int(block_tile),
         softmax_scale,
         bool(deterministic),
-        all_inputs_contiguous,
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -403,8 +409,8 @@ def sparse_attention_backward_wrapper(
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
 
+    dq_user, dkv_user = dq, dkv
     with torch.cuda.device(q.device):
-        launch_stream = resolve_stream(stream)
         # execute() never allocates: outputs and scratch are provided here, ordered with the launch stream (R2).
         with torch_stream_context(launch_stream):
             if workspace is None:
@@ -413,8 +419,12 @@ def sparse_attention_backward_wrapper(
                     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
             if dq is None:
                 dq = torch.empty_like(q)
+            elif not dq.is_contiguous():
+                dq = torch.empty(dq.shape, dtype=dq.dtype, device=dq.device)  # staged; copied back into the caller's tensor below
             if dkv is None:
                 dkv = torch.empty_like(kv)
+            elif not dkv.is_contiguous():
+                dkv = torch.empty(dkv.shape, dtype=dkv.dtype, device=dkv.device)
             d_sink = torch.empty_like(attn_sink)
 
     dq_out, dkv_out, d_sink_out = obj.execute(
@@ -433,4 +443,12 @@ def sparse_attention_backward_wrapper(
         current_stream=launch_stream,
         d_sink=d_sink,
     )
+    if (dq_user is not None and dq_user is not dq_out) or (dkv_user is not None and dkv_user is not dkv_out):
+        with torch.cuda.device(q.device), torch_stream_context(launch_stream):
+            if dq_user is not None and dq_user is not dq_out:
+                dq_user.copy_(dq_out)
+                dq_out = dq_user
+            if dkv_user is not None and dkv_user is not dkv_out:
+                dkv_user.copy_(dkv_out)
+                dkv_out = dkv_user
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)

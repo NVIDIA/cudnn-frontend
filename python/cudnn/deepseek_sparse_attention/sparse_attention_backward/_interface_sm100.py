@@ -211,10 +211,11 @@ def flash_attn_bwd_sm100(
     topk_length: Optional[torch.Tensor] = None,
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
-    d_sink: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     current_stream=None,
     workspace: Optional[torch.Tensor] = None,
+    *,
+    d_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 

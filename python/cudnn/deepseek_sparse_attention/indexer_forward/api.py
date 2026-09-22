@@ -19,17 +19,10 @@ import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
 
-from cudnn.deepseek_sparse_attention.utils.runtime import device_major, maybe_contiguous, torch_stream_context
+from cudnn.deepseek_sparse_attention.utils.runtime import device_major
 
-from ._interface import TMA_ALIGN_ELEMS, indexer_fwd as indexer_fwd_sm100, padded_seqlen_k
+from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
-
-
-def _alloc_padded_scores(lead_shape: tuple[int, ...], seqlen_k: int, device: torch.device, stream) -> torch.Tensor:
-    """Allocate ``(*lead_shape, ceil4(seqlen_k))`` fp32 on the launch stream (R1) and return the ``[..., :seqlen_k]`` view the kernel binds directly."""
-    with torch_stream_context(stream):
-        buf = torch.empty((*lead_shape, padded_seqlen_k(seqlen_k)), dtype=torch.float32, device=device)
-    return buf[..., :seqlen_k]
 
 
 class IndexerForward(APIBase):
@@ -187,14 +180,14 @@ class IndexerForward(APIBase):
 
         # `out` is the padded (B, S_q, S_k_padded) allocation the descriptor
         # promised; the kernel binds the [..., :S_k] view with that row stride
-        # (no staging, no copy-back). indexer_fwd re-checks the live strides.
+        # (no staging, no copy-back). _indexer_fwd_bound re-checks the live strides.
         padded_shape = (self.batch_size, self.s_q, self.s_k_padded)
         if tuple(out.shape) != padded_shape or not out.is_contiguous():
             raise ValueError(
                 f"out must be the contiguous {padded_shape} fp32 allocation declared to IndexerForward; got shape {tuple(out.shape)}, strides {tuple(out.stride())}"
             )
         logical_out = out[..., : self.s_k]
-        indexer_fwd_sm100(
+        _indexer_fwd_bound(
             q,
             k,
             w,
@@ -245,13 +238,16 @@ def indexer_forward_wrapper(
     specify the global uncompressed token index for each batch/THD segment's
     local q[0].
 
-    On SM100 the returned ``scores`` is the ``[..., :S_k]`` view over a
-    ``(B, S_q, ceil4(S_k))`` (THD: ``(total_q, ceil4(max_seqlen_k))``)
-    allocation, so its row stride is ``ceil4(S_k)`` when ``S_k % 4 != 0``. A
-    caller-provided ``out`` must be such a view (``ValueError`` otherwise);
-    nothing is staged or copied back. Strided ``q``/``k``/``w``/scales are made
-    contiguous here on the launch stream as a torch-op convenience (one copy
-    kernel each); ``IndexerForward`` itself declines them in ``check_support()``.
+    On SM100 the kernel writes a ``(B, S_q, ceil4(S_k))`` (THD:
+    ``(total_q, ceil4(max_seqlen_k))``) padded buffer through its ``[..., :S_k]``
+    view. The wrapper keeps the torch-op contract on top of that: a returned
+    ``scores`` is contiguous (one copy when ``S_k % 4 != 0``), and a
+    caller-provided ``out`` of the logical shape is filled whatever its layout
+    (a padded-stride view is bound directly; anything else is staged and copied
+    back, so the caller's tensor keeps its identity). Strided ``q``/``k``/``w``/
+    scales are made contiguous here on the launch stream as a torch-op
+    convenience (one copy kernel each). ``IndexerForward`` itself declines all
+    of that in ``check_support()`` and binds only a padded-stride ``out``.
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
@@ -300,21 +296,9 @@ def indexer_forward_wrapper(
     if return_lse or lse_out is not None:
         raise NotImplementedError("SM100 dense indexer forward does not expose LSE; " "LSE is produced by dense_indexer_score_recompute_wrapper")
 
-    q, k, w = [maybe_contiguous(t, stream) for t in (q, k, w)]
-    q_scale = maybe_contiguous(q_scale, stream)
-    k_scale = maybe_contiguous(k_scale, stream)
-    if out is None:
-        if cu_seqlens_q is not None:
-            if max_seqlen_k is None:
-                raise ValueError("THD input requires max_seqlen_q and max_seqlen_k")
-            out = _alloc_padded_scores((q.shape[0],), int(max_seqlen_k), q.device, stream)
-        else:
-            out = _alloc_padded_scores((q.shape[0], q.shape[1]), k.shape[1], q.device, stream)
-
-    # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
-    # internally) with a single shape-agnostic compile cache. cu_seqlens_q/k /
-    # max_seqlen_q/k are None for BSHD; seqlen is then derived from the tensor
-    # shapes at runtime.
+    # indexer_fwd is the dense convenience entry: it normalises strided inputs,
+    # allocates / stages `out` and returns the torch-op layout, all on `stream`.
+    # BSHD and THD both go through it (it branches on cu_seqlens internally).
     scores = indexer_fwd_sm100(
         q,
         k,

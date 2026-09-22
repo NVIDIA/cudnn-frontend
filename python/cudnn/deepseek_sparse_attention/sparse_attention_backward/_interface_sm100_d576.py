@@ -184,9 +184,10 @@ def flash_attn_bwd_sm100_h128_d576(
     topk_length=None,
     dq=None,
     dkv=None,
-    d_sink=None,
     current_stream=None,
     workspace=None,
+    *,
+    d_sink=None,
 ):
     """Direct entry point: allocate omitted outputs and scratch, then launch.
 

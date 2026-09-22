@@ -92,6 +92,24 @@ def _wrapper_int32_contiguous(t: Optional[torch.Tensor]) -> Optional[torch.Tenso
     return None if t is None else t.to(torch.int32).contiguous()
 
 
+def _wrapper_stage_output(t: Optional[torch.Tensor], shape, dtype: torch.dtype, device) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Wrapper-surface: allocate an omitted output, or stage a non-contiguous caller output the class
+    would decline; ``_wrapper_copy_back`` restores the caller's tensor identity. Call inside the launch-stream context."""
+    if t is None:
+        return torch.empty(shape, dtype=dtype, device=device), None
+    if t.is_contiguous() or tuple(t.shape) != tuple(shape):
+        return t, None  # bound directly, or left for the class to reject
+    return torch.empty(shape, dtype=t.dtype, device=t.device), t
+
+
+def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor]) -> torch.Tensor:
+    if user is None:
+        return staged
+    with _torch_stream_context(stream, user.device):
+        user.copy_(staged)
+    return user
+
+
 class _ScoreRecomputeBase(APIBase):
     """Common APIBase shell for score-recompute ops.
 
@@ -316,9 +334,9 @@ def sparse_indexer_score_recompute_wrapper(
         q_indexer, k_indexer, weights = (maybe_contiguous(t) for t in (q_indexer, k_indexer, weights))
         topk_indices = _wrapper_int32_contiguous(topk_indices)
         topk_length = _wrapper_int32_contiguous(topk_length)
-        if out is None:
-            out = torch.empty((q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]), dtype=torch.float32, device=q_indexer.device)
+        out, out_user = _wrapper_stage_output(out, (q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]), torch.float32, q_indexer.device)
     key = (
+        q_indexer.device,
         q_indexer.dtype,
         q_indexer.shape,
         k_indexer.shape,
@@ -357,7 +375,7 @@ def sparse_indexer_score_recompute_wrapper(
         topk_length=topk_length,
         current_stream=stream,
     )
-    return TupleDict(predict=predict)
+    return TupleDict(predict=_wrapper_copy_back(stream, predict, out_user))
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +512,9 @@ def sparse_attn_score_recompute_wrapper(
         q_attn, k_attn, lse = (maybe_contiguous(t) for t in (q_attn, k_attn, lse))
         topk_indices = _wrapper_int32_contiguous(topk_indices)
         topk_length = _wrapper_int32_contiguous(topk_length)
-        if out is None:
-            out = torch.empty((q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]), dtype=torch.float32, device=q_attn.device)
+        out, out_user = _wrapper_stage_output(out, (q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]), torch.float32, q_attn.device)
     key = (
+        q_attn.device,
         q_attn.dtype,
         q_attn.shape,
         k_attn.shape,
@@ -538,7 +556,7 @@ def sparse_attn_score_recompute_wrapper(
         softmax_scale=softmax_scale,
         current_stream=stream,
     )
-    return TupleDict(target=target)
+    return TupleDict(target=_wrapper_copy_back(stream, target, out_user))
 
 
 # ---------------------------------------------------------------------------
@@ -584,9 +602,9 @@ def _dense_sample_shapes(
 
 
 _SM90_THD_DECLINE = (
-    "{name}: THD (cu_seqlens_q/cu_seqlens_k) dense score recompute is not supported on SM90 -- the SM90 kernel is "
-    "BSHD-native and serving THD would need a host copy of cu_seqlens per call (Rule 3/8). "
-    "Use BSHD on SM90, or THD on SM100+."
+    "{name}: THD (cu_seqlens_q/cu_seqlens_k) dense score recompute is not plan-eligible on SM90 -- the SM90 kernel is "
+    "BSHD-native and serving THD needs a host copy of cu_seqlens per call (Rule 3/8). "
+    "Use BSHD on SM90, THD on SM100+, or the eager *_wrapper, which adapts per batch on SM90."
 )
 
 
@@ -675,11 +693,20 @@ def _dense_wrapper_prepare(stream, q, k, aux, out, denom_out, out_shape, denom_s
         cu_seqlens_q, cu_seqlens_k = (_wrapper_int32_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k))
         if q_causal_offsets is not None:
             q_causal_offsets = q_causal_offsets.contiguous()
-        if out is None:
-            out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
-        if denom_out is None:
-            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=q.device)
-    return q, k, aux, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
+        out, out_user = _wrapper_stage_output(out, out_shape, torch.float32, q.device)
+        denom_out, denom_user = _wrapper_stage_output(denom_out, denom_shape, torch.float32, q.device)
+    return q, k, aux, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale, out_user, denom_user
+
+
+def _dense_wrapper_result(stream, out: torch.Tensor, denom: torch.Tensor, out_user, denom_user) -> TupleDict:
+    return TupleDict(out=_wrapper_copy_back(stream, out, out_user), denom=_wrapper_copy_back(stream, denom, denom_user))
+
+
+def _dense_sm90_thd_wrapper_path(is_thd: bool, device) -> bool:
+    # Wrapper-only: the SM90 kernel is BSHD-native, so THD is adapted per batch from a
+    # host copy of cu_seqlens (_interface_sm90._dense_score_recompute_varlen); the plan
+    # classes decline it in check_support() (Rule 3/8).
+    return is_thd and device_capability(device)[0] == 9
 
 
 class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
@@ -691,8 +718,8 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
     Layouts: BSHD (``is_thd=False``) on SM90 and SM100+; THD packed
     (``is_thd=True``, ``cu_seqlens_q``/``cu_seqlens_k`` at execute) on SM100+
     only. SM90 declines THD in ``check_support()`` with ``NotImplementedError``:
-    its kernel is BSHD-native and serving THD would need a host copy of
-    ``cu_seqlens`` per call.
+    its kernel is BSHD-native and serving THD needs a host copy of
+    ``cu_seqlens`` per call (the eager ``*_wrapper`` does that per batch).
 
     THD launch envelope: ``max_seqlen_q`` is required at ``__init__`` and
     ``max_seqlen_k`` defaults to (and must equal) ``sample_out.shape[1]``.
@@ -834,17 +861,19 @@ def dense_indexer_score_recompute_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out': scores, 'denom': logsumexp}``.
 
-    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) is SM100+ only; SM90 raises
-    ``NotImplementedError``. Pass ``max_seqlen_q`` and ``max_seqlen_k``: when
-    either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
+    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on
+    SM90 the wrapper adapts it per batch from a host copy of ``cu_seqlens``
+    (the class declines SM90 THD). Pass ``max_seqlen_q`` and ``max_seqlen_k``:
+    when either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
     one blocking device-to-host read per call that is not CUDA-graph
     capturable (a wrapper-surface convenience; the class requires both at
     plan time). The memo key includes the resulting values.
 
     Wrapper-surface convenience (the class declines instead): inputs with a
     non-unit innermost stride are copied contiguous, ``cu_seqlens_*`` are cast
-    to contiguous int32, and ``out`` / ``denom_out`` are allocated when
-    omitted. All of it runs on ``stream``.
+    to contiguous int32, ``out`` / ``denom_out`` are allocated when omitted and
+    a non-contiguous caller ``out`` / ``denom_out`` is staged and copied back
+    (identity kept). All of it runs on ``stream``.
     """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
@@ -854,7 +883,7 @@ def dense_indexer_score_recompute_wrapper(
         max_seqlen_q,
         max_seqlen_k,
     )
-    q, k, weights, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale = _dense_wrapper_prepare(
+    q, k, weights, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale, out_user, denom_user = _dense_wrapper_prepare(
         stream, q, k, weights, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
     )
     precision = precision.lower()
@@ -884,8 +913,28 @@ def dense_indexer_score_recompute_wrapper(
             sf_vec_size=sf_vec_size,
             current_stream=stream,
         )
-        return TupleDict(out=o, denom=d)
+        return _dense_wrapper_result(stream, o, d, out_user, denom_user)
+    if _dense_sm90_thd_wrapper_path(is_thd, q.device):
+        from . import _interface_sm90 as _iface_sm90
+
+        o, d = _iface_sm90.dense_indexer_score_recompute(
+            q,
+            k,
+            weights,
+            out,
+            denom_out,
+            sm_scale=sm_scale,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            q_causal_offsets=q_causal_offsets,
+            current_stream=stream,
+        )
+        return _dense_wrapper_result(stream, o, d, out_user, denom_user)
     key = (
+        q.device,
         q.dtype,
         q.shape,
         k.shape,
@@ -937,7 +986,7 @@ def dense_indexer_score_recompute_wrapper(
         q_causal_offsets=q_causal_offsets,
         current_stream=stream,
     )
-    return TupleDict(out=o, denom=d)
+    return _dense_wrapper_result(stream, o, d, out_user, denom_user)
 
 
 # ---------------------------------------------------------------------------
@@ -955,8 +1004,8 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
     Layouts: BSHD (``is_thd=False``) on SM90 and SM100+; THD packed
     (``is_thd=True``, ``cu_seqlens_q``/``cu_seqlens_k`` at execute) on SM100+
     only. SM90 declines THD in ``check_support()`` with ``NotImplementedError``:
-    its kernel is BSHD-native and serving THD would need a host copy of
-    ``cu_seqlens`` per call.
+    its kernel is BSHD-native and serving THD needs a host copy of
+    ``cu_seqlens`` per call (the eager ``*_wrapper`` does that per batch).
 
     THD launch envelope: ``max_seqlen_q`` is required at ``__init__`` and
     ``max_seqlen_k`` defaults to (and must equal) ``sample_out.shape[1]``.
@@ -1098,17 +1147,19 @@ def dense_attn_score_recompute_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out': scores, 'denom': l1norm}``.
 
-    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) is SM100+ only; SM90 raises
-    ``NotImplementedError``. Pass ``max_seqlen_q`` and ``max_seqlen_k``: when
-    either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
+    THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on
+    SM90 the wrapper adapts it per batch from a host copy of ``cu_seqlens``
+    (the class declines SM90 THD). Pass ``max_seqlen_q`` and ``max_seqlen_k``:
+    when either is omitted the wrapper derives it as ``(cu[1:] - cu[:-1]).max()``,
     one blocking device-to-host read per call that is not CUDA-graph
     capturable (a wrapper-surface convenience; the class requires both at
     plan time). The memo key includes the resulting values.
 
     Wrapper-surface convenience (the class declines instead): inputs with a
     non-unit innermost stride are copied contiguous, ``cu_seqlens_*`` are cast
-    to contiguous int32, and ``out`` / ``denom_out`` are allocated when
-    omitted. All of it runs on ``stream``.
+    to contiguous int32, ``out`` / ``denom_out`` are allocated when omitted and
+    a non-contiguous caller ``out`` / ``denom_out`` is staged and copied back
+    (identity kept). All of it runs on ``stream``.
     """
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
@@ -1118,7 +1169,7 @@ def dense_attn_score_recompute_wrapper(
         max_seqlen_q,
         max_seqlen_k,
     )
-    q, k, lse, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale = _dense_wrapper_prepare(
+    q, k, lse, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale, out_user, denom_user = _dense_wrapper_prepare(
         stream, q, k, lse, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale
     )
     precision = precision.lower()
@@ -1148,8 +1199,28 @@ def dense_attn_score_recompute_wrapper(
             sf_vec_size=sf_vec_size,
             current_stream=stream,
         )
-        return TupleDict(out=o, denom=d)
+        return _dense_wrapper_result(stream, o, d, out_user, denom_user)
+    if _dense_sm90_thd_wrapper_path(is_thd, q.device):
+        from . import _interface_sm90 as _iface_sm90
+
+        o, d = _iface_sm90.dense_attn_score_recompute(
+            q,
+            k,
+            lse,
+            softmax_scale,
+            out,
+            denom_out,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            q_causal_offsets=q_causal_offsets,
+            current_stream=stream,
+        )
+        return _dense_wrapper_result(stream, o, d, out_user, denom_user)
     key = (
+        q.device,
         q.dtype,
         q.shape,
         k.shape,
@@ -1201,4 +1272,4 @@ def dense_attn_score_recompute_wrapper(
         q_causal_offsets=q_causal_offsets,
         current_stream=stream,
     )
-    return TupleDict(out=o, denom=d)
+    return _dense_wrapper_result(stream, o, d, out_user, denom_user)

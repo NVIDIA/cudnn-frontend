@@ -294,3 +294,24 @@ def test_DSA_indexer_top_k_wrapper_ignores_vector_padding_with_negative_infinity
         atol=0.0,
         rtol=0.0,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=5)
+def test_DSA_indexer_top_k_wrapper_accepts_strided_inputs():
+    """The eager wrapper copies strided ``input_values`` / ``seq_lens`` contiguous on the launch stream; the class declines them."""
+    DSA = _import_dsa()
+    n_rows, num_cols, top_k = 16, 512, 64
+    base = torch.randn(n_rows, 2 * num_cols, dtype=torch.float32, device="cuda")
+    input_values = base[:, ::2]
+    seq_lens = torch.full((2 * n_rows,), num_cols, dtype=torch.int32, device="cuda")[::2]
+    assert not input_values.is_contiguous() and not seq_lens.is_contiguous()
+
+    with pytest.raises((ValueError, NotImplementedError)):
+        DSA.IndexerTopK(input_values, seq_lens, top_k).check_support()
+
+    got = DSA.indexer_top_k_wrapper(input_values, seq_lens, top_k)
+    expected = DSA.indexer_top_k_wrapper(input_values.contiguous(), seq_lens.contiguous(), top_k)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(torch.sort(got["values"], dim=1).values, torch.sort(expected["values"], dim=1).values, atol=0.0, rtol=0.0)
+    assert torch.equal(torch.sort(got["indices"], dim=1).values, torch.sort(expected["indices"], dim=1).values)

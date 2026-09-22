@@ -2206,14 +2206,22 @@ def test_DSA_sparse_attention_backward_check_support_declines_strided_inputs():
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
     out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
 
-    # The head-major backing of the original #385 reproduction: the wrapper
-    # builds a plan from it and must surface check_support's decline.
+    # The head-major backing of the original #385 reproduction: the eager wrapper
+    # normalises it on the launch stream (develop's behaviour) and matches the
+    # contiguous call; only the plan class declines it (below).
     out_head_major = out.transpose(0, 1).contiguous().transpose(0, 1)
     dout_head_major = torch.randn(num_heads, s_q, head_dim_v, dtype=torch.bfloat16, device=device).transpose(0, 1)
     assert out_head_major.stride() == dout_head_major.stride() == (head_dim_v, s_q * head_dim_v, 1)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    with pytest.raises(NotImplementedError, match=r"contiguous out; got shape .* strides"):
-        DSA.sparse_attention_backward_wrapper(q, kv, out_head_major, dout_head_major, lse, attn_sink, topk_idxs, softmax_scale=softmax_scale, stream=stream)
+    strided_res = DSA.sparse_attention_backward_wrapper(
+        q, kv, out_head_major, dout_head_major, lse, attn_sink, topk_idxs, softmax_scale=softmax_scale, stream=stream
+    )
+    dense_res = DSA.sparse_attention_backward_wrapper(
+        q, kv, out_head_major.contiguous(), dout_head_major.contiguous(), lse, attn_sink, topk_idxs, softmax_scale=softmax_scale, stream=stream
+    )
+    torch.cuda.synchronize()
+    for name in ("dq", "dkv", "d_sink"):
+        torch.testing.assert_close(strided_res[name], dense_res[name], atol=1e-2, rtol=1e-2)
 
     def strided_like(tensor):
         base = torch.zeros(*tensor.shape[:-1], 2 * tensor.shape[-1], dtype=tensor.dtype, device=tensor.device)
@@ -2633,6 +2641,73 @@ def test_DSA_sparse_attention_backward_interface_rejects_noncontiguous_inputs():
                 **outputs,
             )
     assert set(_interface_sm100.flash_attn_bwd_sm100.compile_cache) == cached_keys, "a rejected input must not reach a compile"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=44)
+def test_DSA_sparse_attention_backward_wrapper_accepts_strided_inputs_and_keeps_output_identity():
+    """The plan declines strided tensors (R5), the wrapper does not: it normalises every strided input on
+    the launch stream (cold and warm plan cache alike), stages a strided caller-provided dq/dkv and copies
+    back so the caller's tensors keep their identity, and the results match the contiguous call."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import api as sbwd_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 4, 128, 64
+    head_dim, head_dim_v, topk = 576, 512, 64
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    good = dict(
+        q=torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device),
+        kv=torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device),
+        out=torch.randn(s_q, num_heads, head_dim_v, dtype=torch.bfloat16, device=device),
+        dout=torch.randn(s_q, num_heads, head_dim_v, dtype=torch.bfloat16, device=device),
+        lse=torch.randn(s_q, num_heads, dtype=torch.float32, device=device),
+        attn_sink=torch.randn(num_heads, dtype=torch.float32, device=device),
+        topk_idxs=torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32),
+        topk_length=torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device),
+    )
+
+    def strided_like(tensor):
+        base = torch.zeros(*tensor.shape[:-1], 2 * tensor.shape[-1], dtype=tensor.dtype, device=tensor.device)
+        base[..., ::2] = tensor
+        assert not base[..., ::2].is_contiguous()
+        return base[..., ::2]
+
+    def run(args, **kw):
+        return DSA.sparse_attention_backward_wrapper(
+            args["q"],
+            args["kv"],
+            args["out"],
+            args["dout"],
+            args["lse"],
+            args["attn_sink"],
+            args["topk_idxs"],
+            softmax_scale=softmax_scale,
+            topk_length=args["topk_length"],
+            deterministic=True,
+            **kw,
+        )
+
+    reference = run(good)
+    torch.cuda.synchronize()
+    plans_before = len(sbwd_api._cache_of_SparseAttentionBackwardObjects)
+    strided = {name: strided_like(t) for name, t in good.items()}
+    for _ in range(2):  # warm plan cache on the second pass
+        dq_user = torch.empty(s_q, num_heads, 2 * head_dim, dtype=torch.bfloat16, device=device)[..., ::2]
+        dkv_user = torch.empty(s_kv, 2 * head_dim, dtype=torch.bfloat16, device=device)[:, ::2]
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            got = run(strided, dq=dq_user, dkv=dkv_user, stream=side.cuda_stream)
+        torch.cuda.synchronize()
+        assert got["dq"] is dq_user and got["dkv"] is dkv_user, "caller-provided outputs keep their identity"
+        for name in ("dq", "dkv", "d_sink"):
+            torch.testing.assert_close(got[name].float(), reference[name].float(), atol=2e-2, rtol=2e-2, msg=name)
+    assert len(sbwd_api._cache_of_SparseAttentionBackwardObjects) == plans_before, "a strided call reuses the contiguous plan"
 
 
 @pytest.mark.L0

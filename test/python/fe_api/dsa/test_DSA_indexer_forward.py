@@ -158,16 +158,63 @@ def test_padded_out_is_bound_directly(compile_allocates_nothing):
     check_ref_indexer_forward(q, k, w, out[..., :s_k], ratio)
     assert torch.equal(out[..., s_k:], torch.full_like(out[..., s_k:], sentinel))
 
-    # A contiguous (B, S_q, 1001) buffer has 4004-byte rows: not bindable.
+    # The strict entry the plan binds: a contiguous (B, S_q, 1001) buffer has 4004-byte rows, not bindable; out is required.
+    plain = torch.empty(b, s_q, s_k, dtype=torch.float32, device=q.device)
     with pytest.raises(ValueError, match="16-byte-aligned"):
-        dense_impl.indexer_fwd(q, k, w, ratio=ratio, out=torch.empty(b, s_q, s_k, dtype=torch.float32, device=q.device))
+        dense_impl._indexer_fwd_bound(q, k, w, ratio=ratio, out=plain)
     with pytest.raises(ValueError, match="requires out"):
-        dense_impl.indexer_fwd(q, k, w, ratio=ratio)
+        dense_impl._indexer_fwd_bound(q, k, w, ratio=ratio)
+
+    # The convenience entry (imported by Megatron-LM without out=) keeps develop's torch-op contract.
+    scores = dense_impl.indexer_fwd(q, k, w, ratio=ratio)
+    assert scores.shape == (b, s_q, s_k) and scores.is_contiguous()
+    check_ref_indexer_forward(q, k, w, scores, ratio)
+    got = dense_impl.indexer_fwd(q, k, w, ratio=ratio, out=plain)
+    assert got is plain and torch.equal(plain, scores), "an unbindable caller out is staged and copied back"
 
     scores = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio)["scores"]
-    assert scores.shape == (b, s_q, s_k)
-    assert scores.stride() == (s_q * s_k_padded, s_k_padded, 1)
+    assert scores.shape == (b, s_q, s_k) and scores.is_contiguous(), "the wrapper's default result keeps the torch-op layout"
     check_ref_indexer_forward(q, k, w, scores, ratio)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_wrapper_ragged_k_out_layouts():
+    """S_k % 4 != 0 at the torch-op layer (the plan binds only a padded-stride view): the default result is
+    contiguous; a caller's contiguous ``out`` is filled and returned (identity kept, staged + copied back);
+    a caller's padded-stride view is bound directly; a wrong shape is refused; a non-default stream works."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    b, s_q, s_k, ratio = 2, 64, 1001, 1
+    q, k, w = _sm100_mqa_inputs(b, s_q, s_k)
+    dev = q.device
+    reference = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio)["scores"]
+    assert reference.is_contiguous()
+    check_ref_indexer_forward(q, k, w, reference, ratio)
+
+    plain = torch.full((b, s_q, s_k), -7.0, dtype=torch.float32, device=dev)
+    got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=plain)["scores"]
+    assert got is plain and torch.equal(plain, reference)
+
+    padded = torch.full((b, s_q, 1004), -7.0, dtype=torch.float32, device=dev)
+    view = padded[..., :s_k]
+    got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=view)["scores"]
+    assert got is view and torch.equal(view, reference)
+    assert torch.equal(padded[..., s_k:], torch.full_like(padded[..., s_k:], -7.0)), "the pad columns are never written"
+
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        strided_out = torch.empty(b, s_q, 2 * s_k, dtype=torch.float32, device=dev)[..., ::2]
+        got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=strided_out, stream=side.cuda_stream)["scores"]
+    torch.cuda.synchronize()
+    assert got is strided_out and torch.equal(strided_out, reference)
+
+    with pytest.raises(ValueError, match="out must have shape"):
+        DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=torch.empty(b, s_q, 1004, dtype=torch.float32, device=dev))
 
 
 @pytest.mark.L0
@@ -200,7 +247,8 @@ def test_check_support_declines_non_unit_innermost_stride():
         DSA.IndexerForward(q, k, w, out_strided, ratio=ratio).check_support()
 
     with pytest.raises(ValueError, match="unit innermost stride"):
-        dense_impl.indexer_fwd(q_t, k, w, ratio=ratio, out=out)
+        dense_impl._indexer_fwd_bound(q_t, k, w, ratio=ratio, out=out)
+    check_ref_indexer_forward(q_t, k, w, dense_impl.indexer_fwd(q_t, k, w, ratio=ratio), ratio)
 
     scores = DSA.indexer_forward_wrapper(q_t, k, w, ratio=ratio)["scores"]
     check_ref_indexer_forward(q_t, k, w, scores, ratio)

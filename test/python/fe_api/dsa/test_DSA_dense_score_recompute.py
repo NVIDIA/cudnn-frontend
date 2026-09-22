@@ -60,7 +60,7 @@ def test_DSA_dense_indexer_sm90_singleton_and_mask_cache(heads, ratio, singleton
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("is_thd", [False, True])
 def test_DSA_dense_attn_sm90_masked_output(heads, ratio, is_thd):
-    """Masked scores stay -inf across KV tiles while contributing zero to L1; THD is declined on SM90."""
+    """Masked scores stay -inf across KV tiles while contributing zero to L1; THD goes through the SM90 wrapper adapter."""
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("This regression exercises the SM90 dense score kernel")
     from cudnn import DSA
@@ -83,12 +83,7 @@ def test_DSA_dense_attn_sm90_masked_output(heads, ratio, is_thd):
             max_seqlen_k=128,
         )
     scale = 128**-0.5
-    if is_thd:
-        # The SM90 kernel is BSHD-native; THD is declined at plan time instead of
-        # being adapted by a host loop over cu_seqlens (Rule 3/8).
-        with pytest.raises(NotImplementedError, match="cu_seqlens"):
-            DSA.dense_attn_score_recompute_wrapper(q, k, lse, scale, qhead_per_kv_head=heads, out=out, ratio=ratio, q_causal_offsets=offsets, **options)
-        return
+    # THD on SM90 is served by the wrapper's per-batch adapter (the plan class declines it).
     result = DSA.dense_attn_score_recompute_wrapper(q, k, lse, scale, qhead_per_kv_head=heads, out=out, ratio=ratio, q_causal_offsets=offsets, **options)
     assert result["out"].data_ptr() == out.data_ptr()
     q0, k0 = 0, 0
@@ -283,7 +278,8 @@ def test_DSA_dense_score_recompute_thd_plan_requires_max_seqlen(score_type):
 @pytest.mark.L0
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
 def test_DSA_dense_score_recompute_thd_sm90_declines_in_check_support(score_type):
-    """SM90 dense score is BSHD-native: THD is declined at plan time (class and wrapper), BSHD stays served."""
+    """SM90 dense score is BSHD-native: THD is declined at plan time (the class), BSHD stays served.
+    The eager wrapper serves SM90 THD per batch instead (test_DSA_dense_score_recompute_wrapper_thd_sm90_per_batch_adapter)."""
     try:
         from cudnn import DSA
     except ImportError:
@@ -296,17 +292,83 @@ def test_DSA_dense_score_recompute_thd_sm90_declines_in_check_support(score_type
     with pytest.raises(NotImplementedError, match="cu_seqlens"):
         plan.check_support()
 
-    cu_q = torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda")
-    cu_k = torch.tensor([0, 16, 32], dtype=torch.int32, device="cuda")
-    thd = dict(qhead_per_kv_head=q.shape[-2], cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=8, max_seqlen_k=out.shape[1])
-    with pytest.raises(NotImplementedError, match="cu_seqlens"):
-        if score_type == "indexer":
-            DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **thd)
-        else:
-            DSA.dense_attn_score_recompute_wrapper(q, k, aux, q.shape[-1] ** -0.5, **thd)
-
     bshd = [t.unsqueeze(0) for t in (q, k, aux, out, denom)]
     assert _make_dense_plan(DSA, score_type, *bshd).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=19)
+def test_DSA_dense_score_recompute_wrapper_thd_sm90_per_batch_adapter(score_type):
+    """SM90 THD at the wrapper level: per-batch BSHD launches from a host copy of cu_seqlens; a caller ``out`` keeps its
+    identity, padding columns are -inf, and a non-default stream works."""
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This adapter is specific to SM90")
+
+    device = torch.device("cuda")
+    shapes = [(5, 40), (16, 32), (0, 8), (3, 64)]  # (s_q, s_k) per segment, one empty
+    ratio, heads, d = 1, 32, 128
+    q_lengths = [s_q for s_q, _ in shapes]
+    k_lengths = [s_k for _, s_k in shapes]
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    total_q, total_k = sum(q_lengths), sum(k_lengths)
+    max_q, max_k = max(q_lengths), max(k_lengths)
+    q = torch.randn(total_q, heads, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(total_k, 1, d, dtype=torch.bfloat16, device=device)
+    softmax_scale = None
+    if score_type == "indexer":
+        aux = torch.randn(total_q, heads, dtype=torch.bfloat16, device=device).abs() * 0.1
+    else:
+        softmax_scale = 1.0 / math.sqrt(d)
+        lse_parts = []
+        q0 = k0 = 0
+        for s_q, s_k in shapes:
+            if s_q:
+                lse_parts.append(_dense_attn_lse(q[q0 : q0 + s_q].unsqueeze(0), k[k0 : k0 + s_k].unsqueeze(0), softmax_scale).squeeze(0))
+            q0 += s_q
+            k0 += s_k
+        aux = torch.cat(lse_parts, dim=0).contiguous()
+    out = torch.full((total_q, max_k), 123.0, dtype=torch.float32, device=device)
+    side = torch.cuda.Stream()
+    stream = cuda.CUstream(side.cuda_stream)
+    thd = dict(qhead_per_kv_head=heads, ratio=ratio, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q, max_seqlen_k=max_k, out=out, stream=stream)
+
+    with torch.cuda.stream(side):
+        if score_type == "indexer":
+            result = DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **thd)
+        else:
+            result = DSA.dense_attn_score_recompute_wrapper(q, k, aux, softmax_scale, **thd)
+    torch.cuda.synchronize()
+
+    assert result["out"] is out
+    assert result["denom"].shape == (total_q,)
+    q0 = k0 = 0
+    for s_q, s_k in shapes:
+        if s_q:
+            check_ref_dense_score_recompute(
+                score_type,
+                q[q0 : q0 + s_q].unsqueeze(0),
+                k[k0 : k0 + s_k].unsqueeze(0),
+                aux[q0 : q0 + s_q].unsqueeze(0),
+                out[q0 : q0 + s_q, :s_k].unsqueeze(0),
+                result["denom"][q0 : q0 + s_q].unsqueeze(0),
+                softmax_scale=softmax_scale,
+                ratio=ratio,
+            )
+            assert torch.isneginf(out[q0 : q0 + s_q, s_k:]).all(), "padding columns are -inf, never the caller's stale values"
+        q0 += s_q
+        k0 += s_k
+
+    # The plan class still declines SM90 THD; the adapter is a wrapper-only path.
+    denom = torch.empty(total_q, dtype=torch.float32, device=device)
+    with pytest.raises(NotImplementedError, match="cu_seqlens"):
+        _make_dense_plan(DSA, score_type, q, k, aux, out, denom, is_thd=True, max_seqlen_q=max_q).check_support()
 
 
 def _bshd_plan_samples(score_type: str, b: int = 2, s_q: int = 8, s_k: int = 128, heads: int = 32, d: int = 128):
@@ -342,6 +404,35 @@ def test_DSA_dense_score_recompute_output_contiguity_declined(score_type):
     with pytest.raises(NotImplementedError, match="K must have a unit innermost stride"):
         _make_dense_plan(DSA, score_type, q, k_strided, aux, out, denom).check_support()
     assert _make_dense_plan(DSA, score_type, q, k, aux, out, denom).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=17)
+def test_DSA_dense_score_recompute_wrapper_stages_noncontiguous_outputs(score_type):
+    """The eager wrapper fills a non-contiguous caller ``out`` / ``denom_out`` (staged + copied back, identity kept); the class declines them."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Dense score recompute requires SM90+")
+
+    q, k, aux, out, denom = _bshd_plan_samples(score_type)
+    softmax_scale = q.shape[-1] ** -0.5
+    if score_type == "attention":
+        aux = _dense_attn_lse(q, k, softmax_scale)
+    b, s_q, s_k = out.shape
+    out_t = torch.full((b, s_k, s_q), 7.0, dtype=torch.float32, device="cuda").transpose(1, 2)
+    denom_t = torch.full((s_q, b), 7.0, dtype=torch.float32, device="cuda").transpose(0, 1)
+    common = dict(qhead_per_kv_head=q.shape[-2], out=out_t, denom_out=denom_t)
+    if score_type == "indexer":
+        result = DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **common)
+    else:
+        result = DSA.dense_attn_score_recompute_wrapper(q, k, aux, softmax_scale, **common)
+    torch.cuda.synchronize()
+    assert result["out"] is out_t and result["denom"] is denom_t
+    check_ref_dense_score_recompute(score_type, q, k, aux, out_t, denom_t, softmax_scale=softmax_scale if score_type == "attention" else None)
 
 
 @pytest.mark.L0

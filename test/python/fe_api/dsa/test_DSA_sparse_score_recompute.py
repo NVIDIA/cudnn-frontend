@@ -312,6 +312,25 @@ def test_DSA_sparse_score_recompute_output_contiguity_declined(score_type):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_sparse_score_recompute_wrapper_stages_noncontiguous_out(score_type):
+    """The eager wrapper fills a non-contiguous caller ``out`` (staged + copied back, identity kept); the class declines it."""
+    DSA, q, k, aux, topk_indices, _, _ = _sparse_case(score_type)
+    b, s_q, topk = topk_indices.shape
+    out_t = torch.empty(b, topk, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)
+    if score_type == "indexer":
+        reference = DSA.sparse_indexer_score_recompute_wrapper(q, k, aux, topk_indices, qhead_per_kv_head=q.shape[2])["predict"]
+        got = DSA.sparse_indexer_score_recompute_wrapper(q, k, aux, topk_indices, qhead_per_kv_head=q.shape[2], out=out_t)["predict"]
+    else:
+        scale = q.shape[-1] ** -0.5
+        reference = DSA.sparse_attn_score_recompute_wrapper(q, k, aux, topk_indices, scale, qhead_per_kv_head=q.shape[2])["target"]
+        got = DSA.sparse_attn_score_recompute_wrapper(q, k, aux, topk_indices, scale, qhead_per_kv_head=q.shape[2], out=out_t)["target"]
+    torch.cuda.synchronize()
+    assert got is out_t
+    torch.testing.assert_close(out_t, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
 def test_DSA_sparse_score_recompute_execute_requires_outputs(score_type, compile_allocates_nothing):
     """out is a required execute argument, re-validated live (Rule 1): missing raises, a strided view raises."""
     DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
