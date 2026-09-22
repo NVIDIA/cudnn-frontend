@@ -315,3 +315,33 @@ def test_DSA_indexer_top_k_wrapper_accepts_strided_inputs():
     torch.cuda.synchronize()
     torch.testing.assert_close(torch.sort(got["values"], dim=1).values, torch.sort(expected["values"], dim=1).values, atol=0.0, rtol=0.0)
     assert torch.equal(torch.sort(got["indices"], dim=1).values, torch.sort(expected["indices"], dim=1).values)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=6)
+def test_DSA_indexer_top_k_wrapper_staging_outlives_the_released_original():
+    """R1 staging: the strided-input copy on an explicit side stream reads the caller's tensor
+    asynchronously. The wrapper records the original on that stream, so a caller that releases it
+    right after the call, while the copy is still queued, cannot hand the block to its next
+    same-size allocation (poisoned here) before the copy has read it."""
+    DSA = _import_dsa()
+    from cuda.bindings import driver as cuda
+
+    n_rows, num_cols, top_k = 64, 4096, 64
+    seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
+    base = torch.randn(n_rows, 2 * num_cols, dtype=torch.float32, device="cuda")
+    expected = DSA.indexer_top_k_wrapper(base[:, ::2].contiguous(), seq_lens, top_k)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000_000)  # the wrapper's staging copy queues behind this
+    got = DSA.indexer_top_k_wrapper(base[:, ::2], seq_lens, top_k, stream=cuda.CUstream(side.cuda_stream))
+    del base  # the caller releases its reference while the copy is still pending
+    poison = torch.empty(n_rows, 2 * num_cols, dtype=torch.float32, device="cuda")
+    # Same size as the released block: with the original recorded, the allocator defers the block's reuse
+    # (or waits for the pending copy first) instead of letting this fill race it.
+    poison.fill_(float("-inf"))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(torch.sort(got["values"], dim=1).values, torch.sort(expected["values"], dim=1).values, atol=0.0, rtol=0.0)
+    assert torch.equal(torch.sort(got["indices"], dim=1).values, torch.sort(expected["indices"], dim=1).values)

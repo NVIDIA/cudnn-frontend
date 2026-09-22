@@ -18,6 +18,7 @@ import cuda.bindings.driver as cuda
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import contiguous_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
 from . import _interface_sm100 as _iface_sm100
@@ -371,10 +372,10 @@ def sparse_attention_backward_wrapper(
     # caller's tensor keeps its identity.
     with torch.cuda.device(q.device):
         launch_stream = resolve_stream(stream)
-        with torch_stream_context(launch_stream):
-            q, kv, out, dout, lse, attn_sink, topk_idxs = (t.contiguous() for t in (q, kv, out, dout, lse, attn_sink, topk_idxs))
-            if topk_length is not None:
-                topk_length = topk_length.contiguous()
+    # R1 staging: each original is record_stream'ed on the launch stream before it is rebound.
+    q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length = (
+        contiguous_on_stream(t, launch_stream, q.device) for t in (q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
+    )
     key = (
         q.device,
         q.dtype,

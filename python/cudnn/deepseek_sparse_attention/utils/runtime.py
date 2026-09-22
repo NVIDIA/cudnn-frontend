@@ -9,7 +9,7 @@ from typing import Iterator, Optional
 
 import torch
 
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import record_streams, stream_context
 import cuda.bindings.driver as cuda
 
 
@@ -40,6 +40,7 @@ def maybe_contiguous(
 ) -> torch.Tensor | None:
     if x is None or x.stride(-1) == 1:
         return x
+    record_streams((x,), stream, x.device)  # R1 staging: the copy reads x asynchronously on `stream`
     with torch_stream_context(stream, x.device):
         return x.contiguous()
 

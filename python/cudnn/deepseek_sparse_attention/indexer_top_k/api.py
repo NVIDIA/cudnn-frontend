@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn._torch_stream import as_torch_stream
+from cudnn._torch_stream import as_torch_stream, contiguous_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_capability,
@@ -250,9 +250,9 @@ def indexer_top_k_wrapper(
     avoid the allocations. Strided ``input_values`` / ``seq_lens`` are copied
     contiguous here (the class declines them in ``check_support()``).
     """
-    with torch.cuda.device(input_values.device), _torch_stream_context(stream):
-        input_values = input_values.contiguous()
-        seq_lens = seq_lens.contiguous()
+    # R1 staging: the originals are record_stream'ed on `stream` before they are rebound.
+    input_values = contiguous_on_stream(input_values, stream, input_values.device)
+    seq_lens = contiguous_on_stream(seq_lens, stream, seq_lens.device)
     cache_key = (
         input_values.dtype,
         int(input_values.shape[0]),  # n_rows affects wrapper validation and output shape

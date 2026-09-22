@@ -23,6 +23,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
 )
 
+from cudnn._torch_stream import contiguous_on_stream, record_streams
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
@@ -87,9 +88,13 @@ def _require_int32_vector(api: APIBase, t: torch.Tensor, name: str, device) -> N
     )
 
 
-def _wrapper_int32_contiguous(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    # Wrapper-surface convenience only; the classes decline/raise instead (R5).
-    return None if t is None else t.to(torch.int32).contiguous()
+def _wrapper_int32_contiguous(t: Optional[torch.Tensor], stream) -> Optional[torch.Tensor]:
+    # Wrapper-surface convenience only; the classes decline/raise instead (R5). Call inside the
+    # launch-stream context; the original is record_stream'ed there before the cast copies it (R1).
+    if t is None or (t.dtype == torch.int32 and t.is_contiguous()):
+        return t
+    record_streams((t,), stream, t.device)
+    return t.to(torch.int32).contiguous()
 
 
 def _wrapper_stage_output(t: Optional[torch.Tensor], shape, dtype: torch.dtype, device) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -331,9 +336,9 @@ def sparse_indexer_score_recompute_wrapper(
     omitted. All of it runs on ``stream``.
     """
     with _torch_stream_context(stream):
-        q_indexer, k_indexer, weights = (maybe_contiguous(t) for t in (q_indexer, k_indexer, weights))
-        topk_indices = _wrapper_int32_contiguous(topk_indices)
-        topk_length = _wrapper_int32_contiguous(topk_length)
+        q_indexer, k_indexer, weights = (maybe_contiguous(t, stream) for t in (q_indexer, k_indexer, weights))
+        topk_indices = _wrapper_int32_contiguous(topk_indices, stream)
+        topk_length = _wrapper_int32_contiguous(topk_length, stream)
         out, out_user = _wrapper_stage_output(out, (q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]), torch.float32, q_indexer.device)
     key = (
         q_indexer.device,
@@ -509,9 +514,9 @@ def sparse_attn_score_recompute_wrapper(
     omitted. All of it runs on ``stream``.
     """
     with _torch_stream_context(stream):
-        q_attn, k_attn, lse = (maybe_contiguous(t) for t in (q_attn, k_attn, lse))
-        topk_indices = _wrapper_int32_contiguous(topk_indices)
-        topk_length = _wrapper_int32_contiguous(topk_length)
+        q_attn, k_attn, lse = (maybe_contiguous(t, stream) for t in (q_attn, k_attn, lse))
+        topk_indices = _wrapper_int32_contiguous(topk_indices, stream)
+        topk_length = _wrapper_int32_contiguous(topk_length, stream)
         out, out_user = _wrapper_stage_output(out, (q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]), torch.float32, q_attn.device)
     key = (
         q_attn.device,
@@ -689,10 +694,9 @@ def _require_dense_live(api: APIBase, q, k, aux, aux_desc, aux_name: str, out, d
 def _dense_wrapper_prepare(stream, q, k, aux, out, denom_out, out_shape, denom_shape, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale):
     """Wrapper-surface convenience copies/allocations, all on the launch stream (R1); the classes decline instead."""
     with _torch_stream_context(stream):
-        q, k, aux, q_scale, k_scale = (maybe_contiguous(t) for t in (q, k, aux, q_scale, k_scale))
-        cu_seqlens_q, cu_seqlens_k = (_wrapper_int32_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k))
-        if q_causal_offsets is not None:
-            q_causal_offsets = q_causal_offsets.contiguous()
+        q, k, aux, q_scale, k_scale = (maybe_contiguous(t, stream) for t in (q, k, aux, q_scale, k_scale))
+        cu_seqlens_q, cu_seqlens_k = (_wrapper_int32_contiguous(t, stream) for t in (cu_seqlens_q, cu_seqlens_k))
+        q_causal_offsets = contiguous_on_stream(q_causal_offsets, stream, q.device)
         out, out_user = _wrapper_stage_output(out, out_shape, torch.float32, q.device)
         denom_out, denom_user = _wrapper_stage_output(denom_out, denom_shape, torch.float32, q.device)
     return q, k, aux, out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets, q_scale, k_scale, out_user, denom_user

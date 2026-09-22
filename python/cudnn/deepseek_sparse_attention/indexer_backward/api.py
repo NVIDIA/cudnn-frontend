@@ -28,6 +28,7 @@ import cuda.bindings.driver as cuda
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
+from cudnn._torch_stream import contiguous_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn.frost.buffers import memset_zero_async
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
@@ -73,14 +74,15 @@ def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) ->
     return grad_loss.detach().view(1)
 
 
-def _contiguous_input(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor if tensor.is_contiguous() else tensor.contiguous()
+def _contiguous_input(tensor: torch.Tensor, stream) -> torch.Tensor:
+    # Wrapper-surface staging on the launch stream; the original is record_stream'ed there first (R1).
+    return contiguous_on_stream(tensor, stream, tensor.device)
 
 
-def _contiguous_mutable(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+def _contiguous_mutable(tensor: torch.Tensor, stream) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if tensor.is_contiguous():
         return tensor, None
-    return tensor.contiguous(), tensor
+    return contiguous_on_stream(tensor, stream, tensor.device), tensor
 
 
 def _contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1105,16 +1107,16 @@ def dense_indexer_backward_wrapper(
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
     with _torch_stream_context(current_stream, index_q.device):
-        cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
-        cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
+        cu_seqlens_q = _contiguous_input(cu_seqlens_q, current_stream) if cu_seqlens_q is not None else None
+        cu_seqlens_k = _contiguous_input(cu_seqlens_k, current_stream) if cu_seqlens_k is not None else None
 
-        index_q_exec = _contiguous_input(index_q)
-        weights_exec = _contiguous_input(weights)
-        index_k_exec = _contiguous_input(index_k)
-        attn_l1norm_exec = _contiguous_input(attn_l1norm)
-        index_lse_exec = _contiguous_input(index_lse)
-        attn_score_exec, attn_score_original = _contiguous_mutable(attn_score)
-        index_score_exec, index_score_original = _contiguous_mutable(index_score)
+        index_q_exec = _contiguous_input(index_q, current_stream)
+        weights_exec = _contiguous_input(weights, current_stream)
+        index_k_exec = _contiguous_input(index_k, current_stream)
+        attn_l1norm_exec = _contiguous_input(attn_l1norm, current_stream)
+        index_lse_exec = _contiguous_input(index_lse, current_stream)
+        attn_score_exec, attn_score_original = _contiguous_mutable(attn_score, current_stream)
+        index_score_exec, index_score_original = _contiguous_mutable(index_score, current_stream)
 
         (
             is_thd,
