@@ -2914,7 +2914,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         dev = q_buf.device
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label)
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label, align=_WS_ALIGN)  # O TMA descriptors live here
         meta = carver.take(4 * b + 4, torch.int32)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
@@ -3824,7 +3824,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
         scale_softmax=scale_softmax,
         sinks=sinks,
         seq_kv_lens=seq_kv_lens,
-        workspace=torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None,
+        workspace=_wrapper_workspace(ws_bytes, q_tensor.device, current_stream),
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -4733,7 +4733,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         dev = q_buf.device
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label)
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label, align=_WS_ALIGN)  # O TMA descriptors live here
 
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1)] — bound as the kernel's
         # seq_kv_lens tensor; the leading B words alias the per-sequence KV
@@ -5022,7 +5022,7 @@ def sdpa_fwd_wrapper_dsl_sm120(
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
-        workspace=torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None,
+        workspace=_wrapper_workspace(ws_bytes, q_tensor.device, current_stream),
         current_stream=current_stream,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
@@ -5159,6 +5159,15 @@ def _sm80_load_kernel_module(flavor: str, params):
 
 def _sm80_sched_policy_int(token: str) -> int:
     return {"default": SCHED_NATURAL, "lpt": SCHED_LPT, "lpt_l2": SCHED_LPT_L2}[token]
+
+
+def _wrapper_workspace(nbytes: int, device: torch.device, current_stream) -> Optional[torch.Tensor]:
+    """The wrapper-tier scratch for an adapter (R2), allocated on the launch stream (R1) so the
+    caching allocator orders its reuse against the kernel that reads it; None when nothing is needed."""
+    if not nbytes:
+        return None
+    with _torch_stream_context(current_stream, device):
+        return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 def _sm80_rope_table(rope_freqs: torch.Tensor, d2: int, device: torch.device) -> torch.Tensor:
@@ -5950,6 +5959,12 @@ def sdpa_fwd_wrapper_sm80(
         (bias_tensor.dtype if bias_tensor is not None else None),
         rope_max_s,
         q_tensor.device,
+        # scratch_workspace_bytes() depends on the operand layouts (a non-compact Q/K/V is gathered
+        # through scratch): two layouts of one shape must not share a cached size.
+        tuple(q_tensor.stride()),
+        tuple(k_tensor.stride()),
+        tuple(v_tensor.stride()),
+        tuple(o_tensor.stride()),
     )
     entry = _sm80_wrapper_cache.get(cache_key)
     if entry is None:
