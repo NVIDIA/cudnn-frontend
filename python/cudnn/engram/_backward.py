@@ -37,7 +37,7 @@ def engram_gate_saved_apply(
     d: cutlass.Constexpr,
     ks: cutlass.Constexpr,
     dks: cutlass.Constexpr,
-    dvs: cutlass.Constexpr,
+    dv_stride: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     split, column, _ = cute.arch.block_idx()
@@ -83,7 +83,7 @@ def engram_gate_saved_apply(
         result = cute.make_rmem_tensor(4, cutlass.BFloat16)
         for j in cutlass.range_constexpr(4):
             result[j] = cached_dv[step * 4 + j].to(cutlass.BFloat16)
-        _store(result, dv, cutlass.Int64(token) * dvs + col, 4)
+        _store(result, dv, cutlass.Int64(token) * dv_stride + col, 4)
 
 
 engram_gate_saved_apply.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -105,8 +105,8 @@ def launch_apply(
     d: cutlass.Constexpr,
     ks: cutlass.Constexpr,
     dks: cutlass.Constexpr,
-    dvs: cutlass.Constexpr,
+    dv_stride: cutlass.Constexpr,
 ):
     layout = cute.make_layout((1 << 63) - 1)
     tensors = [cute.make_tensor(p, layout) for p in (x, key, weight, upstream, stats, dx, dk, dv, partial)]
-    engram_gate_saved_apply(*tensors, d, ks, dks, dvs).launch(grid=(tokens // 64, d // 128, 1), block=(256, 1, 1), stream=stream)
+    engram_gate_saved_apply(*tensors, d, ks, dks, dv_stride).launch(grid=(tokens // 64, d // 128, 1), block=(256, 1, 1), stream=stream)
