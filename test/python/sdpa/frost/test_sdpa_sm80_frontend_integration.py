@@ -428,3 +428,20 @@ def test_engine_execute_does_not_allocate():
     torch.testing.assert_close(dq_buf, ref_dq, rtol=0, atol=0)
     torch.testing.assert_close(dk_buf, ref_dk, rtol=0, atol=0)
     torch.testing.assert_close(dv_buf, ref_dv, rtol=0, atol=0)
+
+
+@pytest.mark.L0
+def test_sm80_rope_table_covers_the_runtime_head_dim_and_pads_the_flavor_with_identity():
+    """An envelope-served head dim (d_qk=64 on the d_qk=128 flavor) needs a caller table over the
+    runtime d_qk//2 only; the flavor's extra columns rotate the zero padding by (cos 0, sin 0)."""
+    from cudnn.sdpa.fwd.api_dsl import _sm80_rope_table
+
+    freqs = torch.rand(8, 32, device="cuda")  # runtime d_qk = 64
+    table = _sm80_rope_table(freqs, 32, freqs.device, table_d2=64)
+    assert tuple(table.shape) == (8, 64, 2) and table.dtype == torch.float32 and table.is_contiguous()
+    torch.testing.assert_close(table[:, :32, 0], freqs.cos())
+    torch.testing.assert_close(table[:, :32, 1], freqs.sin())
+    assert torch.equal(table[:, 32:, 0], torch.ones(8, 32, device="cuda")) and torch.equal(table[:, 32:, 1], torch.zeros(8, 32, device="cuda"))
+    assert tuple(_sm80_rope_table(freqs, 32, freqs.device).shape) == (8, 32, 2)
+    with pytest.raises(ValueError, match="rope_freqs last dim"):
+        _sm80_rope_table(freqs[:, :16], 32, freqs.device, table_d2=64)

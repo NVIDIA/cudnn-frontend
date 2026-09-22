@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Tuple, overload
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple, overload
 import os
+
+if TYPE_CHECKING:
+    import torch
 
 from cuda.bindings import driver as cuda
 

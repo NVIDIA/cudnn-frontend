@@ -944,9 +944,10 @@ class SdpaFwdDsl(APIBase):
         # zeroes it (``_thd_compile_kwargs``).
         return buf.as_strided((1, tokens, h, d), (ts, ts, hs, es), buf.storage_offset())
 
-    def _scratch_base(self, workspace, label: str, required: Optional[int] = None) -> int:
+    def _scratch_base(self, workspace, label: str, required: Optional[int] = None, *, align: int = 16) -> int:
         """The device address of the caller's per-execute scratch, validated
-        against ``scratch_workspace_bytes()`` (size and 16-byte alignment).
+        against ``scratch_workspace_bytes()`` (size and ``align``-byte alignment;
+        a path that carves TMA descriptors out of the buffer asks for ``_WS_ALIGN``).
         FROST executor contract (``engine._FrostSdpaFwdPlan``): scratch is fixed
         offsets into the caller's buffer, never a per-execute allocation. A
         missing buffer raises the R2 contract error (``WorkspaceCarver``'s text)."""
@@ -957,6 +958,8 @@ class SdpaFwdDsl(APIBase):
                 f"cudnn.sdpa: {label} requires a {required}-byte workspace but execute() received none; "
                 "allocate graph.get_workspace_size() bytes (uint8, on the graph's device) and pass the buffer to execute()"
             )
+        if not (hasattr(workspace, "is_cuda") and hasattr(workspace, "data_ptr") and hasattr(workspace, "element_size")):
+            raise TypeError(f"cudnn.sdpa: {label} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
         if not workspace.is_cuda or workspace.device != self.q_desc.device:
             raise ValueError(f"cudnn.sdpa: {label} workspace must be on the plan's device {self.q_desc.device}, got {workspace.device}")
         if not workspace.is_contiguous():
@@ -967,8 +970,8 @@ class SdpaFwdDsl(APIBase):
                 f"cudnn.sdpa: {label} requires a {required}-byte workspace; the provided buffer has {nbytes} bytes (size it with graph.get_workspace_size())"
             )
         base = workspace.data_ptr()
-        if base % 16 != 0:
-            raise ValueError(f"cudnn.sdpa: {label} workspace must be at least 16-byte aligned; got data_ptr=0x{base:x}")
+        if base % align != 0:
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be at least {align}-byte aligned; got data_ptr=0x{base:x}")
         return base
 
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
@@ -3128,7 +3131,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
         _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
-        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes, align=_WS_ALIGN)  # TMA descriptors live here
         frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
         if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
@@ -5234,15 +5237,21 @@ def _wrapper_workspace(nbytes: int, device: torch.device, current_stream) -> Opt
         return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
-def _sm80_rope_table(rope_freqs: torch.Tensor, d2: int, device: torch.device) -> torch.Tensor:
-    """The SM80 kernels' ``(max_s, d_qk//2, 2)`` fp32 ``(cos, sin)`` table from
-    the caller's ``(max_s, ...)`` angle table. Wrapper-tier work (the engine row
-    never admits RoPE), built per call on the launch stream; ``execute`` binds
+def _sm80_rope_table(rope_freqs: torch.Tensor, d2: int, device: torch.device, *, table_d2: Optional[int] = None) -> torch.Tensor:
+    """The SM80 kernels' ``(max_s, table_d2, 2)`` fp32 ``(cos, sin)`` table from
+    the caller's ``(max_s, ...)`` angle table. ``d2`` is the runtime ``d_qk // 2``
+    the caller must cover; ``table_d2`` (default ``d2``) is the serving flavor's
+    ``flavor_d_qk // 2`` -- the columns beyond ``d2`` rotate the envelope's zero
+    padding and are the identity ``(cos 0, sin 0)``. Wrapper-tier work (the engine
+    row never admits RoPE), built per call on the launch stream; ``execute`` binds
     the result as-is."""
+    table_d2 = d2 if table_d2 is None else table_d2
     rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
     if rf.shape[1] < d2:
         raise ValueError(f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
     angles = rf[:, :d2]
+    if table_d2 > d2:
+        angles = torch.nn.functional.pad(angles, (0, table_d2 - d2))
     return torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
 
 
@@ -6059,7 +6068,7 @@ def sdpa_fwd_wrapper_sm80(
     # builds the RoPE table, both on the launch stream (R1).
     with _torch_stream_context(current_stream, q_tensor.device):
         workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None
-        rope_cs = _sm80_rope_table(rope_freqs, api.flavor_d_qk // 2, q_tensor.device) if rope_freqs is not None else None
+        rope_cs = _sm80_rope_table(rope_freqs, q_tensor.shape[-1] // 2, q_tensor.device, table_d2=api.flavor_d_qk // 2) if rope_freqs is not None else None
     api.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
