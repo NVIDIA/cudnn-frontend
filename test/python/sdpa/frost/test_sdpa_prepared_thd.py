@@ -557,7 +557,7 @@ def test_execute_allocates_nothing_and_never_synchronizes():
     pack = _pack(t, bufs)
     g.execute(pack, ws)  # warm: dummies, indices
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]  # the counter: memory_allocated() also moves on unrelated frees
     torch.cuda.set_sync_debug_mode("error")
     try:
         for _ in range(5):
@@ -565,7 +565,7 @@ def test_execute_allocates_nothing_and_never_synchronizes():
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "execute() allocated device memory"
 
 
 @requires_pre_rubin_blackwell

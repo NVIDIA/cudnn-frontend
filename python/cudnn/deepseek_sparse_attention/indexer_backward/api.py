@@ -708,6 +708,32 @@ class DenseIndexerBackward(APIBase):
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
+        # Cross-tensor shape contract (the wrapper's ``_dense_shapes``, restated on the
+        # descriptors): a directly built plan may pair tensors that each match their own
+        # descriptor yet disagree with each other, and the kernel sizes its grid and the
+        # dK store from index_q / index_k, not from the gradient buffers -- a smaller
+        # d_index_k would be written past its end. Rejected here, before compile.
+        t_q, t_k, h, d = self.normalization_tokens, self.total_k, self.heads, self.head_dim
+        if self.is_thd:
+            q_shape, w_shape, k_shape = (t_q, h, d), (t_q, h), (t_k, d)
+            score_shape, denom_shape = (t_q, self.max_seqlen_k), (t_q,)
+        else:
+            b, s_q, s_k = self.batch, self.max_seqlen_q, self.max_seqlen_k
+            q_shape, w_shape, k_shape = (b, s_q, h, d), (b, s_q, h), (b, s_k, d)
+            score_shape, denom_shape = (b, s_q, s_k), (b, s_q)
+        for name, desc, shape in (
+            ("index_q", self.iq_desc, q_shape),
+            ("weights", self.w_desc, w_shape),
+            ("index_k", self.ik_desc, k_shape),
+            ("d_index_q", self.diq_desc, q_shape),
+            ("d_weights", self.dw_desc, w_shape),
+            ("d_index_k", self.dik_desc, k_shape),
+            ("attn_score", self.attn_desc, score_shape),
+            ("attn_l1norm", self.attn_denom_desc, denom_shape),
+            ("index_score", self.idx_score_desc, score_shape),
+            ("index_lse", self.idx_lse_desc, denom_shape),
+        ):
+            self._check_tensor_shape(desc, shape, name=name)
         self._is_supported = True
         return True
 
@@ -807,7 +833,7 @@ class DenseIndexerBackward(APIBase):
         )
 
         if d_index_k_f32 is not d_index_k:
-            with _torch_stream_context(current_stream):
+            with _torch_stream_context(current_stream, d_index_k.device):
                 d_index_k.copy_(d_index_k_f32)
 
 
@@ -911,7 +937,7 @@ def indexer_backward_wrapper(
         raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
     if topk_indices.ndim != 3:
         raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
-    with _torch_stream_context(stream):
+    with _torch_stream_context(stream, index_q.device):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
         if d_weights is None:
@@ -1078,7 +1104,7 @@ def dense_indexer_backward_wrapper(
     """
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q.device):
         cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
         cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
 
@@ -1198,7 +1224,7 @@ def dense_indexer_backward_wrapper(
         current_stream=current_stream,
         workspace=workspace,
     )
-    with _torch_stream_context(current_stream):
+    with _torch_stream_context(current_stream, index_q_exec.device):
         _copy_back_if_needed(attn_score_exec, attn_score_original)
         _copy_back_if_needed(index_score_exec, index_score_original)
         _copy_back_if_needed(d_index_q_exec, d_index_q_original)
