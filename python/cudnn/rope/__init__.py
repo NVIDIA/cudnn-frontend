@@ -5,12 +5,18 @@
 
 from importlib import import_module
 
-__all__ = ["VisionRoPEBackward", "vision_rope_backward_wrapper"]
+_EXPORT_MODULES = {
+    "VisionRoPEBackward": ".api",
+    "vision_rope_backward_wrapper": ".api",
+    "RopeQDQInplace": ".qdq",
+    "rope_qdq_inplace": ".qdq",
+}
+__all__ = list(_EXPORT_MODULES)
 
 
 def __getattr__(name):
-    if name in __all__:
-        value = getattr(import_module(".api", __name__), name)
+    if name in _EXPORT_MODULES:
+        value = getattr(import_module(_EXPORT_MODULES[name], __name__), name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

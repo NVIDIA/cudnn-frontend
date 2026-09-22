@@ -177,6 +177,9 @@ navigation:
           - page: CSA Fused Compressor
             path: ../../fe-oss-apis/csa.md
             slug: csa
+          - page: Tail RoPE + Microscaled QDQ
+            path: ../../fe-oss-apis/rope_qdq.md
+            slug: rope-qdq
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../fe-oss-apis/dsa.md
             slug: dsa
