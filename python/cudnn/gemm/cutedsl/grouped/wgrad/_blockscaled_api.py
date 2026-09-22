@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    import torch
 
 import cutlass
 import cutlass.cute as cute

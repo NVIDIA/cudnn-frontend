@@ -351,7 +351,6 @@ def run_kda_fwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("kimi_delta_attention: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
@@ -483,7 +482,7 @@ def run_kda_fwd(
         t["v"]: v,
         t["g"]: g,
         t["beta"]: beta,
-        t["cu"]: cu,
+        t["cu"]: cu_seqlens,
         t["O"]: o,
     }
     if state0 is not None:
@@ -871,7 +870,6 @@ def kda_bwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("kimi_delta_attention: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
@@ -996,7 +994,7 @@ def kda_bwd(
         t["v"]: v,
         t["g"]: g,
         t["beta"]: beta,
-        t["cu"]: cu,
+        t["cu"]: cu_seqlens,
         t["dO"]: dO,
         t["dQ"]: dq,
         t["dK"]: dk,
