@@ -139,15 +139,17 @@ def test_functional_return_contract(monkeypatch):
 
     def apply(*args):
         apply_calls.append(args)
-        return "out", "lse"
+        return "out", "lse", "max_logit"
 
     monkeypatch.setattr(MaskPlan, "_validate_runtime", validate_runtime)
     monkeypatch.setattr(FlexAttnFunc, "apply", staticmethod(apply))
     q, k, v = object(), object(), object()
     assert flex_attention.flex_attn_func(q, k, v, mask_plan=plan) == "out"
     assert flex_attention.flex_attn_func(q, k, v, mask_plan=plan, return_lse=True) == ("out", "lse")
-    assert runtime_calls == [(plan, q, k, v), (plan, q, k, v)]
-    assert [call[-1] for call in apply_calls] == [False, True]
+    assert flex_attention.flex_attn_func(q, k, v, mask_plan=plan, return_max_logit=True) == ("out", "max_logit")
+    assert flex_attention.flex_attn_func(q, k, v, mask_plan=plan, return_lse=True, return_max_logit=True) == ("out", "lse", "max_logit")
+    assert runtime_calls == [(plan, q, k, v)] * 4
+    assert [call[-2:] for call in apply_calls] == [(False, False), (True, False), (False, True), (True, True)]
 
 
 def test_allocating_wrappers_stay_internal():
@@ -157,3 +159,16 @@ def test_allocating_wrappers_stay_internal():
     assert callable(execution._flex_attention_backward)
     assert "_flex_attention_forward" not in execution.__all__
     assert "_flex_attention_backward" not in execution.__all__
+
+
+@pytest.mark.parametrize("value", [1, None, "yes"])
+def test_max_logit_option_requires_bool(value):
+    with pytest.raises(TypeError, match="return_max_logit"):
+        validate_call_options(softmax_scale=None, deterministic=False, return_lse=False, return_max_logit=value)
+
+
+def test_max_logit_requires_nonnegative_scale():
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_call_options(softmax_scale=-1.0, deterministic=False, return_lse=False, return_max_logit=True)
+    validate_call_options(softmax_scale=-1.0, deterministic=False, return_lse=False)
+    validate_call_options(softmax_scale=0.0, deterministic=False, return_lse=False, return_max_logit=True)

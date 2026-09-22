@@ -19,6 +19,7 @@ from cutlass import Float32, Int32, const_expr
 from cudnn.flex_attention._compat import copy_utils
 from cudnn.flex_attention._compat import layout_utils
 
+from cudnn.flex_attention.kernels.common.max_logit import init_max_logit, store_max_logit, update_max_logit
 from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 from cudnn.flex_attention.kernels.common.pack_gqa import PackGQA
@@ -69,6 +70,7 @@ class FlexAttentionForwardBase:
         mV_type: Type[cutlass.Numeric],
         mO_type: Type[cutlass.Numeric],
         mLSE_type: Type[cutlass.Numeric] | None,
+        mMaxLogit_type: Type[cutlass.Numeric] | None,
         mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
         mCuSeqlensK_type: Type[cutlass.Numeric] | None,
     ):
@@ -79,6 +81,8 @@ class FlexAttentionForwardBase:
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mLSE_type not in [None, Float32]):
             raise TypeError("LSE tensor must be Float32")
+        if const_expr(mMaxLogit_type not in [None, Float32]):
+            raise TypeError("max_logit tensor must be Float32")
         if const_expr(mCuSeqlensQ_type not in [None, Int32]):
             raise TypeError("cu_seqlens_q tensor must be Int32")
         if const_expr(mCuSeqlensK_type not in [None, Int32]):
@@ -99,6 +103,7 @@ class FlexAttentionForwardBase:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -115,9 +120,12 @@ class FlexAttentionForwardBase:
         self,
         acc_O: cute.Tensor,
         lse: cute.Tensor,
+        row_max: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         sO: cute.Tensor,
+        sMaxLogit: Optional[cute.Tensor],
         seqlen: SeqlenInfoQK,
         tma_atom_O: Optional[cute.CopyAtom],
         tiled_mma: cute.TiledMma,
@@ -125,8 +133,16 @@ class FlexAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        softmax_scale: Float32,
         sO_empty_mbar_ptr: Optional[cute.Pointer] = None,
     ):
+        if const_expr(mMaxLogit is not None):
+            init_max_logit(sMaxLogit, tidx)
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue),
+                number_of_threads=self.num_epilogue_threads,
+            )
+
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -142,6 +158,39 @@ class FlexAttentionForwardBase:
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(self.tile_m, self.tile_hdimv, self.check_hdim_v_oob, self.qhead_per_kvhead)
 
+        thr_mma = None
+        taccOcO = None
+        if const_expr(mLSE is not None or mMaxLogit is not None):
+            thr_mma = tiled_mma.get_slice(tidx)
+            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+
+        if const_expr(mMaxLogit is not None):
+            if taccOcO[0][1] == 0:
+                for m in cutlass.range(cute.size(row_max), unroll_full=True):
+                    row = m_block * self.tile_m + taccOcO[m, 0][0]
+                    row_is_valid = row < seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                    update_max_logit(
+                        sMaxLogit,
+                        row_max[m],
+                        row_is_valid,
+                        row % self.qhead_per_kvhead if const_expr(self.pack_gqa) else Int32(0),
+                        softmax_scale,
+                    )
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue),
+                number_of_threads=self.num_epilogue_threads,
+            )
+            store_max_logit(
+                sMaxLogit,
+                mMaxLogit,
+                tidx,
+                head_idx * self.qhead_per_kvhead if const_expr(self.pack_gqa) else head_idx,
+            )
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue),
+                number_of_threads=self.num_epilogue_threads,
+            )
+
         # Write LSE from rmem -> gmem
         if const_expr(mLSE is not None):
             mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
@@ -149,10 +198,8 @@ class FlexAttentionForwardBase:
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(gLSE.layout, cute.make_layout((self.tile_hdimv,), stride=(0,)))
                 gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
-                thr_mma = tiled_mma.get_slice(tidx)
                 taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gLSE_expanded))
                 assert cute.size(taccOgLSE, mode=[0]) == cute.size(lse)
-                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
                 t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
                 # Only the thread corresponding to column 0 writes out the lse to gmem
                 if taccOcO[0][1] == 0:

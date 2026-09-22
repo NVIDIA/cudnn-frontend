@@ -3,6 +3,7 @@
 
 from .api import (
     QKVG_TILE_ALIGN,
+    Fp4Format,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
     MxQuantSpec,
@@ -20,6 +21,7 @@ from .api_bwd import (
 
 __all__ = [
     "QKVG_TILE_ALIGN",
+    "Fp4Format",
     "GatedAttentionBlockBwd",
     "GatedAttentionBlockFwd",
     "GatedAttentionBlockGeometry",

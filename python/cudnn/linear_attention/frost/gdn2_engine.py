@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST GDN-2 engine: GDN2 / GDN2_BWD nodes on the chunked prefill and backward kernels (SM100/SM103/SM107, bf16/fp16,
+"""FROST GDN-2 engine: GDN2 / GDN2_BWD nodes on the chunked prefill and backward kernels (SM100 / SM103 / SM107, bf16/fp16,
 BT=16), the only GDN-2 engine; the backward regenerates the checkpoint series with the recompute kernel when the graph
 carries none.  Long sequences on few (sequence, head) tiles run as an exact piece chain (``common/piece_chain.py``) or as
 the decay-warmup split-K."""
@@ -17,6 +17,9 @@ from cudnn.frost.device import build_device, current_device, multiprocessor_coun
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
+
+# the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
+PREP_TILE_FRACTION = 0.425
 
 
 def build_gdn2(graph):
@@ -40,7 +43,7 @@ def build_gdn2(graph):
 class Gdn2FrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node GDN-2 graphs (THD layout).
 
-    The only GDN-2 engine (SM100/SM103/SM107); GDN2_BWD runs on the FROST backward
+    The only GDN-2 engine (SM100 / SM103 / SM107); GDN2_BWD runs on the FROST backward
     kernel with a forward checkpoint recompute when the graph has no ``state_checkpoints`` input."""
 
     name = "gdn2_frost"
@@ -118,14 +121,15 @@ class Gdn2FrostEngine(BaseEngine):
 
 
 class CompiledGdn2:
-    """Compiled FROST GDN-2 plan over the resolved node buffers.  ``choose_pieces`` fixes the scheme at build: ``uncut``
-    (one item per sequence and head), ``warmup`` (decay-warmup split-K) or ``chain`` (per-piece H and M from the fused
+    """Compiled FROST GDN-2 plan over the resolved node buffers.  ``choose_pieces`` and ``is_dv_split`` fix the scheme at build: ``uncut``
+    (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head, on the prep path up to ``PREP_TILE_FRACTION`` of the SM count in tiles,
+    each owning half of d_v) or ``chain`` (per-piece H and M from the fused
     summary, an fp32 state chain seeding every piece, the prefill over the pieces storing every piece's fp32 final state,
     the last filled piece gathered into ``final_state`` in the state dtype).  A rectangular state chains like a square
     one: the M pass runs k in place of v and w, so M is (DK, DK) while H and X are (DV, DK)."""
 
     def __init__(self, node, kernel_module):
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.gdn2_chain_forward_f16 import build_chain_forward, run_chain_forward
         from .kernel.gdn2_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
         from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
@@ -177,7 +181,24 @@ class CompiledGdn2:
             expand_num=1,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
+        self.dv_split = (
+            not self.chain
+            and not self.batch_invariant
+            and is_dv_split(
+                num_seqs=B,
+                heads_out=HO,
+                dim_v=V,
+                num_sm=self.num_sm,
+                total_tokens=total,
+                b_t=self.b_t,
+                expand_num=1,
+                unit_chunks=self.unit_chunks,
+            )
+        )
+        self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
+        self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
+        self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
+        self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
         self.length_rule = self.chain and self.batch_invariant
 
         layout = WorkspaceLayout()
@@ -219,7 +240,7 @@ class CompiledGdn2:
             ]
         else:
             regions.append(("scheduler", layout.add(8), "int32", (2,)))
-            self.n_tiles = B * HO
+            self.n_tiles = B * HO * self.tiles_per_head
             if self.split:
                 self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
                 self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
@@ -232,7 +253,24 @@ class CompiledGdn2:
                 self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
-            self.tensormap_bytes = tensormap_workspace_bytes(kernel_module, B)
+            if self.prep:
+                from .kernel import gdn2_prep_f16 as prep_module
+                from .kernel.gdn_tinv_f16 import tinv_rows
+
+                rows = tinv_rows(total, B, 1, self.b_t)
+                for name in ("prep_k_decay", "prep_q_decay", "prep_t"):
+                    regions.append((name, layout.add(rows * HO * self.b_t * K * 2, align=128), self.io_name, (rows, HO, self.b_t, K)))
+                regions.append(("prep_a", layout.add(rows * HO * self.b_t * self.b_t * 2, align=128), "int32", (rows, HO, self.b_t * self.b_t // 2)))
+                regions.append(("prep_diag", layout.add(rows * HO * K * 4, align=128), "float32", (rows, HO, K)))
+                prep_words = tensormap_workspace_bytes(prep_module, B) // 8
+                regions.append(("prep_tensormaps", layout.add(prep_words * 8, align=128), "int64", (prep_words,)))
+                regions.append(("prep_rows", layout.add(rows * 16), "int32", (rows, 4)))
+                regions.append(("prep_row_count", layout.add(4), "int32", (1,)))
+            if self.prep:
+                from .kernel import gdn2_prep_prefill_f16 as prefill_module
+            else:
+                prefill_module = kernel_module
+            self.tensormap_bytes = tensormap_workspace_bytes(prefill_module, B)
             regions.append(("tensormaps", layout.add(self.tensormap_bytes, align=128), "int64", (self.tensormap_bytes // 8,)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -302,11 +340,21 @@ class CompiledGdn2:
             chunk_scratch=region.get("chunk_scratch"),
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
+            prep_k_decay=region.get("prep_k_decay"),
+            prep_q_decay=region.get("prep_q_decay"),
+            prep_t=region.get("prep_t"),
+            prep_a=region.get("prep_a"),
+            prep_diag=region.get("prep_diag"),
+            prep_words=region.get("prep_tensormaps"),
+            prep_rows=region.get("prep_rows"),
+            prep_row_count=region.get("prep_row_count"),
         )
         if self.warmup_launch is None:
             self.warmup_launch = self.build_warmup_forward(
                 **buffers,
                 split=self.split,
+                tiles_per_head=self.tiles_per_head,
+                prep=self.prep,
                 n_tiles=self.n_tiles,
                 ideal_chunks=self.ideal,
                 num_sm=self.num_sm,
@@ -1156,7 +1204,7 @@ class CompiledGdn2Summary:
             )
 
         if self.fused_direct:
-            self.fused_cache = self.fused_summary.chunk_gdn2_summary_sm100(
+            self.fused_cache = self.fused_summary.chunk_gdn2_summary(
                 k,
                 v,
                 g,
@@ -1187,7 +1235,7 @@ class CompiledGdn2Summary:
                 stream=stream,
             )
             return
-        self.final_cache = self.recompute.chunk_gdn2_recompute_sm100(
+        self.final_cache = self.recompute.chunk_gdn2_recompute(
             k,
             v,
             g,
@@ -1274,7 +1322,7 @@ class CompiledGdn2Summary:
                 own_prologue=False,
             )
         else:
-            self.fused_cache = self.fused_summary.chunk_gdn2_summary_sm100(
+            self.fused_cache = self.fused_summary.chunk_gdn2_summary(
                 k,
                 v,
                 g,
@@ -1564,7 +1612,7 @@ class CompiledGdn2SummaryBwd:
                 stream=stream,
             )
 
-        self.kernel_cache = self.summary.chunk_gdn2_bwd_summary_sm100(
+        self.kernel_cache = self.summary.chunk_gdn2_bwd_summary(
             q,
             k,
             g,
@@ -1627,7 +1675,7 @@ class CompiledGdn2SummaryBwd:
                 stream,
             )
         else:
-            self.transition_cache = self.recompute.chunk_gdn2_recompute_sm100(
+            self.transition_cache = self.recompute.chunk_gdn2_recompute(
                 k,
                 k,
                 g,
@@ -1754,7 +1802,7 @@ class CompiledGdn2SummaryBwd:
                 own_prologue=False,
             )
         else:
-            self.state_m_cache = self.recompute.chunk_gdn2_recompute_sm100(
+            self.state_m_cache = self.recompute.chunk_gdn2_recompute(
                 k,
                 k,
                 g,
@@ -1784,7 +1832,7 @@ class CompiledGdn2SummaryBwd:
                 stream=stream,
                 own_prologue=False,
             )
-            self.state_g_cache = self.summary.chunk_gdn2_bwd_summary_sm100(
+            self.state_g_cache = self.summary.chunk_gdn2_bwd_summary(
                 q,
                 k,
                 g,

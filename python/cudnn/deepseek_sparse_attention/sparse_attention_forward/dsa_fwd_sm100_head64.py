@@ -1,6 +1,9 @@
 # Copyright (c) 2025 DeepSeek
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """SM100 DeepSeek sparse-attention forward kernel for 64 query heads.
 
@@ -47,6 +50,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cudnn._cutlass_compat import SmemAllocator, TmemAllocator
 
 from ..utils import copy as copy_utils
 from ._tcgen05_sync import (
@@ -525,7 +529,7 @@ class SparseAttentionForwardSm100Head64:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         # CuTe DSL 4.5 cannot carry a local SharedStorage object into a
         # dynamic control-flow region.  Materialize the fields used by those
@@ -628,7 +632,7 @@ class SparseAttentionForwardSm100Head64:
             cute.make_layout((8,)),
             cute.make_layout((self.COPY_ELEMS,)),
         )
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # WG0 warp 0 allocates and frees TMEM, so the epilogue does not

@@ -6,9 +6,10 @@
 Listed in ``cudnn/engines/manifest.py`` as ONE row owning the
 ``FROST_SDPA_FWD_ID_BASE`` block, so ``FrostSdpaFwdEngines()`` returns the whole
 family and a graph containing an sdpa() node reaches them through the ordinary
-lifecycle — no registration call. The row is opt-in
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until these engines have the arch
-coverage to serve graphs unasked.
+lifecycle — no registration call. The SM100 and SM120 f16/bf16 slots are default
+candidates, ranked against the backend per measured shard (``placement.py``); the
+other slots stay opt-in (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until they have
+the arch coverage to serve graphs unasked.
 
 The capability table, the probe and the lowering are unchanged and stay in
 ``engines.py`` (``ENGINE_SPECS`` / ``analyze_for`` / ``build``); this file is
@@ -50,26 +51,65 @@ class _FrostSdpaFwdPlan(CompiledPlan):
         # here rather than re-walking the list on every execute.
         self._uids = [t.get_uid() for t in self._tensors]
         self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0) or 0)
+        # Prepared launch (plan-time argument template, positional tvm-ffi call): binds the graph's
+        # normalized VariantPack; without one the plan is handed the raw uid map as before.
+        self._prepared = getattr(compiled, "prepared", None)
+        self._default_stream = getattr(compiled, "default_stream", None)  # the caller's current stream when the handle carries none
+        self.takes_variant_pack = self._prepared is not None
+        self._stream_handles: dict = {}
 
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
 
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
-        # Keyed by IR tensor object: that is the binding's own identity, and the
-        # only key resolve_variant_pack() accepts for an auto-assigned uid.
-        pack = {}
+        if self._prepared is not None:
+            pack = uid_to_data  # a VariantPack (takes_variant_pack)
+            if pack is None:
+                raise ValueError(f"{self._name}: the graph could not normalize the variant pack for this plan")
+            ws_ptr = 0
+            if self._workspace_bytes:
+                ws_ptr, nbytes = pack.workspace, pack.workspace_bytes
+                if not ws_ptr:
+                    raise ValueError(
+                        f"{self._name} requires a {self._workspace_bytes}-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes"
+                    )
+                if nbytes and nbytes < self._workspace_bytes:  # 0: a bare address, size unknown
+                    raise ValueError(
+                        f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
+                    )
+                device = getattr(ctx.workspace, "__dlpack_device__", None)
+                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                    raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
+            raw_stream = ctx.stream
+            if raw_stream is None:
+                # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does
+                # (a legacy-stream launch would run eagerly inside a CUDA-graph capture and leave the graph empty).
+                cu_stream = self._default_stream() if self._default_stream is not None else None
+                stream_int = int(cu_stream) if cu_stream is not None else 0
+            else:
+                cu_stream = self._stream_handles.get(raw_stream)
+                if cu_stream is None:
+                    from cuda.bindings import driver as _drv
+
+                    cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
+                stream_int = int(raw_stream)
+            self._prepared.execute(pack, ws_ptr, cu_stream, stream_int)
+            return
+        # The executor's operands out of the graph-wide variant pack, keyed by
+        # IR tensor identity (the binding's own key).
+        resolved = {}
         for t, uid in zip(self._tensors, self._uids):
             buf = uid_to_data.get(uid)
             if buf is None:
                 missing = [t.get_name() or uid for t, uid in zip(self._tensors, self._uids) if uid_to_data.get(uid) is None]
                 raise ValueError(f"{self._name}: the variant pack is missing buffers for {missing}")
-            pack[t] = buf
+            resolved[id(t)] = buf
         required = self._workspace_bytes
         if required:
             _check_workspace(ctx.workspace, required, self._name)
-            self._compiled(pack, ctx.workspace, stream=ctx.stream)
+            self._compiled.execute_resolved(resolved, ctx.workspace, stream=ctx.stream)
         else:
-            self._compiled(pack, stream=ctx.stream)
+            self._compiled.execute_resolved(resolved, stream=ctx.stream)
 
 
 class FrostSdpaFwdEngine(BaseEngine):

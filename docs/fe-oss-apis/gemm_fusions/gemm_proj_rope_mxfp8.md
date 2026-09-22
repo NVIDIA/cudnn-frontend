@@ -159,6 +159,10 @@ Returns a `TupleDict` with keys `out_fp8_row`, `out_scales_row`, `out_fp8_col`, 
 - BF16 path: `x`, `w`, `cos`, `sin` are `bfloat16`.
 - MXFP8 path: `x`, `w` are `float8_e4m3fn` codes; `x_scale`, `w_scale` are `uint8` (E8M0); `cos`, `sin` are `bfloat16`.
 - Outputs (both paths): `out_fp8_row`, `out_fp8_col` are `float8_e4m3fn`; `out_scales_row`, `out_scales_col` are `uint8` (E8M0).
+- No fp4 (e2m1) input on either path: the fused projection epilogues -- this kernel and the
+  [gated attention block](../gated_attention_block.md)'s `fuse_norm_rope` fork twin alike -- are rendered for an
+  `e4m3` B operand. The gated block serves an MXFP4 `W_qkvg` on its **unfused** pipeline only (the FROST GEMM's
+  mixed MXFP8 x MXFP4 block-scale row); asking for it with `fuse_norm_rope=True` is a typed `NotImplementedError`.
 
 ### Shapes and divisibility
 - `tokens % TILE_M == 0` (`TILE_M = 128`); no tail handling.

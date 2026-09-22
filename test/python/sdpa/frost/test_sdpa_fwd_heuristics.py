@@ -7,10 +7,10 @@ Unit tier (no GPU): recommend() emits ordered COMPLETE knob assignments — the
 same engine repeated with different sets, every set admissible, no cartesian
 blowup, cross-axis constraints never emitted, mode never on an entry.
 
-Executable tier (SM100): the ranked list carries knob-suffixed duplicates of
-one cell; the split_kv entry, pinned by name, builds, carves its partial slabs
-from the caller workspace, recombines correctly (O and Stats), and its
-(engine_id, knobs) tuple replays on a fresh graph.
+Executable tier (SM100): explicit public knob assignments build independently
+of recommendation order. The split plan carves its partial slabs from caller
+workspace, recombines correctly (O and Stats), and its (engine_id, knobs)
+record replays on a fresh graph.
 """
 
 import math
@@ -119,9 +119,13 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
         facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
         f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
         assert seen, "the split leg never consulted the wave-cost model"
+        # Geometry runners now consult the model too. Packed candidates carry
+        # p=4 (24 head groups), unpacked ones carry all 96 heads; no candidate
+        # may mistake the GQA ratio G=12 for p and model only eight heads.
+        assert {kw["heads_q"] for kw in seen} == {24, 96}
         for kw in seen:
-            assert (kw["q_tiles"], kw["heads_q"]) == (1, 24), f"split launch fed the GQA ratio, not the packed group: {kw}"
-            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
+            assert kw["q_tiles"] == 1
+            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == kw["heads_q"], kw["unsplit_launch"]
             # The combine still reduces the graph's own (S_q, H, B) rows.
             assert kw["combine_rows"] == 1 * 96 * b
         assert f16[0].knobs.pack_gqa is True and f16[0].knobs.cga == 1 and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
@@ -437,11 +441,11 @@ def test_d512_mxfp8_primary_uses_measured_scheduler():
 
 @pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
-    """Placement is the SHARED layer's job (engines/heuristics._assemble):
-    proposals lead the backend's entries inside each mode block by standing
-    assumption, the delegating entry never leads an OPENSOURCE block, one
-    config repeated across blocks keeps its first position, and no final
-    entry carries a mode."""
+    """Placement is the SHARED layer's job (engines/heuristics._assemble): a
+    list WITHOUT the BACKEND marker keeps the historical order (ours lead the
+    backend's entries inside each mode block), the delegating entry never
+    leads an OPENSOURCE block, one config repeated across blocks keeps its
+    first position, and no final entry carries a mode."""
     ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
     backend = [
         PlanConfig(-1, None),  # delegating (mode None)
@@ -457,6 +461,36 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     # OPENSOURCE: ours + delegating, and never the backend's own entries.
     oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: ours, backend)
     assert [p.engine_id for p in oss] == [20500, 20500, -1]
+
+
+@pytest.mark.L0
+def test_assemble_places_the_backend_block_where_the_marker_sits():
+    """The BACKEND marker: ``[BACKEND, ours]`` puts the delegating entry and the
+    mode's backend entries ahead of ours; ``[ours, BACKEND]`` is the historical
+    order; the marker itself never reaches the list, a repeat is dropped, an
+    OPENSOURCE block ignores it (python-only + delegating), FALLBACK expands to
+    the FALLBACK entries, and with no backend entries the block is empty."""
+    from cudnn.engines.heuristics import BACKEND, is_backend_block
+
+    ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
+    backend = [
+        PlanConfig(-1, None),
+        PlanConfig(7, {"k": 1}, cpp_index=0, mode=cudnn.heur_mode.A),
+        PlanConfig(8, {"k": 2}, cpp_index=1, mode=cudnn.heur_mode.FALLBACK),
+    ]
+    trail = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in trail] == [-1, 7, 20500, 20500]
+    lead = _assemble([cudnn.heur_mode.A], lambda kind: ours + [BACKEND], backend)
+    assert [p.engine_id for p in lead] == [20500, 20500, -1, 7]
+    assert not any(is_backend_block(p) for p in trail + lead)
+    twice = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND, ours[0], BACKEND, ours[1]], backend)
+    assert [p.engine_id for p in twice] == [-1, 7, 20500, 20500]
+    oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in oss] == [20500, 20500, -1], "OPENSOURCE stays python-only + delegating"
+    both = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [BACKEND] + ours if kind == "A" else [BACKEND, ours[0]], backend)
+    assert [p.engine_id for p in both] == [-1, 7, 20500, 20500, 8], "FALLBACK block expands to the FALLBACK entries; dedup keeps first positions"
+    alone = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, [])
+    assert [p.engine_id for p in alone] == [20500, 20500], "no backend entries: the block is empty and ours stay"
 
 
 @pytest.mark.L0
@@ -503,37 +537,32 @@ def _build_decodeish_graph(*, causal=True):
     st.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
     return g, (q, k, v, o, st), (B, H, SQ, SKV, D)
+
+
+def _append_explicit_f16_plan(g, *, split_kv):
+    engine = next(e for e in manifest.engines_for(g) if e.name == _F16)
+    knobs = {
+        cudnn.knob_type.TILE_M: 128,
+        cudnn.knob_type.TILE_N: 128,
+        cudnn.knob_type.TILE_CGA_M: 1,
+        cudnn.knob_type.SCHED_POLICY: 0,
+        cudnn.knob_type.SPLIT_KV: split_kv,
+        cudnn.knob_type.PACK_GQA: 0,
+    }
+    g.create_execution_plan(engine.engine_id, knobs)
+    index = g.get_execution_plan_count() - 1
+    assert g.get_engine_and_knobs_at_index(index) == (engine.engine_id, knobs)
+    return index
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_split_kv_plan_pinned_by_name_matches_reference():
+def test_explicit_split_kv_plan_matches_reference_and_roundtrips():
     """Issue F-2 regression: the split plan is graph-reachable, carves its
     slabs from the caller workspace, and recombines exactly."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph(causal=False)
-    # The split value depends on this device's SM count — ask the chooser
-    # rather than hard-coding one that only holds at one part's geometry.
-    from cudnn._device import device_info
-    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m
-    from cudnn.sdpa.fwd.heuristics import choose_split_kv
-
-    want = choose_split_kv(
-        q_tiles=-(-SQ // cga_tile_m(D)),
-        heads_q=H,
-        batch=B,
-        kv_tiles=-(-SKV // 128),
-        sm_count=device_info(torch.cuda.current_device()).sm_count,
-        combine_rows=SQ * H * B,
-        ctas_per_tile=2,
-    )
-    if want == 1:
-        pytest.skip("this part is small enough that the shape already fills it")
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    f16 = [n for n in names if n.split("[")[0] == "sdpa_fwd_prefill_sm100"]
-    assert len(f16) >= 3, f"expected knob-suffixed duplicates of the f16 family engine: {f16}"
-    split_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and f"split_kv={want}" in n)
+    split_idx = _append_explicit_f16_plan(g, split_kv=2)
     g.select_plan(split_idx)
     g.check_support()
     g.build_plans()
@@ -555,25 +584,33 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
 
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
-    assert knobs.split_kv == want
-    g2, _handles2, _ = _build_decodeish_graph(causal=False)
-    cfg = g2.create_execution_plan(eng_id, knobs)
-    assert cfg is not None
+    assert knobs[cudnn.knob_type.SPLIT_KV] == 2
+    g2, (q2, k2, v2, o2, st2), _ = _build_decodeish_graph(causal=False)
+    g2.create_execution_plan(eng_id, knobs)
+    replay_idx = g2.get_execution_plan_count() - 1
+    assert g2.get_engine_and_knobs_at_index(replay_idx) == (eng_id, knobs)
+    g2.select_plan(replay_idx)
+    g2.check_support()
+    g2.build_plans()
+    replay_o, replay_st = torch.empty_like(o_gpu), torch.empty_like(st_gpu)
+    replay_ws = torch.empty(g2.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    g2.execute({q2: q_gpu, k2: k_gpu, v2: v_gpu, o2: replay_o, st2: replay_st}, replay_ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replay_o, o_gpu, atol=0, rtol=0)
+    torch.testing.assert_close(replay_st, st_gpu, atol=0, rtol=0)
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_runner_up_sched_plan_builds_and_matches_the_winner():
-    """select_plan on a runner-up knob set compiles the adapter with exactly
-    that set and executes correctly — honored, not silently degraded."""
+def test_explicit_natural_unsplit_plan_builds_and_matches_reference():
+    """A pinned scheduler is honored regardless of the recommendation list."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    nat_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and "sched_policy=0" in n and "split_kv=1" in n)
+    nat_idx = _append_explicit_f16_plan(g, split_kv=1)
     g.select_plan(nat_idx)
     g.check_support()
     g.build_plans()
     eng_id, knobs = g.get_engine_and_knobs_at_index(nat_idx)
-    assert knobs.sched_policy == 0 and knobs.split_kv == 1
+    assert knobs[cudnn.knob_type.SCHED_POLICY] == 0 and knobs[cudnn.knob_type.SPLIT_KV] == 1
 
     torch.manual_seed(0)
     q_gpu = torch.randn(B, SQ, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
@@ -638,3 +675,84 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph():
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
+
+
+def _decode_d256_facts(**over):
+    """Qwen3.5 decode as served: 32/2 heads (packed 16:1), d=256, S_q=1, paged
+    (page 16) over a 4096-key table, on a 148-SM SM100 part."""
+    base = dict(
+        b=32,
+        h_q=32,
+        h_kv=2,
+        s_q=1,
+        s_kv=4096,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=False,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 0),
+        device_sm_count=148,
+    )
+    base.update(over)
+    return SdpaGraphFacts(**base)
+
+
+@pytest.mark.L0
+def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
+    """A d256 graph the decode tile serves gets the decode split model
+    (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
+    choice that also pays for the split path's second host launch, the captured
+    caller's optimum follows as a runner-up (select_plan / autotune reach it),
+    and no-split closes the list. The same graph one token wider (S_q=2: 32
+    packed rows, the compiled-but-unrouted 32-column tile) or longer (S_q=3: 48
+    rows) is the prefill tile's launch and keeps the prefill model, which does
+    not split either shape at b=32."""
+
+    def sets(**over):
+        return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
+
+    serving = sets()
+    assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
+    assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    small = sets(b=8)
+    assert small[0].split_kv == 8, small[0]
+    assert any(k.split_kv == 1 for k in small[1:]), small
+    saturated = sets(b=128)
+    assert all(k.split_kv == 1 for k in saturated), saturated
+    long_kv = sets(s_kv=16384)
+    assert long_kv[0].split_kv == 2, long_kv[0]
+    # The 16-row MTP step (Qwen3-Next 16/2 at S_q=2 bottom-right: 8:1 packing)
+    # is decode-shaped and follows the serving shape's policy.
+    mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
+    assert mtp16[0].split_kv == 1 and mtp16[0].pack_gqa is True, mtp16[0]
+    assert [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
+    # The 32-row MTP step (32/2 at S_q=2) is NOT routed onto the decode tile
+    # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS): the prefill model, unsplit.
+    mtp32 = sets(s_q=2, causal=True, bottom_right=True)
+    assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
+    prefill = sets(s_q=3)
+    assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
+
+
+@pytest.mark.L0
+def test_decode_tile_model_counts_the_whole_packed_group():
+    """96/8 (G = 12) at d256: the prefill tile packs gcd(12, 128) = 4 heads per
+    row-group (partial PackGQA), the decode tile packs all 12 (HEADS_PER_TILE =
+    QH_PER_KH, no partial form), so its routing test and its split model count
+    S_q x 12 like the adapter does: S_q = 1 is a 12-row decode launch of b x 8
+    units, S_q = 2 (24 rows) is the prefill tile's graph.  Fed the partial group
+    the model would call S_q = 2 an 8-row decode launch and cost it with the
+    decode model while the adapter lowers it onto the prefill tile."""
+    from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _decode_tile_pack_g, _pack_gqa_group
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    one, two = _decode_d256_facts(h_q=96, h_kv=8, s_q=1), _decode_d256_facts(h_q=96, h_kv=8, s_q=2)
+    partial = _pack_gqa_group(row, one, 128, True)
+    assert partial == 4, partial
+    assert _decode_tile_pack_g(one, partial) == 12 and _decode_tile_pack_g(one, 1) == 1
+    assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
+    assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
+    assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))

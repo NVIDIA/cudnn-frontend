@@ -8,6 +8,7 @@ analysis, runtime buffer binding, and engine integration live outside this
 module.
 """
 
+from cudnn._cutlass_compat import SmemAllocator, TmemAllocator, get_num_tmem_alloc_cols, get_smem_capacity_in_bytes
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal, Optional, Tuple, Type, Union
@@ -711,7 +712,7 @@ class _Sm100BlockScaledPersistentDenseImplicitGemmKernel(_PersistentKernelBase):
         # N-extent of one epilogue subtile (used by overlapping-accum early release).
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = get_smem_capacity_in_bytes()
 
         # Setup A/B/D stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_d_stage = self._compute_stages(
@@ -777,7 +778,7 @@ class _Sm100BlockScaledPersistentDenseImplicitGemmKernel(_PersistentKernelBase):
         # 2-stage fake) would under-count. Derive the column count from the
         # same fake tensor used at the injection sites instead.
         if cutlass.const_expr(self.overlapping_accum):
-            self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(
+            self.num_tmem_alloc_cols = get_num_tmem_alloc_cols(
                 self._make_acc_fake_tensor(tiled_mma, self.mma_tiler),
                 arch=self.arch,
             )
@@ -1601,7 +1602,7 @@ class _Sm100BlockScaledPersistentDenseImplicitGemmKernel(_PersistentKernelBase):
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Pipeline Init: merged pipeline shares one mbarrier between TMA (A+B+SFB)
@@ -1688,12 +1689,12 @@ class _Sm100BlockScaledPersistentDenseImplicitGemmKernel(_PersistentKernelBase):
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # Cluster arrive after barrier init
