@@ -469,6 +469,28 @@ def test_moe_grouped_matmul_fwd_e2e(group_sizes, offset_cudnn_dt, offset_torch_d
     torch.testing.assert_close(output[0], _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@requires_sm100
+@pytest.mark.no_workspace_shim
+def test_moe_grouped_matmul_fwd_direct_call_requires_workspace() -> None:
+    """Rule 8: the plan owns no workspace. A direct call without one is a contract
+    error naming the byte count; the test harness supplies ``workspace_bytes``."""
+    E, N, K = 8, 256, 128
+    group_sizes = [96] * E
+    S = sum(group_sizes)
+    compiled = _plan(_build_graph(E, S, N, K), config=by_name(_CFG))
+    assert compiled.workspace_bytes > 0
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
+    vp = _vp_moe(compiled, token, weight, _offsets(group_sizes, S, dtype=torch.int32), output)
+    with pytest.raises(ValueError, match="workspace"):
+        compiled._compiled(vp)
+    compiled(vp)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output[0], _ref_f32(token, weight, _offsets(group_sizes, S), S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
 def test_analyzer_detects_n_major_weight() -> None:
     chain = analyze(_build_graph(8, 768, 256, 128, weight_major="n"))
     assert chain.matmul.a_major == "k" and chain.matmul.b_major == "n"

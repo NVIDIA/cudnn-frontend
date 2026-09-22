@@ -204,9 +204,12 @@ class DeviceView:
 
 
 class DeviceBuffer(DeviceView):
-    """A uint8 device allocation this process owns, for the paths where no
-    caller buffer exists. Allocated on the CURRENT context, so the caller owns
-    the context this memory belongs to."""
+    """A uint8 device allocation this process owns. Allocated on the CURRENT
+    context, so the caller owns the context this memory belongs to.
+
+    No production path may own one (Rule 8: plans and engines carve scratch from
+    the caller's workspace). Kept for tests that need a driver-owned allocation
+    whose GC-timed release must not invalidate a stream capture."""
 
     def __init__(self, nbytes: int, device_id: int):
         from cuda.bindings import driver as _drv

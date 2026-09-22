@@ -302,7 +302,12 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         decl = spec.decl[name]
         h, d = decl[0], decl[1]
         st, sh = f.strides, f.shape
-        if len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
+        if f.numel == 0:
+            # A zero-numel operand has no geometry of its own, whatever its rank (issue #552: an all-KV-zero
+            # call may pass an empty K/V; the packed-KV clamp below binds the dummy token). It takes the
+            # plan's declared strides, as the pre-prepared path did.
+            ts, hs, es = decl[2], decl[3], decl[4]
+        elif len(st) == 4:  # the graph's (B, H, S, D) declaration, possibly overridden
             if int(sh[0]) != b or int(sh[1]) != h or int(sh[3]) != d:
                 raise ValueError(f"cudnn.sdpa: " + (f"{name}: effective shape {tuple(sh)} must be ({b}, {h}, S, {d}) for this plan"))
             ts, hs, es = int(st[2]), int(st[1]), int(st[3])
@@ -311,10 +316,7 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
                 raise ValueError(f"cudnn.sdpa: " + (f"{name}: a packed THD buffer is (T, {h}, {d}); got {tuple(sh)}"))
             ts, hs, es = int(st[0]), int(st[1]), int(st[2])
         else:
-            if True:
-                raise ValueError(f"cudnn.sdpa: " + (f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}"))
-        if f.numel == 0:
-            ts, hs, es = decl[2], decl[3], decl[4]
+            raise ValueError(f"cudnn.sdpa: " + (f"{name}: a THD operand is (T, H, D) or the graph's (B, H, S, D); got rank {len(st)}"))
         width = _buffers.DTYPE_ITEMSIZE[spec.expect[name]]
         if es != 1:
             raise ValueError(f"cudnn.sdpa: " + (f"{name}: the head dim must be contiguous (elem stride 1); got {es}"))
@@ -558,7 +560,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     else:
         if sinks is not None:
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a sink; construct the API with has_sink"))
-        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
+        frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
     if workspace_ptr % _ALIGN_TMA != 0:
         raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
@@ -948,7 +950,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     else:
         if sinks is not None:
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
-        frame[ix["sinks_ptr"]] = q.ptr  # HAS_SINK=False: an aligned, never-read ABI slot
+        frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
     def lens(name: str) -> int:
         f = facts.get(name)
@@ -964,9 +966,9 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
-    # meta and only THD reads o_desc. Bind live storage instead of owning dummies.
-    frame[ix["o_desc_ptr"]] = q.ptr
-    frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else q.ptr
+    # meta and only THD reads o_desc (both compile-time flags): dead slots are 0.
+    frame[ix["o_desc_ptr"]] = 0
+    frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else 0
     if spec.seq_q_present:
         frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
 

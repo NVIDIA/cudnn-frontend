@@ -12,8 +12,9 @@ For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point
 
 **Unified Grouped GEMM + dGLU fusion**: one public class and wrapper select a
 plain BF16 or legacy block-scaled grouped GEMM fused with a dGLU backward
-epilogue (dSwiGLU, dGeGLU, or block-scaled dSiTU-GLU) on NVIDIA Blackwell GPUs (SM100+). The operation
-is implemented with CUTLASS/CuTe DSL.
+epilogue (dSwiGLU, dGeGLU, or block-scaled dSiTU-GLU) on NVIDIA Blackwell GPUs
+(SM100/SM103), with a block-scaled dSwiGLU/dGeGLU path on Rubin (SM107).
+The operation is implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
@@ -36,6 +37,10 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
 `dsituglu` is not available on the BF16 or Rubin backends.
+The block-scaled dGeGLU path supports configurable activation alpha, clamp
+bounds, and linear offset on both Blackwell and Rubin in dense and discrete
+weight modes. These values are constructor configuration and remain part of
+the backward wrapper's compiled-kernel cache key.
 
 ## BF16 contract
 
@@ -163,7 +168,7 @@ the dGLU compiled-kernel cache key.
   - `SFB` (discrete): per-expert SFB pointers, `sfb_ptrs` shape `(num_experts,)` of int64
   - `padded_offsets`: cumulative sum of aligned group M sizes, shape `(L,)`. `valid_m = padded_offsets[-1]`
   - `alpha`: per-group scaling factors for GEMM, shape `(L,)`
-  - `beta`: per-group scaling factors for `C`, shape `(L,)`
+  - `beta`: per-group scaling factors for `C` in dSwiGLU, shape `(L,)`; dGeGLU consumes the saved `C` directly and ignores `beta`
   - `prob`: per-row gating probabilities, shape `(valid_m, 1, 1)`
   - `norm_const`: normalization constant for FP8 quantization, shape `(1,)`
 - **Outputs**
@@ -183,7 +188,8 @@ $$
 
 **Step 2: dGLU backward epilogue** (performed with 32-column interleaving along `2N`):
 
-- Scale `C` by `beta_g` per group and deinterleave into input/gate halves by 32-wide blocks.
+- Deinterleave `C` into alternating 32-column gate and up blocks. dSwiGLU
+  applies `beta_g` to `C`; dGeGLU uses the saved forward values directly.
 
 For **dSwiGLU** (`act_func="dswiglu"`):
 - `swish = gate * sigmoid(gate)`
@@ -192,7 +198,46 @@ For **dSwiGLU** (`act_func="dswiglu"`):
 - `dswiglu = ref * prob * input * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))`
 - Interleave `[ab, dswiglu]` back into `D_row`/`D_col` with 32-column blocks.
 
-For **dGeGLU** (`act_func="dgeglu"`): Uses `sigmoid(1.702 * gate)` scaling in the backward computation.
+For **dGeGLU** (`act_func="dgeglu"`), let `gate` and `up` be the original
+saved `C` values and `ref` the GEMM result from Step 1:
+
+```python
+gate_clamped = min(gate, glu_clamp_max)
+up_clamped = clamp(up, glu_clamp_min, glu_clamp_max)
+s = sigmoid(geglu_alpha * gate_clamped)
+gate_mask = gate <= glu_clamp_max
+up_mask = (glu_clamp_min <= up) & (up <= glu_clamp_max)
+dgate = ref * prob * (up_clamped + linear_offset) * s
+dgate *= (1 + geglu_alpha * gate_clamped * (1 - s)) * gate_mask
+dup = ref * prob * gate_clamped * s * up_mask
+dprob += sum(ref * gate_clamped * s * (up_clamped + linear_offset), axis=columns)
+```
+
+The gate has only an upper clamp; the up branch has both bounds. Clamp masks
+use the original values before clamping, and gradients are retained at equality
+with either bound. The offset is added after clamping the up branch. The
+probability gradient does not include a factor of `prob`, so it can be nonzero
+when the routing probability is zero. `[dgate, dup]` is stored in alternating
+32-column blocks.
+
+The upstream `ref` includes `alpha_tensor[g] ** 2` on both architectures; this
+per-group GEMM scale is separate from `geglu_alpha`. dGeGLU reads `C` in its
+stored precision, so a BF16 saved intermediate is the input to this derivative,
+not the original FP32 forward accumulator. `C` is not modified.
+
+The defaults are `geglu_alpha=1.702`, `glu_clamp_max=7.0`,
+`glu_clamp_min=-7.0`, and `linear_offset=1.0`. For DeepSeek V4 clamped SwiGLU,
+use `act_func="dgeglu"`, `geglu_alpha=1.0`, `linear_offset=0.0`,
+`glu_clamp_max=L`, and `glu_clamp_min=-L`, matching the forward configuration
+(`L=10` for the Flash recipe).
+
+Set these parameters when constructing `GroupedGemmDgluSm100` or calling
+`grouped_gemm_dglu_wrapper_sm100`. The backward API specializes the activation
+configuration; changing it selects another compiled-kernel cache entry, while
+repeating a configuration reuses that entry. It does not expose the forward
+API's per-execution activation controls. With BF16 `C`, the packed derivative
+represents clamp bounds in BF16; limits such as `7` and `10` are exact, while
+nonrepresentable limits can differ from the scalar FP32 clamp path.
 
 **Step 3: Optional output quantization** (when SFD outputs are generated):
 
@@ -215,17 +260,17 @@ $$
    v    v                                        v
   Dequantize → Grouped GEMM (per group ranges) → ref
                     |
-                    | × alpha[group_idx]
+                    | × alpha[group_idx]^2
                     v
                ref (valid_m×N×1)
                     |
- C (valid_m×2N×1) --× beta[group_idx]--> deinterleave 32-col blocks
+ C (valid_m×2N×1) --> activation-specific preparation and 32-col split
                     |                    |
                     |                swish, sigmoid
                     |                    |
                     +--> dprob (sum over blocks)
                     |
-                    +--> ab, dswiglu → interleave → D (valid_m×2N×1)
+                    +--> dgate, dup → interleave → D (valid_m×2N×1)
                                       |
                          +-----------+-----------+
                          |                       |
@@ -526,6 +571,11 @@ Providing both or neither raises `ValueError`.
 - `m_aligned`: Must be `256`. Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
 - `act_func`: Backward activation function. `"dswiglu"` (default), `"dgeglu"`, or block-scaled `"dsituglu"`
+- `linear_offset`: Offset added to the clamped dGeGLU up branch. Default: `1.0` for dGeGLU
+- `geglu_alpha`: dGeGLU sigmoid input scale. Default: `1.702`
+- `glu_clamp_max`: dGeGLU upper bound for gate and up. Default: `7.0`
+- `glu_clamp_min`: dGeGLU lower bound for up only. Default: `-7.0`
+- These activation parameters must match forward and specialize the block-scaled backward cache on Blackwell and Rubin; the BF16 backend retains its fixed alpha/clamp values
 - `situ_beta1`: Positive finite gate tanh scale for dSiTU-GLU. Default: `4.0`
 - `situ_beta2`: Positive finite up-branch tanh scale for dSiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
@@ -591,10 +641,14 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ### Environment
 
-- Requires CUDA with **SM100+ compute capability** (Blackwell GPUs)
+- Requires CUDA with **SM100/SM103** (Blackwell), or **SM107** (Rubin) for the block-scaled backend
+- Rubin MXFP8 uses matching FP8 A/B operands, E8M0 scale factors, and `sf_vec_size=32`; the dGLU API requires FP8 D outputs with row/column scale factors for these inputs
 
 ---
 
 ## Usage Examples
 
 For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
+Rubin MXFP8 activation-parameter coverage is in
+`test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py`
+(`test_rubin_mxfp8_clamped_dgeglu_*`).

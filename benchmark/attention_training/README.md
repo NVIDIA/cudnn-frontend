@@ -209,6 +209,17 @@ python benchmark_single_sdpa.py \
     --sdpa_backend cudnn --data_type fp8 \
     --attn_mask top_left --fwd_bwd
 
+# cuDNN OSS FROST engines, FP8 inputs with a block-scaled O epilogue
+# (forward-only inference): `fp8_nvfp4` writes O as FP4 (E2M1, two per byte)
+# with one E4M3 scale per 16 head-dim elements, `fp8_mxfp8` writes E4M3 O with
+# one UE8M0 scale per 32, both into the extra `sf_o` output of `sdpa_fp8` in
+# the F8_128x4 atom order a block-scaled GEMM consumes directly. d = 128 only.
+python benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type fp8_nvfp4 \
+    --attn_mask no_mask --profile_pass fwd
+
 # FlashAttention 4
 python benchmark_single_sdpa.py \
     --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \

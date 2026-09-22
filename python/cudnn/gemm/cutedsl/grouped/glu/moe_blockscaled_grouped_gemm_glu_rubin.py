@@ -51,7 +51,7 @@ from ..moe_kernel_helpers import (
     fmax,
     atomic_max_float32,
     silu_f32,
-    silu_f32_geglu_scaled,
+    silu_f32_scaled,
     compute_stages,
     compute_grid,
     get_dtype_rcp_limits,
@@ -745,6 +745,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
     ):
         """Execute the GEMM.
 
@@ -752,6 +755,17 @@ class BlockScaledMoEGroupedGemmGluKernel:
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
+
+        For ``act_func == "geglu"``, runtime ``cutlass.Float32`` parameters
+        configure the activation:
+
+            gate_clamped = min(gate, glu_clamp_max)
+            up_clamped = clamp(up, min=glu_clamp_min, max=glu_clamp_max)
+            out = gate_clamped * sigmoid(geglu_alpha * gate_clamped)
+                  * (up_clamped + linear_offset)
+
+        The optional routing probability multiplies this result. Stored C
+        retains the GEMM-plus-bias values before activation clamping.
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
@@ -1130,6 +1144,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
             self.sched_params,
             epilogue_op,
             linear_offset,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1458,7 +1475,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
         return tCgSFDCol_mnl
 
     @cute.jit
-    def geglu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor, linear_offset: cutlass.Float32 = 1.0):
+    def geglu_act(
+        self,
+        tCompute: cute.Tensor,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        mProb: cute.Tensor,
+        linear_offset: cutlass.Float32 = 1.0,
+        alpha: cutlass.Float32 = 1.702,
+    ):
         if cutlass.const_expr(self.vectorized_f32):
             # GeGlu Packed Version
             LOG2_E = cutlass.Float32(1.4426950408889634)
@@ -1466,7 +1491,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
                 scaled_gate_0, scaled_gate_1 = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                    (1.702, 1.702),
+                    (alpha, alpha),
                     rnd="rn",
                     ftz=False,
                 )
@@ -1531,7 +1556,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             # GeGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
-                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_geglu_scaled(acc_vec_gate[i], fastmath=True)
+                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_scaled(acc_vec_gate[i], alpha=alpha, fastmath=True)
                 if cutlass.const_expr(self.has_prob):
                     tCompute[i] = tCompute[i] * mProb
 
@@ -1638,6 +1663,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2872,12 +2900,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                             )
 
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            geglu_max_val = cutlass.Float32(7.0)
-                            geglu_min_val = cutlass.Float32(-7.0)
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
+                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], glu_clamp_min)
 
                         acc_vec_gate = tTR_rAcc_gate.load()
                         acc_vec_up = tTR_rAcc_up.load()
@@ -2885,7 +2911,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         # SwiGlu or GeGLU
                         tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
+                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset, geglu_alpha)
                         elif cutlass.const_expr(self.act_func == "swiglu"):
                             self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
 
