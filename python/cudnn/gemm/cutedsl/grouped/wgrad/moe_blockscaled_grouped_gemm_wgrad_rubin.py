@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """Rubin (SM107) block-scaled MoE grouped GEMM weight-gradient kernel."""
 
@@ -7,6 +10,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import get_smem_capacity_in_bytes
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -86,7 +90,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.architecture = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.smem_capacity = get_smem_capacity_in_bytes(self.architecture)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     def _setup_attributes(self) -> None:

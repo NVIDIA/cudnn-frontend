@@ -20,6 +20,8 @@ from .helpers import (
     note_frost_routing,
 )
 from .mxfp8_ref import compute_ref, compute_ref_backward
+from .fp8 import assert_close_fp8_grad, block_scaled_o_sf_dims
+from cudnn.engines.manifest import opt_in_engines_enabled
 
 # Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
 # TransformerEngine MXFP8Quantizer / tex.swizzle_scales_for_gemm_ semantics —
@@ -59,6 +61,8 @@ class GraphFwdUid(IntEnum):
     stats = 4
     o_amax = 12
     sink_token = 13
+    scale_o = 14  # block-scaled O: the FP4 global scale (python-only input of sdpa_mxfp8)
+    sf_o = 15  # block-scaled O: per-(b, h) F8_128x4 scale planes (python-only output)
 
 
 class GraphBwdUid(IntEnum):
@@ -159,7 +163,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        left_bound=None, right_bound=None, diag_align=None,
                        with_sink_token=False,
                        with_unfuse_fma=False,
-                       implementation=cudnn.attention_implementation.AUTO):
+                       implementation=cudnn.attention_implementation.AUTO,
+                       o_block_scale=0):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -174,24 +179,30 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         compute_data_type=cudnn.data_type.FLOAT
     )
 
-    # Q, K, V tensors with BHSD layout
-    # Stride: (s * h * d, d, h * d, 1) for interleaved layout
+    # Q, K, V, O tensors: (b, h, s, d) dims, BHSD-physical strides -- except for a
+    # block-scaled O draw, whose sf_o output has no backend lowering: it runs on
+    # the FROST MXFP8 engine, which serves BSHD-physical Q/K/V/O only.
+    bshd = bool(o_block_scale)
+    q_stride = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1) if bshd else (h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1)
+    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if bshd else (h_k * s_kv * d_qk, s_kv * d_qk, d_qk, 1)
+    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if bshd else (h_v * s_kv * d_vo, s_kv * d_vo, d_vo, 1)
+    o_stride = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1) if bshd else (h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1)
     q = graph.tensor(
         uid=GraphFwdUid.q,
         dim=(b, h_q, s_qo, d_qk),
-        stride=(h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1),
+        stride=q_stride,
         data_type=cudnn_itype
     )
     k = graph.tensor(
         uid=GraphFwdUid.k,
         dim=(b, h_k, s_kv, d_qk),
-        stride=(h_k * s_kv * d_qk, s_kv * d_qk, d_qk, 1),
+        stride=k_stride,
         data_type=cudnn_itype
     )
     v = graph.tensor(
         uid=GraphFwdUid.v,
         dim=(b, h_v, s_kv, d_vo),
-        stride=(h_v * s_kv * d_vo, s_kv * d_vo, d_vo, 1),
+        stride=v_stride,
         data_type=cudnn_itype
     )
 
@@ -234,8 +245,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     if with_sink_token:
         sink_token = graph.tensor(uid=GraphFwdUid.sink_token, dim=(1, h_q, 1, 1), stride=(h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
-    # Call MXFP8 SDPA
-    o, stats, amax_o = graph.sdpa_mxfp8(
+    sdpa_kwargs = dict(
         q=q, k=k, v=v,
         descale_q=sf_q, descale_k=sf_k, descale_v=sf_v,
         attn_scale=attn_scale,
@@ -247,9 +257,24 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         unfuse_fma=with_unfuse_fma,
         implementation=implementation,
     )
+    if o_block_scale:
+        # Block-scaled O: the sf_o output (per-(b, h) F8_128x4 planes) rides
+        # sdpa_mxfp8 the way it rides sdpa_fp8. FP4 O carries E4M3 scales per
+        # 16 d and needs scale_o (the FP4 global scale, a python-only input);
+        # E4M3 O carries UE8M0 scales per 32 d and runs without a global scale.
+        sf_dims = block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale)
+        sf_stride = (sf_dims[1] * sf_dims[2] * sf_dims[3], sf_dims[2] * sf_dims[3], sf_dims[3], 1)
+        sf_dtype = cudnn.data_type.FP8_E4M3 if o_block_scale == 16 else cudnn.data_type.FP8_E8M0
+        sdpa_kwargs['sf_o'] = graph.tensor(uid=GraphFwdUid.sf_o, dim=sf_dims, stride=sf_stride, data_type=sf_dtype)
+        if o_block_scale == 16:
+            sdpa_kwargs['scale_o'] = graph.tensor(uid=GraphFwdUid.scale_o, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
+        cudnn_otype = cudnn.data_type.FP4_E2M1 if o_block_scale == 16 else cudnn.data_type.FP8_E4M3
+
+    # Call MXFP8 SDPA
+    o, stats, amax_o = graph.sdpa_mxfp8(**sdpa_kwargs)
 
     # Set output tensor properties
-    o.set_uid(GraphFwdUid.o).set_output(True).set_dim((b, h_q, s_qo, d_vo)).set_stride((h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1)).set_data_type(cudnn_otype)
+    o.set_uid(GraphFwdUid.o).set_output(True).set_dim((b, h_q, s_qo, d_vo)).set_stride(o_stride).set_data_type(cudnn_otype)
     stats.set_uid(GraphFwdUid.stats).set_output(True).set_dim((b, h_q, s_qo, 1)).set_stride((h_q * s_qo, s_qo, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_uid(GraphFwdUid.o_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
 
@@ -750,6 +775,62 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     assert amax_diff <= 0.02 * max(amax_ref, 1.0), f"amax mismatch: gpu={amax_o_gpu.item():.6e} ref={amax_ref:.6e}"
 
 
+def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):
+    """Mirror of the FROST MXFP8 engine's S_kv rule (engines._band_covers_kv_tail):
+    a KV tail that is not a whole 128-tile is served only when the causal band
+    provably masks every column >= S_kv -- top-left: s_q + right_bound <= s_kv;
+    bottom-right: plain causal (right_bound == 0)."""
+    if s_kv % 128 == 0:
+        return True
+    if right_bound is None:
+        return False
+    if diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT:
+        return right_bound == 0
+    return s_qo + right_bound <= s_kv
+
+
+def _mxfp8_block_scaled_engine_covers(sm):
+    """Whether a FROST MXFP8 forward engine row that carries the block-scaled O
+    epilogue serves this arch (``engines.py`` is the source of truth: the SM100
+    and SM107 lines today; SM120 has no MXFP8 kernel, so a draw there must fold)."""
+    from cudnn.sdpa.fwd import engines
+
+    return any(
+        c.is_mxfp8 and c.phase == "prefill" and {16, 32} <= set(c.o_block_scales) and c.sm_lo <= sm <= c.sm_hi
+        for c in (spec.capabilities for spec in engines.ENGINE_SPECS)
+    )
+
+
+def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fma, d_qk, d_vo, s_qo, s_kv, right_bound, diag_align, engines_enabled=None, has_fp4=None):
+    """The ``o_block_scale`` a drawn config actually runs with: the draw itself where
+    the FROST d128 MXFP8 epilogue serves it, else 0 (a plain MXFP8 forward).
+
+    Mirrors the engine's rules, so a draw admitted here and then declined is a
+    FAILURE, not a waive: an MXFP8 engine row for this arch (and the opt-in FROST
+    engines enabled), a dense unpaged inference forward, no backend-only
+    ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile or covered
+    by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure function
+    (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
+    if not o_block_scale:
+        return 0
+    engines_enabled = opt_in_engines_enabled() if engines_enabled is None else engines_enabled
+    has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
+    if not (
+        engines_enabled
+        and _mxfp8_block_scaled_engine_covers(sm)
+        and is_infer
+        and not is_paged
+        and not with_unfuse_fma
+        and d_qk == 128
+        and d_vo == 128
+        and _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align)
+    ):
+        return 0
+    if o_block_scale == 16 and not has_fp4:
+        return 0  # the packed FP4 dtype arrived in torch 2.8; older builds run the draw as plain mxfp8
+    return o_block_scale
+
+
 def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     """Execute MXFP8 SDPA test."""
     if request.config.option.dryrun:
@@ -780,6 +861,31 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
     torch_otype = cfg.output_type if hasattr(cfg, 'output_type') and cfg.output_type else torch.bfloat16
 
+    # Block-scaled O (sf_o): run the draw where the FROST d128 MXFP8 epilogue
+    # serves it (block_scaled_o_draw mirrors the engine rows: arch range, dense
+    # unpaged inference forward, no unfuse_fma, d = 128, KV-tail rule) -- laid
+    # out BSHD-physical, see generate_graph_fwd. Elsewhere the draw folds to a
+    # plain MXFP8 forward: the sf_o output has no backend lowering, so an
+    # admitted draw that is declined below is a failure, not a waive.
+    cc = torch.cuda.get_device_capability()
+    o_block_scale = block_scaled_o_draw(
+        int(getattr(cfg, 'o_block_scale', 0) or 0),
+        sm=10 * cc[0] + cc[1],
+        is_infer=cfg.is_infer,
+        is_paged=getattr(cfg, 'is_paged', False),
+        with_unfuse_fma=with_unfuse_fma,
+        d_qk=d_qk,
+        d_vo=d_vo,
+        s_qo=s_qo,
+        s_kv=s_kv,
+        right_bound=right_bound,
+        diag_align=diag_align,
+    )
+    if o_block_scale:
+        # The quantized O container is E4M3 (mxfp8 out) or the E2M1 byte container
+        # (nvfp4); the reference stays fp32 and is compared after dequantization.
+        torch_otype = torch.float8_e4m3fn
+
     # Map torch types to cudnn types
     if torch_itype == torch.float8_e4m3fn:
         cudnn_itype = cudnn.data_type.FP8_E4M3
@@ -800,6 +906,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             with_sink_token=with_sink_token,
             with_unfuse_fma=with_unfuse_fma,
             implementation=cfg.implementation,
+            o_block_scale=o_block_scale,
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -808,6 +915,10 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="mxfp8-fwd")
     except cudnn.cudnnGraphNotSupportedError as e:
+        if o_block_scale:
+            # The fold above mirrors the FROST MXFP8 engine's rules, so a decline
+            # of an admitted block-scaled draw is a regression (or a stale mirror).
+            pytest.fail(f"block-scaled O draw (o_block_scale={o_block_scale}) declined: {e}")
         pytest.skip(f"MXFP8 SDPA not supported: {e}")
     except Exception as e:
         # NOT_SUPPORTED can also surface at build_plans/finalize AFTER
@@ -832,6 +943,10 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     q_fp8_d, sf_q_d_ref, sf_q_d_swizzle, q_fp8_s, sf_q_s_ref, sf_q_s_swizzle = quantize_to_mxfp8(q_f32, b, h_q, s_qo, d_qk, block_size, torch_itype, with_ref=not perf)
     k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
     v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
+    if o_block_scale:
+        # The graph declared BSHD-physical Q/K/V for this draw (see generate_graph_fwd);
+        # the per-(b, h) F8_128x4 scale planes are layout-independent.
+        q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
 
     # Generate sink_token if needed
     sink_token_gpu = None
@@ -840,9 +955,32 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5
 
     # Allocate output tensors
-    o_gpu = torch.empty(b, h_q, s_qo, d_vo, dtype=torch_otype, device="cuda")
+    if o_block_scale == 16:
+        o_gpu = torch.full((b, s_qo, h_q, d_vo // 2), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    elif o_block_scale:
+        o_gpu = torch.full((b, s_qo, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda").transpose(1, 2)
+    else:
+        o_gpu = torch.empty(b, h_q, s_qo, d_vo, dtype=torch_otype, device="cuda")
     stats_gpu = torch.empty(b, h_q, s_qo, 1, dtype=torch.float32, device="cuda")
     amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
+
+    sf_o_gpu = scale_o_gpu = None
+    o_ref32 = stats_ref32 = None
+    o_scale_val = 1.0
+    if o_block_scale:
+        sf_o_gpu = torch.full(block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale), 0xAA, dtype=torch.uint8, device="cuda")
+        if not perf:
+            # fp32 reference up front: the FP4 global scale is set from its amax.
+            o_ref32, stats_ref32 = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
+                                               torch_itype=torch_itype, output_type=torch.float32,
+                                               left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
+                                               sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
+        if o_block_scale == 16:
+            # NVFP4 global scale: put the tensor amax at half the top of the
+            # E4M3 x E2M1 range (block scale <= 448 when the block amax / 6 is scaled by it).
+            if o_ref32 is not None:
+                o_scale_val = (448.0 * 6.0) / max(o_ref32.abs().max().item(), 1e-6) * 0.5
+            scale_o_gpu = torch.tensor([[[[o_scale_val]]]], dtype=torch.float32, device="cuda")
 
     # Build variant pack
     variant_pack = {
@@ -858,6 +996,10 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     }
     if with_sink_token:
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
+    if o_block_scale:
+        variant_pack[int(GraphFwdUid.sf_o)] = sf_o_gpu
+        if scale_o_gpu is not None:
+            variant_pack[int(GraphFwdUid.scale_o)] = scale_o_gpu
 
     # Execute
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
@@ -871,7 +1013,29 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
     o_f16 = o_gpu
     stats_bwd = stats_gpu
-    if not perf:
+    if not perf and o_block_scale:
+        from .block_scale_o_ref import dequant_block_scaled_o, quantize_o_mxfp8, quantize_o_nvfp4
+
+        o_ref, stats_ref = o_ref32, stats_ref32
+        o_f16 = o_ref.to(torch.bfloat16)
+        stats_bwd = stats_ref
+        # The kernel's O is compared after dequantization, in scale_o units: within
+        # the MXFP8 pipeline tolerance plus three times the pure block-quantization
+        # floor of the reference itself; every per-plane pad row past s_q zero;
+        # Amax_O the pre-scale amax (the API divides the global scale back out).
+        c_pad = block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale)[3]
+        o_deq, sf_pad_ok = dequant_block_scaled_o(o_gpu, sf_o_gpu, o_block_scale, "planes", b, h_q, s_qo, d_vo, c_pad)
+        o_ref_scaled = o_ref * o_scale_val
+        _, _, ref_q = (quantize_o_nvfp4 if o_block_scale == 16 else quantize_o_mxfp8)(o_ref_scaled)
+        assert not torch.isnan(o_deq).any(), "NaN in dequantized block-scaled O"
+        assert sf_pad_ok, "sf_o pad rows past s_q must be zero"
+        floor = (ref_q - o_ref_scaled).abs().max().item()
+        atol = max((0.125 if torch_itype == torch.float8_e5m2 else 0.12) * o_scale_val, 3.0 * floor)
+        assert_close_fp8_grad(o_deq, o_ref_scaled, atol, 0.2, tag="O(block-scaled)", keys=s_kv)
+        error = compare_tensors(stats_gpu, stats_ref, 0.05, 0.05, "stats")
+        assert error == 0, f"stats mismatch: {error} elements differ"
+        assert compare_amax(amax_o_gpu, o_ref, rtol=0.05, tag="amax(block-scaled, pre-scale)"), "Amax mismatch: 1 element differs"
+    elif not perf:
         o_ref, stats_ref = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
                                        torch_itype=torch_itype, output_type=torch_otype,
                                        left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,

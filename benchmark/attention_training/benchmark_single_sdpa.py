@@ -101,10 +101,19 @@ _FLOPS_PER_CLOCK_PER_SM = {
     # (No fp8/mxfp8 entries: Ampere has neither datapath.)
     8: {"bfloat16": 2048, "float16": 2048},
     9: {"bfloat16": 4096, "float16": 4096, "fp8": 8192},
-    # fp8_nvfp4 / fp8_mxfp8: fp8 inputs with a block-scaled O epilogue -- the
-    # MMAs are the fp8 ones, so the peak is the fp8 peak.
-    10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384, "fp8_nvfp4": 16384, "fp8_mxfp8": 16384},
-    12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048, "fp8_nvfp4": 2048, "fp8_mxfp8": 2048},
+    # fp8_nvfp4 / fp8_mxfp8 / mxfp8_nvfp4 / mxfp8_mxfp8: fp8 or mxfp8 inputs with a
+    # block-scaled O epilogue -- the MMAs are the fp8 ones, so the peak is the fp8 peak.
+    10: {
+        "bfloat16": 8192,
+        "float16": 8192,
+        "fp8": 16384,
+        "mxfp8": 16384,
+        "fp8_nvfp4": 16384,
+        "fp8_mxfp8": 16384,
+        "mxfp8_nvfp4": 16384,
+        "mxfp8_mxfp8": 16384,
+    },
+    12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048, "fp8_nvfp4": 2048, "fp8_mxfp8": 2048, "mxfp8_nvfp4": 2048, "mxfp8_mxfp8": 2048},
 }
 
 
@@ -273,11 +282,11 @@ def parse_args():
     parser.add_argument(
         "--data_type",
         default="bfloat16",
-        choices=["bfloat16", "float16", "float", "fp8", "mxfp8", "fp8_nvfp4", "fp8_mxfp8"],
+        choices=["bfloat16", "float16", "float", "fp8", "mxfp8", "fp8_nvfp4", "fp8_mxfp8", "mxfp8_nvfp4", "mxfp8_mxfp8"],
         help=(
-            "Data type: bfloat16, float16, float, fp8, mxfp8, or the fp8-input block-scaled-output modes "
-            "fp8_nvfp4 (FP4 O + E4M3 scale per 16 d) and fp8_mxfp8 (E4M3 O + UE8M0 scale per 32 d); "
-            "those two are forward-only and served by the cudnn_oss backend"
+            "Data type: bfloat16, float16, float, fp8, mxfp8, or the block-scaled-output modes over fp8 / mxfp8 inputs: "
+            "fp8_nvfp4 / mxfp8_nvfp4 (FP4 O + E4M3 scale per 16 d) and fp8_mxfp8 / mxfp8_mxfp8 (E4M3 O + UE8M0 scale per 32 d); "
+            "those four are forward-only and served by the cudnn_oss backend"
         ),
     )
     parser.add_argument(
@@ -588,14 +597,14 @@ else:
         print(f"UNSUPPORTED_CONFIG: {reason}")
         sys.exit(UNSUPPORTED_CONFIG_RETURN_CODE)
 
-    # Block-scaled O modes ride the fp8 graph (fp8 Q/K/V, sdpa_fp8) with an
-    # extra sf_o output: 16 = FP4 O + E4M3 scale per 16 d, 32 = E4M3 O + UE8M0
-    # scale per 32 d. Forward-only, cudnn_oss only.
-    o_block_scale = {"fp8_nvfp4": 16, "fp8_mxfp8": 32}.get(args.data_type, 0)
+    # Block-scaled O modes ride the fp8 graph (fp8 Q/K/V, sdpa_fp8) or the mxfp8
+    # graph (MXFP8 Q/K/V, sdpa_mxfp8) with an extra sf_o output: 16 = FP4 O + E4M3
+    # scale per 16 d, 32 = E4M3 O + UE8M0 scale per 32 d. Forward-only, cudnn_oss only.
+    o_block_scale = {"fp8_nvfp4": 16, "fp8_mxfp8": 32, "mxfp8_nvfp4": 16, "mxfp8_mxfp8": 32}.get(args.data_type, 0)
     if o_block_scale:
         if args.sdpa_backend != "cudnn_oss":
             exit_unsupported(f"{args.data_type} (block-scaled O) is served by the cudnn_oss backend only")
-        args.data_type = "fp8"
+        args.data_type = "mxfp8" if args.data_type.startswith("mxfp8_") else "fp8"
 
     if args.data_type == "bfloat16":
         target_dtype = torch.bfloat16
@@ -607,7 +616,7 @@ else:
         target_dtype = torch.float8_e4m3fn
     elif args.data_type == "mxfp8":
         target_dtype = torch.float8_e4m3fn  # Q/K/V input type
-        output_dtype = torch.bfloat16  # O output type
+        output_dtype = torch.float8_e4m3fn if o_block_scale else torch.bfloat16  # O output type (the E4M3 container of a block-scaled O)
     else:
         raise ValueError(f"Invalid data type: {args.data_type}")
 
@@ -642,9 +651,9 @@ else:
         run_fwd = True
         run_bwd = False
     if o_block_scale and run_bwd:
-        exit_unsupported("block-scaled O (fp8_nvfp4 / fp8_mxfp8) is a forward-only inference epilogue")
+        exit_unsupported("block-scaled O (fp8_nvfp4 / fp8_mxfp8 / mxfp8_nvfp4 / mxfp8_mxfp8) is a forward-only inference epilogue")
     if o_block_scale and (head_dim_qk != 128 or head_dim_vo != 128):
-        exit_unsupported("block-scaled O is served by the d128 fp8 kernel flavor only")
+        exit_unsupported("block-scaled O is served by the d128 fp8 / mxfp8 kernel flavors only")
     enable_gqa = num_q_heads != num_kv_heads
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
@@ -701,13 +710,13 @@ else:
         query = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         key = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
-        if args.data_type == "mxfp8":
-            output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
-        elif o_block_scale == 16:
+        if o_block_scale == 16:
             # FP4 O: the packed byte container (two E2M1 per byte).
             output = (
                 torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo // 2, dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2).transpose(1, 2)
             )
+        elif args.data_type == "mxfp8":
+            output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         else:
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=target_dtype, device=device).transpose(1, 2)
         sf_o_gpu = None
@@ -755,6 +764,7 @@ else:
             sf_q_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, s_q_padded, head_dim_qk, block_size)
             sf_k_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, s_kv_padded, head_dim_qk, block_size)
             sf_v_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_kv_heads, d_vo_padded, kv_seqlen, block_size)
+            scale_o_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)  # block-scaled FP4 O: the global scale (sdpa_mxfp8 scale_o)
             # Backward-specific scale factors: transposed views for Q, K, dO
             # SF_Q_T, SF_K_T: scale along sequence dimension [b, h, s_scale_padded, d_padded]
             sf_q_t_gpu = create_scale_factor_tensor_mxfp8(batch_size * num_q_heads, d_qk_padded, q_seqlen, block_size)
@@ -868,6 +878,14 @@ else:
                 reordering_type=cudnn.tensor_reordering.F8_128x4,
             )
 
+            sf_o_fwd = scale_o_fwd = None
+            if o_block_scale:
+                # Block-scaled O rides sdpa_mxfp8 the way it rides sdpa_fp8: the sf_o
+                # output, plus scale_o (a python-only input) as the FP4 global scale.
+                sf_o_fwd = graph_fwd.tensor_like(sf_o_gpu).set_data_type(cudnn.data_type.FP8_E4M3 if o_block_scale == 16 else cudnn.data_type.FP8_E8M0)
+                if o_block_scale == 16:
+                    scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
+
             o_fwd, stats_fwd, amax_o_fwd = graph_fwd.sdpa_mxfp8(
                 q=q_fwd,
                 k=k_fwd,
@@ -880,6 +898,8 @@ else:
                 diagonal_band_left_bound=left_bound,
                 diagonal_band_right_bound=right_bound,
                 generate_stats=True,
+                **({"sf_o": sf_o_fwd} if o_block_scale else {}),
+                **({"scale_o": scale_o_fwd} if scale_o_fwd is not None else {}),
             )
         else:
             q_fwd = graph_fwd.tensor_like(query)
@@ -927,7 +947,16 @@ else:
                     sf_o_fwd.set_output(True)
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
             elif args.data_type == "mxfp8":
-                o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
+                if o_block_scale == 16:
+                    # FP4 O: logical (B, H, S, d) dims over the packed byte container.
+                    o_dims = list(output.size())
+                    o_dims[-1] *= 2
+                    o_strides = [s * 2 if s != 1 else 1 for s in output.stride()]
+                    o_fwd.set_output(True).set_dim(o_dims).set_stride(o_strides).set_data_type(cudnn.data_type.FP4_E2M1)
+                else:
+                    o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
+                if o_block_scale:
+                    sf_o_fwd.set_output(True)
                 stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
@@ -1389,6 +1418,10 @@ else:
                     sf_v_fwd: sf_v_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
+                if o_block_scale:
+                    variant_pack_fwd[sf_o_fwd] = sf_o_gpu
+                    if scale_o_fwd is not None:
+                        variant_pack_fwd[scale_o_fwd] = scale_o_gpu
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
             else:
                 variant_pack_fwd = {
@@ -1668,7 +1701,15 @@ else:
 
         if is_cudnn_fe:
             if args.data_type == "mxfp8":
-                output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
+                if o_block_scale == 16:
+                    # FP4 O: the packed byte container (two E2M1 per byte).
+                    output = (
+                        torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo // 2, dtype=torch.uint8, device=device)
+                        .view(torch.float4_e2m1fn_x2)
+                        .transpose(1, 2)
+                    )
+                else:
+                    output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
                 # MXFP8 backward outputs use the same dtype as forward output
                 dQuery = torch.empty(batch_size, num_q_heads, q_seqlen, head_dim_qk, dtype=output_dtype, device=device)
                 dKey = torch.empty(batch_size, num_kv_heads, kv_seqlen, head_dim_qk, dtype=output_dtype, device=device)
@@ -1825,6 +1866,10 @@ else:
                         sf_v_fwd: sf_v_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
+                    if o_block_scale:
+                        variant_pack_fwd[sf_o_fwd] = sf_o_gpu
+                        if scale_o_fwd is not None:
+                            variant_pack_fwd[scale_o_fwd] = scale_o_gpu
                 else:
                     variant_pack_fwd = {
                         q_fwd: query,

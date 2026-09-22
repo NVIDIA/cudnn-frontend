@@ -1,7 +1,11 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_fwd_combine_kernel.h
 # from Cutlass C++ to Cute-DSL.
+
 import math
 from typing import Type, Optional
 from functools import partial
@@ -12,11 +16,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Boolean, const_expr
+from cudnn._cutlass_compat import FastDivmodDivisor, SmemAllocator
 
 from cudnn.block_sparse_attention.csrc.utils import kernel_utils as utils
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import assume_tensor_aligned
 from cudnn.block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfo
-from cutlass.cute import FastDivmodDivisor
 
 
 class BlockSparseAttnForwardCombine:
@@ -281,7 +285,7 @@ class BlockSparseAttnForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))

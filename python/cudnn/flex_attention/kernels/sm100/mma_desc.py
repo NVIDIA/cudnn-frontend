@@ -1,13 +1,18 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # Copyright (c) 2025, Tri Dao.
 # Ported Cutlass code from C++ to Python:
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/mma_traits_sm100.hpp
 
+
 from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import OperandMajorMode
 
 # ---------------------------------------------------------------------------
 # Enumerations that match the HW encodings (values MUST stay identical)
@@ -87,8 +92,8 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.b_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.a_major_mode == OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == OperandMajorMode.K else Major.MN,
     )
 
 
