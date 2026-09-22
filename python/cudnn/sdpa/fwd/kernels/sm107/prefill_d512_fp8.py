@@ -183,12 +183,22 @@ from cudnn.frost.tile_dsl.tma import (
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline):
+# every masked call site below passes `form=MASK_FORM`, so the two forms of the
+# same mask -- "cells" (per-cell compare + select, 3-7 instructions per cell) and
+# "bits" (one keep-word per 32 columns, register-to-predicate R2P + one FSEL per
+# cell, 1.4-1.6 per cell) -- are an A/B by flipping this line.  Both produce the
+# same masked set with the same sentinel, so O / LSE are bitwise identical;
+# test_sm107_every_mask_site_takes_the_module_mask_form counts the sites.
+MASK_FORM: str = MASK_FORM_BITS
 
 # Reuse sm107 SDPA pipeline-shared helpers (KvLoopBounds + closures factory).
 # Note: dsv4 forks Bars in this file (NOT imported from _sdpa_common) per the
@@ -1049,7 +1059,7 @@ def _sg0_softmax_kv_iter(
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
-            apply_mask_chunk(
+            apply_mask_chunk_form(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * SOFTMAX_CHUNK),
@@ -1060,6 +1070,7 @@ def _sg0_softmax_kv_iter(
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
                 window_right=CFG.WINDOW_RIGHT,
+                form=MASK_FORM,
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
