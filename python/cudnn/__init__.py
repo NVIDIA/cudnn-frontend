@@ -342,12 +342,24 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "pack_forward_weights",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
+    "rope_qdq_inplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
+    "EngramGateSavedForward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "EngramGateSavedBackward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_forward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_backward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "RopeQDQInplace": (".rope", "RopeQDQInplace"),
+    "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
+    "EngramGateSavedForward": (".engram", "EngramGateSavedForward"),
+    "EngramGateSavedBackward": (".engram", "EngramGateSavedBackward"),
+    "engram_gate_saved_forward": (".engram", "engram_gate_saved_forward"),
+    "engram_gate_saved_backward": (".engram", "engram_gate_saved_backward"),
     "gnn": (".gnn", None),
     "moe_ep": (".moe_ep", None),
     "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
