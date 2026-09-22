@@ -18,7 +18,7 @@
 """One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the T pass (with its own
 descriptor prologue), the split-K table (warmup only), the recompute prologue and the checkpoint-series recompute (unless
 the forward's per-chunk series is passed back) and the bprop prologue, all at ``--opt-level 2`` like their standalone
-builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd_sm100`` /
+builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd`` /
 ``run_bwd`` without their prologue), so the call sequence is two crossings into the DSL instead of six.  Every kernel, its
 host and the tensor placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
 through different placeholder types is passed twice (the table's 4-byte compact views of work_items, work_count and
@@ -300,10 +300,10 @@ def build_warmup_backward(
 ):
     """Compile (cached per static config) the head of the warmup or uncut backward over the buffers of one plan.  The
     placeholders repeat the marks of the standalone builds so every kernel compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
-    HO = gate.shape[1]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
+    gate.shape[1]
     if not safe_gate:
         a_log = None
         dt_bias = None

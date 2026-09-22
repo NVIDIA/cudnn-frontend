@@ -631,7 +631,7 @@ def _bprop_kernel(
     GRAD_N = d_qk if cutlass.const_expr(d_qk >= d_v) else d_v
     GRAD_NFRAGS = GRAD_N // 8
     acc_grad = cutlass.Array(cutlass.Float32, GRAD_NFRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-    for i in cutlass.range_constexpr(GRAD_NFRAGS * 4):
+    for i in cutlass.range(GRAD_NFRAGS * 4, unroll_full=True):
         acc_grad[i] = cutlass.Float32(0.0)
 
     # acc1: BMM1 result — sg0 → S[kv,q]; sg1 → dP[kv,q].  N = tile_q.

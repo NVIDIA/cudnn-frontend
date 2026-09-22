@@ -18,6 +18,10 @@ os.environ.setdefault(
 # before jax initializes its backend.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+# Transformer Engine is used only for PyTorch quantization references. JAX
+# interop tests do not need its optional JAX extension, even when JAX is installed.
+os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
+
 import faulthandler
 import subprocess
 import sys

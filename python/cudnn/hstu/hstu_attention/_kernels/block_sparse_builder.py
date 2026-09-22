@@ -12,6 +12,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Int8, Int32, const_expr
+from cutlass.cute.runtime import from_dlpack
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.api_base import WorkspaceCarver, ws_align
 
@@ -301,7 +303,7 @@ class HSTUQ2KBlockSparseBuilder:
                 16,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         reduction = storage.reduction.get_tensor(cute.make_layout((self.num_warps, 2)))
         candidate_bounds = storage.candidate_bounds.get_tensor(cute.make_layout((self.num_warps, 2)))
@@ -535,7 +537,7 @@ class HSTUQ2KBlockSparseBuilder:
                 16,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         scan_storage = storage.scan.get_tensor(cute.make_layout((self.scan_threads + 1, 2)))
 
@@ -587,7 +589,7 @@ class HSTUQ2KBlockSparseBuilder:
                 16,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         scan_storage = storage.scan.get_tensor(cute.make_layout((self.scan_threads + 1, 2)))
 
@@ -817,7 +819,7 @@ class HSTUK2QBlockSparseBuilder(HSTUQ2KBlockSparseBuilder):
                 16,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         reduction = storage.reduction.get_tensor(cute.make_layout((self.num_warps, 2)))
         candidate_bounds = storage.candidate_bounds.get_tensor(cute.make_layout((self.num_warps, 2)))

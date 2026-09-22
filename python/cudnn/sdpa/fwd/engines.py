@@ -1110,7 +1110,12 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1423,7 +1428,12 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1735,6 +1745,10 @@ def lower_dsl_prefill(
         # per-(b,h)-plane or token-major scale-factor layout (see
         # SdpaFwdDsl._sf_o_geometry).
         sample_sf_o=ga.tensor_desc_from_ir(facts.sf_o_t, name="sf_o") if facts.sf_o_t is not None else None,
+        # MXFP8 input: scale_o is a python-only OPTIONAL input (the FP4 global
+        # scale) and its presence is a compile form of the kernel (identity fold
+        # otherwise). The per-tensor FP8 op's scale_o is a required execute operand.
+        sample_scale_o=ga.tensor_desc_from_ir(facts.scale_o_t, name="scale_o") if (facts.is_mxfp8 and facts.scale_o_t is not None) else None,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
@@ -1962,7 +1976,7 @@ def lower_dsl_prefill(
         for name, tid in quant_ids.items():
             execute_kwargs[name] = resolved.get(tid)
         if facts.o_block_scale and execute_kwargs.get("sf_o") is None:
-            raise ValueError("cudnn.sdpa_fp8: the graph requests the sf_o output but no buffer was provided for it")
+            raise ValueError("cudnn.sdpa: the graph requests the sf_o output but no buffer was provided for it")
         if forward_bias:
             execute_kwargs["bias_tensor"] = bias_buf  # SM80 feature operand (mismatch admitted it for this row)
         if gate_src is not None:

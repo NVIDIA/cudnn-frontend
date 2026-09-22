@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """SM90 backward tile schedulers shared by DSA kernels."""
 
 from typing import Optional, Tuple
@@ -14,8 +17,7 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-
-from cutlass.cute import FastDivmodDivisor
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
