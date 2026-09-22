@@ -341,6 +341,38 @@ def _validate_forward(node) -> None:
         if (d_qk % 16 != 0) or (d_v % 16 != 0):
             raise _not_supported("hidden_dim should be multiple of 16")
 
+    if node.node_type in (NodeType.SDPA_FP8, NodeType.SDPA_MXFP8):
+        # Block-scaled O (both quantized forwards): FP4_E2M1 O carries one E4M3
+        # scale per 16 d elements in sf_o; an FP8_E4M3 O with sf_o carries one
+        # UE8M0 scale per 32 (MXFP8 output).
+        sf_o = node.outputs.get("sf_o")
+        o_dtype = _dtype_name(o)
+        if o_dtype == "FP4_E2M1":
+            if sf_o is None:
+                raise _not_supported("An FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements).")
+            if _dtype_name(sf_o) not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o must be FP8_E4M3 for an FP4_E2M1 O.")
+        elif sf_o is not None:
+            if o_dtype not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output).")
+            if _dtype_name(sf_o) not in (None, "FP8_E8M0"):
+                raise _not_supported("sf_o must be FP8_E8M0 for an FP8_E4M3 O (MXFP8 output).")
+            if d_v % 32 != 0:
+                raise _not_supported("MXFP8 output needs d_v to be a multiple of 32.")
+        if sf_o is not None:
+            _check_dim_stride(node, "sf_o", sf_o)
+        if node.node_type == NodeType.SDPA_MXFP8:
+            # sdpa_mxfp8 has no per-tensor O scale: ``scale_o`` exists only as the
+            # block-scaled epilogue's global scale (an FP4 O cannot span its range
+            # through the E4M3 block scale alone, so it is REQUIRED there).
+            scale_o = node.inputs.get("scale_o")
+            if scale_o is not None and sf_o is None:
+                raise _not_supported("sdpa_mxfp8: scale_o is accepted only together with the sf_o output (block-scaled O).")
+            if o_dtype == "FP4_E2M1" and scale_o is None:
+                raise _not_supported("sdpa_mxfp8: an FP4_E2M1 O requires scale_o (the FP4 global scale; a 1-element FLOAT tensor).")
+            if scale_o is not None and _dtype_name(scale_o) not in (None, "FLOAT"):
+                raise _not_supported("sdpa_mxfp8: scale_o must be a FLOAT tensor.")
+
     if node.node_type == NodeType.SDPA_MXFP8:
         _validate_mxfp8_descales(node, q, k, v, s_kv if s_kv is not None else k.get_dim()[2])
 

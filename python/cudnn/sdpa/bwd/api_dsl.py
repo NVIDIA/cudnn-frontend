@@ -2667,7 +2667,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._dot_fn = None
         self._reduce_fn = None
         self._zero_ws = False
-        self._dummy_desc = None
         self._setup_fn = None
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
         # Head-major Stats only: the caller's head stride, which the compiled
@@ -2788,7 +2787,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         else:
             delta = ws_align(self.batch_size * self.h_q * (-(-self.s_q_max // 128) * 128) * 4)
             ws = ws_align(self.batch_size * self._qh_chunk * self._sq_pad * self._skv_pad * self._bpe)
-            total = delta + 2 * ws
+            # Stage 2 / stage 3's THD ABI slots ((B,) int32 metadata, one int64
+            # descriptor word), dead on the dense path (every read is under
+            # const_expr(_THD)) but part of the compiled ABI: borrowed here (Rule 8).
+            total = delta + 2 * ws + ws_align(self.batch_size * 4) + ws_align(8)
         for name in self._stage_in + self._stage_out:
             s_len = self.s_k_max if name in ("k", "v", "dK", "dV") else self.s_q_max
             total += ws_align(self.batch_size * s_len * self.h_q * self.head_dim_qk * self._bpe)
@@ -3093,14 +3095,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._dot_fn(_t(o), _t(do), _t(delta), None, None, stream)
 
             lse = stats_tensor.reshape(b, h, sq)
-            seq_kv = torch.full((b,), skv, device=q.device, dtype=torch.int32)
-            # Stage 2's THD ABI slots, unused on this dense path: the metadata
-            # buffer rides `seq_kv` (which the dense kernel never reads) and the
-            # descriptor array is a 1-element dummy. Cached on the adapter so a
-            # per-execute call does not allocate.
-            if self._dummy_desc is None or self._dummy_desc.device != q.device:
-                self._dummy_desc = torch.zeros(1, dtype=torch.int64, device=q.device)
-            desc_words = self._dummy_desc
+            # Stage 2 / stage 3's THD ABI slots: dead on this dense path (every
+            # read is under const_expr(_THD)), but the compiled ABI is a (B,) int32
+            # and a 1-element int64 tensor, so borrow them from the workspace.
+            seq_kv = carver.take(b, torch.int32)
+            desc_words = carver.take(1, torch.int64)
             for c in range(h // chunk):
                 hb = c * chunk
                 hs = slice(hb, hb + chunk)
@@ -3286,8 +3285,19 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # enable_tvm_ffi matches the `--enable-tvm-ffi` the artifacts below
             # are compiled with; without it the call boundary rejects the tensor.
             _t = lambda x: from_dlpack(x, assumed_align=16, enable_tvm_ffi=True)
-            _i32 = lambda x: x.to(dtype=torch.int32, device=q.device).contiguous()
-            ql, kl = _i32(seq_q_lens), _i32(seq_kv_lens)
+
+            def _lens(x, name):
+                # Validated, never converted: a .to()/.contiguous() here would
+                # allocate and launch a cast per execute (Rule 1), and the graph
+                # analyzer already gates the dtype at build.
+                if x.dtype != torch.int32 or not x.is_contiguous() or x.device != q.device or x.numel() not in (b, b + 1):
+                    raise ValueError(
+                        f"cudnn.sdpa: {name} must be a contiguous int32 tensor of {b} per-batch lengths or "
+                        f"{b + 1} prefix sums on {q.device}; got {x.dtype} x {x.numel()} on {x.device}"
+                    )
+                return x.view(-1)
+
+            ql, kl = _lens(seq_q_lens, "seq_q_lens"), _lens(seq_kv_lens, "seq_kv_lens")
             # lens_form: bit 0 = Q side is a cu prefix, bit 1 = KV side is.
             lens_form = (1 if ql.numel() == b + 1 else 0) | (2 if kl.numel() == b + 1 else 0)
             # Occupancy-sized persistent grid; the DEVICE live-unit total in the

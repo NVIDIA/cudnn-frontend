@@ -19,9 +19,11 @@ Example (pass torch tensors directly):
     >>> graph.execute({C: c_tensor})  # routes to a supporting engine, else cuDNN
 """
 
+import atexit
 import ctypes
 from dataclasses import dataclass
 import logging
+import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -37,6 +39,44 @@ from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_t
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
+
+# A handle-less graph used to let the C++ PyGraph cudnnCreate a handle of its own
+# at lowering and cudnnDestroy it from the destructor: a GC-timed backend release
+# that, inside someone else's stream capture, poisons every later launch (Rule 8,
+# #1151). Lend it a process default instead: one per (thread, device) -- cuDNN
+# forbids sharing a handle across threads -- never re-streamed (a fresh handle
+# runs on stream 0, exactly like the owned one did), destroyed at interpreter exit.
+_DEFAULT_HANDLES = threading.local()
+_DEFAULT_HANDLE_REGISTRY: List[Handle] = []
+_DEFAULT_HANDLE_LOCK = threading.Lock()
+
+
+def _default_backend_handle() -> int:
+    from .frost.device import ambient_device
+
+    device = ambient_device()
+    by_device = getattr(_DEFAULT_HANDLES, "by_device", None)
+    if by_device is None:
+        by_device = _DEFAULT_HANDLES.by_device = {}
+    handle = by_device.get(device)
+    if handle is None:
+        handle = by_device[device] = cudnn.create_handle()
+        with _DEFAULT_HANDLE_LOCK:
+            _DEFAULT_HANDLE_REGISTRY.append(handle)
+    return to_backend_handle(handle)
+
+
+def _destroy_default_handles() -> None:
+    with _DEFAULT_HANDLE_LOCK:
+        handles, _DEFAULT_HANDLE_REGISTRY[:] = list(_DEFAULT_HANDLE_REGISTRY), []
+    for handle in handles:
+        try:
+            cudnn.destroy_handle(handle)
+        except Exception:  # noqa: BLE001 -- CUDA may already be torn down at exit
+            pass
+
+
+atexit.register(_destroy_default_handles)
 
 
 def _detached_exception(exc: Exception) -> Exception:
@@ -1138,6 +1178,10 @@ class pygraph:
                 return node  # declared python-only: lowering raises by design
             if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
+            if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
+                return node  # an output the backend cannot produce (sf_o) is requested: python engines only
+            if any(node.inputs.get(port) is not None for port in spec_entry[1].get("python_only_in_kwargs", ())):
+                return node  # an input the backend has no field for (sdpa_mxfp8 scale_o) is bound: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -1382,6 +1426,18 @@ class pygraph:
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+
+    def _backend_handle_for_lowering(self, cpp_kwargs: Dict[str, Any]) -> Optional[int]:
+        """The raw handle the C++ graph is constructed with: the caller's, else the
+        process default for this thread and device. None only on the deviceless
+        (``device_property``) AOT path, which lowers without any handle. The graph
+        never owns a handle (Rule 8); ``self._handle`` stays as the caller set it, so
+        execute-time stream resolution is unchanged."""
+        if self._handle is not None:
+            return to_backend_handle(self._handle)
+        if cpp_kwargs.get("device_property") is not None:
+            return None
+        return _default_backend_handle()
 
     def _reset_lowered_state(self) -> None:
         """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
@@ -2335,8 +2391,9 @@ class pygraph:
                 for _k in ("name", "kernel_cache", "device_property"):
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
-                if self._handle is not None:
-                    deser_kwargs["handle"] = to_backend_handle(self._handle)
+                backend_handle = self._backend_handle_for_lowering(deser_kwargs)
+                if backend_handle is not None:
+                    deser_kwargs["handle"] = backend_handle
                 self._lowered_graph = cudnn._pybind_module.backend_graph(**deser_kwargs)
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
@@ -2362,8 +2419,9 @@ class pygraph:
             pg_kwargs["io_data_type"] = _library_type(self._context.io_data_type)
         pg_kwargs["intermediate_data_type"] = _library_type(self._context.intermediate_data_type or cudnn.data_type.FLOAT)
         pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
-        if self._handle is not None:
-            pg_kwargs["handle"] = to_backend_handle(self._handle)
+        backend_handle = self._backend_handle_for_lowering(pg_kwargs)
+        if backend_handle is not None:
+            pg_kwargs["handle"] = backend_handle
         graph = cudnn._pybind_module.backend_graph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
@@ -2464,11 +2522,13 @@ class pygraph:
                     # user callbacks (score_mod, ...) get a shimmed graph so
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
+                python_only_ins = spec.get("python_only_in_kwargs", ())
                 for port, t in node.inputs.items():
-                    if not port.startswith("dropout_"):
-                        kw[port] = tensor_map[t.uid]
+                    if not port.startswith("dropout_") and port not in python_only_ins:
+                        kw[port] = tensor_map[t.uid]  # python-only inputs never reach C++ (_unlowerable_node keeps a SET one off the backend)
+                python_only_outs = spec.get("python_only_out_kwargs", ())
                 for port in spec.get("out_kwargs", ()):
-                    if port in node.outputs:  # classic passes these descriptors as args
+                    if port in node.outputs and port not in python_only_outs:  # classic passes these descriptors as args
                         kw[port] = lower_tensor(node.outputs[port])
                 n_drop = node.params.get("_dropout_n")
                 if n_drop:
@@ -3515,7 +3575,13 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_FP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o"),
         outputs=("O", "Stats", "Amax_S", "Amax_O"),
-        out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
+        # ``sf_o``: block-scaled O scale factors (O declared FP4_E2M1 -> one
+        # E4M3 scale per 16 d elements; O FP8_E4M3 + sf_o -> one UE8M0 scale
+        # per 32). The caller passes its descriptor like rng_dump; the cuDNN
+        # backend has no field for it, so a graph that sets it is served by
+        # python engines only (see python_only_out_kwargs / _unlowerable_node).
+        out_kwargs=("rng_dump", "score_max", "score_sum_exp", "sf_o"),
+        python_only_out_kwargs=("sf_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
         python_only_attrs=("softmax_precision",),  # see "sdpa"
@@ -3571,6 +3637,15 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_MXFP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v"),
         outputs=("O", "Stats", "Amax_O"),
+        # Block-scaled O, as on sdpa_fp8: ``sf_o`` (E4M3 scales per 16 d for an
+        # FP4_E2M1 O, UE8M0 per 32 d for an FP8_E4M3 O) is an OUTPUT the cuDNN
+        # backend has no field for, and ``scale_o`` -- the FP4 global scale the
+        # epilogue folds into O (required for an FP4 O, optional with an
+        # UE8M0-scaled E4M3 O) -- an INPUT it has none for either: setting one
+        # makes the node python-engines-only (python_only_* / _unlowerable_node).
+        out_kwargs=("sf_o",),
+        python_only_out_kwargs=("sf_o",),
+        python_only_in_kwargs=("scale_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),

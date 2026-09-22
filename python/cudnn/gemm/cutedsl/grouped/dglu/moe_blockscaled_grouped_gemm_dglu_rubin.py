@@ -21,8 +21,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, CollectorOp
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.cutlass_dsl import T
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -362,7 +363,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
@@ -798,14 +799,14 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
         else:
             self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         # dBias configuration
         self.generate_dbias = dbias_tensor is not None
@@ -2213,7 +2214,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
 
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -2296,7 +2297,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -3861,9 +3862,9 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         num_smem_capacity: int,
@@ -3887,7 +3888,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param d_layout: Layout of operand D.
-        :type d_layout: utils.LayoutEnum
+        :type d_layout: LayoutEnum
         :param sf_dtype: Data type of scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Vector size of scale factor.

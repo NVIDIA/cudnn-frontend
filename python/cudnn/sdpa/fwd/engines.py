@@ -212,6 +212,9 @@ class Capabilities:
     # O dtype domain, declared only by the quantized rows: elsewhere O must
     # equal Q, which facts.uniform_dtype already enforces.
     out_dtypes: frozenset = frozenset()
+    # Block-scaled O domain (facts.o_block_scale): 0 = plain O; 16 = FP4_E2M1 O
+    # + E4M3 scale per 16 d in ``sf_o``; 32 = FP8_E4M3 O + UE8M0 scale per 32.
+    o_block_scales: frozenset = frozenset({0})
 
     # optional features a graph may request
     bias: bool = False
@@ -639,6 +642,25 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"this engine serves only {quant} graphs"
     if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
         return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
+    if facts.o_block_scale not in capabilities.o_block_scales:
+        return f"block-scaled O (scale block {facts.o_block_scale} along d) is not served by this engine (domain {sorted(capabilities.o_block_scales)})"
+    if facts.dtype_o == cudnn.data_type.FP4_E2M1 and facts.o_block_scale != 16:
+        # FP4_E2M1 sits in out_dtypes for the block-scaled epilogue only (the
+        # analyzer derives o_block_scale = 16 from sf_o); a bare FP4 O has no store.
+        return "an FP4_E2M1 O is served only as a block-scaled O (sf_o with 16-element scale blocks)"
+    if facts.o_block_scale:
+        # The block-scaled epilogue writes SF_O per dense Q row of one
+        # sequence; THD / per-batch Q trim / a KV split (fp32 partials) / a
+        # packed GQA tile all break that row <-> scale-factor mapping.
+        if facts.thd or facts.seq_q_trim:
+            return "block-scaled O (sf_o) serves dense, untrimmed Q rows only"
+        if knobs is not None and knobs.split_kv is not None and knobs.split_kv > 1:
+            return "block-scaled O (sf_o) cannot be combined with split_kv > 1"
+        if knobs is not None and knobs.pack_gqa:
+            return "block-scaled O (sf_o) cannot be combined with pack_gqa"
+        if facts.has_epilogue_gate:
+            # Two different epilogues own the O store (quantize + SF_O vs. O *= sigmoid(G)).
+            return "block-scaled O (sf_o) cannot be combined with the fused epilogue gate"
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
@@ -1088,7 +1110,12 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1211,7 +1238,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # stays expressible without reintroducing a boolean that cannot say it.
             thd_d_shapes=SM107_FP8_THD_SHAPES if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32):
+            # the d128 flavor on both arch lines; the adapter declines the
+            # wider flavors (config_sm100 backstop).
+            o_block_scales=frozenset({0, 16, 32}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -1395,7 +1428,12 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1703,6 +1741,14 @@ def lower_dsl_prefill(
         paged_table_v_stride=_table_stride(facts.paged_v_table_t) if facts.has_paged_kv else None,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
+        # Block-scaled O: the sf_o output's declared geometry selects the
+        # per-(b,h)-plane or token-major scale-factor layout (see
+        # SdpaFwdDsl._sf_o_geometry).
+        sample_sf_o=ga.tensor_desc_from_ir(facts.sf_o_t, name="sf_o") if facts.sf_o_t is not None else None,
+        # MXFP8 input: scale_o is a python-only OPTIONAL input (the FP4 global
+        # scale) and its presence is a compile form of the kernel (identity fold
+        # otherwise). The per-tensor FP8 op's scale_o is a required execute operand.
+        sample_scale_o=ga.tensor_desc_from_ir(facts.scale_o_t, name="scale_o") if (facts.is_mxfp8 and facts.scale_o_t is not None) else None,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
@@ -1777,6 +1823,7 @@ def lower_dsl_prefill(
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
         amax_o=facts.amax_o_t,
+        sf_o=facts.sf_o_t,
         descale_q=facts.descale_q_t,
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
@@ -1806,7 +1853,18 @@ def lower_dsl_prefill(
     # which feature operands the facts demand, the static keywords — resolved
     # once here; an execute is then dict lookups and one adapter call.
     def _layout(t):
-        return (tuple(t.get_dim()), tuple(t.get_stride()))
+        dim, stride = tuple(t.get_dim()), tuple(t.get_stride())
+        if t.get_data_type() == cudnn.data_type.FP4_E2M1:
+            # Two E2M1 per byte: the buffer is the byte container of the logical
+            # geometry (unit-stride extent and every other stride halved); the
+            # adapter binds it as FP8-typed bytes (two E2M1 per byte).
+            from cudnn.graph_types import storage_geometry
+
+            geom = storage_geometry(dim, stride, t.get_data_type())
+            if geom is None:
+                raise ValueError(f"FP4 O geometry dim={dim} stride={stride} has no byte-container spelling")
+            dim, stride = geom
+        return (dim, stride)
 
     id_q, id_k, id_v, id_o = id(binding.q), id(binding.k), id(binding.v), id(binding.o)
     lay_q, lay_k, lay_v, lay_o = _layout(binding.q), _layout(binding.k), _layout(binding.v), _layout(binding.o)
@@ -1834,6 +1892,8 @@ def lower_dsl_prefill(
                 ("descale_k", binding.descale_k),
                 ("descale_v", binding.descale_v),
                 ("scale_o", binding.scale_o),
+                # Block-scaled O: the SF_O output travels with the quantized operands.
+                ("sf_o", binding.sf_o),
             )
             if t is not None
         }
@@ -1915,6 +1975,8 @@ def lower_dsl_prefill(
             )
         for name, tid in quant_ids.items():
             execute_kwargs[name] = resolved.get(tid)
+        if facts.o_block_scale and execute_kwargs.get("sf_o") is None:
+            raise ValueError("cudnn.sdpa: the graph requests the sf_o output but no buffer was provided for it")
         if forward_bias:
             execute_kwargs["bias_tensor"] = bias_buf  # SM80 feature operand (mismatch admitted it for this row)
         if gate_src is not None:
@@ -2028,7 +2090,11 @@ def _sm120_fp8_spec() -> EngineSpec:
             d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
             d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (d_v = 128; the adapter declines other head dims).
+            o_block_scales=frozenset({0, 16, 32}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
