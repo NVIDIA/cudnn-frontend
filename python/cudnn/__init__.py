@@ -309,6 +309,8 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
+    "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
 }
