@@ -458,6 +458,19 @@ def test_first_execute_under_capture(family):
 
 
 @pytest.mark.L0
+def test_wgrad_expert_ptrs_rejects_overlapping_or_strided_slices():
+    """The discrete kernels read each expert's slice through one contiguous (hidden, intermediate)
+    descriptor: a view whose slices are strided or overlap is refused before a pointer table is built."""
+    e, h, i = 4, 64, 32
+    stacked = torch.empty(e, h, i, dtype=torch.bfloat16, device="cuda")
+    assert tuple(cudnn.wgrad_expert_ptrs(stacked).shape) == (e,)
+    with pytest.raises(ValueError, match="contiguous"):
+        cudnn.wgrad_expert_ptrs(stacked.transpose(1, 2))
+    with pytest.raises(ValueError, match="overlap"):
+        cudnn.wgrad_expert_ptrs(stacked.as_strided((e, h, i), (h * i // 2, i, 1)))
+
+
+@pytest.mark.L0
 def test_wgrad_discrete_requires_wgrad_ptrs():
     """Design D2 / recipe R4: the discrete wgrad APIs consume a caller-provided pointer table and
     never derive one per execute; ``wgrad_expert_ptrs`` is the caller-layer derivation the wrapper

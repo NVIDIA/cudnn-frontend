@@ -284,19 +284,30 @@ def _padded_q(q):
 
 @requires_hopper
 def test_undeclared_padded_input_raises():
-    """The op layer declares packed operands; a padded q it then passes is
-    refused, naming the port -- not silently repacked into a per-call copy.
+    """The plan can only stage what the graph DECLARED: a padded q handed to a
+    graph that declared q packed is refused, naming the port -- not silently
+    repacked into a per-call copy (Rule 5). The torch op above it keeps its
+    contract: it repacks a fused-projection slice itself, in the op layer, and
+    answers exactly like the packed call.
 
     History: the kernels take addresses and never see a stride, so before the
     layout guard an ordinary fused-projection slice was read as if it were
     packed (reviewer-measured relative errors of 7.0 on o). The guard then
-    repacked it with a hidden ``torch.empty`` + copy per call (Rule 8). Now the
-    plan can only stage what the graph DECLARED, so an undeclared padding is a
-    contract error (Rule 5).
+    repacked it with a hidden ``torch.empty`` + copy per call inside the plan
+    (Rule 8); that copy now lives in the op layer, where allocation is allowed.
     """
-    q, k, v, g, beta, cu, s0 = make_case(T=512, H=4, N=2)
+    case = make_case(T=512, H=4, N=2)
+    q, k, v, g, beta, cu, s0 = case
+    graph, pack, _, _ = fwd_graph(ENGINE, case)
+    t_q = next(t for t in pack if pack[t] is q)
+    pack[t_q] = _padded_q(q)
     with pytest.raises(NotImplementedError, match="'q'.*reserved no staging"):
-        kimi_delta_attention(_padded_q(q), k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)
+        graph.execute(pack, workspace_for(graph))
+
+    packed = kimi_delta_attention(q, k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)
+    sliced = kimi_delta_attention(_padded_q(q), k, v, g, beta, cu, initial_state=s0, output_final_state=True, plan_name=ENGINE)
+    for a, b in zip(packed, sliced):
+        assert torch.equal(a, b), "the op layer repacks a fused-projection slice; the answer is the packed one"
 
 
 @requires_hopper

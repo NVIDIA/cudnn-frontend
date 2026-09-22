@@ -23,7 +23,7 @@ from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
     BlockScaledMoEGroupedGemmQuantBwdKernel,
     EpilogueType,
 )
-from ..backend_utils import _torch_stream_context, allocate_wrapper_workspace
+from ..backend_utils import _torch_stream_context, allocate_wrapper_workspace, retain_workspace
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -1586,10 +1586,7 @@ class GroupedGemmDsreluSm100(APIBase):
             dbias_tensor = dbias_workspace_tensor if self._has_dbias else dbias_tensor
         nbytes = self.scratch_workspace_bytes()
         ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        if not is_torch_tensor(workspace):
-            # Immutable frameworks (JAX) have no record_stream: keep the caller's buffer referenced
-            # until the next execute so it outlives the asynchronous launch (same as _live_ptrs).
-            self._live_workspace = workspace
+        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

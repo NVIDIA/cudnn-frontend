@@ -117,7 +117,7 @@ class MoEGroupedGemmWgradBF16Kernel:
         if m <= 0 or n <= 0 or expert_cnt <= 0:
             result = False
         if group_k_list is None:
-            if tokens_sum is None:
+            if tokens_sum is None or int(tokens_sum) < 0:
                 return False
         else:
             if len(group_k_list) != expert_cnt:
