@@ -195,6 +195,10 @@ _E2E_ENABLED = bool(PARAMS.exp2_fma_split)
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
     raise ValueError(f"{__name__}: exp2 emulation pattern freq={_E2E_FREQ} res={_E2E_RES} limit={_E2E_LIMIT} must be even with 0 <= res <= freq | limit")
+if _E2E_CHUNK * CFG.N_BMM2_CHUNKS != CFG.TILE_N or _E2E_CHUNK % _E2E_FREQ != 0:
+    raise ValueError(
+        f"{__name__}: softmax chunk ({_E2E_CHUNK}) x N_BMM2_CHUNKS ({CFG.N_BMM2_CHUNKS}) must equal TILE_N ({CFG.TILE_N}) and be a multiple of the emulation period ({_E2E_FREQ})"
+    )
 
 
 def _e2e_pairs(chunk: int, chunk_elems: int) -> frozenset:
