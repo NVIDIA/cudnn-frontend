@@ -341,7 +341,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
         self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        if not hasattr(self, "_scratch_nbytes"):
+            self._scratch_nbytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return self._scratch_nbytes
 
     @staticmethod
     def _fake_workspace_ptr():
@@ -1342,7 +1344,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 "dbias_tensor is required when GroupedGemmDgluSm100 is configured with sample_dbias",
             )
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

@@ -397,7 +397,16 @@ allocates per call on the caller's behalf, it allocates under
 `stream_context(<launch stream>)` (R1): the caching allocator orders a block's
 reuse only against the stream it was allocated on, so scratch allocated on
 torch's ambient stream for a handle re-streamed to a side stream is a
-use-after-free waiting for load.
+use-after-free waiting for load. For eager JAX wrappers, allocation readiness
+(`block_until_ready`) does not extend storage lifetime through a foreign CUDA
+consumer. Pair caller-layer stream-ordered allocation/free around the launch
+(`grouped.backend_utils.wrapper_workspace`), or use an XLA custom call that owns
+scratch. A cached plan's latest reference cannot cover overlapping calls. Test
+multiple pending consumers on independent streams with an intercepted bounded
+byte copy; never run a real kernel on an intentionally recycled scratch pointer.
+For direct API workspace, validate CUDA device type and the operand's ordinal
+before launch (`Workspace(..., device=...)`); byte size/alignment alone also
+accept host memory.
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter

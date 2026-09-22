@@ -739,3 +739,10 @@ For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grou
 Rubin MXFP8 activation-parameter coverage is in
 `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py`
 (`test_rubin_mxfp8_clamped_dgeglu_*`).
+
+The eager JAX wrapper allocates its internal scratch with the CUDA stream-ordered
+allocator and enqueues its release after the consumer on the same stream. This
+covers overlapping wrapper calls without storing mutable scratch on a cached
+plan. Input, pointer-table, weight, and output ownership still follows the eager
+JAX synchronization contract above. Direct API callers must pass a CUDA workspace
+on the same device as the operands and keep it alive through completion.

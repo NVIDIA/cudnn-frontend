@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Iterator, Optional, Sequence, Tuple
 
@@ -147,6 +147,35 @@ def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stre
     import jax.numpy as jnp
 
     return jax.block_until_ready(jnp.empty((nbytes,), dtype=jnp.uint8, device=device))
+
+
+def wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
+    """Wrapper-owned scratch whose release follows the consumer on its launch stream.
+
+    JAX allocation readiness does not cover a foreign CUDA consumer. Use a driver
+    stream-ordered allocation for that caller layer, paired with a free after launch,
+    so overlapping calls have independent lifetimes without plan-owned storage.
+    The APIBase execute path still only receives and carves the supplied buffer.
+    """
+    if framework == "torch" or nbytes <= 0:
+        return nullcontext(allocate_wrapper_workspace(framework, nbytes, device, current_stream))
+    return _jax_wrapper_workspace(nbytes, device, current_stream)
+
+
+@contextmanager
+def _jax_wrapper_workspace(nbytes: int, device, current_stream: cuda.CUstream):
+    from cudnn._device import _ck, ensure_current_context
+    from cudnn.frost.buffers import DeviceView
+
+    device_id = int(device.local_hardware_id)
+    ensure_current_context(current_stream, device_id)
+    ptr = _ck(*cuda.cuMemAllocAsync(nbytes, current_stream))
+    try:
+        yield DeviceView(int(ptr), (nbytes,), "uint8", device_id)
+    finally:
+        # Free is enqueued even when validation/launch raises; no host wait or GC
+        # finalizer, and no mutable "latest workspace" on the cached plan.
+        _ck(*cuda.cuMemFreeAsync(ptr, current_stream))
 
 
 def wrapper_operand_meta(tensor):

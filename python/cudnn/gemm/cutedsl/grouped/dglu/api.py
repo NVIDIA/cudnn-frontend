@@ -30,6 +30,7 @@ from ..backend_utils import (
     block_scaled_sfd_tensors,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    wrapper_workspace,
 )
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
@@ -47,6 +48,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     cuda_is_available,
     detect_framework,
+    default_stream,
     framework_dtype,
     get_compute_capability,
     get_device,
@@ -1220,23 +1222,25 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     if memo_key is not None:
         _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
 
-    api._implementation.execute(
-        a_tensor=call.a_tensor,
-        c_tensor=call.c_tensor,
-        d_row_tensor=d_row_tensor,
-        padded_offsets=call.padded_offsets,
-        alpha_tensor=call.alpha_tensor,
-        beta_tensor=call.beta_tensor,
-        prob_tensor=call.prob_tensor,
-        dprob_tensor=call.dprob_tensor,
-        b_tensor=call.b_tensor,
-        b_ptrs=call.b_ptrs,
-        dbias_tensor=dbias_tensor,
-        linear_offset=call.linear_offset,
-        current_stream=call.current_stream,
-        workspace=allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
-        activation_tensor=call.activation_tensor,
-    )
+    launch_stream = call.current_stream if call.current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, launch_stream) as workspace:
+        api._implementation.execute(
+            a_tensor=call.a_tensor,
+            c_tensor=call.c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=call.padded_offsets,
+            alpha_tensor=call.alpha_tensor,
+            beta_tensor=call.beta_tensor,
+            prob_tensor=call.prob_tensor,
+            dprob_tensor=call.dprob_tensor,
+            b_tensor=call.b_tensor,
+            b_ptrs=call.b_ptrs,
+            dbias_tensor=dbias_tensor,
+            linear_offset=call.linear_offset,
+            current_stream=launch_stream,
+            workspace=workspace,
+            activation_tensor=call.activation_tensor,
+        )
     return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=None,
@@ -1351,23 +1355,25 @@ def grouped_gemm_dglu_wrapper_sm100(
         d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
             memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
         )
-        api._implementation.execute(
-            a_tensor=a_tensor,
-            c_tensor=c_tensor,
-            d_row_tensor=d_row_tensor,
-            padded_offsets=padded_offsets,
-            alpha_tensor=alpha_tensor,
-            beta_tensor=beta_tensor,
-            prob_tensor=prob_tensor,
-            dprob_tensor=dprob_tensor,
-            b_tensor=b_tensor,
-            b_ptrs=b_ptrs,
-            dbias_tensor=dbias_tensor,
-            linear_offset=resolved_linear_offset,
-            current_stream=current_stream,
-            workspace=allocate_wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream),
-            activation_tensor=activation_tensor,
-        )
+        launch_stream = current_stream if current_stream is not None or memo_framework == "torch" else default_stream(memo_framework)
+        with wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, launch_stream) as workspace:
+            api._implementation.execute(
+                a_tensor=a_tensor,
+                c_tensor=c_tensor,
+                d_row_tensor=d_row_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                beta_tensor=beta_tensor,
+                prob_tensor=prob_tensor,
+                dprob_tensor=dprob_tensor,
+                b_tensor=b_tensor,
+                b_ptrs=b_ptrs,
+                dbias_tensor=dbias_tensor,
+                linear_offset=resolved_linear_offset,
+                current_stream=launch_stream,
+                workspace=workspace,
+                activation_tensor=activation_tensor,
+            )
         return TupleDict(
             d_row_tensor=d_row_tensor,
             d_col_tensor=None,

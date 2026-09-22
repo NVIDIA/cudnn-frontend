@@ -393,7 +393,9 @@ class GroupedGemmDgluBf16API(APIBase):
         """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
         TMA-descriptor slots and the dynamic-scheduler counter, 128-byte aligned, never 0."""
         self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        if not hasattr(self, "_scratch_nbytes"):
+            self._scratch_nbytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return self._scratch_nbytes
 
     def compile(self) -> None:
         self._ensure_support_checked()
@@ -662,7 +664,7 @@ class GroupedGemmDgluBf16API(APIBase):
             self._record_pointer_stream(b_ptrs, current_stream)
 
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
         self._compiled_kernel(
             a_tensor,
             c_tensor,

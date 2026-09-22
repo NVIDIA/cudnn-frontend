@@ -96,6 +96,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     api._get_default_stream = lambda stream: stream
     api._runtime_error_if = lambda condition, message: None
     api._has_dbias = False
+    api.a_desc = Mock(device=torch.device("cuda:0"))
     api.weight_mode = None
     api._compiled_kernel = Mock()
     api.scratch_workspace_bytes = lambda: 128  # the workspace contract (R2) is stubbed: this test is about pointer streams
@@ -109,7 +110,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     )
     carved = Mock()
     carved.take.return_value.data_ptr.return_value = 0
-    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner: carved)
+    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner, *, device: carved)
 
     b_ptrs = object()
     sfb_ptrs = object()
