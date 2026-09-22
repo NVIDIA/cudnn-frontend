@@ -2701,6 +2701,7 @@ def test_DSA_sparse_attention_backward_wrapper_accepts_strided_inputs_and_keeps_
         dq_user = torch.empty(s_q, num_heads, 2 * head_dim, dtype=torch.bfloat16, device=device)[..., ::2]
         dkv_user = torch.empty(s_kv, 2 * head_dim, dtype=torch.bfloat16, device=device)[:, ::2]
         side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())  # the strided inputs were written on the current stream
         with torch.cuda.stream(side):
             got = run(strided, dq=dq_user, dkv=dkv_user, stream=side.cuda_stream)
         torch.cuda.synchronize()
