@@ -8,6 +8,10 @@ Synthetic activations and exact source frequency/configuration are explicit.
 Every sample starts from restored input; no repeated quantization drift.
 """
 
+# Source, numerical and admission checks below rely on assertions.
+if not __debug__:
+    raise RuntimeError("This benchmark/auditor requires Python assertions; run without -O/-OO or PYTHONOPTIMIZE.")
+
 import argparse
 import ast
 from datetime import datetime, timezone
