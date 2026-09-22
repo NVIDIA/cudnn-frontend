@@ -540,21 +540,23 @@ def sliding_window_attention_wrapper(
 ) -> TupleDict:
     """Allocate ``o`` (and ``stats`` unless ``is_infer``) and run sliding-window attention; objects are memoized per shape.
 
-    ``T,H,D`` (rank-3 q): ``max_seq_len_q`` / ``max_seq_len_kv`` are REQUIRED plan-time ints (the graph's launch
-    envelope, also part of the memo key); they are not read back from ``seq_len_*_tensor``. When no ragged-offset
-    tensor is given the batch is taken as fully packed and the offsets are derived here, per call, with
-    ``NSA.packed_thd_ragged_offsets`` (a few small torch kernels on ``stream`` / the current stream). The backend
-    workspace (``get_workspace_size()`` bytes) is allocated here per call. Pass the offsets and use the class API
-    with a caller-owned workspace to avoid both.
+    This is the eager torch-op layer over ``SlidingWindowAttention``. ``T,H,D`` (rank-3 q): ``max_seq_len_q`` /
+    ``max_seq_len_kv`` (the plan's launch envelope, part of the memo key) are read back from ``seq_len_*_tensor``
+    (``.max().item()``, a device sync) when not passed; pass them to avoid the sync. Caller-provided ragged-offset
+    tensors are made contiguous; when none is given the batch is taken as fully packed and the offsets are derived
+    with ``NSA.packed_thd_ragged_offsets``. The backend workspace (``get_workspace_size()`` bytes) is allocated per
+    call. All of that torch work runs on the launch stream: ``stream`` if given, else the cuDNN handle's stream.
+    Use the class API with a caller-owned workspace and precomputed offsets to avoid it.
     """
     o_tensor, stats_tensor = None, None
     o_dtype = o_dtype if o_dtype is not None else q_tensor.dtype
     if q_tensor.ndim == 3:  # thd
-        if max_seq_len_q is None or max_seq_len_kv is None:
-            raise ValueError(
-                "sliding_window_attention_wrapper: max_seq_len_q and max_seq_len_kv are required for the T,H,D layout (plan-time launch "
-                f"envelope); they are not inferred from seq_len_q/seq_len_kv (a device read, Rule 8). Got {max_seq_len_q}, {max_seq_len_kv}"
-            )
+        if seq_len_q_tensor is None or seq_len_kv_tensor is None:
+            raise ValueError("sliding_window_attention_wrapper: seq_len_q_tensor and seq_len_kv_tensor are required for the T,H,D layout")
+        if max_seq_len_q is None:
+            max_seq_len_q = int(seq_len_q_tensor.max().item())
+        if max_seq_len_kv is None:
+            max_seq_len_kv = int(seq_len_kv_tensor.max().item())
         _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor o for thd layout")
         t, h_q, d = q_tensor.shape
         _, h_k, d_v = v_tensor.shape
@@ -604,29 +606,40 @@ def sliding_window_attention_wrapper(
         max_seq_len_q,
         max_seq_len_kv,
     )
-    ragged_given = [q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, stats_ragged_offset_tensor]
-    if q_tensor.ndim == 3 and all(t is None for t in ragged_given):
-        if seq_len_q_tensor is None or seq_len_kv_tensor is None:
-            raise ValueError(
-                "sliding_window_attention_wrapper: seq_len_q_tensor and seq_len_kv_tensor are required for the T,H,D layout when no ragged-offset tensors are supplied"
-            )
-        with torch.cuda.device(q_tensor.device), stream_context(stream, q_tensor.device):
-            (
-                q_ragged_offset_tensor,
-                k_ragged_offset_tensor,
-                v_ragged_offset_tensor,
-                o_ragged_offset_tensor,
-                stats_ragged_offset_tensor,
-            ) = packed_thd_ragged_offsets(seq_len_q_tensor, seq_len_kv_tensor, q_tensor, k_tensor, v_tensor, o_tensor, stats_tensor)
+    sliding_window_attention_object = _cache_of_SlidingWindowAttentionObjects.get(cache_key)
+    if cudnn_handle is None and sliding_window_attention_object is None:
+        cudnn_handle = cudnn.create_handle()
+    handle = cudnn_handle if cudnn_handle is not None else sliding_window_attention_object._cudnn_handle
+    # The graph launches on `stream` (re-streaming the handle) or on the handle's own stream; every torch op below
+    # must run there (R1: the caching allocator orders a block's reuse only against its allocation stream).
+    launch = stream if stream is not None else cudnn.get_stream(handle)
+
+    if q_tensor.ndim == 3:
+        ragged_given = [q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, stats_ragged_offset_tensor]
+        with torch.cuda.device(q_tensor.device), stream_context(launch, q_tensor.device):
+            if all(t is None for t in ragged_given):
+                (
+                    q_ragged_offset_tensor,
+                    k_ragged_offset_tensor,
+                    v_ragged_offset_tensor,
+                    o_ragged_offset_tensor,
+                    stats_ragged_offset_tensor,
+                ) = packed_thd_ragged_offsets(seq_len_q_tensor, seq_len_kv_tensor, q_tensor, k_tensor, v_tensor, o_tensor, stats_tensor)
+            else:
+                (
+                    q_ragged_offset_tensor,
+                    k_ragged_offset_tensor,
+                    v_ragged_offset_tensor,
+                    o_ragged_offset_tensor,
+                    stats_ragged_offset_tensor,
+                ) = (None if t is None else t.contiguous() for t in ragged_given)
 
     def allocate_workspace(obj: SlidingWindowAttention) -> torch.Tensor:
-        with torch.cuda.device(q_tensor.device), stream_context(stream, q_tensor.device):
+        with torch.cuda.device(q_tensor.device), stream_context(launch, q_tensor.device):
             return torch.empty(max(obj.get_workspace_size(), 1), dtype=torch.uint8, device=q_tensor.device)
 
-    sliding_window_attention_object = None
-    if cache_key in _cache_of_SlidingWindowAttentionObjects:
+    if sliding_window_attention_object is not None:
         _logger.debug("sliding_window_attention_wrapper: Using previously cached SlidingWindowAttention object")
-        sliding_window_attention_object = _cache_of_SlidingWindowAttentionObjects[cache_key]
 
         sliding_window_attention_object.execute(
             q_tensor=q_tensor,

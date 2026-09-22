@@ -373,19 +373,42 @@ def test_nsa_swa_execute_requires_workspace(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_nsa_swa_wrapper_thd_requires_max_seq_len(request):
-    """Rule 8 on the wrapper surface: the envelope is a required host int, not max(seq_len).item()."""
-    NSA, cfg, _, _, (Q, K, V, _, _, actual_s_q, actual_s_kv, max_s_q, max_s_kv) = _thd_swa_case(request)
-    with pytest.raises(ValueError, match="max_seq_len_q and max_seq_len_kv are required"):
-        NSA.sliding_window_attention_wrapper(
-            q_tensor=Q,
-            k_tensor=K,
-            v_tensor=V,
-            seq_len_q_tensor=actual_s_q,
-            seq_len_kv_tensor=actual_s_kv,
-            left_bound=cfg["window_size"],
-            cudnn_handle=cudnn.create_handle(),
-        )
+def test_nsa_swa_wrapper_thd_derives_max_seq_len_and_restrides_offsets(request):
+    """The wrapper keeps develop's eager surface: with the envelope ints omitted it derives them from seq_len_*,
+    and caller-provided strided ragged offsets are made contiguous. The class itself still rejects both."""
+    NSA, cfg, swa, execute_kwargs, (Q, K, V, O, Stats, actual_s_q, actual_s_kv, max_s_q, max_s_kv) = _thd_swa_case(request)
+    # stride-2 views of the reference offsets: declined by the class, normalised by the wrapper
+    strided = {k: torch.stack([v, v], dim=1).flatten(0, 1)[::2] for k, v in execute_kwargs.items() if k.endswith("_ragged_offset_tensor")}
+    assert all(not v.is_contiguous() for v in strided.values())
+    ws = torch.empty(max(swa.get_workspace_size(), 1), dtype=torch.uint8, device=Q.device)
+    with pytest.raises(ValueError, match="must be contiguous"):
+        swa.execute(**dict(execute_kwargs, **strided), workspace=ws)
+    no_envelope = NSA.SlidingWindowAttention(
+        sample_q=Q,
+        sample_k=K,
+        sample_v=V,
+        sample_o=O,
+        sample_stats=Stats,
+        sample_seq_len_q=actual_s_q,
+        sample_seq_len_kv=actual_s_kv,
+        cudnn_handle=swa._cudnn_handle,
+    )
+    with pytest.raises(ValueError, match="max_seq_len_q and max_seq_len_kv must be provided"):
+        no_envelope.check_support()
+
+    O_w, Stats_w = NSA.sliding_window_attention_wrapper(
+        q_tensor=Q,
+        k_tensor=K,
+        v_tensor=V,
+        seq_len_q_tensor=actual_s_q,
+        seq_len_kv_tensor=actual_s_kv,
+        **strided,
+        left_bound=cfg["window_size"],
+        right_bound=0,
+        attn_scale=cfg["scale_softmax"],
+        cudnn_handle=cudnn.create_handle(),
+    )
+    check_ref_nsa_swa(Q, K, V, O_w, Stats_w, actual_s_q, actual_s_kv, max_s_q, max_s_kv, cfg)
 
 
 @pytest.mark.L0

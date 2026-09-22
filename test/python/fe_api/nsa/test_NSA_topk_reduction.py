@@ -202,16 +202,48 @@ def test_nsa_topk_reduction_thd_requires_max_s(request):
         bad = dict(kwargs, **{missing: None})
         with pytest.raises(ValueError, match="max_s_q and max_s_k are required"):
             NSA.TopKReduction(**bad)
-    with pytest.raises(ValueError, match="max_s_q and max_s_k are required"):
-        NSA.topk_reduction_wrapper(
-            q_tensor=tensors["Q"],
-            k_tensor=tensors["K"],
-            lse_tensor=tensors["LSE"],
-            cum_seqlen_q_tensor=tensors["cum_seqlen_q"],
-            cum_seqlen_k_tensor=tensors["cum_seqlen_kv"],
-            max_s_q=None,
-            max_s_k=kwargs["max_s_k"],
-        )
+
+
+def _wrapper_kwargs(kwargs, tensors):
+    return dict(
+        q_tensor=tensors["Q"],
+        k_tensor=tensors["K"],
+        lse_tensor=tensors["LSE"],
+        cum_seqlen_q_tensor=tensors["cum_seqlen_q"],
+        cum_seqlen_k_tensor=tensors["cum_seqlen_kv"],
+        max_s_q=kwargs["max_s_q"],
+        max_s_k=kwargs["max_s_k"],
+        acc_dtype=kwargs["acc_dtype"],
+        k_value=kwargs["k_value"],
+        selection_block_size=kwargs["selection_block_size"],
+        compress_stride=kwargs["compress_stride"],
+        is_causal=kwargs["is_causal"],
+        mma_tiler_mn=kwargs["mma_tiler_mn"],
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_nsa_topk_reduction_wrapper_infers_max_s(request):
+    """The eager wrapper keeps develop's surface: the T,H,D envelope is inferred from cum_seqlen when omitted."""
+    NSA, _, kwargs, tensors = _thd_topk_case(request)
+    ref = NSA.topk_reduction_wrapper(**_wrapper_kwargs(kwargs, tensors))
+    got = NSA.topk_reduction_wrapper(**dict(_wrapper_kwargs(kwargs, tensors), max_s_q=None, max_s_k=None))
+    torch.testing.assert_close(got["topk_indices_tensor"], ref["topk_indices_tensor"])
+    torch.testing.assert_close(got["topk_scores_tensor"], ref["topk_scores_tensor"], equal_nan=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_nsa_topk_reduction_wrapper_accepts_row_major_lse(request):
+    """The eager wrapper stages a row-major (T, H_q[, 1]) LSE into the layout the class accepts; results match."""
+    NSA, _, kwargs, tensors = _thd_topk_case(request)
+    ref = NSA.topk_reduction_wrapper(**_wrapper_kwargs(kwargs, tensors))
+    for row_major in (tensors["LSE"].contiguous(), tensors["LSE"].squeeze(-1).contiguous()):
+        assert row_major.is_contiguous() and row_major.stride(0) != 1
+        got = NSA.topk_reduction_wrapper(**dict(_wrapper_kwargs(kwargs, tensors), lse_tensor=row_major))
+        torch.testing.assert_close(got["topk_indices_tensor"], ref["topk_indices_tensor"])
+        torch.testing.assert_close(got["topk_scores_tensor"], ref["topk_scores_tensor"], equal_nan=True)
 
 
 @pytest.mark.L0

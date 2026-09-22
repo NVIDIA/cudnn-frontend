@@ -14,6 +14,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import stream_context
 
 
 def _lse_stride_mismatch(shape, stride) -> bool:
@@ -21,6 +22,17 @@ def _lse_stride_mismatch(shape, stride) -> bool:
     b, h_q, s_q = shape
     expected = (h_q * s_q, s_q, 1)
     return any(n > 1 and st != e for n, st, e in zip(shape, stride, expected))
+
+
+def _stage_lse(lse: torch.Tensor, is_thd: bool) -> torch.Tensor:
+    """``lse`` itself when ``TopKReduction`` accepts its layout, else a copy in the accepted layout
+    (``(B,H_q,S_q)`` row-major; ``T,H,D``: ``(T,H_q[,1])`` with T at unit stride). Runs on the current torch stream."""
+    view = lse.unsqueeze(0).transpose(1, 2) if is_thd else lse
+    while view.ndim > 3:
+        view = view.squeeze(-1)
+    if not _lse_stride_mismatch(tuple(view.shape), tuple(view.stride())):
+        return lse
+    return lse.transpose(0, 1).contiguous().transpose(0, 1) if is_thd else lse.contiguous()
 
 
 class TopKReduction(APIBase):
@@ -325,30 +337,45 @@ def topk_reduction_wrapper(
     scale_softmax: Optional[float] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    """Allocate ``topk_scores`` / ``topk_indices`` and run ``TopKReduction``; objects are memoized per shape.
+
+    This is the eager torch-op layer over the strict class. ``T,H,D`` (``cum_seqlen_*`` given): ``max_s_q`` /
+    ``max_s_k`` are inferred from ``cum_seqlen_*`` (``.max().item()``, a device sync) when not passed, and the
+    outputs are sized ``(q_tensor.shape[0], H_k, k_value)`` -- q's token extent, equal to ``cum_seqlen_q[-1]`` for
+    a fully packed batch; a slack tail is never written. An ``lse_tensor`` whose layout the class would decline is
+    staged into the accepted layout (``(B,H_q,S_q)`` row-major / ``(T,H_q)`` with T at unit stride) on the launch
+    stream. Pass the host ints and an accepted LSE layout to avoid both.
+    """
 
     _logger.debug("topk_reduction_wrapper: Entering topk_reduction_wrapper")
-    topk_scores_tensor, topk_indices_tensor = None, None
-    if cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None:  # T,H,D
-        if max_s_q is None or max_s_k is None:
-            raise ValueError(
-                "topk_reduction_wrapper: max_s_q and max_s_k are required for the T,H,D layout (plan-time launch envelope); "
-                f"they are not inferred from cum_seqlen (a device read, Rule 8). Got max_s_q={max_s_q}, max_s_k={max_s_k}"
-            )
-        # Packed T,H,D: the output leads with q's token extent (== cum_seqlen_q[-1] when fully packed; a slack tail
-        # is never written). Reading cum_seqlen_q[-1] back would be a blocking D2H copy per call.
-        total_seq_len_q = q_tensor.shape[0]
-        h_k = k_tensor.shape[1]
-        topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
-        topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
-    elif cum_seqlen_q_tensor is None and cum_seqlen_k_tensor is None:  # B,H,S,D
-        b, _, s_q, _ = q_tensor.shape
-        _, h_k, _, _ = k_tensor.shape
-        topk_scores_tensor = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device).transpose(1, 2)
-        topk_indices_tensor = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device).transpose(1, 2)
-    else:
+    is_thd = cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None
+    if not is_thd and not (cum_seqlen_q_tensor is None and cum_seqlen_k_tensor is None):
         raise ValueError(
             f"cum_seqlen_q_tensor and cum_seqlen_k_tensor must either both be None (B,H,S,D) or both not None (T,H,D), got {cum_seqlen_q_tensor} and {cum_seqlen_k_tensor}"
         )
+    # Launch stream (R1): `current_stream`, or torch's current stream when None (stream_context is then a no-op).
+    with torch.cuda.device(q_tensor.device), stream_context(current_stream, q_tensor.device):
+        if is_thd:
+            if max_s_q is None:
+                _logger.warning("topk_reduction_wrapper: max_s_q not provided, inferring from cum_seqlen_q (device sync)")
+                cum = cum_seqlen_q_tensor.reshape(-1)
+                max_s_q = int((cum[1:] - cum[:-1]).max().item())
+            if max_s_k is None:
+                _logger.warning("topk_reduction_wrapper: max_s_k not provided, inferring from cum_seqlen_k (device sync)")
+                cum = cum_seqlen_k_tensor.reshape(-1)
+                max_s_k = int((cum[1:] - cum[:-1]).max().item())
+        lse_tensor = _stage_lse(lse_tensor, is_thd)
+
+        if is_thd:
+            total_seq_len_q = q_tensor.shape[0]
+            h_k = k_tensor.shape[1]
+            topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
+            topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
+        else:
+            b, _, s_q, _ = q_tensor.shape
+            _, h_k, _, _ = k_tensor.shape
+            topk_scores_tensor = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device).transpose(1, 2)
+            topk_indices_tensor = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device).transpose(1, 2)
 
     cache_key = (
         q_tensor.shape,
