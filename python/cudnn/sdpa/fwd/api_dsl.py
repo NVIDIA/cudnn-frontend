@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
 
 import torch
+
+from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
@@ -231,10 +233,6 @@ _SM120_DTYPE_QKV_CODE = {
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
 _WS_ALIGN = 128
 
-# Private torch symbol, resolved once. It only shortcuts the stream context, so
-# a build without it must fall through to the public API rather than fail.
-_CUDA_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-
 
 @contextmanager
 def _torch_stream_context(
@@ -243,41 +241,13 @@ def _torch_stream_context(
     *,
     verify_current: bool = False,
 ) -> Iterator[None]:
-    """Run PyTorch work on the CUDA stream used for the kernel launch.
+    """Run PyTorch work on the CUDA stream used for the kernel launch (Rule 5;
+    the sentinel mapping and the raw-handle fast path live in ``cudnn._torch_stream``).
 
-    ``verify_current`` bypasses the private raw-handle shortcut when a caller
-    supplies the stream, making that handle authoritative for the context.
+    ``verify_current`` bypasses the raw-handle shortcut when a caller supplies
+    the stream, making that handle authoritative for the context.
     """
-    if current_stream is None:
-        yield
-        return
-    handle = int(current_stream)
-    if handle in (0, 1, 2):
-        # Legacy default / per-thread-default stream sentinels: wrapping one in
-        # ExternalStream breaks re-execution on some torch builds (NGC), where
-        # every launch after the compile run silently no-ops (all-zero outputs;
-        # caught by test_mhas_v2's determinism re-run). Torch work is already
-        # ordered against the default stream here, so run in place.
-        yield
-        return
-    # Fast path: the launch stream is almost always the one torch is already on,
-    # and entering a context for the current stream is a no-op. Building the two
-    # Stream objects below costs ~3.4 us each and this runs several times per
-    # execute; the raw handle getter is ~0.07 us.
-    if not verify_current and _CUDA_RAW_STREAM is not None:
-        _idx = device.index if device.index is not None else torch.cuda.current_device()
-        if handle == _CUDA_RAW_STREAM(_idx):
-            yield
-            return
-    torch_current = torch.cuda.current_stream(device)
-    torch_default = torch.cuda.default_stream(device)
-    if handle == torch_current.cuda_stream:
-        launch_stream = torch_current
-    elif handle == torch_default.cuda_stream:
-        launch_stream = torch_default
-    else:
-        launch_stream = torch.cuda.ExternalStream(handle, device=device)
-    with torch.cuda.stream(launch_stream):
+    with stream_context(current_stream, device, verify_current=verify_current):
         yield
 
 
