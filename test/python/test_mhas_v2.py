@@ -1825,6 +1825,12 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         # the NaN-poisoned capacity tails that catch the GitHub #624 class.
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
+        # Block-scaled O on the FROST d128 MXFP8 kernel: FP4 O + E4M3/16 scales (16)
+        # or E4M3 O + UE8M0/32 scales (32) with the sf_o output. exec_sdpa_mxfp8
+        # folds it to 0 on configs the epilogue does not serve (d != 128, unfuse_fma,
+        # a ragged KV tail without a covering causal band, FROST engines off), so the
+        # draw stays a plain mxfp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
