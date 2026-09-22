@@ -385,6 +385,24 @@ Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
 a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
 resolve to `torch.cuda.default_stream(device)`.
 
+*R1 staging (a wrapper copies a caller input on the launch stream).* `.contiguous()`,
+`.to(dtype)`, `clone(memory_format=...)` read the caller's tensor asynchronously on
+`stream`; rebinding the name (`t = t.contiguous()`) drops the wrapper's reference, and a
+caller that releases its own right after the call returns the block to the allocator's
+pool for the caller's stream while the copy is still queued. Record the ORIGINAL first:
+```python
+from cudnn._torch_stream import contiguous_on_stream, record_streams
+
+t = contiguous_on_stream(t, stream, device)          # None / contiguous -> t itself
+record_streams((t,), stream, device)                 # then any other copy (.to, clone(memory_format=...))
+with stream_context(stream, device):
+    t32 = t.to(torch.int32).contiguous()
+```
+Both are no-ops for `stream=None` / torch's current stream (the allocation stream orders
+reuse there). Detector: `test/python/fe_api/test_torch_stream_staging.py` -- a long kernel on
+the side stream, the wrapper call, release the original, a same-size allocation filled with
+poison, synchronize, compare (the bare-`.contiguous()` control reads the poison).
+
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-
 required tensor slot).** Declare it, carve it, never allocate it:
