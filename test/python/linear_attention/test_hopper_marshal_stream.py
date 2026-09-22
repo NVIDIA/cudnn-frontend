@@ -62,10 +62,10 @@ def test_resolve_inputs_converts_into_staging_on_the_default_stream(no_external_
     g_stage = torch.full((3, 8), 9.0, device="cuda", dtype=torch.float32)
     cu_stage = torch.full((3,), 9, device="cuda", dtype=torch.int32)
     staging = {"g": _view(g_stage), "cu_seqlens": _view(cu_stage)}
-    before = torch.cuda.memory_allocated()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]  # the counter: memory_allocated() also moves on unrelated frees
     addr = marshal.resolve_inputs(["g", "cu_seqlens"], [_view(g), _view(cu)], "test", 0, want={"g": "float32", "cu_seqlens": "int32"}, staging=staging)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before, "a conversion allocated instead of using its staging carve"
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "a conversion allocated instead of using its staging carve"
     assert [addr["g"], addr["cu_seqlens"]] == [g_stage.data_ptr(), cu_stage.data_ptr()]
     assert torch.equal(g_stage, g.float())
     assert torch.equal(cu_stage, cu.to(torch.int32))

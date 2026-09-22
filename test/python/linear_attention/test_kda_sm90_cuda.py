@@ -210,10 +210,11 @@ def workspace_for(graph):
 
 
 def assert_executes_allocate_nothing(graph, pack, ws, repeats=5):
-    """R9: warm once, then no torch allocation and no torch-visible sync across ``repeats`` executes."""
+    """R9: warm once, then no torch allocation and no torch-visible sync across ``repeats`` executes.
+    The allocation COUNTER is the assertion: ``memory_allocated()`` also moves when Python frees an
+    earlier test's tensors mid-test, so equality on it reports phantom failures under xdist."""
     graph.execute(pack, ws)  # warm: NVRTC / cute.compile, port binding, the carve memo
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
     allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -222,7 +223,6 @@ def assert_executes_allocate_nothing(graph, pack, ws, repeats=5):
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations, "execute() allocated (and freed) device memory"
 
 

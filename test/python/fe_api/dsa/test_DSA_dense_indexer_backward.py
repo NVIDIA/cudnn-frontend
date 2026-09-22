@@ -318,6 +318,72 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
 
 
 @pytest.mark.L0
+def test_dense_plan_rejects_cross_tensor_shape_mismatch():
+    """A directly built plan validates its descriptors against each other in
+    ``check_support`` (the wrapper's ``_dense_shapes`` contract): the kernel sizes
+    its grid and the dK store from index_q / index_k, so a gradient, score or
+    denominator buffer of another extent is rejected before compile, on both layouts."""
+    major = torch.cuda.get_device_capability()[0]
+    if major != 9 and major < 10:
+        pytest.skip("Dense indexer backward requires SM90 or SM100+")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    b, s_q, s_k, h, d = 1, 128, 128, 64, 128
+    bf16 = dict(dtype=torch.bfloat16, device="cuda")
+    f32 = dict(dtype=torch.float32, device="cuda")
+    bshd = dict(
+        sample_index_q=torch.empty(b, s_q, h, d, **bf16),
+        sample_weights=torch.empty(b, s_q, h, **bf16),
+        sample_index_k=torch.empty(b, s_k, d, **bf16),
+        sample_d_index_q=torch.empty(b, s_q, h, d, **bf16),
+        sample_d_weights=torch.empty(b, s_q, h, **bf16),
+        sample_d_index_k=torch.empty(b, s_k, d, **bf16),
+        sample_attn_score=torch.empty(b, s_q, s_k, **f32),
+        sample_attn_l1norm=torch.empty(b, s_q, **f32),
+        sample_index_score=torch.empty(b, s_q, s_k, **f32),
+        sample_index_lse=torch.empty(b, s_q, **f32),
+    )
+    assert DSA.DenseIndexerBackward(**bshd).check_support()
+    for name, bad in (
+        ("d_index_k", torch.empty(b, s_k // 2, d, **bf16)),
+        ("attn_score", torch.empty(b, s_q, 2 * s_k, **f32)),
+        ("d_weights", torch.empty(b, s_q // 2, h, **bf16)),
+        ("index_lse", torch.empty(b, 2 * s_q, **f32)),
+    ):
+        with pytest.raises(ValueError, match=name):
+            DSA.DenseIndexerBackward(**{**bshd, f"sample_{name}": bad}).check_support()
+
+    t_q, t_k = s_q, s_k
+    thd = dict(
+        sample_index_q=torch.empty(t_q, h, d, **bf16),
+        sample_weights=torch.empty(t_q, h, **bf16),
+        sample_index_k=torch.empty(t_k, d, **bf16),
+        sample_d_index_q=torch.empty(t_q, h, d, **bf16),
+        sample_d_weights=torch.empty(t_q, h, **bf16),
+        sample_d_index_k=torch.empty(t_k, d, **bf16),
+        sample_attn_score=torch.empty(t_q, s_k, **f32),
+        sample_attn_l1norm=torch.empty(t_q, **f32),
+        sample_index_score=torch.empty(t_q, s_k, **f32),
+        sample_index_lse=torch.empty(t_q, **f32),
+        is_thd=True,
+        batch=1,
+        max_seqlen_q=s_q,
+        max_seqlen_k=s_k,
+    )
+    assert DSA.DenseIndexerBackward(**thd).check_support()
+    for name, bad in (
+        ("d_index_k", torch.empty(t_k // 2, d, **bf16)),
+        ("index_score", torch.empty(t_q, 2 * s_k, **f32)),
+        ("attn_l1norm", torch.empty(2 * t_q, **f32)),
+    ):
+        with pytest.raises(ValueError, match=name):
+            DSA.DenseIndexerBackward(**{**thd, f"sample_{name}": bad}).check_support()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(("queries", "keys"), [(1, 1), (17, 31), (32, 128), (33, 129), (32, 513)])
 def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_dim: int) -> None:
