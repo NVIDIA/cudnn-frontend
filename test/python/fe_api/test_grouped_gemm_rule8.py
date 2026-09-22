@@ -479,8 +479,8 @@ def test_retain_workspace_guards_device_and_keeps_eager_buffers_until_their_laun
     stream = torch.cuda.current_stream().cuda_stream
     with pytest.raises(ValueError, match="CUDA buffer"):
         retain_workspace(api, torch.empty(64, dtype=torch.uint8), stream)
-    with pytest.raises(ValueError, match="plan's device"):
-        retain_workspace(api, _EagerBuffer(torch.device("cuda", 7)), stream)
+    with pytest.raises(ValueError, match="plan's device"):  # metadata-only: the index need not exist
+        retain_workspace(api, _EagerBuffer(torch.device("cuda", torch.cuda.current_device() + 1)), stream)
 
     ws = torch.empty(64, dtype=torch.uint8, device="cuda")
     retain_workspace(api, ws, stream)  # torch: record_stream, nothing retained
@@ -492,10 +492,13 @@ def test_retain_workspace_guards_device_and_keeps_eager_buffers_until_their_laun
         retain_workspace(api, b, stream)
     assert [e.buffer for e in api._live_workspaces] == buffers, "every in-flight buffer is held, not only the latest"
     assert all(e.event is not None for e in api._live_workspaces[:-1]) and api._live_workspaces[-1].event is None
+    sentinel = _EagerBuffer(_Desc.device)
+    retain_workspace(api, sentinel, stream)  # fences the third buffer (its launch is enqueued by now)
     torch.cuda.synchronize()
     late = _EagerBuffer(_Desc.device)
-    retain_workspace(api, late, stream)  # every earlier launch has completed: their buffers are released
-    assert [e.buffer for e in api._live_workspaces] == [late]
+    retain_workspace(api, late, stream)  # every fenced launch has completed: those buffers are released
+    held = [e.buffer for e in api._live_workspaces]
+    assert not any(b in held for b in buffers) and late in held
 
 
 @pytest.mark.L0

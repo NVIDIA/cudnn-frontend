@@ -78,6 +78,11 @@ def _build_nvfp4_graph(
     out_major="n",
 ):
     sf_k = K // block_size
+    sf_m, sf_n = M, N
+    if reorder:
+        # F8_128x4 descriptors include the padding in the reordered SF buffers.
+        sf_m, sf_n = _ceil_div(M, 128) * 128, _ceil_div(N, 128) * 128
+        sf_k = _ceil_div(sf_k, 4) * 4
     b_dt = b_dt if b_dt is not None else a_dt
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
@@ -93,15 +98,15 @@ def _build_nvfp4_graph(
     sf_kw = dict(reordering_type=cudnn.tensor_reordering.F8_128x4) if reorder else {}
     SFA = g.tensor(
         name="SFA",
-        dim=[1, M, sf_k],
-        stride=[M * sf_k, sf_k, 1],
+        dim=[1, sf_m, sf_k],
+        stride=[sf_m * sf_k, sf_k, 1],
         data_type=sf_dt,
         **sf_kw,
     )
     SFB = g.tensor(
         name="SFB",
-        dim=[1, sf_k, N],
-        stride=[sf_k * N, 1, sf_k],
+        dim=[1, sf_k, sf_n],
+        stride=[sf_k * sf_n, 1, sf_k],
         data_type=sf_dt,
         **sf_kw,
     )
@@ -2015,9 +2020,9 @@ def test_auto_config_is_accepted_by_the_registry(M, N):
 # --- SF blob packing guard -------------------------------------------------
 # The templates rebuild the F8_128x4 layout from the SF BASE POINTER alone (a
 # packed run of 512-B atoms, 128 rows x 4 SF-K), so a blob that is not one dense
-# byte run of that size is read out of bounds and silently miscomputes. The
-# graph declares the LOGICAL scale factors, whose shape legitimately differs from
-# the reordered blob, so only the call site can check this.
+# byte run of that size is read out of bounds and silently miscomputes. Padded
+# graph descriptors alone cannot guarantee the runtime blob's storage span;
+# the call site must check it too.
 _SF_GUARD_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
