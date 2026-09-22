@@ -99,6 +99,14 @@ requires all seven of `q`, `k`, `v`, `do`, `dq`, `dk`, and `dv` to be contiguous
 does not compare storage spans across distinct tensors; callers must ensure that
 output writes do not overwrite live inputs or the same logical output element.
 
+The high-level functions `hstu_attention_forward` and `hstu_attention_backward`
+accept any of these layouts: before building or looking up the plan they clone
+inputs the kernels cannot read natively into contiguous storage and run
+caller-provided gradients the kernels cannot store to natively through
+contiguous scratch that is copied back, all on the launch stream. Gradients the
+functions allocate themselves use a layout the plan accepts. Only the class APIs
+decline with `NotImplementedError`.
+
 ## High-level functions
 
 `hstu_attention_forward` allocates and returns the packed output. A basic causal

@@ -154,6 +154,59 @@ def _decline_layout(name: str, tensor: torch.Tensor, requirement: str) -> None:
     raise NotImplementedError(f"HSTU SM100 cannot serve {name} with shape {tuple(tensor.shape)} and strides {tuple(tensor.stride())} natively: {requirement}")
 
 
+# The eager wrappers normalise layouts the plan classes decline (R5): non-native inputs are
+# cloned to contiguous storage and non-native caller-provided gradients run into contiguous
+# scratch that is copied back, all on the launch stream. Misaligned storage is an input
+# error check_support reports, never adapted.
+def _input_layout_accepted(tensor: torch.Tensor, contiguous_only: bool) -> bool:
+    if contiguous_only:
+        return tensor.is_contiguous()
+    return _interface._supports_bwd_original_qkv_layout(tensor)
+
+
+def _grad_layout_accepted(tensor: torch.Tensor, contiguous_only: bool) -> bool:
+    if contiguous_only:
+        return tensor.is_contiguous()
+    return _interface._supports_bwd_direct_grad_layout(tensor)
+
+
+def _needs_staging(tensor: torch.Tensor, accepted: bool) -> bool:
+    return not accepted and tensor.is_cuda and tensor.ndim == 3 and tensor.data_ptr() % 16 == 0
+
+
+def _stage_input(tensor: torch.Tensor, contiguous_only: bool) -> torch.Tensor:
+    if _needs_staging(tensor, _input_layout_accepted(tensor, contiguous_only)):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor
+
+
+def _stage_grad(
+    tensor: Optional[torch.Tensor],
+    reference: torch.Tensor,
+    contiguous_only: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``(plan_grad, caller_grad)``: ``caller_grad`` is the tensor to ``copy_`` into afterwards, or None."""
+    if tensor is None:
+        if _grad_layout_accepted(reference, contiguous_only):
+            return _empty_grad_like(reference), None
+        return torch.empty_like(reference, memory_format=torch.contiguous_format), None
+    if _needs_staging(tensor, _grad_layout_accepted(tensor, contiguous_only)):
+        return torch.empty_like(tensor, memory_format=torch.contiguous_format), tensor
+    return tensor, None
+
+
+def _bwd_requires_contiguous(
+    q_tensor: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size: Tuple[int, int],
+    func_tensor: Optional[torch.Tensor],
+) -> bool:
+    if q_tensor.ndim != 3 or len(window_size) != 2:
+        return False
+    return _interface._bwd_d256_route(int(q_tensor.shape[2]), max_seqlen_q, max_seqlen_k, int(window_size[0]), int(window_size[1]), func_tensor)
+
+
 def _allocate_workspace(
     api: "_HSTUBase",
     device: torch.device,
@@ -886,13 +939,18 @@ def hstu_attention_forward(
     page_indptrs_tensor: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
 ) -> TupleDict:
-    """Allocate and compute packed HSTU forward on an SM10x GPU."""
+    """Allocate and compute packed HSTU forward on an SM10x GPU.
+
+    Inputs the kernels cannot read natively are cloned to contiguous storage on the
+    launch stream before the plan is built or looked up.
+    """
     _validate_cu_seqlens_metadata(cu_seqlens_q_tensor, "cu_seqlens_q_tensor")
     _validate_cu_seqlens_metadata(cu_seqlens_k_tensor, "cu_seqlens_k_tensor")
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
     with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+        q_tensor, k_tensor, v_tensor = (_stage_input(tensor, False) for tensor in (q_tensor, k_tensor, v_tensor))
         o_tensor = torch.empty(
             q_tensor.shape,
             dtype=q_tensor.dtype,
@@ -975,22 +1033,22 @@ def hstu_attention_backward(
     """Compute packed HSTU backward on an SM10x GPU.
 
     Any gradient output tensor that is not provided is allocated by this
-    function. Caller-provided gradient outputs are overwritten and returned;
-    they must be layouts the kernels store to directly (see the HSTU docs),
-    otherwise ``check_support()`` raises ``NotImplementedError``.
+    function. Caller-provided gradient outputs are overwritten and returned.
+    Inputs and gradients in layouts the kernels cannot address natively are
+    staged through contiguous copies on the launch stream (gradients are copied
+    back, so the caller's tensors keep their identity).
     """
     _validate_cu_seqlens_metadata(cu_seqlens_q_tensor, "cu_seqlens_q_tensor")
     _validate_cu_seqlens_metadata(cu_seqlens_k_tensor, "cu_seqlens_k_tensor")
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
+    contiguous_only = _bwd_requires_contiguous(q_tensor, resolved_max_q, resolved_max_k, window_size, func_tensor)
     with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
-        if dq_tensor is None:
-            dq_tensor = _empty_grad_like(q_tensor)
-        if dk_tensor is None:
-            dk_tensor = _empty_grad_like(k_tensor)
-        if dv_tensor is None:
-            dv_tensor = _empty_grad_like(v_tensor)
+        do_tensor, q_tensor, k_tensor, v_tensor = (_stage_input(tensor, contiguous_only) for tensor in (do_tensor, q_tensor, k_tensor, v_tensor))
+        dq_tensor, dq_caller = _stage_grad(dq_tensor, q_tensor, contiguous_only)
+        dk_tensor, dk_caller = _stage_grad(dk_tensor, k_tensor, contiguous_only)
+        dv_tensor, dv_caller = _stage_grad(dv_tensor, v_tensor, contiguous_only)
     cache_key = (
         _tensor_signature(do_tensor),
         _tensor_signature(q_tensor),
@@ -1046,10 +1104,14 @@ def hstu_attention_backward(
         current_stream=stream,
         workspace=_allocate_workspace(api, q_tensor.device, stream),
     )
+    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+        for caller, scratch in ((dq_caller, dq_tensor), (dk_caller, dk_tensor), (dv_caller, dv_tensor)):
+            if caller is not None:
+                caller.copy_(scratch)
     return TupleDict(
-        dq_tensor=dq_tensor,
-        dk_tensor=dk_tensor,
-        dv_tensor=dv_tensor,
+        dq_tensor=dq_tensor if dq_caller is None else dq_caller,
+        dk_tensor=dk_tensor if dk_caller is None else dk_caller,
+        dv_tensor=dv_tensor if dv_caller is None else dv_caller,
     )
 
 

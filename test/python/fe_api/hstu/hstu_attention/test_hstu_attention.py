@@ -866,12 +866,9 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         for reference in (q, k, v)
     ]
     dq, dk, dv = (storage[:, : reference.shape[1]] for storage, reference in zip(padded_outputs, (q, k, v)))
-    if head_dim == 256:
-        # The D=256 two-kernel backward stores through TMA and declines head-padded gradient views (R5).
-        with pytest.raises(NotImplementedError, match="dq_tensor .* contiguous"):
-            hstu_attention_backward(do, q, k, v, cu, cu, **kwargs, dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
-        assert len(cache) == 1
-        return
+    # The D=256 two-kernel backward stores through TMA: the wrapper runs head-padded gradient
+    # views through contiguous scratch (the plan already cached for the first call) and copies back.
+    plans_after_padded = 1 if head_dim == 256 else 2
     actual = hstu_attention_backward(
         do,
         q,
@@ -885,10 +882,11 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         dv_tensor=dv,
     )
 
-    assert len(cache) == 2
-    for name, output in zip(("dq_tensor", "dk_tensor", "dv_tensor"), (dq, dk, dv)):
+    assert len(cache) == plans_after_padded
+    for name, output, storage in zip(("dq_tensor", "dk_tensor", "dv_tensor"), (dq, dk, dv), padded_outputs):
         assert actual[name] is output
         torch.testing.assert_close(actual[name], expected[name], rtol=1e-2, atol=1e-2)
+        assert torch.isnan(storage[:, output.shape[1] :].float()).all()
 
     partial_dq_storage = torch.full_like(padded_outputs[0], float("nan"))
     partial_dq = partial_dq_storage[:, : q.shape[1]]
@@ -903,7 +901,7 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         dq_tensor=partial_dq,
     )
 
-    assert len(cache) == 3
+    assert len(cache) == (1 if head_dim == 256 else 3)
     assert partial["dq_tensor"] is partial_dq
     for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
         torch.testing.assert_close(partial[name], expected[name], rtol=1e-2, atol=1e-2)
@@ -1038,6 +1036,7 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
             dtype=torch.bfloat16,
             device="cuda",
         )
+        * 0.2
         for _ in range(4)
     ]
     q_unaligned, k_unaligned, v_unaligned, do_unaligned = (storage[..., :head_dim] for storage in unaligned_storage)
@@ -1059,6 +1058,56 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
             alpha=alpha,
             scaling_seqlen=scaling_seqlen,
         ).check_support()
+
+    # The eager wrapper still serves the same inputs: it clones them to contiguous storage and runs
+    # unaligned caller-provided gradients through contiguous scratch, copying back into the views.
+    unaligned_grad_storage = [torch.full_like(storage, padding_sentinel) for storage in unaligned_storage[:3]]
+    dq_unaligned, dk_unaligned, dv_unaligned = (storage[..., :head_dim] for storage in unaligned_grad_storage)
+    unaligned_refs = [tensor.float().detach().requires_grad_(True) for tensor in (q_unaligned, k_unaligned, v_unaligned)]
+    expected_unaligned = torch.autograd.grad(
+        _reference_forward(*unaligned_refs, cu, cu, alpha=alpha, scaling_seqlen=scaling_seqlen, causal=True),
+        unaligned_refs,
+        do_unaligned.float(),
+    )
+    result = hstu_attention_backward(
+        do_unaligned,
+        q_unaligned,
+        k_unaligned,
+        v_unaligned,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        dq_tensor=dq_unaligned,
+        dk_tensor=dk_unaligned,
+        dv_tensor=dv_unaligned,
+    )
+    for name, grad, expected_grad, storage in zip(
+        ("dq_tensor", "dk_tensor", "dv_tensor"), (dq_unaligned, dk_unaligned, dv_unaligned), expected_unaligned, unaligned_grad_storage
+    ):
+        assert result[name] is grad
+        torch.testing.assert_close(grad.float(), expected_grad, rtol=8e-2, atol=8e-2)
+        assert bool(torch.all(storage[..., head_dim:] == padding_sentinel))
+    implicit = hstu_attention_backward(
+        do_unaligned,
+        q_unaligned,
+        k_unaligned,
+        v_unaligned,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_unaligned):
+        assert implicit[name].is_contiguous()
+        torch.testing.assert_close(implicit[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
 
     # (D + 8)-padded storage keeps the strides 8-element aligned: served natively, no copy.
     input_storage = [
@@ -1221,6 +1270,29 @@ def test_d256_explicit_compile_and_packed_gradient_outputs():
         ).check_support()
     assert not hstu_varlen_bwd_256_cute.compile_cache
 
+    # The eager wrapper serves the same packed views: contiguous input clones, contiguous scratch
+    # gradients copied back into dqkv, so the caller's packed gradient tensor is the one filled.
+    packed = hstu_attention_backward(
+        do_transposed,
+        q_packed,
+        k_packed,
+        v_packed,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        dq_tensor=dqkv[:, 0],
+        dk_tensor=dqkv[:, 1],
+        dv_tensor=dqkv[:, 2],
+    )
+    assert torch.isfinite(dqkv.float()).all()
+    for name, index in (("dq_tensor", 0), ("dk_tensor", 1), ("dv_tensor", 2)):
+        assert packed[name].data_ptr() == dqkv[:, index].data_ptr()
+        assert packed[name].stride() == dqkv[:, index].stride()
+
     # Contiguous operands are served directly; without func the path carves no scratch.
     q, k, v = (tensor.contiguous() for tensor in (q_packed, k_packed, v_packed))
     dq, dk, dv = (torch.full_like(tensor, float("nan")) for tensor in (q, k, v))
@@ -1261,7 +1333,7 @@ def test_d256_explicit_compile_and_packed_gradient_outputs():
         (q_ref, k_ref, v_ref),
         do.float(),
     )
-    for actual, expected_grad in zip((dq, dk, dv), expected):
+    for actual, expected_grad in zip((dq, dk, dv, *dqkv.unbind(1)), (*expected, *expected)):
         torch.testing.assert_close(
             actual.float(),
             expected_grad,
@@ -2572,3 +2644,41 @@ def test_check_support_declines_unaligned_layouts():
         sample_dv=dkv[:, 1],
         **causal,
     ).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_wrappers_normalise_layouts_the_plan_declines(monkeypatch):
+    """The eager wrappers stage what check_support declines: cloned inputs, scratch grads copied back, on the launch stream."""
+    fwd_cache, bwd_cache = OrderedDict(), OrderedDict()
+    monkeypatch.setattr(_api, "_FWD_CACHE", fwd_cache)
+    monkeypatch.setattr(_api, "_BWD_CACHE", bwd_cache)
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=64)
+    kwargs = {"max_seqlen_q": 128, "max_seqlen_k": 128, "window_size": (-1, 0), "alpha": 0.7, "scaling_seqlen": 64.0}
+    stream = torch.cuda.Stream()
+
+    def unaligned_copy(tensor):
+        storage = torch.empty((tensor.shape[0], tensor.shape[1], tensor.shape[2] + 1), dtype=tensor.dtype, device=tensor.device)
+        view = storage[..., : tensor.shape[2]]
+        view.copy_(tensor)
+        assert not _interface._supports_bwd_original_qkv_layout(view)
+        return view
+
+    q_unaligned, k_unaligned, v_unaligned, do_unaligned = (unaligned_copy(tensor) for tensor in (q, k, v, do))
+    expected = hstu_attention_forward(q, k, v, cu, cu, **kwargs)["o_tensor"]
+    stream.wait_stream(torch.cuda.current_stream())
+    actual = hstu_attention_forward(q_unaligned, k_unaligned, v_unaligned, cu, cu, **kwargs, stream=stream)["o_tensor"]
+    torch.cuda.synchronize()
+    assert len(fwd_cache) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    expected_grads = hstu_attention_backward(do, q, k, v, cu, cu, **kwargs)
+    dq_unaligned = unaligned_copy(torch.full_like(q, float("nan")))
+    stream.wait_stream(torch.cuda.current_stream())
+    actual_grads = hstu_attention_backward(do_unaligned, q_unaligned, k_unaligned, v_unaligned, cu, cu, **kwargs, stream=stream, dq_tensor=dq_unaligned)
+    torch.cuda.synchronize()
+    assert len(bwd_cache) == 1
+    assert actual_grads["dq_tensor"] is dq_unaligned
+    for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        torch.testing.assert_close(actual_grads[name], expected_grads[name], rtol=1e-2, atol=1e-2)
+    assert actual_grads["dk_tensor"].is_contiguous() and actual_grads["dv_tensor"].is_contiguous()

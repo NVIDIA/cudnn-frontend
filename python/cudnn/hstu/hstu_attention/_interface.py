@@ -165,6 +165,30 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
     return t.stride(0) % 8 == 0 and t.stride(1) % 8 == 0
 
 
+def _normalize_window(max_seqlen_k: int, window_size_left: int, window_size_right: int) -> tuple[int, int, bool, bool]:
+    """Clamp the window to ``max_seqlen_k`` and classify it: ``(left, right, is_causal, is_local)``."""
+    left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
+    right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
+    is_causal = left == max_seqlen_k and right == 0
+    is_local = (left < max_seqlen_k or right < max_seqlen_k) and not is_causal
+    return left, right, is_causal, is_local
+
+
+def _bwd_d256_route(
+    head_dim: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size_left: int,
+    window_size_right: int,
+    func: Optional[torch.Tensor],
+) -> bool:
+    """Whether ``_bwd_dispatch`` sends native-layout operands of this problem down the D=256 two-kernel route."""
+    if head_dim != 256:
+        return False
+    _, _, is_causal, is_local = _normalize_window(max_seqlen_k, window_size_left, window_size_right)
+    return not (max_seqlen_q == 1 and (is_causal or is_local) and func is None)
+
+
 def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     """Return whether the fused epilogue can write directly to ``t``.
 
@@ -502,10 +526,7 @@ def _fwd_dispatch(
     assert head_dim in (32, 64, 128, 256), "Only support head_dim 32, 64, 128 and 256"
 
     is_q_len_one = max_seqlen_q == 1
-    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
-    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
-    is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
+    window_size_left, window_size_right, is_causal, is_local = _normalize_window(max_seqlen_k, window_size_left, window_size_right)
     is_arbitrary = func is not None
     use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
@@ -905,10 +926,7 @@ def _bwd_dispatch(
     is_q_len_one_supported = max_seqlen_q == 1 and head_dim in (64, 128, 256)
     m_block_size = 128
     n_block_size = 128
-    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
-    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
-    is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
+    window_size_left, window_size_right, is_causal, is_local = _normalize_window(max_seqlen_k, window_size_left, window_size_right)
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_supported
