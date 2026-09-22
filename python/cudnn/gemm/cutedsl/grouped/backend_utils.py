@@ -120,6 +120,25 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
+def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
+    """Caller-layer allocation of an APIBase's ``scratch_workspace_bytes()`` (recipe R2).
+
+    The ``*_wrapper_sm100`` functions allocate here, on the launch stream (R1), and pass
+    ``workspace=``; an APIBase never allocates one. Returns None when ``nbytes`` is 0.
+    """
+    if nbytes <= 0:
+        return None
+    if framework == "torch":
+        import torch
+
+        with _torch_stream_context(current_stream, device):
+            return torch.empty(nbytes, dtype=torch.uint8, device=device)
+    import jax
+    import jax.numpy as jnp
+
+    return jax.block_until_ready(jnp.empty((nbytes,), dtype=jnp.uint8, device=device))
+
+
 def wrapper_operand_meta(tensor):
     """Everything a wrapper's derivation reads off an operand, and nothing else.
 
