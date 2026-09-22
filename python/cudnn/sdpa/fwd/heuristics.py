@@ -538,6 +538,22 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
         # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
         primary = SCHED_NATURAL
+    elif causal_ish and caps.sm_lo == 100 and facts.is_mxfp8 and _selected_d_shape(caps, facts) == (128, 128):
+        # SM100 d128 MXFP8 (sm100/prefill_d128_mxfp8.py): plain LPT beats the L2-budget
+        # arm's LPT_L2 on EVERY measured causal shape -- MEASURED on B200 (cc 10.0,
+        # 148 SMs, 2026-09-22; CUPTI device time, L2 flushed per launch, 3 rounds,
+        # one process per slot, controls <= 0.35 %): LPT over LPT_L2 +5.1 / +7.2 /
+        # +5.0 / +4.3 / +7.9 / +10.4 % at B1 H24/8 S16K / S8K / S32K, B1 H128/128
+        # S16K, B1 H8/8 S4K, B4 H24/8 S4K (GQA 1 and 3, 1.7-111 waves, 1-8 MiB per
+        # head), and on three of the six LPT_L2 is slower than NATURAL.  O / Stats /
+        # Amax_O are bitwise identical across the three policies, so this moves
+        # only the PROPOSAL: LPT_L2 stays the first runner through order[SCHED_LPT]
+        # for autotune and the row's domain is untouched.  The per-tensor FP8 d128
+        # row measured SHAPE-DEPENDENT on the same node (LPT +2.9..+4.0 % at S=4K,
+        # LPT_L2 +0.5..+0.9 % at S=16K, S=8K / 32K inside 1.5x their control) and
+        # keeps the L2-budget arm below, unchanged; the other MXFP8 flavors
+        # (d192x128 / d256 / d512) and the Rubin rows are unmeasured here and unchanged.
+        primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
