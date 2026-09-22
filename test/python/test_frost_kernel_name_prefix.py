@@ -12,6 +12,7 @@ _KERNEL_ROOTS = (
     _REPO_ROOT / "python" / "cudnn" / "gemm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
     _REPO_ROOT / "python" / "cudnn" / "engram",
+    _REPO_ROOT / "python" / "cudnn" / "rope",
 )
 
 

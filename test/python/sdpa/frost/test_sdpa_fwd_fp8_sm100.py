@@ -27,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2156,3 +2156,101 @@ def test_fp8_gate_tail_graph_api(out_key):
     assert (
         pos.amax == neg.amax == no_gate.amax
     ), f"Amax_O must be G-independent and equal the no-gate graph's: +1e4 {pos.amax:.6f}, -1e4 {neg.amax:.6f}, none {no_gate.amax:.6f}"
+
+
+# ============================================================================ sm100 d128 per-tensor FP8: the exp2 MUFU / FMA split, pinned on the SASS per arch
+# The split (`sm100/prefill_d128_fp8.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
+# the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
+# SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
+# (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record
+# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT and the kernel is
+# develop's -- the gate-off cubin is md5-identical to develop's on both archs).  Compiled here for the target arch
+# (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
+_SM100_D128_FP8_SASS_PROBE = sass_probe_source("""
+    # The PRODUCTION geometry of the llama chart layer the split was measured on (B200, B=1 H=64/8 S=8K, E4M3 in /
+    # E4M3 out, Stats + Amax_O, cga2 from the adapter's own table); the per-arch field (exp2_fma_split) and the causal
+    # specialization (window_right / sched_policy) come from the caller as the record api_dsl.template_params() builds.
+    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True)
+    params = TemplateParams(dtype_qkv=0, dtype_o=0, cta_mma=cta_mma, qh_per_kh=8, emit_amax_o=True, **params_kw)
+    mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=True, rubin=False)
+    # MUFU.EX2 the kernel must carry: per traced softmax body one alpha exp2 plus the non-emulated columns; the body is
+    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm -- derived from
+    # the module, so the pin follows the pattern (and the gate) rather than a literal.
+    n_bodies = (2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1) * (2 if mod.CFG.MASK_FLAGS else 1)
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
+    print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    print("E2E_ENABLED", int(mod._E2E_ENABLED))
+    mod.compile(b=1, qh=64, kh=8, sq=8192, skv=8192, has_lse=True)
+    """)
+# The two specializations the breadth measurement covered: dense (NATURAL) and top-left causal (LPT_L2, the heuristics'
+# pick on both trees), as extra TemplateParams fields on top of the per-arch record.
+_D128_FP8_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}}
+# MEASURED 2026-09-22 on the trace-compiled cubins that are md5-IDENTICAL to the ones A/B'd on B200 (+4.53 % S=8K dense,
+# +2.4 % S=2K, +1.50 % S=32K, causal +0.26 % = noise).  Gate ON (sm_100a): dense MUFU.EX2 258 -> 194 (2 x 97), FFMA2
+# 130 -> 226, FADD2 126 -> 222 (+3 each per emulated pair), STL / LDL 3 / 3 unchanged; causal (masked + unmasked arm x 2
+# warpgroups) MUFU.EX2 516 -> 388 (4 x 97), FFMA2 260 -> 452, FADD2 252 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a,
+# cubin md5-identical to develop's): develop's counts exactly.  The MUFU count is pinned EXACTLY (derived from the
+# module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches one emulated pair falling
+# back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries are the counts of THIS
+# toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins read 1 / 1 under the CI
+# lane's 4.7.0 + 13.3 ptxas on develop and on the branch alike (frost_test_utils.SPILL_TOLERANCE).
+_D128_FP8_SASS_SLACK = 16
+_D128_FP8_ON_PINS = {
+    "dense": {"MUFU_EX2": 194, "FFMA2": 226, "FADD2": 222, "STL": 3, "LDL": 3},
+    "causal": {"MUFU_EX2": 388, "FFMA2": 452, "FADD2": 444, "STL": 0, "LDL": 0},
+}
+_D128_FP8_OFF_PINS = {
+    "dense": {"MUFU_EX2": 258, "FFMA2": 130, "FADD2": 126, "STL": 3, "LDL": 3},
+    "causal": {"MUFU_EX2": 516, "FFMA2": 260, "FADD2": 252, "STL": 0, "LDL": 0},
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("spec", sorted(_D128_FP8_SPECS))
+def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
+    """cc 10.0 record (exp2_fma_split=True, what api_dsl.template_params() builds for a d128 per-tensor FP8 build on a
+    B200): 32 of the 128 softmax columns are evaluated on the FMA pipe -- MUFU.EX2 == 2 x 97 (dense) / 4 x 97 (causal)
+    exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured counts minus slack;
+    no new spill (STL / LDL within SPILL_TOLERANCE of this toolchain's count).  Compiled for sm_100a at the chart-layer geometry."""
+    from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
+
+    assert _exp2_fma_split_for((10, 0), kind="fp8", flavor=(128, 128)) is True, "the cc 10.0 record must switch the split ON for this kernel"
+    probe = run_sass_probe(
+        tmp_path, probe_src=_SM100_D128_FP8_SASS_PROBE, arch="sm_100a", params={"exp2_fma_split": True, **_D128_FP8_SPECS[spec]}, tag=f"d128_fp8_{spec}"
+    )
+    pins = _D128_FP8_ON_PINS[spec]
+    assert probe.expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
+    assert probe.expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {probe.expect['EMULATED_COLS']}"
+    assert (
+        probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
+    ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
+    for key in ("FFMA2", "FADD2"):
+        assert probe.stats[key] >= pins[key] - _D128_FP8_SASS_SLACK, f"{key} {probe.stats[key]} < {pins[key]} - {_D128_FP8_SASS_SLACK}: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("spec", sorted(_D128_FP8_SPECS))
+def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
+    """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
+    Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (2 x 129
+    dense / 4 x 129 causal, derived from `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at
+    or below develop's plus slack) and no spill beyond develop's plus SPILL_TOLERANCE.  Compiled for sm_103a; skips where this cutlass-dsl has
+    no sm_103a."""
+    from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
+
+    assert _exp2_fma_split_for((10, 3), kind="fp8", flavor=(128, 128)) is False, "the cc 10.3 record must fold the split OUT"
+    probe = run_sass_probe(
+        tmp_path, probe_src=_SM100_D128_FP8_SASS_PROBE, arch="sm_103a", params={"exp2_fma_split": False, **_D128_FP8_SPECS[spec]}, tag=f"d128_fp8_{spec}"
+    )
+    pins = _D128_FP8_OFF_PINS[spec]
+    assert probe.expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert probe.expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {probe.expect['EMULATED_COLS']}"
+    assert (
+        probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
+    ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
+    for key in ("FFMA2", "FADD2"):
+        assert (
+            probe.stats[key] <= pins[key] + _D128_FP8_SASS_SLACK
+        ), f"{key} {probe.stats[key]} > {pins[key]} + {_D128_FP8_SASS_SLACK}: emulation instructions with the gate off: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")

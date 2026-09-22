@@ -286,7 +286,7 @@ class Sm107Mxfp8GluFc12Kernel:
         if n not in SupportedMmaTileN:
             raise ValueError(
                 f"mma_tiler N ({n}) must be one of {SupportedMmaTileN} in fused fc12 "
-                f"(N=64 SFB workaround is unavailable; swap-AB sched handles short-N "
+                f"(N=64 SFB special case is dropped; swap-AB sched handles short-N "
                 f"via subtile early-exit)."
             )
 
