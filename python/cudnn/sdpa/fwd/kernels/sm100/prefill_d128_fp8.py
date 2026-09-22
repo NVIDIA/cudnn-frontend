@@ -20,6 +20,15 @@ f16 / mxfp8 SM100 d=128 layout plus the FP8-on-Blackwell K-path:
      ``TILE_K_HW=32`` (config).  ``NUM_KPHASES_PV`` derives from
      ``CFG.TILE_K_HW_BMM2`` (→ 4 k-steps at TILE_K_HW=32).  Confirmed by the
      cuDNN f8 reference (UTCMMA_TILE_K=32, BMM_XMMAS_K=4, kind::f8f6f4).
+  5. **exp2 split MUFU / FMA** (``_E2E_*``, **cc 10.0 only**): 32 of the 128 P
+     columns of every softmax row are evaluated on the FMA pipe by
+     ``exp2_emul_pair`` (blocks of 4, spread over both P chunks), the alpha
+     exp2 stays on MUFU -- 97 instead of 129 MUFU.EX2 per row per KV step.
+     MEASURED on B200 (llama layer, H=64/8, E4M3, A/B/A x3): +4.5 % at S=8K
+     dense, +2.4 % at S=2K, +1.5 % at S=32K, causal +0.3 % (noise).
+     ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out on
+     every other cc, where MUFU.EX2 runs at twice B200's rate and the same
+     split loses (``_E2E_ENABLED``).
 
 THD / varlen (``CFG.THD_VARLEN=1``) follows the device-built-metadata +
 plan-time-envelope design (``write_thd_meta``, issue #552 / PRs #606, #608)
@@ -97,6 +106,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    exp2_mixed,
     # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
     # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
     # is not imported.
@@ -149,6 +159,56 @@ else:
 # denominator term is scaled up to match). Invariant:
 # RESCALE_THRESHOLD + P_CAST_LOG2_SCALE <= log2(448).
 P_CAST_LOG2_SCALE = 4.0
+
+# exp2 split between MUFU and the FMA pipe.  With 128 exps per row per KV step the
+# MUFU pipe (4 lanes/clk/SMSP) is the softmax warps' longest pipe on SM100 (2 x 128
+# x 128 exps per SM per step = 2048 clk against ~1024 clk of FP8 MMA), while the
+# FP32 pipe has slack; a compile-time subset of the P columns is evaluated by
+# ``exp2_emul_pair`` (6 packed instructions per pair) instead.  The ALPHA (rescale)
+# exp2 stays on MUFU.  The pattern is the same SHAPE as the cuDNN backend fprop
+# kernel's (of every _E2E_FREQ columns the LAST _E2E_RES are emulated, none at or
+# past _E2E_LIMIT) with the distribution taken from the MXFP8 sibling
+# (``prefill_d128_mxfp8.py``), where it was tuned on B200 (B=1 H=24/8 S=16K dense,
+# A/B/A): (16, 4, 128) = 32 columns in blocks of 4 over BOTH chunks, +1.63 % over the
+# backend's own (16, 8, 72) and +9.73 % over the all-MUFU kernel; 24 / 40 / 48 / 64
+# emulated columns and blocks of 2 / 8 all lost 0.9-8.7 pt.  At TILE_N=128 this
+# emulates columns 12..15 of every 16 (8 blocks): MUFU.EX2 per row per step 129 -> 97.
+# On THIS kernel MEASURED on B200 (llama layer B=1 H=64/8 E4M3, A/B/A x3, controls
+# <= 0.4 %): +4.53 % at S=8K dense, +2.4 % at S=2K (by TFLOPS), +1.50 % at S=32K,
+# causal (LPT_L2) +0.26 % = noise.  Derived per chunk as pair indices for exp2_mixed.
+#
+# ARCH GATE.  The split trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows
+# the part's MUFU rate -- MEASURED 16 elements/clk/SM on sm_100a (B200) and 32 on
+# sm_107a (Rubin, where the same split is -9..-10 %); cc 10.3 (GB300) DOCUMENTS the
+# doubled rate too.  ``PARAMS.exp2_fma_split`` is auto-set by the adapter from the
+# BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the kernels that measured
+# a win) and folded here at trace time: off, ``_E2E_PAIRS`` are empty and both exp2
+# sites trace ``cute.math.exp2`` -- the develop spelling.  Full rationale and the
+# measured rates: the ``_E2E_*`` block of ``prefill_d128_mxfp8.py``.
+_E2E_FREQ = 16
+_E2E_RES = 4
+_E2E_LIMIT = CFG.TILE_N
+_E2E_CHUNK = CFG.TILE_N // CFG.N_BMM2_CHUNKS
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off): the MUFU.EX2 the softmax
+# still issues per row per KV step is the alpha exp2 plus the non-emulated columns (97 on, 129 off).
+_E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
+if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
+    raise ValueError(f"{__name__}: exp2 emulation pattern freq={_E2E_FREQ} res={_E2E_RES} limit={_E2E_LIMIT} must be even with 0 <= res <= freq | limit")
+
+
+def _e2e_pairs(chunk: int, chunk_elems: int) -> frozenset:
+    """Pair indices (pair p = columns 2p, 2p+1 of the chunk) that ``exp2_mixed`` emulates."""
+    return frozenset(
+        p
+        for p in range(chunk_elems // 2)
+        if ((chunk * chunk_elems + 2 * p) % _E2E_FREQ) >= (_E2E_FREQ - _E2E_RES) and (chunk * chunk_elems + 2 * p) < _E2E_LIMIT
+    )
+
+
+_E2E_PAIRS = tuple(_e2e_pairs(c, _E2E_CHUNK) if _E2E_ENABLED else frozenset() for c in range(CFG.N_BMM2_CHUNKS))
+if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
+    raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
 
 # DTYPE_O is independent of DTYPE_QKV (mirrors C++ Cfg::DTYPE_O — defaults to
 # DTYPE_QKV but may be promoted to BF16/FP16 so a downstream consumer skips a
@@ -1504,7 +1564,12 @@ def _softmax_kv_body(
     reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Gated per arch
+    # at trace time (_E2E_ENABLED): off, both chunks are the plain MUFU exp2 -- the develop spelling.
+    if cutlass.const_expr(_E2E_ENABLED):
+        chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
+    else:
+        chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
     # Hoist chunk-0 sum before cast to overlap with cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
@@ -1519,7 +1584,10 @@ def _softmax_kv_body(
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        if cutlass.const_expr(_E2E_ENABLED):
+            deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
+        else:
+            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
         chunk_P_1_fp8 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
