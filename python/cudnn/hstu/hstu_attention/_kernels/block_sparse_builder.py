@@ -5,18 +5,20 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Int8, Int32, const_expr
-from cutlass.cute.runtime import from_dlpack
+
+from cudnn.api_base import WorkspaceCarver, ws_align
 
 from .block_sparsity import (
     HSTUD256BwdBlockSparseBuilderWorkspace,
     HSTUBlockSparseBuilderWorkspace,
+    HSTUBlockSparseTensors,
     HSTUBlockSparseTensorsTorch,
     HSTUK2QBlockSparseBuilderWorkspace,
 )
@@ -1212,104 +1214,103 @@ class HSTUD256BwdBlockSparseBuilder(HSTUK2QBlockSparseBuilder):
         )
 
 
-def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
-    return from_dlpack(
-        tensor.detach(),
-        assumed_align=16,
-        enable_tvm_ffi=True,
-    ).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+_INT32_MAX = 2**31 - 1
+_D256_BWD_BLOCK_SIZE = (256, 128)
 
 
-def allocate_hstu_q2k_workspace(
-    *,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    block_size: tuple[int, int],
-    device: torch.device,
-) -> HSTUBlockSparseBuilderWorkspace:
-    """Allocate capacity-backed Q2K CSR storage without reading device data."""
+class _CsrGeometry(NamedTuple):
+    """Capacity geometry of one CSR orientation; the carve order is the field order of ``int32_numels``."""
 
-    tile_m, tile_n = block_size
+    batch_size: int
+    num_row_blocks: int
+    num_col_blocks: int
+    num_rows: int
+    capacity: int
+
+    @property
+    def int32_numels(self) -> tuple[int, ...]:
+        # counts(mask, full), offsets(mask, full), indices(mask, full), staging(mask, full), scan(mask, full)
+        scan_numel = _scan_workspace_numel(self.num_rows)
+        return (
+            self.batch_size * self.num_row_blocks,
+            self.batch_size * self.num_row_blocks,
+            self.num_rows + 1,
+            self.num_rows + 1,
+            self.capacity,
+            self.capacity,
+            self.capacity,
+            self.capacity,
+            scan_numel,
+            scan_numel,
+        )
+
+    def nbytes(self) -> int:
+        return sum(ws_align(4 * numel) for numel in self.int32_numels)
+
+
+def _q2k_geometry(batch_size: int, max_seqlen_q: int, max_seqlen_k: int, block_size: tuple[int, int]) -> _CsrGeometry:
+    tile_m, tile_n = int(block_size[0]), int(block_size[1])
     num_m_blocks = (int(max_seqlen_q) + tile_m - 1) // tile_m
     num_n_blocks = (int(max_seqlen_k) + tile_n - 1) // tile_n
     num_rows = int(batch_size) * num_m_blocks
     capacity = num_rows * num_n_blocks
-    if capacity > torch.iinfo(torch.int32).max:
-        raise ValueError("HSTU Q2K metadata capacity exceeds int32: " f"{capacity} block edges")
-
-    count_shape = (int(batch_size), 1, num_m_blocks)
-    counts = [torch.empty(count_shape, dtype=torch.int32, device=device) for _ in range(2)]
-    offsets = [torch.empty(num_rows + 1, dtype=torch.int32, device=device) for _ in range(2)]
-    # max_seqlen_{q,k} are positive in the public API, so capacity is nonzero.
-    indices = [torch.empty(capacity, dtype=torch.int32, device=device) for _ in range(2)]
-    staging = [
-        torch.empty(
-            (num_rows, num_n_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        for _ in range(2)
-    ]
-    tensors = HSTUBlockSparseTensorsTorch(
-        mask_block_cnt=counts[0],
-        mask_block_offset=offsets[0],
-        mask_block_idx=indices[0],
-        full_block_cnt=counts[1],
-        full_block_offset=offsets[1],
-        full_block_idx=indices[1],
-        block_size=(tile_m, tile_n),
-        orientation="q2k",
-    )
-    return HSTUBlockSparseBuilderWorkspace(
-        tensors=tensors,
-        mask_staging=staging[0],
-        full_staging=staging[1],
-        mask_scan_blocks=torch.empty(
-            _scan_workspace_numel(num_rows),
-            dtype=torch.int32,
-            device=device,
-        ),
-        full_scan_blocks=torch.empty(
-            _scan_workspace_numel(num_rows),
-            dtype=torch.int32,
-            device=device,
-        ),
-    )
+    if capacity > _INT32_MAX:
+        raise ValueError(f"HSTU Q2K metadata capacity exceeds int32: {capacity} block edges")
+    return _CsrGeometry(int(batch_size), num_m_blocks, num_n_blocks, num_rows, capacity)
 
 
-def allocate_hstu_k2q_workspace(
-    *,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    block_size: tuple[int, int],
-    device: torch.device,
-) -> HSTUK2QBlockSparseBuilderWorkspace:
-    """Allocate capacity-backed K2Q CSR storage without device value reads."""
-
-    tile_q, tile_k = map(int, block_size)
+def _k2q_geometry(batch_size: int, max_seqlen_q: int, max_seqlen_k: int, block_size: tuple[int, int]) -> _CsrGeometry:
+    tile_q, tile_k = int(block_size[0]), int(block_size[1])
     if tile_q not in (128, 256) or tile_k != 128:
         raise ValueError("HSTU K2Q supports block_size=(128, 128) or (256, 128)")
     num_q_blocks = (int(max_seqlen_q) + tile_q - 1) // tile_q
     num_k_blocks = (int(max_seqlen_k) + tile_k - 1) // tile_k
     num_rows = int(batch_size) * num_k_blocks
     capacity = num_rows * num_q_blocks
-    if capacity > torch.iinfo(torch.int32).max:
-        raise ValueError("HSTU K2Q metadata capacity exceeds int32: " f"{capacity} block edges")
+    if capacity > _INT32_MAX:
+        raise ValueError(f"HSTU K2Q metadata capacity exceeds int32: {capacity} block edges")
+    return _CsrGeometry(int(batch_size), num_k_blocks, num_q_blocks, num_rows, capacity)
 
-    count_shape = (int(batch_size), 1, num_k_blocks)
-    counts = [torch.empty(count_shape, dtype=torch.int32, device=device) for _ in range(2)]
-    offsets = [torch.empty(num_rows + 1, dtype=torch.int32, device=device) for _ in range(2)]
-    indices = [torch.empty(capacity, dtype=torch.int32, device=device) for _ in range(2)]
-    staging = [
-        torch.empty(
-            (num_rows, num_q_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        for _ in range(2)
-    ]
+
+def hstu_q2k_block_sparse_workspace_bytes(batch_size: int, max_seqlen_q: int, max_seqlen_k: int, block_size: tuple[int, int]) -> int:
+    """Workspace bytes ``build_hstu_q2k_block_sparse`` carves (R2); pure host arithmetic."""
+    return _q2k_geometry(batch_size, max_seqlen_q, max_seqlen_k, block_size).nbytes()
+
+
+def hstu_k2q_block_sparse_workspace_bytes(batch_size: int, max_seqlen_q: int, max_seqlen_k: int, block_size: tuple[int, int]) -> int:
+    """Workspace bytes ``build_hstu_k2q_block_sparse`` carves: the CSR chunks plus the int8 state matrix."""
+    geometry = _k2q_geometry(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+    return geometry.nbytes() + ws_align(geometry.capacity)
+
+
+def hstu_d256_bwd_block_sparse_workspace_bytes(batch_size: int, max_seqlen_q: int, max_seqlen_k: int) -> int:
+    """Workspace bytes ``build_hstu_d256_bwd_block_sparse`` carves: Q2K then K2Q at (256, 128)."""
+    return hstu_q2k_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, _D256_BWD_BLOCK_SIZE) + hstu_k2q_block_sparse_workspace_bytes(
+        batch_size, max_seqlen_q, max_seqlen_k, _D256_BWD_BLOCK_SIZE
+    )
+
+
+def _carve_csr(carver: WorkspaceCarver, geometry: _CsrGeometry):
+    counts = [carver.take(geometry.batch_size * geometry.num_row_blocks, torch.int32).view(geometry.batch_size, 1, geometry.num_row_blocks) for _ in range(2)]
+    offsets = [carver.take(geometry.num_rows + 1, torch.int32) for _ in range(2)]
+    indices = [carver.take(geometry.capacity, torch.int32) for _ in range(2)]
+    staging = [carver.take(geometry.capacity, torch.int32).view(geometry.num_rows, geometry.num_col_blocks) for _ in range(2)]
+    scan = [carver.take(_scan_workspace_numel(geometry.num_rows), torch.int32) for _ in range(2)]
+    return counts, offsets, indices, staging, scan
+
+
+def carve_hstu_q2k_workspace(
+    carver: WorkspaceCarver,
+    *,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_size: tuple[int, int],
+) -> HSTUBlockSparseBuilderWorkspace:
+    """Carve capacity-backed Q2K CSR storage from the caller's workspace (R2)."""
+
+    geometry = _q2k_geometry(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+    counts, offsets, indices, staging, scan = _carve_csr(carver, geometry)
     tensors = HSTUBlockSparseTensorsTorch(
         mask_block_cnt=counts[0],
         mask_block_offset=offsets[0],
@@ -1317,71 +1318,115 @@ def allocate_hstu_k2q_workspace(
         full_block_cnt=counts[1],
         full_block_offset=offsets[1],
         full_block_idx=indices[1],
-        block_size=(tile_q, tile_k),
+        block_size=(int(block_size[0]), int(block_size[1])),
+        orientation="q2k",
+    )
+    return HSTUBlockSparseBuilderWorkspace(
+        tensors=tensors,
+        mask_staging=staging[0],
+        full_staging=staging[1],
+        mask_scan_blocks=scan[0],
+        full_scan_blocks=scan[1],
+    )
+
+
+def carve_hstu_k2q_workspace(
+    carver: WorkspaceCarver,
+    *,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_size: tuple[int, int],
+) -> HSTUK2QBlockSparseBuilderWorkspace:
+    """Carve capacity-backed K2Q CSR storage plus the int8 state matrix from the caller's workspace (R2)."""
+
+    geometry = _k2q_geometry(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+    counts, offsets, indices, staging, scan = _carve_csr(carver, geometry)
+    block_states = carver.take(geometry.capacity, torch.int8).view(geometry.batch_size, geometry.num_col_blocks, geometry.num_row_blocks)
+    tensors = HSTUBlockSparseTensorsTorch(
+        mask_block_cnt=counts[0],
+        mask_block_offset=offsets[0],
+        mask_block_idx=indices[0],
+        full_block_cnt=counts[1],
+        full_block_offset=offsets[1],
+        full_block_idx=indices[1],
+        block_size=(int(block_size[0]), int(block_size[1])),
         orientation="k2q",
     )
     return HSTUK2QBlockSparseBuilderWorkspace(
         tensors=tensors,
         mask_staging=staging[0],
         full_staging=staging[1],
-        mask_scan_blocks=torch.empty(
-            _scan_workspace_numel(num_rows),
-            dtype=torch.int32,
-            device=device,
-        ),
-        full_scan_blocks=torch.empty(
-            _scan_workspace_numel(num_rows),
-            dtype=torch.int32,
-            device=device,
-        ),
-        block_states=torch.empty(
-            (int(batch_size), num_q_blocks, num_k_blocks),
-            dtype=torch.int8,
-            device=device,
-        ),
+        mask_scan_blocks=scan[0],
+        full_scan_blocks=scan[1],
+        block_states=block_states,
     )
 
 
-def allocate_hstu_d256_bwd_workspace(
+def carve_hstu_d256_bwd_workspace(
+    carver: WorkspaceCarver,
     *,
     batch_size: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    device: torch.device,
 ) -> HSTUD256BwdBlockSparseBuilderWorkspace:
-    """Allocate paired Q256-by-K128 backward metadata workspaces."""
+    """Carve the paired Q256-by-K128 backward metadata (Q2K first, then K2Q)."""
 
-    block_size = (256, 128)
     return HSTUD256BwdBlockSparseBuilderWorkspace(
-        q2k=allocate_hstu_q2k_workspace(
+        q2k=carve_hstu_q2k_workspace(
+            carver,
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            block_size=block_size,
-            device=device,
+            block_size=_D256_BWD_BLOCK_SIZE,
         ),
-        k2q=allocate_hstu_k2q_workspace(
+        k2q=carve_hstu_k2q_workspace(
+            carver,
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            block_size=block_size,
-            device=device,
+            block_size=_D256_BWD_BLOCK_SIZE,
         ),
     )
 
 
-def build_hstu_q2k_block_sparse(
-    func: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    *,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    block_size: tuple[int, int],
-    compile_only: bool = False,
-) -> HSTUBlockSparseTensorsTorch:
-    """Build compact Q2K metadata on the caller's current CUDA stream."""
+def _fake_dynamic_tensor(rank: int, dtype=Int32):
+    """R11 stand-in with the layout ``from_dlpack(t).mark_layout_dynamic(leading_dim=rank - 1)`` yields at launch."""
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        tuple(cute.sym_int() for _ in range(rank)),
+        tuple(cute.sym_int64() for _ in range(rank - 1)) + (1,),
+        assumed_align=16,
+    )
 
+
+def fake_block_sparse_tensors() -> HSTUBlockSparseTensors:
+    """The six CSR operands of one orientation as compile-time fakes (counts rank 3, offsets/indices rank 1)."""
+    return HSTUBlockSparseTensors(
+        _fake_dynamic_tensor(3),
+        _fake_dynamic_tensor(1),
+        _fake_dynamic_tensor(1),
+        _fake_dynamic_tensor(3),
+        _fake_dynamic_tensor(1),
+        _fake_dynamic_tensor(1),
+    )
+
+
+def _fake_csr_builder_operands():
+    """One orientation's builder operands in launch order: six CSR tensors, two staging rows, two scan buffers."""
+    return (*fake_block_sparse_tensors(), _fake_dynamic_tensor(2), _fake_dynamic_tensor(2), _fake_dynamic_tensor(1), _fake_dynamic_tensor(1))
+
+
+def _fake_builder_inputs():
+    """``cu_seqlens_q``, ``cu_seqlens_k`` and ``func`` as launch-shaped fakes."""
+    return (_fake_dynamic_tensor(1), _fake_dynamic_tensor(1), _fake_dynamic_tensor(3))
+
+
+def _fake_stream():
+    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False)
+
+
+def _validate_builder_inputs(func: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> None:
     if func.dtype != torch.int32 or func.ndim != 3:
         raise ValueError("func must be a rank-3 torch.int32 tensor")
     if not func.is_cuda:
@@ -1395,57 +1440,74 @@ def build_hstu_q2k_block_sparse(
     if func.device != cu_seqlens_q.device or func.device != cu_seqlens_k.device:
         raise ValueError("func and cu_seqlens_q/k must be on the same device")
 
+
+def _current_stream(device: torch.device) -> cuda.CUstream:
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+
+def build_hstu_q2k_block_sparse(
+    func: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_size: tuple[int, int],
+    workspace: Optional[torch.Tensor] = None,
+    compile_only: bool = False,
+) -> Optional[HSTUBlockSparseTensorsTorch]:
+    """Build compact Q2K metadata on the caller's current CUDA stream.
+
+    Execute carves ``hstu_q2k_block_sparse_workspace_bytes(...)`` out of ``workspace``
+    (R2); ``compile_only=True`` compiles from fakes, ignores ``workspace`` and returns None.
+    """
+
+    _validate_builder_inputs(func, cu_seqlens_q, cu_seqlens_k)
+    block_size = (int(block_size[0]), int(block_size[1]))
+    compile_key = (
+        func.device,
+        torch.cuda.get_device_capability(func.device),
+        block_size,
+        int(func.shape[1]),
+    )
+    if compile_key not in build_hstu_q2k_block_sparse.compile_cache:
+        kernel = HSTUQ2KBlockSparseBuilder(block_size[0], block_size[1], int(func.shape[1]))
+        with torch.cuda.device(func.device):
+            build_hstu_q2k_block_sparse.compile_cache[compile_key] = cute.compile(
+                kernel,
+                *_fake_csr_builder_operands(),
+                *_fake_builder_inputs(),
+                _fake_stream(),
+                options="--enable-tvm-ffi",
+            )
+    if compile_only:
+        return None
+
     batch_size = int(cu_seqlens_q.numel() - 1)
-    workspace = allocate_hstu_q2k_workspace(
+    carver = WorkspaceCarver(
+        workspace,
+        hstu_q2k_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size),
+        "hstu_q2k_block_sparse",
+    )
+    carved = carve_hstu_q2k_workspace(
+        carver,
         batch_size=batch_size,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         block_size=block_size,
-        device=func.device,
     )
-    tensors = workspace.tensors
-    runtime_tensors = (
-        tensors.mask_block_cnt,
-        tensors.mask_block_offset,
-        tensors.mask_block_idx,
-        tensors.full_block_cnt,
-        tensors.full_block_offset,
-        tensors.full_block_idx,
-        workspace.mask_staging,
-        workspace.full_staging,
-        workspace.mask_scan_blocks,
-        workspace.full_scan_blocks,
+    tensors = carved.tensors
+    build_hstu_q2k_block_sparse.compile_cache[compile_key](
+        *tensors[:6],
+        carved.mask_staging,
+        carved.full_staging,
+        carved.mask_scan_blocks,
+        carved.full_scan_blocks,
         cu_seqlens_q,
         cu_seqlens_k,
         func,
+        _current_stream(func.device),
     )
-
-    device_capability = torch.cuda.get_device_capability(func.device)
-    compile_key = (
-        func.device,
-        device_capability,
-        tuple(map(int, block_size)),
-        int(func.shape[1]),
-    )
-    if compile_key not in build_hstu_q2k_block_sparse.compile_cache:
-        kernel = HSTUQ2KBlockSparseBuilder(
-            int(block_size[0]),
-            int(block_size[1]),
-            int(func.shape[1]),
-        )
-        build_hstu_q2k_block_sparse.compile_cache[compile_key] = cute.compile(
-            kernel,
-            *(_to_cute_tensor(tensor) for tensor in runtime_tensors),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options="--enable-tvm-ffi",
-        )
-
-    if not compile_only:
-        current_stream = cuda.CUstream(torch.cuda.current_stream(func.device).cuda_stream)
-        build_hstu_q2k_block_sparse.compile_cache[compile_key](
-            *runtime_tensors,
-            current_stream,
-        )
     return tensors
 
 
@@ -1460,79 +1522,62 @@ def build_hstu_k2q_block_sparse(
     max_seqlen_q: int,
     max_seqlen_k: int,
     block_size: tuple[int, int] = (128, 128),
+    workspace: Optional[torch.Tensor] = None,
     compile_only: bool = False,
-) -> HSTUBlockSparseTensorsTorch:
-    """Build compact K2Q metadata on the caller's current CUDA stream."""
+) -> Optional[HSTUBlockSparseTensorsTorch]:
+    """Build compact K2Q metadata on the caller's current CUDA stream (workspace contract as Q2K)."""
 
-    if func.dtype != torch.int32 or func.ndim != 3:
-        raise ValueError("func must be a rank-3 torch.int32 tensor")
-    if not func.is_cuda:
-        raise ValueError("func must be a CUDA tensor")
-    if func.shape[1] <= 0 or func.shape[1] % 2 == 0:
-        raise ValueError("func.shape[1] must be positive and odd")
-    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32 or not cu_seqlens_q.is_cuda or not cu_seqlens_k.is_cuda:
-        raise ValueError("cu_seqlens_q/k must be CUDA int32 tensors")
-    if cu_seqlens_q.shape != cu_seqlens_k.shape:
-        raise ValueError("cu_seqlens_q/k must have matching shapes")
-    if func.device != cu_seqlens_q.device or func.device != cu_seqlens_k.device:
-        raise ValueError("func and cu_seqlens_q/k must be on the same device")
-
-    block_size = tuple(map(int, block_size))
+    _validate_builder_inputs(func, cu_seqlens_q, cu_seqlens_k)
+    block_size = (int(block_size[0]), int(block_size[1]))
     if block_size not in ((128, 128), (256, 128)):
         raise ValueError("HSTU K2Q supports block_size=(128, 128) or (256, 128)")
-    batch_size = int(cu_seqlens_q.numel() - 1)
-    workspace = allocate_hstu_k2q_workspace(
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size=block_size,
-        device=func.device,
-    )
-    tensors = workspace.tensors
-    runtime_tensors = (
-        tensors.mask_block_cnt,
-        tensors.mask_block_offset,
-        tensors.mask_block_idx,
-        tensors.full_block_cnt,
-        tensors.full_block_offset,
-        tensors.full_block_idx,
-        workspace.mask_staging,
-        workspace.full_staging,
-        workspace.mask_scan_blocks,
-        workspace.full_scan_blocks,
-        workspace.block_states,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        func,
-    )
-
-    device_capability = torch.cuda.get_device_capability(func.device)
     compile_key = (
         func.device,
-        device_capability,
+        torch.cuda.get_device_capability(func.device),
         "k2q",
         block_size,
         int(func.shape[1]),
     )
     if compile_key not in build_hstu_k2q_block_sparse.compile_cache:
-        kernel = HSTUK2QBlockSparseBuilder(
-            block_size[0],
-            block_size[1],
-            int(func.shape[1]),
-        )
-        build_hstu_k2q_block_sparse.compile_cache[compile_key] = cute.compile(
-            kernel,
-            *(_to_cute_tensor(tensor) for tensor in runtime_tensors),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options="--enable-tvm-ffi",
-        )
+        kernel = HSTUK2QBlockSparseBuilder(block_size[0], block_size[1], int(func.shape[1]))
+        with torch.cuda.device(func.device):
+            build_hstu_k2q_block_sparse.compile_cache[compile_key] = cute.compile(
+                kernel,
+                *_fake_csr_builder_operands(),
+                _fake_dynamic_tensor(3, Int8),
+                *_fake_builder_inputs(),
+                _fake_stream(),
+                options="--enable-tvm-ffi",
+            )
+    if compile_only:
+        return None
 
-    if not compile_only:
-        current_stream = cuda.CUstream(torch.cuda.current_stream(func.device).cuda_stream)
-        build_hstu_k2q_block_sparse.compile_cache[compile_key](
-            *runtime_tensors,
-            current_stream,
-        )
+    batch_size = int(cu_seqlens_q.numel() - 1)
+    carver = WorkspaceCarver(
+        workspace,
+        hstu_k2q_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size),
+        "hstu_k2q_block_sparse",
+    )
+    carved = carve_hstu_k2q_workspace(
+        carver,
+        batch_size=batch_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        block_size=block_size,
+    )
+    tensors = carved.tensors
+    build_hstu_k2q_block_sparse.compile_cache[compile_key](
+        *tensors[:6],
+        carved.mask_staging,
+        carved.full_staging,
+        carved.mask_scan_blocks,
+        carved.full_scan_blocks,
+        carved.block_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        func,
+        _current_stream(func.device),
+    )
     return tensors
 
 
@@ -1546,90 +1591,71 @@ def build_hstu_d256_bwd_block_sparse(
     *,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    workspace: Optional[torch.Tensor] = None,
     compile_only: bool = False,
-) -> Tuple[HSTUBlockSparseTensorsTorch, HSTUBlockSparseTensorsTorch]:
+) -> Optional[Tuple[HSTUBlockSparseTensorsTorch, HSTUBlockSparseTensorsTorch]]:
     """Build both D256 backward CSR orientations from one device classify.
 
     The returned tuple is ``(q2k, k2q)``.  Both orientations use the same
     Q256-by-K128 coarse states, so a supertile whose two Q128 subtiles have
     different states is conservatively emitted as MASK in both views.
+    Workspace contract as ``build_hstu_q2k_block_sparse``.
     """
 
-    if func.dtype != torch.int32 or func.ndim != 3:
-        raise ValueError("func must be a rank-3 torch.int32 tensor")
-    if not func.is_cuda:
-        raise ValueError("func must be a CUDA tensor")
-    if func.shape[1] <= 0 or func.shape[1] % 2 == 0:
-        raise ValueError("func.shape[1] must be positive and odd")
-    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32 or not cu_seqlens_q.is_cuda or not cu_seqlens_k.is_cuda:
-        raise ValueError("cu_seqlens_q/k must be CUDA int32 tensors")
-    if cu_seqlens_q.shape != cu_seqlens_k.shape:
-        raise ValueError("cu_seqlens_q/k must have matching shapes")
-    if func.device != cu_seqlens_q.device or func.device != cu_seqlens_k.device:
-        raise ValueError("func and cu_seqlens_q/k must be on the same device")
-
-    batch_size = int(cu_seqlens_q.numel() - 1)
-    workspace = allocate_hstu_d256_bwd_workspace(
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        device=func.device,
-    )
-    q2k_workspace = workspace.q2k
-    k2q_workspace = workspace.k2q
-    q2k = q2k_workspace.tensors
-    k2q = k2q_workspace.tensors
-    runtime_tensors = (
-        q2k.mask_block_cnt,
-        q2k.mask_block_offset,
-        q2k.mask_block_idx,
-        q2k.full_block_cnt,
-        q2k.full_block_offset,
-        q2k.full_block_idx,
-        q2k_workspace.mask_staging,
-        q2k_workspace.full_staging,
-        q2k_workspace.mask_scan_blocks,
-        q2k_workspace.full_scan_blocks,
-        k2q.mask_block_cnt,
-        k2q.mask_block_offset,
-        k2q.mask_block_idx,
-        k2q.full_block_cnt,
-        k2q.full_block_offset,
-        k2q.full_block_idx,
-        k2q_workspace.mask_staging,
-        k2q_workspace.full_staging,
-        k2q_workspace.mask_scan_blocks,
-        k2q_workspace.full_scan_blocks,
-        k2q_workspace.block_states,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        func,
-    )
-
-    device_capability = torch.cuda.get_device_capability(func.device)
+    _validate_builder_inputs(func, cu_seqlens_q, cu_seqlens_k)
     compile_key = (
         func.device,
-        device_capability,
+        torch.cuda.get_device_capability(func.device),
         "d256_bwd_paired",
-        (256, 128),
+        _D256_BWD_BLOCK_SIZE,
         int(func.shape[1]),
     )
     if compile_key not in build_hstu_d256_bwd_block_sparse.compile_cache:
         kernel = HSTUD256BwdBlockSparseBuilder(int(func.shape[1]))
-        build_hstu_d256_bwd_block_sparse.compile_cache[compile_key] = cute.compile(
-            kernel,
-            *(_to_cute_tensor(tensor) for tensor in runtime_tensors),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options="--enable-tvm-ffi",
-        )
+        with torch.cuda.device(func.device):
+            build_hstu_d256_bwd_block_sparse.compile_cache[compile_key] = cute.compile(
+                kernel,
+                *_fake_csr_builder_operands(),
+                *_fake_csr_builder_operands(),
+                _fake_dynamic_tensor(3, Int8),
+                *_fake_builder_inputs(),
+                _fake_stream(),
+                options="--enable-tvm-ffi",
+            )
+    if compile_only:
+        return None
 
-    if not compile_only:
-        current_stream = cuda.CUstream(torch.cuda.current_stream(func.device).cuda_stream)
-        build_hstu_d256_bwd_block_sparse.compile_cache[compile_key](
-            *runtime_tensors,
-            current_stream,
-        )
-    return q2k, k2q
+    batch_size = int(cu_seqlens_q.numel() - 1)
+    carver = WorkspaceCarver(
+        workspace,
+        hstu_d256_bwd_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k),
+        "hstu_d256_bwd_block_sparse",
+    )
+    carved = carve_hstu_d256_bwd_workspace(
+        carver,
+        batch_size=batch_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+    q2k, k2q = carved.q2k, carved.k2q
+    build_hstu_d256_bwd_block_sparse.compile_cache[compile_key](
+        *q2k.tensors[:6],
+        q2k.mask_staging,
+        q2k.full_staging,
+        q2k.mask_scan_blocks,
+        q2k.full_scan_blocks,
+        *k2q.tensors[:6],
+        k2q.mask_staging,
+        k2q.full_staging,
+        k2q.mask_scan_blocks,
+        k2q.full_scan_blocks,
+        k2q.block_states,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        func,
+        _current_stream(func.device),
+    )
+    return q2k.tensors, k2q.tensors
 
 
 build_hstu_d256_bwd_block_sparse.compile_cache = {}

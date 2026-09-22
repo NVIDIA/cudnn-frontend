@@ -360,10 +360,12 @@ cudnn.hstu.hstu_attention.HSTUBwdSm100
 cudnn.hstu.hstu_attention.HSTUBwdSm100.check_support
 cudnn.hstu.hstu_attention.HSTUBwdSm100.compile
 cudnn.hstu.hstu_attention.HSTUBwdSm100.execute
+cudnn.hstu.hstu_attention.HSTUBwdSm100.scratch_workspace_bytes
 cudnn.hstu.hstu_attention.HSTUFwdSm100
 cudnn.hstu.hstu_attention.HSTUFwdSm100.check_support
 cudnn.hstu.hstu_attention.HSTUFwdSm100.compile
 cudnn.hstu.hstu_attention.HSTUFwdSm100.execute
+cudnn.hstu.hstu_attention.HSTUFwdSm100.scratch_workspace_bytes
 cudnn.hstu.hstu_attention.hstu_attention_backward
 cudnn.hstu.hstu_attention.hstu_attention_forward
 cudnn.hstu.hstu_lmsd

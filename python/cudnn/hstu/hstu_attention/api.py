@@ -16,9 +16,15 @@ import torch
 
 from cudnn._torch_stream import as_torch_stream
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 
 from . import _interface
+
+_NATIVE_INPUT_LAYOUT = (
+    "the kernels read a unit-stride head dim with token and head strides that are multiples of 8 elements, non-overlapping, from a 16-byte-aligned base"
+)
+_NATIVE_GRAD_LAYOUT = _NATIVE_INPUT_LAYOUT + ", with non-zero token and head strides"
+_D256_BWD_LAYOUT = "the D=256 two-kernel backward reads and writes q/k/v/do/dq/dk/dv through TMA and requires contiguous tensors"
 
 _logger = logging.getLogger(__name__)
 _API_CACHE_CAPACITY = 128
@@ -143,6 +149,24 @@ def _empty_grad_like(tensor: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(tensor, memory_format=torch.preserve_format)
 
 
+def _decline_layout(name: str, tensor: torch.Tensor, requirement: str) -> None:
+    """R5: a layout the kernels cannot address natively is declined, never staged."""
+    raise NotImplementedError(f"HSTU SM100 cannot serve {name} with shape {tuple(tensor.shape)} and strides {tuple(tensor.stride())} natively: {requirement}")
+
+
+def _allocate_workspace(
+    api: "_HSTUBase",
+    device: torch.device,
+    stream: Optional[cuda.CUstream | torch.cuda.Stream],
+) -> Optional[torch.Tensor]:
+    """The wrappers are the one allocation site for the class API's scratch (R2), on the launch stream (R1)."""
+    workspace_bytes = api.scratch_workspace_bytes()
+    if workspace_bytes == 0:
+        return None
+    with torch.cuda.device(device), _stream_context(stream, device):
+        return torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+
+
 def _validate_page_metadata(
     page_ids: torch.Tensor,
     page_indptrs: torch.Tensor,
@@ -208,6 +232,22 @@ class _HSTUBase(APIBase):
         self.num_heads = None
         self.is_causal = None
         self.is_local = None
+        self._scratch_bytes = None
+
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes ``execute()`` carves from ``workspace`` (R2); valid once ``check_support()`` has passed."""
+        if not self._is_supported or self._scratch_bytes is None:
+            raise RuntimeError(f"{type(self).__name__}.scratch_workspace_bytes() requires check_support() first")
+        return self._scratch_bytes
+
+    def _check_workspace(self, workspace: Optional[torch.Tensor], device: torch.device) -> None:
+        if workspace is not None:
+            if not workspace.is_cuda or workspace.device != device:
+                raise ValueError(f"workspace must be a CUDA tensor on {device}")
+            if workspace.dtype != torch.uint8 or not workspace.is_contiguous():
+                raise ValueError("workspace must be a contiguous torch.uint8 tensor")
+        if self._scratch_bytes > 0:
+            WorkspaceCarver(workspace, self._scratch_bytes, type(self).__name__)
 
     def _check_common(self, supported_head_dims: Tuple[int, ...]) -> None:
         q = self._sample_q
@@ -451,6 +491,26 @@ class HSTUFwdSm100(_HSTUBase):
                 self.batch_size,
             )
 
+        for name, tensor in (("q_tensor", q), ("k_tensor", self._sample_k), ("v_tensor", self._sample_v)):
+            if not _interface._supports_bwd_original_qkv_layout(tensor):
+                _decline_layout(name, tensor, _NATIVE_INPUT_LAYOUT)
+        self._scratch_bytes = _interface.hstu_varlen_fwd_100_scratch_bytes(
+            q,
+            self._sample_k,
+            self._sample_v,
+            self._sample_cu_seqlens_q,
+            self._sample_cu_seqlens_k,
+            self.max_seqlen_q,
+            self.max_seqlen_k,
+            self.window_size[0],
+            self.window_size[1],
+            self.alpha,
+            self._sample_func,
+            paged,
+            page_ids,
+            page_indptrs,
+            self.scaling_seqlen,
+        )
         self._is_supported = True
         return True
 
@@ -497,6 +557,7 @@ class HSTUFwdSm100(_HSTUBase):
         page_ids_tensor: Optional[torch.Tensor] = None,
         page_indptrs_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
         if self._compiled_kernel is None:
             raise RuntimeError("HSTUFwdSm100 kernel is not compiled")
@@ -538,6 +599,7 @@ class HSTUFwdSm100(_HSTUBase):
                 page_indptrs_tensor,
                 self.batch_size,
             )
+        self._check_workspace(workspace, q_tensor.device)
         with _stream_context(current_stream, q_tensor.device):
             _interface.hstu_varlen_fwd_100(
                 q_tensor,
@@ -556,6 +618,7 @@ class HSTUFwdSm100(_HSTUBase):
                 page_indptrs_tensor,
                 self.scaling_seqlen,
                 out=o_tensor,
+                workspace=workspace,
             )
         _record_streams(
             (
@@ -569,6 +632,7 @@ class HSTUFwdSm100(_HSTUBase):
                 paged_kv_tensor,
                 page_ids_tensor,
                 page_indptrs_tensor,
+                workspace,
             ),
             current_stream,
             q_tensor.device,
@@ -649,6 +713,45 @@ class HSTUBwdSm100(_HSTUBase):
             _require_16_byte_alignment(tensor, name)
         if self.deterministic:
             raise NotImplementedError("deterministic HSTU backward is not supported by HSTU SM100")
+
+        do, dq, dk, dv = self._sample_do, self._sample_dq, self._sample_dk, self._sample_dv
+        for name, tensor in (("q_tensor", q), ("k_tensor", k), ("v_tensor", v), ("do_tensor", do)):
+            if not _interface._supports_bwd_original_qkv_layout(tensor):
+                _decline_layout(name, tensor, _NATIVE_INPUT_LAYOUT)
+        for name, tensor in (("dq_tensor", dq), ("dk_tensor", dk), ("dv_tensor", dv)):
+            if not _interface._supports_bwd_direct_grad_layout(tensor):
+                _decline_layout(name, tensor, _NATIVE_GRAD_LAYOUT)
+        dispatch = _interface._bwd_dispatch(
+            do,
+            q,
+            k,
+            v,
+            self._sample_cu_seqlens_q,
+            self._sample_cu_seqlens_k,
+            self.max_seqlen_q,
+            self.max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            self.window_size[0],
+            self.window_size[1],
+            self._sample_func,
+            self.deterministic,
+            "auto",
+        )
+        if dispatch.route == "d256":
+            for name, tensor in (
+                ("q_tensor", q),
+                ("k_tensor", k),
+                ("v_tensor", v),
+                ("do_tensor", do),
+                ("dq_tensor", dq),
+                ("dk_tensor", dk),
+                ("dv_tensor", dv),
+            ):
+                if not tensor.is_contiguous():
+                    _decline_layout(name, tensor, _D256_BWD_LAYOUT)
+        self._scratch_bytes = _interface._bwd_scratch_bytes(dispatch, q.shape[0], self.max_seqlen_q, self.max_seqlen_k)
         self._is_supported = True
         return True
 
@@ -696,6 +799,7 @@ class HSTUBwdSm100(_HSTUBase):
         cu_seqlens_k_tensor: torch.Tensor,
         func_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
         if self._compiled_kernel is None:
             raise RuntimeError("HSTUBwdSm100 kernel is not compiled")
@@ -723,6 +827,7 @@ class HSTUBwdSm100(_HSTUBase):
             if not _has_non_overlapping_strides(tensor):
                 raise ValueError(f"{name} must have non-overlapping strides")
             _require_16_byte_alignment(tensor, name)
+        self._check_workspace(workspace, q_tensor.device)
 
         with _stream_context(current_stream, q_tensor.device):
             _interface.hstu_varlen_bwd_100(
@@ -743,6 +848,7 @@ class HSTUBwdSm100(_HSTUBase):
                 func_tensor,
                 False,
                 self.scaling_seqlen,
+                workspace=workspace,
             )
         _record_streams(
             (
@@ -756,6 +862,7 @@ class HSTUBwdSm100(_HSTUBase):
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
                 func_tensor,
+                workspace,
             ),
             current_stream,
             q_tensor.device,
@@ -841,6 +948,7 @@ def hstu_attention_forward(
         page_ids_tensor=page_ids_tensor,
         page_indptrs_tensor=page_indptrs_tensor,
         current_stream=stream,
+        workspace=_allocate_workspace(api, q_tensor.device, stream),
     )
     return TupleDict(o_tensor=o_tensor)
 
@@ -867,7 +975,9 @@ def hstu_attention_backward(
     """Compute packed HSTU backward on an SM10x GPU.
 
     Any gradient output tensor that is not provided is allocated by this
-    function. Caller-provided gradient outputs are overwritten and returned.
+    function. Caller-provided gradient outputs are overwritten and returned;
+    they must be layouts the kernels store to directly (see the HSTU docs),
+    otherwise ``check_support()`` raises ``NotImplementedError``.
     """
     _validate_cu_seqlens_metadata(cu_seqlens_q_tensor, "cu_seqlens_q_tensor")
     _validate_cu_seqlens_metadata(cu_seqlens_k_tensor, "cu_seqlens_k_tensor")
@@ -934,6 +1044,7 @@ def hstu_attention_backward(
         cu_seqlens_k_tensor=cu_seqlens_k_tensor,
         func_tensor=func_tensor,
         current_stream=stream,
+        workspace=_allocate_workspace(api, q_tensor.device, stream),
     )
     return TupleDict(
         dq_tensor=dq_tensor,

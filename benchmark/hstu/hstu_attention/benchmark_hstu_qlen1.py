@@ -213,6 +213,11 @@ def _measure_ms(run: Callable[[], None], warmup: int, iterations: int, groups: i
     }
 
 
+def _workspace(nbytes: int, device: torch.device) -> torch.Tensor | None:
+    """The caller-owned scratch the HSTU class API carves at execute (R2); None when it needs none."""
+    return None if nbytes == 0 else torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
 def _compile_forward(
     tensors: dict[str, torch.Tensor | list[int]],
     max_k: int,
@@ -248,13 +253,14 @@ def _compile_forward(
             scaling_seqlen=scaling_seqlen,
         )
         api.check_support()
+        workspace = _workspace(api.scratch_workspace_bytes(), q.device)
         start = time.perf_counter()
         api.compile()
         torch.cuda.synchronize()
         compile_seconds = time.perf_counter() - start
 
         def run() -> None:
-            api.execute(q, k, v, out, cu_q, cu_k)
+            api.execute(q, k, v, out, cu_q, cu_k, workspace=workspace)
 
     else:
         internal_forward_impl = "auto" if forward_impl == "dispatch" else forward_impl
@@ -272,6 +278,10 @@ def _compile_forward(
             alpha,
             None,
         )
+        workspace = _workspace(
+            _interface.hstu_varlen_fwd_100_scratch_bytes(*call_args, scaling_seqlen=scaling_seqlen, _q1_fwd_tuning_config=tuning_config),
+            q.device,
+        )
         start = time.perf_counter()
         _interface.hstu_varlen_fwd_100(
             *call_args,
@@ -288,6 +298,7 @@ def _compile_forward(
                 *call_args,
                 scaling_seqlen=scaling_seqlen,
                 out=out,
+                workspace=workspace,
                 _q1_fwd_tuning_config=tuning_config,
             )
 
@@ -334,13 +345,14 @@ def _compile_backward(
             scaling_seqlen=scaling_seqlen,
         )
         api.check_support()
+        workspace = _workspace(api.scratch_workspace_bytes(), q.device)
         start = time.perf_counter()
         api.compile()
         torch.cuda.synchronize()
         compile_seconds = time.perf_counter() - start
 
         def run() -> None:
-            api.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k)
+            api.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k, workspace=workspace)
 
     else:
         internal_backward_impl = "auto" if backward_impl == "dispatch" else backward_impl
@@ -363,6 +375,10 @@ def _compile_backward(
             False,
             scaling_seqlen,
         )
+        workspace = _workspace(
+            _interface.hstu_varlen_bwd_100_scratch_bytes(*call_args, _q1_bwd_algorithm=internal_backward_impl),
+            q.device,
+        )
         start = time.perf_counter()
         _interface.hstu_varlen_bwd_100(
             *call_args,
@@ -375,6 +391,7 @@ def _compile_backward(
         def run() -> None:
             _interface.hstu_varlen_bwd_100(
                 *call_args,
+                workspace=workspace,
                 _q1_bwd_algorithm=internal_backward_impl,
             )
 
