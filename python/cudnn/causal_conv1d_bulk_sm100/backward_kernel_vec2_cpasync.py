@@ -17,6 +17,7 @@ reducer in :mod:`backward_kernel_vec4` produces the API's FP32 dW accumulator.
 """
 
 from __future__ import annotations
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -262,7 +263,7 @@ def _causal_conv1d_bulk_bwd_vec2_cpasync_kernel(
         num_bits_per_copy=128,
     )
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     shared_x_raw = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout(_SMEM_ELEMENTS),

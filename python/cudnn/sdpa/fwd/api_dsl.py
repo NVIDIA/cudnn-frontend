@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """cuDNN-frontend adapter over the Frost DSL SDPA prefill kernels."""
 
@@ -4238,7 +4241,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         import cutlass
 
         arch = f"sm_{self.compute_capability[0]}{self.compute_capability[1]}"
-        smem_capacity_bytes = cutlass.utils.get_smem_capacity_in_bytes(arch)
+        from cudnn._cutlass_compat import get_smem_capacity_in_bytes
+
+        smem_capacity_bytes = get_smem_capacity_in_bytes(arch)
 
         # General head dims round to the dtype's granule. The SMEM model also
         # promotes envelope-served dimensions to their flavor's fixed tiles;

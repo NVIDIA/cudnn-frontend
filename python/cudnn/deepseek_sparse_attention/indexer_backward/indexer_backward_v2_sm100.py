@@ -185,6 +185,7 @@ from cutlass.cute.typing import BFloat16, Float32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
+from cudnn._cutlass_compat import OperandMajorMode, SmemAllocator, TmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -424,8 +425,8 @@ class IndexerBackwardV2Sm100:
         mma_S = sm100_utils.make_trivial_tiled_mma(
             BFloat16,
             BFloat16,
-            tcgen05.OperandMajorMode.K,  # A = gathered K rows (slot, dim)
-            tcgen05.OperandMajorMode.K,  # B = Q rows (head, dim)
+            OperandMajorMode.K,  # A = gathered K rows (slot, dim)
+            OperandMajorMode.K,  # B = Q rows (head, dim)
             Float32,
             cta_group,
             self.tiler_S[:2],
@@ -433,8 +434,8 @@ class IndexerBackwardV2Sm100:
         mma_dQ = sm100_utils.make_trivial_tiled_mma(
             BFloat16,
             BFloat16,
-            tcgen05.OperandMajorMode.MN,  # A = Ksel^T view (dim, slot)
-            tcgen05.OperandMajorMode.MN,  # B = A_mat^T view (head, slot)
+            OperandMajorMode.MN,  # A = Ksel^T view (dim, slot)
+            OperandMajorMode.MN,  # B = A_mat^T view (head, slot)
             Float32,
             cta_group,
             self.tiler_dQ[:2],
@@ -442,8 +443,8 @@ class IndexerBackwardV2Sm100:
         mma_dK = sm100_utils.make_trivial_tiled_mma(
             BFloat16,
             BFloat16,
-            tcgen05.OperandMajorMode.K,  # A = A_mat (slot, head)
-            tcgen05.OperandMajorMode.MN,  # B = Q^T view (dim, head)
+            OperandMajorMode.K,  # A = A_mat (slot, head)
+            OperandMajorMode.MN,  # B = Q^T view (dim, head)
             Float32,
             cta_group,
             self.tiler_dK[:2],
@@ -575,7 +576,7 @@ class IndexerBackwardV2Sm100:
             sAhi: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sA_layout)], 1024]
             sAlo: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sA_layout)], 1024]
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ---- pipelines (phases roll across rows without reset) ----
@@ -660,8 +661,8 @@ class IndexerBackwardV2Sm100:
             defer_sync=True,
         )
 
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epi_warp_ids[0],
         )
@@ -997,7 +998,7 @@ class IndexerBackwardV2Sm100:
                     )
                     pe_wrow = cute.make_tensor(pe_wptr, cute.make_layout((self.num_heads,)))
                     cute.autovec_copy(pe_wrow, rWb)
-                    for h in cutlass.range_constexpr(self.num_heads):
+                    for h in cutlass.range(self.num_heads, unroll_full=True):
                         rW[h] = Float32(rWb[h])
                         rdW[h] = Float32(0.0)
 
@@ -1097,7 +1098,7 @@ class IndexerBackwardV2Sm100:
                         a_prod.advance()
 
                     # ---- dW butterfly + stage partial (parity smem buffer)
-                    for h in cutlass.range_constexpr(self.num_heads):
+                    for h in cutlass.range(self.num_heads, unroll_full=True):
                         pe_v = rdW[h]
                         for off in cutlass.range_constexpr(5):
                             pe_v += cute.arch.shuffle_sync_bfly(pe_v, 1 << off)
@@ -1126,7 +1127,7 @@ class IndexerBackwardV2Sm100:
                     cute.arch.fence_view_async_tmem_load()
                     pipe_DQ.consumer_release(dq_cons)
                     dq_cons.advance()
-                    for h in cutlass.range_constexpr(self.num_heads):
+                    for h in cutlass.range(self.num_heads, unroll_full=True):
                         mdQ[pe_rowi, h, pe_drow] = BFloat16(Float32(tSrdQ[h]))
 
                     # ---- deterministic dW combine (fixed order, plain
