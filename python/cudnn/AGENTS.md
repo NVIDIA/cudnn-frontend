@@ -397,9 +397,11 @@ t = contiguous_on_stream(t, stream, device)          # None / contiguous -> t it
 record_streams((t,), stream, device)                 # then any other copy (.to, clone(memory_format=...))
 with stream_context(stream, device):
     t32 = t.to(torch.int32).contiguous()
+copy_into_on_stream(user_out, staged_out, stream, device)   # copy-back into a caller buffer: same rule
 ```
-Both are no-ops for `stream=None` / torch's current stream (the allocation stream orders
-reuse there). Detector: `test/python/fe_api/test_torch_stream_staging.py` -- a long kernel on
+Record whenever `stream` is given, even when it is torch's current stream (the caller may have
+entered a side-stream context; the allocator orders reuse against the ALLOCATION stream);
+`stream=None` is the caller's own context and records nothing. Detector: `test/python/fe_api/test_torch_stream_staging.py` -- a long kernel on
 the side stream, the wrapper call, release the original, a same-size allocation filled with
 poison, synchronize, compare (the bare-`.contiguous()` control reads the poison).
 
