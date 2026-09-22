@@ -1484,7 +1484,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         real_fc1_output, _ = self.kernel_extension.get_gmem_tensor("c", self.fc1_output, work_tile_info)
         # (tokens_this_expert, intermediate_down, 1)
         real_fc1_output_sf, _ = self.kernel_extension.get_gmem_tensor("sfc", self.fc1_output_sf, work_tile_info)
-        # subtile-irrevalent hoist out here.
+        # Hoist here because the value is shared across subtiles.
         if cutlass.const_expr(self.optional_epi_args.fc1_alpha is not None):
             alpha_val = self.optional_epi_args.fc1_alpha[work_tile_info.expert_idx]
         else:
@@ -2168,7 +2168,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         acc_consumer_state,
         is_odd_turn: cutlass.Int32,
     ):
-        # subtile-irrelevant hoist: fc2 alpha scales raw fc2 accumulators before f2fp.
+        # Shared across subtiles: fc2 alpha scales raw fc2 accumulators before f2fp.
         if cutlass.const_expr(self.optional_epi_args.fc2_alpha is not None):
             alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
         else:
