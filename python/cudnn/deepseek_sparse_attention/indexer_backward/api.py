@@ -667,7 +667,6 @@ class DenseIndexerBackward(APIBase):
             self.max_seqlen_k = int(sample_index_k.shape[1])
         self.heads = int(heads)
         self.head_dim = int(head_dim)
-        self._uses_current_stream_pipeline = False
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -697,7 +696,6 @@ class DenseIndexerBackward(APIBase):
             return
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = dense_indexer_backward_sm90 if major == 9 else dense_indexer_backward_sm100
-        self._uses_current_stream_pipeline = major == 9
         self._compiled_kernel = kernel_factory(
             self.batch,
             self.max_seqlen_q,
@@ -730,8 +728,7 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        backend_stream = None if self._uses_current_stream_pipeline else current_stream
-        with _torch_stream_context(backend_stream):
+        with _torch_stream_context(current_stream):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
             grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
@@ -759,11 +756,11 @@ class DenseIndexerBackward(APIBase):
             cu_seqlens_q,
             cu_seqlens_k,
             q_causal_offsets,
-            backend_stream,
+            current_stream,
         )
 
         if d_index_k_f32 is not d_index_k_target:
-            with _torch_stream_context(backend_stream):
+            with _torch_stream_context(current_stream):
                 d_index_k_target.copy_(d_index_k_f32)
 
 
@@ -1015,10 +1012,9 @@ def dense_indexer_backward_wrapper(
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
     """
-    major, _ = device_capability()
-    backend_stream = None if major == 9 else stream
+    current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(backend_stream):
+    with _torch_stream_context(current_stream):
         cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
         cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
 
@@ -1052,7 +1048,7 @@ def dense_indexer_backward_wrapper(
             max_seqlen_q,
             max_seqlen_k,
         )
-        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream)
+        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=current_stream)
 
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q_exec)
@@ -1128,9 +1124,9 @@ def dense_indexer_backward_wrapper(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         q_causal_offsets=q_causal_offsets,
-        current_stream=backend_stream,
+        current_stream=current_stream,
     )
-    with _torch_stream_context(backend_stream):
+    with _torch_stream_context(current_stream):
         _copy_back_if_needed(attn_score_exec, attn_score_original)
         _copy_back_if_needed(index_score_exec, index_score_original)
         _copy_back_if_needed(d_index_q_exec, d_index_q_original)

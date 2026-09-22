@@ -66,31 +66,12 @@ def _torch_dtype(name: str):
     return {"float32": torch.float32, "bfloat16": torch.bfloat16, "int32": torch.int32}[name]
 
 
-# cudaStream_t 0, cudaStreamLegacy and cudaStreamPerThread. torch's default
-# stream is the legacy one and every blocking stream orders against it.
-_DEFAULT_STREAM_HANDLES = frozenset({0, 1, 2})
-
-
 def stream_ctx(stream: int, device=None):
-    """``torch.cuda.stream`` context for the execution stream ``stream``.
+    """``torch.cuda.stream`` context for the execution stream ``stream`` (Rule 5:
+    default-stream sentinels map to torch's default stream, see ``cudnn._torch_stream``)."""
+    from cudnn._torch_stream import stream_context
 
-    A default-stream handle is never wrapped in ``torch.cuda.ExternalStream``:
-    on torch <= 2.12 and some 2.13 nightlies ``ExternalStream(0)`` is a fresh
-    NON-BLOCKING pool stream, so a copy issued inside it does not order against
-    the kernel launched on ``CUstream(0)``. Under GPU contention the kernel then
-    read conversion buffers before the copy landed, and ``write_back`` copied a
-    staged output before the kernel wrote it.
-    """
-    import torch
-
-    handle = int(stream)
-    default = torch.cuda.default_stream(device)
-    if handle in _DEFAULT_STREAM_HANDLES or handle == default.cuda_stream:
-        return torch.cuda.stream(default)
-    current = torch.cuda.current_stream(device)
-    if handle == current.cuda_stream:
-        return torch.cuda.stream(current)
-    return torch.cuda.stream(torch.cuda.ExternalStream(handle, device=device))
+    return stream_context(stream, device)
 
 
 def packed(dim, stride) -> bool:

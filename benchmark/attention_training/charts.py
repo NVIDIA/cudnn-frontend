@@ -46,6 +46,9 @@ DTYPE_ORDER = {
     "float16": 0,  # same bucket as bf16
     "mxfp8": 1,
     "fp8": 2,
+    # fp8 inputs with a block-scaled O epilogue (FROST OSS, forward-only)
+    "fp8_mxfp8": 3,
+    "fp8_nvfp4": 4,
 }
 
 
@@ -96,6 +99,10 @@ def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version
         return f"{base_name} (FP8)"
     elif data_type == "mxfp8":
         return f"{base_name} (MXFP8)"
+    elif data_type == "fp8_nvfp4":
+        return f"{base_name} (FP8 in, NVFP4 out)"
+    elif data_type == "fp8_mxfp8":
+        return f"{base_name} (FP8 in, MXFP8 out)"
     elif data_type == "float16":
         return f"{base_name} (FP16)"
     elif data_type == "bfloat16":
@@ -119,6 +126,9 @@ def get_backend_color(backend: str, data_type: str) -> str:
         return config["color_fp8"]
     if data_type == "mxfp8" and "color_mxfp8" in config:
         return config["color_mxfp8"]
+    if data_type in ("fp8_nvfp4", "fp8_mxfp8") and "color_fp8" in config:
+        # Same fp8 datapath as "fp8"; the hatch (set by the caller) tells the O modes apart.
+        return config["color_fp8"]
     return config.get("color", "gray")
 
 
@@ -129,6 +139,9 @@ _PEAK_LINE_STYLE = {
     "float16": {"color": "#333333", "label": "FP16 peak (dense MMA)"},
     "fp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
     "mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    # block-scaled-O modes run the fp8 MMAs: same peak line
+    "fp8_nvfp4": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    "fp8_mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
 }
 
 

@@ -233,9 +233,10 @@ the kernel that reads it).
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
   Map the sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
-  genuine side stream to `ExternalStream(handle, device=device)`. Reuse
-  `_torch_stream_context` (`sdpa/fwd/api_dsl.py`) or `marshal.stream_ctx`
-  (`linear_attention/hopper/`) rather than writing a fresh wrapper. Detector:
+  genuine side stream to `ExternalStream(handle, device=device)`. The one
+  implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
+  with the raw-handle fast path); every engine calls it, none writes its own
+  wrapper. Detector:
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
 
@@ -354,6 +355,105 @@ spellings the torch vocabulary does not name.
   capture window, then replay and a native cuDNN launch); and a capture test
   whose first execute of a shape happens inside `torch.cuda.graph`, so the lazy
   build runs under capture.
+
+
+### Rule 8 / Rule 5 recipes — do exactly this, do not reinvent
+
+One canonical answer per situation. Every engine copies the recipe; a reviewer
+cites the recipe name. If a recipe does not fit, say so in the PR and extend the
+recipe here — do not write a local variant (the audit behind #1165/#1167/this
+section found 18 hand-rolled stream wrappers, 5 of them wrong).
+
+**R1 — a raw stream handle becomes a torch stream.**
+```python
+from cudnn._torch_stream import as_torch_stream, stream_context
+
+with stream_context(ctx.stream, device):          # torch work on the launch stream
+    buf.copy_(src)
+tensor.record_stream(as_torch_stream(ctx.stream, device))
+```
+Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
+`stream_context(None)` is a no-op; a handle equal to torch's current stream is
+a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`.
+
+**R2 — execute needs scratch (metadata, on-device descriptors, an output the
+kernel always writes but the graph did not request, staging for a dead-but-
+required tensor slot).** Declare it, carve it, never allocate it:
+```python
+def get_workspace_size(self) -> int:                 # BaseEngine / CompiledPlan
+    return ws_align(meta_bytes) + ws_align(desc_bytes) + ...
+def execute(self, graph, variant_pack, ctx):
+    ws = Workspace.over(variant_pack, self.get_workspace_size(), type(self).__name__)  # frost/workspace.py
+    meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
+```
+(APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
+in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
+`"<owner> requires a N-byte workspace but execute() received none; allocate
+graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
+that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
+passed nothing. A path with no workspace contract gets one. Where a wrapper
+allocates per call on the caller's behalf, it allocates under
+`stream_context(<launch stream>)` (R1): the caching allocator orders a block's
+reuse only against the stream it was allocated on, so scratch allocated on
+torch's ambient stream for a handle re-streamed to a side stream is a
+use-after-free waiting for load.
+
+**R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
+of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
+read only under `cutlass.const_expr(flag)`, with `flag` in the compile key, and
+`None` passed at BOTH compile and launch (DSA sm90 `mTopkIdx`, `mTopkLength`);
+(2) pointer ABI: bind `0` (`prepared.py` `sinks_ptr`, dense `o_desc_ptr` /
+`meta_ptr`); (3) tensor ABI with a required `cute.Tensor` parameter: borrow the
+bytes from the workspace via R2 (`sdpa/bwd/api_dsl.py` dense `seq_kv` /
+`desc_words`). Never a cached `torch.zeros` dummy, never `q.ptr` borrowing
+(a live read then reads Q bytes silently instead of faulting). `0` is legal at
+every layer: `cuTensorMapEncodeTiled` accepts NULL, the DSL rejects only negative
+addresses, the tvm-ffi positional entry carries pointers as ints.
+
+**R4 — a live per-batch table the caller did not give you (lengths, offsets,
+scale scalars).** R2 (carve) + fill on the launch stream with one async op
+(`cuMemsetD32Async`, `cuMemcpyHtoDAsync`, `buffers.memset_zero_async`), or make
+it a scalar kernel argument. Never `torch.tensor(values, device=...)` per execute
+(pageable H2D + implicit sync), never build it at `compile()` into a plan-owned
+tensor.
+
+**R5 — the input is not in the layout/dtype the kernel takes.** Decline in
+`check_support()` with a `NotImplementedError` naming the tensor and its
+strides/dtype (`_thd_check_strides_native` in `sdpa/fwd/api_dsl.py`), so the
+Router picks another engine. Not `.contiguous()`, not `.to(dtype)`, not a
+repack/copy-back — even into the workspace (Rule 2). If the engine is meant to
+serve that input, the kernel reads it natively.
+
+**R6 — something must block the host (host-planned work items, a D2H read
+of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
+raise before doing it (`linear_attention/cake/compiler.py::check_not_capturing`),
+and say so in its docstring. Never a silent `cuStreamSynchronize` /
+`torch.cuda.synchronize()` / `.item()` on a build or execute path.
+
+**R7 — you need a cuDNN handle and the caller gave none.** Graph API lowering:
+`_pygraph._backend_handle_for_lowering` (process default, one per thread and
+device, stream 0, destroyed at exit) — the graph never owns one. torch-op
+layers: the per-device cached handle re-streamed to torch's current stream
+before every call (`linear_attention/ops/common.py::get_handle`,
+`ops/norm/_common.py`). Never `cudnn.create_handle()` inside a plan, engine or
+C++ graph object.
+
+**R8 — you own a CUDA resource whose release can be GC-timed (only tests and
+the C++ PyGraph may).** Release inside `cuThreadExchangeStreamCaptureMode(RELAXED)`
+and restore in `finally` (`frost/buffers.py DeviceBuffer.__del__`,
+`pygraph.h CaptureModeGuard`). Production plans and engines reach this recipe
+only if R2/R7 were skipped — fix that instead.
+
+**R9 — proving it.** Around a warm `build()` + `execute()`:
+`torch.cuda.set_sync_debug_mode("error")` (no sync), and
+`torch.cuda.memory_stats()["allocation.all.allocated"]` unchanged across three
+executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_nothing_and_never_synchronizes`,
+`test_sdpa_bwd_thd_sm80.py::test_graph_thd_execute_does_not_allocate`. For a
+capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
+window, then replay and a native launch). For R1, monkeypatch
+`torch.cuda.ExternalStream` to raise and drive the path with handle 0
+(`test_torch_stream.py`).
 
 
 ## Frontend-only kernel package layout
