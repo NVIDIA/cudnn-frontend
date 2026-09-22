@@ -276,6 +276,9 @@ navigation:
               - page: Grouped GEMM + WGrad (Unified)
                 path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_wgrad.md
                 slug: grouped_gemm_wgrad
+              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/mhc_projection_bwd.md
+                slug: mhc_projection_bwd
           - section: HSTU
             slug: hstu
             contents:
