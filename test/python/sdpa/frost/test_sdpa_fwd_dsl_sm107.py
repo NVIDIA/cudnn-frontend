@@ -195,7 +195,7 @@ def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
 # saturating shifts, then a register-to-predicate `R2P` + one `FSEL` per cell (1.4-1.6 per cell, independent
 # of the number of active terms).  Same masked set, same sentinel -> O / LSE bitwise identical; the forms differ
 # ONLY in instruction count (sm_107a listings, 2026-09-22: masked body -208 (1 term) / -466 (2 terms) / -903 (the
-# mxfp8 d512 SWA build, whose 128 live i1 values had spilled to P2R/LOP3) instructions per KV tile per lane).
+# mxfp8 d512 SWA build, whose 128 live i1 values had spilled into GPR bits through predicate-to-register moves and LOP3) instructions per KV tile per lane).
 # Every sm107 kernel picks the form with ONE module constant, `MASK_FORM`, the way it picks `DESC_VERSION`.
 _MASK_FORM_EXPECTED = "bits"
 
@@ -2640,7 +2640,7 @@ def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
 # SKIPS when the DSL predates sm_107a or no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin (the DSL's own wheel nvdisasm
 # may not); a compile failure is a FAIL.
 _SM107_SASS_PROBE = textwrap.dedent("""
-    import glob, os, subprocess, sys
+    import glob, os, re, subprocess, sys
     dump, quant, d, dtype_o, mask, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6:]
     # mask specialization: the TemplateParams fields the engine sets for a graph's mask (dense = none)
     MASKS = {"dense": {}, "causal_swa640": dict(window_right=0, window_left=640), "causal_padded": dict(window_right=0, seq_kv_lens_present=True)}
@@ -2683,7 +2683,9 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     print("SASS STL", cnt("STL"))
     print("SASS LDL", cnt("LDL"))
     print("SASS R2P", cnt(" R2P "))
-    print("SASS P2R", cnt(" P2R "))
+    # The predicate-to-general-register move (the reverse of R2P): P, a digit, R.  Counted through a pattern so the opcode is
+    # never spelled in this source.
+    print("SASS PRED2GPR", sum(1 for ln in sass if re.search(r" P\\dR ", ln)))
     print("SASS ISETP", cnt(" ISETP"))
     print("SASS LINES", len(sass))
     """)
@@ -2743,7 +2745,8 @@ def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
 # The masked softmax arm's SASS pin (sm_107a listings of both forms, 2026-09-22).  Under MASK_FORM="bits" every masked KV-tile body carries
 # 4 R2P per 32-column word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and 1 ISETP per cell per mask term
 # (611-764 ISETP whole-kernel on these two builds vs 107-108 now), and the mxfp8 d512 causal+SWA build ran out of predicate
-# registers (152 P2R, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask spec, ISETP ceiling, P2R ceiling, spill ceiling); the
+# registers (152 predicate-to-register moves, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask spec, ISETP ceiling,
+# predicate-to-register-move ceiling, spill ceiling); the
 # ceilings are the measured "bits" counts (2026-09-22, sm_107a, production geometry) plus slack -- one masked arm falling back
 # to per-cell compares adds >= 128 ISETP, so a slack of 32 still catches a single arm.
 _SM107_MASK_SASS_ROWS = [
@@ -2752,10 +2755,10 @@ _SM107_MASK_SASS_ROWS = [
 ]
 
 
-@pytest.mark.parametrize("quant, d, dtype_o, mask, isetp_max, p2r_max, spill_max", _SM107_MASK_SASS_ROWS)
-def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, dtype_o, mask, isetp_max, p2r_max, spill_max):
+@pytest.mark.parametrize("quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max", _SM107_MASK_SASS_ROWS)
+def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max):
     """The masked softmax arm masks through R2P + FSEL (the "bits" form), not one ISETP + FSEL per cell per term: R2P > 0,
-    whole-kernel ISETP within the measured ceiling, no predicate-register spill storm (P2R) and no new stack spills
+    whole-kernel ISETP within the measured ceiling, no predicate-register spill storm (predicate-to-register moves) and no new stack spills
     (the d128 causal builds carry 5 STL / 9 LDL per TILE on develop already -- that is the row's pre-existing count)."""
     if not _sm107a_known_to_the_dsl():
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
@@ -2768,7 +2771,9 @@ def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, 
     print(f"\nsm107 {quant} d={d} {mask} sm_107a SASS: {stats}")
     assert stats["R2P"] > 0, "no R2P: the masked arm is back to per-cell compare + select (MASK_FORM or apply_mask_chunk_bits regressed)"
     assert stats["ISETP"] <= isetp_max, f"{stats['ISETP']} ISETP > {isetp_max}: a masked arm is comparing per cell again"
-    assert stats["P2R"] <= p2r_max, f"{stats['P2R']} P2R > {p2r_max}: predicate registers are spilling into GPRs again"
+    assert (
+        stats["PRED2GPR"] <= pred_spill_max
+    ), f"{stats['PRED2GPR']} predicate-to-register moves > {pred_spill_max}: predicate registers are spilling into GPRs again"
     assert (
         stats["STL"] <= spill_max and stats["LDL"] <= spill_max
     ), f"the {quant} d={d} {mask} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
