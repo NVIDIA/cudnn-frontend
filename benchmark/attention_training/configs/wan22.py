@@ -53,11 +53,11 @@ CONFIG = BenchmarkConfig(
         (75600, 75600),  # 720p, 81 frames
     ],
     backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
-    # bf16 = the released/trained precision. The fp8 rows model quantized
-    # inference: per-tensor fp8 in/out, and the fp8-input block-scaled-output
-    # modes (FP4 O + E4M3/16 scales, E4M3 O + UE8M0/32 scales) that feed a
-    # block-scaled projection GEMM directly (forward-only, cudnn_oss).
-    data_types=["bfloat16", "fp8", "fp8_nvfp4", "fp8_mxfp8"],
+    # bf16 = the released/trained precision. The fp8 / mxfp8 rows model quantized
+    # inference: per-tensor fp8 in/out, block-scale mxfp8 in, and the block-scaled-
+    # output modes over either input (FP4 O + E4M3/16 scales, E4M3 O + UE8M0/32
+    # scales) that feed a block-scaled projection GEMM directly (forward-only, cudnn_oss).
+    data_types=["bfloat16", "fp8", "fp8_nvfp4", "fp8_mxfp8", "mxfp8", "mxfp8_nvfp4", "mxfp8_mxfp8"],
     attn_masks=["no_mask"],  # bidirectional diffusion DiT, no causal mask
     profile_pass="both",  # forward + backward for training
     deterministic_bwd=[False, True],

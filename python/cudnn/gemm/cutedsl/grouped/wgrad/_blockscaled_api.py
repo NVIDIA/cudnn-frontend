@@ -578,13 +578,18 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         workspace=None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """``workspace``: caller-owned, 128-byte-aligned, contiguous device buffer of at least
-        ``scratch_workspace_bytes()`` bytes; never allocated here. Discrete mode requires
-        ``wgrad_ptrs`` (see :func:`cudnn.gemm.cutedsl.grouped.wgrad.api.wgrad_expert_ptrs`)."""
+        ``scratch_workspace_bytes()`` bytes; never allocated here. ``descriptor_workspace`` is
+        the same buffer under its public name (a uint8 torch tensor sized with
+        ``get_grouped_gemm_wgrad_workspace_size_sm100``); passing both requires one object.
+        Discrete mode requires ``wgrad_ptrs`` (see
+        :func:`cudnn.gemm.cutedsl.grouped.wgrad.api.wgrad_expert_ptrs`)."""
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
         nbytes = self.scratch_workspace_bytes()
+        workspace = self._resolve_workspace_alias(workspace, descriptor_workspace, nbytes, a_tensor)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
@@ -625,6 +630,37 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             global_scale_a,
             global_scale_b,
         )
+
+    def _resolve_workspace_alias(self, workspace, descriptor_workspace, nbytes: int, a_tensor):
+        """``descriptor_workspace`` is an alias of ``workspace``: one caller-owned buffer, never
+        a plan-owned fallback. The alias keeps its torch-only validation messages."""
+        if descriptor_workspace is None:
+            return workspace
+        if workspace is not None and workspace is not descriptor_workspace:
+            raise ValueError("workspace and descriptor_workspace name the same buffer; pass one of them, or the same object to both")
+        self._value_error_if(
+            not is_torch_tensor(descriptor_workspace),
+            f"descriptor_workspace must be a torch.uint8 tensor, got {type(descriptor_workspace).__name__}",
+        )
+        import torch
+
+        self._value_error_if(
+            descriptor_workspace.dtype != torch.uint8,
+            f"descriptor_workspace must have dtype uint8, got {descriptor_workspace.dtype}",
+        )
+        self._value_error_if(
+            descriptor_workspace.device != get_device(a_tensor),
+            "descriptor_workspace and WGrad operands must be on the same device",
+        )
+        self._value_error_if(
+            not descriptor_workspace.is_contiguous(),
+            "descriptor_workspace must be contiguous",
+        )
+        self._value_error_if(
+            descriptor_workspace.numel() < nbytes,
+            f"descriptor_workspace requires at least {nbytes} bytes, got {descriptor_workspace.numel()}",
+        )
+        return descriptor_workspace
 
 
 __all__ = ["GroupedGemmWgradBlockScaledAPI"]

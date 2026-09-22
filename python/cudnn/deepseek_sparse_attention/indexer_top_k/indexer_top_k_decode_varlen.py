@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+from cudnn._cutlass_compat import SmemAllocator
 import torch
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
@@ -62,7 +63,7 @@ class ComputeDynamicCTAOffsets:
         row_cta_offsets: cute.Tensor,
         row_output_offsets: cute.Tensor,
     ):
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         num_warps = cutlass.const_expr(self.NUM_THREADS // 32)
         s_warp_sums = smem.allocate_tensor(
             element_type=cutlass.Int32,
@@ -271,7 +272,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         # TODO: how to simplify the smem allocate codes?
         s_histogram_buf_layout = cute.make_ordered_layout((self.radix + 1), order=(0))
         s_histogram = smem.allocate_tensor(

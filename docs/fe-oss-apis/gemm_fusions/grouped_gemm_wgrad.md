@@ -122,6 +122,40 @@ operand pair. It preserves the pre-existing scale-factor contract: provide
 `global_scale_b` where the selected low-precision format requires them. BF16
 does not reinterpret these controls; it rejects them instead.
 
+The block-scaled backend's per-expert TMA-descriptor scratch is the same
+caller-owned `workspace` described above; the plan never allocates one. Torch
+block-scaled callers may pass it under the keyword-only name
+`descriptor_workspace` on `grouped_gemm_wgrad_wrapper_sm100` and on the class
+`execute()` -- an alias of `workspace`, accepted only for this backend, so a
+retained plan can be replayed (CUDA Graph capture included) over a buffer the
+caller controls. It must be a contiguous `torch.uint8` CUDA tensor on the
+operands' device of at least `get_grouped_gemm_wgrad_workspace_size_sm100(
+num_experts, output_mode=..., input_order=...)` bytes, which equals the plan's
+`scratch_workspace_bytes()`; keep it alive for as long as the call site may
+replay, and do not share it between call sites that may overlap. Passing both
+`workspace` and `descriptor_workspace` requires the same object. When neither is
+given, the wrapper allocates the scratch per call on the launch stream and the
+class `execute()` raises. One compiled plan serves every output buffer either
+way; nothing is cached per output address.
+
+```python
+workspace = torch.empty(
+    cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(num_experts),
+    dtype=torch.uint8,
+    device=a_tensor.device,
+)
+result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
+    a_tensor=a_tensor,
+    b_tensor=b_tensor,
+    sfa_tensor=sfa_tensor,
+    sfb_tensor=sfb_tensor,
+    offsets_tensor=offsets_tensor,
+    wgrad_tensor=wgrad_tensor,
+    descriptor_workspace=workspace,
+    output_mode="dense",
+)
+```
+
 ## API usage
 
 ### BF16

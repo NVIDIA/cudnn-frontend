@@ -27,6 +27,7 @@ from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cutlass_dsl import T
 from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
+from cudnn._cutlass_compat import fast_divmod_create_divisor
 import cutlass
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
@@ -565,13 +566,13 @@ class PersistentTileSchedulerParams:
             cluster_count_n = self.problem_layout_ncluster_mnl.shape[1]
 
             # batch_fdd: Used to map linear_idx to work_unit_id (handles persistent scheduling)
-            self.batch_fdd = cute.fast_divmod_create_divisor(problem_layout_size, loc=loc, ip=ip)
+            self.batch_fdd = fast_divmod_create_divisor(problem_layout_size, loc=loc, ip=ip)
 
             # cluster_shape_m_fdd: Used to decode work_unit_id to cluster coordinates
-            self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor(cluster_count_m, loc=loc, ip=ip)
+            self.cluster_shape_m_fdd = fast_divmod_create_divisor(cluster_count_m, loc=loc, ip=ip)
 
             # cluster_shape_n_fdd: Used for the second level decomposition
-            self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(cluster_count_n, loc=loc, ip=ip)
+            self.cluster_shape_n_fdd = fast_divmod_create_divisor(cluster_count_n, loc=loc, ip=ip)
         else:
             # FastDivmod not applicable with swizzling, set to None
             self.batch_fdd = None
@@ -594,6 +595,7 @@ class PersistentTileSchedulerParams:
         # Only add non-None values to avoid MLIR type errors
         fastdivmod_values = []
         fastdivmod_indices = []  # Track which FastDivmod objects are present
+        fastdivmod_widths = []
 
         for i, (fdd_name, fdd_obj) in enumerate(
             [
@@ -607,10 +609,12 @@ class PersistentTileSchedulerParams:
                 fdd_values = extract_mlir_values(fdd_obj)
                 fastdivmod_values.extend(fdd_values)
                 fastdivmod_indices.append(i)
+                fastdivmod_widths.append(len(fdd_values))
 
         values += fastdivmod_values
         self._values_pos.append(len(fastdivmod_indices))  # Store count of FastDivmod objects, not values
         self._fastdivmod_indices = fastdivmod_indices  # Store for reconstruction
+        self._fastdivmod_widths = fastdivmod_widths
 
         return values
 
@@ -640,14 +644,13 @@ class PersistentTileSchedulerParams:
 
         if hasattr(self, "_fastdivmod_indices") and len(self._fastdivmod_indices) > 0:
             # Override the FastDivmod divisors created by __init__ with reconstructed ones
-            for j, original_index in enumerate(self._fastdivmod_indices):
+            for original_index, n_items in zip(self._fastdivmod_indices, self._fastdivmod_widths):
                 fdd_name = fdd_names[original_index]
-                # Get the original FastDivmodDivisor object
                 original_fdd = getattr(self, fdd_name)
-                if original_fdd is not None and j < len(values_copy):
-                    # Each FastDivmodDivisor has 1 MLIR value
-                    reconstructed_fdd = new_from_mlir_values(original_fdd, [values_copy[j]])
-                    setattr(new_params, fdd_name, reconstructed_fdd)
+                # V1 carries one MLIR value; V2 also carries the scalar divisor.
+                reconstructed_fdd = new_from_mlir_values(original_fdd, values_copy[:n_items])
+                values_copy = values_copy[n_items:]
+                setattr(new_params, fdd_name, reconstructed_fdd)
 
         return new_params
 

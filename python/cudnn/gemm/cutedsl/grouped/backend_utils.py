@@ -168,9 +168,6 @@ def _event_done(event) -> bool:
     return False
 
 
-_PENDING_CAP = 64  # entries whose event could not be recorded are the only ones this cap ever drops
-
-
 def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) -> None:
     """Guard and keep alive the caller's workspace across the asynchronous launch that reads it (R2 lifetime).
 
@@ -182,7 +179,7 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     record_stream: the API keeps a reference to every such workspace until an event recorded
     on its launch stream -- at the NEXT call, once its launch is enqueued -- has completed.
     Overlapping calls therefore never free each other's scratch; holding only the most recent
-    buffer would.
+    buffer would, and no cap ever drops an entry whose fence has not completed.
     """
     if workspace is None:
         return
@@ -208,9 +205,22 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     for entry in pending:  # every earlier entry's launch is enqueued by now: fence it
         if entry.event is None:
             entry.event = _event_after(entry.stream)
-    pending[:] = [entry for entry in pending if entry.event is None or not _event_done(entry.event)]
-    if len(pending) >= _PENDING_CAP:
-        pending[:] = [entry for entry in pending if entry.event is not None][-(_PENDING_CAP - 1) :]
+    # An entry is released only once its own fence has completed. An entry whose fence could not
+    # be recorded (driver declined) is released when a LATER entry on the same stream has completed:
+    # stream order puts its launch before that fence. Nothing here blocks the host, and nothing is
+    # ever dropped while it may still be in flight -- the list is bounded by what is genuinely pending.
+    done_streams = set()
+    kept = []
+    for entry in reversed(pending):
+        if entry.event is not None:
+            if _event_done(entry.event):
+                done_streams.add(entry.stream)
+                continue
+        elif entry.stream in done_streams:
+            continue
+        kept.append(entry)
+    kept.reverse()
+    pending[:] = kept
     pending.append(_PendingWorkspace(workspace, stream))
 
 
