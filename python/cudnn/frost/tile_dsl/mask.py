@@ -7,6 +7,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 from .constants import MASK_CAUSAL, MASK_NONE, MASK_PADDED, MASK_SWA  # noqa: F401
 
@@ -73,6 +74,203 @@ def apply_mask_chunk(
         )
         elems.append(val)
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+# ---------------------------------------------------------------------------
+# Per-cell mask, "bits" form: one keep-word per 32 columns, register-to-predicate
+# ---------------------------------------------------------------------------
+#
+# `apply_mask_chunk` above compares EVERY cell against every active bound and
+# ORs the terms: per cell one IADD (kv_col_base + i, never folded into the
+# compare), one ISETP per term and one FSEL per term (the i1 OR lowers to nested
+# selects), so a causal+SWA tile costs 5 instructions per cell and a padded
+# causal+SWA one 7 -- 51-72 % of a masked softmax tile's instructions, serialized
+# in front of the exp burst (frost_dev/mask_sass/Q1_SASS.md).  The information
+# content of any of these masks is one or two band EDGES per row, so the form
+# below spends its instructions there instead:
+#
+#   1. per 32-column word, build the KEEP mask from the band edges with two
+#      saturating shifts (`shr.u32` for the upper edge, `shl.b32` for the lower;
+#      PTX clamps a shift amount >= 32 to a zero result, which is exactly the
+#      "edge is outside this word" case) -- ~7 integer ops per word, per lane;
+#   2. per cell, test one bit of the word and feed the SAME `arith.select`
+#      `apply_mask_chunk` uses.  ptxas turns 32 consecutive bit tests into
+#      `R2P` (register -> 7 predicates) + one `FSEL` per cell, so the per-cell
+#      cost is 1.4-1.6 instructions regardless of how many mask terms are on
+#      (frost_dev/mask_sass/Q2_LOWERING.md, Q3_INTREE_IDIOM.md; the same idiom
+#      the block-sparse-attention SM90 backward uses, `predicate_bitmask_below`).
+#
+# Semantics contract (shared with `apply_mask_chunk`, bitwise):
+#   - a masked cell becomes `mask_value` (default: the finite fp32-min sentinel;
+#     pass float("-inf") for the true -inf form); an unmasked cell is passed
+#     through untouched (NaN payloads included);
+#   - bounds are PER LANE (one lane = one q row): `lo`/`hi` are Int32 values
+#     derived from that lane's q row, `kv_col_base` is the chunk's first
+#     absolute kv column; a fully-masked row yields `mask_value` in every cell,
+#     so the caller's `row_max_for_exp2` guard applies exactly as today;
+#   - a `tcgen05.ld 32x32b` chunk is contiguous along columns per lane (register
+#     k = column k), so NO column remap is needed here -- unlike the WGMMA
+#     accumulator layout the BSA kernel remaps with `sm90_col_to_predicate_idx`.
+
+MASK_FORM_CELLS = "cells"  # apply_mask_chunk: per-cell compare + select
+MASK_FORM_BITS = "bits"  # apply_mask_chunk_bits: keep-word + register-to-predicate select
+MASK_FORMS = (MASK_FORM_CELLS, MASK_FORM_BITS)
+
+MASK_WORD_COLS = 32  # columns per keep-word = bits per register
+
+
+def keep_below_word(hi_rel, s: int):
+    """Keep-word of 32-column word ``s``: bit ``i`` is set iff column ``32 s + i < hi_rel``.
+
+    ``hi_rel`` is the exclusive upper bound RELATIVE to the chunk base (an Int32, per lane;
+    any value, including negative or past the chunk).  Spelled in PTX because the
+    saturating shift is the whole point: LLVM treats a shift by >= 32 as poison, PTX
+    ``shr.u32`` clamps it and yields 0 (= every column of this word is at or past ``hi``).
+    The ``max.s32`` clamps the other side (``hi`` past the word -> shift 0 -> all kept)."""
+    n_masked = cutlass.Int32(MASK_WORD_COLS * (s + 1)) - hi_rel
+    return inline_ptx(
+        "{ .reg .b32 n, ones; mov.b32 ones, 0xFFFFFFFF; max.s32 n, {$r0}, 0; shr.u32 {$w0}, ones, n; }",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[n_masked],
+    )
+
+
+def keep_from_word(lo_rel, s: int):
+    """Keep-word of 32-column word ``s``: bit ``i`` is set iff column ``32 s + i >= lo_rel``.
+
+    The lower-edge twin of :func:`keep_below_word`: ``shl.b32`` of all-ones by the number
+    of columns below ``lo`` in this word, clamped at 0 (``lo`` left of the word -> all kept)
+    and saturating at >= 32 (``lo`` right of the word -> 0, all masked)."""
+    n_masked = lo_rel - cutlass.Int32(MASK_WORD_COLS * s)
+    return inline_ptx(
+        "{ .reg .b32 n, ones; mov.b32 ones, 0xFFFFFFFF; max.s32 n, {$r0}, 0; shl.b32 {$w0}, ones, n; }",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[n_masked],
+    )
+
+
+def band_mask_words(lo, hi, kv_col_base, n_cols: int):
+    """Per-lane keep-words for the ``n_cols`` columns starting at absolute kv column
+    ``kv_col_base``: bit ``i`` of word ``s`` is set iff column ``c = kv_col_base + 32 s + i``
+    satisfies ``keep(c) = (lo is None or c >= lo) & (hi is None or c < hi)``.
+
+    ``lo`` / ``hi`` are per-lane Int32 absolute column bounds (``hi`` exclusive), or ``None``
+    for a side no mask term defines -- that side folds out at trace time (one shift per word
+    for a one-sided mask, two for a band), never an INT_MIN/INT_MAX sentinel, so ``lo - base``
+    cannot wrap.  Returns a tuple of ``ceil(n_cols / 32)`` ``Uint32`` words.  Trace-time
+    helper (plain Python over traced values), like :func:`apply_mask_chunk`."""
+    if lo is None and hi is None:
+        raise ValueError("band_mask_words: at least one of lo / hi must be given (a mask with no edge is no mask)")
+    n_words = (n_cols + MASK_WORD_COLS - 1) // MASK_WORD_COLS
+    hi_rel = None if hi is None else hi - kv_col_base
+    lo_rel = None if lo is None else lo - kv_col_base
+    words = []
+    for s in range(n_words):
+        word = None
+        if hi_rel is not None:
+            word = keep_below_word(hi_rel, s)
+        if lo_rel is not None:
+            above = keep_from_word(lo_rel, s)
+            word = above if word is None else (word & above)
+        words.append(word)
+    return tuple(words)
+
+
+def apply_mask_words(reg_S, words, mask_value: float = _NEG_INF_BITS, n_cols: int = None):
+    """``reg_S[c] if keep-bit(c) else mask_value`` over an ``n_cols``-wide register chunk.
+
+    ``words`` is the tuple :func:`band_mask_words` returns (bit ``i`` of word ``s`` = column
+    ``32 s + i`` is KEPT).  The inner loop is a Python ``range`` over a compile-time bit
+    index, which is what lets ptxas see 32 consecutive single-bit tests of one register and
+    emit ``R2P`` + one ``FSEL`` per cell.  Same ``arith.select`` as :func:`apply_mask_chunk`
+    (only the predicate derivation differs), so the two forms are bitwise identical for the
+    same mask set, for either sentinel, NaN payloads included."""
+    if n_cols is None:
+        n_cols = MASK_WORD_COLS * len(words)
+    if len(words) * MASK_WORD_COLS < n_cols:
+        raise ValueError(f"apply_mask_words: {len(words)} word(s) cover {len(words) * MASK_WORD_COLS} columns, chunk has {n_cols}")
+    neg_inf = cutlass.Float32(mask_value)
+    elems = []
+    for s, word in enumerate(words):
+        for i in range(MASK_WORD_COLS):
+            c = MASK_WORD_COLS * s + i
+            if c >= n_cols:
+                break
+            keep = cutlass.Boolean(word & cutlass.Uint32(1 << i))
+            elems.append(cutlass.Float32(arith.select(keep.ir_value(), reg_S[c].ir_value(), neg_inf.ir_value())))
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+def apply_mask_chunk_bits(
+    reg_S,
+    q_abs,
+    kv_col_base,
+    seq_kv_len,
+    window_left: int,
+    mask_flags: int,
+    N: int = 64,
+    bottom_right: int = 0,
+    causal_diag=None,
+    mask_value: float = _NEG_INF_BITS,
+    window_right: int = 0,
+):
+    """:func:`apply_mask_chunk` with the same signature and the same masked set, in the
+    "bits" form.  The three terms map onto one band ``[lo, hi)`` per lane:
+
+    - CAUSAL masks ``kv > q_caus_lim``  ->  ``hi = q_caus_lim + 1`` with the same
+      ``q_caus_lim = q_abs (+ causal_diag under bottom_right) (+ window_right)``;
+    - PADDED masks ``kv >= seq_kv_len``  ->  ``hi = min(hi, seq_kv_len)``;
+    - SWA masks ``kv < q_minus_w``  ->  ``lo = q_minus_w`` (the same bottom-right anchor).
+
+    A side no term defines is ``None`` and folds out.  Fully-masked rows, the sentinel and
+    the caller's tile-level trimming are exactly as for :func:`apply_mask_chunk`."""
+    if cutlass.const_expr(mask_flags == MASK_NONE):
+        return reg_S
+
+    lo = None
+    hi = None
+    if mask_flags & MASK_SWA:
+        swa_base = (q_abs + causal_diag) if bottom_right else q_abs
+        lo = swa_base - cutlass.Int32(window_left)
+    if mask_flags & MASK_CAUSAL:
+        q_caus_lim = (q_abs + causal_diag) if bottom_right else q_abs
+        if window_right != 0:
+            q_caus_lim = q_caus_lim + cutlass.Int32(window_right)
+        hi = q_caus_lim + cutlass.Int32(1)
+    if mask_flags & MASK_PADDED:
+        hi = seq_kv_len if hi is None else cute.math.min(hi, seq_kv_len)
+
+    words = band_mask_words(lo, hi, kv_col_base, N)
+    return apply_mask_words(reg_S, words, mask_value=mask_value, n_cols=N)
+
+
+def apply_mask_chunk_form(
+    reg_S,
+    q_abs,
+    kv_col_base,
+    seq_kv_len,
+    window_left: int,
+    mask_flags: int,
+    N: int = 64,
+    bottom_right: int = 0,
+    causal_diag=None,
+    mask_value: float = _NEG_INF_BITS,
+    window_right: int = 0,
+    *,
+    form: str,
+):
+    """:func:`apply_mask_chunk` (``form=MASK_FORM_CELLS``) or :func:`apply_mask_chunk_bits`
+    (``form=MASK_FORM_BITS``) behind one signature.  A kernel picks the form with ONE
+    module-level constant (``MASK_FORM``) that every masked call site passes -- the
+    ``DESC_VERSION`` discipline -- so an A/B of the two lowerings is a constant flip and a
+    test can count call sites against the constant.  ``form`` is keyword-only and has no
+    default: a call site that forgets it fails at trace time instead of silently picking one."""
+    kw = dict(N=N, bottom_right=bottom_right, causal_diag=causal_diag, mask_value=mask_value, window_right=window_right)
+    if form == MASK_FORM_BITS:
+        return apply_mask_chunk_bits(reg_S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, **kw)
+    if form == MASK_FORM_CELLS:
+        return apply_mask_chunk(reg_S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, **kw)
+    raise ValueError(f"apply_mask_chunk_form: form must be one of {MASK_FORMS}, got {form!r}")
 
 
 # ---------------------------------------------------------------------------
