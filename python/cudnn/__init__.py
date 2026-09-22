@@ -356,8 +356,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
-    "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
-    "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
+    "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
+    "vision_rope_backward_wrapper": (".rope", "vision_rope_backward_wrapper"),
     "RopeQDQInplace": (".rope", "RopeQDQInplace"),
     "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
     "EngramGateSavedForward": (".engram", "EngramGateSavedForward"),
@@ -435,6 +435,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     ),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
+    "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
     "gemm_srelu_wrapper_sm100": (
