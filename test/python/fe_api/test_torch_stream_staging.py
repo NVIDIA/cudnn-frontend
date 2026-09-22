@@ -6,7 +6,7 @@ original's block from being reused on the caller's stream until the copy has run
 import pytest
 import torch
 
-from cudnn._torch_stream import contiguous_on_stream, record_streams
+from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
 
 _ROWS, _COLS = 1024, 2048  # 8 MiB fp32: one large-pool block, handed back whole to the next same-size request
 
@@ -75,6 +75,27 @@ def test_staging_helpers_pass_through_and_noop_on_the_current_stream():
     assert contiguous_on_stream(t, None) is t
     assert contiguous_on_stream(t, torch.cuda.current_stream().cuda_stream, t.device) is t
     record_streams((None, t), None)  # no stream: nothing to record
-    record_streams((t,), torch.cuda.current_stream(), t.device)  # current stream: the allocation stream orders reuse
+    record_streams((t,), torch.cuda.current_stream(), t.device)  # recorded (the allocation stream may differ)
     copy = contiguous_on_stream(t.t(), None)
     assert copy.is_contiguous() and copy.shape == (8, 4)
+
+
+@pytest.mark.L0
+def test_copy_into_on_stream_keeps_the_released_destination_until_the_copy_lands():
+    """The copy-back twin: a caller buffer released right after the call is not handed to a same-size
+    allocation on the caller's stream while the side-stream write is still pending."""
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    src = torch.arange(_ROWS * _COLS, dtype=torch.float32, device="cuda").view(_ROWS, _COLS)
+    dst = torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda")
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000_000)
+    copy_into_on_stream(dst, src, side.cuda_stream, dst.device)
+    keep = dst  # the caller keeps ITS handle; the wrapper's reference is what is dropped
+    del dst
+    other = torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda")
+    other.fill_(-1.0)
+    torch.cuda.synchronize()
+    assert torch.equal(keep, src) and other.data_ptr() != keep.data_ptr()

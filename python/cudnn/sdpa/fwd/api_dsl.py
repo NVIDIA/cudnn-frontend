@@ -19,7 +19,7 @@ from typing import Callable, Hashable, Iterator, Optional
 
 import torch
 
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import record_streams, stream_context
 from cuda.bindings import driver as cuda
 
 # WorkspaceCarver / ws_align / _WS_ALIGN live in api_base.py and are re-exported here for the bwd/engines importers.
@@ -6068,6 +6068,8 @@ def sdpa_fwd_wrapper_sm80(
     # builds the RoPE table, both on the launch stream (R1).
     with _torch_stream_context(current_stream, q_tensor.device):
         workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=q_tensor.device) if ws_bytes else None
+        if rope_freqs is not None and rope_freqs.is_cuda:
+            record_streams((rope_freqs,), current_stream, rope_freqs.device)  # R1 staging: the table build reads it asynchronously
         rope_cs = _sm80_rope_table(rope_freqs, q_tensor.shape[-1] // 2, q_tensor.device, table_d2=api.flavor_d_qk // 2) if rope_freqs is not None else None
     api.execute(
         q_tensor=q_tensor,
