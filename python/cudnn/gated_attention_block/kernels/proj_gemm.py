@@ -82,6 +82,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 import torch
@@ -817,25 +818,43 @@ _LOG = logging.getLogger(__name__)
 # at the block's ``compile()`` -- never at a possibly captured execute -- and re-streamed
 # with ``cudnn.set_stream`` before every launch (``cudnnSetStream`` is host-only handle
 # state and capture-legal; ``_pygraph.execute`` reads the stream off the handle).  The
-# re-streaming is single-threaded: two Python threads driving one device concurrently
-# must each pass their own ``handle=``.
+# re-stream + execute pair is serialised per device by ``_graph_handle_lock`` (a
+# cuDNN handle must not be used by two threads at once); a caller that passes its
+# own ``handle=`` bypasses both the shared handle and the lock.
 _GRAPH_HANDLE_BY_DEVICE: dict = {}
+_GRAPH_HANDLE_LOCKS: dict = {}
+_GRAPH_HANDLE_REGISTRY_LOCK = threading.Lock()
+
+
+def _device_index(device) -> int:
+    dev = torch.device(device)
+    return dev.index if dev.index is not None else torch.cuda.current_device()
 
 
 def graph_handle(device) -> Any:
     """The process-lifetime ``cudnn.Handle`` for ``device`` (created on first use, never destroyed)."""
     import cudnn
 
-    dev = torch.device(device)
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    h = _GRAPH_HANDLE_BY_DEVICE.get(idx)
-    if h is None:
-        # create_handle() binds to the CURRENT device -- pin it so a tensor on
-        # cuda:1 never gets a handle created against cuda:0.
-        with torch.cuda.device(idx):
-            h = cudnn.create_handle()
-        _GRAPH_HANDLE_BY_DEVICE[idx] = h
+    idx = _device_index(device)
+    with _GRAPH_HANDLE_REGISTRY_LOCK:
+        h = _GRAPH_HANDLE_BY_DEVICE.get(idx)
+        if h is None:
+            # create_handle() binds to the CURRENT device -- pin it so a tensor on
+            # cuda:1 never gets a handle created against cuda:0.
+            with torch.cuda.device(idx):
+                h = cudnn.create_handle()
+            _GRAPH_HANDLE_BY_DEVICE[idx] = h
     return h
+
+
+def _graph_handle_lock(device) -> threading.Lock:
+    """The per-device lock guarding ``set_stream`` + ``execute`` on the shared handle."""
+    idx = _device_index(device)
+    with _GRAPH_HANDLE_REGISTRY_LOCK:
+        lock = _GRAPH_HANDLE_LOCKS.get(idx)
+        if lock is None:
+            lock = _GRAPH_HANDLE_LOCKS[idx] = threading.Lock()
+    return lock
 
 
 @dataclass
@@ -1343,12 +1362,19 @@ def run_proj_gemm(
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
     # The graph route names its stream through the handle: the plan's engine
     # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
-    if handle is None:
-        import cudnn
+    if handle is not None:
+        plan.graph.execute(vp, workspace, handle)
+        return
+    import cudnn
 
-        handle = graph_handle(out.device)
+    # The shared per-device handle must not be driven by two threads at once
+    # (cuDNN: a handle is not thread-safe while in use): re-stream + execute
+    # are one critical section per device. A caller with its own `handle=`
+    # skips the lock.
+    handle = graph_handle(out.device)
+    with _graph_handle_lock(out.device):
         cudnn.set_stream(handle=handle, stream=stream)
-    plan.graph.execute(vp, workspace, handle)
+        plan.graph.execute(vp, workspace, handle)
 
 
 def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, expect: Any) -> None:
