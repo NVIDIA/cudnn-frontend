@@ -24,6 +24,9 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
      4, spread over both P chunks) so the MUFU pipe stops pacing the tile --
      97 instead of 129 MUFU.EX2 per row per KV step.  The Amax_O fold is
      ``fmax_f32`` (FMNMX3).  Together +10.9 % at S=16K on B200 (see below).
+     The split is **cc 10.0 only**: ``PARAMS.exp2_fma_split`` (auto-set from
+     the build device) folds it out on every other cc, where MUFU.EX2 runs at
+     twice B200's rate and the same split loses (``_E2E_ENABLED``).
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -199,9 +202,22 @@ SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
-# Emulated columns per row (32 of CFG.TILE_N=128), and the MUFU.EX2 the softmax still issues per
-# row per KV step (the alpha exp2 plus the 96 MUFU columns = 97).
-_E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES
+# ARCH GATE.  The split is claimed per kernel AND per arch: it trades MUFU.EX2 pipe-time for FMA pipe-time, so
+# its sign follows the part's MUFU rate.  MEASURED (2026-09-22, one CTA of independent ex2 / fma chains timed with
+# %clock64, so every op is issue-bound): MUFU.EX2 = 16 elements/clk/SM on sm_100a (B200) and 32 on sm_107a
+# (Rubin), the FP32 pipe ~120 lanes/clk/SM on both.  So an emulated exp2 (6 packed FP32 / INT instructions per
+# pair) costs 0.96x the MUFU time it frees on B200 (+10.9 % here) and 1.99x on Rubin, where the sm107 port of the
+# same pattern MEASURED -9..-10 %.  DOCUMENTED (NVIDIA's Blackwell Ultra material, FlashAttention-4 s2.2): sm_103a
+# (GB300) doubles SFU exp2 throughput to 32/clk/SM -- the Rubin regime -- so on cc 10.3 the split is INFERRED to
+# lose and stays OFF.  ``PARAMS.exp2_fma_split`` is auto-set by the adapter from the BUILD device
+# (api_dsl._exp2_fma_split_for: cc == (10, 0), the arch the split was measured on) and folded here at trace
+# time: off, ``_E2E_PAIRS`` are empty and both exp2 sites trace ``cute.math.exp2`` -- the develop spelling
+# (MUFU.EX2 258 on the whole sm_100a kernel; the SASS pin's cc 10.3 arm).  Widen the cc set only after an A/B on
+# the new part.  The standalone default (``TemplateParams()``) is the all-MUFU kernel.
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off), and the MUFU.EX2 the softmax still
+# issues per row per KV step (the alpha exp2 plus the 96 MUFU columns = 97; 129 with the gate off).
+_E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
 if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
     raise ValueError(f"{__name__}: exp2 emulation pattern freq={_E2E_FREQ} res={_E2E_RES} limit={_E2E_LIMIT} must be even with 0 <= res <= freq | limit")
 # The softmax body walks the row as two 64-wide chunks (CHUNK in _softmax_kv_body).
@@ -217,7 +233,7 @@ def _e2e_pairs(chunk: int, chunk_elems: int = _SOFTMAX_CHUNK) -> frozenset:
     )
 
 
-_E2E_PAIRS = tuple(_e2e_pairs(c) for c in range(CFG.TILE_N // _SOFTMAX_CHUNK))
+_E2E_PAIRS = tuple(_e2e_pairs(c) if _E2E_ENABLED else frozenset() for c in range(CFG.TILE_N // _SOFTMAX_CHUNK))
 if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
     raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
 
@@ -2088,15 +2104,22 @@ def _softmax_kv_body(
     exp_bias = new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE)
     reg_S_a = reg_S_a * scale_log2 - exp_bias
     reg_S_b = reg_S_b * scale_log2 - exp_bias
-    # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).
-    reg_P_a = exp2_mixed(reg_S_a, _E2E_PAIRS[0], CHUNK)
+    # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Gated per arch
+    # at trace time (_E2E_ENABLED): off, both chunks are the plain MUFU exp2 -- the develop spelling.
+    if cutlass.const_expr(_E2E_ENABLED):
+        reg_P_a = exp2_mixed(reg_S_a, _E2E_PAIRS[0], CHUNK)
+    else:
+        reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
     sum_a_pair = row_reduction_pair_64(reg_P_a)
     p_a_fp16 = reg_P_a.to(P_STORAGE_DTYPE)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    reg_P_b = exp2_mixed(reg_S_b, _E2E_PAIRS[1], CHUNK)
+    if cutlass.const_expr(_E2E_ENABLED):
+        reg_P_b = exp2_mixed(reg_S_b, _E2E_PAIRS[1], CHUNK)
+    else:
+        reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
     p_b_fp16 = reg_P_b.to(P_STORAGE_DTYPE)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)

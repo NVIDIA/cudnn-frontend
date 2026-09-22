@@ -26,6 +26,7 @@ Skips cleanly otherwise.
 """
 
 import glob
+import json
 import math
 import os
 import shutil
@@ -2141,32 +2142,37 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
         _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="mxfp8")
 
 
-# ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the sm_100a SASS
+# ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the SASS per arch
 # Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
 # worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
-# this pin compiles the kernel for sm_100a here (`CUTE_DSL_ARCH=sm_100a` needs no matching device -- the module-level
-# `requires_blackwell` is what confines it to the Blackwell-line lanes) and counts the instructions.  SKIPS when no
-# nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin; a compile failure is a FAIL.
+# these pins compile the kernel here for the target arch (`CUTE_DSL_ARCH` needs no matching device -- the module-level
+# `requires_blackwell` is what confines them to the Blackwell-line lanes) and count the instructions.  Two arms, one per
+# cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True: the split is ON) and
+# sm_103a with the cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate,
+# so the split is folded OUT and the kernel issues develop's 258 MUFU.EX2).  SKIPS when no nvdisasm on $CUDA_PATH/bin or
+# $PATH decodes the cubin; a compile failure is a FAIL.
 _SM100_D128_MXFP8_SASS_PROBE = textwrap.dedent("""
-    import glob, os, subprocess, sys
-    dump, cands = sys.argv[1], sys.argv[2:]
+    import glob, json, os, subprocess, sys
+    dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
-    os.environ["CUTE_DSL_ARCH"] = "sm_100a"       # unconditional: an inherited value would pin the wrong target's SASS
+    os.environ["CUTE_DSL_ARCH"] = arch               # unconditional: an inherited value would pin the wrong target's SASS
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    # The PRODUCTION geometry from the adapter itself (cga2), the cc 10.0 specialization (fused_ldtm_stat=False: the
-    # manual tcgen05_ld + software row-max, i.e. B200), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape the
-    # split was tuned and measured on (B=1 H=24/8 S=16K dense).
+    # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
+    # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
+    # come from the caller as the record api_dsl.template_params() builds for that device.
     (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
-    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, fused_ldtm_stat=False, emit_amax_o=True)
+    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **json.loads(params_json))
     mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
-    # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern rather than a literal.
+    # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern (and the gate) rather
+    # than a literal.
     n_bodies = 2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1
     print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    print("E2E_ENABLED", int(mod._E2E_ENABLED))
     mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
@@ -2202,8 +2208,15 @@ _SM100_D128_MXFP8_SASS_PROBE = textwrap.dedent("""
 # FMNMX3 124 -> 252, STL 3 / LDL 3 unchanged (none in the softmax loops), REG 128.  Slack 16 tolerates unrelated ptxas
 # drift and still catches one site: a fold site regressing to compare+select adds >= 384 FSETP, one emulated pair
 # falling back to MUFU adds 2 MUFU.EX2 and drops 3 FFMA2 (the MUFU count is pinned EXACTLY, derived from the module).
+# The cc 10.3 arm (sm_103a, fused_ldtm_stat=True, exp2_fma_split=False), MEASURED the same day: MUFU.EX2 258, FFMA2 130,
+# FADD2 126 (develop's counts: no emulated pair), FSETP 19 (the fold stays), FMNMX3 128 (the fused LDTM.STAT row-max
+# replaces the software tree), STL 3 / LDL 3.
 _SM100_SASS_SLACK = 16
 _SM100_D128_MXFP8_SASS_PINS = {"FFMA2": 226, "FADD2": 222, "FSETP": 19, "FMNMX3": 252, "STL": 3, "LDL": 3}
+_SM103_D128_MXFP8_SASS_PINS = {"FFMA2": 130, "FADD2": 126, "FSETP": 19, "STL": 3, "LDL": 3}
+# The per-cc TemplateParams fields exactly as api_dsl.template_params() derives them for an MXFP8 d128 build.
+_CC100_D128_MXFP8_PARAMS = {"fused_ldtm_stat": False, "exp2_fma_split": True}
+_CC103_D128_MXFP8_PARAMS = {"fused_ldtm_stat": True, "exp2_fma_split": False}
 
 
 def _nvdisasm_candidates():
@@ -2216,27 +2229,47 @@ def _nvdisasm_candidates():
     return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
 
 
-@pytest.mark.L0
-def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
-    """32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 == 2 x 97 exactly, derived from the
-    module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222 minus slack) and the Amax_O fold
-    is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no new spill (STL / LDL <= 3, the
-    pre-existing count).  Compiled for sm_100a at the production geometry -- no Blackwell device needed for the
-    compile, only for this module's gate."""
+def _arch_known_to_the_dsl(arch: str) -> bool:
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string(arch)
+        return True
+    except Exception:
+        return False
+
+
+def _d128_mxfp8_sass_probe(tmp_path, arch: str, params: dict):
+    """Trace-compile the d128 MXFP8 kernel for ``arch`` with the per-cc ``params`` and return (stats, expect):
+    the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state)."""
+    if not _arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch}")
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / "sm100a_mxfp8_d128"
+    dump = tmp_path / f"{arch}_mxfp8_d128"
     dump.mkdir()
-    argv = [sys.executable, "-c", _SM100_D128_MXFP8_SASS_PROBE, str(dump), *cands]
+    argv = [sys.executable, "-c", _SM100_D128_MXFP8_SASS_PROBE, str(dump), arch, json.dumps(params), *cands]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"sm_100a trace-compile of the d128 mxfp8 kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    assert proc.returncode == 0, f"{arch} trace-compile of the d128 mxfp8 kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
-    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith(("EXPECT_MUFU_EX2 ", "EMULATED_COLS "))}
-    print(f"\nsm100 d128 mxfp8 sm_100a SASS: {stats}; expected MUFU.EX2 {expect}")
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith(("EXPECT_MUFU_EX2 ", "EMULATED_COLS ", "E2E_ENABLED "))}
+    print(f"\nsm100 d128 mxfp8 {arch} {params} SASS: {stats}; module says {expect}")
+    return stats, expect
+
+
+@pytest.mark.L0
+def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
+    """cc 10.0 record (exp2_fma_split=True): 32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 ==
+    2 x 97 exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222
+    minus slack) and the Amax_O fold is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no
+    new spill (STL / LDL <= 3, the pre-existing count).  Compiled for sm_100a at the production geometry -- no
+    Blackwell device needed for the compile, only for this module's gate."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", _CC100_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
     assert expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {expect['EMULATED_COLS']}"
     assert (
         stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 194
@@ -2249,6 +2282,30 @@ def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
         stats["FSETP"] <= _SM100_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
     ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
     assert stats["STL"] <= _SM100_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM100_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
+
+
+@pytest.mark.L0
+def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
+    """cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300):
+    the split is OFF because GB300 doubles the MUFU.EX2 rate to Rubin's 32/clk/SM, where the same split MEASURED
+    -9..-10 %.  The kernel must issue develop's MUFU.EX2 count exactly (2 x 129 = 258, derived from the module's
+    `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at or below develop's 130 / 126 plus
+    slack), while the arch-independent Amax_O fold stays FMNMX3 (FSETP <= 19 + 16) and nothing spills (STL / LDL <= 3).
+    Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_103a", _CC103_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 258
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
+    for key in ("FFMA2", "FADD2"):
+        assert (
+            stats[key] <= _SM103_D128_MXFP8_SASS_PINS[key] + _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} > {_SM103_D128_MXFP8_SASS_PINS[key]} + {_SM100_SASS_SLACK}: emulation instructions with the gate off: {stats}"
+    assert (
+        stats["FSETP"] <= _SM103_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert stats["STL"] <= _SM103_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM103_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
 
 
 # ============================================================================ sm100 d128 MXFP8: Stats is the exact fp32 log-sum-exp (fp64 reference), with the exp2 split in place
