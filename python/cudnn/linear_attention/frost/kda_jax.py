@@ -14,6 +14,8 @@ from .common import gate_bwd, head_reduce, piece_chain, split_k
 from .kernel import kda_bprop_f16 as bwd
 from .kernel import kda_bprop_summary_f16 as bwd_summary
 from .kernel import kda_prefill_f16 as fwd
+from .kernel import kda_prep_f16 as prep
+from .kernel import kda_prep_prefill_f16 as prep_fwd
 from .kernel import kda_recompute_f16 as recompute
 from .kernel import kda_summary_f16 as summary
 from .kernel.kda_chain_backward_f16 import chain_backward_host
@@ -99,18 +101,36 @@ def make_launcher(plan, names):
                 **flags,
             )
     else:
+        prefill = prep_fwd if plan.prep else fwd
         config.update(
             order_gen=not split,
-            prefill_cfg=fwd.build_cfg(
+            tiles_per_head=plan.tiles_per_head,
+            prep=plan.prep,
+            prep_cfg=None,
+            prefill_cfg=prefill.build_cfg(
                 io_dtype,
                 ct.Float32 if chain else state_dtype,
                 gate_dtype,
                 use_initial_state=chain or state is not None,
                 store_final_state=plan.has_final_state,
                 enable_checkpoints=saved,
-                **flags,
+                tiles_per_head=plan.tiles_per_head,
+                **dict(flags, d_v=dv // plan.tiles_per_head),
             ),
         )
+        if plan.prep:
+            config["prep_cfg"] = prep.build_cfg(
+                io_dtype,
+                gate_dtype,
+                num_sm=plan.num_sm,
+                l2norm=plan.use_qk_l2norm,
+                safe_gate=safe_gate,
+                gate_scale_log2=flags["gate_scale_log2"],
+                log_gate=log_gate,
+                beta_sigmoid=plan.use_beta_sigmoid,
+                allow_neg_eigval=plan.allow_neg_eigval,
+                d_k=dk,
+            )
     if chain:
         config.update(
             unit_chunks=plan.unit_chunks,
@@ -287,6 +307,14 @@ def make_launcher(plan, names):
                     staging=staging,
                     scheduler=w["scheduler"],
                     workspace=w["tensormaps"],
+                    prep_k_decay=w.get("prep_k_decay"),
+                    prep_q_decay=w.get("prep_q_decay"),
+                    prep_t=w.get("prep_t"),
+                    prep_a=w.get("prep_a"),
+                    prep_diag=w.get("prep_diag"),
+                    prep_words=w.get("prep_tensormaps"),
+                    prep_rows=w.get("prep_rows"),
+                    prep_row_count=w.get("prep_row_count"),
                 )
         for name, dtype in scalar_types.items():
             args[name] = dtype(args[name])

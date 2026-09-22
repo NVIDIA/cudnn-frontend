@@ -498,3 +498,48 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
             assert_close(got, want, 0.06)
         assert differentiated._cache_size() == 1
     assert "KDA" in plans and "KDA_BWD" in plans
+
+
+@pytest.mark.parametrize("prep", [False, True], ids=["direct", "prep"])
+@pytest.mark.parametrize("checkpoint", [0, 48])
+def test_value_split_forward_and_gradients(prep, checkpoint, monkeypatch):
+    from cudnn.frost.device import multiprocessor_count
+    from cudnn.linear_attention import jax_api
+    from cudnn.linear_attention.frost import kda_engine
+
+    build = kda_engine.build_kda
+    plans = []
+
+    def checked_build(graph):
+        plan = build(graph)
+        if plan.node.node_type.name == "KDA":
+            assert plan.dv_split and not plan.chain and not plan.split
+            assert plan.prep == prep
+            assert plan.tiles_per_head == 2
+        plans.append(plan.node.node_type.name)
+        return plan
+
+    jax_api.build_call.cache_clear()
+    monkeypatch.setattr(kda_engine, "build_kda", checked_build)
+    heads = 1 if prep else multiprocessor_count(0) // 2
+    span = 128 * max(1, checkpoint // 16)
+    bounds = (0, span, span, 3 * span + 1) if prep else (0, span + 1)
+    args, cu = inputs(dv=128, hq=heads, hk=heads, hv=heads, dtype=jnp.bfloat16 if prep else jnp.float16, bounds=bounds, gates=prep)
+    options = dict(checkpoint_every_n_tokens=checkpoint, safe_gate=prep, use_qk_l2norm_in_kernel=prep, use_beta_sigmoid_in_kernel=prep)
+    actual = jax.jit(partial(run, **options))(args, cu)
+    expected = reference(args, bounds, **options)
+    for got, want in zip(actual, expected):
+        assert_close(got, want, 0.02)
+    rng = np.random.default_rng(23)
+    do = jnp.asarray(rng.normal(size=actual[0].shape), args[0].dtype)
+    ds = jnp.asarray(rng.normal(size=actual[1].shape), jnp.float32)
+
+    def loss(args, ref=False):
+        out, state = reference(args, bounds, **options) if ref else run(args, cu, **options)
+        return jnp.sum(out.astype(jnp.float32) * do) + jnp.sum(state.astype(jnp.float32) * ds)
+
+    actual_grads = jax.jit(jax.grad(loss))(args)
+    expected_grads = jax.jit(jax.grad(partial(loss, ref=True)))(args)
+    for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
+        assert_close(got, want, 0.06)
+    assert "KDA" in plans and "KDA_BWD" in plans

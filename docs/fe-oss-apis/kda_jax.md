@@ -143,7 +143,7 @@ checkpoints; any positive multiple of 16 fitting signed INT32 is supported.
 | Safe gate | `lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`; default bound -5, allowed [-5, 0); omitted parameters mean 0 |
 | Beta | Direct write strength, or sigmoid of logits; `allow_neg_eigval=True` multiplies sigmoid by 2 and requires sigmoid enabled |
 | Q/K normalization | Optional in-kernel L2 normalization |
-| Scheduling | Frost automatic piece-chain / decay-warmup / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
+| Scheduling | Frost automatic piece-chain / decay-warmup / value-dimension split / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
 | Checkpoints | Cadence 0 (backward recomputes), 16, or coarser positive multiples of 16 (seeded recomputation) |
 | Transformations | Eager, jit, first-order grad/vjp, recurrent scan |
 
@@ -177,6 +177,8 @@ Frost's automatic piece-chain selection applies to both paths, including
 checkpoint-aligned piece boundaries. Coarse checkpoints, linear gate inputs
 and INT64 sequence offsets use the native forward/backward hosts. State-pool
 indexing remains outside the JAX API; native support is unchanged.
+Value-dimension splits use the engine's tile count and optional preprocessing
+buffers, through the same forward host as torch.
 
 Graph tensors come directly from JAX shape/dtype metadata; the existing
 `graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
