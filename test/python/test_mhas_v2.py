@@ -396,8 +396,21 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
         pytest.skip("no unified backend plan on this device")
     graph.select_plan(backend_plans[0])
     graph.check_support()
-    graph.build_plans()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1:
+        # NVBug 6813175: the native decode codegen does not reduce the Q tile for ragged s_q == 1 graphs
+        # and emits a TMEM Stats round-trip wider than the ISA allows, so build_plans fails NVRTC
+        # (cuDNN 9.26 GA through the 9.28 nightlies; the s_q == 2 control builds). The plan also fails
+        # on SM100, but only the Rubin heuristic ranks it first. A backend that builds it is an
+        # XPASS that asks us to retire this marker.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                raises=cudnn.cudnnGraphNotSupportedError,
+                reason="Rubin ranks the native ragged-decode plan first and it fails NVRTC (NVBug 6813175, cuDNN 9.26-9.28)",
+            )
+        )
+    graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
     graph.execute(pack, workspace, handle=cudnn_handle)
@@ -1544,6 +1557,11 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        # Block-scaled O epilogue (FROST d128 per-tensor FP8 only): FP4 O + E4M3
+        # scales per 16 d (16) or E4M3 O + UE8M0 scales per 32 d (32), with the
+        # sf_o output. exec_sdpa_fp8 folds it to 0 on configs the epilogue does
+        # not serve (paged / ragged / d != 128), so the draw stays a plain fp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         # KNOWN GAP: a dense "padded" draw currently runs as full — exec_sdpa_fp8
