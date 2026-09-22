@@ -23,7 +23,8 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
      softmax row are evaluated on the FMA pipe by ``exp2_emul_pair`` (blocks of
      4, spread over both P chunks) so the MUFU pipe stops pacing the tile --
      97 instead of 129 MUFU.EX2 per row per KV step.  The Amax_O fold is
-     ``fmax_f32`` (FMNMX3).  Together +10.9 % at S=16K on B200 (see below).
+     ``fmax_f32`` (FMNMX3).  Together +7.83 % vs develop at B=1 H=24/8 S=16K
+     dense on B200 (see below).
      The split is **cc 10.0 only**: ``PARAMS.exp2_fma_split`` (auto-set from
      the build device) folds it out on every other cc, where MUFU.EX2 runs at
      twice B200's rate and the same split loses (``_E2E_ENABLED``).
@@ -208,7 +209,12 @@ SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
 #   (16, 8,  96)  48 columns in blocks of 8                    -5.34 %
 #   (16, 8, 128)  64 columns in blocks of 8                    -8.73 %
 # and (16, 8, 72) itself is +8.15 % over the all-MUFU kernel; the shipped pattern is +9.73 % over
-# it (+10.88 % with the Amax_O fold below; 1.885 vs 2.090 ms, 0.9 % behind the backend kernel).
+# it (both on the pre-#1169 base 9b9f3278 the sweep ran on -- the table's DELTAS are what carries).
+# The FINAL tree vs develop (e14c9cbe; B200, A/B/A x3, CUPTI medians, one process per slot):
+# +7.83 % at B=1 H=24/8 S=16K dense (2.217 -> 2.056 ms), +7.05 % at S=8K, +8.41 % at S=32K,
+# +8.97 % at H=128/128 S=16K, +9.56 % causal at a pinned scheduler policy -- 6.6 % of time behind
+# the cuDNN backend kernel on develop's base.  The remaining gap is the #1169 credit arrive, which
+# PREDICATED_CREDIT_ARRIVE (above) restores to the branch form on the unmasked specialization.
 # 32 columns is the count (24 and 40 both lose), blocks of 4 over both chunks is the shape.  At
 # TILE_N=128 the shipped pattern emulates columns 12..15 of every 16 (8 blocks): MUFU.EX2 per row
 # per step 129 -> 97; sm_100a SASS of the whole kernel MUFU.EX2 258 -> 194.  Numerics: the
@@ -223,7 +229,7 @@ _E2E_LIMIT = CFG.TILE_N
 # its sign follows the part's MUFU rate.  MEASURED (2026-09-22, one CTA of independent ex2 / fma chains timed with
 # %clock64, so every op is issue-bound): MUFU.EX2 = 16 elements/clk/SM on sm_100a (B200) and 32 on sm_107a
 # (Rubin), the FP32 pipe ~120 lanes/clk/SM on both.  So an emulated exp2 (6 packed FP32 / INT instructions per
-# pair) costs 0.96x the MUFU time it frees on B200 (+10.9 % here) and 1.99x on Rubin, where the sm107 port of the
+# pair) costs 0.96x the MUFU time it frees on B200 (+7.83 % vs develop here, S=16K) and 1.99x on Rubin, where the sm107 port of the
 # same pattern MEASURED -9..-10 %.  DOCUMENTED (NVIDIA's Blackwell Ultra material, FlashAttention-4 s2.2): sm_103a
 # (GB300) doubles SFU exp2 throughput to 32/clk/SM -- the Rubin regime -- so on cc 10.3 the split is INFERRED to
 # lose and stays OFF.  ``PARAMS.exp2_fma_split`` is auto-set by the adapter from the BUILD device

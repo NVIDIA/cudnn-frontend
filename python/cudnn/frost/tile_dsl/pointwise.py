@@ -408,9 +408,13 @@ def exp2_emul_pair(x_lo, x_hi):
     row.  On SM100 the MUFU pipe (4 lanes/clk/SMSP) is then the longest single pipe of the
     softmax warps while the FP32 pipe has slack, so evaluating a compile-time subset of the
     columns here (6 packed FP32/INT instructions per PAIR instead of one MUFU per element)
-    shortens the burst.  The cuDNN backend kernel splits its exps the same way; the sm100 d128
-    MXFP8 prefill (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) is the shipped consumer:
-    +10.9 % at S=16K on B200 together with its Amax_O fold.
+    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Three sm100
+    prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
+    ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
+    d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
+    dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
+    +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
+    H=128/128).
 
     What it computes (bit for bit the backend's split, all ops ``.ftz``):
 

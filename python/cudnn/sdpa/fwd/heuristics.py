@@ -553,6 +553,9 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # LPT_L2 +0.5..+0.9 % at S=16K, S=8K / 32K inside 1.5x their control) and
         # keeps the L2-budget arm below, unchanged; the other MXFP8 flavors
         # (d192x128 / d256 / d512) and the Rubin rows are unmeasured here and unchanged.
+        # Row-keyed (``caps.sm_lo == 100`` names a cc RANGE, not a device): this also
+        # proposes LPT on cc 10.3, where LPT vs LPT_L2 is unmeasured; it follows the
+        # existing B200-measured precedent of the decode-tile arm above, keyed the same way.
         primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by

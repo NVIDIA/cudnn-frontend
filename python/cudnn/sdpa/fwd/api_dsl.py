@@ -383,7 +383,11 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
 # costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, so the split
 # stays off there until a GB300 A/B says otherwise.  Positive gate on the measured cc, never a negative gate on
-# 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.
+# 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with
+# the gate OFF the three kernels trace develop's exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at both
+# softmax sites), and the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold
+# (``fmax_f32``, not behind this gate -- MEASURED +0.5..+1.8 % on B200, unmeasured on GB300), so a cc 10.3 build of
+# that kernel is develop's exp burst plus the fold, not develop's kernel byte for byte.
 #
 # Per kernel, keyed by (quantization kind, flavor) -- the spelling ``_load_sm100_kernel_module`` selects the
 # kernel file by.  ON = MEASURED wins on B200 (A/B/A x3, CUPTI medians, 2026-09-22): ("mxfp8", (128, 128))
