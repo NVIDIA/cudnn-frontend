@@ -458,6 +458,47 @@ def test_first_execute_under_capture(family):
 
 
 @pytest.mark.L0
+def test_retain_workspace_guards_device_and_keeps_eager_buffers_until_their_launch_completes():
+    """R2 lifetime for the caller's workspace: a CPU or other-device buffer is refused before any
+    pointer is taken; a torch buffer is record_stream'ed; an immutable-framework buffer (stand-in:
+    a non-torch object) is held by the API until an event recorded on its launch stream after the
+    launch has completed -- overlapping calls keep every buffer, not just the latest one."""
+    from cudnn.gemm.cutedsl.grouped.backend_utils import retain_workspace
+
+    class _Desc:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    class _Api:
+        a_desc = _Desc()
+
+    class _EagerBuffer:  # what a JAX array looks like to retain_workspace: a device and nothing torch
+        def __init__(self, device):
+            self.device = device
+
+    api = _Api()
+    stream = torch.cuda.current_stream().cuda_stream
+    with pytest.raises(ValueError, match="CUDA buffer"):
+        retain_workspace(api, torch.empty(64, dtype=torch.uint8), stream)
+    with pytest.raises(ValueError, match="plan's device"):
+        retain_workspace(api, _EagerBuffer(torch.device("cuda", 7)), stream)
+
+    ws = torch.empty(64, dtype=torch.uint8, device="cuda")
+    retain_workspace(api, ws, stream)  # torch: record_stream, nothing retained
+    assert not hasattr(api, "_live_workspaces")
+
+    buffers = [_EagerBuffer(_Desc.device) for _ in range(3)]
+    torch.cuda._sleep(2_000_000_000)  # a long kernel in flight on the launch stream: nothing recorded behind it completes yet
+    for b in buffers:
+        retain_workspace(api, b, stream)
+    assert [e.buffer for e in api._live_workspaces] == buffers, "every in-flight buffer is held, not only the latest"
+    assert all(e.event is not None for e in api._live_workspaces[:-1]) and api._live_workspaces[-1].event is None
+    torch.cuda.synchronize()
+    late = _EagerBuffer(_Desc.device)
+    retain_workspace(api, late, stream)  # every earlier launch has completed: their buffers are released
+    assert [e.buffer for e in api._live_workspaces] == [late]
+
+
+@pytest.mark.L0
 def test_wgrad_expert_ptrs_rejects_overlapping_or_strided_slices():
     """The discrete kernels read each expert's slice through one contiguous (hidden, intermediate)
     descriptor: a view whose slices are strided or overlap is refused before a pointer table is built."""
