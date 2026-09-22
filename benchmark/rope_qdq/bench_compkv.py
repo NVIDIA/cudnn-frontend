@@ -418,9 +418,10 @@ def main():
                         for index, actual in enumerate(buffers):
                             key = f"{tag}/{name}/{role}/{mode}/{index}"
                             metrics = compare(actual, expected)
-                            assert bool((storage[index][:64] == 123).all() and (storage[index][-64:] == 123).all())
-                            metrics["guards_unchanged"] = True
+                            metrics["guards_unchanged"] = bool((storage[index][:64] == 123).all() and (storage[index][-64:] == 123).all())
                             result["checks"][key] = metrics
+                            if not metrics["guards_unchanged"]:
+                                raise RuntimeError(f"output guards changed: {key}")
                             passed[role] &= metrics["passed"]
                             if not metrics["passed"] and role not in case["failures"]:
                                 path = args.output.with_name(args.output.stem + "." + tag + "." + role + ".failure.pt")
