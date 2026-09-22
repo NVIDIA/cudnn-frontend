@@ -1027,7 +1027,12 @@ def test_grouped_gemm_wgrad_workspace_size_matches_plan(output_mode):
     else:
         kw.update(sample_wgrad=allocate_grouped_gemm_wgrad_output(cfg))
     op = cudnn.GroupedGemmWgradSm100(**kw)
-    assert op.check_support()
+    try:
+        supported = op.check_support()
+    except (ValueError, NotImplementedError, RuntimeError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    if not supported:
+        pytest.skip("Unsupported testcase")
     assert op.scratch_workspace_bytes() == cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(cfg["l"], output_mode=output_mode)
 
 

@@ -774,7 +774,8 @@ or `make_fake_compact_tensor(dtype, sym-shape, stride_order=..., assumed_align=.
 `causal_conv1d_update_sm100/api.py`, `hstu/hstu_lmsd/api.py` workspace descs;
 module-level: `flex_attention/dispatch.py::_make_fake_bwd_aux_tensors`,
 `_make_fake_fp32_scratch`, `_make_fake_semaphore`, `_make_fake_scheduler_counter`);
-pointer slot -> `cute.runtime.make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align)`
+pointer slot -> the R3 stand-in, `cute.runtime.make_ptr(dtype, <aligned dummy address>,
+cute.AddressSpace.gmem, assumed_align=...)` (e.g. `make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)`)
 (`_FakeTensor.iterator` is rejected by the DSL). The fake must reproduce the
 layout the launch-time conversion yields — dynamic extents, static leading
 stride 1, the compact path's divisibility, and a static stride 0 on a size-1
