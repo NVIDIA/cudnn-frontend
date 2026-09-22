@@ -724,17 +724,19 @@ def launch_topk_kernel(
         )
         return
 
-    # The kernel indexes the scratch with int32: launch per row chunk that fits.
+    # The kernel indexes the scratch with int32: launch per row chunk that fits
+    # (chunk_rows * elems_per_row - 1 must stay <= int32_max).
     if elems_per_row > 0:
-        max_chunk_rows = int32_max // elems_per_row + 1
+        max_chunk_rows = (int32_max + 1) // elems_per_row
     else:
         max_chunk_rows = num_rows
     align_rows = max(1, BUFFER_ALIGN // input_values.element_size())
     row_step = (next_n * align_rows) // math.gcd(next_n, align_rows)
     if max_chunk_rows < row_step:
-        chunk_rows = num_rows
-    else:
-        chunk_rows = (max_chunk_rows // row_step) * row_step
+        raise ValueError(
+            f"num_cols={num_cols} makes one aligned row chunk ({row_step} rows) exceed the int32 scratch indexing limit; reduce num_cols or next_n"
+        )
+    chunk_rows = (max_chunk_rows // row_step) * row_step
     for row_lo in range(0, num_rows, chunk_rows):
         row_hi = min(row_lo + chunk_rows, num_rows)
         batch_lo = row_lo // next_n

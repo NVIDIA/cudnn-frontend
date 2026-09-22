@@ -159,6 +159,37 @@ def _dense_shapes(
     return False, batch, batch * seqlen_q, batch * seqlen_k, heads, head_dim, seqlen_q, seqlen_k
 
 
+def _check_execute_signature(wrapper_name: str, *entries) -> None:
+    """Validate runtime tensors against the descriptors captured at plan-build
+    time, before any kernel launch.
+
+    Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
+    directly-built/exported plan with a tensor whose dtype, shape, or
+    stride/layout differs from what it was compiled for — kernel 1 overwrites
+    ``attn_score`` in place, so a mismatch must raise *before* the pipeline
+    starts (no fail-dirty).
+    """
+    for tensor, desc, name in entries:
+        if desc is None:
+            continue
+        if tensor.dtype != desc.dtype:
+            raise ValueError(
+                f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use {wrapper_name}) for a different signature."
+            )
+        tensor_shape = tuple(tensor.shape)
+        desc_shape = tuple(desc.shape)
+        if tensor_shape != desc_shape:
+            raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
+        # Compare layouts with the same unit-dim canonicalization the framework
+        # uses for compile-equality (extent-1 dims carry an unobservable stride):
+        # the compiled kernel bakes in the sample stride/layout.
+        tensor_stride = tuple(tensor.stride())
+        if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
+            desc_shape, tuple(desc.stride)
+        ):
+            raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
+
+
 class IndexerBackward(APIBase):
     """End-to-end indexer backward (staged pipeline).
 
@@ -512,36 +543,7 @@ class IndexerBackward(APIBase):
         return counter + accumulator
 
     def _check_execute_signature(self, *entries) -> None:
-        """Validate runtime tensors against the descriptors captured at
-        plan-build time, before any kernel launch.
-
-        Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
-        directly-built/exported plan with a tensor whose dtype, shape, or
-        stride/layout differs from what it was compiled for — kernel 1
-        overwrites ``attn_score`` in place, so a mismatch must raise *before*
-        the pipeline starts (no fail-dirty).
-        """
-        for tensor, desc, name in entries:
-            if desc is None:
-                continue
-            if tensor.dtype != desc.dtype:
-                raise ValueError(
-                    f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use indexer_backward_wrapper) for a different signature."
-                )
-            tensor_shape = tuple(tensor.shape)
-            desc_shape = tuple(desc.shape)
-            if tensor_shape != desc_shape:
-                raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
-            # Compare layouts with the same unit-dim canonicalization the
-            # framework uses for compile-equality (extent-1 dims carry an
-            # unobservable stride): the compiled kernel bakes in the sample
-            # stride/layout, so a different stride would run the kernel against
-            # a layout it was not compiled for.
-            tensor_stride = tuple(tensor.stride())
-            if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
-                desc_shape, tuple(desc.stride)
-            ):
-                raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
+        _check_execute_signature("indexer_backward_wrapper", *entries)
 
     def execute(
         self,
@@ -756,6 +758,22 @@ class DenseIndexerBackward(APIBase):
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
         launch_stream = _resolve_stream(current_stream)
+        # A directly-built plan may be handed tensors it was not compiled for:
+        # validate every runtime tensor against its descriptor before the carve
+        # and the first (in-place) kernel.
+        _check_execute_signature(
+            "dense_indexer_backward_wrapper",
+            (index_q, self.iq_desc, "index_q"),
+            (weights, self.w_desc, "weights"),
+            (index_k, self.ik_desc, "index_k"),
+            (d_index_q, self.diq_desc, "d_index_q"),
+            (d_weights, self.dw_desc, "d_weights"),
+            (d_index_k, self.dik_desc, "d_index_k"),
+            (attn_score, self.attn_desc, "attn_score"),
+            (attn_l1norm, self.attn_denom_desc, "attn_l1norm"),
+            (index_score, self.idx_score_desc, "index_score"),
+            (index_lse, self.idx_lse_desc, "index_lse"),
+        )
         grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
         grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 

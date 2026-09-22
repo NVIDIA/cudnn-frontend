@@ -409,6 +409,8 @@ class SlidingWindowAttention(APIBase):
             raise ValueError(f"SlidingWindowAttention: {name} must be a CUDA tensor, got device {tensor.device}")
         if tuple(tensor.shape) != (b + 1, 1, 1, 1):
             raise ValueError(f"SlidingWindowAttention: {name} must have shape (b+1, 1, 1, 1) = {(b + 1, 1, 1, 1)}, got {tuple(tensor.shape)}")
+        if not tensor.is_contiguous():  # the graph declares stride (1, 1, 1, 1); a strided view would be read as packed
+            raise ValueError(f"SlidingWindowAttention: {name} must be contiguous, got strides {tuple(tensor.stride())}")
 
     def execute(
         self,
@@ -604,6 +606,10 @@ def sliding_window_attention_wrapper(
     )
     ragged_given = [q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, stats_ragged_offset_tensor]
     if q_tensor.ndim == 3 and all(t is None for t in ragged_given):
+        if seq_len_q_tensor is None or seq_len_kv_tensor is None:
+            raise ValueError(
+                "sliding_window_attention_wrapper: seq_len_q_tensor and seq_len_kv_tensor are required for the T,H,D layout when no ragged-offset tensors are supplied"
+            )
         with torch.cuda.device(q_tensor.device), stream_context(stream, q_tensor.device):
             (
                 q_ragged_offset_tensor,
