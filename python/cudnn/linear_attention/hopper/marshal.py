@@ -20,6 +20,8 @@ Three rules this file exists to keep:
   nothing downstream re-derives it.
 * every copy is issued ON THE EXECUTION STREAM. A torch op runs on torch's
   ambient stream, which has no dependency on the stream the kernel launches on.
+  A default-stream handle (0, 1, 2) maps to torch's own default stream rather
+  than an ``ExternalStream``: see :func:`stream_ctx`.
 * scratch is PER EXECUTION, never cached on the plan. Two threads may execute
   one compiled graph concurrently with different operands; a buffer owned by
   the plan lets one call's conversion land in the other's launch. Nothing is
@@ -64,10 +66,12 @@ def _torch_dtype(name: str):
     return {"float32": torch.float32, "bfloat16": torch.bfloat16, "int32": torch.int32}[name]
 
 
-def _stream_ctx(stream: int):
-    import torch
+def stream_ctx(stream: int, device=None):
+    """``torch.cuda.stream`` context for the execution stream ``stream`` (Rule 5:
+    default-stream sentinels map to torch's default stream, see ``cudnn._torch_stream``)."""
+    from cudnn._torch_stream import stream_context
 
-    return torch.cuda.stream(torch.cuda.ExternalStream(int(stream)))
+    return stream_context(stream, device)
 
 
 def packed(dim, stride) -> bool:
@@ -117,9 +121,9 @@ def resolve_inputs(
         # One copy per port fixes layout and dtype together, on the execution
         # stream, into a buffer this call owns.
         keepalive: List = []
-        with _stream_ctx(stream):
-            for name, view, target in fixups:
-                source = torch.from_dlpack(view)
+        sources = [(name, torch.from_dlpack(view), target) for name, view, target in fixups]
+        with stream_ctx(stream, sources[0][1].device):
+            for name, source, target in sources:
                 dtype = _torch_dtype(target) if target else source.dtype
                 buf = torch.empty(source.shape, dtype=dtype, device=source.device)
                 buf.copy_(source)
@@ -142,7 +146,7 @@ def stage_output(view, target, stream: int) -> Tuple[int, Optional[Any], Optiona
     if buffers.dtype_name(view) == target:
         return int(view.data_ptr()), None, None
     destination = torch.from_dlpack(view)
-    with _stream_ctx(stream):
+    with stream_ctx(stream, destination.device):
         buf = torch.empty(destination.shape, dtype=_torch_dtype(target), device=destination.device)
     return int(buf.data_ptr()), buf, destination
 
@@ -151,5 +155,5 @@ def write_back(staged: Optional[Any], destination: Optional[Any], stream: int) -
     """Copy a staged output back into the caller's buffer, on the execution stream."""
     if staged is None or destination is None:
         return
-    with _stream_ctx(stream):
+    with stream_ctx(stream, destination.device):
         destination.copy_(staged)

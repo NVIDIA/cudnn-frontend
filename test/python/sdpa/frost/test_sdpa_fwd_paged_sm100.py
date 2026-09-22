@@ -7,13 +7,16 @@ The graph is cuDNN's own paged-cache contract — ``graph.sdpa(..., k=<page pool
 v=<page pool>, use_padding_mask=True, seq_len_q=, seq_len_kv=,
 paged_attention_k_table=, paged_attention_v_table=,
 paged_attention_max_seq_len_kv=)`` — served by ``sdpa_fwd_prefill_sm100``
-through the d128 kernel's ``PAGED_KV`` specialization: block-table indirection on
-the K/V TMA loads, HND and NHD page layouts, per-batch lengths read on device,
-KV split + combine.  The reference gathers each sequence's pages in torch and
-runs fp32 attention over the live tokens.  Attention sinks and left sliding
-windows (bottom-right causal, the decode spelling) ride the same graph: the sink
-is an epilogue fold and the window only moves the first KV tile, so neither
-touches the paged loader -- but the pair had never been compiled together.
+through the d128 / d192x128 / d256 kernels' ``PAGED_KV`` specialization:
+block-table indirection on the K/V TMA loads, HND and NHD page layouts,
+per-batch lengths read on device, KV split + combine.  The K and V pools may
+differ in row width (d192x128: a 192-wide K pool and a 128-wide V pool); mixed
+head dims land on the smallest covering flavor.  The reference gathers each
+sequence's pages in torch and runs fp32 attention over the live tokens.
+Attention sinks and left sliding windows (bottom-right causal, the decode
+spelling) ride the same graph: the sink is an epilogue fold and the window only
+moves the first KV tile, so neither touches the paged loader -- but the pair had
+never been compiled together.
 
 The second half drives the kernel template directly (like the split-KV suite)
 for the geometry the heuristic would not pick on its own: forced splits with
@@ -26,7 +29,7 @@ import os
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import launch_f16, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -84,20 +87,23 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
-    [num_pages, H_kv, page_size, D]-dim views the graph declares."""
+    [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v``
+    (default ``d``) is the V pool's row width: the K and V pools may differ
+    (MLA-style d_qk != d_v — the d192x128 flavor's contract)."""
     torch.manual_seed(seed)
     dev = "cuda"
+    d_v = d if d_v is None else d_v
     num_pages = B * max_pages + 5
     if hnd:
         k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool, v_pool
     else:
         k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
+        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype)
         k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
     bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
@@ -122,6 +128,7 @@ def _run_graph(
     window_left=None,
     causal_br=False,
     pack_gqa=None,
+    d_v=None,
 ):
     """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
 
@@ -131,16 +138,19 @@ def _run_graph(
     diagonal (``diagonal_band_right_bound=0``, BOTTOM_RIGHT) and ``window_left`` adds
     ``diagonal_band_left_bound`` to it -- the decode spelling FlashInfer uses (a left
     window alone with BOTTOM_RIGHT has no right bound and the row declines it).
-    ``pack_gqa`` pins the packed / unpacked plan."""
+    ``pack_gqa`` pins the packed / unpacked plan. ``d_v`` (default ``d``) is the V
+    pool's row width: the K and V pools may differ (MLA-style d_qk != d_v -- the
+    d192x128 flavor's contract). ``want_split`` pins the split / unsplit leg."""
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev = "cuda"
+    d_v = d if d_v is None else d_v
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
-    o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, s_q, H, d_v, device=dev, dtype=dtype).transpose(1, 2)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     slk = seq_lens.view(B, 1, 1, 1)
     slq = torch.full((B, 1, 1, 1), s_q, dtype=torch.int32, device=dev)
@@ -181,7 +191,7 @@ def _run_graph(
         kw["sink_token"] = snk
         vp[snk] = sink_gpu
     o, st = g.sdpa(**kw)
-    o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
     stats_gpu = None
     if stats:
         stats_gpu = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
@@ -245,10 +255,25 @@ def _run_graph(
 @pytest.mark.L0
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
 @pytest.mark.parametrize("page_size", [16, 128])
-def test_paged_graph_matches_reference(hnd, page_size):
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192x128"])
+def test_paged_graph_matches_reference(dims, hnd, page_size):
     """Mixed lengths incl. 0 and 1, GQA 8:2 (PackGQA), a tile-unaligned tail and a
-    length ending exactly on a page/tile boundary; Stats requested."""
-    _run_graph(5, 8, 2, D, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, stats=True)
+    length ending exactly on a page/tile boundary; Stats requested.  (192, 128)
+    is the native d192x128 flavor: a 192-wide K pool and a 128-wide V pool
+    behind separate block tables."""
+    d_qk, d_v = dims
+    _run_graph(5, 8, 2, d_qk, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, stats=True, d_v=d_v)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dims", [(256, 128), (64, 192), (136, 72)], ids=["d256x128", "d64x192", "d136x72"])
+def test_paged_graph_mixed_head_dims_ride_envelopes(dims):
+    """Mixed head dims land on the smallest covering flavor — (256, 128) and
+    (64, 192) on d256, (136, 72) on d192x128 — with the pools zero-padded by TMA
+    past their real widths.  The earlier gate declined every graph with exactly
+    one dim above 128 (INVERTED from a decline)."""
+    d_qk, d_v = dims
+    _run_graph(3, 8, 2, d_qk, 32, 40, [1000, 1, 1279], hnd=d_qk > d_v, stats=True, d_v=d_v)
 
 
 @pytest.mark.L0
@@ -437,6 +462,18 @@ def test_paged_graph_d256_sink(hnd, s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("s_q", [1, 4])
+def test_paged_graph_d192x128_sink(hnd, s_q):
+    """The d192x128 flavor's PAGED_KV specialization with the sink fold: a 192-wide K
+    pool and a 128-wide V pool, at S_q = 1 and as a four-token chunk under the
+    bottom-right causal diagonal (the one-key batch leaves its first rows keyless:
+    LSE = sink).  The sink fold (#1095) and the paged loader (this PR) landed
+    separately on this kernel; this is the first graph that compiles them together."""
+    _run_graph(3, 8, 2, 192, 32, 40, [1000, 1, 1279], hnd, s_q=s_q, sink=True, causal_br=s_q > 1, stats=True, d_v=128)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q", [2, 4])
 def test_paged_graph_sink_multi_token_causal_br(s_q):
     """S_q in {2, 4} (speculative / multi-token decode) with the bottom-right causal
@@ -487,11 +524,13 @@ def test_paged_graph_declines_off_contract():
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
-    def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False):
+    def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False, d_v=None):
         B, max_pages = 2, 8
         dev = "cuda"
-        _, _, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, torch.float16)
+        d_v = d if d_v is None else d_v
+        _, _, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, torch.float16, d_v=d_v)
         q_gpu = torch.randn(B, 1, H, d, device=dev, dtype=torch.float16).transpose(1, 2)
+        o_gpu = torch.empty(B, 1, H, d_v, device=dev, dtype=torch.float16).transpose(1, 2)
         g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
         q, k, v, tk, tv = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c), g.tensor_like(bt), g.tensor_like(bt)
         lens = torch.full((B, 1, 1, 1), 10, dtype=torch.int32, device=dev)
@@ -514,7 +553,7 @@ def test_paged_graph_declines_off_contract():
             paged_attention_max_seq_len_kv=max_pages * P,
             **kw,
         )
-        o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+        o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
         try:
             g.validate()
             g.build_operation_graph()
@@ -535,7 +574,14 @@ def test_paged_graph_declines_off_contract():
     # validator no longer rejects sink_token at s_q == 1).
     assert _offers(_build(16, sink=True)), "paged KV with an attention sink at decode must be offered"
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d256 flavors only"
+    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes):
+    # d192x128 is wired, and mixed dims that ride the d256 envelope are served
+    # (all three INVERTED from declines); a d512-envelope selection stays out.
+    assert _offers(_build(16, d=192, d_v=128)), "paged KV is wired on the d192x128 flavor"
+    assert _offers(_build(16, d=256, d_v=128)), "(256, 128) rides the d256 envelope"
+    assert _offers(_build(16, d=64, d_v=192)), "(64, 192) rides the d256 envelope"
+    assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d192x128 / d256 flavors only"
+    assert not _offers(_build(16, d=512, d_v=128)), "(512, 128) selects the d512 flavor, which is not wired"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
 
 
@@ -546,7 +592,10 @@ def test_paged_graph_declines_off_contract():
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, expect_pack_g=None):
+_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "prefill_d256_f16.py"}
+
+
+def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):
     import cutlass
     import cuda.bindings.driver as cuda_driver
 
@@ -556,19 +605,20 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     dev = "cuda"
+    d_v = d if d_v is None else d_v
     G = H // KH
     # The d128 / d256 f16 kernels pack the largest divisor of G that divides the
     # 128-row tile (partial PackGQA); 1 means nothing packs and the unpacked path serves.
     pack = pack_gqa_group_size(G, 128, partial=True) > 1
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt4 = _pools(B, KH, d, P, max_pages, hnd, dtype)
+    k_pool, v_pool, k_c, v_c, bt4 = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
     bt = bt4.view(B, max_pages)
     q = torch.randn(B, 1, H, d, device=dev, dtype=dtype)
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     # kernel view: [num_pages, page_size, H_kv, d] (a permutation of the container)
     k_view, v_view = k_c.permute(0, 2, 1, 3), v_c.permute(0, 2, 1, 3)
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", f"prefill_d{d}_f16.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", _KERNEL_FILES[d])
     params = TemplateParams(
         dtype_qkv=3 if dtype == torch.float16 else 2,
         seq_kv_lens_present=True,
@@ -584,14 +634,15 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         assert cfg.PACK_G == expect_pack_g, f"PACK_G={cfg.PACK_G} for G={G}, expected {expect_pack_g}"
     mod = load_template(path, params, tag=f"paged_p{P}_s{splits}_c{cta_mma}_g{G if pack else 1}_{dtype}")
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=1, skv=0, d_qk=d, d_v=d, has_lse=True, k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
+    fn = mod.compile(d_qk=d, d_v=d_v, has_lse=True, lse_kind="dense", paged_hnd=k_view.stride(1) < k_view.stride(2))
     # Split partials are fp32 on SM100 (#891); the combine must be compiled for that width.
     from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
 
-    o_p = torch.zeros(splits * B, 1, H, d, device=dev, dtype=_partial_o_dtype(splits, dtype))
+    o_p = torch.zeros(splits * B, 1, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, 1, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k_view,
         v_view,
@@ -607,17 +658,18 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
         **_partial_kwargs(splits, o_p),
         block_table_tensor=bt,
         block_table_v_tensor=bt,
+        page_size=P,
         stream=stream,
     )
     if splits == 1:
         o_out, lse_out = o_p, lse_p
     else:
-        o_out = torch.zeros(B, 1, H, d, device=dev, dtype=dtype)
+        o_out = torch.zeros(B, 1, H, d_v, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, 1, device=dev, dtype=torch.float32)
         cfn = comb.compile(
-            b=B, h=H, sq=1, d_v=d, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
+            b=B, h=H, sq=1, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
         )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, 1, d), cutlass.Int32(splits), stream=stream)
+        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, 1, d_v), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     ref_o, ref_lse = _ref(q[:, 0], k_pool, v_pool, bt, seq_lens, hnd, scale)
     live = seq_lens > 0
@@ -649,6 +701,17 @@ def test_paged_kernel_d256(page_size):
     """The d256 (Qwen) f16 flavor carries the same PAGED_KV specialization: cga2
     (K box = 64 rows per CTA), forced 4 splits with one empty range."""
     _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=4, cta_mma=2, d=256)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("page_size,cta_mma,splits", [(16, 2, 4), (128, 2, 4), (32, 1, 1)], ids=["p16_cga2_split4", "p128_cga2_split4", "p32_cga1"])
+def test_paged_kernel_d192_d128(page_size, cta_mma, splits):
+    """The d192x128 f16 flavor's PAGED_KV specialization: a 192-wide K pool (three
+    128 B D-subtiles per box) and a 128-wide V pool (two) behind separate block
+    tables; cga2 (K box = 64 rows per CTA) with 4 forced splits and one empty
+    range, and cga1 (K box = 128 rows, STAGES_KV=1) unsplit — d192 split-KV is
+    cga2-only by its config rule."""
+    _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=splits, cta_mma=cta_mma, d=192, d_v=128)
 
 
 @pytest.mark.L0
@@ -730,47 +793,69 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
 
 
-@pytest.mark.L0
-@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-def test_paged_graph_thd_queries(hnd):
+def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None):
+    """One packed sequence's rows against its own pages: ``q_seq`` [S_q, H, d],
+    ``pages`` that sequence's block-table row, ``L`` its live KV length.  Full
+    attention over the L keys, or (``causal_window`` = W) top-left causal with a
+    left window -- row r sees keys r - W <= j <= r.  Returns O [S_q, H, D_v] fp32."""
+    S_q, H, d = q_seq.shape
+    KH = k_pool.shape[1] if hnd else k_pool.shape[2]
+    P = k_pool.shape[2] if hnd else k_pool.shape[1]
+    D_v = v_pool.shape[-1]
+    idx = pages[: (L + P - 1) // P].long()
+    k, v = k_pool[idx], v_pool[idx]
+    if hnd:
+        k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+    k = k.reshape(-1, KH, d)[:L].repeat_interleave(H // KH, dim=1).float()
+    v = v.reshape(-1, KH, D_v)[:L].repeat_interleave(H // KH, dim=1).float()
+    s = torch.einsum("qhd,lhd->hql", q_seq.float(), k) * scale
+    if causal_window is not None:
+        r = torch.arange(S_q, device=s.device).view(-1, 1)
+        j = torch.arange(L, device=s.device).view(1, -1)
+        s = s.masked_fill((j > r) | (j < r - causal_window), float("-inf"))
+    return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
+
+
+def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
-    ``seq_len_q``) attending K/V page pools through block tables: each sequence's
-    q tokens see its own live KV pages. Only Q/O are ragged — the pools are
-    ordinary dense tensors — and the THD scheduler walks the Q units while the
-    KV side comes from ``seq_len_kv`` + the tables."""
+    ``seq_len_q``) attending K/V page pools through block tables, optionally under
+    top-left causal + a left window of ``causal_window`` keys.  Checks every packed
+    row against the fp32 reference; returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
-    H, KH, d, P, max_pages = 8, 2, D, 16, 20
-    q_lens = [37, 130, 5]
-    kv_lens = [300, 77, 129]
+    d, d_v = dims
     B, T, S_max = len(q_lens), sum(q_lens), max(q_lens)
     cu = [0]
     for s in q_lens:
         cu.append(cu[-1] + s)
     scale = 1.0 / math.sqrt(d)
-    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype)
+    k_pool, v_pool, k_c, v_c, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, d_v=d_v)
     torch.manual_seed(7)
     q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
     stride = (S_max * H * d, d, H * d, 1)
+    o_stride = (S_max * H * d_v, d_v, H * d_v, 1)
     q_stor = torch.zeros(B * S_max * H * d, device=dev, dtype=dtype)
     q_stor[: T * H * d] = q_pk.reshape(-1)
     q_gpu = q_stor.as_strided((B, H, S_max, d), stride)
-    o_stor = torch.zeros(B * S_max * H * d, device=dev, dtype=dtype)
-    o_gpu = o_stor.as_strided((B, H, S_max, d), stride)
+    o_stor = torch.zeros(B * S_max * H * d_v, device=dev, dtype=dtype)
+    o_gpu = o_stor.as_strided((B, H, S_max, d_v), o_stride)
     slq = torch.tensor(q_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     slk = torch.tensor(kv_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     ro = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d).view(B + 1, 1, 1, 1)
+    o_ro = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d_v).view(B + 1, 1, 1, 1)
 
     g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=cudnn.data_type.HALF, name="q")
     k, v = g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
-    qro, oro = g.tensor_like(ro), g.tensor_like(ro)
+    qro, oro = g.tensor_like(ro), g.tensor_like(o_ro)
     tq.set_ragged_offset(qro)
+    # cuDNN's sliding_window_length counts the diagonal: offset W == length W + 1.
+    band = {} if causal_window is None else dict(use_causal_mask=True, sliding_window_length=causal_window + 1)
     o, _ = g.sdpa(
         name="sdpa",
         q=tq,
@@ -784,30 +869,88 @@ def test_paged_graph_thd_queries(hnd):
         paged_attention_k_table=tk,
         paged_attention_v_table=tv,
         paged_attention_max_seq_len_kv=max_pages * P,
+        **band,
     )
-    o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(stride))
+    o.set_output(True).set_dim([B, H, S_max, d_v]).set_stride(list(o_stride))
     o.set_ragged_offset(oro)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    plan = select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        g.execute({tq: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, qro: ro, oro: ro, o: o_gpu}, ws)
+        g.execute({tq: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, qro: ro, oro: o_ro, o: o_gpu}, ws)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
-    o_out = o_stor[: T * H * d].reshape(T, H, d).float()
-    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device=dev)
+    o_out = o_stor[: T * H * d_v].reshape(T, H, d_v).float()
+    assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
-        for r in range(q_lens[b]):
-            q_row = q_pk[cu[b] + r].unsqueeze(0)  # [1, H, d] -> batch of one
-            ref_o, _ = _ref(q_row, k_pool, v_pool, bt.view(B, max_pages)[b : b + 1], kv_lens_t[b : b + 1], hnd, scale)
-            torch.testing.assert_close(o_out[cu[b] + r], ref_o[0], atol=2e-2, rtol=0)
+        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window)
+        torch.testing.assert_close(o_out[cu[b] : cu[b + 1]], ref_o, atol=2e-2, rtol=0)
+    return plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192x128"])
+def test_paged_graph_thd_queries(dims, hnd):
+    """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
+    ``seq_len_q``) attending K/V page pools through block tables: each sequence's
+    q tokens see its own live KV pages. Only Q/O are ragged — the pools are
+    ordinary dense tensors — and the THD scheduler walks the Q units while the
+    KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
+    kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
+    _run_thd_graph(dims, hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129])
+
+
+# Left-window offset W for the THD + causal cases below.  Wide enough that the
+# d192 kernel's one-sided band geometry holds at both cgas (_SWA_ONE_SIDED_GEOMETRY:
+# W >= TILES_Q * TOKENS_PER_TILE * CTA_MMA + TILE_N - 2 = 2 * 128 * 2 + 126 = 638 at
+# cga2; THD-varlen never packs GQA, so TOKENS_PER_TILE is the full tile), i.e. the
+# DENSE THD twin of each case would take the predecoded scheduler.
+_THD_SWA_W = 640
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(8, 2), (8, 8)], ids=["gqa", "mha"])
+def test_paged_graph_thd_queries_causal_left_window(heads):
+    """THD queries over d192x128 pools under top-left causal + a wide left window.
+    Dense THD with this band takes the d192 kernel's predecoded scheduler
+    (_PREDECODE_THD_SWA_SEGMENTS: the TMA-LDG warp's next-tile KV bounds come from
+    decoded SMEM, no eff_seqlen_kv re-resolve on the back-edge); PAGED_KV folds
+    it off because the paged loader needs the live page count for every tile, so
+    this band walks the plain decode path the d128 / d256 flavors use.  The window
+    bites (one sequence longer than W), one sequence has more Q rows than keys,
+    and every row keeps at least one key (no dead rows).  GQA rides unpacked:
+    the config offers no PackGQA under THD-varlen."""
+    H, KH = heads
+    _run_thd_graph((192, 128), True, H=H, KH=KH, max_pages=57, q_lens=[900, 130, 45], kv_lens=[850, 200, 45], causal_window=_THD_SWA_W)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cta_mma", [2, 1], ids=["cga2", "cga1"])
+def test_paged_kernel_d192_thd_swa_predecode_folds_off(cta_mma):
+    """The d192 template's THD + causal + wide-left-window scheduler
+    (_PREDECODE_THD_SWA_SEGMENTS) is compiled in for the dense THD flavor and
+    folded off under PAGED_KV at the same band -- pinned on the module constants
+    so an edit cannot re-enable the predecoded back-edge over pools (d192-only
+    interplay: the d128 / d256 flavors have no predecoded THD + SWA path)."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", _KERNEL_FILES[192])
+    common = dict(dtype_qkv=3, seq_kv_lens_present=True, thd_varlen=True, window_right=0, window_left=_THD_SWA_W, cta_mma=cta_mma)
+    dense = load_template(path, TemplateParams(**common), tag=f"thd_swa_dense_c{cta_mma}")
+    paged = load_template(path, TemplateParams(paged_kv=True, page_size=16, **common), tag=f"thd_swa_paged_c{cta_mma}")
+    assert dense._SWA_ONE_SIDED_GEOMETRY and paged._SWA_ONE_SIDED_GEOMETRY, "the band must be one-sided at this width, or nothing is pinned"
+    assert dense._PREDECODE_THD_SWA_SEGMENTS, "dense THD at this band takes the predecoded scheduler"
+    assert not paged._PREDECODE_THD_SWA_SEGMENTS, "PAGED_KV must fold the predecoded scheduler off (its back-edge never re-resolves eff_seqlen_kv)"
 
 
 @pytest.mark.L0

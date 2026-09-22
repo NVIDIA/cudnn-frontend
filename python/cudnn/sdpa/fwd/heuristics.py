@@ -19,11 +19,13 @@ behind for a caller that autotunes) or ``"FALLBACK"`` (the config expected to
 build where A's choice may not — nothing chosen for speed).
 
 Everything else about the final list — mode blocks, the backend's entries,
-the delegating entry, dedup, the mode strip — is PLACEMENT, and placement is
-not a family opinion: it lives once in ``engines/heuristics._assemble``,
-under the standing assumption that these proposals lead the backend's entries
-(an OSS engine measured behind the backend gets fixed or pulled, not
-demoted).
+the delegating entry, dedup, the mode strip — is PLACEMENT and lives once in
+``engines/heuristics._assemble``. The one placement opinion this family holds
+is WHERE the backend's block goes, and :func:`propose` (the manifest hook)
+states it per measured shard through ``placement.place``: ours first where
+FROST is timed ahead of the backend, the backend's block first where it is
+not. With ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set the caller asked for
+FROST and ours lead everywhere.
 
 Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
 order. Today that is unambiguous in practice — co-eligible cells are the
@@ -41,6 +43,7 @@ the honest answer while nobody has timed it.
 from __future__ import annotations
 
 from dataclasses import replace
+from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import cudnn
@@ -58,8 +61,10 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
+    cga_ctas,
     d192_square_br_as_tl,
     d256_square_br_as_tl,
+    decode_d256_q_tile,
     pack_gqa_group_size,
     pack_gqa_supported,
 )
@@ -278,6 +283,106 @@ def choose_split_kv(
         if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
     return best_split
+
+
+# --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
+# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
+# tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
+# kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
+# streamed by a lone CTA (1.75 us on B200):
+#
+# The share of the device's SMs whose concurrent K/V streams saturate HBM. Past
+# it every CTA slows in proportion to the stream count (the bandwidth is
+# shared), which for an HBM-bound kernel is the same statement as "waves".
+# Fitted on B200 (148 SMs): 64 CTAs x 32 tiles ran 56.9 us (1.78 us/tile,
+# per-CTA-bound), 128 CTAs x 16 tiles 45 us (1.57x per tile), 256 CTAs x 32
+# tiles 184 us (3.2x per tile) -- all consistent with ~81 CTAs.
+_DECODE_TILE_SATURATION_FRACTION = 0.55
+# What a CTA costs beyond its KV loop (Q^T load, prologue, a 16/32-row epilogue).
+_DECODE_TILE_CTA_COST = 1.0
+# A KV tile's cost to a lone CTA on the 32-column tile (S_q x G in (16, 32]:
+# two softmax column groups over the same 128 TMEM lanes, issue-bound where
+# the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
+# against the 16-column tile's 57.1 us. HBM saturates at the same byte rate,
+# so a slower stream also needs proportionally more CTAs to reach it. That
+# tile is compiled but not routed today (the adapter keeps S_q x G in (16, 32]
+# on the prefill tile, config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); its fit
+# stays here so routing it is a one-constant change.
+_DECODE_TILE_WIDE_Q_TILE_COST = 1.6
+# The shared sm100/split_combine pass over a decode-shaped grid: one combine
+# wave, ~6 us measured at b=32 x 32 heads.
+_DECODE_TILE_COMBINE_COST = 3.5
+# What the two-launch split path costs an EAGER caller on the host per
+# graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
+# partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
+# keys serving shape (Python launch path, B200 host), against a 6 us GPU
+# saving. A CUDA-graph replay pays none of it, but a plan cannot know whether
+# it will be captured, so the default CHARGES it -- a split leads only where
+# its GPU saving also covers the eager caller's extra host time -- and the
+# captured caller's optimum (this term at 0) is listed as the runner-up plan.
+_DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
+
+
+def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
+    streams = units * split
+    per_tile = max(tile_cost, streams / (_DECODE_TILE_SATURATION_FRACTION * sm_count))
+    cost = (_ceil_div(kv_tiles, split) + _DECODE_TILE_CTA_COST) * per_tile
+    if split > 1:
+        cost += _DECODE_TILE_COMBINE_COST + launch_cost
+    return cost
+
+
+def choose_decode_tile_split_kv(
+    *,
+    units: int,
+    kv_tiles: int,
+    sm_count: int,
+    q_tile: int = 16,
+    launch_cost: float = _DECODE_TILE_SPLIT_LAUNCH_COST,
+) -> int:
+    """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
+
+    ``units`` is the launch's CTA count before splitting -- batch x KV-head
+    groups (a packed group is one unit, an unpacked head one each);
+    ``kv_tiles`` the 128-key tiles of the declared S_kv; ``q_tile`` the tile's
+    N extent (16 or 32 packed Q rows, :func:`config_sm100.decode_d256_q_tile`).
+
+        streams(s)  = units * s                                   # concurrent K/V streams
+        per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
+        cost(s)     = (ceil(kv_tiles / s) + CTA_COST) * per_tile(s)
+                    + [s > 1] * (COMBINE_COST + launch_cost)
+
+    A lone CTA streams a KV tile at TILE_COST (1 on the 16-column tile, 1.6 on
+    the issue-bound 32-column one); once the streams saturate HBM every CTA
+    slows with their count instead.  What falls out: an under-full launch
+    splits until its streams saturate HBM; a launch already past it never
+    splits (the bytes are the same, only the fixed costs grow); in between,
+    the split must SAVE more than it ADDS.  With the default ``launch_cost``
+    the added part includes the eager caller's second host launch, so on the
+    16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
+    saving for 30 us of host time) stays unsplit while a small batch or a
+    long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
+    whose lone CTA is slow enough that the same shape saves ~32 us -- would
+    split (it is not routed today; see _DECODE_TILE_WIDE_Q_TILE_COST).
+    ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
+    graph.
+
+    Candidates come from :func:`split_kv_candidates`; ties go to the smaller
+    split. Returns 1 for degenerate inputs.
+    """
+    if min(units, kv_tiles, sm_count) <= 0:
+        return 1
+    tile_cost = _DECODE_TILE_WIDE_Q_TILE_COST if q_tile > 16 else 1.0
+    kw = dict(units=units, kv_tiles=kv_tiles, sm_count=sm_count, tile_cost=tile_cost, launch_cost=launch_cost)
+    best, best_cost = 1, _decode_tile_cost(1, **kw)
+    for split in split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles):
+        if split <= 1:
+            continue
+        cost = _decode_tile_cost(split, **kw)
+        if cost < best_cost:
+            best, best_cost = split, cost
+    return best
 
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
@@ -699,6 +804,36 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
 
+def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
+    """Whether the SM100 f16/bf16 row lowers this graph onto the d256 decode tile
+    (sm100/decode_d256_f16.py) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``:
+    the (256, 256) flavor, half inputs, dense (not THD), S_q x packed heads
+    within the tile's N extent, ``pack_g`` being the DECODE tile's group
+    (:func:`_decode_tile_pack_g`).  Rubin has its own row (no decode tile)."""
+    return (
+        caps.sm_lo == 100
+        and caps.sm_hi < 107
+        and not facts.is_fp8
+        and not facts.is_mxfp8
+        and not facts.thd
+        and _selected_d_shape(caps, facts) == (256, 256)
+        and decode_d256_q_tile(facts.s_q, pack_g) > 0
+    )
+
+
+def _decode_tile_pack_g(facts, pack_g: int) -> int:
+    """The heads the DECODE tile packs per token for a set whose prefill-tile
+    group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
+    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    one unit per (KV head, batch) with every head of the group in its 16-column
+    tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
+    the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
+    this launch's geometry: fed that, S_q = 2 x 96/8 (24 packed rows, the
+    prefill tile's graph -- the adapter counts S_q x G) would read as an
+    8-row decode launch and be costed with the decode model."""
+    return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
+
+
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the batch is dense, the graph carries no fused epilogue gate (its per-head
@@ -736,6 +871,63 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
+
+
+def _sm100_f16(caps: Capabilities, facts) -> bool:
+    """The Blackwell datacenter f16 rows below Rubin (the row's capability range,
+    not the device: ``sdpa_fwd_prefill_sm100`` spans cc 10.0-10.6, so B200 and
+    GB300 both take this geometry)."""
+    return 100 <= caps.sm_lo and caps.sm_hi < 107 and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+
+
+def _swa_kv_tiles(facts, *, token_span: int, tile_n: int) -> int:
+    """Maximum issued KV range of this candidate's Q clusters under SWA.
+
+    Mirrors the range, not the element mask: the last Q cluster retains its
+    full token span, including padding, just as compute_kv_loop_bounds does.
+    Distinct Q-start residues repeat after tile_n/gcd(token_span,tile_n)
+    clusters. Within one residue, both unclipped bounds move by whole tiles;
+    their clipped intersection is largest at one of the two integer points
+    nearest its center. Thus planning never scans an unbounded Q sequence.
+    """
+    kv_tiles = _ceil_div(facts.s_kv, tile_n)
+    if facts.window_left is None:
+        return kv_tiles
+    causal = facts.causal or facts.right_band_widening
+    right = facts.right_bound if facts.right_band_widening else 0
+    if facts.padded and facts.bottom_right:
+        # Device KV lengths change the diagonal's tile residue. Bound every
+        # possible alignment without reading a device value on the host.
+        return min(kv_tiles, _ceil_div(token_span + facts.window_left + right + tile_n - 1, tile_n)) if causal else kv_tiles
+    diagonal = facts.s_kv - facts.s_q if facts.bottom_right else 0
+    if not causal:
+        return max(0, kv_tiles - max(0, (diagonal - facts.window_left) // tile_n))
+    q_tiles = _ceil_div(facts.s_q, token_span)
+    period = tile_n // gcd(token_span, tile_n)
+    step = period * token_span // tile_n
+    longest = 0
+    for residue in range(min(period, q_tiles)):
+        lo = (residue * token_span + diagonal - facts.window_left) // tile_n
+        hi = _ceil_div(residue * token_span + diagonal + token_span + right, tile_n)
+        last = (q_tiles - 1 - residue) // period
+        center = max(0, min(last, (kv_tiles - lo - hi) // (2 * step)))
+        for index in (center, min(last, center + 1)):
+            longest = max(longest, min(kv_tiles, hi + index * step) - max(0, lo + index * step))
+    return longest
+
+
+def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *, physical: bool = True) -> _SplitKvLaunch:
+    """The launch the wave-cost model sees. ``physical=False`` counts the MMA
+    width per cluster (the count the model's constants were fitted with);
+    ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
+    rows = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
+    ctas = cga or 1
+    if _sm100_f16(caps, facts):
+        kv_tiles = _swa_kv_tiles(facts, token_span=rows // pack_g, tile_n=tile_n or 128)
+        if physical:
+            ctas = cga_ctas(_selected_d_shape(caps, facts)[0], cga)
+    return _SplitKvLaunch(_ceil_div(facts.s_q * pack_g, rows), facts.h_q // pack_g, kv_tiles, ctas)
 
 
 def _split_points(
@@ -795,39 +987,63 @@ def _split_points(
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]
-    rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m, cga)
-    split_launch = _SplitKvLaunch(
-        q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
-        heads_q=facts.h_q // pack_g,
-        kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
-        ctas_per_tile=cga or 1,
-    )
-    unsplit_launch = None
+    decode_pack_g = _decode_tile_pack_g(facts, pack_g)
+    if _d256_decode_tile_selected(caps, facts, decode_pack_g):
+        # The decode tile is a different machine from the one the prefill model
+        # below was fitted on (one cta_group::1 CTA per (KV-head group, batch,
+        # split) unit, HBM-bound, ~1 tile of fixed cost -- not cga2 clusters
+        # with a 21-tile cost), so it has its own model.  The LEADING entry is
+        # the choice that also pays for the split path's second host launch
+        # (charged as if serialized with the GPU work -- SUPPORT_MATRIX_TRACKER.md
+        # footnote d has the measured eager and replay numbers); the captured
+        # caller's optimum, when it differs, is the runner-up; no-split closes
+        # the list as usual.
+        geometry = dict(
+            units=facts.b * (facts.h_q // decode_pack_g),
+            kv_tiles=_swa_kv_tiles(facts, token_span=decode_d256_q_tile(facts.s_q, decode_pack_g) // decode_pack_g, tile_n=tile_n or 128),
+            sm_count=sm_count,
+            q_tile=decode_d256_q_tile(facts.s_q, decode_pack_g),
+        )
+        eager = choose_decode_tile_split_kv(**geometry)
+        captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
+        points = [eager]
+        for split in (captured, no_split):
+            if split not in points:
+                points.append(split)
+        return points
+    unsplit_pack_g = None
     if unsplit_knobs is not None:
         unsplit_pack_g = _pack_gqa_group(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.pack_gqa)
-        unsplit_launch = _SplitKvLaunch(
-            q_tiles=_ceil_div(
-                facts.s_q * unsplit_pack_g,
-                _pack_gqa_tile_q(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.cga),
-            ),
-            heads_q=facts.h_q // unsplit_pack_g,
-            kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
-            ctas_per_tile=unsplit_knobs.cga or 1,
+
+    def _choose(physical: bool) -> int:
+        split_launch = _split_launch(caps, facts, tile_m, tile_n, cga, pack_g, physical=physical)
+        unsplit_launch = None
+        if unsplit_knobs is not None:
+            unsplit_launch = _split_launch(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.tile_n, unsplit_knobs.cga, unsplit_pack_g, physical=physical)
+        return choose_split_kv(
+            q_tiles=split_launch.q_tiles,
+            heads_q=split_launch.heads_q,
+            batch=facts.b,
+            kv_tiles=split_launch.kv_tiles,
+            sm_count=sm_count,
+            # The combine's grid is (S_q, H, B) — the REAL head count, not the
+            # packed one: packing folds heads into Q rows for the main kernel, but
+            # the combine still reduces one block per (row, head, batch) of the
+            # graph's own output.
+            combine_rows=facts.s_q * facts.h_q * facts.b,
+            ctas_per_tile=split_launch.ctas_per_tile,
+            unsplit_launch=unsplit_launch,
         )
-    split = choose_split_kv(
-        q_tiles=split_launch.q_tiles,
-        heads_q=split_launch.heads_q,
-        batch=facts.b,
-        kv_tiles=split_launch.kv_tiles,
-        sm_count=sm_count,
-        # The combine's grid is (S_q, H, B) — the REAL head count, not the
-        # packed one: packing folds heads into Q rows for the main kernel, but
-        # the combine still reduces one block per (row, head, batch) of the
-        # graph's own output.
-        combine_rows=facts.s_q * facts.h_q * facts.b,
-        ctas_per_tile=split_launch.ctas_per_tile,
-        unsplit_launch=unsplit_launch,
-    )
+
+    split = _choose(physical=True)
+    if _sm100_f16(caps, facts) and cga_ctas(_selected_d_shape(caps, facts)[0], cga) != (cga or 1):
+        # The physical CTA count is a one-sided correction: every measured win of
+        # counting D512's role CTAs is a LOWER split (decode-shaped D512: 64 -> 32,
+        # 8 -> 4 on B200); the regime where it asks for MORE splits than the
+        # MMA-width count the constants were fitted with (D512, S_q <= 128, long
+        # KV) is unmeasured and timed slower on an SM100 board, so keep the
+        # fitted answer there.
+        split = min(split, _choose(physical=False))
     if split <= 1:
         return [no_split]
     return [split, no_split]
@@ -850,8 +1066,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    axis at a time in impact order (tiles, sched, pack_gqa, split) with the
-    other axes held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Two
+    geometry at a time (tiles, sched, pack_gqa, split), recomputing split for
+    SM100 f16 geometry runners, capped at ``_MAX_SETS_PER_ENGINE``. Two
     axes carry a structural coupling: a packed set rides the largest tile
     that admits the ratio, and a split set rides the plain scheduler. Axis
     interactions the kernels cannot serve are the generators'/mismatch's job
@@ -917,6 +1133,31 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         pack_g=split_pack_g,
         unsplit_knobs=unsplit_leg,
     )
+
+    def _resplit(knobs: SdpaFwdKnobs) -> SdpaFwdKnobs:
+        # A runner's changed packing/tile/CGA is a different launch, not just
+        # a label on the baseline's split. Keep other architecture policies
+        # unchanged until they have their own geometry validation.
+        if not _sm100_f16(caps, facts):
+            return knobs
+
+        def leg(split):
+            policy, auto_cga = _auto_sched_cga(spec, facts, split_kv=split, sched_policy=plain_sched if split > 1 else scheds[0], pack_gqa=knobs.pack_gqa)
+            cga = knobs.cga if knobs.cga in effective_cgas(caps, facts, split) else auto_cga
+            return replace(knobs, sched_policy=policy, cga=cga, split_kv=split)
+
+        unsplit, split = leg(1), leg(2)
+        points = _split_points(
+            caps,
+            facts,
+            split.tile_m,
+            split.tile_n,
+            split.cga,
+            pack_g=_pack_gqa_group(caps, facts, split.tile_m, split.pack_gqa),
+            unsplit_knobs=unsplit,
+        )
+        return leg(points[0])
+
     base = _leg(splits[0])
     out = [base]
     for tile_m, tile_n in tiles[1:]:
@@ -925,7 +1166,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # set-cap slots for mismatch to drop.
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga):
             continue
-        out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
+        out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
+    # No explicit CGA-width runner: on SM100 f16 the width follows the d128
+    # decode-tile fit of each leg's own rows (_auto_sched_cga), and the other
+    # width is not offered (test_sdpa_fwd_decode_d128_sm100 pins this).
     # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
     # scheduler above, so an LPT runner is only a candidate without one.
     sched_host = unsplit_leg
@@ -941,10 +1185,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     if pack_tile is not None:
         if base.pack_gqa is True:
             _, unpacked_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=False)
-            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga))
+            out.append(_resplit(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1], cga=unpacked_cga)))
         else:
             _, packed_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=True)
-            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga))
+            out.append(_resplit(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga)))
     for split in splits[1:]:
         out.append(_leg(split))
     seen, unique = set(), []
@@ -1012,7 +1256,26 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     return out
 
 
-# Placement — mode blocks, the backend's entries, the delegating entry, dedup,
-# the mode strip — is NOT this family's business: it happens once for every
-# family in ``engines/heuristics._assemble``, with these proposals leading the
-# backend's entries inside each block by standing assumption.
+def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+    """The manifest hook: :func:`recommend`'s proposals with the backend's block
+    placed per the measured shard (:func:`placement.place`) — ours first where
+    FROST is timed ahead of the backend, the backend's block first where it is
+    not. ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` set means the caller asked for
+    FROST (the ``cudnn_oss`` benchmark lane, the FROST suites): ours lead
+    everywhere. An empty proposal list stays empty — nothing to place."""
+    ours = recommend(kind, facts, offered)
+    if not ours:
+        return ours
+    from cudnn.engines.heuristics import BACKEND
+    from cudnn.engines.manifest import opt_in_engines_enabled
+
+    from .placement import LEAD, place
+
+    if opt_in_engines_enabled():
+        return ours + [BACKEND]
+    spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == ours[0].engine_id)
+    return ours + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + ours
+
+
+# Mode blocks, the delegating entry, dedup, the mode strip: placement bookkeeping
+# that happens once for every family in ``engines/heuristics._assemble``.

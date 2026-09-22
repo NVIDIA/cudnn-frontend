@@ -1721,16 +1721,18 @@ def test_DSA_sparse_attention_backward_h128_two_cta_padded_slots_under_very_nega
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=678)
-def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
+@pytest.mark.parametrize("num_heads,expected_backend", [(16, "h16_m128"), (32, "h32_m64"), (64, "generic_m64")])
+def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32(num_heads: int, expected_backend: str) -> None:
     """dSink uses the saved BF16 O but must multiply O*dO in FP32."""
     _require_sm100()
     try:
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, num_heads, head_dim = 8, 64, 64, 576
+    s_q, s_kv, head_dim = 8, 64, 576
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
     attn_sink = torch.linspace(2.0, 5.0, num_heads, dtype=torch.float32, device=device)
@@ -1751,6 +1753,9 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
     p_sink = torch.exp(attn_sink.view(1, -1) - torch.logaddexp(lse, attn_sink.view(1, -1)))
     expected_d_sink = (-p_sink * (out.float() * dout.float()).sum(dim=-1)).sum(dim=0)
     torch.testing.assert_close(result["d_sink"], expected_d_sink, atol=2e-5, rtol=2e-3)
+    assert any(
+        key[0] == expected_backend and key[5] == num_heads for key in _interface_sm100.flash_attn_bwd_sm100.compile_cache
+    ), f"Expected native {expected_backend} dispatch for {num_heads} heads"
 
 
 @pytest.mark.L0

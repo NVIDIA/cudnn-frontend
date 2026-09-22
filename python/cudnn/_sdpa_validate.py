@@ -49,7 +49,8 @@ virtual O_v would surface as a bare ``ValueError`` out of planning
 (``create_execution_plans`` catches only the typed declines).  The native
 validator turns that into the typed not-supported with the fix in the message.
 Scope: the family's validator runs whenever a python SDPA engine is OFFERED
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
+(the SM100/SM120 f16 forward rows by default, the others with
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
 -- not only where a row serves the tail -- so the tail validates natively there
 and the backend's own verdict on it is deferred to planning, as for every
 python-validated graph.  With the engines disabled nothing changes (classic path).
@@ -339,6 +340,24 @@ def _validate_forward(node) -> None:
             raise _not_supported("SDPA FP8 does not support bias")
         if (d_qk % 16 != 0) or (d_v % 16 != 0):
             raise _not_supported("hidden_dim should be multiple of 16")
+        # Block-scaled O: FP4_E2M1 O carries one E4M3 scale per 16 d elements in
+        # sf_o; an FP8_E4M3 O with sf_o carries one UE8M0 scale per 32 (MXFP8 output).
+        sf_o = node.outputs.get("sf_o")
+        o_dtype = _dtype_name(o)
+        if o_dtype == "FP4_E2M1":
+            if sf_o is None:
+                raise _not_supported("An FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements).")
+            if _dtype_name(sf_o) not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o must be FP8_E4M3 for an FP4_E2M1 O.")
+        elif sf_o is not None:
+            if o_dtype not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output).")
+            if _dtype_name(sf_o) not in (None, "FP8_E8M0"):
+                raise _not_supported("sf_o must be FP8_E8M0 for an FP8_E4M3 O (MXFP8 output).")
+            if d_v % 32 != 0:
+                raise _not_supported("MXFP8 output needs d_v to be a multiple of 32.")
+        if sf_o is not None:
+            _check_dim_stride(node, "sf_o", sf_o)
 
     if node.node_type == NodeType.SDPA_MXFP8:
         _validate_mxfp8_descales(node, q, k, v, s_kv if s_kv is not None else k.get_dim()[2])

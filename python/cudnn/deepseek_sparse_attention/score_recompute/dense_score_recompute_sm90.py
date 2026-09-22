@@ -1319,7 +1319,9 @@ class DenseScoreRecomputeSm90:
                     if pos < col_limit:
                         mOut_cur[pos] = acc_out_regs[r]
                     else:
-                        mOut_cur[pos] = Float32(0.0)
+                        # Match the dense-score mask contract without changing
+                        # the zero contribution to the L1 denominator above.
+                        mOut_cur[pos] = Float32(float("-inf"))
 
             # Broadcast accumulated warp_col_sum from lane 0 to all lanes
             warp_col_sum = sm90_ops.shuffle_sync(warp_col_sum, 0)
@@ -1372,7 +1374,9 @@ class DenseScoreRecomputeSm90:
                     if pos < col_limit:
                         mOut_cur[pos] = acc_out_regs[r]
                     else:
-                        mOut_cur[pos] = Float32(0.0)
+                        # Raw indexer scores use -inf for causal masking,
+                        # including masked columns within a visited KV tile.
+                        mOut_cur[pos] = Float32(float("-inf"))
 
             # LSE computation: only on last head tile when acc_out_regs has final scores.
             # On earlier head tiles acc_out_regs only has partial head sums, so

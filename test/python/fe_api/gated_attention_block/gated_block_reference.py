@@ -628,13 +628,14 @@ def _mxfp8_quant():
         return mod
 
 
-def mx_sf_padded_dims(rows: int, k: int) -> Tuple[int, int]:
-    """``(rows_pad, blocks_pad)`` of one F8_128x4 scale matrix over ``rows x K``: whole
-    128-row x 4-block atoms.  A deliberately INDEPENDENT mirror of
-    ``kernels.proj_gemm.sf_padded_dims`` (the reference must not import the thing it checks)."""
-    if k % MX_BLOCK:
-        raise ValueError(f"K={k} must be a multiple of the {MX_BLOCK}-element MX block")
-    return -(-rows // MX_ATOM_ROWS) * MX_ATOM_ROWS, -(-(k // MX_BLOCK) // MX_ATOM_COLS) * MX_ATOM_COLS
+def mx_sf_padded_dims(rows: int, k: int, block: int = MX_BLOCK) -> Tuple[int, int]:
+    """``(rows_pad, blocks_pad)`` of one F8_128x4 scale matrix over ``rows x K`` at ``block``
+    elements per scale (32 for MXFP8 / MXFP4, 16 for NVFP4): whole 128-row x 4-block atoms.
+    A deliberately INDEPENDENT mirror of ``kernels.proj_gemm.sf_padded_dims`` (the reference
+    must not import the thing it checks)."""
+    if k % block:
+        raise ValueError(f"K={k} must be a multiple of the {block}-element scale block")
+    return -(-rows // MX_ATOM_ROWS) * MX_ATOM_ROWS, -(-(k // block) // MX_ATOM_COLS) * MX_ATOM_COLS
 
 
 def mx_quantize_rowwise_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -648,34 +649,40 @@ def mx_quantize_rowwise_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     return codes.reshape(rows, k), e.contiguous()
 
 
-def mx_swizzle_sf_rowwise_padded(e: torch.Tensor) -> torch.Tensor:
-    """Logical ``[rows, K/32]`` E8M0 bytes -> the PADDED F8_128x4 blob (flat uint8) the block's
-    ``sample_h_sf`` / ``sample_w_qkvg_sf`` contract takes: rows padded to 128, blocks to 4, pad
-    ``0x00``, then cuDNN's F8_128x4 reorder (``swizzle_sf_rowwise`` == the FROST GEMM suite's
-    ``to_blocked``).  ``numel == kernels.proj_gemm.sf_blob_bytes(rows, K)``."""
+def mx_swizzle_sf_rowwise_padded(e: torch.Tensor, block: int = MX_BLOCK) -> torch.Tensor:
+    """Logical ``[rows, K/block]`` scale BYTES -> the PADDED F8_128x4 blob (flat uint8) the block's
+    ``sample_h_sf`` / ``sample_w_qkvg_sf`` / ``sample_w_o_sf`` contract takes: rows padded to 128,
+    blocks to 4, pad ``0x00``, then cuDNN's F8_128x4 reorder (``swizzle_sf_rowwise`` == the FROST
+    GEMM suite's ``to_blocked``).  ``numel == kernels.proj_gemm.sf_blob_bytes(rows, K, block)``.
+
+    The ONE blob builder for every scale format: ``block`` only sizes the logical matrix (the
+    atom rule is format-agnostic), and an ``e`` handed over as ``float8_e8m0fnu`` / ``float8_e4m3fn``
+    is re-VIEWED as its bytes, never value-cast (``0.0137.to(uint8)`` would be ``0``)."""
     mq = _mxfp8_quant()
+    if e.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn):
+        e = e.view(torch.uint8)
     rows, cols = e.shape
-    rows_pad, cols_pad = mx_sf_padded_dims(rows, cols * MX_BLOCK)
+    rows_pad, cols_pad = mx_sf_padded_dims(rows, cols * block, block)
     pad = torch.zeros(rows_pad, cols_pad, dtype=torch.uint8, device=e.device)
     pad[:rows, :cols] = e.to(torch.uint8)
     return mq.swizzle_sf_rowwise(pad).contiguous().flatten()
 
 
-def mx_unswizzle_sf_rowwise(blob: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+def mx_unswizzle_sf_rowwise(blob: torch.Tensor, rows: int, k: int, block: int = MX_BLOCK) -> torch.Tensor:
     """The inverse of :func:`mx_swizzle_sf_rowwise_padded`: a PADDED F8_128x4 blob -> the logical
-    ``[rows, K/32]`` E8M0 bytes (pad rows / blocks dropped).
+    ``[rows, K/block]`` scale bytes (pad rows / blocks dropped).
 
     ``_swizzle_128x4`` views ``[R, C]`` as ``(rt, rg, rr, ct, cc)`` = ``(R/128, 4, 32, C/4, 4)`` and
     stores it as ``(rt, ct, rr, rg, cc)``; reading the blob back in that order and permuting
     ``(0, 3, 2, 1, 4)`` restores the logical matrix.  The oracle dequantizes ``h`` / ``W_qkvg``
     THROUGH this, so it reads exactly the bytes the kernel reads (a wrong caller blob is a
     wrong oracle too, never a silent agreement)."""
-    rows_pad, cols_pad = mx_sf_padded_dims(rows, k)
+    rows_pad, cols_pad = mx_sf_padded_dims(rows, k, block)
     if blob.numel() != rows_pad * cols_pad:
-        raise ValueError(f"blob has {blob.numel()} bytes, the padded F8_128x4 matrix over {rows} x K={k} is {rows_pad}x{cols_pad}")
+        raise ValueError(f"blob has {blob.numel()} bytes, the padded F8_128x4 matrix over {rows} x K={k} at block {block} is {rows_pad}x{cols_pad}")
     v = blob.reshape(rows_pad // MX_ATOM_ROWS, cols_pad // MX_ATOM_COLS, 32, 4, MX_ATOM_COLS)  # (rt, ct, rr, rg, cc)
     e = v.permute(0, 3, 2, 1, 4).reshape(rows_pad, cols_pad)  # (rt, rg, rr, ct, cc)
-    return e[:rows, : k // MX_BLOCK].contiguous()
+    return e[:rows, : k // block].contiguous()
 
 
 def mx_dequant_rowwise_2d(codes: torch.Tensor, blob: torch.Tensor) -> torch.Tensor:
@@ -687,11 +694,151 @@ def mx_dequant_rowwise_2d(codes: torch.Tensor, blob: torch.Tensor) -> torch.Tens
     return codes.float() * scale
 
 
-def quantize_block_inputs_mxfp8(inp: dict) -> Tuple[dict, dict]:
+# ---------------------------------------------------------------------------
+# FP4 (E2M1 codes, two per byte) -- NVFP4 (E4M3 scale per 16) and MXFP4 (E8M0 scale per 32)
+# ---------------------------------------------------------------------------
+#
+# torch 2.13 has ``float4_e2m1fn_x2`` but cannot cast to or from it (``copy_kernel`` is not
+# implemented), so the reference rounds on fp32 BY HAND and compares codes as uint8.  The two
+# formats share the E2M1 code grid and the F8_128x4 blob builder above; they differ only in the
+# scale rule (``fp4_quantize_rowwise_2d``).  Both scale rules multiply by the fp32 rounding of
+# ``1/6`` (E2M1's max) exactly as the kernel does (``opaque_fp4_max_rcp``): dividing by 6 is one
+# ulp apart on some amax values and would move an E8M0 exponent or an E4M3 code.
+
+E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # positive codes 0..7; code | 0x8 is the negative
+E2M1_MAX = E2M1_GRID[-1]
+_E2M1_MIDPOINTS = tuple((a + b) / 2 for a, b in zip(E2M1_GRID[:-1], E2M1_GRID[1:]))  # 0.25 .. 5.0
+FP4_INV_MAX = 1.0 / E2M1_MAX  # rounded to fp32 at use (bits 0x3E2AAAAB), the kernel's constant
+E4M3_MIN_SUBNORMAL = 2.0**-9  # the NVFP4 scale floor: keeps an all-zero block's encode scale finite
+FP4_FORMATS = {
+    "nvfp4": (16, torch.float8_e4m3fn),  # kernel_registry: fp4_e2m1 x fp8_e4m3, block 16
+    "mxfp4": (32, torch.float8_e8m0fnu),  # kernel_registry: fp4_e2m1 x fp8_e8m0, block 32
+}
+
+
+def fp4_format(fmt) -> Tuple[str, int, torch.dtype]:
+    """``"nvfp4"`` / ``"mxfp4"`` (or an enum member NAMED so, e.g. the block's ``Fp4Format``) ->
+    ``(name, block, sf_dtype)``.  The reference must not import the thing it checks, so the
+    format is spelled by name here and the block / scale dtype are derived from that name."""
+    name = str(getattr(fmt, "name", fmt)).lower()
+    if name not in FP4_FORMATS:
+        raise ValueError(f"unknown fp4 format {fmt!r}; the served formats are {sorted(FP4_FORMATS)}")
+    block, sf_dtype = FP4_FORMATS[name]
+    return name, block, sf_dtype
+
+
+def e2m1_codes(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> 4-bit E2M1 codes (uint8 ``0..15``, sign in bit 3): round to NEAREST on the grid,
+    ties to the EVEN code (``0.25 -> 0``, ``0.75 -> 1.0``, ``1.25 -> 1.0``, ``1.75 -> 2``,
+    ``2.5 -> 2``, ``3.5 -> 4``, ``5.0 -> 4``), saturate at ``6`` (``cvt.rn.satfinite.e2m1x2`` --
+    ``+-inf`` saturates too), sign kept (``-0.2 -> -0.0``).  NaN is REFUSED (``ValueError``): the torchao
+    port this is pinned against has no NaN code, ``satfinite``'s NaN byte is unspecified, and a reference
+    that encoded NaN as ``6.0`` would report a kernel CODE mismatch instead of a bad input."""
+    if bool(torch.isnan(x).any()):
+        raise ValueError("e2m1_codes: NaN input is out of the fp4 quantizer's contract (the reference does not fabricate a code for it)")
+    a = x.float().abs()
+    mids = torch.tensor(_E2M1_MIDPOINTS, dtype=torch.float32, device=a.device)
+    lo = torch.bucketize(a, mids, right=False)  # a == midpoint -> the lower code
+    hi = torch.bucketize(a, mids, right=True)  # a == midpoint -> the upper code; equal to ``lo`` otherwise
+    code = torch.where(lo % 2 == 0, lo, hi)  # ties to the even code
+    return (code.to(torch.uint8) | (torch.signbit(x).to(torch.uint8) << 3)).contiguous()
+
+
+def e2m1_values(codes: torch.Tensor) -> torch.Tensor:
+    """4-bit E2M1 codes (uint8 ``0..15``) -> their fp32 values (``-0.0`` for code ``8``)."""
+    lut = torch.tensor(E2M1_GRID + tuple(-v for v in E2M1_GRID), dtype=torch.float32, device=codes.device)
+    return lut[(codes & 0xF).long()]
+
+
+def e2m1_rne(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> fp32 on the E2M1 grid ``{0, .5, 1, 1.5, 2, 3, 4, 6}`` (sign kept): the value
+    :func:`e2m1_codes` encodes."""
+    return e2m1_values(e2m1_codes(x))
+
+
+def pack_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    """E2M1 codes ``[..., K]`` -> bytes ``[..., K/2]``: the LOW nibble is the EVEN ``k`` (what the
+    GEMM's ``float4_e2m1fn_x2`` operand and the suite's ``unpack_fp4`` read)."""
+    if codes.shape[-1] % 2:
+        raise ValueError(f"K={codes.shape[-1]} must be even to pack two E2M1 codes per byte")
+    c = codes.to(torch.uint8) & 0xF
+    return (c[..., 0::2] | (c[..., 1::2] << 4)).contiguous()
+
+
+def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Bytes ``[..., K/2]`` -> fp32 E2M1 values ``[..., K]`` (low nibble first)."""
+    u8 = packed.view(torch.uint8) if packed.dtype != torch.uint8 else packed
+    lo = e2m1_values(u8 & 0xF)
+    hi = e2m1_values(u8 >> 4)
+    return torch.stack([lo, hi], dim=-1).flatten(-2)
+
+
+def fp4_quantize_rowwise_2d(x2d: torch.Tensor, fmt) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``[rows, K]`` -> (packed E2M1 bytes ``[rows, K/2]``, logical scale BYTES ``[rows, K/block]``),
+    one scale per ``block`` elements along K.
+
+    MXFP4: ``e = e8m0_ceil(amax * fp32(1/6))`` (TE / cuDNN semantics, exponent rounded UP -- the
+    shared ``mxfp8_quant.e8m0_ceil``), ``q = e2m1_rne(x * 2^(127-e))`` (exact power-of-two scaling).
+    NVFP4: ``s = (amax * fp32(1/6)).clamp_min(2^-9).to(float8_e4m3fn)`` (RN, the E4M3 min-subnormal
+    floor keeps an all-zero block's scale ``0x01`` rather than ``0``), ``q = e2m1_rne(x / s)`` with a
+    TRUE division -- a reciprocal-multiply perturbs exact E2M1 midpoints (``0.5859375 / 0.46875 ==
+    1.25``) and flips a whole code; the kernel uses ``div.rn.f32`` for the same reason.  No global
+    (per-tensor) scale in either format.  The scale bytes are the kernel's SF bytes; feed them to
+    :func:`mx_swizzle_sf_rowwise_padded` with the format's ``block``."""
+    name, block, sf_dtype = fp4_format(fmt)
+    mq = _mxfp8_quant()
+    rows, k = x2d.shape
+    if k % block:
+        raise ValueError(f"K={k} must be a multiple of the {block}-element {name} block")
+    if not bool(torch.isfinite(x2d).all()):
+        # A non-finite element makes its block's amax non-finite: the E8M0 exponent would come out 0xFF, the
+        # E4M3 scale 0x7F, and every code in the block a fabricated 6.0 -- a bitwise tier comparing the kernel
+        # against that would report a CODE mismatch where the finding is "bad input".  Refuse instead.
+        raise ValueError(f"{name}: non-finite input is out of the fp4 quantizer's contract")
+    x = x2d.float().reshape(rows, k // block, block)
+    amax = x.abs().amax(dim=-1)  # [rows, K/block]
+    inv_max = torch.tensor(FP4_INV_MAX, dtype=torch.float32, device=x.device)
+    if name == "mxfp4":
+        e = mq.e8m0_ceil(amax * inv_max)
+        q = x * mq.exp2_rcp(e).unsqueeze(-1)
+        sf_bytes = e
+    else:
+        s = (amax * inv_max).clamp_min(E4M3_MIN_SUBNORMAL).to(sf_dtype)
+        q = x / s.float().unsqueeze(-1)
+        sf_bytes = s.view(torch.uint8)
+    codes = e2m1_codes(q).reshape(rows, k)
+    return pack_e2m1(codes), sf_bytes.contiguous()
+
+
+def fp4_dequant_rowwise_2d(packed: torch.Tensor, blob: torch.Tensor, fmt, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Packed E2M1 bytes ``[rows, K/2]`` x their PADDED F8_128x4 scale blob -> ``out_dtype`` ``[rows, K]``.
+
+    THROUGH the blob (:func:`mx_unswizzle_sf_rowwise` at the format's block), so the oracle reads
+    exactly the scale bytes the GEMM reads -- a wrong caller blob is a wrong oracle too, never a
+    silent agreement.  E8M0 scales dequantize as ``2^(e-127)``, E4M3 scales as their value.  Every
+    product ``code x scale`` is exact in fp64; in fp32 it is exact wherever it is representable, but
+    an MXFP4 block whose amax sits in bf16's top octave can dequantize to ``4 x 2^126 = 2^128`` and
+    overflows to ``inf`` -- the same ``inf`` the GEMM's fp32 accumulator would produce from those
+    codes.  Pass ``out_dtype=torch.float64`` to read such a blob back finite."""
+    name, block, sf_dtype = fp4_format(fmt)
+    mq = _mxfp8_quant()
+    rows, k_half = packed.shape
+    k = 2 * k_half
+    sf = mx_unswizzle_sf_rowwise(blob.view(torch.uint8) if blob.dtype != torch.uint8 else blob, rows, k, block)
+    scale = (mq.e8m0_to_float(sf) if name == "mxfp4" else sf.view(sf_dtype).float()).to(out_dtype)
+    return unpack_e2m1(packed).to(out_dtype) * scale.repeat_interleave(block, dim=-1)
+
+
+def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None) -> Tuple[dict, dict]:
     """``make_inputs`` output -> the same dict with ``h`` / ``w_qkvg`` as e4m3 MXFP8 CODES plus
     their PADDED F8_128x4 blobs ``h_sf`` / ``w_qkvg_sf`` (the block's ``sample_h_sf`` /
     ``sample_w_qkvg_sf`` and execute ``h_sf=`` / ``w_qkvg_sf=``), ``w_o`` per-tensor e4m3 (D1),
     and ``{descale_w_o}`` -- the ``MxQuantSpec`` constructor kwargs (``scale_o`` is the caller's).
+
+    ``o_fp4`` (appended; ``"nvfp4"`` / ``"mxfp4"`` or the block's ``Fp4Format`` member): the fp4 O
+    mode's ``W_o`` instead -- packed E2M1 codes ``[d_model, K/2]`` viewed ``float4_e2m1fn_x2`` plus
+    the format's PADDED F8_128x4 blob ``w_o_sf`` (the block's ``sample_w_o_sf`` / ``w_o_sf``), and
+    ``descale_w_o=1.0`` (no per-tensor scale on a block-scaled weight).
 
     Norm weights, cos/sin stay bf16 (the block's activation dtype).  Built from an EXISTING
     input dict so a harness can hand the bf16, FP8 and MXFP8 arms the same data."""
@@ -699,14 +846,20 @@ def quantize_block_inputs_mxfp8(inp: dict) -> Tuple[dict, dict]:
     b, s, dm = h.shape
     h_codes, h_e = mx_quantize_rowwise_2d(h.reshape(b * s, dm))
     w_codes, w_e = mx_quantize_rowwise_2d(inp["w_qkvg"])
-    s_wo = amax_scale(inp["w_o"])
     mx = dict(inp)
     mx["h"] = h_codes.reshape(b, s, dm).contiguous()
     mx["h_sf"] = mx_swizzle_sf_rowwise_padded(h_e)
     mx["w_qkvg"] = w_codes.contiguous()
     mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
-    mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)
-    return mx, dict(descale_w_o=1.0 / s_wo)
+    if o_fp4 is None:
+        s_wo = amax_scale(inp["w_o"])
+        mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)
+        return mx, dict(descale_w_o=1.0 / s_wo)
+    _, block, _ = fp4_format(o_fp4)
+    packed, e = fp4_quantize_rowwise_2d(inp["w_o"].float(), o_fp4)
+    mx["w_o"] = packed.view(torch.float4_e2m1fn_x2)
+    mx["w_o_sf"] = mx_swizzle_sf_rowwise_padded(e, block)
+    return mx, dict(descale_w_o=1.0)
 
 
 def make_mxfp8_inputs(geom: RefGeometry, batch: int, seq_len: int, *, device: torch.device | str = "cuda", seed: int = 0) -> Tuple[dict, dict]:
@@ -810,6 +963,7 @@ def gated_attention_block_mxfp8_reference(
     scale_o: float,
     seq_lens: Optional[torch.Tensor] = None,
     fused: bool = False,
+    o_fp4=None,
 ) -> torch.Tensor:
     """fp32 chain with the MXFP8 block's exact quantization points -> bf16 ``[B, S, d_model]``.
 
@@ -825,9 +979,29 @@ def gated_attention_block_mxfp8_reference(
     rotates the fp32 accumulator and block-quantizes ONCE (GATE rounded to bf16 -- ``gate16`` IS
     a bf16 buffer), the gated MXFP8 SDPA multiplies its fp32 O by ``sigmoid(gate16)`` and casts
     to e4m3 ONCE, UNSCALED -- pass ``scale_o=1.0`` (D8).  Neither variant replicates the MXFP8
-    SDPA's unit-scale e4m3 P, which is why the block tests gate on a cosine."""
+    SDPA's unit-scale e4m3 P, which is why the block tests gate on a cosine.
+
+    ``o_fp4`` (appended; ``"nvfp4"`` / ``"mxfp4"`` or the block's ``Fp4Format``) mirrors the fp4 O
+    mode: the gated O is a **bf16** tensor on BOTH pipelines (the gate kernel's, or -- fused -- the
+    gated MXFP8 SDPA writing bf16 O, config row 10), block-quantized to E2M1 + the format's scale
+    (:func:`fp4_quantize_rowwise_2d` over ``[T, K = H_q*D]``) and dequantized THROUGH its padded
+    blob, then multiplied by ``W_o`` dequantized through ``inp_mx["w_o_sf"]`` (the dict of
+    :func:`quantize_block_inputs_mxfp8` with the same ``o_fp4``) -- the oracle reads exactly the
+    scale bytes the block-scale GEMM reads.  Neither side carries a per-tensor scale:
+    ``scale_o`` / ``descale_w_o`` must be 1.0 (``ValueError`` otherwise, so a mis-specified oracle
+    cannot silently agree with a block that pins them)."""
     og, (b, s, dm) = _mxfp8_gated_o(inp_mx, geom, seq_lens=seq_lens, fused=fused)
     hq, d = geom.h_q, geom.d_head
-    og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(b * s, hq * d)  # o was transposed: reshape copies
-    wo32 = dequant_e4m3(inp_mx["w_o"], descale_w_o)
+    if o_fp4 is None:
+        og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(b * s, hq * d)  # o was transposed: reshape copies
+        wo32 = dequant_e4m3(inp_mx["w_o"], descale_w_o)
+    else:
+        if float(scale_o) != 1.0 or float(descale_w_o) != 1.0:
+            raise ValueError(f"o_fp4: a block-scaled O / W_o has no per-tensor scale; got scale_o={scale_o}, descale_w_o={descale_w_o}")
+        _, block, _ = fp4_format(o_fp4)
+        og16 = og.to(torch.bfloat16).float().reshape(b * s, hq * d)  # the bf16 gated O both pipelines hand the fp4 quantizer
+        packed, e = fp4_quantize_rowwise_2d(og16, o_fp4)
+        og32 = fp4_dequant_rowwise_2d(packed, mx_swizzle_sf_rowwise_padded(e, block), o_fp4)
+        w_o = inp_mx["w_o"]
+        wo32 = fp4_dequant_rowwise_2d(w_o.view(torch.uint8) if w_o.dtype != torch.uint8 else w_o, inp_mx["w_o_sf"], o_fp4)
     return (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)

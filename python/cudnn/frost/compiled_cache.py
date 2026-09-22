@@ -526,6 +526,25 @@ def _export(entry: Path, compiled: Any, key: str, symbol: str, manifest: Dict[st
     _write_atomic(entry / _ENTRY, json.dumps(record, indent=1, sort_keys=True).encode("utf-8"))
 
 
+def positional_entry(compiled: Any) -> Optional[Any]:
+    """The positional ``tvm_ffi.Function`` behind a ``compile_cached`` result, or None.
+
+    A reloaded artifact carries it as ``_compiled_cache_raw``; an in-process
+    ``--enable-tvm-ffi`` object exposes it through ``__tvm_ffi_object__``. Pointer
+    parameters take plain integer addresses, ``Tuple[int, ...]`` parameters take
+    tuples; the caller keeps ``compiled`` alive for as long as it uses the entry."""
+    raw = getattr(compiled, "_compiled_cache_raw", None)
+    if raw is not None:
+        return raw
+    get = getattr(compiled, "__tvm_ffi_object__", None)
+    if get is None:
+        return None
+    try:
+        return get()
+    except Exception:  # noqa: BLE001 -- not a tvm-ffi object after all
+        return None
+
+
 def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: str = "kernel", **kwargs: Any) -> Any:
     """``cute.compile(fn, *args, **kwargs)`` with a persistent object behind it.
 
