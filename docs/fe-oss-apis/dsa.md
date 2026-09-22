@@ -204,11 +204,13 @@ SM103 (10, 3) devices, BF16 H128 with `head_dim = head_dim_v = 512` and
 Contiguous BF16 H128 with `head_dim = 576`, `head_dim_v = 512`, and the same
 `topk_max` set uses the H128/D576 two-CTA specialization. H16 with
 `head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
-counts and dimensions, every other `topk_max`, and noncontiguous H128/D576
-inputs retain the existing generic/H16/H32 selection. Other compute
-capabilities, including SM107, do not select the two-CTA paths. No backend or
-tile-size argument is required. SM90 continues to use its Hopper-specific
-implementation.
+counts and dimensions, and every other `topk_max` retain the existing
+generic/H16/H32 selection. Other compute capabilities, including SM107, do not
+select the two-CTA paths. No backend or tile-size argument is required. SM90
+continues to use its Hopper-specific implementation. Every input must be
+contiguous on every route: `check_support()` declines a strided tensor with
+`NotImplementedError` naming it and its strides, and `execute()` rejects one
+with `ValueError`; the plan never repacks an input.
 
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
@@ -242,16 +244,21 @@ atomics.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
 
-`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
-scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
-size to `execute(..., workspace=workspace)` and reuse it across calls; the
-compiled kernel initializes the dKV accumulator on every execution. The
-high-level wrapper accepts the same optional `workspace=` argument and only
-allocates convenience scratch when it is omitted. The H128/D576 two-CTA plan
-compiles its kernel in `compile()`, and its `execute()` additionally requires
-caller-provided `dq`, `dkv`, and `d_sink` buffers: it never allocates or
-compiles during execution. The wrapper allocates those outputs when they are
-omitted. Other backends do not accept a caller-provided `d_sink`.
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
+requirement on every backend: the SM100 FP32 statistics and dKV-accumulator
+planes, and on SM90 the FP32 dPsum and log2-scaled LSE vectors plus the dKV
+accumulator (`2 * align128(round64(total_S_q) * H * 4) +
+align128(round64(total_S_kv) * round32(D) * 4)` bytes). Pass a contiguous CUDA
+`uint8` tensor of at least this size to `execute(..., workspace=workspace)` and
+reuse it across calls; the launch sequence re-initializes the accumulators on
+every execution (in-kernel on SM100, and with one stream-ordered memset for the
+SM90 dKV accumulator and for `d_sink` on the routes that accumulate it
+atomically). `execute(q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv,
+d_sink, ...)` requires caller-provided `dq`, `dkv`, and `d_sink` on every
+backend and never allocates or copies during execution; the H128/D576 two-CTA
+plan additionally compiles in `compile()`, while the other routes compile on
+their first execution. The high-level wrapper allocates the outputs and the
+scratch on the launch stream when they are omitted.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
