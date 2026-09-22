@@ -16,7 +16,9 @@ Three tiers:
 
 - GPU-free: the config backstop (accept / reject), the standalone cga domain,
   the heuristics' cga and scheduler rules, and the ``mismatch`` gates (a THD
-  graph never gets the decode tile).
+  graph gets the decode tile only as the ragged-Q-over-paged-KV leg at
+  S_q(max) == 1 -- ``engines._thd_decode_leg`` -- and keeps the prefill tile
+  otherwise).
 - Kernel template, direct: paged pools at every page geometry, mixed lengths
   incl. 0 and 1, PackGQA on / off / partial (a group that does not divide the
   tile packs its largest divisor that does; one sharing no factor with it runs
@@ -26,8 +28,10 @@ Three tiers:
   the keyless-row sink contract (O := 0, LSE := sink at any sink magnitude).
 - Graph API: decode / MTP shapes select the decode tile (partially packed GQA
   groups included), a prefill shape keeps
-  the prefill tile, a pinned cga=2 on a decode shape is honored, THD declines
-  cga=1, dense (non-paged) padded decode, a dense MTP graph whose keyless rows
+  the prefill tile, a pinned cga=2 on a decode shape is honored, a chunked-prefill
+  THD graph declines cga=1 while FlashInfer's ragged paged graph at one token per
+  sequence rides the ragged-Q leg (int32 / int64 offsets, an empty sequence, no
+  Stats), dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
   ``set_sync_debug_mode("error")`` (Rule 3).
 """
@@ -925,6 +929,248 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
         g2.check_support()
         g2.build_plans()
+
+
+# --- the ragged-Q leg: ragged Q/O/Stats over paged K/V at S_q(max) == 1 (nvbug 6607857) ---
+
+
+class _RaggedStub:
+    """A graph tensor carrying ragged offsets, for the GPU-free facts."""
+
+    class _Off:
+        def __init__(self, dtype):
+            self._dtype = dtype
+
+        def get_data_type(self):
+            return self._dtype
+
+    def __init__(self, dtype, mult=1, stride=(64 * 128, 128, 64 * 128, 1)):
+        self.ragged_offset = _RaggedStub._Off(dtype)
+        self._mult = mult
+        self._stride = tuple(stride)
+
+    def get_ragged_offset_multiplier(self):
+        return self._mult
+
+    def get_stride(self):
+        return self._stride
+
+
+def _ragged_paged_facts(*, dtype=None, s_q=1, stats=True, mult=(1, 1, 1), o_token_stride=64 * 128, **over):
+    """FlashInfer's prefill-style paged graph at one token per sequence: ragged
+    Q/O(/Stats) over page pools, per-batch lengths, GQA 64/8 (packed (T, H, D)
+    Q; O's token stride may carry a gap; token-major (T, H) Stats)."""
+    import cudnn
+
+    dtype = cudnn.data_type.INT32 if dtype is None else dtype
+    q_t = _RaggedStub(dtype, mult[0])
+    o_t = _RaggedStub(dtype, mult[1], stride=(o_token_stride, 128, o_token_stride, 1))
+    st_t = _RaggedStub(dtype, mult[2], stride=(64, 1, 64, 1))
+    base = dict(
+        b=4, h_q=64, h_kv=8, s_q=s_q, s_kv=2048, thd=True, padded=True, has_paged_kv=True, page_size=16, q_t=q_t, o_t=o_t, stats_t=st_t if stats else None
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+def test_decode_cfg_ragged_q_leg_contract():
+    """The config twin of the ragged-Q leg: ragged_q needs the decode tile, a split
+    (>= 2) and paged K/V, excludes the prefill THD leg and the dense Q trim, and
+    surfaces as CfgD128Decode.RAGGED_Q."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128, make_cfg_d128_decode
+
+    ok = dict(cta_mma=1, ragged_q=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=2)
+    cfg, _ = make_cfg_d128_decode(TemplateParams(**ok))
+    assert cfg.RAGGED_Q == 1 and cfg.THD_VARLEN == 0 and cfg.SPLIT_KV == 2 and cfg.PAGED_KV == 1
+    cfg_packed, _ = make_cfg_d128_decode(TemplateParams(**ok, pack_gqa=True, qh_per_kh=8))
+    assert cfg_packed.RAGGED_Q == 1 and cfg_packed.PACK_G == 8
+    with pytest.raises(ValueError, match="split_kv must be >= 2"):
+        make_cfg_d128_decode(TemplateParams(**{**ok, "split_kv": 1}))
+    with pytest.raises(ValueError, match="PAGED"):
+        make_cfg_d128_decode(TemplateParams(cta_mma=1, ragged_q=True, seq_kv_lens_present=True, split_kv=2))
+    with pytest.raises(ValueError, match="mutually exclusive|THD"):
+        make_cfg_d128_decode(TemplateParams(**ok, thd_varlen=True))
+    with pytest.raises(ValueError, match="seq_q_lens_present"):
+        make_cfg_d128_decode(TemplateParams(**ok, seq_q_lens_present=True))
+    with pytest.raises(ValueError, match="decode tile only"):
+        make_cfg_d128(TemplateParams(**{**ok, "cta_mma": 2}))
+
+
+@pytest.mark.L0
+def test_ragged_q_leg_predicate_and_heuristics():
+    """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
+    paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
+    row) and the heuristics then propose the decode tile with PackGQA and a split
+    of at least 2 -- no unsplit runner-up; every other THD graph keeps cga=2."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
+
+    specs = list(engines.ENGINE_SPECS.values()) if isinstance(engines.ENGINE_SPECS, dict) else list(engines.ENGINE_SPECS)
+    caps = next(s for s in specs if s.name == ENGINE).capabilities
+    leg = _ragged_paged_facts()
+    assert _thd_decode_leg(caps, leg)
+    assert _thd_decode_leg_divisors(leg) == (64 * 128, 64 * 128, 64) and not _thd_decode_leg_int64(leg)
+    # cuDNN's multiplier form: offsets in tokens (Q/O: H*D per token; Stats: H per token).
+    tok = _ragged_paged_facts(mult=(64 * 128, 64 * 128, 64))
+    assert _thd_decode_leg(caps, tok) and _thd_decode_leg_divisors(tok) == (1, 1, 1)
+    # The offset unit is the DECLARED token stride, not H*D: a token-stride gap on O
+    # (test_mhas_v2's with_ragged_token_gap) makes its offsets 4x larger per token.
+    gap = _ragged_paged_facts(o_token_stride=4 * 64 * 128)
+    assert _thd_decode_leg(caps, gap) and _thd_decode_leg_divisors(gap) == (64 * 128, 4 * 64 * 128, 64)
+    i64 = _ragged_paged_facts(dtype=cudnn.data_type.INT64)
+    assert _thd_decode_leg(caps, i64) and _thd_decode_leg_int64(i64)
+    assert _thd_decode_leg(caps, _ragged_paged_facts(stats=False))
+    for off in (
+        _ragged_paged_facts(s_q=2),  # MTP-THD keeps the prefill THD leg
+        _ragged_paged_facts(has_paged_kv=False, page_size=0),  # ragged K/V: the THD leg's clamped descriptors
+        _ragged_paged_facts(mult=(3, 1, 1)),  # a multiplier that does not divide the row
+        _ragged_paged_facts(d_qk=64, d_v=64),  # the d128 envelope, not the native flavor
+        _ragged_paged_facts(has_sink=True),
+        _ragged_paged_facts(stats_t=_RaggedStub(cudnn.data_type.INT64)),  # mixed offset widths
+        _ragged_paged_facts(cu_seq_kv_t=object()),  # the cu form is not plumbed on the dense kernel
+    ):
+        assert not _thd_decode_leg(caps, off), off
+    # Rubin has no decode tile: its row's capabilities (sm 107) never admit the leg.
+    rubin = [s for s in specs if s.capabilities.sm_lo == 107 and not (s.capabilities.is_fp8 or s.capabilities.is_mxfp8)]
+    assert rubin and all(not _thd_decode_leg(s.capabilities, leg) for s in rubin)
+    plans = _plans(leg)
+    assert plans and all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+    assert all(p.knobs.split_kv >= 2 for p in plans), "the ragged final rows exist only through the combine"
+    assert plans[0].knobs.pack_gqa is True
+    assert all(p.knobs.cga == 2 and p.knobs.split_kv == 1 for p in _plans(_ragged_paged_facts(s_q=2)))
+    # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
+    K = engines.SdpaFwdKnobs
+    assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
+    assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
+    assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
+    assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
+    assert "decode tile" in (engines.mismatch(caps, _ragged_paged_facts(s_q=2), K(cga=1, split_kv=2)) or ""), "MTP-THD keeps the prefill tile"
+
+
+def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, P=16, max_pages=20, stats=True):
+    """Build + run the FlashInfer-shaped ragged paged graph at S_q(max) == 1 and check
+    it end to end: routing (decode tile, split, PackGQA, prepared launch), a
+    zero-length sequence whose rows are never written, per-sequence numerics
+    (O and packed token-major Stats at the ragged offsets), Rule 3 (no host read)."""
+    import cudnn
+    import cudnn.sdpa  # noqa: F401
+    from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
+
+    dev, d = "cuda", D
+    B, T = len(q_lens), sum(q_lens)
+    assert max(q_lens) == 1 and T >= 1
+    cu = [0]
+    for s in q_lens:
+        cu.append(cu[-1] + s)
+    scale = 1.0 / math.sqrt(d)
+    k_pool, v_pool, bt = _pools(B, KH, d, P, max_pages, hnd, dtype, seed=3)
+    k_c, v_c = (k_pool, v_pool) if hnd else (k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3))
+    bt4 = bt.view(B, 1, max_pages, 1)
+    gen = torch.Generator(device=dev).manual_seed(11)
+    # Packed (T, H, d) storage with a poisoned tail past the last token: the leg must
+    # neither read it into a live row nor write past T (the empty sequence has no row).
+    cap = T + 3
+    q_pk = torch.randn(cap, H, d, device=dev, dtype=torch.float32, generator=gen).to(dtype)
+    o_pk = torch.full((cap, H, d), float("nan"), device=dev, dtype=dtype)
+    st_pk = torch.full((cap, H), float("nan"), device=dev, dtype=torch.float32)
+    stride_q = (H * d, d, H * d, 1)  # the graph's (B, H, S_max=1, d) declaration; batch stride == token stride (never stepped)
+    tdt = torch.int32 if offset_dtype == cudnn.data_type.INT32 else torch.int64
+    ro_q = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d).to(tdt).view(B + 1, 1, 1, 1)
+    ro_st = (torch.tensor(cu, dtype=torch.int64, device=dev) * H).to(tdt).view(B + 1, 1, 1, 1)
+    slq = torch.tensor(q_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slk = torch.tensor(kv_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, 1, d], stride=list(stride_q), data_type=io, name="q")
+    k, v = g.tensor_like(k_c), g.tensor_like(v_c)
+    tk, tv = g.tensor_like(bt4), g.tensor_like(bt4)
+    sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
+    qro, oro, sro = g.tensor_like(ro_q), g.tensor_like(ro_q), g.tensor_like(ro_st)
+    tq.set_ragged_offset(qro)
+    o, st = g.sdpa(
+        name="sdpa",
+        q=tq,
+        k=k,
+        v=v,
+        generate_stats=stats,
+        attn_scale=scale,
+        use_padding_mask=True,
+        seq_len_q=sq_t,
+        seq_len_kv=sk_t,
+        paged_attention_k_table=tk,
+        paged_attention_v_table=tv,
+        paged_attention_max_seq_len_kv=max_pages * P,
+    )
+    o.set_output(True).set_dim([B, H, 1, d]).set_stride(list(stride_q))
+    o.set_ragged_offset(oro)
+    if stats:
+        st.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([B, H, 1, 1]).set_stride([H, 1, H, 1])  # token-major (T, H)
+        st.set_ragged_offset(sro)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    plan = select_engine(g, ENGINE)
+    assert plan.knobs.cga == 1 and plan.knobs.split_kv >= 2 and plan.knobs.pack_gqa is True, plan.knobs
+    g.check_support()
+    g.build_plans()
+    compiled = g._compiled_plans[g._plan_index]
+    assert compiled._compiled.kernel_template == "decode_d128_f16"
+    assert isinstance(compiled._prepared, PreparedDenseLaunch)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    vp = {tq: q_pk, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, qro: ro_q, oro: ro_q, o: o_pk}
+    if stats:
+        vp[st] = st_pk
+        vp[sro] = ro_st
+    # Rule 3: the ragged offsets and the per-batch lengths are read on device.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        g.execute(vp, ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    o_out = o_pk.float()
+    for b in range(B):
+        if q_lens[b] == 0:
+            continue
+        ref_o, ref_lse = _ref(q_pk[cu[b] : cu[b] + 1], _gather_kv(k_pool, bt[b], kv_lens[b], hnd), _gather_kv(v_pool, bt[b], kv_lens[b], hnd), 1, scale)
+        got = o_out[cu[b] : cu[b] + 1]
+        assert not torch.isnan(got).any(), f"batch {b}: NaN in O"
+        torch.testing.assert_close(got, ref_o, atol=_tol(dtype), rtol=0, msg=f"batch {b}")
+        if stats:
+            got_lse = st_pk[cu[b], :]  # (H,)
+            ref = ref_lse[:, 0]
+            live = ~torch.isinf(ref)
+            torch.testing.assert_close(got_lse[live], ref[live], atol=5e-3, rtol=0, msg=f"batch {b} Stats")
+            assert torch.isinf(got_lse[~live]).all()
+    # Nothing written past the packed total (the empty sequence owns no row).
+    assert torch.isnan(o_pk[T:].float()).all() and (not stats or torch.isnan(st_pk[T:]).all())
+    return plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("offsets", ["int32", "int64"])
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+def test_graph_thd_paged_decode_rides_the_ragged_q_leg(hnd, offsets):
+    """FlashInfer's prefill-style paged graph at one token per sequence (ragged
+    Q/O/Stats + page pools, S_q(max) == 1, GQA 16/2) rides the decode tile's
+    ragged-Q leg: cga=1, PackGQA, split + combine, prepared launch; one sequence
+    is empty (no row written), KV lengths span short / page-unaligned / one
+    page, int32 (FlashInfer) and int64 (cuDNN's default) offsets."""
+    import cudnn
+
+    dt = cudnn.data_type.INT32 if offsets == "int32" else cudnn.data_type.INT64
+    _thd_decode_graph(dtype=torch.bfloat16, offset_dtype=dt, hnd=hnd, q_lens=[1, 1, 0, 1, 1], kv_lens=[300, 77, 129, 16, 1])
+
+
+@pytest.mark.L0
+def test_graph_thd_paged_decode_without_stats_fp16():
+    """The same leg with no Stats output (has_lse folds the combine's LSE store out)."""
+    import cudnn
+
+    _thd_decode_graph(dtype=torch.float16, offset_dtype=cudnn.data_type.INT32, hnd=True, q_lens=[1, 1, 1], kv_lens=[320, 5, 64], stats=False)
 
 
 @pytest.mark.L0

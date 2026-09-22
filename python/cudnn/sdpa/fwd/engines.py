@@ -429,6 +429,85 @@ def _synth_kv_padding(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
     )
 
 
+_RAGGED_OFFSET_DTYPES = (cudnn.data_type.INT32, cudnn.data_type.INT64)
+
+
+def _ragged_row_divisor(t) -> Optional[int]:
+    """Offset-units-per-token divisor of a ragged tensor: its declared TOKEN
+    stride (the ``S`` stride of the (B, H, S, D) declaration -- ``H * D`` for a
+    packed buffer, larger with a token-stride gap) over the offset multiplier,
+    when the tensor carries int32 / int64 ragged offsets and the multiplier
+    divides that stride.  cuDNN's contract: ``offset[b] * multiplier`` is the
+    ELEMENT offset of sequence ``b``'s first token, so the kernel reads
+    ``offset[b] // divisor`` as its token row.  None when the tensor cannot
+    be addressed that way."""
+    off = getattr(t, "ragged_offset", None)
+    if off is None or off.get_data_type() not in _RAGGED_OFFSET_DTYPES:
+        return None
+    stride = tuple(int(s) for s in t.get_stride())
+    if len(stride) != 4:
+        return None
+    token_stride = stride[2]
+    mult = int(t.get_ragged_offset_multiplier() or 1)
+    if mult <= 0 or token_stride <= 0 or token_stride % mult != 0:
+        return None
+    return token_stride // mult
+
+
+def _thd_decode_leg_int64(facts: "ga.SdpaGraphFacts") -> bool:
+    """Whether a ``_thd_decode_leg`` graph's ragged offsets are int64 (one width
+    for Q, O and Stats -- a mixed graph is declined by ``_thd_decode_leg``)."""
+    return facts.q_t.ragged_offset.get_data_type() == cudnn.data_type.INT64
+
+
+def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """True when a THD (ragged Q/O/Stats) graph rides the SM100 d128 DECODE tile's
+    ragged-Q leg (``sm100/decode_d128_f16.py``, ``TemplateParams.ragged_q``)
+    instead of the prefill tile's THD leg: the FlashInfer prefill-style paged
+    graph at one token per sequence.
+
+    The leg keeps the dense grid over the declared batch, reads each batch's Q
+    ragged offset on device as its row coordinate over the packed Q view, and
+    always splits the KV walk so the combine pass -- not the kernel -- places
+    the final O / Stats rows at their ragged offsets. Hence the shape of the
+    predicate: the (128, 128) half flavor on the Blackwell line (Rubin has no
+    decode tile), S_q(max) == 1, PAGED K/V (a ragged K/V needs the THD leg's
+    clamped descriptors), ragged Stats when Stats are requested (a per-batch
+    padded Stats has no ragged base to place rows at), int32 offsets whose
+    multiplier divides the row, per-batch ``seq_len_kv`` (the dense kernel's
+    SEQ_KV read; the cu form is not plumbed), no sink (sink + split is declined
+    everywhere) and no fused epilogue gate (unsplittable). Twin of
+    ``SdpaFwdDslSm100.thd_decode_leg``; keep in lockstep.
+    """
+    if not (facts.thd and facts.has_paged_kv and facts.s_q == 1):
+        return False
+    if facts.is_fp8 or facts.is_mxfp8 or facts.has_sink or getattr(facts, "has_epilogue_gate", False):
+        return False
+    if capabilities.sm_lo != 100 or capabilities.sm_hi >= 107:
+        return False
+    if (facts.d_qk, facts.d_v) != (128, 128) or _selected_d_shape(capabilities, facts) != (128, 128):
+        return False
+    if facts.cu_seq_kv_t is not None:
+        return False
+    if _ragged_row_divisor(facts.q_t) is None or _ragged_row_divisor(facts.o_t) is None:
+        return False
+    if facts.stats_t is not None and _ragged_row_divisor(facts.stats_t) is None:
+        return False
+    # One offset width for every ragged operand (the kernels compile one read width).
+    widths = {t.ragged_offset.get_data_type() for t in (facts.q_t, facts.o_t) + ((facts.stats_t,) if facts.stats_t is not None else ())}
+    return len(widths) == 1
+
+
+def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
+    """The (Q, O, Stats) elements-per-token divisors of a ``_thd_decode_leg`` graph
+    (Stats: 1 when no Stats output is declared)."""
+    return (
+        _ragged_row_divisor(facts.q_t),
+        _ragged_row_divisor(facts.o_t),
+        _ragged_row_divisor(facts.stats_t) if facts.stats_t is not None else 1,
+    )
+
+
 def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int]) -> Optional[str]:
     """Pure admission for the graph's normalized VariantPack executor.
 
@@ -442,7 +521,13 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:
-        return "prepared THD overrides cannot use an epilogue gate or split-KV" if facts.has_epilogue_gate or (split_kv or 1) > 1 else None
+        if facts.has_epilogue_gate:
+            return "prepared THD overrides cannot use an epilogue gate"
+        if (split_kv or 1) > 1:
+            # Only the decode tile's ragged-Q leg splits a THD graph (its dense
+            # prepared launch binds the packed Q / O / Stats from the offsets).
+            return None if _thd_decode_leg(capabilities, facts) else "prepared THD overrides cannot use split-KV"
+        return None
     if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
         return "prepared dense overrides require per-batch lengths, not prefix sums"
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
@@ -545,12 +630,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
-        if knobs.cga == 1 and facts.thd and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
-            # cga1 on the SM100 line's d128 f16/bf16 flavor IS the decode tile
-            # (sm100/decode_d128_f16.py, TILES_Q=1), which carries no THD leg.
-            # A ragged graph keeps the cga2 prefill tile; api_dsl.check_support
-            # mirrors this line (keep the two in lockstep).
-            return "cga=1 on the d128 flavor selects the dense decode tile; THD (ragged) graphs run the cga2 prefill tile"
+        # cga1 on the SM100 line's d128 f16/bf16 flavor IS the decode tile
+        # (sm100/decode_d128_f16.py, TILES_Q=1), which carries no THD_VARLEN
+        # leg: a ragged graph rides it only as the ragged-Q-over-paged-KV leg
+        # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
+        # api_dsl.check_support mirrors these lines (keep them in lockstep).
+        ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
+        if knobs.cga == 1 and facts.thd and not ragged_decode and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
+            return (
+                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
+                "other THD (ragged) graphs run the cga2 prefill tile"
+            )
+        if ragged_decode and (knobs.split_kv is None or knobs.split_kv < 2):
+            # The ragged final rows exist only through the combine pass.
+            return "the d128 decode tile's ragged-Q leg rides the split path (the combine places the ragged O / Stats rows); pin split_kv >= 2"
         if knobs.split_kv is not None and knobs.split_kv < 1:
             return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
         if knobs.split_kv is not None and knobs.split_kv > 1:
@@ -567,8 +660,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # Paged KV is padded by construction and its split composes with
             # the per-batch lengths (the decode path — B*H_kv is far below
             # the SM count), so it is exempt from the padded exclusion.
-            if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
-                return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+                return "split_kv > 1 serves dense, unpadded, sink-free graphs only (and the decode tile's ragged-Q leg)"
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
@@ -589,8 +682,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd:
-                return "PackGQA is currently not supported for THD/ragged graphs"
+            if facts.thd and not ragged_decode:
+                return "PackGQA is currently not supported for THD/ragged graphs (except the decode tile's ragged-Q leg)"
             if facts.has_epilogue_gate:
                 # The gate tile is one TMA box per (head, Q tile); a packed
                 # tile interleaves (token, head) rows the box cannot address.
@@ -1724,6 +1817,13 @@ def lower_dsl_prefill(
         thd=facts.thd,
         # THD Stats without ragged offsets = FlashInfer's per-batch padded (b, s_max, h) buffer
         thd_stats_padded=(facts.thd and facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None),
+        # The decode tile's ragged-Q leg reads the ragged offsets on device as
+        # token rows: the (Q, O, Stats) elements-per-token divisors it divides by.
+        **(
+            {"ragged_divisors": _thd_decode_leg_divisors(facts), "ragged_offsets_int64": _thd_decode_leg_int64(facts)}
+            if (_thd_decode_leg(spec.capabilities, facts) and "ragged_divisors" in _ctor_params)
+            else {}
+        ),
         # Caller-declared packed token totals (issue #624): when present the
         # adapter binds EXACT token extents instead of the buffer-derived
         # capacity, putting an over-allocated buffer's uninitialized tail out
@@ -1831,7 +1931,14 @@ def lower_dsl_prefill(
         # The gate tail's G is a REQUIRED bound operand; its virtual O_v and s
         # never are (facts.o_t already points at the mul output).
         gate=facts.epilogue_gate_t,
+        # THD ragged offsets: bound operands of the decode tile's ragged-Q leg
+        # (read on device as the row bases); the prefill THD leg never reads
+        # them, and a stats-less graph has no Stats offsets.
+        ragged_q=getattr(facts.q_t, "ragged_offset", None) if facts.thd else None,
+        ragged_o=getattr(facts.o_t, "ragged_offset", None) if facts.thd else None,
+        ragged_stats=getattr(facts.stats_t, "ragged_offset", None) if (facts.thd and facts.stats_t is not None) else None,
     )
+    thd_decode_leg = bool(getattr(api, "thd_decode_leg", False))
 
     def _ir_view(buf, dim, stride):
         """Reinterpret a variant-pack buffer through the IR tensor's dim/stride.
@@ -1973,6 +2080,13 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
+        if thd_decode_leg:
+            # The ragged offsets are bound operands of this leg (device reads).
+            execute_kwargs.update(
+                ragged_q=_need(resolved, binding.ragged_q, "Q ragged offsets"),
+                ragged_o=_need(resolved, binding.ragged_o, "O ragged offsets"),
+                ragged_lse=_need(resolved, binding.ragged_stats, "Stats ragged offsets") if binding.ragged_stats is not None else None,
+            )
         for name, tid in quant_ids.items():
             execute_kwargs[name] = resolved.get(tid)
         if facts.o_block_scale and execute_kwargs.get("sf_o") is None:
@@ -2016,7 +2130,9 @@ def lower_dsl_prefill(
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
             _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
-        elif not facts.thd and getattr(api, "_dense_spec", None) is not None:
+        elif getattr(api, "_dense_spec", None) is not None:
+            # Dense plans, and the decode tile's ragged-Q leg (a dense split
+            # launch whose Q / O / Stats rows come from the bound ragged offsets).
             _execute.prepared = PreparedDenseLaunch(
                 api._dense_spec, binding, seq_kv_src=seq_kv_src, seq_q_src=seq_q_src if seq_q_lens_present else None, gate_src=gate_src
             )

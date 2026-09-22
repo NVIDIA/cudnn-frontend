@@ -232,6 +232,11 @@ def launch_f16(
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
         n_pages=n_pages,
+        # The d128 decode tile's ragged-Q leg slots (dense launches leave them
+        # dead: RAGGED_Q is off in every direct test's params); filtered out for
+        # hosts that do not carry them.
+        ragged_q_addr=0,
+        ragged_q_div=1,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)

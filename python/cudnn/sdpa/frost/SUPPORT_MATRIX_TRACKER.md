@@ -142,8 +142,10 @@ underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −
 off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA incl. partial
 packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head), KV split
 + combine, NATURAL
-/ LPT / LPT_L2. **Not on the decode tile: THD** (a ragged graph keeps `TILE_CGA_M=2`; a
-pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+/ LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
+ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
+at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
+and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 rides it through the d128 envelope. Measured on B200 (graph path,
@@ -152,6 +154,32 @@ prefill tile → 48.9 us on the decode tile (the cuDNN backend's decode engine: 
 64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12 packs 4,
 partial PackGQAᵐ on both tiles) 615 → 225 us (the same shape unpacked on the decode tile:
 875 us); d64 64/8 230.5 → 80.2 us. The kernel docstring carries the full table.
+
+ʳᵠ **Ragged Q over paged KV on the d128 decode tile (`TemplateParams.ragged_q`, nvbug
+6607857).** FlashInfer's prefill-style paged graph — ragged Q/O/Stats (ragged offsets +
+`seq_len_q`) over page pools + block tables — at `S_q(max) == 1` used to be THD to every
+FROST row and so kept the cga2 prefill tile unsplit and unpacked: on B200 (b=4, 64/8,
+d128, page 16, bf16) 206 us at `S_kv=2048` and 1641 us at 16384, 9–22× the dense decode
+graph of the same geometry (the cuDNN backend's `heur_mode.A` served it with the sm80
+WMMA engine, 66 / 517 us). It now rides the decode tile's **ragged-Q leg**: the dense
+grid over the declared batch is kept (one unit per packed head × batch × split), the
+TMA-LDG warp reads each batch's Q ragged offset on device and uses it as the row
+coordinate over the packed `[1, T, H, D]` Q view (no host read — Rule 3), PackGQA
+composes (the row base is token-unit), and the split path is **mandatory**: the fp32
+partials stay dense in the workspace and `split_combine_sm100` places the recombined O
+/ Stats rows at their ragged offsets, skipping every row of a zero-length sequence. No
+THD setup launch, no per-sequence O descriptors. Same shape after: 23.6 / 73.5 us
+(device time incl. the 6–7 us combine) — the dense decode graph's 22.7 / 73.3 us — with
+bit-clean Stats. Contract: the native (128, 128) f16/bf16 flavor on cc10.0/10.3 (Rubin
+has no decode tile), `S_q(max) == 1`, page pools (a ragged K/V needs the prefill THD
+leg's clamped descriptors), ragged Stats when Stats are requested (a per-batch padded
+Stats has no ragged base), int32 **or** int64 offsets of one width whose multiplier
+divides the row (`engines._thd_decode_leg`), per-batch `seq_len_kv` (not the cu form),
+no sink, no gate. Twins: `engines._thd_decode_leg` / `SdpaFwdDslSm100.thd_decode_leg` /
+`config_sm100._validate_params(ragged_q)` / `CfgD128Decode.RAGGED_Q`. **Not yet:**
+MTP-THD (`S_q(max) > 1` needs the per-sequence Q length in the bottom-right diagonal —
+the prefill THD leg keeps it), ragged K/V (non-paged THD decode), d192×d128 / d256 /
+d512 ragged decode (their decode graphs keep the prefill THD leg), fp8.
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 / d192×d128 / d256 flavors**
 (`Capabilities.paged_d_shapes = {(128, 128), (192, 128), (256, 256)}`). The head-dim
@@ -173,6 +201,9 @@ the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets + `seq_len
 over the same pools — chunked prefill — with the THD scheduler walking the Q units (no
 KV split there), including top-left causal + a left window (on d192x128 that band takes
 the plain decode path: the predecoded THD+SWA scheduler is folded off under `PAGED_KV`).
+At `S_q(max) == 1` a ragged d128 f16/bf16 graph with ragged Stats instead rides the
+d128 decode tile's ragged-Q legʳᵠ (PackGQA + KV split + combine, the offsets read on
+device) — FlashInfer's prefill-style paged graph at one token per sequence.
 KV split is proposed on dense-Q paged graphs by the same wave-cost
 model as on dense graphs (they are padded by construction: the per-batch lengths bound
 the walk on device and the split composes with them; it pays when `B * H_kv` leaves
