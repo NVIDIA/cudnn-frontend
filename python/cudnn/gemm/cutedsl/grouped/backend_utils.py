@@ -179,7 +179,10 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     record_stream: the API keeps a reference to every such workspace until an event recorded
     on its launch stream -- at the NEXT call, once its launch is enqueued -- has completed.
     Overlapping calls therefore never free each other's scratch; holding only the most recent
-    buffer would, and no cap ever drops an entry whose fence has not completed.
+    buffer would, and no cap ever drops an entry whose fence has not completed. The fence for a
+    call is recorded by the NEXT call on the same API instance, which assumes the earlier launch
+    is enqueued by then: an API instance (and the wrappers' memoised instances) serves one host
+    thread at a time, like the compile cache it fronts.
     """
     if workspace is None:
         return
