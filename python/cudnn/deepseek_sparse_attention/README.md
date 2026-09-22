@@ -5,7 +5,7 @@
 - **Indexer Top-K**: SM90+ CuTe-DSL radix top-K kernel with per-row ``seq_lens``.
 - **Sparse Attention Backward**: DSA backward for flat MQA tensors on SM90/SM100; consumes the forward wrapper's `out` and KV-only `lse`.
 - **Sparse Indexer / Attention Score Recompute**: Sparse (top-K) recomputation of indexer and attention scores for training loss.
-- **Dense Indexer / Attention Score Recompute**: Dense (full-KV) analogues of the above.
+- **Dense Indexer / Attention Score Recompute**: Dense (full-KV) analogues of the above (BSHD on SM90/SM100; the THD `cu_seqlens` layout is SM100+ only).
 - **Indexer Backward**: Three-stage pipeline (score-grad, three GEMMs, dtype cast) for sparse top-K score tensors.
 - **Dense Indexer Backward**: Full-KV counterpart of Indexer Backward.
 

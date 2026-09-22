@@ -184,6 +184,7 @@ def flash_attn_bwd_sm100_h128_d576(
     topk_length=None,
     dq=None,
     dkv=None,
+    d_sink=None,
     current_stream=None,
     workspace=None,
 ):
@@ -204,7 +205,8 @@ def flash_attn_bwd_sm100_h128_d576(
                 dq = torch.empty_like(q)
             if dkv is None:
                 dkv = torch.empty_like(kv)
-            d_sink = torch.empty_like(attn_sink)
+            if d_sink is None:
+                d_sink = torch.empty_like(attn_sink)
             if workspace is None:
                 workspace = torch.empty(_workspace_bytes(sq, skv), dtype=torch.uint8, device=q.device)
     return _execute_d576_2cta(

@@ -57,6 +57,8 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 
+from cudnn.api_base import WorkspaceCarver, ws_align
+from cudnn.frost.buffers import memset_zero_async
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -1719,10 +1721,23 @@ def _build_cute_dsl_kernel(
         GradLoss,
         grad_scale,
         current_stream=None,
+        workspace=None,
     ):
         # ``grad_scale`` is a host scalar (Python float) forwarded as a
         # runtime ``Float32`` arg to the score-grad kernel; changing it
         # across calls does not trigger recompilation.
+        s = _resolve_stream(current_stream)
+        # The dK epilogue reduce-adds into an fp32 target that must start
+        # zeroed: the fp32 output itself, or for a bf16 output an fp32
+        # accumulator carved from the caller's workspace (R2). Carve before
+        # kernel 1 so a missing workspace cannot leave AttnScore overwritten.
+        if dIndexK.dtype == torch.float32:
+            dIndexK_f32 = dIndexK
+        else:
+            carver = WorkspaceCarver(workspace, ws_align(dIndexK.numel() * 4), "IndexerBackward (sm90)")
+            dIndexK_f32 = carver.take(dIndexK.numel(), torch.float32).view(dIndexK.shape)
+        memset_zero_async(dIndexK_f32.data_ptr(), dIndexK_f32.numel() * 4, s)
+
         # Kernel 1: Compute grad_signal from scores (CuTe DSL only).
         _score_grad_inplace(
             AttnScore,
@@ -1732,43 +1747,18 @@ def _build_cute_dsl_kernel(
             index_is_log=score_input_is_log,
             current_stream=current_stream,
         )
-
-        if dIndexK.dtype == torch.float32:
-            # fp32 output: the dK epilogue reduce-/atomic-adds into this
-            # buffer, so it must start zeroed. Zero it internally on the
-            # selected stream (cheap; removes the fragile caller pre-zero
-            # contract) rather than trusting the caller to pass a zeroed
-            # buffer. This is a promised stage of the execute pipeline and
-            # mirrors the SM100 backend and the DenseIndexerBackward fp32
-            # path.
-            with _torch_stream_context(current_stream):
-                dIndexK.zero_()
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK,
-                AttnScore,
-                TopkIndices,
-                current_stream=current_stream,
-            )
-        else:
-            # Need separate f32 buffer for atomicAdd, then convert back
-            with _torch_stream_context(current_stream):
-                dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK_f32,
-                AttnScore,
-                TopkIndices,
-                current_stream=current_stream,
-            )
+        _run_gemm_only(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            AttnScore,
+            TopkIndices,
+            current_stream=current_stream,
+        )
+        if dIndexK_f32 is not dIndexK:
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 

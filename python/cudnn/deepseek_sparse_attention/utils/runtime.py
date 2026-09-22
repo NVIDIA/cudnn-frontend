@@ -40,7 +40,7 @@ def maybe_contiguous(
 ) -> torch.Tensor | None:
     if x is None or x.stride(-1) == 1:
         return x
-    with torch_stream_context(stream):
+    with torch_stream_context(stream, x.device):
         return x.contiguous()
 
 
@@ -66,7 +66,7 @@ def validate_q_causal_offsets(
         raise ValueError("q_causal_offsets must be on the same device as q")
     if q_causal_offsets.is_contiguous():
         return q_causal_offsets
-    with torch_stream_context(stream):
+    with torch_stream_context(stream, device):
         return q_causal_offsets.contiguous()
 
 
@@ -77,15 +77,18 @@ def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstr
 
 
 @contextmanager
-def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iterator[None]:
+def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None) -> Iterator[None]:
+    """Run torch work on ``current_stream`` (R1). ``device`` is the operand's
+    device; it defaults to the current device, which is only right when the
+    operands live there -- pass it whenever a tensor is at hand."""
     if current_stream is None:
         yield
         return
     # A resolved handle usually names the already-current stream. Avoid
     # constructing ExternalStream and entering another CUDA stream context.
-    active = torch.cuda.current_stream(torch.cuda.current_device())
+    active = torch.cuda.current_stream(device if device is not None else torch.cuda.current_device())
     if int(current_stream) == active.cuda_stream:
         yield
         return
-    with stream_context(current_stream):
+    with stream_context(current_stream, device):
         yield
