@@ -3,6 +3,8 @@
 
 """Tests for grouped GEMM wgrad FE API."""
 
+import inspect
+
 import pytest
 import torch
 import cudnn
@@ -25,6 +27,79 @@ from fe_api.test_grouped_gemm_wgrad_bf16_utils import (
     grouped_gemm_wgrad_bf16_reference,
     make_grouped_gemm_wgrad_bf16_problem,
 )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("callable_obj", "legacy_positional_parameters"),
+    (
+        (
+            cudnn.GroupedGemmWgradSm100.execute,
+            (
+                "self",
+                "a_tensor",
+                "b_tensor",
+                "sfa_tensor",
+                "sfb_tensor",
+                "offsets_tensor",
+                "wgrad_tensor",
+                "wgrad_ptrs",
+                "global_scale_a",
+                "global_scale_b",
+                "current_stream",
+            ),
+        ),
+        (
+            cudnn.grouped_gemm_wgrad_wrapper_sm100,
+            (
+                "a_tensor",
+                "b_tensor",
+                "sfa_tensor",
+                "sfb_tensor",
+                "offsets_tensor",
+                "output_mode",
+                "wgrad_tensor",
+                "wgrad_ptrs",
+                "global_scale_a",
+                "global_scale_b",
+                "acc_dtype",
+                "wgrad_dtype",
+                "mma_tiler_mn",
+                "cluster_shape_mn",
+                "sf_vec_size",
+                "sf_fp8_dtype_override",
+                "accumulate_on_output",
+                "input_order",
+                "current_stream",
+            ),
+        ),
+    ),
+    ids=("facade-execute", "wrapper"),
+)
+def test_grouped_gemm_wgrad_preserves_legacy_positional_prefix(callable_obj, legacy_positional_parameters):
+    signature = inspect.signature(callable_obj)
+    parameters = signature.parameters
+    positional_parameters = tuple(
+        name for name, parameter in parameters.items() if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    assert positional_parameters == legacy_positional_parameters
+
+    descriptor_workspace = parameters["descriptor_workspace"]
+    assert descriptor_workspace.kind is inspect.Parameter.KEYWORD_ONLY
+    assert descriptor_workspace.default is None
+
+    sentinels = [object() for _ in legacy_positional_parameters]
+    bound = signature.bind(*sentinels)
+    for name, sentinel in zip(legacy_positional_parameters, sentinels):
+        assert bound.arguments[name] is sentinel
+    assert "descriptor_workspace" not in bound.arguments
+
+    workspace = object()
+    bound_with_workspace = signature.bind(*sentinels, descriptor_workspace=workspace)
+    assert bound_with_workspace.arguments["descriptor_workspace"] is workspace
+    with pytest.raises(TypeError):
+        signature.bind(*(sentinels + [workspace]))
+
 
 # ---------------------------------------------------------------------------
 # Dense mode: Class API
@@ -767,6 +842,318 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
 
     assert compile_count["value"] == 1
     assert cache_entries == 1
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("caller_owned_workspace", [False, True], ids=["wrapper-allocates", "caller-workspace"])
+def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(monkeypatch, caller_owned_workspace):
+    """One compiled plan serves every dense output, whoever owns the scratch (recipe R2): the plan
+    holds no descriptor workspace of its own, so there is nothing to isolate per output address.
+    ``descriptor_workspace`` reaches ``execute`` as the caller's buffer; otherwise the wrapper
+    allocates ``scratch_workspace_bytes()`` per call."""
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+    compile_count = {"value": 0}
+    execute_kwargs = []
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: execute_kwargs.append(kwargs))
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "scratch_workspace_bytes", lambda self: 128)
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "allocate_wrapper_workspace", lambda framework, nbytes, device, stream: torch.empty(nbytes, dtype=torch.uint8))
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+    )
+
+    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
+    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16) for _ in range(2)]
+    workspaces = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    try:
+        for output, workspace in zip(outputs, workspaces):
+            workspace_kwargs = {"descriptor_workspace": workspace} if caller_owned_workspace else {}
+            cudnn.grouped_gemm_wgrad_wrapper_sm100(
+                **inputs,
+                **workspace_kwargs,
+                output_mode="dense",
+                wgrad_tensor=output,
+                acc_dtype=torch.float32,
+                wgrad_dtype=torch.bfloat16,
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+                sf_vec_size=16,
+            )
+    finally:
+        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
+        grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+
+    assert outputs[0].data_ptr() != outputs[1].data_ptr()
+    assert compile_count["value"] == 1
+    assert cache_entries == 1
+    assert len(execute_kwargs) == 2
+    if caller_owned_workspace:
+        assert [kw["descriptor_workspace"] is w for kw, w in zip(execute_kwargs, workspaces)] == [True, True]
+        assert all("workspace" not in kw for kw in execute_kwargs)
+    else:
+        assert all(kw["workspace"].numel() == 128 and "descriptor_workspace" not in kw for kw in execute_kwargs)
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_wrapper_descriptor_workspace_rejected_off_block_scaled(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
+
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BF16,
+    )
+    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
+    inputs["sfa_tensor"] = inputs["sfb_tensor"] = None
+    with pytest.raises(ValueError, match="descriptor_workspace is supported only for torch block-scaled WGrad"):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            **inputs,
+            output_mode="dense",
+            wgrad_tensor=torch.empty((2, 32, 64), dtype=torch.bfloat16),
+            descriptor_workspace=torch.empty(512, dtype=torch.uint8),
+        )
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_wrapper_discrete_accepts_caller_workspace(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+    compile_count = {"value": 0}
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api.GroupedGemmWgradSm100,
+        "check_support",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api.GroupedGemmWgradSm100,
+        "compile",
+        counted_compile,
+    )
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api.GroupedGemmWgradSm100,
+        "execute",
+        lambda self, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+    )
+    # Recipe R4: the discrete pointer table is caller-layer work the wrapper derives on device;
+    # these are host tensors, so stub the derivation.
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "wgrad_expert_ptrs", lambda wgrad_tensor, current_stream=None: None)
+
+    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
+    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16) for _ in range(2)]
+    workspaces = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    try:
+        for output, workspace in zip(outputs, workspaces):
+            cudnn.grouped_gemm_wgrad_wrapper_sm100(
+                **inputs,
+                output_mode="discrete",
+                wgrad_tensor=output,
+                descriptor_workspace=workspace,
+                acc_dtype=torch.float32,
+                wgrad_dtype=torch.bfloat16,
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+                sf_vec_size=16,
+            )
+    finally:
+        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
+        grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+
+    assert compile_count["value"] == 1
+    assert cache_entries == 1
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_workspace_size():
+    assert cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2) == 1024
+    assert (
+        cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(
+            2,
+            input_order="tensor_ragged",
+        )
+        == 1024
+    )
+    assert cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(1, output_mode="discrete") % 128 == 0
+    with pytest.raises(ValueError, match="num_experts must be positive"):
+        cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("output_mode", ["dense", "discrete"])
+def test_grouped_gemm_wgrad_workspace_size_matches_plan(output_mode):
+    """The public size is the number the plan carves: ``execute(workspace=)`` sized with
+    ``get_grouped_gemm_wgrad_workspace_size_sm100`` is exactly ``scratch_workspace_bytes()``."""
+    cfg = grouped_gemm_wgrad_init(
+        ab_dtype=torch.float8_e4m3fn,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+    inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+    kw = dict(
+        sample_a=inputs["a_tensor"],
+        sample_b=inputs["b_tensor"],
+        sample_sfa=inputs["sfa_tensor"],
+        sample_sfb=inputs["sfb_tensor"],
+        sample_offsets=inputs["offsets_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+    )
+    if output_mode == "discrete":
+        kw.update(num_experts=cfg["l"], wgrad_shape=(cfg["m"], cfg["n"]), wgrad_dtype=cfg["wgrad_dtype"])
+    else:
+        kw.update(sample_wgrad=allocate_grouped_gemm_wgrad_output(cfg))
+    op = cudnn.GroupedGemmWgradSm100(**kw)
+    assert op.check_support()
+    assert op.scratch_workspace_bytes() == cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(cfg["l"], output_mode=output_mode)
+
+
+def _fake_blockscaled_wgrad_api(weight_mode):
+    """A block-scaled plan skeleton whose launch records the workspace view it was handed."""
+    from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
+
+    api = object.__new__(_blockscaled_api.GroupedGemmWgradBlockScaledAPI)
+    api.a_desc = type("TensorDesc", (), {"device": torch.device("cuda", torch.cuda.current_device())})()
+    api.weight_mode = weight_mode
+    api.expert_cnt = 2
+    api._get_default_stream = lambda stream: stream
+    api._runtime_error_if = lambda condition, message: None
+    api.scratch_workspace_bytes = lambda: 128
+    launch_workspaces = []
+    api._compiled_kernel = lambda *args: launch_workspaces.append(args[6])
+    return api, launch_workspaces
+
+
+@pytest.mark.L0
+def test_blockscaled_wgrad_execute_uses_caller_workspace():
+    """Dense ``execute``: ``descriptor_workspace`` is the caller's ``workspace``; the launch reads a
+    view over that buffer, never a plan-owned one, and refuses to run without it (recipe R2)."""
+    from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
+
+    api, launch_workspaces = _fake_blockscaled_wgrad_api(_blockscaled_api.MoEWeightMode.DENSE)
+    operand = torch.empty((1, 1), device="cuda")
+    offsets = torch.tensor([1], dtype=torch.int32, device="cuda")
+    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16, device="cuda") for _ in range(2)]
+    workspaces = [torch.empty(128, dtype=torch.uint8, device="cuda") for _ in range(2)]
+    stream = torch.cuda.current_stream().cuda_stream
+    for output, workspace in ((outputs[0], workspaces[0]), (outputs[0], workspaces[0]), (outputs[1], workspaces[1])):
+        api.execute(operand, operand, operand, operand, offsets, wgrad_tensor=output, descriptor_workspace=workspace, current_stream=stream)
+    api.execute(
+        operand, operand, operand, operand, offsets, wgrad_tensor=outputs[1], workspace=workspaces[1], descriptor_workspace=workspaces[1], current_stream=stream
+    )
+
+    assert [view.data_ptr() for view in launch_workspaces] == [
+        workspaces[0].data_ptr(),
+        workspaces[0].data_ptr(),
+        workspaces[1].data_ptr(),
+        workspaces[1].data_ptr(),
+    ]
+    assert not hasattr(api, "_workspace") and not hasattr(api, "_workspace_arg")
+
+    with pytest.raises(ValueError, match="requires a 128-byte workspace but execute\\(\\) received none"):
+        api.execute(operand, operand, operand, operand, offsets, wgrad_tensor=outputs[0], current_stream=stream)
+    with pytest.raises(ValueError, match="name the same buffer"):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=outputs[0],
+            workspace=workspaces[0],
+            descriptor_workspace=workspaces[1],
+            current_stream=stream,
+        )
+    with pytest.raises(ValueError, match="descriptor_workspace must have dtype uint8"):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=outputs[0],
+            descriptor_workspace=torch.empty(128, dtype=torch.int8, device="cuda"),
+            current_stream=stream,
+        )
+    with pytest.raises(ValueError, match="descriptor_workspace requires at least 128 bytes, got 64"):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=outputs[0],
+            descriptor_workspace=torch.empty(64, dtype=torch.uint8, device="cuda"),
+            current_stream=stream,
+        )
+    with pytest.raises(ValueError, match="descriptor_workspace must be contiguous"):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=outputs[0],
+            descriptor_workspace=torch.empty(256, dtype=torch.uint8, device="cuda")[::2],
+            current_stream=stream,
+        )
+    with pytest.raises(ValueError, match="same device"):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=outputs[0],
+            descriptor_workspace=torch.empty(128, dtype=torch.uint8),
+            current_stream=stream,
+        )
+    assert len(launch_workspaces) == 4
+
+
+@pytest.mark.L0
+def test_blockscaled_discrete_wgrad_execute_uses_caller_workspace(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
+
+    api, launch_workspaces = _fake_blockscaled_wgrad_api(_blockscaled_api.MoEWeightMode.DISCRETE)
+    monkeypatch.setattr(_blockscaled_api, "_validate_pointer_tensor", lambda tensor, name, count: None)
+    monkeypatch.setattr(_blockscaled_api, "debug_validate_pointer_values", lambda tensor, name, stream=None: None)
+
+    operand = torch.empty((1, 1), device="cuda")
+    offsets = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    wgrad_ptrs = torch.empty(2, dtype=torch.int64, device="cuda")
+    workspaces = [torch.empty(128, dtype=torch.uint8, device="cuda") for _ in range(2)]
+    stream = torch.cuda.current_stream().cuda_stream
+    for workspace in (workspaces[0], workspaces[0], workspaces[1]):
+        api.execute(operand, operand, operand, operand, offsets, wgrad_ptrs=wgrad_ptrs, descriptor_workspace=workspace, current_stream=stream)
+
+    assert [view.data_ptr() for view in launch_workspaces] == [workspaces[0].data_ptr(), workspaces[0].data_ptr(), workspaces[1].data_ptr()]
+    with pytest.raises(ValueError, match="requires a 128-byte workspace but execute\\(\\) received none"):
+        api.execute(operand, operand, operand, operand, offsets, wgrad_ptrs=wgrad_ptrs, current_stream=stream)
+    assert len(launch_workspaces) == 3
 
 
 @pytest.mark.L0

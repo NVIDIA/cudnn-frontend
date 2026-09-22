@@ -736,22 +736,30 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
-    # Block-scaled O (per-tensor FP8 forward only): FP4 O needs the sf_o
-    # output (E4M3 scale per 16 d); an E4M3 O with sf_o is the MXFP8 output
-    # (UE8M0 scale per 32 d). Any other pairing is not a graph any engine serves.
-    sf_o = rec.get("sf_o") if is_fp8 else None
+    # Block-scaled O (the quantized forwards, sdpa_fp8 and sdpa_mxfp8): FP4 O
+    # needs the sf_o output (E4M3 scale per 16 d); an E4M3 O with sf_o is the
+    # MXFP8 output (UE8M0 scale per 32 d). Any other pairing is not a graph any
+    # engine serves. sdpa_mxfp8 carries no per-tensor O scale otherwise, so its
+    # scale_o (the FP4 global scale) is legal only with sf_o and mandatory for FP4.
+    _quant_fwd = (is_fp8 or is_mxfp8) and not is_backward
+    sf_o = rec.get("sf_o") if _quant_fwd else None
     o_block_scale = 0
-    if is_fp8:
+    if _quant_fwd:
+        _op = "sdpa_fp8" if is_fp8 else "sdpa_mxfp8"
         if o.get_data_type() == cudnn.data_type.FP4_E2M1:
             if sf_o is None:
-                return _invalid("sdpa_fp8: an FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements)")
+                return _invalid(f"{_op}: an FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements)")
+            if is_mxfp8 and rec.get("scale_o") is None:
+                return _invalid("sdpa_mxfp8: an FP4_E2M1 O requires scale_o (the FP4 global scale)")
             o_block_scale = 16
         elif sf_o is not None:
             if o.get_data_type() != cudnn.data_type.FP8_E4M3:
-                return _invalid("sdpa_fp8: sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output, UE8M0 scale per 32 d elements)")
+                return _invalid(f"{_op}: sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output, UE8M0 scale per 32 d elements)")
             o_block_scale = 32
+        if is_mxfp8 and rec.get("scale_o") is not None and sf_o is None:
+            return _invalid("sdpa_mxfp8: scale_o is accepted only together with the sf_o output (block-scaled O)")
     elif rec.get("sf_o") is not None:
-        return _invalid("sf_o is an output of sdpa_fp8 only")
+        return _invalid("sf_o is an output of the quantized forwards (sdpa_fp8 / sdpa_mxfp8) only")
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
@@ -984,7 +992,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         descale_q_t=(dsc_q if is_fp8 else None),
         descale_k_t=(dsc_k if is_fp8 else None),
         descale_v_t=(dsc_v if is_fp8 else None),
-        scale_o_t=(rec.get("scale_o") if is_fp8 else None),
+        scale_o_t=(rec.get("scale_o") if (is_fp8 or is_mxfp8) else None),
         descale_s_t=(rec.get("descale_s") if is_fp8 else None),
         scale_s_t=(rec.get("scale_s") if is_fp8 else None),
         # Amax_S: the op RETURNS the port unconditionally; only a real

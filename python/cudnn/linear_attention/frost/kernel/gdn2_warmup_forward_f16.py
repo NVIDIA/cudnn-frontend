@@ -33,7 +33,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common import split_k
 from ..common.host import get_dtype
-from . import gdn2_prefill_f16
+from . import gdn2_prefill_f16, gdn2_prep_f16, gdn2_prep_prefill_f16
 
 warmup_forward_cache = {}
 
@@ -55,6 +55,7 @@ def warmup_forward_host(
     io_dtype: cutlass.Constexpr,
     order_gen: cutlass.Constexpr[bool],
     prefill_cfg: cutlass.Constexpr,
+    tiles_per_head: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
     batch_size: cutlass.Int32,
@@ -94,6 +95,16 @@ def warmup_forward_host(
     chunk_scratch: Optional[cute.Tensor],
     scheduler: cute.Tensor,
     workspace: cute.Tensor,
+    prep: cutlass.Constexpr[bool],
+    prep_cfg: cutlass.Constexpr,
+    prep_k_decay: Optional[cute.Tensor],
+    prep_q_decay: Optional[cute.Tensor],
+    prep_t: Optional[cute.Tensor],
+    prep_a: Optional[cute.Tensor],
+    prep_diag: Optional[cute.Tensor],
+    prep_words: Optional[cute.Tensor],
+    prep_rows: Optional[cute.Tensor],
+    prep_row_count: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
     if cutlass.const_expr(split):
@@ -129,28 +140,82 @@ def warmup_forward_host(
             n_walk_ctas,
             stream,
         )
-    gdn2_prefill_f16.prologue(
-        io_dtype,
-        b_t,
-        order_gen,
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        w,
-        o,
-        checkpoints,
-        cu_seqlens,
-        staging,
-        work_count,
-        work_items,
-        scheduler,
-        workspace,
-        checkpoint_every_n,
-        stream,
-    )
-    gdn2_prefill_f16.host(
+    if cutlass.const_expr(prep):
+        gdn2_prep_prefill_f16.prologue(
+            io_dtype,
+            b_t,
+            order_gen,
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            w,
+            o,
+            checkpoints,
+            cu_seqlens,
+            staging,
+            work_count,
+            work_items,
+            scheduler,
+            workspace,
+            checkpoint_every_n,
+            stream,
+            tiles_per_head,
+            prep_k_decay,
+            prep_q_decay,
+            prep_t,
+            prep_a,
+            prep_diag,
+            prep_cfg,
+            beta,
+            prep_words,
+            prep_rows,
+            prep_row_count,
+        )
+        gdn2_prep_f16.host(
+            prep_cfg,
+            q,
+            k,
+            prep_words,
+            gate,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            prep_k_decay,
+            prep_q_decay,
+            prep_t,
+            prep_a,
+            prep_diag,
+            prep_rows,
+            prep_row_count,
+            stream,
+        )
+    else:
+        gdn2_prefill_f16.prologue(
+            io_dtype,
+            b_t,
+            order_gen,
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            w,
+            o,
+            checkpoints,
+            cu_seqlens,
+            staging,
+            work_count,
+            work_items,
+            scheduler,
+            workspace,
+            checkpoint_every_n,
+            stream,
+            tiles_per_head,
+        )
+    prefill_host = gdn2_prep_prefill_f16.host if cutlass.const_expr(prep) else gdn2_prefill_f16.host
+    prefill_host(
         prefill_cfg,
         q,
         k,
@@ -215,14 +280,24 @@ def build_warmup_forward(
     scale,
     device,
     stream,
+    tiles_per_head=1,
+    prep=False,
+    prep_k_decay=None,
+    prep_q_decay=None,
+    prep_t=None,
+    prep_a=None,
+    prep_diag=None,
+    prep_words=None,
+    prep_rows=None,
+    prep_row_count=None,
 ):
-    """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the split-K geometry, state and
+    """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the split-K geometry, the d_v split, state and
     checkpoint presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat
     the marks of the standalone split-table and prefill builds so every kernel compiles as it does there."""
     HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
+    k.shape[1]
     HV, DV = v.shape[1], v.shape[2]
-    HO = max(HQ, HV)
+    max(HQ, HV)
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -272,9 +347,12 @@ def build_warmup_forward(
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        int(tiles_per_head),
+        bool(prep),
     )
     if key not in warmup_forward_cache:
-        prefill_cfg = gdn2_prefill_f16.build_cfg(
+        prefill_module = gdn2_prep_prefill_f16 if prep else gdn2_prefill_f16
+        prefill_cfg = prefill_module.build_cfg(
             io_dtype,
             state_dtype,
             gate_dtype,
@@ -290,8 +368,32 @@ def build_warmup_forward(
             beta_guard=beta_guard,
             max_active_clusters=num_sm,
             d_k=DK,
-            d_v=DV,
+            d_v=DV // tiles_per_head,
+            tiles_per_head=tiles_per_head,
         )
+        prep_cfg = None
+        if prep:
+            prep_cfg = gdn2_prep_f16.build_cfg(
+                io_dtype,
+                gate_dtype,
+                num_sm=num_sm,
+                l2norm=use_qk_l2norm,
+                safe_gate=safe_gate,
+                gate_scale_log2=float(gate_lower_bound) * gdn2_prefill_f16.LOG2_E,
+                log_gate=log_gate,
+                beta_sigmoid=use_beta_sigmoid,
+                allow_neg_eigval=allow_neg_eigval,
+                d_k=DK,
+                beta_guard=beta_guard,
+            )
+        prep_placeholders = [None] * 8
+        if prep:
+            prep_placeholders = [from_dlpack(rec, assumed_align=128).mark_layout_dynamic(leading_dim=3) for rec in (prep_k_decay, prep_q_decay, prep_t)]
+            prep_placeholders.append(from_dlpack(prep_a, assumed_align=16).mark_layout_dynamic(leading_dim=2))
+            prep_placeholders.append(from_dlpack(prep_diag, assumed_align=16).mark_layout_dynamic(leading_dim=2))
+            prep_placeholders.append(from_dlpack(prep_words, assumed_align=128).mark_layout_dynamic())
+            prep_placeholders.append(from_dlpack(prep_rows, assumed_align=16).mark_layout_dynamic(leading_dim=1))
+            prep_placeholders.append(from_dlpack(prep_row_count, assumed_align=4).mark_layout_dynamic())
 
         gate_table_placeholder = None
         dt_bias_table_placeholder = None
@@ -334,6 +436,7 @@ def build_warmup_forward(
             io_dtype,
             not split,
             prefill_cfg,
+            int(tiles_per_head),
             cutlass.Int32(facts.n_tiles),
             cutlass.Int32(facts.ideal_chunks),
             cutlass.Int32(facts.batch_size),
@@ -373,6 +476,9 @@ def build_warmup_forward(
             chunk_scratch_placeholder,
             from_dlpack(scheduler, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(workspace, assumed_align=128).mark_layout_dynamic(),
+            bool(prep),
+            prep_cfg,
+            *prep_placeholders,
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
@@ -407,6 +513,14 @@ def run_warmup_forward(
     checkpoint_every_n_tokens,
     scale,
     stream,
+    prep_k_decay=None,
+    prep_q_decay=None,
+    prep_t=None,
+    prep_a=None,
+    prep_diag=None,
+    prep_words=None,
+    prep_rows=None,
+    prep_row_count=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
@@ -451,5 +565,13 @@ def run_warmup_forward(
         chunk_scratch if facts.split else None,
         scheduler,
         workspace,
+        prep_k_decay,
+        prep_q_decay,
+        prep_t,
+        prep_a,
+        prep_diag,
+        prep_words,
+        prep_rows,
+        prep_row_count,
         cuda.CUstream(int(stream)),
     )

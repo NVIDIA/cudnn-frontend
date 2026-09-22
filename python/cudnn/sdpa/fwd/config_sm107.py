@@ -419,9 +419,9 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     fail here at compile.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
-    block-scaled O epilogue (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output). Only the
-    per-tensor FP8 d128 kernel does; the d192xd128 and MXFP8 siblings share the
-    d128 config family but accept DTYPE_O 0..3 only, so a flavor-name test
+    block-scaled O epilogue (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output). The two d128
+    kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
+    config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
     # Fused epilogue gate FIRST, so an interaction decline names the feature the
     # caller asked for (`TemplateParams(epilogue_gate=True, split_kv=2)` reads
@@ -447,7 +447,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         if k.dtype_qkv > _DTYPE_E5M2:
             raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) requires FP8 inputs")
         if not block_scaled_o_wired:
-            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) is wired in the per-tensor FP8 d128 kernel only")
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) is wired in the d128 kernels (per-tensor FP8, MXFP8) only")
         if k.thd_varlen or k.seq_q_lens_present or (k.split_kv or 1) > 1 or k.pack_gqa:
             raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked graphs only")
     if k.dtype_qkv > _DTYPE_E5M2 and dtype_o != k.dtype_qkv:
@@ -828,8 +828,9 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # (at tile_k=192) the d192 one -- hence the dtype and tile checks rather than
     # keying on the flavor string.
     split_wired = not mxfp8 and tile_k == 128 and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
-    # The block-scaled O epilogue lives in prefill_d128_fp8 only (same kernel as the split helpers).
-    block_scaled_o_wired = not mxfp8 and tile_k == 128 and tile_o == 128
+    # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
+    # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
+    block_scaled_o_wired = tile_k == 128 and tile_o == 128
     _validate_params(flavor, params, split_wired=split_wired, block_scaled_o_wired=block_scaled_o_wired)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)

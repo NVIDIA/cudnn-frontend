@@ -14,6 +14,7 @@ import cutlass
 
 from cudnn.api_base import APIBase, TupleDict, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -34,7 +35,7 @@ from ..backend_utils import (
     select_grouped_gemm_backend,
     wrapper_operand_meta,
 )
-from ..moe_utils import WGradInputOrder
+from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
 
 def _block_scaled_dtype_pairs():
@@ -50,6 +51,29 @@ def _block_scaled_dtype_pairs():
 
 
 _cache_of_GroupedGemmWgradSm100Objects = {}
+
+
+def get_grouped_gemm_wgrad_workspace_size_sm100(
+    num_experts: int,
+    *,
+    output_mode: str = "dense",
+    input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+) -> int:
+    """Bytes of the caller-owned runtime TMA-descriptor workspace a block-scaled wgrad plan of
+    this configuration carves at ``execute(workspace=)`` -- the same number that plan's
+    ``scratch_workspace_bytes()`` reports (128-byte aligned, never 0)."""
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    try:
+        weight_mode = MoEWeightMode(output_mode)
+    except ValueError as exc:
+        raise ValueError(f"unsupported output_mode {output_mode!r}") from exc
+    try:
+        normalized_input_order = WGradInputOrder(input_order)
+    except ValueError as exc:
+        raise ValueError(f"unsupported input_order {input_order!r}") from exc
+    raw = WgradSfTensormapConstructor.get_workspace_size(normalized_input_order, weight_mode, num_experts)
+    return max(align_up(raw, 128), 128)
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
@@ -186,7 +210,9 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: None = None,
         global_scale_b: None = None,
+        current_stream: Optional[cuda.CUstream] = None,
         workspace: Any = None,
+        descriptor_workspace: None = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -203,7 +229,9 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
+        current_stream: Optional[cuda.CUstream] = None,
         workspace: Any = None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def execute(
@@ -220,10 +248,19 @@ class GroupedGemmWgradSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         workspace: Any = None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None:
+        """``workspace`` (recipe R2) is required whenever ``scratch_workspace_bytes() > 0``; the
+        block-scaled backend also accepts it as ``descriptor_workspace`` (an alias, torch uint8,
+        sized with :func:`get_grouped_gemm_wgrad_workspace_size_sm100`)."""
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
-        self._implementation.execute(
+        if descriptor_workspace is not None and not isinstance(
+            self._implementation,
+            GroupedGemmWgradBlockScaledAPI,
+        ):
+            raise ValueError("descriptor_workspace requires the block-scaled WGrad backend")
+        execute_kwargs = dict(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             sfa_tensor=sfa_tensor,
@@ -236,6 +273,9 @@ class GroupedGemmWgradSm100(APIBase):
             current_stream=current_stream,
             workspace=workspace,
         )
+        if descriptor_workspace is not None:
+            execute_kwargs["descriptor_workspace"] = descriptor_workspace
+        self._implementation.execute(**execute_kwargs)
 
 
 def wgrad_expert_ptrs(wgrad_tensor, current_stream: Optional[cuda.CUstream] = None):
@@ -307,6 +347,32 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
 # Operand-metadata key -> (op, framework, output shape, output dtype); see wrapper_operand_meta.
 _wgrad_wrapper_memo: dict = {}
 
+# JAX only: (operand meta, data pointer) of a stacked output -> its pointer table. The table is a
+# pure function of the key, so a recycled address with the same geometry gets the right answer,
+# and the block_until_ready inside wgrad_expert_ptrs happens once per buffer, not per execute.
+_wgrad_jax_ptrs_memo: dict = {}
+_WGRAD_JAX_PTRS_MEMO_MAX = 64
+
+
+def _discrete_wgrad_ptrs(framework: str, wgrad_tensor, current_stream: Optional[cuda.CUstream]):
+    if framework != "jax":
+        return wgrad_expert_ptrs(wgrad_tensor, current_stream)
+    key = (wrapper_operand_meta(wgrad_tensor), int(get_data_ptr(wgrad_tensor)))
+    table = _wgrad_jax_ptrs_memo.get(key)
+    if table is None:
+        table = wgrad_expert_ptrs(wgrad_tensor, current_stream)
+        if len(_wgrad_jax_ptrs_memo) >= _WGRAD_JAX_PTRS_MEMO_MAX:
+            _wgrad_jax_ptrs_memo.pop(next(iter(_wgrad_jax_ptrs_memo)))
+        _wgrad_jax_ptrs_memo[key] = table
+    return table
+
+
+def _wrapper_workspace_kwargs(framework: str, op, descriptor_workspace, device, current_stream: Optional[cuda.CUstream]) -> dict:
+    """The caller's ``descriptor_workspace`` when given, else a per-call allocation (recipe R2)."""
+    if descriptor_workspace is not None:
+        return {"descriptor_workspace": descriptor_workspace}
+    return {"workspace": allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), device, current_stream)}
+
 
 def grouped_gemm_wgrad_wrapper_sm100(
     a_tensor: torch.Tensor,
@@ -328,8 +394,16 @@ def grouped_gemm_wgrad_wrapper_sm100(
     accumulate_on_output: bool = False,
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
+    *,
+    descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
-    """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    """Compile and execute grouped GEMM wgrad through the selected backend API.
+
+    ``descriptor_workspace`` (torch block-scaled only): the caller's uint8 buffer of
+    ``get_grouped_gemm_wgrad_workspace_size_sm100(...)`` bytes, used as the plan's
+    ``workspace=``; when omitted the wrapper allocates that scratch per call on the launch
+    stream. Either way the plan owns no scratch, so one compiled plan serves every output.
+    """
     memo_key = (
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
@@ -340,6 +414,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         output_mode,
         wrapper_operand_meta(wgrad_tensor),
         wrapper_operand_meta(wgrad_ptrs),
+        descriptor_workspace is not None,
         wrapper_operand_meta(global_scale_a),
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
@@ -358,7 +433,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
         if output_mode == "discrete" and wgrad_ptrs is None:
-            wgrad_ptrs = wgrad_expert_ptrs(wgrad_tensor, current_stream)
+            wgrad_ptrs = _discrete_wgrad_ptrs(framework, wgrad_tensor, current_stream)
         op.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -370,7 +445,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
             current_stream=current_stream,
-            workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
+            **_wrapper_workspace_kwargs(framework, op, descriptor_workspace, a_tensor.device, current_stream),
         )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
@@ -412,6 +487,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     )
     if framework == "jax" and backend is GroupedGemmBackend.BLOCK_SCALED:
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
+    if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
+        raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
     wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
         wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
@@ -485,7 +562,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
     _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
     if output_mode == "discrete" and wgrad_ptrs is None:
-        wgrad_ptrs = wgrad_expert_ptrs(wgrad_tensor, current_stream)
+        wgrad_ptrs = _discrete_wgrad_ptrs(framework, wgrad_tensor, current_stream)
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,
@@ -497,6 +574,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
         current_stream=current_stream,
-        workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
+        **_wrapper_workspace_kwargs(framework, op, descriptor_workspace, a_tensor.device, current_stream),
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)

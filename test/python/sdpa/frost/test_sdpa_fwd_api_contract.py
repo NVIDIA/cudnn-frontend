@@ -71,6 +71,21 @@ def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
 
 
 @pytest.mark.L0
+def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy():
+    """sdpa_mxfp8's scale_o is optional. A graph that declares none must get the
+    kernel's None-specialized identity fold (constructor ``sample_scale_o=None``
+    -> ``compile(has_scale_o=False)``), NEVER a cached ``torch.ones`` created on
+    the first execute: when that first execute is under CUDA-graph capture the
+    dummy is allocated but its fill is only captured, so an eager execute before
+    the first replay reads garbage (review on #1180; Rule 8)."""
+    source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
+    assert "self._scale_view(None" not in source
+    assert "self.has_scale_o" in source
+    # Append-only public signature: sample_scale_o is the last constructor parameter.
+    assert list(inspect.signature(SdpaFwdDsl.__init__).parameters)[-1] == "sample_scale_o"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("api_cls", [SdpaFwdDslSm100, SdpaFwdDslSm120], ids=["sm100", "sm120"])
 def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cls):
     """The lowering hands ``sf_o`` to ``execute()`` for every graph whose engine
@@ -79,7 +94,9 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     passes check_support and compile, then fails every block-scaled draw at
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
-    for fn in (api_cls.execute, api_cls._execute_fp8):
+    # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
+    fns = (api_cls.execute, api_cls._execute_fp8) + ((api_cls._execute_mxfp8,) if hasattr(api_cls, "_execute_mxfp8") else ())
+    for fn in fns:
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
         assert params["sf_o"].default is None

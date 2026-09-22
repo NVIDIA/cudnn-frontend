@@ -9,10 +9,12 @@
 # MXF8/F6/F4 idesc layout used by CUTLASS/CuTe for
 # `tcgen05.mma.kind::mxf8f6f4.block_scale`.
 
+
 from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import OperandMajorMode
 
 # ---------------------------------------------------------------------------
 # Enumerations that match the HW encodings (values MUST stay identical)
@@ -209,8 +211,8 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.a_major_mode == OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == OperandMajorMode.K else Major.MN,
     )
 
 
@@ -220,8 +222,8 @@ def blockscaled_mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp, sf_
         op.b_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.a_major_mode == OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == OperandMajorMode.K else Major.MN,
         a_sf_id=sf_id,
         b_sf_id=sf_id,
     )

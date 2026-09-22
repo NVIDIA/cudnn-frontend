@@ -66,6 +66,7 @@ exponent reaching ``exp2`` to be ``<= 0``, so the exponential can only underflow
 to zero -- overflow is structurally impossible rather than merely budgeted.
 """
 
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 import os
 
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_90a")
@@ -180,14 +181,14 @@ def prep_kernel(
 
     if active:
         sA_layout = cute.slice_(
-            hh.make_smem_layout_a(utils.LayoutEnum.ROW_MAJOR, (64, 16, 128), BF16, 1),
+            hh.make_smem_layout_a(LayoutEnum.ROW_MAJOR, (64, 16, 128), BF16, 1),
             (None, None, 0),
         )
         sB_layout = cute.slice_(
-            hh.make_smem_layout_b(utils.LayoutEnum.ROW_MAJOR, (64, 16, 128), BF16, 1),
+            hh.make_smem_layout_b(LayoutEnum.ROW_MAJOR, (64, 16, 128), BF16, 1),
             (None, None, 0),
         )
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         sA = smem.allocate_tensor(BF16, sA_layout.outer, byte_alignment=1024, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(BF16, sB_layout.outer, byte_alignment=1024, swizzle=sB_layout.inner)
         sM = smem.allocate_tensor(F32, cute.make_layout((64, 16)), byte_alignment=16)
@@ -383,13 +384,13 @@ def seg_kernel(
     cb = (s0 // 16 + sq + c0) * nheads + hq
     opi = (sq * nheads + hq) * NSEG + seg
 
-    sMW_l = hh.make_smem_layout_b(utils.LayoutEnum.ROW_MAJOR, (128, 16, 128), BF16, NSTAGE)
-    sKG_l = hh.make_smem_layout_b(utils.LayoutEnum.COL_MAJOR, (128, 128, 16), BF16, NSTAGE)
-    sZ_l = hh.make_smem_layout_b(utils.LayoutEnum.ROW_MAJOR, (128, 16, 16), BF16, NSTAGE)
-    sUT_l = hh.make_smem_layout_b(utils.LayoutEnum.COL_MAJOR, (vm, vm, 16), BF16, NSTAGE)
+    sMW_l = hh.make_smem_layout_b(LayoutEnum.ROW_MAJOR, (128, 16, 128), BF16, NSTAGE)
+    sKG_l = hh.make_smem_layout_b(LayoutEnum.COL_MAJOR, (128, 128, 16), BF16, NSTAGE)
+    sZ_l = hh.make_smem_layout_b(LayoutEnum.ROW_MAJOR, (128, 16, 16), BF16, NSTAGE)
+    sUT_l = hh.make_smem_layout_b(LayoutEnum.COL_MAJOR, (vm, vm, 16), BF16, NSTAGE)
     sAV_l = cute.make_layout((1, 128, NSTAGE), stride=(128, 1, 128))
 
-    smem = utils.SmemAllocator()
+    smem = SmemAllocator()
     mbar = smem.allocate_array(cutlass.Int64, NSTAGE * 2, byte_alignment=16)
     sMW = smem.allocate_tensor(BF16, sMW_l.outer, byte_alignment=1024, swizzle=sMW_l.inner)
     sQG = smem.allocate_tensor(BF16, sMW_l.outer, byte_alignment=1024, swizzle=sMW_l.inner)
@@ -697,12 +698,12 @@ def comb_kernel(
     if warp_idx == 0:
         cpasync.prefetch_descriptor(atom_mt)
 
-    sA_l = hh.make_smem_layout_a(utils.LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, NSTC)
+    sA_l = hh.make_smem_layout_a(LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, NSTC)
     sX_l = cute.slice_(
-        hh.make_smem_layout_b(utils.LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, 1),
+        hh.make_smem_layout_b(LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, 1),
         (None, None, 0),
     )
-    smem = utils.SmemAllocator()
+    smem = SmemAllocator()
     mbar = smem.allocate_array(cutlass.Int64, NSTC * 2, byte_alignment=16)
     sMt = smem.allocate_tensor(BF16, sA_l.outer, byte_alignment=1024, swizzle=sA_l.inner)
     sX = smem.allocate_tensor(BF16, sX_l.outer, byte_alignment=1024, swizzle=sX_l.inner)
@@ -940,9 +941,9 @@ def kda_launch(
         a_source=warpgroup.OperandSource.RMEM,
     )
 
-    sMW_1 = cute.slice_(hh.make_smem_layout_b(utils.LayoutEnum.ROW_MAJOR, (128, 16, 128), BF16, NSTAGE), (None, None, 0))
-    sKG_1 = cute.slice_(hh.make_smem_layout_b(utils.LayoutEnum.COL_MAJOR, (128, 128, 16), BF16, NSTAGE), (None, None, 0))
-    sZ_1 = cute.slice_(hh.make_smem_layout_b(utils.LayoutEnum.ROW_MAJOR, (128, 16, 16), BF16, NSTAGE), (None, None, 0))
+    sMW_1 = cute.slice_(hh.make_smem_layout_b(LayoutEnum.ROW_MAJOR, (128, 16, 128), BF16, NSTAGE), (None, None, 0))
+    sKG_1 = cute.slice_(hh.make_smem_layout_b(LayoutEnum.COL_MAJOR, (128, 128, 16), BF16, NSTAGE), (None, None, 0))
+    sZ_1 = cute.slice_(hh.make_smem_layout_b(LayoutEnum.ROW_MAJOR, (128, 16, 16), BF16, NSTAGE), (None, None, 0))
     sAV_1 = cute.make_layout((1, 128), stride=(128, 1))
 
     op = cpasync.CopyBulkTensorTileG2SOp()
@@ -995,7 +996,7 @@ def kda_launch(
             tiler_mn=(64, DIM // VSPLIT),
         )
         sMT_1 = cute.slice_(
-            hh.make_smem_layout_a(utils.LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, NSTC),
+            hh.make_smem_layout_a(LayoutEnum.COL_MAJOR, (128, DIM // VSPLIT, 128), BF16, NSTC),
             (None, None, 0),
         )
         atom_mt, tMT = cpasync.make_tiled_tma_atom(op, mMTt, sMT_1, (128, 128))
@@ -1013,7 +1014,7 @@ def kda_launch(
     if cutlass.const_expr(nseg == 1):
         sUT_1_v = cute.slice_(
             hh.make_smem_layout_b(
-                utils.LayoutEnum.COL_MAJOR,
+                LayoutEnum.COL_MAJOR,
                 (DIM // 2, DIM // 2, 16),
                 BF16,
                 NSTAGE,
