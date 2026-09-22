@@ -77,7 +77,7 @@ def assert_bits(actual, expected):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_prepared_dynamic_length_alignment_and_guards(quantization, heads, dtype, monkeypatch):
     import triton
-    from cudnn.rope import api
+    from cudnn.rope import qdq as api
 
     dim = 128 if quantization == "fp4" else 512
     initial = inputs((1, heads, dim), dtype, quantization=quantization)
