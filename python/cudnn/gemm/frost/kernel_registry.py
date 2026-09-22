@@ -662,7 +662,9 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     block-scale MMA halves the instruction count at a wide tile, so take it
     whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
     asks the arch and not the config family. Everything else stays at 32."""
-    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
+    mm = chain.matmul
+    dense_fp8 = mm.a_dtype.startswith("fp8_") and mm.b_dtype.startswith("fp8_")
+    if not dense_fp8 and classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
         return 32
     from . import compiler as C
 

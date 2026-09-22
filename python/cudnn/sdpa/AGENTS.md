@@ -121,3 +121,20 @@ ordered after that read.**
   `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
   clears the partial-log2 flag itself, so adapter-only tests cannot detect
   a missing guard in a directly called template.
+
+**Rule S5 — Strided outputs must retain their layout through the final store.**
+
+- `make_array_view(t)[b, s, h, :]` returns a row pointer; indexing that pointer
+  by `d` assumes a unit D stride. Use full indexing (`view[b, s, h, d]`) when
+  accepting an arbitrary declared D stride, or explicitly require D-contiguous
+  storage. Test padding canaries as well as numerical output; the detector is
+  `test_pointer_combine_strided_outputs_and_dead_splits`.
+
+## Heuristic geometry regressions
+
+When changing tile, packing, CGA or split candidates, spy on the chooser's
+inputs for both split and unsplit legs: physical CTA count can differ from
+public MMA width, and masked KV work depends on the candidate Q span and tile
+alignment. Compare masked bounds with an independent visible-key oracle and
+verify every alternative is rescored, deduplicated and within the candidate
+cap. An exact winning-rank golden alone does not detect stale model inputs.

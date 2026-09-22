@@ -39,6 +39,15 @@ from .nodes import Node, _row_major_stride
 _LOG = logging.getLogger("cudnn.pygraph")
 
 
+def _detached_exception(exc: Exception) -> Exception:
+    """Preserve the backend error type/message without retaining traceback frames.
+
+    Clearing only __traceback__ leaves chained exceptions pointing at the graph.
+    Never raise the stored copy either: raising attaches a new traceback to it.
+    """
+    return type(exc)(*exc.args)
+
+
 def _is_dense(dim, stride) -> bool:
     """Row-major compact."""
     expect = 1
@@ -47,6 +56,38 @@ def _is_dense(dim, stride) -> bool:
             return False
         expect *= extent
     return True
+
+
+def _observed_span(data) -> Optional[int]:
+    """Element span of a caller's buffer as the CALLER describes it (``1 + sum((size-1)*stride)``,
+    numel when compact); None for a bare address or a producer without shape/stride."""
+    if data is None or type(data) is int:
+        return None
+    try:
+        shape, strides = tuple(data.shape), tuple(data.stride())
+    except (AttributeError, TypeError):
+        try:
+            return int(data.numel())
+        except (AttributeError, TypeError):
+            return None
+    n = 1
+    for extent in shape:
+        n *= int(extent)
+    if n == 0:
+        return 0
+    return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
+
+
+def _producer_itemsize(data, declared_data_type) -> int:
+    """Bytes per element of the caller's buffer as the caller types it; the declaration's slot width when the producer does not say."""
+    es = getattr(data, "element_size", None)
+    if callable(es):
+        try:
+            return int(es())
+        except TypeError:
+            pass
+    slot = storage_slot_bytes(declared_data_type)
+    return int(slot) if slot else 1
 
 
 def _in_axis_order_of(shape, stride, reference_stride):
@@ -187,6 +228,7 @@ class pygraph:
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
         self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
+        self._slot_of_uid = None  # uid -> slot of that order, built with the layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -1031,7 +1073,7 @@ class pygraph:
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
             _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             self._reset_lowered_state()
 
     def _attach_facts(self) -> None:
@@ -1148,7 +1190,7 @@ class pygraph:
             # our own translator bug and must not read as a decline.
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             # RuntimeError here is overloaded by the binding: a rejected
             # descriptor (cannot represent) and a failing device look the same.
             # Treat it as a decline so a python engine can still serve the
@@ -1168,7 +1210,7 @@ class pygraph:
         except cudnn.cudnnGraphNotSupportedError as exc:
             # Lowering succeeded, so the only decline left is "no engine for it";
             # an AttributeError here is a binding mismatch, not an absent backend.
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.debug("backend has no engine for this graph: %s", exc)
             self._backend_entries = []
             return self._backend_entries
@@ -1516,7 +1558,7 @@ class pygraph:
             others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
             if self._plan_pinned or not others:
                 raise
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
@@ -1575,7 +1617,7 @@ class pygraph:
         if self._is_built:
             return
         if self._backend_declined is not None and not failures:
-            raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
+            raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
         raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
@@ -1857,7 +1899,9 @@ class pygraph:
                        ExecutionContext; plans that need one require it)
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
-            override_uids/shapes/strides: dynamic-shape overrides (backend path)
+            override_uids/shapes/strides: runtime geometry for the backend or a
+                         compatible VariantPack plan; legacy uid-map plans raise
+                         rather than ignoring these arguments
         """
         if not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
@@ -1870,9 +1914,8 @@ class pygraph:
             self.build(ctx=caller_ctx)
 
         uid_to_data = self._uid_to_data(tensor_dict)
-        # The dynamic-shape overrides live only on the backend's uid-map
-        # overload, so a call carrying them takes that path and normalizes
-        # nothing.
+        # Backend overrides use its uid-map overload. Python plans must consume
+        # them through VariantPack; a legacy uid-map executor cannot honor them.
         overriding = override_uids is not None or override_shapes is not None or override_strides is not None
         eng = self.selected_engine
 
@@ -1896,6 +1939,8 @@ class pygraph:
                 pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
                 plan.execute(self, pack, ctx)
             else:
+                if overriding:
+                    raise ValueError(f"{eng.name}: this plan does not support execute-time shape or stride overrides")
                 plan.execute(self, uid_to_data, ctx)
             return
 
@@ -2011,7 +2056,24 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type), _dlpack_lanes(tensor.data_type))
+            span = _observed_span(data)
+            if span is not None:  # bytes, in the PRODUCER's element width (the description below may re-type the slot)
+                span = span * _producer_itemsize(data, tensor.data_type)
+            dev = getattr(data, "device", None)
+            dev_type, dev_id = (-1, -1)
+            if dev is not None and getattr(dev, "type", None) is not None:  # a torch-like device: CUDA (2) or CPU (1); unknown stays -1
+                dev_type, dev_id = (2, int(dev.index or 0)) if dev.type == "cuda" else (1, 0)
+            native.set_operand(
+                i,
+                ptr,
+                tuple(tensor.dim),
+                tuple(tensor.stride),
+                *_dlpack_code_bits(tensor.data_type),
+                _dlpack_lanes(tensor.data_type),
+                -1 if span is None else span,
+                dev_type,
+                dev_id,
+            )
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -2027,7 +2089,8 @@ class pygraph:
         # what a bare address gets -- so an engine reading the pack answers the
         # way the backend does. A buffer with the declared extents but its own
         # strides, a strided view, or one too small for the declaration keeps
-        # its own description; the engine decides. The rule runs natively, one
+        # its own description; the engine decides. Reordered scale blobs retain
+        # their physical extents for capacity checks. The rule runs natively, one
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
@@ -2038,21 +2101,16 @@ class pygraph:
                     f"override_uids, override_shapes and override_strides must name the same tensors: got "
                     f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
                 )
-            slot_of = {uid: i for i, uid in enumerate(order)}
-            for j, uid in enumerate(override_uids):
-                i = slot_of.get(uid)
-                if i is None:
-                    raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                # Overrides speak cuDNN element units; the slot speaks storage slots.
-                declared = self._tensor_by_uid.get(uid)
-                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
-                if storage is None:
-                    raise ValueError(
-                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
-                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
-                    )
-                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
-                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
+            # One crossing for every override: the native side turns each element geometry into
+            # storage-slot geometry (fp4 packing), re-expresses it in the buffer's own axis order and
+            # applies it with the declared dtype (see VariantPackNative::override_many).
+            layout = self._declared_layout(order)
+            slot_of = self._slot_of_uid
+            try:
+                indices = [slot_of[uid] for uid in override_uids]
+            except KeyError as exc:
+                raise ValueError(f"override_uids names tensor uid {exc.args[0]}, which is not an operand of this graph") from None
+            native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2078,12 +2136,14 @@ class pygraph:
         layout = self._declared_layout_native
         if layout is None:
             layout = _pybind_module.DeclaredLayout(len(order))
+            self._slot_of_uid = {uid: i for i, uid in enumerate(order)}
             for i, uid in enumerate(order):
                 declared = self._tensor_by_uid.get(uid)
-                if declared is None or not declared.dim:
+                if declared is None:
                     continue
-                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type) if declared.dim else None
                 if storage is None:
+                    layout.set_dtype(i, *_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type))  # overrides still speak its dtype
                     continue
                 layout.set(
                     i,
@@ -2092,6 +2152,7 @@ class pygraph:
                     storage_slot_bytes(declared.data_type) or 0,
                     *_dlpack_code_bits(declared.data_type),
                     _dlpack_lanes(declared.data_type),
+                    declared.get_reordering_type() == _pybind_module.tensor_reordering.F8_128x4,
                 )
             self._declared_layout_native = layout
         return layout
@@ -2283,6 +2344,7 @@ class pygraph:
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
         self._declared_layout_native = None
+        self._slot_of_uid = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""

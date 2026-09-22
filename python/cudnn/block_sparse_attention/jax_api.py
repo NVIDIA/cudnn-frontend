@@ -168,7 +168,7 @@ def backward_call(c):
     )
 
 
-def block_sparse_attention_forward_jax(
+def block_sparse_attention_forward(
     q_tensor,
     k_tensor,
     v_tensor,
@@ -201,7 +201,7 @@ def block_sparse_attention_forward_jax(
     return BSAResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
 
-def block_sparse_attention_backward_jax(
+def block_sparse_attention_backward(
     do_tensor,
     q_tensor,
     k_tensor,
@@ -262,7 +262,7 @@ def attention_backward(c, residual, do):
 attention.defvjp(attention_forward, attention_backward)
 
 
-def block_sparse_attention_jax(
+def block_sparse_attention(
     q_tensor,
     k_tensor,
     v_tensor,

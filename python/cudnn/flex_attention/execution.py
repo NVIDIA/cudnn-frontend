@@ -223,6 +223,7 @@ class FlexAttentionFwd(APIBase):
         sample_lse: Optional[torch.Tensor] = None,
         *,
         sm90_use_smem_mask_pipeline: bool = True,
+        sample_max_logit: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         _validate_plan(sample_mask_plan)
@@ -232,11 +233,13 @@ class FlexAttentionFwd(APIBase):
         self.v_desc = self._make_tensor_desc(sample_v, name="v")
         self.o_desc = self._make_tensor_desc(sample_o, name="o")
         self.lse_desc = self._make_tensor_desc(sample_lse, name="lse")
+        self.max_logit_desc = self._make_tensor_desc(sample_max_logit, name="max_logit")
         self._sample_q = sample_q
         self._sample_k = sample_k
         self._sample_v = sample_v
         self._sample_o = sample_o
         self._sample_lse = sample_lse
+        self._sample_max_logit = sample_max_logit
         self._sample_mask_plan = sample_mask_plan
         self._sm90_use_smem_mask_pipeline = sm90_use_smem_mask_pipeline
         self._dispatch_compile_key = None
@@ -256,6 +259,7 @@ class FlexAttentionFwd(APIBase):
             pack_gqa=mask_plan.metadata.pack_gqa,
             block_sparse_tensors=packed_plan,
             has_lse=self.lse_desc is not None,
+            has_max_logit=self.max_logit_desc is not None,
             sm90_use_smem_mask_pipeline=self._sm90_use_smem_mask_pipeline,
         )
 
@@ -266,7 +270,16 @@ class FlexAttentionFwd(APIBase):
         for name, tensor in (("q", self._sample_q), ("k", self._sample_k), ("v", self._sample_v), ("o", self._sample_o)):
             _validate_runtime_tensor(tensor, getattr(self, f"{name}_desc"), name)
         _validate_runtime_tensor(self._sample_lse, self.lse_desc, "lse", align_bytes=4)
+        _validate_runtime_tensor(self._sample_max_logit, self.max_logit_desc, "max_logit", align_bytes=4)
         dispatch = self._prepare(self._sample_q, self._sample_k, self._sample_v, self._sample_mask_plan)
+        if self._sample_max_logit is not None:
+            if (
+                tuple(self._sample_max_logit.shape) != (dispatch.num_q_heads,)
+                or self._sample_max_logit.dtype != torch.float32
+                or not self._sample_max_logit.is_contiguous()
+                or self._sample_max_logit.device != self._sample_q.device
+            ):
+                raise ValueError(f"max_logit must be contiguous, have shape ({dispatch.num_q_heads},), dtype torch.float32, and be on {self._sample_q.device}")
         if dispatch.total_q == 0 or dispatch.total_k == 0:
             raise ValueError("FlexAttentionFwd APIBase requires non-empty sample tensors")
         if tuple(self._sample_o.shape) != dispatch.output_shape or self._sample_o.dtype != self._sample_q.dtype:
@@ -296,9 +309,10 @@ class FlexAttentionFwd(APIBase):
             cu_q,
             cu_k,
             scheduler,
+            max_logit=self._sample_max_logit,
         )
         self._sample_q = self._sample_k = self._sample_v = None
-        self._sample_o = self._sample_lse = self._sample_mask_plan = None
+        self._sample_o = self._sample_lse = self._sample_max_logit = self._sample_mask_plan = None
 
     def execute(
         self,
@@ -312,6 +326,7 @@ class FlexAttentionFwd(APIBase):
         workspace: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
+        max_logit_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if self._compiled_kernel is None:
             raise RuntimeError("FlexAttentionFwd kernel is not compiled")
@@ -319,6 +334,7 @@ class FlexAttentionFwd(APIBase):
         for name, tensor in (("q", q_tensor), ("k", k_tensor), ("v", v_tensor), ("o", o_tensor)):
             _validate_runtime_tensor(tensor, getattr(self, f"{name}_desc"), name)
         _validate_runtime_tensor(lse_tensor, self.lse_desc, "lse", align_bytes=4)
+        _validate_runtime_tensor(max_logit_tensor, self.max_logit_desc, "max_logit", align_bytes=4)
         mask_plan._validate_runtime(q_tensor, k_tensor, v_tensor)
         dispatch = self._prepare(q_tensor, k_tensor, v_tensor, mask_plan)
         if dispatch.compile_key != self._dispatch_compile_key:
@@ -327,6 +343,7 @@ class FlexAttentionFwd(APIBase):
         scheduler = carver.take((1,), torch.int32) if dispatch.arch == 90 else None
         cu_q, cu_k, _, _ = _sequence_args(mask_plan)
         scale = _resolve_scale(softmax_scale, dispatch.head_dim)
+        validate_call_options(softmax_scale=scale, deterministic=False, return_lse=False, return_max_logit=max_logit_tensor is not None)
         with torch.cuda.device(q_tensor.device), _stream_context(current_stream, q_tensor.device):
             _launch_flex_attn_fwd(
                 dispatch,
@@ -340,9 +357,10 @@ class FlexAttentionFwd(APIBase):
                 cu_q,
                 cu_k,
                 scheduler,
+                max_logit=max_logit_tensor,
             )
         _record_streams(
-            (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, workspace, *_plan_tensors(mask_plan)),
+            (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, max_logit_tensor, workspace, *_plan_tensors(mask_plan)),
             current_stream,
             q_tensor.device,
         )
@@ -557,11 +575,12 @@ def _flex_attention_forward(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
+    return_max_logit: bool = False,
 ) -> TupleDict:
     """Allocate outputs and execute reusable-plan Flex Attention forward."""
 
     _validate_plan(mask_plan)
-    validate_call_options(softmax_scale=softmax_scale, deterministic=False, return_lse=return_lse)
+    validate_call_options(softmax_scale=softmax_scale, deterministic=False, return_lse=return_lse, return_max_logit=return_max_logit)
     mask_plan._validate_runtime(q_tensor, k_tensor, v_tensor)
     metadata = mask_plan.metadata
     output_shape = (
@@ -578,12 +597,15 @@ def _flex_attention_forward(
     with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
         o_tensor = torch.empty(output_shape, dtype=q_tensor.dtype, device=q_tensor.device)
         lse_tensor = torch.empty(lse_shape, dtype=torch.float32, device=q_tensor.device) if needs_lse else None
+        max_logit_tensor = torch.empty((metadata.num_q_heads,), dtype=torch.float32, device=q_tensor.device) if return_max_logit else None
     if metadata.total_q == 0 or metadata.total_k == 0:
         with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+            if max_logit_tensor is not None:
+                max_logit_tensor.fill_(float("-inf"))
             o_tensor.zero_()
             if lse_tensor is not None:
                 lse_tensor.fill_(float("-inf"))
-        return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
+        return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor, max_logit_tensor=max_logit_tensor)
 
     key = (
         _tensor_signature(q_tensor),
@@ -591,11 +613,12 @@ def _flex_attention_forward(
         _tensor_signature(v_tensor),
         _tensor_signature(o_tensor),
         _tensor_signature(lse_tensor),
+        _tensor_signature(max_logit_tensor),
         _plan_signature(mask_plan),
     )
     api = _cache_get(_FWD_CACHE, key)
     if api is None:
-        api = FlexAttentionFwd(q_tensor, k_tensor, v_tensor, o_tensor, mask_plan, lse_tensor)
+        api = FlexAttentionFwd(q_tensor, k_tensor, v_tensor, o_tensor, mask_plan, lse_tensor, sample_max_logit=max_logit_tensor)
         api.check_support()
         api.compile()
         _cache_put(_FWD_CACHE, key, api)
@@ -611,8 +634,9 @@ def _flex_attention_forward(
         workspace=workspace,
         softmax_scale=softmax_scale,
         current_stream=stream,
+        max_logit_tensor=max_logit_tensor,
     )
-    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
+    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor, max_logit_tensor=max_logit_tensor)
 
 
 def _flex_attention_backward(

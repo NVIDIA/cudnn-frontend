@@ -18,7 +18,7 @@ The configs sweep the two cuDNN frontend paths only:
 
 | Backend | What it measures |
 |---|---|
-| `cudnn` | cuDNN frontend graph API, native backend engines (heur A + FALLBACK), contiguous KV |
+| `cudnn` | cuDNN frontend graph API, native backend engines only (heur A + FALLBACK; the FROST SDPA engines are deselected by name, since the SM100/SM120 f16 rows are default candidates), contiguous KV |
 | `cudnn_oss` | the same graph planned with `heur_mode.OPENSOURCE` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: only the frontend's open-source engines (frost python engines + the backend's OSS candidates) may serve it; the winning plan is recorded per case |
 
 Unsupported combinations are recorded (not hidden) and show up as blank slots

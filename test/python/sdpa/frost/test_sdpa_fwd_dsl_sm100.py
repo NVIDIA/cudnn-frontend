@@ -379,6 +379,69 @@ def test_dsl_sm100_d192_d128(dtype, is_causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("singleton", ["q", "kv"])
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=61)
+def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
+    """S=1 operands in BHSD-contiguous storage: the transposed view is contiguous
+    (torch wildcards size-1 dims) but its seq stride is D, not H*D, so the batch
+    stride must come from the caller, never from S * seq_stride (PR #1099 review)."""
+    _require_dsl()
+    b, h, hk, s = 3, 4, 2, 128
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    s_q, s_kv = (1, s) if singleton == "q" else (s, 1)
+    q = torch.randn(b, h, s_q, d, device="cuda", dtype=dtype)
+    k = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    v = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+def _require_free_gib(gib):
+    free, _ = torch.cuda.mem_get_info()
+    if free < gib * 2**30:
+        pytest.skip(f"needs ~{gib} GiB free device memory, have {free / 2**30:.1f} GiB")
+
+
+def _ref_rows(q, k, v, rows, scale):
+    """fp32 reference for query rows [0, rows) of one batch; a wrapped stride aliases whole operands, so a slice proves the batch."""
+    scores = torch.matmul(q[:, :rows].float(), k.float().transpose(-1, -2)) * scale
+    return torch.matmul(torch.softmax(scores, dim=-1), v.float())
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,b,s_q,s_kv,dtype",
+    [
+        (128, 1, 8192, 128, torch.float16),  # Q / O batch extent 2^27 = 8192 * 128 * 128
+        (512, 1, 16, 2048, torch.bfloat16),  # K / V batch extent 2^27 = 2048 * 128 * 512 (the benchmark repro's K/V)
+        (128, 2, 16384, 128, torch.float16),  # Q / O batch stride 2^28 at B = 2
+        (256, 2, 16, 8192, torch.float16),  # K / V batch stride 2^28 at B = 2 (the reported silent case, decode-shaped)
+    ],
+    ids=["q_2p27_d128", "kv_2p27_d512", "q_2p28_b2_d128", "kv_2p28_b2_d256"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_stride_leaves_are_int64(d, b, s_q, s_kv, dtype):
+    """Per-batch extents of 2^27 / 2^28 16-bit elements, H = 128. The host binds the (batch, seq,
+    head) strides as Int64 leaves; an Int32 leaf wraps in the TMA-unit scaling (stride * 16 // 128):
+    2^27 encodes negative (cuTensorMapEncodeTiled rejects, the launch aborts with
+    cudaErrorInvalidValue), 2^28 encodes 0 (every batch aliases batch 0, silently)."""
+    _require_dsl()
+    _require_free_gib(6)
+    h = 128
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, dtype), _bhsd(b, h, s_kv, d, dtype), _bhsd(b, h, s_kv, d, dtype)
+    assert max(q.stride(0), k.stride(0)) in (2**27, 2**28), "the geometry under test drifted"
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False))
+    rows = min(s_q, 256)
+    for i in range(b):
+        torch.testing.assert_close(o[i, :, :rows].float(), _ref_rows(q[i], k[i], v[i], rows, scale), atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
@@ -733,6 +796,152 @@ def test_dsl_sm100_sink(dtype, d):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,s_q,pack_gqa",
+    [(128, 1, False), (128, 1, True), (128, 2, True), (128, 4, True), (64, 1, True)],
+    ids=["d128_sq1_unpacked", "d128_sq1_packed", "d128_sq2_packed", "d128_sq4_packed", "d64_sq1_packed"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink(d, s_q, pack_gqa):
+    """Decode-shaped dense graphs (S_q in {1, 2, 4}) with an attention sink over
+    bottom-right causal, padded KV lengths incl. a zero-length batch: a keyless row
+    is O = 0 / LSE = sink, live rows match the sink-as-extra-column reference.
+    sink_token at s_q == 1 used to be rejected by the python validator as a
+    graph-validity error; it is the backend engines' support-surface rule, and
+    this row serves the combination (the sink fold is independent of S_q)."""
+    _require_dsl()
+    if _SM == 107 and pack_gqa:
+        # Only the packed cases lack a path on the ported Rubin f16 kernels
+        # (row: pack_gqas={False}); the unpacked S_q == 1 sink case must still run there.
+        pytest.skip("no PackGQA path in the ported Rubin f16 kernels")
+    dtype = torch.float16
+    b, h_q, h_kv, s_kv = 3, 8, 2, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 129], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=pack_gqa,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@_skip_pack_gqa_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(24, 2), (12, 2)], ids=["g12_packs4", "g6_packs2"])
+@pytest.mark.parametrize("s_q", [1, 4])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_sink_partial_pack_gqa(h_q, h_kv, s_q):
+    """Sink + partial PackGQA (#1104) on the dense path: G = 12 packs 4 heads per
+    token row-group (three packed heads per KV head), G = 6 packs 2.  The sink fold
+    indexes ``sinks[row_head_idx]`` (``packed_head * PACK_G + row % PACK_G``, the Q
+    head) and every head draws its own logit, so the live rows' LSE and the keyless
+    rows' LSE (= sink; the zero-length batch, and the rows above the bottom-right
+    diagonal of the 1-key batch at S_q = 4) both pin the head mapping."""
+    _require_dsl()
+    d, dtype = 128, torch.float16
+    b, s_kv = 3, 1024
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_kv_lens = torch.tensor([1000, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        pack_gqa=True,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[1] == 0).all(), "a zero-length KV batch writes O := 0 even with a sink"
+    torch.testing.assert_close(lse[1], sink.view(h_q, 1).expand(h_q, s_q), atol=1e-4, rtol=0)
+    if s_q > 1:
+        # The 1-key batch: rows 0..S_q-2 sit above the bottom-right diagonal -> keyless.
+        torch.testing.assert_close(lse[2, :, : s_q - 1], sink.view(h_q, 1).expand(h_q, s_q - 1), atol=1e-4, rtol=0)
+        assert (o[2, :, : s_q - 1] == 0).all(), "rows above the bottom-right diagonal write O := 0 even with a sink"
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d_qk,d_v,stats_use_log2",
+    [(128, 128, False), (128, 128, True), (192, 128, False), (256, 256, False), (512, 512, False)],
+    ids=["d128_ln", "d128_log2", "d192_d128_ln", "d256_ln", "d512_ln"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
+    """Dense padded multi-token decode (S_q = 4, bottom-right causal) with a
+    zero-length KV batch, a one-key batch and a sink of -120 on every head, on all
+    four SM100 f16 flavors.  A keyless row (the empty batch's four rows, the one-key
+    batch's three rows above the diagonal) holds the sink's mass alone: O := 0,
+    LSE := sink (times log2(e) under stats_use_log2).  Review regression (PR #1095):
+    the softmax publishes total_sum = 0 and a 0-substituted max for such a row, and a
+    fold that computes exp(sink - 0) underflows to 0 in fp32 -> O = 0 * inf = NaN,
+    LSE = log(0) = -inf.  test_dsl_sm100_decode_sink draws its sinks from randn (|sink|
+    < 4) and cannot see this."""
+    _require_dsl()
+    dtype = torch.bfloat16
+    b, h_q, h_kv, s_q, s_kv = 3, 8, 2, 4, 512
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s_q, d_qk, dtype)
+    k = _bhsd(b, h_kv, s_kv, d_qk, dtype)
+    v = _bhsd(b, h_kv, s_kv, d_v, dtype)
+    seq_kv_lens = torch.tensor([300, 0, 1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    sink = torch.full((1, h_q, 1, 1), -120.0, dtype=torch.float32, device="cuda")
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, stats_use_log2=stats_use_log2),
+        seq_len_kv=seq_kv_lens,
+        sink=sink,
+        return_stats=True,
+    )
+    lse = lse.squeeze(-1)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=seq_kv_lens, sinks=sink.flatten(), return_stats=True)
+    if stats_use_log2:
+        lse_ref = lse_ref * math.log2(math.e)
+    rows = torch.arange(s_q, device="cuda").view(1, s_q)
+    keyless = (seq_kv_lens.view(b, 1) - s_q + rows < 0).view(b, 1, s_q).expand(b, h_q, s_q)
+    assert keyless.sum().item() == h_q * (s_q + s_q - 1), "batch 1 is keyless on every row, batch 2 on all but its last"
+    assert torch.isfinite(o.float()).all(), "keyless rows must not NaN the output"
+    assert (o[keyless] == 0).all(), "a keyless row writes O := 0 even with a sink"
+    want = -120.0 * (math.log2(math.e) if stats_use_log2 else 1.0)
+    torch.testing.assert_close(lse[keyless], torch.full_like(lse[keyless], want), atol=1e-4, rtol=0)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse[~keyless], lse_ref[~keyless], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_execute_sink_lse_contract():
     """execute() rejects sinks inconsistent with the compiled specialization.
@@ -905,6 +1114,65 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
     for i, n in enumerate(lens.tolist()):
         torch.testing.assert_close(hsb[i, :, :n], ref[i, :, :n], atol=0, rtol=0)
         assert torch.isneginf(hsb[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
+    """execute() on a thread that never touched CUDA, with the caller's workspace: the padded-Stats
+    seed (a driver memset) and the launch both need the calling thread's context bound FIRST -- for a
+    live batch, for all-zero lengths over addressable buffers (the binder sizes the launch from the
+    buffers, so this still launches), and for a zero-CAPACITY packed Q / O, which seeds -inf and
+    returns without launching."""
+    _require_dsl()
+    import threading
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    outcome = {}
+    launches = []
+    spec = api._thd_spec
+    fn = spec.fn
+    spec.fn = lambda *args: launches.append(1) or fn(*args)  # counts the positional-entry launches
+
+    def run(lens, q_buf=q, o_buf=o):
+        try:
+            api.execute(q_tensor=q_buf, k_tensor=k, v_tensor=v, o_tensor=o_buf, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse, workspace=ws)
+            torch.cuda.synchronize()
+            outcome["ok"] = True
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["err"] = exc
+
+    def on_fresh_thread(*args):
+        outcome.clear()
+        launches.clear()
+        lse.fill_(float("nan"))
+        t = threading.Thread(target=run, args=args, daemon=True)
+        t.start()
+        t.join(timeout=120)
+        assert not t.is_alive() and outcome.get("ok"), outcome.get("err")
+
+    try:
+        for lens in (torch.tensor([200, 150], dtype=torch.int32, device="cuda"), torch.zeros(b, dtype=torch.int32, device="cuda")):
+            on_fresh_thread(lens)
+            assert launches == [1], "addressable buffers launch once, whatever the lengths"
+            for i, n in enumerate(lens.tolist()):
+                assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+                assert not torch.isnan(lse[i, :, :n]).any(), f"batch {i}: live rows unwritten"
+        # zero capacity: no addressable Q / O row, so the declared seed runs and the kernel is never launched
+        on_fresh_thread(torch.zeros(b, dtype=torch.int32, device="cuda"), q[:, :, :0, :], o[:, :, :0, :])
+        assert launches == [], "a zero-capacity call must not launch"
+        assert torch.isneginf(lse).all(), "every declared Stats row reads -inf after the seed"
+    finally:
+        spec.fn = fn
 
 
 @pytest.mark.L0
@@ -2031,7 +2299,8 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     _run_and_check([64, 33])
     info_exec = api._k_mod.compile.cache_info()
     assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
-    assert info_exec.hits >= info_plan.hits + 2
+    # The plan-time artifact is launched directly: execute does not even re-key the cache.
+    assert info_exec.hits == info_plan.hits, "a THD execute re-derived its compile key per call"
 
 
 @pytest.mark.L0

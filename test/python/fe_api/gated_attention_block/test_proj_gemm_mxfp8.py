@@ -53,6 +53,12 @@ import sys
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Gated attention block tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, build_proj_gemm, run_proj_gemm, sf_blob_bytes, sf_padded_dims  # noqa: E402
@@ -63,6 +69,19 @@ _SENTINEL = 1.5e30
 _BLOCK = 32
 _BLOCK_SHAPE = (4096, 4096, 17408)  # the 397B qkv_gate_proj: M tokens x K=d_model x N=n_qkvg
 _FORCED_K32 = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+
+
+def _default_forced_tile():
+    """The tile the block's forced 256-wide config resolves to WITHOUT an explicit ``mma_tile_k_bytes``: the catalog's
+    K=32 name re-targeted to the engine's preferred MMA K width (``kernel_registry.preferred_mma_tile_k_bytes`` -- 64 on
+    SM 10.7, where the 64-byte block-scale MMA is silicon, else 32).  Returns ``(tile_config_name, mma_tile_k_bytes)``."""
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+    from cudnn.gemm.frost.sm100.compiler import _current_arch
+
+    arch = _current_arch()
+    if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+        return _FORCED_K32.replace("x32_", "x64_"), 64
+    return _FORCED_K32, 32
 
 
 def _frost_gemm_unavailable() -> str | None:
@@ -360,7 +379,7 @@ def test_block_scale_matches_fake_quant_with_distinctive_scales(m, k, n):
     if n % 256:
         assert plan.tile_config_name != _FORCED_K32 and str(plan.tile_config_name).startswith("CONFIG_"), describe(plan)
     else:
-        assert plan.tile_config_name == _FORCED_K32, describe(plan)
+        assert plan.tile_config_name == _default_forced_tile()[0], describe(plan)
     # The graph declares the SF tensors at the PADDED F8_128x4 extents (what the backend requires
     # and what the bound blob view is); at M=1000 that is 1024 rows.
     assert tuple(plan.sfa.get_dim()) == (1, *sf_padded_dims(m, k)), plan.sfa.get_dim()
@@ -434,11 +453,12 @@ def test_k32_and_k64_mma_forms(m, k, n):
 @requires_fp8
 def test_route_and_resolved_tile_are_recorded_for_the_block_shape():
     """The perf table states what ran: the resolved tile config, its MMA K width and the route.
-    Default K width = the named 256-wide config's own (K=32) -- arch-neutral within the family."""
+    Default K width = the engine's preferred one for a block-scale graph (64 on SM 10.7 -- measured 82 -> 95 % of the fp8
+    MMA peak on the block's stage-(1) shape at S=16K -- else the named 256-wide config's own K=32)."""
     m, k, n = _BLOCK_SHAPE
     plan = build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label="qkv_gate_proj", block_scale=True)
     print(f"\n[block shape default] {describe(plan)}")
-    assert plan.tile_config_name == _FORCED_K32 and plan.mma_tile_k_bytes == 32
+    assert (plan.tile_config_name, plan.mma_tile_k_bytes) == _default_forced_tile(), describe(plan)
     assert plan.route in ("graph+jit", "jit-only")
     assert plan.workspace_bytes >= 1
 
