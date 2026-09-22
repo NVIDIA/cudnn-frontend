@@ -526,7 +526,7 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
         # multiple of the tile work at all. A PER-BATCH seq_len still needs the
         # per-batch value threaded to the bounds and mask sites.
         # LPT / LPT_L2 need lpt_tile_coords and its L2-residency model, which
-        # bwd/kernels/_common_sm100.py deliberately does not copy.
+        # bwd/kernels/sm100/_common.py deliberately does not copy.
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 v1: only SCHED_NATURAL is implemented (LPT/LPT_L2 need the L2 tile-coord model)"),
         (cfg.ACC_EMPTY_ARRIVERS == cfg.COMPUTE_LANES * cfg.CTA_MMA, "bwd d512: ACC_EMPTY_ARRIVERS must be COMPUTE_LANES * CTA_MMA"),
     )
