@@ -25,25 +25,6 @@
 #include "block_scale_dequantize.h"
 #include "sdpa_support_surface.h"
 
-namespace cudnn_frontend::detail {
-
-// Development headers may advertise a newer version before this attribute lands.
-// Make the enum lookup dependent so those headers still compile without guessing its ABI value.
-template <typename AttributeName>
-constexpr auto
-get_sdpa_stats_log2_attribute(int)
-    -> decltype(std::optional<AttributeName>{AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2}) {
-    return AttributeName::CUDNN_ATTR_OPERATION_SDPA_FWD_STATS_LOG2;
-}
-
-template <typename AttributeName>
-constexpr std::optional<AttributeName>
-get_sdpa_stats_log2_attribute(long) {
-    return std::nullopt;
-}
-
-}  // namespace cudnn_frontend::detail
-
 namespace cudnn_frontend::graph {
 
 // If a 1-D length/offset index tensor [n] is supplied, promote it to the 4-D
@@ -971,6 +952,9 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
+        // Base-2 Stats: on cuDNN 9.21+ this softmax lowers to the unified softmax operation, whose
+        // descriptor carries the log-base attribute (cuDNN 9.27+); the composite engine honors it.
+        softmax_attributes.set_stats_use_log2(attributes.stats_use_log2);
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output,
                 softmax_attributes,
@@ -2568,6 +2552,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
             if (has_output(output_names::Stats)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Stats] =
                     attributes.outputs[output_names::Stats];
+                softmax_attrs.set_stats_use_log2(attributes.stats_use_log2);
             }
             if (has_output(output_names::Max)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Max] = attributes.outputs[output_names::Max];
@@ -2657,6 +2642,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         } else {
             auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
             if (stats_it != attributes.outputs.end() && stats_it->second) {
+                // stats_use_log2 cannot reach this pre-9.21 path: the support surface rejects it below 9.27.
                 auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
                 _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
                                                                CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
@@ -2841,25 +2827,6 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
 #else
             return unfuse_fma_cudnn_ver_error;
 #endif
-        }
-
-        // Base-2 Stats scales the entire natural-log LSE by log2(e).
-        auto stats_log2_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
-        if (attributes.stats_use_log2 && stats_log2_it != attributes.outputs.end() && stats_log2_it->second) {
-            constexpr auto stats_log2_attr = detail::get_sdpa_stats_log2_attribute<cudnnBackendAttributeName_t>(0);
-            if (!stats_log2_attr.has_value()) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "stats_use_log2 requires cuDNN headers with the SDPA Stats log-base attribute"};
-            }
-            auto stats_log2_cudnn_ver_error =
-                error_t{error_code_t::GRAPH_NOT_SUPPORTED, "stats_use_log2 in unified SDPA node requires cuDNN 9.28.0"};
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, stats_log2_cudnn_ver_error);
-            bool stats_log2_value = true;
-            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
-                                                           *stats_log2_attr,
-                                                           CUDNN_TYPE_BOOLEAN,
-                                                           1,
-                                                           &stats_log2_value));
         }
 
         // Dropout attributes

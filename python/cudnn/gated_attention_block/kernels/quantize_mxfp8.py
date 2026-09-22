@@ -28,7 +28,10 @@ by the SDPA's TMA descriptors, so a wrong order is numerically wrong and never a
   = 512 B) are laid out row-major; inside an atom, scale (r, c) lives at byte
   ``(r % 32) * 16 + (r // 32) * 4 + c``."  ``swizzle_sf_rowwise`` applies it to
   ``[..., M, K//32]``; ``swizzle_sf_columnwise`` applies it to the TRANSPOSE
-  ``[K, M//32]`` and returns the storage shape.
+  ``[K, M//32]`` and returns the storage shape.  The atom-local arithmetic is
+  spelled ONCE, host and device, in ``frost/tile_dsl/sf_layout.py``
+  (``sf_atom_offset`` / ``sf_atom_byte``); this kernel and the FP4 quantizer
+  both import it, and the host twins below add only the per-unit atom base.
 * Q/K (rowwise), consumer ``_build_sf_desc``: **tile ``(b, h, s_tile)`` = ``4*D``
   (1024 at D=256) contiguous bytes at ``((b*H + h)*n_tiles + s_tile) * 4*D``**;
   inside: ``(c//4)*512 + (s%32)*16 + ((s%128)//32)*4 + c%4`` with ``c = d//32``.
@@ -76,6 +79,7 @@ import torch
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, e8m0_from_amax, e8m0_pair, f16x2_to_f32, fmax_f32, fp32_to_fp8_pack, fp32_to_fp8x2
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS, sf_atom_byte, sf_atom_offset
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global_v4
 
 from .qk_norm_rope import fake_rowmajor_dynamic_token_stride
@@ -85,9 +89,9 @@ AXIS_COL = "col"  # V:   32-element blocks along S (the BMM2 contraction)
 AXES = (AXIS_ROW, AXIS_COL)
 
 SF_BLOCK = 32  # elements per E8M0 scale
-SF_TILE_ROWS = 128  # rows of an F8_128x4 atom == the SDPA's Q / KV tile height
-SF_ATOM_BYTES = 512  # 128 rows x 4 blocks
-SF_ATOM_COLS = 4
+SF_TILE_ROWS = SF_ATOM_ROWS  # 128 rows of an F8_128x4 atom == the SDPA's Q / KV tile height
+# SF_ATOM_BYTES / SF_ATOM_COLS / SF_ATOM_ROWS are defined in tile_dsl.sf_layout and RE-EXPORTED from here (the
+# import above is load-bearing: `from quantize_mxfp8 import SF_ATOM_BYTES` callers exist in the tests).
 SF_BURST_BYTES = 16  # one st.global.v4 per burst lane
 
 ELEMS_PER_LANE = 16  # rowwise: what fp32_to_fp8_pack converts in one call (32 B of bf16 in, 16 B of e4m3 out)
@@ -141,7 +145,7 @@ def sf_byte_rowwise(b: int, h: int, s: int, d_idx: int, *, n_heads: int, n_tiles
     c = d_idx // SF_BLOCK
     r = s % SF_TILE_ROWS
     tile = (b * n_heads + h) * n_tiles + s // SF_TILE_ROWS
-    return tile * sf_tile_bytes(d) + (c // SF_ATOM_COLS) * SF_ATOM_BYTES + (r % 32) * 16 + (r // 32) * 4 + c % SF_ATOM_COLS
+    return tile * sf_tile_bytes(d) + sf_atom_offset(r, c)
 
 
 def sf_byte_columnwise(b: int, h: int, s: int, d_idx: int, *, n_heads: int, n_tiles: int, batch: int) -> int:
@@ -150,7 +154,7 @@ def sf_byte_columnwise(b: int, h: int, s: int, d_idx: int, *, n_heads: int, n_ti
     dm = d_idx % SF_TILE_ROWS
     tile = (b * n_heads + h) * n_tiles + s // SF_TILE_ROWS
     v_sf_groups = batch * n_heads * n_tiles
-    return plane * (v_sf_groups * SF_ATOM_BYTES) + tile * SF_ATOM_BYTES + (dm % 32) * 16 + (dm // 32) * 4 + (s % SF_TILE_ROWS) // SF_BLOCK
+    return sf_atom_byte(dm, (s % SF_TILE_ROWS) // SF_BLOCK, base=plane * (v_sf_groups * SF_ATOM_BYTES) + tile * SF_ATOM_BYTES)
 
 
 def validate_shape(d: int, threads_per_cta: int, axis: str) -> None:
@@ -268,14 +272,9 @@ def frost_quantize_mxfp8(
                     st_global_v4(
                         dst_row + cutlass.Int64((c * lanes) * DST_BYTES_PER_LANE) + dst_lane_off, [packed[0], packed[1], packed[2], packed[3]], cutlass.Int32
                     )
-                # SF SMEM byte for block column c_idx = d//32 of row r: (c//4)*512 + (r%32)*16 + (r//32)*4 + c%4.
+                # SF SMEM byte for block column c_idx = d//32 of row r: (c//4)*512 + (r%32)*16 + (r//32)*4 + c%4 (sf_layout).
                 c_idx = (cutlass.Int32(c * lanes) + lane) // cutlass.Int32(2)
-                sf_off = (
-                    (c_idx // cutlass.Int32(SF_ATOM_COLS)) * cutlass.Int32(SF_ATOM_BYTES)
-                    + (r % cutlass.Int32(32)) * cutlass.Int32(16)
-                    + (r // cutlass.Int32(32)) * cutlass.Int32(4)
-                    + c_idx % cutlass.Int32(SF_ATOM_COLS)
-                )
+                sf_off = sf_atom_offset(r, c_idx)
                 if even:
                     sSF.store(sf_byte.to(cutlass.Uint8), sf_off)
     else:
@@ -318,10 +317,10 @@ def frost_quantize_mxfp8(
             for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
                 if valids[t]:
                     st_global_b16(dsts[t], fp32_to_fp8x2(los[t] * rcp0, his[t] * rcp1))
-            # SF SMEM bytes: plane p = d//128 at p*512 + ((d%128)%32)*16 + ((d%128)//32)*4 + tb; d0+1 sits 16 B after d0.
+            # SF SMEM bytes: plane p = d//128 at p*512 + ((d%128)%32)*16 + ((d%128)//32)*4 + tb (sf_layout); d0+1 sits 16 B after d0.
             plane = d0 // cutlass.Int32(SF_TILE_ROWS)
             dm = d0 % cutlass.Int32(SF_TILE_ROWS)
-            sf_off = plane * cutlass.Int32(SF_ATOM_BYTES) + (dm % cutlass.Int32(32)) * cutlass.Int32(16) + (dm // cutlass.Int32(32)) * cutlass.Int32(4) + tb
+            sf_off = sf_atom_byte(dm, tb, base=plane * cutlass.Int32(SF_ATOM_BYTES))
             sSF.store((sf_pair & cutlass.Int32(0xFF)).to(cutlass.Uint8), sf_off)
             sSF.store(((sf_pair >> 8) & cutlass.Int32(0xFF)).to(cutlass.Uint8), sf_off + cutlass.Int32(16))
 

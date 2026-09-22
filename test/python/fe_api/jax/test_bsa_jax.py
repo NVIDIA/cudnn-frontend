@@ -18,9 +18,9 @@ if requirement_error:
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
-from cudnn import block_sparse_attention_forward_jax as forward
-from cudnn import block_sparse_attention_backward_jax as backward
-from cudnn import block_sparse_attention_jax as attention
+from cudnn.jax import block_sparse_attention_forward as forward
+from cudnn.jax import block_sparse_attention_backward as backward
+from cudnn.jax import block_sparse_attention as attention
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -109,8 +109,17 @@ class NoTorch:
             raise RuntimeError("torch import attempted")
 sys.meta_path.insert(0, NoTorch())
 import cudnn
-assert callable(cudnn.BSA.block_sparse_attention_jax)
-assert callable(cudnn.block_sparse_attention_backward_jax)
+import cudnn.block_sparse_attention as bsa
+import cudnn.jax as cj
+assert "cudnn.block_sparse_attention.jax_api" not in sys.modules
+for name in ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward"):
+    assert callable(getattr(cj, name))
+assert not hasattr(bsa, "block_sparse_attention")
+assert not hasattr(cudnn.BSA, "block_sparse_attention")
+assert "cudnn.block_sparse_attention.api" not in sys.modules
+for name in ("block_sparse_attention_forward_jax", "block_sparse_attention_backward_jax", "block_sparse_attention_jax"):
+    for namespace in (cudnn, cudnn.BSA, bsa, cj):
+        assert not hasattr(namespace, name)
 assert "torch" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True, env=os.environ.copy())
@@ -123,6 +132,9 @@ assert "torch" not in sys.modules
         ({"sparse_block_size": 64}, ValueError),
         ({"block_sparse_num": 1}, ValueError),
         ({"softmax_scale": float("nan")}, ValueError),
+        ({"pack_gqa": True}, TypeError),
+        ({"kv_splits": 2}, TypeError),
+        ({"use_clc": False}, TypeError),
     ],
 )
 def test_unsupported(options, error):
@@ -131,6 +143,14 @@ def test_unsupported(options, error):
     kwargs.update(options)
     with pytest.raises(error):
         jax.jit(partial(forward, **kwargs))(q, k, v, indices)
+
+
+@pytest.mark.parametrize("name", ["dq_tensor", "dk_tensor", "dv_tensor"])
+def test_jax_rejects_caller_gradient_outputs(name):
+    q, k, v, indices, _ = inputs()
+    o, lse = forward(q, k, v, indices, 2)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        backward(q, q, k, v, o, lse, indices, 2, **{name: q})
 
 
 def test_async_repeated_calls_and_metadata_changes():
@@ -223,7 +243,7 @@ class NoTorch:
 sys.meta_path.insert(0, NoTorch())
 import jax
 import jax.numpy as jnp
-from cudnn import block_sparse_attention_jax as attention
+from cudnn.jax import block_sparse_attention as attention
 from cudnn.tensor_adapter import get_compute_capability
 assert get_compute_capability() == (10, 0)
 assert get_compute_capability(0) == (10, 0)

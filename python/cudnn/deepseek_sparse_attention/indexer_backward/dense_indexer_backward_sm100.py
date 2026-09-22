@@ -455,6 +455,10 @@ class DenseIndexerBackward2QGemmSm100:
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
         )
+        self.dk_reduce_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.WARPGROUP_SIZE,
+        )
 
     @cute.jit
     def __call__(
@@ -2139,6 +2143,7 @@ class DenseIndexerBackward2QGemmSm100:
             # 4. Wait for previous bulk reduce to finish, then signal TMA engine is free
             if bi > 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+            self.dk_reduce_sync_barrier.arrive_and_wait()
 
             # 5. Scatter-write: registers → sdK_reduce
             for pair in cutlass.range(cute.size(tDKrDK) // 2, unroll_full=True):
@@ -2151,6 +2156,7 @@ class DenseIndexerBackward2QGemmSm100:
                     sdK_reduce[n, d + 1] = tDKrDK[ei + 1] * Float32(sm_scale)
 
             cute.arch.fence_proxy("async.shared", space="cta")
+            self.dk_reduce_sync_barrier.arrive_and_wait()
 
             # 6. Single-thread bulk reduce DMA — only ONE thread in the
             # reduce warpgroup must issue cp.async.bulk; otherwise each

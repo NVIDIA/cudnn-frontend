@@ -23,6 +23,17 @@ python engine's ``check_support()`` gives its own, and the backend gives its
 own when it is lowered (declines recorded by ``backend_plan_entries()``, and
 surfaced by ``plan()`` only if no engine proposes a plan).
 
+Also absent, for the same reason: the C++ surface's unconditional "decode only
+mode, i.e. s_q == 1, not supported with sink_token" (``sdpa_support_surface.h``).
+A sink at s_q == 1 is a well-formed graph; whether it is SERVED is an engine
+answer — the FROST SM100 f16/bf16 row folds the sink logit into its epilogue
+independent of S_q (dense and paged), while the backend engines decline it.
+The C++ rule is left in place on purpose so the backend-only configuration (no
+python candidate, classic eager lowering) keeps rejecting at validate(); with a
+python candidate a graph no engine can serve fails at
+``create_execution_plans()`` with "no engine — python or backend — proposed a
+plan for this graph (the backend declined: decode only mode ...)".
+
 Error-type parity with the pybind ``throw_if`` mapping:
 ``GRAPH_NOT_SUPPORTED`` -> ``cudnn.cudnnGraphNotSupportedError`` (callers catch
 it to skip a config); ``ATTRIBUTE_NOT_SET`` / ``INVALID_VALUE`` ->
@@ -38,7 +49,8 @@ virtual O_v would surface as a bare ``ValueError`` out of planning
 (``create_execution_plans`` catches only the typed declines).  The native
 validator turns that into the typed not-supported with the fix in the message.
 Scope: the family's validator runs whenever a python SDPA engine is OFFERED
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
+(the SM100/SM120 f16 forward rows by default, the others with
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
 -- not only where a row serves the tail -- so the tail validates natively there
 and the backend's own verdict on it is deferred to planning, as for every
 python-validated graph.  With the engines disabled nothing changes (classic path).
@@ -304,8 +316,7 @@ def _validate_forward(node) -> None:
     if node.node_type == NodeType.SDPA:
         if (d_qk % 8 != 0) or (d_v % 8 != 0):
             raise _not_supported("hidden_dim should be multiple of 8")
-        if s_q == 1 and _has(node, "sink_token"):
-            raise _not_supported("decode only mode, i.e. s_q == 1, not supported with sink_token")
+        # No sink_token x (s_q == 1) rule here: see the module docstring.
 
         has_any_q = _has(node, "seq_len_q") or _has(node, "cu_seq_len_q")
         has_any_kv = _has(node, "seq_len_kv") or _has(node, "cu_seq_len_kv")

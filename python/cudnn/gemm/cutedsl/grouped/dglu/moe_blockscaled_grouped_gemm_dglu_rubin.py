@@ -762,6 +762,9 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        geglu_alpha: cutlass.Constexpr = 1.702,
+        glu_clamp_max: cutlass.Constexpr = 7.0,
+        glu_clamp_min: cutlass.Constexpr = -7.0,
     ):
         """Execute the GEMM.
 
@@ -769,6 +772,18 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
+
+        For ``act_func == "dgeglu"``, the activation alpha and clamp bounds
+        specialize the derivative of the forward activation:
+
+            gate_clamped = min(gate, glu_clamp_max)
+            up_clamped = clamp(up, min=glu_clamp_min, max=glu_clamp_max)
+            out = gate_clamped * sigmoid(geglu_alpha * gate_clamped)
+                  * (up_clamped + linear_offset)
+
+        Clamp derivative masks use the original C values and retain gradients
+        at the bounds. The optional probability gradient differentiates the
+        routing multiplier, so it is not multiplied by that probability.
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -1175,6 +1190,9 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             self.epi_tile,
             sched_params,
             epilogue_op,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1952,17 +1970,25 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         x1_vec_load: cute.Tensor,
         x2_vec_load: cute.Tensor,
         mProb: cute.Tensor,
+        square_alpha: Float32,
         linear_offset: Float32,
+        alpha: Float32 = cutlass.Float32(1.702),
+        glu_clamp_max: Float32 = cutlass.Float32(7.0),
+        glu_clamp_min: Float32 = cutlass.Float32(-7.0),
         dprob_swiglu: Optional[cute.Tensor] = None,
     ):
         LOG2_E = cutlass.Float32(1.4426950408889634)
         x_dtype = x1_vec_load.element_type
-        geglu_max_value = x_dtype(7.0)
-        geglu_min_value = x_dtype(-7.0)
+        # Clamp limits as the input dtype for the bf16x2 fast path; the same
+        # values (cast to f32) drive the gradient mask further down.
+        geglu_max_value = x_dtype(glu_clamp_max)
+        geglu_min_value = x_dtype(glu_clamp_min)
+        geglu_max_value_f32 = cutlass.Float32(glu_clamp_max)
+        geglu_min_value_f32 = cutlass.Float32(glu_clamp_min)
         zero_x_dtype = x_dtype(0.0)
         fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
         fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
-        scale_1702 = (1.702, 1.702)
+        scale_alpha = (alpha, alpha)
         ones2 = (1.0, 1.0)
         mprob2 = (mProb, mProb)
         linear_offset2 = (linear_offset, linear_offset)
@@ -1972,6 +1998,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             dx2_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             for i in cutlass.range(0, cute.size(acc_vec), 2, unroll_full=True):
                 acc = (acc_vec[i], acc_vec[i + 1])
+                acc = fmul2(acc, (square_alpha, square_alpha))
                 x1_0 = x1_vec_load[i]
                 x1_1 = x1_vec_load[i + 1]
                 x2_0 = x2_vec_load[i]
@@ -2004,8 +2031,8 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 y1 = (y1_0, y1_1)
                 y2 = (y2_0, y2_1)
 
-                # y1 = 1.702 * x1
-                y1_scaled = fmul2(y1, scale_1702)
+                # y1 = alpha * x1
+                y1_scaled = fmul2(y1, scale_alpha)
 
                 sigmoid_out_0 = sigmoid_f32(y1_scaled[0], fastmath=True)
                 sigmoid_out_1 = sigmoid_f32(y1_scaled[1], fastmath=True)
@@ -2016,7 +2043,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 if cutlass.const_expr(self.has_prob):
                     acc_mul_sigmoid_prob = fmul2(acc_mul_sigmoid_out, mprob2)
 
-                # y1 = 1 + 1.702 * y1 * (1 - sigmoid_out)
+                # y1 = 1 + alpha * y1 * (1 - sigmoid_out)
                 one_minus_sigmoid_0, one_minus_sigmoid_1 = fadd2(ones2, (-sigmoid_out_0, -sigmoid_out_1))
                 y1_scaled = fadd2(
                     fmul2(y1_scaled, (one_minus_sigmoid_0, one_minus_sigmoid_1)),
@@ -2031,7 +2058,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                     (y2_with_linear_offset_0, y2_with_linear_offset_1),
                     acc_mul_sigmoid_out,
                 )
-                # dy1 = g * sigmoid_out * (y2 + linear_offset) * (1 + 1.702 * y1 * (1 - sigmoid_out)) * mProb
+                # dy1 = g * sigmoid_out * (y2 + linear_offset) * (1 + alpha * y1 * (1 - sigmoid_out)) * mProb
                 dy1_0, dy1_1 = fmul2((dy1_pre_0, dy1_pre_1), y1_scaled)
                 if cutlass.const_expr(self.has_prob):
                     dy1_0, dy1_1 = fmul2((dy1_0, dy1_1), mprob2)
@@ -2067,23 +2094,23 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             dx1_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             dx2_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
 
-            # y1 = clamp(x1, max=7.0); y2 = clamp(x2, min=-7.0, max=7.0)
+            # y1 = clamp(x1, max=glu_clamp_max); y2 = clamp(x2, min=glu_clamp_min, max=glu_clamp_max)
             for i in cutlass.range_constexpr(element_count):
-                fc2_dgrad = acc_vec[i]
+                fc2_dgrad = acc_vec[i] * square_alpha
                 g = fc2_dgrad
                 if cutlass.const_expr(self.has_prob):
                     g = fc2_dgrad * mProb
-                y1 = min(x1_vec_load[i], 7.0)
-                y2 = min(x2_vec_load[i], 7.0)
-                y2 = max(y2, -7.0)
+                y1 = min(x1_vec_load[i], geglu_max_value_f32)
+                y2 = min(x2_vec_load[i], geglu_max_value_f32)
+                y2 = max(y2, geglu_min_value_f32)
 
-                sigmoid_out = sigmoid_f32(y1 * 1.702, fastmath=True)
+                sigmoid_out = sigmoid_f32(y1 * alpha, fastmath=True)
 
-                dy1 = g * sigmoid_out * (1 + 1.702 * y1 * (1 - sigmoid_out)) * (y2 + linear_offset)
+                dy1 = g * sigmoid_out * (1 + alpha * y1 * (1 - sigmoid_out)) * (y2 + linear_offset)
                 dy2 = g * y1 * sigmoid_out
 
-                x1_filter = 1.0 if x1_vec_load[i] <= 7.0 else 0.0
-                x2_filter = 1.0 if (x2_vec_load[i] >= -7.0 and x2_vec_load[i] <= 7.0) else 0.0
+                x1_filter = 1.0 if x1_vec_load[i] <= geglu_max_value_f32 else 0.0
+                x2_filter = 1.0 if (x2_vec_load[i] >= geglu_min_value_f32 and x2_vec_load[i] <= geglu_max_value_f32) else 0.0
 
                 dx1_vec[i] = x1_filter * dy1
                 dx2_vec[i] = x2_filter * dy2
@@ -2141,6 +2168,9 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        geglu_alpha: cutlass.Constexpr = 1.702,
+        glu_clamp_max: cutlass.Constexpr = 7.0,
+        glu_clamp_min: cutlass.Constexpr = -7.0,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -3182,7 +3212,18 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                     if cutlass.const_expr(self.act_func == "dswiglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dgeglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, linear_offset, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu = self.dgeglu(
+                            acc_vec,
+                            ab1_vec_load,
+                            ab2_vec_load,
+                            mProb,
+                            square_alpha,
+                            linear_offset,
+                            cutlass.Float32(geglu_alpha),
+                            cutlass.Float32(glu_clamp_max),
+                            cutlass.Float32(glu_clamp_min),
+                            dprob_swiglu,
+                        )
 
                     if cutlass.const_expr(self.generate_dprob):
                         # dprob sum reduction

@@ -34,7 +34,7 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     common/beta_guard.py shrinks erase rows that would expand under the decay budget, bitwise-identical across kernels)
 
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = tril(W_kk, -1)
-  T_inv (register MMA) : T_inv = (I + L)^-1 = I - L, then three Neumann doubling rounds
+  T_inv (register MMA) : T_inv = (I + L)^-1 blockwise, 4x4 diagonal blocks then the 4 -> 8 and 8 -> 16 corrections
   K*state GEMM   : KS[BT,DV] = K decay @ S_prev    (erase-gated key applied to state)
   U GEMM         : U[BT,DV]  = T_inv @ Y,  Y = W .* V - KS
   KV update GEMM : S_upd[DK,DV] = K restore^T @ U   (state update, BT contraction, left then right key half)
@@ -65,7 +65,7 @@ TMEM layout (512 columns allocated):
 Warp assignments (16 warps = 512 threads):
   warps 0-7     : compute group 0 - Gate prefix scan, decay/restore operands, left state halves (two ping-pong groups)
   warps 8-11    : compute group 1 - state seed, right state halves, Y / U staging, checkpoint rows, final state store
-  warp  12      : register-MMA warp - KK and the Neumann T_inv
+  warp  12      : register-MMA warp - KK and the blockwise T_inv
   warp  13      : MMA warp       - every tcgen05 GEMM; TMEM lifecycle
   warp  14      : TMA load warp  - loads K, V, Beta, W, Gate
   warp  15      : epilogue warp  - checkpoint TMA stores
@@ -85,6 +85,7 @@ from cutlass.cute.runtime import from_dlpack
 from ..common.beta_guard import beta_guard
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, load_cu, order_body
 from ..common.host import get_dtype
+from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from cudnn.frost.buffers import data_ptr
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .gdn2_recompute_config import CFG
@@ -107,7 +108,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     fadd2,
     fmul2,
     ffma2,
-    movmatrix_16b,
     mul_f16x2,
     opaque_f32_zero,
     opaque_i32_zero,
@@ -148,7 +148,7 @@ class Gdn2RecomputeBars(NamedTuple):
 
     mb_k_decay_inv_cg0_ready: MBarrier
     mb_decay_tcgen05_done: MBarrier
-    mb_decay_super_done: MBarrier
+    mb_decay_register_mma_done: MBarrier
     mb_state_acc_cg0_done: MBarrier
     mb_k_restore_acc_done: MBarrier
     mb_qk_scale_ready: MBarrier
@@ -193,7 +193,7 @@ def make_bars(cfg) -> Gdn2RecomputeBars:
         mb_u_input_ready=MBarrier(alloc(1), stages=1, init_count=CG1_WARPS + CG0_GROUP_WARPS, producer=Producer.THREAD),
         mb_k_decay_inv_cg0_ready=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=CG0_GROUP_WARPS, producer=Producer.THREAD),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
-        mb_decay_super_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.THREAD),
+        mb_decay_register_mma_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.THREAD),
         mb_state_acc_cg0_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_k_restore_acc_done=MBarrier(alloc(cfg.smem_decay_stages), stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_qk_scale_ready=MBarrier(
@@ -322,7 +322,7 @@ def epilogue_warp(
 
 
 @cute.jit
-def super_mma_warp(
+def register_mma_warp(
     cfg,
     total_tiles,
     bidx,
@@ -336,7 +336,7 @@ def super_mma_warp(
     sK_decay_raw,
     bars,
 ) -> None:
-    """Super-MMA warp role (warp 12). Persistent scheduler loop computing the
+    """Register-MMA warp role (warp 12). Persistent scheduler loop computing the
     register-MMA T_inv."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
@@ -407,66 +407,10 @@ def super_mma_warp(
                 if cutlass.const_expr(accum_idx % 2 == 1):
                     col_coord = col_coord + cutlass.Int32(1)
                 l_regs[accum_idx] = kk_acc[accum_idx] if row_coord > col_coord else cutlass.Float32(0.0)
-            l_a0 = fp32_to_fp16(l_regs[0], l_regs[1], dtype=cfg.io_dtype)
-            l_a1 = fp32_to_fp16(l_regs[2], l_regs[3], dtype=cfg.io_dtype)
-            l_a2 = fp32_to_fp16(l_regs[4], l_regs[5], dtype=cfg.io_dtype)
-            l_a3 = fp32_to_fp16(l_regs[6], l_regs[7], dtype=cfg.io_dtype)
 
-            # ---- T^-1 = I - L, then three Neumann doubling rounds --------------------
+            # ---- T_inv = (I + L)^-1 --------------------------------------------------
             tinv_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-            for accum_idx in cutlass.range_constexpr(8):
-                row_coord = row_lo
-                if cutlass.const_expr(accum_idx % 4 >= 2):
-                    row_coord = row_hi
-                col_coord = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
-                if cutlass.const_expr(accum_idx % 2 == 1):
-                    col_coord = col_coord + cutlass.Int32(1)
-                eye = cutlass.Float32(1.0) if row_coord == col_coord else cutlass.Float32(0.0)
-                tinv_acc[accum_idx] = eye - l_regs[accum_idx]
-
-            lpow_a0, lpow_a1, lpow_a2, lpow_a3 = l_a0, l_a1, l_a2, l_a3
-            mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(l_a0), movmatrix_16b(l_a1), movmatrix_16b(l_a2), movmatrix_16b(l_a3)
-            for neumann_round in cutlass.range_constexpr(3):
-                # ---- Lpow = Lpow @ Lpow ----------------------------------------------
-                sq_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    sq_acc[accum_idx] = cutlass.Float32(0.0)
-                mma_step(
-                    sq_acc,
-                    (lpow_a0, lpow_a1, lpow_a2, lpow_a3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                lpow_a0 = fp32_to_fp16(sq_acc[0], sq_acc[1], dtype=cfg.io_dtype)
-                lpow_a1 = fp32_to_fp16(sq_acc[2], sq_acc[3], dtype=cfg.io_dtype)
-                lpow_a2 = fp32_to_fp16(sq_acc[4], sq_acc[5], dtype=cfg.io_dtype)
-                lpow_a3 = fp32_to_fp16(sq_acc[6], sq_acc[7], dtype=cfg.io_dtype)
-                mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3 = movmatrix_16b(lpow_a0), movmatrix_16b(lpow_a1), movmatrix_16b(lpow_a2), movmatrix_16b(lpow_a3)
-
-                # ---- T^-1 += T^-1 @ Lpow ---------------------------------------------
-                upd_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                for accum_idx in cutlass.range_constexpr(8):
-                    upd_acc[accum_idx] = cutlass.Float32(0.0)
-                tinv_p0 = fp32_to_fp16(tinv_acc[0], tinv_acc[1], dtype=cfg.io_dtype)
-                tinv_p1 = fp32_to_fp16(tinv_acc[2], tinv_acc[3], dtype=cfg.io_dtype)
-                tinv_p2 = fp32_to_fp16(tinv_acc[4], tinv_acc[5], dtype=cfg.io_dtype)
-                tinv_p3 = fp32_to_fp16(tinv_acc[6], tinv_acc[7], dtype=cfg.io_dtype)
-                mma_step(
-                    upd_acc,
-                    (tinv_p0, tinv_p1, tinv_p2, tinv_p3),
-                    (mov_lpow0, mov_lpow1, mov_lpow2, mov_lpow3),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
-                tinv_acc[0], tinv_acc[1] = fadd2(tinv_acc[0], tinv_acc[1], upd_acc[0], upd_acc[1])
-                tinv_acc[2], tinv_acc[3] = fadd2(tinv_acc[2], tinv_acc[3], upd_acc[2], upd_acc[3])
-                tinv_acc[4], tinv_acc[5] = fadd2(tinv_acc[4], tinv_acc[5], upd_acc[4], upd_acc[5])
-                tinv_acc[6], tinv_acc[7] = fadd2(tinv_acc[6], tinv_acc[7], upd_acc[6], upd_acc[7])
+            invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx)
 
             bars.mb_t_inv_done[intermediate_stage].wait(cutlass.Int32(((chunk_count // cfg.smem_intermediate_stages) + 1) % 2))
             nvvm.stmatrix(
@@ -483,7 +427,7 @@ def super_mma_warp(
             nvvm.fence_proxy("async.shared", space="cta")
             if nvvm.elect_sync():
                 bars.mb_t_inv_ready[intermediate_stage].arrive()
-                bars.mb_decay_super_done[decay_stage].arrive()
+                bars.mb_decay_register_mma_done[decay_stage].arrive()
         global_chunk_base += num_chunks_tile
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1148,7 +1092,7 @@ def compute0_warp_group(
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
                 if cutlass.const_expr(dim_half == 0):
-                    bars.mb_decay_super_done[decay_stage].wait(decay_free_parity)
+                    bars.mb_decay_register_mma_done[decay_stage].wait(decay_free_parity)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
@@ -2471,13 +2415,13 @@ def frost_gdn2_recompute(
             bars.mb_state_input_cg0_ready.init()
             for stage in cutlass.range_constexpr(cfg.smem_decay_stages):
                 bars.mb_decay_tcgen05_done[stage].init()
-                bars.mb_decay_super_done[stage].init()
+                bars.mb_decay_register_mma_done[stage].init()
                 bars.mb_state_acc_cg0_done[stage].init()
                 bars.mb_k_restore_acc_done[stage].init()
             bars.mb_y_input_ready.init()
             bars.mb_u_input_ready.init()
             bars.mb_tmem_done[0].init()
-    elif warp_idx == cfg.super_mma_warp_id:
+    elif warp_idx == cfg.register_mma_warp_id:
         if elect_one:
             for stage in cutlass.range_constexpr(cfg.smem_intermediate_stages):
                 bars.mb_t_inv_ready[stage].init()
@@ -2524,8 +2468,8 @@ def frost_gdn2_recompute(
             k_ratio=k_ratio,
             v_ratio=v_ratio,
         )
-    elif warp_idx == cfg.super_mma_warp_id:
-        super_mma_warp(
+    elif warp_idx == cfg.register_mma_warp_id:
+        register_mma_warp(
             cfg,
             total_tiles,
             bidx,
@@ -2648,7 +2592,7 @@ class Gdn2RecomputeCfg:
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
-    super_mma_warp_id: int = CFG.SUPER_MMA_WARP_ID
+    register_mma_warp_id: int = CFG.REGISTER_MMA_WARP_ID
     tcgen05_mma_warp_id: int = CFG.TCGEN05_MMA_WARP_ID
     tma_warp_id: int = CFG.TMA_WARP_ID
     epilogue_warp_id: int = CFG.EPILOGUE_WARP_ID

@@ -41,11 +41,12 @@ def _fake_sm100(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
 
 
-def _mk_graph() -> cudnn.pygraph:
+def _mk_graph(**kwargs) -> cudnn.pygraph:
     return cudnn.pygraph(
         io_data_type=DTYPE,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
+        **kwargs,
     )
 
 
@@ -103,6 +104,93 @@ def test_probe_accepts_dsv4_causal():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, dims, strides)
     assert engines.engine_name() in _eligible(g)
+
+
+@pytest.mark.parametrize("unsupported", ["sm120", "synth_kv"])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
+    """Graph admission declines legacy executors before loading a DSL adapter."""
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from cudnn.engines.base import PlanConfig
+    from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
+
+    arch = "sm120" if unsupported == "sm120" else "sm100"
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0) if arch == "sm120" else (10, 0))
+    if opt_in:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    else:
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch=arch))
+    lower = Mock(side_effect=AssertionError("legacy override graph must decline before compilation"))
+    engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
+    for enabled in (False, True):
+        graph = _mk_graph(is_override_shape_enabled=enabled)
+        q, k, v, dims, strides = _mk_qkv(graph, d=128)
+        if unsupported == "synth_kv":
+            k.set_dim((B, H, 129, 128))
+            v.set_dim((B, H, 129, 128))
+        o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        _finish_output(o, dims, strides)
+        if not enabled:
+            engine.check_support(graph)
+            continue
+        with pytest.raises(NotImplementedError, match="prepared"):
+            engine.check_support(graph)
+        with pytest.raises(NotImplementedError, match="prepared"):
+            engine.build_plan(graph, PlanConfig(engine.engine_id))
+        from cudnn.engines.heuristics import rank
+
+        backend = [PlanConfig(7, {}, mode=cudnn.heur_mode.A)]
+        assert rank(graph, [engine], backend, [cudnn.heur_mode.A]) == [PlanConfig(7, {})]
+    lower.assert_not_called()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
+    """A plain-store O may serve split plans even when TMA cannot bind it unsplit."""
+    from cudnn.sdpa.fwd import heuristics
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=d)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    # Odd token pitch is legal for the combine's ordinary global stores, not TMA.
+    output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
+    _finish_output(o, dims, output_strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    unsplit = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
+    from dataclasses import replace
+
+    split = replace(unsplit, split_kv=2)
+    assert engines.analyze_for(spec, graph)[1] is None  # provider has a compatible plan
+    assert engines.analyze_for(spec, graph, unsplit)[1] is not None
+    assert engines.analyze_for(spec, graph, split)[1] is None
+    monkeypatch.setattr(heuristics, "_knob_sets", lambda *_: [unsplit, split])
+    plans = heuristics.recommend("A", facts, {spec.name: 20511})
+    assert [p.knobs for p in plans] == [split]
+    # Restore a TMA-bindable output: both contracts become eligible, regardless of ranking.
+    o.set_stride(strides)
+    fresh = ga.analyze(graph)
+    assert engines.mismatch(spec.capabilities, fresh, unsplit) is None
+    assert engines.mismatch(spec.capabilities, fresh, split) is None
+
+
+@pytest.mark.parametrize("feature", ["fp8", "mxfp8", "bias", "synth_kv"])
+def test_prepared_override_capability_declines_legacy_features(feature):
+    """The same pure predicate serves candidate filtering and runtime executor selection."""
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    changed = dict(fp8=dict(is_fp8=True), mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    assert engines._prepared_decline_reason(caps, facts, 1) is None
+    assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
 def test_probe_accepts_bf16():
@@ -737,17 +825,19 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n != "pack_gqa_partial_d_shapes"]
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes")]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.paged_d_shapes is None
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
     legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
-    assert names[-1] == "pack_gqa_partial_d_shapes", names[-3:]
+    # ... and every later field is appended after it, in the order it landed.
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
@@ -1541,20 +1631,23 @@ def test_bwd_dsink_fact():
 # --- paged KV caches (issue #920) -------------------------------------------
 
 
-def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+def _mk_paged_graph(*, d=128, d_v=None, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
     """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
     (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
-    int32 block tables + per-batch lengths."""
+    int32 block tables + per-batch lengths. ``d_v`` (default ``d``) is the V
+    pool's row width: the two pools may differ (MLA-style d_qk != d_v). ``sink``
+    adds the (1, H, 1, 1) fp32 sink_token (a decode graph: s_q = 1)."""
     g = _mk_graph()
     b, h, kh = B, H, 2
+    d_v = d if d_v is None else d_v
     q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
     num_pages = b * max_pages
-    if hnd:
-        strides = (kh * page_size * d, page_size * d, d, 1)
-    else:
-        strides = (page_size * kh * d, d, kh * d, 1)
-    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="k")
-    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="v")
+
+    def _pool_strides(dd):
+        return (kh * page_size * dd, page_size * dd, dd, 1) if hnd else (page_size * kh * dd, dd, kh * dd, 1)
+
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=_pool_strides(d), data_type=DTYPE, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d_v), stride=_pool_strides(d_v), data_type=DTYPE, name="v")
     tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
     tv = tk if one_table else g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
     slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
@@ -1562,8 +1655,10 @@ def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True,
     kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
     if max_seq_len is not None:
         kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    if sink:
+        kw["sink_token"] = g.tensor(dim=(1, h, 1, 1), stride=(h, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
-    _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
+    _finish_output(o, (b, h, 1, d_v), (h * d_v, d_v, d_v, 1))
     return g
 
 
@@ -1587,10 +1682,25 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d192x128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, which carries no PAGED_KV specialization"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
+    facts = _facts(_mk_paged_graph(sink=True))
+    assert facts.has_paged_kv and facts.has_sink and facts.s_q == 1
+    assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
+
+
+def test_paged_mixed_head_dims_are_served():
+    """The head-dim gate tests the flavor the lowering SELECTS
+    (``Capabilities.paged_d_shapes``), not the raw dims: (192, 128) is the
+    native d192x128 flavor, (256, 128) / (64, 192) / (136, 72) ride the d256 and
+    d192x128 envelopes. The previous "exactly one dim > 128" approximation
+    declined all of them (INVERTED from a decline)."""
+    for d_qk, d_v in ((192, 128), (256, 128), (64, 192), (136, 72)):
+        assert engines.engine_name() in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
 
 
 def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
@@ -1999,3 +2109,26 @@ def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
     assert cpp_amax.get_is_virtual() and list(cpp_amax.get_dim()) == [1, 1, 1, 1] and list(cpp_amax.get_stride()) == [1, 1, 1, 1]
     assert not cpp_o.get_is_virtual() and tuple(cpp_o.get_dim()) == dims and tuple(cpp_o.get_stride()) == bshd
     assert tuple(cpp_stats.get_dim()) == stats_dims and tuple(cpp_stats.get_stride()) == stats_bsh1
+
+
+def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
+    """Planning is graph metadata arithmetic, including explicit override-capable plans."""
+    import builtins
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] in ("torch", "cutlass", "cuda") or name.endswith("api_dsl") or name.endswith("prepared"):
+            raise AssertionError(f"planning imported a lowering dependency: {name}")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    for split in (1, 2):
+        knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
+        assert engines.mismatch(spec.capabilities, facts, knobs) is None

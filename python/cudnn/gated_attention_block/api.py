@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated attention block, forward — SKELETON (no kernel is wired yet).
+"""Gated attention block, forward -- projection, QK-norm/RoPE, SDPA, gate, out
+projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and fp4 O).
 
 FROST's first MODEL-LEVEL block: a SET of FROST kernels behind ONE API, one
 workspace, one call. Every stage is a FROST kernel; there are no cuBLAS or
@@ -149,12 +150,54 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   epilogue and writes ``q8`` / ``k8`` / ``v8`` + ``sf_q`` / ``sf_k`` / ``sf_v``
   + bf16 ``gate16``; the gated production MXFP8 SDPA writes e4m3 O UNSCALED
   (the kernel has no per-tensor ``scale_o`` -- D8: ``MxQuantSpec.scale_o``
-  must be 1.0 on this path, typed decline otherwise); FP8 ``out_proj``.  A
-  typed ``NotImplementedError`` while the twin has not landed (feature-detected
-  on the runner name), never a silently un-quantized path.
+  must be 1.0 on this path, typed decline otherwise); FP8 ``out_proj``.  The
+  fork twin is feature-detected on the runner name (``_fork_supports_field``),
+  so the typed ``NotImplementedError`` returns only on a checkout without the
+  twin -- never a silently un-quantized path.
 * Same envelope as FP8: inference-only, both knobs or neither, e4m3 only
   (E5M2 is a typed decline), ``d_model % 128 == 0`` (whole SF atoms along K),
   padding (``seq_lens_present``) served with the same dead-entry contract.
+
+**fp4 (2026-09-17): two modes RIDE the MXFP8 pipeline as appended
+:class:`MxQuantSpec` fields** (unrepresentable on :class:`QuantSpec` / bf16
+rather than declined); every existing caller and every existing workspace
+offset is byte-identical (pinned by a frozen layout snapshot):
+
+* **MXFP4 weights** (``w_qkvg_dtype=torch.float4_e2m1fn_x2``): ``W_qkvg``
+  arrives as packed e2m1 codes ``[n_qkvg, d_model // 2]`` (two per byte, LOW
+  nibble = even k; the STORAGE shape is what ``check_support`` checks) with the
+  UNCHANGED E8M0 / 32 ``w_qkvg_sf``; stage (1) runs the FROST catalog's MIXED
+  block-scale row (``fp8_e4m3 x fp4_e2m1``, E8M0 per 32 on both sides) --
+  the same 9 launches, no new stage, no new slot.  UNFUSED only: the fused
+  MXFP8 projection fork is rendered for an e4m3 B, so ``fuse_norm_rope`` with
+  an e2m1 ``W_qkvg`` is a feature-detected typed ``NotImplementedError``
+  (``NormRopeFusionParams.weight_fp4``), inverting the day the arm lands.
+* **fp4 O** (``o_fp4=Fp4Format.NVFP4 | Fp4Format.MXFP4``; ONE enum member =
+  e2m1 codes x scale dtype x block, e4m3 / 16 or E8M0 / 32, so an illegal
+  pairing cannot be spelled): the per-tensor tail (``quantize_o`` +
+  ``alpha_o`` FP8 ``out_proj``) is replaced by ``kernels/quantize_fp4.py``
+  (bf16 gated O -> e2m1 codes ``o4`` + the out-projection GEMM's PADDED
+  F8_128x4 blob ``sf_o``, sized by ``proj_gemm.sf_blob_bytes`` -- the GEMM
+  contract, never the SDPA's ``_sf_slot_bytes``) and the fp4 x fp4
+  block-scale ``out_proj`` against an e2m1 ``W_o`` ``[d_model, H_q*D // 2]``
+  of the SAME format with its blob ``sample_w_o_sf`` / ``w_o_sf`` (appended
+  arguments, required iff ``o_fp4``, refused otherwise).  No per-tensor scale
+  on either side: ``scale_o`` and ``descale_w_o`` MUST be 1.0 (typed
+  ``ValueError`` -- the block-scale GEMM has no alpha to carry them).
+  UNFUSED: still 9 launches (``quantize_fp4_o`` in ``quantize_o``'s place);
+  FULLY FUSED: **4 launches** -- the gated MXFP8 SDPA writes **bf16** O
+  (``sdpa_o_dtype = act``; no SDPA ``Capabilities`` change, so the
+  support-matrix tracker is untouched), then the fp4 quantize, then the fp4
+  ``out_proj``.  Workspace: ``o8`` is not reserved (-1); ``o4`` / ``sf_o`` are
+  appended at the END of the arm.  ``d_head % (4 * block) == 0`` (whole
+  4-block scale words per head; d=256 passes both formats), else a typed
+  ``NotImplementedError``.  A dead ragged entry quantizes to codes 0 exactly
+  (NVFP4 scale = the ``2^-9`` e4m3 floor, MXFP4 scale byte ``0x00``).
+* Both compose (row 9: the mixed GEMM at (1), the fp4 tail at (5q')/(6')); both
+  are inference-only like every quantized pipeline (``save_for_backward`` is
+  the same typed decline).  NOT served: an fp4 ``h``, an fp4 ``W_o`` against
+  an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global (per-tensor)
+  scale on either fp4 side.
 
 Three facts the MXFP8 design rests on, kept here because a port will drop them:
 
@@ -181,9 +224,10 @@ PyTorch oracle and perf baseline:
 ``test/python/fe_api/gated_attention_block/reference.py``.
 
 Not in scope for v1, in the order they are likely to land: THD / varlen packing;
-MXFP8 O / MXFP8 ``out_proj`` (D1: per-tensor); the graph-API engine row. This is a frontend-only OSS API
-first; a manifest family + ``Capabilities`` comes when the stages exist to be
-honest about.
+an MXFP8 (e4m3 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the
+block-scaled out projection exists only in the fp4 formats above); the graph-API
+engine row. This is a frontend-only OSS API first; a manifest family +
+``Capabilities`` comes when the stages exist to be honest about.
 """
 
 from __future__ import annotations
@@ -192,8 +236,8 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import IntEnum
-from typing import Optional, Union
+from enum import Enum, IntEnum
+from typing import Optional, Tuple, Union
 
 import torch
 from cuda.bindings import driver as cuda
@@ -318,6 +362,7 @@ _QK_NORM_ROPE_DEFER_SECONDARY_LOADS = True  # keep in step with kernels/qk_norm_
 _QK_NORM_ROPE_TILE_ROWS = 16  # keep in step with kernels/qk_norm_rope_tma.py DEFAULT_TILE_ROWS
 _QK_NORM_ROPE_STAGES = 2  # keep in step with kernels/qk_norm_rope_tma.py DEFAULT_STAGES
 _QUANTIZE_MXFP8_THREADS = 256  # keep in step with kernels/quantize_mxfp8.py DEFAULT_THREADS_PER_CTA (>= the 64 burst lanes of a 1 KiB SF tile)
+_QUANTIZE_FP4_THREADS = 256  # keep in step with kernels/quantize_fp4.py DEFAULT_THREADS_PER_CTA (>= the 128 burst lanes of a 2 KiB nvfp4 SF tile at d=256)
 """Smallest GEMM ``TILE_N`` the block intends to support.
 
 Every ``qkvg`` block boundary must be a multiple of this so no output tile
@@ -708,6 +753,13 @@ class _Intermediates:
     sf_q: int = -1
     sf_k: int = -1
     sf_v: int = -1
+    # fp4 O (``MxQuantSpec.o_fp4``) only (-1 otherwise): the packed e2m1 gated O the fp4 out_proj reads
+    # -- ``[T, H_q*D/2]`` bytes, viewed ``float4_e2m1fn_x2`` -- and its PADDED F8_128x4 scale blob over
+    # ``(rows=T, K=H_q*D)``, ``proj_gemm.sf_blob_bytes(T, H_q*D, block)`` bytes: the GEMM's contract, NOT the
+    # SDPA's ``_sf_slot_bytes`` (a different byte ORDER and count).  ``o8`` is -1 under o_fp4 (never written,
+    # so never reserved); on the fused arm ``o`` (bf16) takes its place, since the gated SDPA then writes bf16 O.
+    o4: int = -1
+    sf_o: int = -1
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -741,12 +793,21 @@ def _plan_workspace(
     fp8: bool = False,
     fp8_fused: bool = False,
     mxfp8: bool = False,
+    o_fp4: Optional[Fp4Format] = None,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
     ``mxfp8`` (appended) adds the three SDPA scale-factor blobs ``sf_q`` /
     ``sf_k`` / ``sf_v`` (:func:`_sf_slot_bytes`) at the END of either layout, so
     every FP8 offset is byte-identical to before MXFP8 existed.
+
+    ``o_fp4`` (appended; an :class:`Fp4Format`) appends ``o4`` (packed e2m1 gated O,
+    ``t*h_q*d_head // 2`` bytes) and ``sf_o`` (its padded F8_128x4 blob,
+    ``proj_gemm.sf_blob_bytes(t, h_q*d_head, block)`` bytes -- the GEMM contract)
+    at the END of either layout and does NOT reserve ``o8`` (a slot never written
+    is not reserved); on the fused arm the bf16 ``o`` the gated SDPA then writes
+    takes ``o8``'s place.  Every layout with ``o_fp4=None`` is byte-identical to
+    before (pinned by ``test_workspace_layout_is_byte_identical_without_fp4``).
 
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
@@ -776,10 +837,13 @@ def _plan_workspace(
             ("k8", t * geom.h_kv * geom.d_head),
             ("v8", t * geom.h_kv * geom.d_head),
             ("gate16", t * geom.h_q * geom.d_head * e),
-            ("o8", t * geom.h_q * geom.d_head),
+            # fp4 O (row 10): the gated SDPA writes bf16 `o` here instead of e4m3 `o8`; quantize_fp4 reads it.
+            ("o", t * geom.h_q * geom.d_head * e) if o_fp4 is not None else ("o8", t * geom.h_q * geom.d_head),
         ]
         if mxfp8:
             slots += _sf_slots(geom, b, s)
+        if o_fp4 is not None:
+            slots += _o_fp4_slots(geom, t, o_fp4)
         for name, nbytes in slots:
             offsets[name] = off
             off += _align_up(nbytes)
@@ -789,7 +853,7 @@ def _plan_workspace(
             gate=-1,
             k=-1,
             v=-1,
-            o=-1,
+            o=offsets.get("o", -1),
             o_gated=-1,
             engine_scratch=off,
             total_bytes=off,
@@ -797,11 +861,13 @@ def _plan_workspace(
             q8=offsets["q8"],
             k8=offsets["k8"],
             v8=offsets["v8"],
-            o8=offsets["o8"],
+            o8=offsets.get("o8", -1),
             gate16=offsets["gate16"],
             sf_q=offsets.get("sf_q", -1),
             sf_k=offsets.get("sf_k", -1),
             sf_v=offsets.get("sf_v", -1),
+            o4=offsets.get("o4", -1),
+            sf_o=offsets.get("sf_o", -1),
         )
     # IN-PLACE: Q and K are normed back over their own columns of `proj`, and V
     # is never moved, so the SDPA reads all three straight out of the slab at
@@ -832,11 +898,14 @@ def _plan_workspace(
             ("v8", t * geom.h_kv * geom.d_head),
         ]
     slots += [("o", t * geom.h_q * geom.d_head * e)]
-    if fp8:
+    if fp8 and o_fp4 is None:
         slots += [("o8", t * geom.h_q * geom.d_head)]
     if mxfp8:
         # MXFP8: the SDPA's F8_128x4 SF blobs, written by the three quantize_mxfp8 stages.
         slots += _sf_slots(geom, b, s)
+    if o_fp4 is not None:
+        # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
+        slots += _o_fp4_slots(geom, t, o_fp4)
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -859,6 +928,8 @@ def _plan_workspace(
         sf_q=offsets.get("sf_q", -1),
         sf_k=offsets.get("sf_k", -1),
         sf_v=offsets.get("sf_v", -1),
+        o4=offsets.get("o4", -1),
+        sf_o=offsets.get("sf_o", -1),
     )
 
 
@@ -868,6 +939,22 @@ def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int) -> list:
         ("sf_q", _sf_slot_bytes(b, geom.h_q, s, geom.d_head)),
         ("sf_k", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
         ("sf_v", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
+    ]
+
+
+def _o_fp4_code_bytes(geom: GatedAttentionBlockGeometry, t: int) -> int:
+    """Bytes of the packed e2m1 gated O: ``T * H_q * D / 2`` (two codes per byte along K = H_q*D)."""
+    return t * geom.h_q * geom.d_head // 2
+
+
+def _o_fp4_slots(geom: GatedAttentionBlockGeometry, t: int, o_fp4: Fp4Format) -> list:
+    """The two fp4-O slots, in the order quantize_fp4 writes them: ``o4`` (codes), ``sf_o`` (the out_proj GEMM's
+    PADDED F8_128x4 blob over ``(rows=T, K=H_q*D)`` at the format's block -- ``proj_gemm.sf_blob_bytes``)."""
+    from .kernels.proj_gemm import sf_blob_bytes
+
+    return [
+        ("o4", _o_fp4_code_bytes(geom, t)),
+        ("sf_o", sf_blob_bytes(t, geom.h_q * geom.d_head, o_fp4.block_size)),
     ]
 
 
@@ -1040,6 +1127,58 @@ class QuantSpec:
 MXFP8_BLOCK_SIZE = 32
 _E8M0 = getattr(torch, "float8_e8m0fnu", None)
 _SF_DTYPES = tuple(t for t in (torch.uint8, _E8M0) if t is not None)
+_FP4_X2 = getattr(torch, "float4_e2m1fn_x2", None)  # packed e2m1: ONE byte = two codes along the contiguous axis
+# The W_qkvg code dtypes an MxQuantSpec may name: e4m3 (MXFP8 x MXFP8) or e2m1 (the catalog's MIXED
+# block-scale row, MXFP8 h x MXFP4 W -- `kernel_registry._BLOCK_SCALE_CASES` fp8_e4m3 x fp4_e2m1, E8M0 / 32).
+_W_QKVG_DTYPES = tuple(t for t in (torch.float8_e4m3fn, _FP4_X2) if t is not None)
+
+
+class Fp4Format(Enum):
+    """The two fp4 OUTPUT formats the block quantizes its gated O to (``MxQuantSpec.o_fp4``) -- and, by
+    construction, the format of the fp4 ``W_o`` the block-scale out projection multiplies it with.
+
+    ONE member = (e2m1 codes, scale dtype, scale block): an illegal pairing cannot be spelled.  Exactly the
+    two rows the FROST block-scale catalog serves for two e2m1 sides (``kernel_registry._BLOCK_SCALE_CASES``):
+
+    ========= ============================ ======= ======================================================
+    member    scale dtype                  block   catalog row
+    ========= ============================ ======= ======================================================
+    ``NVFP4`` ``torch.float8_e4m3fn``      16      ``fp4_e2m1 x fp4_e2m1`` with ``fp8_e4m3`` scales per 16
+    ``MXFP4`` ``torch.float8_e8m0fnu``     32      ``fp4_e2m1 x fp4_e2m1`` with ``fp8_e8m0`` scales per 32
+    ========= ============================ ======= ======================================================
+
+    Members are NAMED after ``kernels/quantize_fp4.py``'s format keys (``"nvfp4"`` / ``"mxfp4"``): the
+    quantize stage takes the member itself and ``fp4_format(member)`` cross-checks ``block_size`` against
+    the kernel's table, so the enum and the kernel cannot drift apart silently.  No global (per-tensor)
+    scale in either format: ``MxQuantSpec.scale_o`` / ``descale_w_o`` are pinned to 1.0 under ``o_fp4``.
+    """
+
+    NVFP4 = ("nvfp4", 16)  # e2m1 x e4m3 scales per 16 along K
+    MXFP4 = ("mxfp4", 32)  # e2m1 x E8M0 scales per 32 along K
+
+    @property
+    def fmt_name(self) -> str:
+        """The ``kernels/quantize_fp4.py`` format key (``"nvfp4"`` / ``"mxfp4"``)."""
+        return self.value[0]
+
+    @property
+    def block_size(self) -> int:
+        """Elements per scale along K (16 for NVFP4, 32 for MXFP4)."""
+        return self.value[1]
+
+    @property
+    def sf_torch_dtype(self) -> torch.dtype:
+        """The scale blob's torch storage dtype: ``float8_e4m3fn`` (NVFP4) / ``float8_e8m0fnu`` (MXFP4); a blob may
+        also arrive as plain ``uint8`` bytes."""
+        return torch.float8_e4m3fn if self is Fp4Format.NVFP4 else _E8M0
+
+    @property
+    def sf_cudnn_dtype(self):
+        """The ``cudnn.data_type`` the out-projection GEMM DECLARES its scale tensors in -- which selects the MMA's
+        scale format (``FP8_E4M3`` for NVFP4, ``FP8_E8M0`` for MXFP4)."""
+        import cudnn
+
+        return cudnn.data_type.FP8_E4M3 if self is Fp4Format.NVFP4 else cudnn.data_type.FP8_E8M0
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1202,30 @@ class MxQuantSpec:
                      ``scale_o``), so it MUST be 1.0 there -- D8, typed decline.
     ``dtype``        the code dtype; only E4M3 is served (E5M2 declines typed)
     ``block_size``   32 -- the MX block; anything else is a ``ValueError``
+    ``w_qkvg_dtype`` the ``W_qkvg`` code dtype (appended, default e4m3 = today's
+                     MXFP8 x MXFP8 GEMM).  ``torch.float4_e2m1fn_x2`` selects an
+                     MXFP4 weight: e2m1 codes stored ``[n_qkvg, d_model // 2]``
+                     (two per byte, LOW nibble = even k) against the e4m3 ``h``
+                     -- the FROST catalog's MIXED block-scale row (``fp8_e4m3 x
+                     fp4_e2m1``, E8M0 scales per 32); ``w_qkvg_sf`` is UNCHANGED
+                     (the same E8M0 / 32 F8_128x4 blob over ``n_qkvg x d_model``).
+                     Unfused pipeline only: the fused MXFP8 projection fork is
+                     rendered for an e4m3 B (typed decline at ``check_support``).
+    ``o_fp4``        (appended, default ``None`` = today's per-tensor e4m3 O).  An
+                     :class:`Fp4Format` member selects the fp4 OUTPUT mode: the gated
+                     O is block-quantized to e2m1 codes + that format's scale blob by
+                     a ``quantize_fp4`` launch, and the out projection becomes the
+                     fp4 x fp4 block-scale GEMM against an e2m1 ``W_o`` of the SAME
+                     format -- stored ``[d_model, h_q*d_head // 2]`` as
+                     ``torch.float4_e2m1fn_x2`` with its F8_128x4 blob
+                     (``sample_w_o_sf`` / ``w_o_sf``,
+                     ``proj_gemm.sf_blob_bytes(d_model, h_q*d_head, block)`` bytes).
+                     Neither side carries a per-tensor scale: ``scale_o`` and
+                     ``descale_w_o`` MUST be 1.0 (typed ``ValueError``).  Served on
+                     the unfused pipeline (config row 8 / 9: ``quantize_o`` becomes
+                     ``quantize_fp4_o``, still 9 launches) and on the fully fused one
+                     (row 10: the gated MXFP8 SDPA writes bf16 O, then the fp4
+                     quantize, then the fp4 out projection -- 4 launches).
     ============== ============================================================
 
     ``h`` / ``W_qkvg`` arrive PRE-quantized by the caller (D2: static, offline,
@@ -1077,6 +1240,13 @@ class MxQuantSpec:
     scale_o: float = 1.0
     dtype: torch.dtype = torch.float8_e4m3fn
     block_size: int = MXFP8_BLOCK_SIZE
+    w_qkvg_dtype: torch.dtype = torch.float8_e4m3fn  # appended: torch.float4_e2m1fn_x2 -> MXFP4 W_qkvg (the mixed row)
+    o_fp4: Optional[Fp4Format] = None  # appended: Fp4Format.NVFP4 | MXFP4 -> fp4 gated O + fp4 W_o of the same format, block-scale out_proj
+
+    @property
+    def w_qkvg_fp4(self) -> bool:
+        """``W_qkvg`` is packed e2m1 (``torch.float4_e2m1fn_x2``): the mixed MXFP8 x MXFP4 stage (1)."""
+        return _FP4_X2 is not None and self.w_qkvg_dtype == _FP4_X2
 
     def validate(self, *, fused: bool = False) -> None:
         """Typed declines; ``fused=True`` adds the D8 unit-``scale_o`` rule of the fully fused path."""
@@ -1084,11 +1254,35 @@ class MxQuantSpec:
             raise NotImplementedError(f"MxQuantSpec: only torch.float8_e4m3fn codes are served (E5M2 is a knob away), got {self.dtype}")
         if int(self.block_size) != MXFP8_BLOCK_SIZE:
             raise ValueError(f"MxQuantSpec.block_size must be {MXFP8_BLOCK_SIZE} (one E8M0 scale per 32-element MX block), got {self.block_size}")
+        if self.w_qkvg_dtype not in _W_QKVG_DTYPES:
+            raise NotImplementedError(
+                f"MxQuantSpec.w_qkvg_dtype: W_qkvg codes are torch.float8_e4m3fn (MXFP8 x MXFP8) or torch.float4_e2m1fn_x2 (the FROST "
+                f"block-scale catalog's mixed row, kernel_registry._BLOCK_SCALE_CASES fp8_e4m3 x fp4_e2m1 with E8M0 scales per 32); got "
+                f"{self.w_qkvg_dtype}. A uint8 blob of packed e2m1 codes is spelled .view(torch.float4_e2m1fn_x2), never uint8."
+            )
+        if self.o_fp4 is not None and not isinstance(self.o_fp4, Fp4Format):
+            raise TypeError(f"MxQuantSpec.o_fp4 must be an Fp4Format member (Fp4Format.NVFP4 | Fp4Format.MXFP4) or None, got {self.o_fp4!r}")
+        if self.o_fp4 is not None and _FP4_X2 is None:
+            # Mirrors quantize_fp4.check_torch_fp4_dtypes: the o4 buffer and W_o are VIEWED as the packed e2m1 dtype, so a
+            # torch without it cannot serve rows 8-10 -- declined here, before _expected_weight_dtypes reports a None dtype.
+            raise NotImplementedError(f"MxQuantSpec.o_fp4 needs torch.float4_e2m1fn_x2 for the packed e2m1 O and W_o (torch {torch.__version__} has none)")
         for name in ("descale_w_o", "scale_o"):
             v = float(getattr(self, name))
             if not (v > 0.0) or v != v or v in (float("inf"),):
                 raise ValueError(f"MxQuantSpec.{name} must be a finite positive float, got {v}")
-        if fused and float(self.scale_o) != 1.0:
+        if self.o_fp4 is not None:
+            # No global scale on either fp4 side (plan section 1): the O quantizer writes local block scales
+            # only, and W_o dequantizes through its own blob in the MMA.  A non-unit value here would be
+            # silently dropped by the block-scale GEMM (no alpha epilogue) -- refused instead.
+            if float(self.scale_o) != 1.0:
+                raise ValueError(f"MxQuantSpec.scale_o: a block-scaled O has no per-tensor scale; pass scale_o=1.0 under o_fp4 (got {self.scale_o})")
+            if float(self.descale_w_o) != 1.0:
+                raise ValueError(
+                    f"MxQuantSpec.descale_w_o: under o_fp4 W_o dequantizes through w_o_sf (its F8_128x4 scale blob); pass descale_w_o=1.0 "
+                    f"(got {self.descale_w_o})"
+                )
+        elif fused and float(self.scale_o) != 1.0:
+            # D8 (per-tensor e4m3 O on the fully fused path).  Skipped under o_fp4: scale_o == 1.0 is already pinned above.
             raise NotImplementedError(
                 f"MxQuantSpec.scale_o must be 1.0 on the FULLY FUSED MXFP8 path (got {self.scale_o}): the production MXFP8 SDPA writes "
                 "e4m3 O UNSCALED (its ABI has no per-tensor scale_o -- PR-B D8). Use scale_o=1.0, or the unfused pipeline."
@@ -1099,19 +1293,24 @@ class MxQuantSpec:
         return (1.0 / self.scale_o) * self.descale_w_o
 
 
-def _check_sf_blob(sf: torch.Tensor, name: str, rows: int, k: int) -> None:
-    """A caller-supplied F8_128x4 E8M0 scale-factor blob: dtype, PADDED byte count
-    (``proj_gemm.sf_blob_bytes``), contiguity, 16-B alignment -- typed, before any kernel."""
+def _check_sf_blob(sf: torch.Tensor, name: str, rows: int, k: int, *, block: int = MXFP8_BLOCK_SIZE, sf_dtypes: Tuple[torch.dtype, ...] = _SF_DTYPES) -> None:
+    """A caller-supplied F8_128x4 scale-factor blob: dtype, PADDED byte count
+    (``proj_gemm.sf_blob_bytes(rows, k, block)``), contiguity, 16-B alignment -- typed, before any kernel.
+
+    ``block`` / ``sf_dtypes`` (appended, defaults = the MXFP8 E8M0 / 32 contract) generalise it to the fp4
+    blobs: one scale byte per ``block`` elements along K, stored as any of ``sf_dtypes`` (``uint8`` plus
+    the format's own fp8 storage dtype -- ``float8_e8m0fnu`` for MX scales, ``float8_e4m3fn`` for NVFP4)."""
     from .kernels.proj_gemm import sf_blob_bytes, sf_padded_dims
 
-    if sf.dtype not in _SF_DTYPES:
-        raise ValueError(f"{name} must be uint8 or torch.float8_e8m0fnu (E8M0 bytes in F8_128x4 order), got {sf.dtype}")
-    need = sf_blob_bytes(rows, k)
+    if sf.dtype not in sf_dtypes:
+        want = " or ".join(str(t) for t in sf_dtypes)
+        raise ValueError(f"{name} must be {want} (scale bytes in F8_128x4 order), got {sf.dtype}")
+    need = sf_blob_bytes(rows, k, block)
     if sf.numel() != need:
-        rows_pad, k4 = sf_padded_dims(rows, k)
+        rows_pad, k4 = sf_padded_dims(rows, k, block)
         raise ValueError(
-            f"{name} has {sf.numel()} bytes; the F8_128x4 blob over {rows} rows x K={k} is {need} = {rows_pad} (rows padded to 128) x {k4} "
-            f"(K/32 blocks padded to 4) -- whole 512-B atoms, pad rows / blocks 0x00 (kernels.proj_gemm.sf_blob_bytes)"
+            f"{name} has {sf.numel()} bytes; the F8_128x4 blob over {rows} rows x K={k} at block {block} is {need} = {rows_pad} (rows padded to 128) "
+            f"x {k4} (K/{block} blocks padded to 4) -- whole 512-B atoms, pad rows / blocks 0x00 (kernels.proj_gemm.sf_blob_bytes)"
         )
     if not sf.is_contiguous():
         raise ValueError(f"{name} must be contiguous (an opaque F8_128x4 byte blob bound by storage order)")
@@ -1187,6 +1386,9 @@ class _Projection(_Stage):
         out_dtype: Optional[torch.dtype] = None,
         alpha: bool = False,
         block_scale: bool = False,
+        w_dtype: Optional[torch.dtype] = None,
+        block_size: int = MXFP8_BLOCK_SIZE,
+        sf_dtype=None,
     ) -> None:
         self.name = name
         self.m = int(m)
@@ -1201,28 +1403,60 @@ class _Projection(_Stage):
         # (over N), dequantized IN the MMA (`block_scale_dequantize`) -- no alpha.
         # The caller hands the two F8_128x4 blobs to execute(sf_a=, sf_w=).
         self.block_scale = bool(block_scale)
+        # fp4 (append-only, default = today's behaviour): `w_dtype` names W's dtype apart from
+        # A's (an e2m1 weight against an e4m3 activation is the catalog's MIXED block-scale
+        # row; two e2m1 sides are NVFP4 / MXFP4), `block_size` the scale block along K (32,
+        # or 16 for NVFP4) and `sf_dtype` the scale dtype (a `cudnn.data_type`; None = the
+        # pair's own default).  The served pairs are `kernels.proj_gemm.block_scale_pairing`.
+        self.w_dtype = w_dtype if w_dtype is not None else dtype
+        self.block_size = int(block_size)
+        self.sf_dtype = sf_dtype
         self._plan = None
 
     def check_support(self) -> None:
-        if self.dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
-            raise NotImplementedError(f"{self.name}: bf16/f16/fp8-e4m3 only, got {self.dtype}")
+        from .kernels.proj_gemm import block_scale_pairing
+
+        fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        a_dtypes = (torch.bfloat16, torch.float16, torch.float8_e4m3fn) + ((fp4,) if (self.block_scale and fp4 is not None) else ())
+        if self.dtype not in a_dtypes:
+            raise NotImplementedError(f"{self.name}: bf16/f16/fp8-e4m3 (and fp4-e2m1 under block_scale) only, got {self.dtype}")
         if self.dtype == torch.float8_e4m3fn and self.k % 16:
             raise NotImplementedError(f"{self.name}: FP8 needs K % 16 == 0 (TMA 16-byte rule at 1 B/elem), got K={self.k}")
         if self.out_dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: output dtype must be bf16/f16, got {self.out_dtype}")
         if self.block_scale:
-            if self.dtype != torch.float8_e4m3fn:
-                raise NotImplementedError(f"{self.name}: block_scale=True (MXFP8) needs e4m3 codes, got {self.dtype}")
+            # The pairing table is the GEMM driver's (one source); its ValueError is the block's typed decline.
+            try:
+                block_scale_pairing(dtype=self.dtype, w_dtype=self.w_dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
+            except ValueError as exc:
+                raise NotImplementedError(str(exc)) from None
             if self.alpha:
-                raise ValueError(f"{self.name}: block_scale=True carries its descale in the E8M0 scale factors; alpha must be False")
+                raise ValueError(f"{self.name}: block_scale=True carries its descale in the per-block scale factors; alpha must be False")
             if self.k % MXFP8_BLOCK_SIZE:
-                raise NotImplementedError(f"{self.name}: block_scale=True needs K % {MXFP8_BLOCK_SIZE} == 0 (one E8M0 scale per block), got K={self.k}")
+                # 32 also for NVFP4 (two 16-blocks): it is the fp4 TMA rule (16 bytes = 32 codes) as much as the scale block.
+                raise NotImplementedError(
+                    f"{self.name}: block_scale=True needs K % {MXFP8_BLOCK_SIZE} == 0 (whole scale blocks; the fp4 TMA rule), got K={self.k}"
+                )
+        elif self.w_dtype != self.dtype:
+            raise NotImplementedError(
+                f"{self.name}: a per-weight dtype (A {self.dtype}, W {self.w_dtype}) exists only as a block-scale row; the dense GEMM takes one dtype"
+            )
 
     def compile(self) -> None:
         from .kernels.proj_gemm import build_proj_gemm
 
         self._plan = build_proj_gemm(
-            m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.name, out_dtype=self.out_dtype, alpha=self.alpha, block_scale=self.block_scale
+            m=self.m,
+            k=self.k,
+            n=self.n,
+            dtype=self.dtype,
+            label=self.name,
+            out_dtype=self.out_dtype,
+            alpha=self.alpha,
+            block_scale=self.block_scale,
+            sf_dtype=self.sf_dtype,
+            w_dtype=self.w_dtype,
+            block_size=self.block_size,
         )
 
     def workspace_bytes(self) -> int:
@@ -1273,18 +1507,53 @@ def _qkv_gate_projection(
     out_dtype: Optional[torch.dtype] = None,
     alpha: bool = False,
     block_scale: bool = False,
+    w_dtype: Optional[torch.dtype] = None,
 ) -> _Projection:
-    """Stage (1). At the 397B full-attention layer: ``M x 17408 x 4096``."""
+    """Stage (1). At the 397B full-attention layer: ``M x 17408 x 4096``.  ``w_dtype`` (default:
+    ``dtype``) is the weight's dtype -- ``torch.float4_e2m1fn_x2`` for an MXFP4 ``W_qkvg`` against
+    e4m3 ``h`` (the block-scale MIXED row; the E8M0 / 32 scale blob is unchanged)."""
     return _Projection(
-        m=batch * seq_len, k=geom.d_model, n=geom.n_qkvg, dtype=dtype, name="qkv_gate_proj", out_dtype=out_dtype, alpha=alpha, block_scale=block_scale
+        m=batch * seq_len,
+        k=geom.d_model,
+        n=geom.n_qkvg,
+        dtype=dtype,
+        name="qkv_gate_proj",
+        out_dtype=out_dtype,
+        alpha=alpha,
+        block_scale=block_scale,
+        w_dtype=w_dtype,
     )
 
 
 def _out_projection(
-    geom: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, out_dtype: Optional[torch.dtype] = None, alpha: bool = False
+    geom: GatedAttentionBlockGeometry,
+    *,
+    batch: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    out_dtype: Optional[torch.dtype] = None,
+    alpha: bool = False,
+    block_scale: bool = False,
+    w_dtype: Optional[torch.dtype] = None,
+    block_size: int = MXFP8_BLOCK_SIZE,
+    sf_dtype=None,
 ) -> _Projection:
-    """Stage (6). At the 397B full-attention layer: ``M x 4096 x 8192``."""
-    return _Projection(m=batch * seq_len, k=geom.h_q * geom.d_head, n=geom.d_model, dtype=dtype, name="out_proj", out_dtype=out_dtype, alpha=alpha)
+    """Stage (6). At the 397B full-attention layer: ``M x 4096 x 8192``.  ``block_scale`` + the fp4
+    trio (``dtype=w_dtype=torch.float4_e2m1fn_x2``, ``block_size`` 16 | 32, ``sf_dtype`` E4M3 | E8M0)
+    is the fp4 gated-O x fp4 ``W_o`` projection; the defaults are the per-tensor / bf16 path as before."""
+    return _Projection(
+        m=batch * seq_len,
+        k=geom.h_q * geom.d_head,
+        n=geom.d_model,
+        dtype=dtype,
+        name="out_proj",
+        out_dtype=out_dtype,
+        alpha=alpha,
+        block_scale=block_scale,
+        w_dtype=w_dtype,
+        block_size=block_size,
+        sf_dtype=sf_dtype,
+    )
 
 
 class _Quantize(_Stage):
@@ -1399,6 +1668,85 @@ class _QuantizeMxfp8(_Stage):
         run_quantize_mxfp8(self._recipe, src, dst, sf, batch=b, seq_len=s, stream=stream)
 
 
+class _QuantizeFp4(_Stage):
+    """(5q') fp4 block quantize of the gated O: compact bf16/f16 ``[T, H_q, D]`` -> e2m1 codes ``[T, H_q*D/2]``
+    (two per byte, bound as ``float4_e2m1fn_x2``) + the out-projection GEMM's PADDED F8_128x4 scale blob
+    over ``(rows=T, K=H_q*D)``.
+
+    Kernel: ``kernels/quantize_fp4.py``.  ONE stage class, TWO formats selected by ``fmt`` (the
+    ``Fp4Format`` member, or its name): ``NVFP4`` -- e4m3 scale per 16 (``e4m3_rn(max(amax/6, 2^-9))``,
+    codes by ``div.rn.f32``) -- and ``MXFP4`` -- E8M0 scale per 32 (``cvt.rp.ue8m0(amax/6)``, codes by the
+    exact power-of-two reciprocal).  The blob is sized by ``proj_gemm.sf_blob_bytes`` (the GEMM contract,
+    NOT the SDPA's ``_sf_slot_bytes``) and the kernel writes EVERY byte of it (pad rows ``0x00``), so the
+    block-scale out projection reads it with no re-layout.  The source is the compact gated ``o``; the
+    stage is what turns it into the fp4 A operand of ``o4 @ W_o^T``.  Built under ``MxQuantSpec.o_fp4`` (config
+    rows 8-10) in ``quantize_o``'s place, on the unfused and the fully fused MXFP8 pipeline.
+    """
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, fmt, name: str) -> None:
+        self.name = name
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype_in = dtype_in
+        self.heads = int(heads)
+        self.fmt = fmt
+        self._recipe = None
+
+    def _format(self) -> tuple:
+        """``(name, block, sf_e4m3)`` of ``fmt`` -- ``ValueError`` for anything but the two served formats."""
+        from .kernels.quantize_fp4 import fp4_format
+
+        return fp4_format(self.fmt)
+
+    def check_support(self) -> None:
+        from .kernels.quantize_fp4 import validate_shape
+
+        _, block, _ = self._format()
+        if self.dtype_in not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
+        if self.geom.d_head % (4 * block):
+            raise NotImplementedError(
+                f"{self.name}: d_head={self.geom.d_head} is not a multiple of 4*block = {4 * block}, so one head's scales are not whole F8_128x4 atoms"
+            )
+        validate_shape(self.geom.d_head, _QUANTIZE_FP4_THREADS, block)
+
+    def compile(self) -> None:
+        from .kernels.quantize_fp4 import compile_quantize_fp4
+
+        self._recipe = compile_quantize_fp4(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, fmt=self.fmt, threads_per_cta=_QUANTIZE_FP4_THREADS)
+
+    def rows(self) -> int:
+        return self.batch * self.seq_len
+
+    def code_bytes(self) -> int:
+        """Bytes of the packed e2m1 codes: ``T * H_q * D / 2``."""
+        return self.rows() * self.heads * self.geom.d_head // 2
+
+    def sf_bytes(self) -> int:
+        """Bytes of the padded F8_128x4 blob this stage writes == what the block-scale out projection binds."""
+        from .kernels.proj_gemm import sf_blob_bytes
+
+        _, block, _ = self._format()
+        return sf_blob_bytes(self.rows(), self.heads * self.geom.d_head, block)
+
+    def moved_bytes(self) -> int:
+        """HBM traffic of one launch: 2 B in, 1/2 B code + 1/block B SF out per element."""
+        from .kernels.quantize_fp4 import moved_bytes
+
+        _, block, _ = self._format()
+        return moved_bytes(self.rows(), self.heads, self.geom.d_head, block, src_elem_bytes=_itemsize(self.dtype_in))
+
+    def execute(self, src: torch.Tensor, dst4: torch.Tensor, sf: torch.Tensor, *, current_stream=None) -> None:
+        """``src`` compact ``[T, H_q, D]``; ``dst4`` uint8 / ``float4_e2m1fn_x2`` of ``code_bytes()``; ``sf`` uint8 of ``sf_bytes()``."""
+        from .kernels.quantize_fp4 import run_quantize_fp4
+
+        if self._recipe is None:
+            raise RuntimeError("call compile() before execute()")
+        stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
+        run_quantize_fp4(self._recipe, src, dst4, sf, stream=stream)
+
+
 class _FusedQkvProjection(_Stage):
     """(1)+(2)+(3) in ONE kernel: the QKV+GATE projection with per-head RMSNorm
     and partial RoPE applied to the Q and K tiles INSIDE the GEMM epilogue.
@@ -1465,6 +1813,7 @@ class _FusedQkvProjection(_Stage):
     _FORK_PATH_FP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "proj_gemm_norm_rope_fp8.py")
     _FORK_PATH_MXFP8 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "proj_gemm_norm_rope_mxfp8.py")
     _MXFP8_RUNNER = "run_fused_proj_gemm_mxfp8"
+    _WEIGHT_FP4_FIELD = "weight_fp4"  # the NormRopeFusionParams field the fork's e2m1-B arm will append (feature-detected)
 
     def __init__(
         self,
@@ -1522,6 +1871,13 @@ class _FusedQkvProjection(_Stage):
             if not self._fork_supports_field("quant_mxfp8"):
                 raise NotImplementedError(f"{self.name}: {self._mxfp8_fork_available()}")
             kw["quant_mxfp8"] = True
+            if self.quant.w_qkvg_fp4:
+                # An e2m1 B is its own rendering (Uint8 B SMEM, the B4X16_P64 form, half the
+                # expect-tx bytes); a fork without the field must never render an e4m3-B artifact
+                # for an fp4 weight, so the same only-when-set idiom guards the key too.
+                if not self._fork_supports_field(self._WEIGHT_FP4_FIELD):
+                    raise NotImplementedError(self._weight_fp4_unsupported_msg())
+                kw[self._WEIGHT_FP4_FIELD] = True
         if not g.qk_norm:
             # Same only-when-set idiom: norm-on keys are spelled identically to
             # today.  The field lands with the fork edits (PR-B slice S2); until
@@ -1567,6 +1923,13 @@ class _FusedQkvProjection(_Stage):
         if not os.path.exists(self._FORK_PATH_FP8):
             return f"{os.path.basename(self._FORK_PATH_FP8)} is not in kernels/"
         return None
+
+    def _weight_fp4_unsupported_msg(self) -> str:
+        return (
+            f"{self.name}: the fused MXFP8 projection fork is rendered for an e4m3 B; W_qkvg is torch.float4_e2m1fn_x2 "
+            f"(MxQuantSpec.w_qkvg_dtype) and NormRopeFusionParams has no `{self._WEIGHT_FP4_FIELD}` arm in this checkout. "
+            "Use the unfused pipeline (fuse_norm_rope=False, fuse_gate=False): its block-scale GEMM serves the mixed MXFP8 x MXFP4 row."
+        )
 
     @staticmethod
     def _fork_supports_field(field: str) -> bool:
@@ -1649,6 +2012,10 @@ class _FusedQkvProjection(_Stage):
         elif self.mxfp8:
             if self.dtype != torch.float8_e4m3fn:
                 raise NotImplementedError(f"{self.name}: the MXFP8 fork twin is rendered for e4m3 codes, got {self.dtype}")
+            if self.quant.w_qkvg_fp4 and not self._fork_supports_field(self._WEIGHT_FP4_FIELD):
+                # Config row 11: MXFP4 W_qkvg + fuse_norm_rope.  Feature-detected like
+                # `quant_mxfp8`, so this decline INVERTS the day the fork's e2m1-B arm lands.
+                raise NotImplementedError(self._weight_fp4_unsupported_msg())
             if self.k % MXFP8_BLOCK_SIZE:
                 raise NotImplementedError(f"{self.name}: MXFP8 needs K % {MXFP8_BLOCK_SIZE} == 0 (one E8M0 scale per block), got K={self.k}")
             if self.want_rstd:
@@ -2639,9 +3006,30 @@ class GatedAttentionBlockFwd(APIBase):
 
     and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, 3 launches):
     ``proj(+norm+rope+block-quant -> q8/k8/v8 + sf_q/k/v + gate16) -> sdpa(+gate, e4m3 O UNSCALED;
-    scale_o must be 1.0, D8) -> out_proj`` -- a typed decline while the MXFP8 GEMM fork twin
-    (``run_fused_proj_gemm_mxfp8``) has not landed.  Padding (``seq_lens_present``) is served under
+    scale_o must be 1.0, D8) -> out_proj`` (the ``run_fused_proj_gemm_mxfp8`` fork twin is
+    feature-detected; a checkout without it gets a typed decline).  Padding (``seq_lens_present``) is served under
     FP8 and MXFP8 like bf16: a dead entry (``seq_lens[b] == 0``) yields ``out[b] == 0`` exactly.
+
+    **MXFP4 W_qkvg** (``MxQuantSpec.w_qkvg_dtype = torch.float4_e2m1fn_x2``: e2m1 codes ``[N, d_model // 2]``,
+    two per byte, ``w_qkvg_sf`` unchanged): the SAME nine unfused stages with stage (1) on the mixed
+    MXFP8 x MXFP4 block-scale row::
+
+        (1)  proj          h8+sf_h, W4+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM, mixed row (fp8_e4m3 x fp4_e2m1, E8M0/32)
+
+    UNFUSED only -- ``fuse_norm_rope`` with an e2m1 ``W_qkvg`` is a typed decline (the fork twin is
+    rendered for an e4m3 B; feature-detected on ``NormRopeFusionParams.weight_fp4``).
+
+    **fp4 O** (``MxQuantSpec.o_fp4 = Fp4Format.NVFP4 | MXFP4`` + an e2m1 ``W_o`` ``[d_model, H_q*D // 2]``
+    with its F8_128x4 blob ``sample_w_o_sf`` / ``w_o_sf``): the per-tensor tail of BOTH MXFP8
+    configurations is replaced -- UNFUSED (still 9 launches)::
+
+        (5q') quantize_fp4_o  O bf16 -> o4 [T, H_q*D/2] e2m1 + sf_o (the GEMM's padded blob)   kernels/quantize_fp4.py
+        (6')  out_proj        o4, W_o4 -> out                        fp4 x fp4 block-scale FROST GEMM (scales dequant in-MMA, no alpha)
+
+    and FULLY FUSED (4 launches: the gated MXFP8 SDPA writes **bf16** O, then (5q') and (6')).
+    ``scale_o`` / ``descale_w_o`` are pinned to 1.0 (no global scale in either format); ``o8`` is not
+    reserved, ``o4`` / ``sf_o`` are appended at the end of the workspace arm.  Composes with the MXFP4
+    ``W_qkvg`` above on the unfused pipeline (the mixed GEMM at (1), the fp4 tail at (5q') / (6')).
 
     Stage (3b) exists only because stage (1) is the UNFORKED FROST GEMM, which
     writes one fused ``[T, N]``. Q and K are de-interleaved for FREE by (2+3),
@@ -2676,6 +3064,7 @@ class GatedAttentionBlockFwd(APIBase):
         quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,  # FP8 (E4M3) per-tensor static scales, or MXFP8 (MxQuantSpec); None = bf16/f16
         sample_h_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of h, proj_gemm.sf_blob_bytes(B*S, d_model) bytes (uint8 / e8m0)
         sample_w_qkvg_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of W_qkvg, sf_blob_bytes(n_qkvg, d_model) bytes
+        sample_w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's F8_128x4 blob, sf_blob_bytes(d_model, h_q*d_head, block)
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -2708,6 +3097,16 @@ class GatedAttentionBlockFwd(APIBase):
             quant.validate(fused=bool(fuse_gate) and bool(fuse_norm_rope))
         elif quant is not None:
             quant.validate()
+        # fp4 O (MxQuantSpec.o_fp4): the e2m1 W_o needs its scale blob, and a blob needs the mode -- both
+        # halves or neither, at declaration (the field lives on MxQuantSpec only, so a QuantSpec / bf16
+        # block can name the blob but never the mode: refused here, typed).
+        self.o_fp4: Optional[Fp4Format] = quant.o_fp4 if self.mxfp8 else None
+        if (self.o_fp4 is not None) != (sample_w_o_sf is not None):
+            raise ValueError(
+                "fp4 O needs both halves: MxQuantSpec.o_fp4 (Fp4Format.NVFP4 | MXFP4) AND sample_w_o_sf (the F8_128x4 scale blob of the e2m1 W_o, "
+                f"proj_gemm.sf_blob_bytes(d_model, h_q*d_head, block) bytes). Got o_fp4={self.o_fp4}, "
+                f"sample_w_o_sf={'tensor' if sample_w_o_sf is not None else 'None'}" + ("" if self.mxfp8 else " (only an MxQuantSpec carries o_fp4)") + "."
+            )
         # geometry.qk_norm vs the two weight slots, BOTH directions, at
         # declaration (again at every execute).  A None sample would otherwise
         # be swallowed by _make_tensor_desc and surface as an untyped
@@ -2807,6 +3206,8 @@ class GatedAttentionBlockFwd(APIBase):
             # MXFP8 only (None otherwise): the caller's F8_128x4 blobs, validated in check_support.
             "h_sf": self._make_tensor_desc(sample_h_sf, name="h_sf"),
             "w_qkvg_sf": self._make_tensor_desc(sample_w_qkvg_sf, name="w_qkvg_sf"),
+            # fp4 O only (None otherwise): the e2m1 W_o's F8_128x4 blob, validated in check_support.
+            "w_o_sf": self._make_tensor_desc(sample_w_o_sf, name="w_o_sf"),
         }
 
         fp8 = quant is not None  # fp8-CLASS pipeline (per-tensor FP8 or MXFP8): e4m3 h / weights, bf16 activations
@@ -2835,8 +3236,17 @@ class GatedAttentionBlockFwd(APIBase):
         else:
             # FP8: e4m3 x e4m3 -> fp32 -> * (descale_h * descale_w_qkvg) -> bf16 slab.
             # MXFP8: e4m3 x e4m3 with the E8M0 block scales dequantized IN the MMA -> bf16 slab (no alpha).
+            # MXFP8 with an e2m1 W_qkvg (MxQuantSpec.w_qkvg_dtype): the same GEMM on the catalog's
+            # MIXED row (e4m3 h x e2m1 W, E8M0 / 32) -- same stage list, same workspace (config row 7).
             self._proj = _qkv_gate_projection(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8 and not mxfp8, block_scale=mxfp8
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                out_dtype=act,
+                alpha=fp8 and not mxfp8,
+                block_scale=mxfp8,
+                w_dtype=quant.w_qkvg_dtype if mxfp8 else None,
             )
             self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd)
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
@@ -2870,7 +3280,10 @@ class GatedAttentionBlockFwd(APIBase):
             # GATE is the compact bf16 gate16, O comes out e4m3 (o8).  The gated
             # FP8 / MXFP8 SDPA specialization (epilogue_gate) is compiled at
             # compact strides.
-            sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = 0, geometry.h_q * geometry.d_head, torch.float8_e4m3fn
+            # fp4 O (row 10): the gated MXFP8 SDPA writes bf16 O (the adapter serves a bf16 O for fp8-class input --
+            # no SDPA row changes) and the quantize_fp4 stage turns it into the fp4 out_proj's A operand.
+            sdpa_token_stride, sdpa_gate_token_stride = 0, geometry.h_q * geometry.d_head
+            sdpa_o_dtype = torch.float8_e4m3fn if self.o_fp4 is None else act
         else:
             # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
             # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
@@ -2897,13 +3310,35 @@ class GatedAttentionBlockFwd(APIBase):
         # projection (same [T, H_q, D] shape as Q, so the Q recipe serves it).
         # UNFUSED MXFP8: an EXPLICIT per-tensor recipe (D1) -- never the rowwise
         # MX recipe, whose SF blob nothing downstream would read.
-        if quantize and mxfp8:
-            self._quant_o = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_o")
+        # (5q') fp4 O (MXFP8, unfused OR fused): ONE block-quantize launch (bf16 gated O -> e2m1 codes + the
+        # out_proj GEMM's padded F8_128x4 blob) replaces the per-tensor quantize_o; the out projection becomes
+        # the fp4 x fp4 block-scale GEMM (no alpha: both sides dequantize through their blobs in the MMA).
+        quant_o_distinct = mxfp8 and (quantize or self.o_fp4 is not None)
+        if self.o_fp4 is not None:
+            self._quant_o = _QuantizeFp4(
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, fmt=self.o_fp4, name="quantize_fp4_o"
+            )
+            self._out_proj = _out_projection(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=_FP4_X2,
+                out_dtype=act,
+                alpha=False,
+                block_scale=True,
+                w_dtype=_FP4_X2,
+                block_size=self.o_fp4.block_size,
+                sf_dtype=self.o_fp4.sf_cudnn_dtype,
+            )
         else:
-            self._quant_o = self._quant_q
-        self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
+            if quantize and mxfp8:
+                self._quant_o = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_o")
+            else:
+                self._quant_o = self._quant_q
+            self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
-        # DISTINCT stage (MXFP8); under FP8 it aliases `_quant_q`, listed once.
+        # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
+        # FP8 it aliases `_quant_q`, listed once.
         self._stages = tuple(
             st
             for st in (
@@ -2916,7 +3351,7 @@ class GatedAttentionBlockFwd(APIBase):
                 self._quant_v,
                 self._sdpa,
                 self._gate,
-                self._quant_o if (quantize and mxfp8) else None,
+                self._quant_o if quant_o_distinct else None,
                 self._out_proj,
             )
             if st is not None
@@ -2933,12 +3368,76 @@ class GatedAttentionBlockFwd(APIBase):
         (Rule 2). A ``ValueError`` escaping a stage's own config builder after
         this returned True is a bug HERE, not user error.
         """
+        self._check_declaration()
+        for st in self._stages:
+            st.check_support()
+        self._is_supported = True
+        return True
+
+    def _expected_weight_dtypes(self) -> dict:
+        """``{"w_qkvg": dtype, "w_o": dtype}`` -- what each weight descriptor must carry.  ``h``'s dtype
+        (bf16 / f16, or e4m3 under a QuantSpec / MxQuantSpec) unless the spec names a packed e2m1 weight:
+        ``MxQuantSpec.w_qkvg_dtype`` for ``w_qkvg`` (the mixed block-scale row).  ONE place for the
+        per-weight contract, so a further fp4 weight is one more entry here, not a second loop."""
+        w_qkvg = self.quant.w_qkvg_dtype if self.mxfp8 else self.dtype
+        w_o = _FP4_X2 if self.o_fp4 is not None else self.dtype
+        return {"w_qkvg": w_qkvg, "w_o": w_o}
+
+    @staticmethod
+    def _fp4_storage_shape(desc: TensorDesc) -> Tuple[int, ...]:
+        """The STORAGE shape of a ``float4_e2m1fn_x2`` descriptor.  ``_make_tensor_desc`` reports the LOGICAL
+        shape of a packed-fp4 tensor (the innermost, stride-1 extent DOUBLED -- pinned by
+        ``test_make_tensor_desc_reports_the_logical_k_of_an_fp4x2_tensor``); this halves that one axis back,
+        so the caller-facing check speaks the shape the caller allocated (``[N, K // 2]``)."""
+        inner = desc.stride_order[0]  # ascending stride: [0] is the stride-1 axis the descriptor doubled
+        return tuple(int(n) // 2 if i == inner else int(n) for i, n in enumerate(desc.shape))
+
+    def _check_weight(self, nm: str, rows: int, k: int, expect: torch.dtype) -> None:
+        """One weight, dtype THEN shape, typed.  A packed e2m1 weight is checked against its STORAGE shape
+        ``(rows, k // 2)``; every other dtype against ``(rows, k)`` exactly as before."""
+        d = self._descs[nm]
+        fp4_expected = _FP4_X2 is not None and expect == _FP4_X2
+        if not fp4_expected:
+            self._check_tensor_shape(d, (rows, k), nm)
+            if d.dtype == _FP4_X2:
+                need = (
+                    "declare it with MxQuantSpec(w_qkvg_dtype=torch.float4_e2m1fn_x2)"
+                    if nm == "w_qkvg"
+                    else "an e2m1 w_o is the block's fp4 O output mode: declare it with MxQuantSpec(o_fp4=Fp4Format.NVFP4 | MXFP4) plus sample_w_o_sf"
+                )
+                raise ValueError(
+                    f"{nm} is torch.float4_e2m1fn_x2 but this block expects {expect}: a packed e2m1 {nm} rides the block-scale "
+                    f"MXFP8 pipeline only -- {need}; a QuantSpec / bf16 block has no GEMM row for it"
+                )
+            if d.dtype != expect:
+                raise ValueError(f"{nm} must have h's dtype {expect}, got {d.dtype}")
+            return
+        if d.dtype != _FP4_X2:
+            hint = (
+                " -- torch 2.13 can VIEW but not cast to fp4: hand over the packed codes as storage.view(torch.float4_e2m1fn_x2), not uint8"
+                if d.dtype == torch.uint8
+                else ""
+            )
+            field = "MxQuantSpec.w_qkvg_dtype" if nm == "w_qkvg" else "MxQuantSpec.o_fp4"
+            raise ValueError(f"{nm} must be torch.float4_e2m1fn_x2 ({field} names an e2m1 {nm}), got {d.dtype}{hint}")
+        storage = self._fp4_storage_shape(d)
+        if storage != (rows, k // 2):
+            raise ValueError(
+                f"{nm} is fp4 storage {storage} (logical {tuple(int(x) for x in d.shape)}); a packed e2m1 {nm} is [{rows}, {k} // 2 = {k // 2}] "
+                f"-- two codes per byte along K, LOW nibble = even k.  A LOGICAL [{rows}, {k}] fp4 tensor holds twice the data the GEMM declares."
+            )
+
+    def _check_declaration(self) -> None:
+        """Everything ``check_support`` verifies BEFORE asking the stages (geometry, every descriptor's shape
+        and dtype, the MXFP8 blob contract) -- device-agnostic, so a test can pin the caller contract on
+        any GPU while the stages' own ``check_support`` still gates the arch."""
         self.geom.validate()
         if self.save_for_backward and not self.return_lse:
             raise ValueError("save_for_backward requires the LSE: the SDPA backward cannot run without it")
         g = self.geom
-        self._check_tensor_shape(self._descs["w_qkvg"], (g.n_qkvg, g.d_model), "w_qkvg")
-        self._check_tensor_shape(self._descs["w_o"], (g.d_model, g.h_q * g.d_head), "w_o")
+        want = self._expected_weight_dtypes()
+        self._check_weight("w_qkvg", g.n_qkvg, g.d_model, want["w_qkvg"])
+        self._check_weight("w_o", g.d_model, g.h_q * g.d_head, want["w_o"])
         # Under qk_norm=False the two norm-weight descriptors are None (the
         # constructor checked both directions), so they are skipped here: the
         # shape check would pass silently and the dtype loop would raise an
@@ -2949,20 +3448,14 @@ class GatedAttentionBlockFwd(APIBase):
         for nm in ("cos", "sin"):
             self._check_tensor_shape(self._descs[nm], (self.batch, self.seq_len, g.rope_dim), nm)
         self._check_tensor_shape(self._descs["out"], (self.batch, self.seq_len, g.d_model), "out")
-        # dtype contract: bf16/f16 everywhere, or (FP8) e4m3 h + weights with
-        # every activation-side tensor in the bf16 activation dtype.
-        for nm in ("w_qkvg", "w_o"):
-            if self._descs[nm].dtype != self.dtype:
-                raise ValueError(f"{nm} must have h's dtype {self.dtype}, got {self._descs[nm].dtype}")
+        # dtype contract: bf16/f16 everywhere, or (FP8 / MXFP8) e4m3 h + weights (an e2m1 W_qkvg
+        # under MxQuantSpec.w_qkvg_dtype -- checked per weight above) with every activation-side
+        # tensor in the bf16 activation dtype.
         for nm in norm_names + ("cos", "sin", "out"):
             if self._descs[nm].dtype != self.act_dtype:
                 raise ValueError(f"{nm} must be the activation dtype {self.act_dtype}, got {self._descs[nm].dtype}")
         if self.mxfp8:
             self._check_mxfp8_declaration()
-        for st in self._stages:
-            st.check_support()
-        self._is_supported = True
-        return True
 
     def _check_mxfp8_declaration(self) -> None:
         """The MXFP8 caller contract, typed, before any stage: whole SF atoms along
@@ -2982,18 +3475,32 @@ class GatedAttentionBlockFwd(APIBase):
                 f"{MXFP8_BLOCK_SIZE}); got d_model={g.d_model}. Use the per-tensor FP8 or bf16 pipeline for this width."
             )
         t = self.batch * self.seq_len
-        for nm, rows in (("h_sf", t), ("w_qkvg_sf", g.n_qkvg)):
+        # (name, rows, K, block, accepted storage dtypes) of every caller blob: the two MXFP8 ones (E8M0 / 32),
+        # plus the e2m1 W_o's under o_fp4 (the format's own scale dtype and block; K = the out_proj's H_q*D).
+        blobs = [("h_sf", t, g.d_model, MXFP8_BLOCK_SIZE, _SF_DTYPES), ("w_qkvg_sf", g.n_qkvg, g.d_model, MXFP8_BLOCK_SIZE, _SF_DTYPES)]
+        if self.o_fp4 is not None:
+            block = self.o_fp4.block_size
+            if g.d_head % (4 * block):
+                # One head's scales must be whole 4-block F8_128x4 words, so the per-head quantize CTA owns whole
+                # atoms of the out_proj blob and no two heads share a byte (d=256 passes both formats).
+                raise NotImplementedError(
+                    f"fp4 O ({self.o_fp4.name}) needs geometry.d_head % {4 * block} == 0 (whole 4-block scale words per head at block {block}); "
+                    f"got d_head={g.d_head}. Use the per-tensor e4m3 O (o_fp4=None) for this head dim."
+                )
+            blobs.append(("w_o_sf", g.d_model, g.h_q * g.d_head, block, (torch.uint8, self.o_fp4.sf_torch_dtype)))
+        for nm, rows, k, block, dtypes in blobs:
             d = self._descs[nm]
-            if d.dtype not in _SF_DTYPES:
-                raise ValueError(f"sample_{nm} must be uint8 or torch.float8_e8m0fnu (E8M0 bytes in F8_128x4 order), got {d.dtype}")
+            if d.dtype not in dtypes:
+                want = " or ".join(str(x) for x in dtypes)
+                raise ValueError(f"sample_{nm} must be {want} (scale bytes in F8_128x4 order), got {d.dtype}")
             numel = 1
             for x in d.shape:
                 numel *= int(x)
-            need = sf_blob_bytes(rows, g.d_model)
+            need = sf_blob_bytes(rows, k, block)
             if numel != need:
                 raise ValueError(
-                    f"sample_{nm} has {numel} bytes; the PADDED F8_128x4 blob over {rows} rows x K={g.d_model} is {need} "
-                    f"(ceil(rows/128)*128 x ceil(K/32/4)*4 -- kernels.proj_gemm.sf_blob_bytes; pad rows / blocks 0x00)"
+                    f"sample_{nm} has {numel} bytes; the PADDED F8_128x4 blob over {rows} rows x K={k} at block {block} is {need} "
+                    f"(ceil(rows/128)*128 x ceil(K/{block}/4)*4 -- kernels.proj_gemm.sf_blob_bytes; pad rows / blocks 0x00)"
                 )
             # Contiguity from the descriptor strides (an opaque blob bound by storage order).
             expect, ok = 1, True
@@ -3018,6 +3525,7 @@ class GatedAttentionBlockFwd(APIBase):
             fp8=self.quant is not None,
             fp8_fused=self.quant_fused,
             mxfp8=self.mxfp8,
+            o_fp4=self.o_fp4,
         )
 
     def get_workspace_size(self) -> int:
@@ -3041,15 +3549,24 @@ class GatedAttentionBlockFwd(APIBase):
         for st in self._stages:
             st.compile()
         self._ws = self._layout()
+        self._quant_dev = self._make_quant_dev()
+
+    def _make_quant_dev(self) -> Optional[dict]:
+        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants, contract § 10;
+        the execute path never allocates).  ``None`` for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o``
+        nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has no alpha epilogue and the fp4
+        quantizer takes no scale)."""
+        if self.o_fp4 is not None:
+            return {}
         if self.mxfp8:
             # MXFP8: only the out projection's per-tensor pair survives (D1) --
             # `alpha_o` for the GEMM epilogue, `scale_o` for the unfused quantize_o.
             q = self.quant
-            self._quant_dev = dict(
+            return dict(
                 alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device=self.device),
                 scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device=self.device),
             )
-        elif self.quant is not None:
+        if self.quant is not None:
             # Plan-time constants (contract § 10 allows compile-time buffers; the
             # execute path never allocates): one fp32 device scalar per scale.
             q = self.quant
@@ -3057,7 +3574,7 @@ class GatedAttentionBlockFwd(APIBase):
             def _dev(v: float) -> torch.Tensor:
                 return torch.full((1,), float(v), dtype=torch.float32, device=self.device)
 
-            self._quant_dev = dict(
+            return dict(
                 alpha_qkvg=_dev(q.alpha_qkvg),
                 alpha_o=_dev(q.alpha_o),
                 scale_q=_dev(q.scale_q),
@@ -3068,6 +3585,7 @@ class GatedAttentionBlockFwd(APIBase):
                 descale_k=_dev(1.0 / q.scale_k),
                 descale_v=_dev(1.0 / q.scale_v),
             )
+        return None
 
     # -- execute ------------------------------------------------------------
 
@@ -3088,6 +3606,7 @@ class GatedAttentionBlockFwd(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         h_sf: Optional[torch.Tensor] = None,  # MXFP8 only (both REQUIRED): the F8_128x4 E8M0 blobs of h and W_qkvg (sample_* byte counts)
         w_qkvg_sf: Optional[torch.Tensor] = None,
+        w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (REQUIRED there): the F8_128x4 blob of the e2m1 W_o (sample_w_o_sf's byte count)
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -3100,7 +3619,8 @@ class GatedAttentionBlockFwd(APIBase):
 
         ``h_sf`` / ``w_qkvg_sf`` (appended): REQUIRED under MXFP8 (both, checked
         for dtype / byte count / contiguity / 16-B alignment, typed), REFUSED
-        otherwise.
+        otherwise.  ``w_o_sf`` (appended): REQUIRED under ``MxQuantSpec.o_fp4``
+        (same checks at the format's block and scale dtype), REFUSED otherwise.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
@@ -3115,6 +3635,24 @@ class GatedAttentionBlockFwd(APIBase):
                     raise ValueError(f"{nm} must live on h's device {h.device}, got {sf.device}")
         elif h_sf is not None or w_qkvg_sf is not None:
             raise ValueError("h_sf / w_qkvg_sf are the MXFP8 scale-factor blobs; this block was declared without an MxQuantSpec")
+        if self.o_fp4 is not None:
+            if w_o_sf is None:
+                raise ValueError(
+                    f"fp4 O ({self.o_fp4.name}) execute needs w_o_sf (the F8_128x4 scale blob of the e2m1 W_o, over d_model rows x K=h_q*d_head); "
+                    "no silent unit scale"
+                )
+            _check_sf_blob(
+                w_o_sf,
+                "w_o_sf",
+                self.geom.d_model,
+                self.geom.h_q * self.geom.d_head,
+                block=self.o_fp4.block_size,
+                sf_dtypes=(torch.uint8, self.o_fp4.sf_torch_dtype),
+            )
+            if w_o_sf.device != h.device:
+                raise ValueError(f"w_o_sf must live on h's device {h.device}, got {w_o_sf.device}")
+        elif w_o_sf is not None:
+            raise ValueError("w_o_sf is the e2m1 W_o's scale blob of the fp4 O mode; this block was declared without MxQuantSpec.o_fp4")
         g = self.geom
         t = self.batch * self.seq_len
         # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
@@ -3140,7 +3678,7 @@ class GatedAttentionBlockFwd(APIBase):
             self._execute_fp8_fused(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
             return
         if self.mxfp8_fused:
-            self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
+            self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=w_o_sf)
             return
         proj = _view(workspace, ws.proj, (t, g.n_qkvg), act)
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
@@ -3159,8 +3697,11 @@ class GatedAttentionBlockFwd(APIBase):
             q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
             k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
             v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
-            o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4)
+            o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if ws.o8 >= 0 else None  # not reserved under o_fp4
             qd = self._quant_dev
+        o4 = sfo = None
+        if self.o_fp4 is not None:
+            o4, sfo = self._fp4_o_views(workspace, ws, t)
         if mxfp8:
             # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages.
             sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(self.batch, g.h_q, self.seq_len, g.d_head),), torch.uint8)
@@ -3269,7 +3810,12 @@ class GatedAttentionBlockFwd(APIBase):
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
             # O := 0 on dead rows, so no residue reaches the sigmoid.
             self._gate.execute(o, gate_src, o, current_stream=stream)
-        if fp8:
+        if self.o_fp4 is not None:
+            # (5q') bf16 gated O -> e2m1 codes + the out_proj GEMM's F8_128x4 blob (block scales, no per-tensor
+            # scale); (6') fp4 x fp4 block-scale out projection, both blobs dequantized IN the MMA (no alpha).
+            self._quant_o.execute(o, o4, sfo, current_stream=stream)
+            self._out_proj.execute(o4, w_o, out.view(t, g.d_model), engine_ws, sf_a=sfo, sf_w=w_o_sf, stream=stream)
+        elif fp8:
             # (5q) bf16 gated O -> e4m3 for the FP8 out projection (PER-TENSOR
             # scale_o under both families, D1); (6) folds (1/scale_o) *
             # descale_w_o into its epilogue.
@@ -3278,6 +3824,18 @@ class GatedAttentionBlockFwd(APIBase):
         else:
             # (6)
             self._out_proj.execute(o.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+
+    def _fp4_o_views(self, workspace: torch.Tensor, ws: "_Intermediates", t: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The two fp4-O workspace views: ``o4`` -- the packed e2m1 gated O as ``float4_e2m1fn_x2 [T, H_q*D/2]``
+        (a re-view of the uint8 bytes, no copy; what ``run_proj_gemm`` binds as the fp4 A operand) -- and ``sfo``, the
+        flat uint8 blob of ``proj_gemm.sf_blob_bytes(T, H_q*D, block)`` bytes the quantize stage writes and the
+        block-scale GEMM reads."""
+        from .kernels.proj_gemm import sf_blob_bytes
+
+        g = self.geom
+        o4 = _view(workspace, ws.o4, (t, g.h_q * g.d_head // 2), torch.uint8).view(_FP4_X2)
+        sfo = _view(workspace, ws.sf_o, (sf_blob_bytes(t, g.h_q * g.d_head, self.o_fp4.block_size),), torch.uint8)
+        return o4, sfo
 
     def _execute_fp8_fused(self, h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream) -> None:
         """The FULLY FUSED FP8 pipeline: three launches, three workspace buffers.
@@ -3345,7 +3903,7 @@ class GatedAttentionBlockFwd(APIBase):
         # (6): e4m3 O_gated @ W_o^T with (1/scale_o) * descale_w_o in the epilogue.
         self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
 
-    def _execute_mxfp8_fused(self, h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream) -> None:
+    def _execute_mxfp8_fused(self, h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=None) -> None:
         """The FULLY FUSED MXFP8 pipeline: three launches, eight workspace slots.
 
         ::
@@ -3361,6 +3919,10 @@ class GatedAttentionBlockFwd(APIBase):
         the unfused pipeline's quantize stages would have written.  No scalar
         rides into the SDPA (``_Sdpa`` refuses ``descale_*`` / ``scale_o`` under
         MXFP8); ``MxQuantSpec.scale_o == 1.0`` was pinned at declaration (D8).
+
+        ``w_o_sf`` (appended) -- fp4 O (config row 10, FOUR launches): the gated SDPA writes **bf16** ``o``
+        (``o8`` is not reserved), ``quantize_fp4_o`` turns it into ``o4`` + ``sf_o``, and the out projection
+        is the fp4 x fp4 block-scale GEMM over ``sf_o`` / ``w_o_sf`` (no alpha).
         """
         g = self.geom
         b, s = self.batch, self.seq_len
@@ -3372,7 +3934,8 @@ class GatedAttentionBlockFwd(APIBase):
         k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
         v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
         gate16 = _view(workspace, ws.gate16, (t, g.h_q, g.d_head), self.act_dtype)
-        o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4)
+        # e4m3 O for the per-tensor out_proj, or (o_fp4) bf16 O for the quantize_fp4 stage -- one slot exists, never both.
+        o_sdpa = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if self.o_fp4 is None else _view(workspace, ws.o, (t, g.h_q, g.d_head), self.act_dtype)
         sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(b, g.h_q, s, g.d_head),), torch.uint8)
         sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
         sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
@@ -3396,23 +3959,30 @@ class GatedAttentionBlockFwd(APIBase):
             sin,
             stream=stream,
         )
-        # (4''): e4m3 in (+ block scales), e4m3 out UNSCALED; the SDPA gates the
+        # (4''): e4m3 in (+ block scales), e4m3 out UNSCALED (or bf16 out under o_fp4); the SDPA gates the
         # SUBSTITUTED O (after the dead-row select, per element) and casts once.
         self._sdpa.execute(
             q8.view(b, s, g.h_q, g.d_head),
             k8.view(b, s, g.h_kv, g.d_head),
             v8.view(b, s, g.h_kv, g.d_head),
-            o8.view(b, s, g.h_q, g.d_head),
+            o_sdpa.view(b, s, g.h_q, g.d_head),
             lse=lse,
             seq_lens=seq_lens,
             workspace=engine_ws,
+            current_stream=cuda.CUstream(stream),
             gate=gate16.view(b, s, g.h_q, g.d_head),
             sf_q=sfq,
             sf_k=sfk,
             sf_v=sfv,
         )
-        # (6): e4m3 O_gated @ W_o^T with descale_w_o (scale_o == 1.0) in the epilogue.
-        self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
+        if self.o_fp4 is not None:
+            # (5q') bf16 O_gated -> e2m1 codes + the out_proj blob; (6') fp4 x fp4 block-scale out projection (no alpha).
+            o4, sfo = self._fp4_o_views(workspace, ws, t)
+            self._quant_o.execute(o_sdpa, o4, sfo, current_stream=stream)
+            self._out_proj.execute(o4, w_o, out.view(t, g.d_model), engine_ws, sf_a=sfo, sf_w=w_o_sf, stream=stream)
+        else:
+            # (6): e4m3 O_gated @ W_o^T with descale_w_o (scale_o == 1.0) in the epilogue.
+            self._out_proj.execute(o_sdpa.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
 
 
 # ---------------------------------------------------------------------------

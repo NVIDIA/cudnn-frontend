@@ -40,9 +40,16 @@ environments that force an older DSL.
 
 ## Forward
 
+The `cudnn.torch` BSA functions are lazy aliases of the existing `cudnn` and
+`cudnn.BSA` functions, with identical signatures, outputs, and supported configurations.
+
 ```python
 import torch
-from cudnn import BSA
+from cudnn.torch import (
+    block_sparse_attention_forward,
+    block_sparse_attention_backward,
+    block_sparse_attention_fp8_forward,
+)
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 2048, 128, device="cuda", dtype=torch.bfloat16)
@@ -54,7 +61,7 @@ q2k_block_index = torch.arange(4, device="cuda", dtype=torch.int32)
 q2k_block_index = q2k_block_index.view(1, 1, 1, 4).expand(1, 8, 16, 4).contiguous()
 block_sizes = torch.full((32,), 64, device="cuda", dtype=torch.int32)
 
-result = BSA.block_sparse_attention_forward(
+result = block_sparse_attention_forward(
     q,
     k,
     v,
@@ -121,7 +128,7 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM103. On SM120, passing `sparse_block_size=128` selects a native
+SM100/SM103. On SM90 or SM120, passing `sparse_block_size=128` selects a native
 KV128 kernel that consumes blk128 metadata directly; it does not
 expand the metadata or invoke the blk64 kernel. Passing `sparse_block_size=64`
 explicitly selects the SM100/SM103 blk64 CuTe DSL path, whose shape support is
@@ -160,7 +167,7 @@ BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
 internally:
 
 ```python
-fp8_result = BSA.block_sparse_attention_fp8_forward(
+fp8_result = block_sparse_attention_fp8_forward(
     q,
     k,
     v,
@@ -203,7 +210,7 @@ operation. It recomputes probabilities from the forward output and LSE:
 
 ```python
 dout = torch.randn_like(o)
-grads = BSA.block_sparse_attention_backward(
+grads = block_sparse_attention_backward(
     dout,
     q,
     k,
@@ -235,7 +242,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 
 | Architecture | Sparse block | Public input / kernel dtype | QK / V dimensions | Attention |
 | --- | ---: | --- | --- | --- |
-| SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
+| SM90 | 64 or 128 (explicit) | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
 | SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
 | SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
@@ -243,25 +250,42 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
-SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
+SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
+positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be
 any positive value. The SM100/SM103 blk128 fixed count must be even and at
 least two; SM120 and the explicit Blackwell blk64 path accept any positive
 fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
 defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
-produce `O = 0` and `LSE = -inf`. SM90 selects the empty-row handling as a
+produce `O = 0` and `LSE = -inf`. SM90 blk64 selects the empty-row handling as a
 compile-time specialization, so the default non-empty configuration keeps its
-branch-free fast path. Split-KV execution therefore excludes empty rows.
+branch-free fast path. Its split-KV execution excludes empty rows. Native SM90
+blk128 supports empty rows and empty splits with `kv_splits=1..256`.
 
 ### Backward
 
 | Architecture | Sparse block | Dtype | Head dimension | Attention |
 | --- | ---: | --- | ---: | --- |
-| SM90 | 64 | BF16 | 128 | MHA |
+| SM90 | 64 or 128 (explicit) | BF16 | 128 | MHA |
 | SM100/SM103 | 64 | BF16 | 128 | MHA |
 | SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
 
 Backward is not implemented for SM120. It requires equal QK/V dimensions and
 does not currently support GQA/MQA.
+
+SM90 native blk128 requires CuTe DSL >= 4.6.2. Q/K/V, O/dO and gradient
+buffers must have a contiguous head dimension, 16-byte aligned base pointers,
+and row strides divisible by 16 bytes. BHSD/BSHD layouts and aligned noncompact
+rows are addressed directly. Sparse metadata can be strided and remains on the
+GPU; backward makes noncontiguous sparse indices and counts contiguous before
+building CSR, as in blk64. Forward supports `block_sizes` of rank 1, 2, or 3; backward supports ranks
+1 and 2. Both paths predicate sequence tails even without `block_sizes`.
+Forward uses Q128 tiles and shares each KV128 load across two compute
+warpgroups. Backward uses Q64xKV128 CTAs: both compute warpgroups execute all
+five GEMMs, splitting KV rows for QK/dP/dK/dV and head dimensions for dQ.
+Each native Q128/KV128 CSR edge streams two Q64 subtiles without expanding
+the metadata. Backward accumulates gradients with FP32 atomics
+and is not deterministic. Benchmark the explicit path for your shapes; blk64
+remains the default, and native blk128 is not faster for every workload.
 
 ## Limitations
 
@@ -276,8 +300,8 @@ BSHD layout, including split-KV execution; FP8 output is contiguous BF16 BHSD.
 Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
 
-The current public surface consists of allocating function wrappers under
-`cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
+The Torch public surface consists of allocating function wrappers under
+`cudnn.torch`, also available under `cudnn` and `cudnn.BSA`; there is no separate `APIBase` class or explicit `compile()`
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
@@ -290,11 +314,21 @@ We would like to express our gratitude to [huangyitong.hyt@alibaba-inc.com](mail
 throughout the deployment process, which has continuously advanced the BSA kernel
 toward Speed of Light.
 
-## Experimental JAX API
+## Experimental JAX support
 
-The JAX draft reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
+`cudnn.jax.block_sparse_attention_forward` and
+`cudnn.jax.block_sparse_attention_backward` provide explicit forward/backward;
+`cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
+The existing `cudnn` and `BSA` Torch APIs are unchanged. The former `_jax`
+exports have been removed without compatibility aliases.
+
+The JAX implementation reuses the SM100 blk128 forward, bucketed CSR, backward preprocess,
 backward, and gradient conversion kernels. Install `jax[cuda13]` alongside the
 frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
+
+The JAX signatures omit Torch-specific launch options and caller-provided
+output buffers. XLA owns the outputs and workspaces.
 
 ### Initial contract
 
@@ -306,7 +340,7 @@ frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch par
 | Layout | Compact BHSD or BSHD, independently specialized |
 | Sparsity | 128-token blocks, int32 indices `[B,H,Sq/128,C]`, no `block_sizes` |
 | Counts | Fixed even `block_sparse_num` in `[2,C]`, or runtime int32 `q2k_block_nums[B,H,Sq/128]` |
-| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention_jax` |
+| Differentiation | First-order reverse-mode Q/K/V gradients through `block_sparse_attention` |
 
 Variable counts must be in `[1,C]`, or `[0,C]` with
 `allow_empty_block_nums=True`. Only each row's active prefix is read. Active
@@ -328,10 +362,10 @@ runtime operands. Do not mutate saved forward inputs or metadata before backward
 import jax
 import jax.numpy as jnp
 from functools import partial
-from cudnn import (
-    block_sparse_attention_forward_jax as forward,
-    block_sparse_attention_backward_jax as backward,
-    block_sparse_attention_jax as attention,
+from cudnn.jax import (
+    block_sparse_attention_forward as forward,
+    block_sparse_attention_backward as backward,
+    block_sparse_attention as attention,
 )
 
 q = jnp.ones((1, 2, 256, 64), dtype=jnp.bfloat16)

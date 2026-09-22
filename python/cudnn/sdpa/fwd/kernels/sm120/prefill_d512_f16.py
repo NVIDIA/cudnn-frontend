@@ -1855,6 +1855,10 @@ class SM120FusedMultiHeadAttentionForward:
         :param thd_kv_lens: THD only: same for the KV side.
         :param thd_lens_form: THD only: runtime bitmask — bit 0: Q is cu,
             bit 1: KV is cu.
+        :param thd_n_ctas: Persistent CTA count. THD: the flat machine-sized
+            grid that claims live units. Dense: caps the flat unit grid so each
+            CTA walks several units and prefetches the next Q tile; 0 = one CTA
+            per unit.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]

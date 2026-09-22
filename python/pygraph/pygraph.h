@@ -113,8 +113,41 @@ class PyGraph {
     }
 
     ~PyGraph() {
-        if (is_handle_owner) {
-            detail::destroy_handle(handle);
+        // Python cyclic GC can reclaim an unrelated graph during CUDA graph
+        // capture. Its resource release must not invalidate that capture. The
+        // mode is thread-local; restore it even if backend cleanup throws.
+        struct CaptureModeGuard {
+            CUstreamCaptureMode previous = CU_STREAM_CAPTURE_MODE_RELAXED;
+            bool exchanged               = detail::cu_thread_exchange_stream_capture_mode(&previous) == CUDA_SUCCESS;
+
+            ~CaptureModeGuard() noexcept {
+                if (exchanged) {
+                    try {
+                        auto status = detail::cu_thread_exchange_stream_capture_mode(&previous);
+                        if (status != CUDA_SUCCESS) {
+                            CUDNN_FE_LOG_LABEL_ENDL("PyGraph capture-mode restoration failed: " << status);
+                        }
+                    } catch (...) {
+                        // Dynamic CUDA loading may already be unavailable at
+                        // interpreter teardown; never throw from a finalizer.
+                    }
+                }
+            }
+        };
+        try {
+            CaptureModeGuard guard;
+            // Members normally die after the destructor body, outside guard.
+            // Release the backend graph and its allocations while it is live.
+            graph.reset();
+            device_properties.reset();
+            if (is_handle_owner) {
+                auto status = detail::destroy_handle(handle);
+                if (status != CUDNN_STATUS_SUCCESS) {
+                    CUDNN_FE_LOG_LABEL_ENDL("PyGraph handle cleanup failed: " << status);
+                }
+            }
+        } catch (std::exception const& exc) {
+            CUDNN_FE_LOG_LABEL_ENDL("PyGraph cleanup failed: " << exc.what());
         }
     }
 
