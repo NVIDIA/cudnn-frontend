@@ -41,6 +41,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
+- [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)

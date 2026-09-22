@@ -35,6 +35,13 @@ def advance(state, stages):
 
 
 @cute.jit
+def wait_try(mb, phase):
+    """Untimed ``mbarrier.try_wait.parity`` loop through the DSL wrapper (no suspend hint, no inline PTX)."""
+    while not nvvm.mbarrier_wait_parity(mb, phase, nvvm.MBarrierWait.TRY):
+        pass
+
+
+@cute.jit
 def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
     """Spin on ``mb`` until its phase parity differs from ``phase``.
 
@@ -198,6 +205,8 @@ class MBarrier:
     init_count: cutlass.Constexpr[object]
     producer: cutlass.Constexpr[int] = int(Producer.THREAD)
     scope: cutlass.Constexpr[int] = int(Scope.LOCAL)
+    try_wait: cutlass.Constexpr[bool] = False
+    spin: cutlass.Constexpr[bool] = False
     stage_idx: object = 0
 
     def __getitem__(self, i):
@@ -221,8 +230,14 @@ class MBarrier:
         nvvm.mbarrier_init(self.smem_ptr, count)
 
     def wait(self, phase, spin: bool = False):
-        # spin=True opts THIS call site into the hint-less uniform spin (see wait()); the default is the sleeping form.
-        wait(self.smem_ptr, phase, spin=spin)
+        # spin=True opts THIS call site into the hint-less uniform spin (see wait()); a barrier declared with spin=True opts
+        # every wait on it in; the default is the sleeping form.  A barrier declared with try_wait=True waits through the
+        # DSL wrapper's untimed try_wait loop instead (the linear attention kernels: one SYNCS.PHASECHK + branch on sm100,
+        # no inline PTX, so their cubins are unchanged).
+        if cutlass.const_expr(self.try_wait):
+            wait_try(self.smem_ptr, phase)
+        else:
+            wait(self.smem_ptr, phase, spin=spin or self.spin)
 
     def arrive(
         self,

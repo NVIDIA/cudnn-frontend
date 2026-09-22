@@ -1,6 +1,10 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # Copyright (c) 2026, Jerry Chen
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
+
 
 import math
 import operator
@@ -14,9 +18,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import FastDivmodDivisor, LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
 from cudnn.deepseek_sparse_attention.utils.sm90 import mma as sm90_mma
@@ -372,7 +375,7 @@ class DenseScoreRecomputeSm90:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_KV)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         mbar_Q_ptr = storage.mbar_Q.data_ptr()

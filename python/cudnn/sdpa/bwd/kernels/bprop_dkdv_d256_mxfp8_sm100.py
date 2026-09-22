@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -26,6 +29,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 import math
 from typing import Type, Tuple, Union, Optional
 
@@ -385,12 +389,12 @@ class BlackwellFmhaBackwardDKDV256:
         QT = make_transposed_tensor(Q_MN, Q.layout)
         LSE = make_lse_head_batch_tensor(LSE, hb)
 
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
-        self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
+        self.Q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.K_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.dO_major_mode = LayoutEnum.from_tensor(dO).mma_major_mode()
 
         if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -409,6 +413,7 @@ class BlackwellFmhaBackwardDKDV256:
         # compute S - using self.cta_group for 2-CTA support
         KQ_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -418,6 +423,7 @@ class BlackwellFmhaBackwardDKDV256:
             tcgen05.OperandSource.TMEM,
         )
         KQ_tiled_mma_smem = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -430,6 +436,7 @@ class BlackwellFmhaBackwardDKDV256:
 
         KQ_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -439,6 +446,7 @@ class BlackwellFmhaBackwardDKDV256:
             tcgen05.OperandSource.TMEM,
         )
         KQ_tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -452,6 +460,7 @@ class BlackwellFmhaBackwardDKDV256:
         # compute dP - using self.cta_group for 2-CTA support
         VDO_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -461,6 +470,7 @@ class BlackwellFmhaBackwardDKDV256:
             tcgen05.OperandSource.TMEM,
         )
         VDO_tiled_mma_smem = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -473,6 +483,7 @@ class BlackwellFmhaBackwardDKDV256:
 
         VDO_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -482,6 +493,7 @@ class BlackwellFmhaBackwardDKDV256:
             tcgen05.OperandSource.TMEM,
         )
         VDO_tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -495,6 +507,7 @@ class BlackwellFmhaBackwardDKDV256:
         # dK
         dSQ_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
             self.sf_dtype,
@@ -503,6 +516,7 @@ class BlackwellFmhaBackwardDKDV256:
             self.dSQ_mma_tiler[:2],
         )
         dSQ_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
@@ -515,6 +529,7 @@ class BlackwellFmhaBackwardDKDV256:
         # dV
         PdO_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
             self.sf_dtype,
@@ -523,6 +538,7 @@ class BlackwellFmhaBackwardDKDV256:
             self.PdO_mma_tiler[:2],
         )
         PdO_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
@@ -1162,7 +1178,7 @@ class BlackwellFmhaBackwardDKDV256:
             cpasync.prefetch_descriptor(tma_atom_LSE)
             cpasync.prefetch_descriptor(tma_atom_sum_OdO)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_KQ_pipeline = self.make_and_init_load_mma_KQ_pipeline(
@@ -1297,12 +1313,12 @@ class BlackwellFmhaBackwardDKDV256:
         tDVrDOT = PdO_tiled_mma.make_fragment_B(sdOT)
 
         # Create TmemAllocator for 2-CTA support
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id_0[0],
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
         if warp_idx == self.compute_warp_id_0[0]:
             tmem.allocate(self.tmem_alloc_cols)
@@ -1440,7 +1456,7 @@ class BlackwellFmhaBackwardDKDV256:
             #  LOAD warp - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.load_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
                 persistent_iter = Int32(0)
                 cumulative_trip_count_load = Int32(0)
                 while work_tile.is_valid_tile:
@@ -1578,7 +1594,7 @@ class BlackwellFmhaBackwardDKDV256:
             #  SCHED warp (CTA 0 only) - CLC producer loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx == self.sched_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
                 if is_first_cta_in_cluster:
                     clc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage)
                     while work_tile.is_valid_tile:
@@ -1598,7 +1614,7 @@ class BlackwellFmhaBackwardDKDV256:
             #  MMA warp - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx == self.mma_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+                cute.arch.setmaxregister_decrease(self.num_regs_mma)
                 persistent_iter = Int32(0)
                 cumulative_trip_count_mma = Int32(0)
                 while work_tile.is_valid_tile:
@@ -1725,7 +1741,7 @@ class BlackwellFmhaBackwardDKDV256:
             #  Compute warps - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
-                cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                cute.arch.setmaxregister_increase(self.num_regs_compute)
                 persistent_iter = Int32(0)
                 cumulative_trip_count_compute = Int32(0)
                 while work_tile.is_valid_tile:
@@ -1840,7 +1856,7 @@ class BlackwellFmhaBackwardDKDV256:
             #  Empty warp (11) - persistent CLC consumer loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx in self.empty_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
                 while work_tile.is_valid_tile:
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
@@ -1905,7 +1921,7 @@ class BlackwellFmhaBackwardDKDV256:
                 #  LOAD
                 # ///////////////////////////////////////////////////////////////////////////////
                 if warp_idx == self.load_warp_id:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+                    cute.arch.setmaxregister_decrease(self.num_regs_load)
 
                     self.load(
                         Q_in,
@@ -1983,7 +1999,7 @@ class BlackwellFmhaBackwardDKDV256:
                 #  MMA
                 # ///////////////////////////////////////////////////////////////////////////////
                 elif warp_idx == self.mma_warp_id:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+                    cute.arch.setmaxregister_decrease(self.num_regs_mma)
                     mma_compute_dK_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_dKdV_stage)
                     # NOTE: HERE
                     self.mma(
@@ -2051,7 +2067,7 @@ class BlackwellFmhaBackwardDKDV256:
                 #  Compute
                 # ///////////////////////////////////////////////////////////////////////////////
                 elif warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
-                    cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                    cute.arch.setmaxregister_increase(self.num_regs_compute)
                     self.compute(
                         tStS,
                         tDPtDP,
@@ -2096,7 +2112,7 @@ class BlackwellFmhaBackwardDKDV256:
                         self.epilogue_sync_barrier.arrive_and_wait()
 
                 else:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                    cute.arch.setmaxregister_decrease(self.num_regs_empty)
             elif trip_count <= 0:
                 if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
                     self.zero_epilogue(blk_coord, blk_offset, problem_shape_cur_batch, dK, dV)
@@ -2765,7 +2781,7 @@ class BlackwellFmhaBackwardDKDV256:
     @cute.jit
     def mma(
         self,
-        tmem: utils.TmemAllocator,
+        tmem: TmemAllocator,
         sDS_scale_exchange: cute.Tensor,
         KQ_tiled_mma: cute.TiledMma,
         VDO_tiled_mma: cute.TiledMma,

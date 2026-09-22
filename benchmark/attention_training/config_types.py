@@ -103,10 +103,11 @@ class BenchmarkConfig:
     models: List[ModelPreset]
     seqlens: List[Tuple[int, int]]
     backends: List[str] = field(default_factory=lambda: ["cudnn"])
-    # "bfloat16" / "float16" / "fp8" / "mxfp8", plus the fp8-input block-scaled-
-    # output modes "fp8_nvfp4" (FP4 O + E4M3 scale per 16 d) and "fp8_mxfp8"
-    # (E4M3 O + UE8M0 scale per 32 d) -- forward-only, cudnn_oss backend only
-    # (the runner drops other backend / pass combinations for them).
+    # "bfloat16" / "float16" / "fp8" / "mxfp8", plus the block-scaled-output modes
+    # over fp8 or mxfp8 inputs: "fp8_nvfp4" / "mxfp8_nvfp4" (FP4 O + E4M3 scale per
+    # 16 d) and "fp8_mxfp8" / "mxfp8_mxfp8" (E4M3 O + UE8M0 scale per 32 d) --
+    # forward-only, cudnn_oss backend only (the runner drops other backend / pass
+    # combinations for them).
     data_types: List[str] = field(default_factory=lambda: ["bfloat16"])
     attn_masks: List[str] = field(default_factory=lambda: ["top_left"])
     profile_pass: str = "fwd"
