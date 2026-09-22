@@ -11,6 +11,9 @@ Provide the `inference` directory from DeepSeek-V4.1-Flash revision
 `model.py`, `kernel.py`, and `config.json` before loading reference functions.
 It does not download code or model weights.
 
+Run these scripts and auditors without `-O`, `-OO`, or `PYTHONOPTIMIZE`;
+they reject optimized Python so source, numerical, and audit checks stay enabled.
+
 ```bash
 python benchmark/rope_qdq/bench_fp4.py \
   --deepseek-source /path/to/DeepSeek-V4.1-Flash/inference \
