@@ -19,14 +19,17 @@ from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     detect_framework,
     framework_dtype,
+    get_data_ptr,
     get_device,
     get_shape,
     get_strides,
+    is_torch_tensor,
 )
 
 from ..backend_utils import (
     GroupedGemmBackend,
     _torch_stream_context,
+    allocate_wrapper_workspace,
     backend_cache_key,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
@@ -163,6 +166,12 @@ class GroupedGemmWgradSm100(APIBase):
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
 
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires."""
+        if self._implementation is None:
+            self.check_support()
+        return self._implementation.scratch_workspace_bytes()
+
     # BF16 implementation
     @overload
     def execute(
@@ -177,6 +186,7 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: None = None,
         global_scale_b: None = None,
+        workspace: Any = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -193,6 +203,7 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
+        workspace: Any = None,
     ) -> None: ...
 
     def execute(
@@ -207,6 +218,8 @@ class GroupedGemmWgradSm100(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace: Any = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -221,7 +234,41 @@ class GroupedGemmWgradSm100(APIBase):
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
             current_stream=current_stream,
+            workspace=workspace,
         )
+
+
+def wgrad_expert_ptrs(wgrad_tensor, current_stream: Optional[cuda.CUstream] = None):
+    """Per-expert output addresses of a stacked ``(num_experts, hidden, intermediate)`` wgrad
+    tensor, as the int64 device table discrete ``execute(wgrad_ptrs=)`` consumes (recipe R4).
+
+    torch: one ``arange`` fill on the launch stream -- no host list, no H2D copy, no sync,
+    capturable. JAX (eager only): the packed little-endian uint8 form, materialized before its
+    pointer is taken. Derive once per output buffer and reuse the table across executes.
+    """
+    shape = get_shape(wgrad_tensor)
+    if len(shape) != 3:
+        raise ValueError(f"wgrad_tensor must be rank-3 (num_experts, hidden, intermediate), got shape {shape}")
+    experts = int(shape[0])
+    stride_bytes = int(get_strides(wgrad_tensor)[0]) * _convert_to_cutlass_data_type(wgrad_tensor.dtype).width // 8
+    base = int(get_data_ptr(wgrad_tensor))
+    if experts > 1 and stride_bytes <= 0:
+        raise ValueError(f"wgrad_tensor expert stride must be positive, got {stride_bytes} bytes")
+    if is_torch_tensor(wgrad_tensor):
+        import torch
+
+        if not wgrad_tensor.is_cuda:
+            raise ValueError(f"wgrad_tensor must be a CUDA tensor, got device={wgrad_tensor.device}")
+        with _torch_stream_context(current_stream, wgrad_tensor.device):
+            if experts <= 1:
+                return torch.full((experts,), base, dtype=torch.int64, device=wgrad_tensor.device)
+            return torch.arange(base, base + experts * stride_bytes, stride_bytes, dtype=torch.int64, device=wgrad_tensor.device)
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    values = np.arange(experts, dtype=np.int64) * np.int64(stride_bytes) + np.int64(base)
+    return jax.block_until_ready(jnp.asarray(values.view(np.uint8)))
 
 
 def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
@@ -304,6 +351,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op, framework, wgrad_shape, memo_wgrad_dtype = memo
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
+        if output_mode == "discrete" and wgrad_ptrs is None:
+            wgrad_ptrs = wgrad_expert_ptrs(wgrad_tensor, current_stream)
         op.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -315,6 +364,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
             current_stream=current_stream,
+            workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
         )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
@@ -428,6 +478,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
     _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
+    if output_mode == "discrete" and wgrad_ptrs is None:
+        wgrad_ptrs = wgrad_expert_ptrs(wgrad_tensor, current_stream)
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,
@@ -439,5 +491,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
         current_stream=current_stream,
+        workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)

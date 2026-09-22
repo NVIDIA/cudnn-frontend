@@ -12,13 +12,13 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import make_fake_stream, make_ptr
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace, align_up
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     canonicalize_unit_dim_strides,
     cuda_is_available,
     default_stream,
@@ -136,7 +136,7 @@ class GroupedGemmBf16API(APIBase):
                 ("sample_bias", sample_bias),
                 ("sample_prob", sample_prob),
             )
-            if tensor is not None
+            if tensor is not None and not isinstance(tensor, TensorDesc)
         }
 
         self.expert_cnt = self.b_desc.shape[2] if self.weight_mode == MoEWeightMode.DENSE and self.b_desc.ndim == 3 else int(num_experts or 0)
@@ -153,9 +153,8 @@ class GroupedGemmBf16API(APIBase):
         self.use_dynamic_sched = use_dynamic_sched
         self._has_bias = self.bias_desc is not None
         self._kernel = MoEGroupedGemmBf16Kernel
-        self._workspace: Optional[torch.Tensor] = None
+        self._kernel_obj = None
         self._live_b_ptrs = None
-        self._compile_b_ptrs = None
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     @staticmethod
@@ -314,36 +313,44 @@ class GroupedGemmBf16API(APIBase):
         self._is_supported = True
         return True
 
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_c=self.generate_c,
+                enable_bias=self._has_bias,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
+        TMA-descriptor slots and the dynamic-scheduler counter, 128-byte aligned, never 0."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
     def compile(self) -> None:
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._kernel(
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            generate_c=self.generate_c,
-            enable_bias=self._has_bias,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            use_dynamic_sched=self.use_dynamic_sched,
-        )
+        kernel = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
         if max_active_clusters <= 0:
             raise ValueError("max_active_clusters must be > 0 after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
 
-        workspace_bytes = kernel.get_workspace_bytes()
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
-        if get_data_ptr(self._workspace) % 128 != 0:
-            raise RuntimeError("workspace allocation must be 128-byte aligned")
-        workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        # Compile-time stand-ins carry type and alignment only (R11); the live addresses
+        # arrive at execute as plain ints.
+        gmem = cute.AddressSpace.gmem
+        workspace_fake = make_ptr(cutlass.Uint8, 128, gmem, assumed_align=128)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         valid_m = cute.sym_int(divisibility=256)
@@ -380,14 +387,7 @@ class GroupedGemmBf16API(APIBase):
             k_value = cutlass.Int32(0)
             b_stride = cutlass.Int64(0)
         else:
-            # Compile-time placeholder for the pointer-array argument: real device bytes
-            # (fake tensors have dummy iterators) allocated in the caller's framework,
-            # retyped to Int64 via the element_type override.
-            self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-            self._validate_pointer_array_alignment(self._compile_b_ptrs)
-            placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
-            placeholder.element_type = cutlass.Int64
-            b_fake = placeholder.iterator
+            b_fake = make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
             n, k = self.b_shape[:2]
             n_value = cutlass.Int32(n)
             k_value = cutlass.Int32(k)
@@ -401,7 +401,7 @@ class GroupedGemmBf16API(APIBase):
             k=k_value,
             b_stride_size=b_stride,
             b_major_mode=OperandMajorMode.K,
-            workspace_ptr=workspace_ptr,
+            workspace_ptr=workspace_fake,
             c=c_fake,
             d=d_fake,
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc),
@@ -427,6 +427,7 @@ class GroupedGemmBf16API(APIBase):
             b_ptrs: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
             prob_tensor: torch.Tensor,
+            workspace_ptr: int,
             stream: cuda.CUstream,
         ) -> None:
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
@@ -491,8 +492,14 @@ class GroupedGemmBf16API(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Launch on ``current_stream`` (torch: the caller's current stream; JAX: the legacy default stream).
+
+        ``workspace`` is a caller-owned, 128-byte-aligned, contiguous device buffer of at least
+        ``scratch_workspace_bytes()`` bytes (torch tensor or any DLPack buffer); this API never
+        allocates scratch itself.
 
         ``padded_offsets`` values (non-decreasing, 256-aligned cumulative ends, last in ``(0, M]``)
         and ``b_ptrs`` entries (non-null, 16-byte aligned) are a device-data contract: the kernel
@@ -560,6 +567,8 @@ class GroupedGemmBf16API(APIBase):
             debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
 
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
         self._compiled_kernel(
             a_tensor,
             c_tensor,
@@ -570,5 +579,6 @@ class GroupedGemmBf16API(APIBase):
             b_ptrs,
             bias_tensor,
             prob_tensor,
+            ws_view.data_ptr(),
             current_stream,
         )
