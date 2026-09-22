@@ -46,6 +46,24 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d192(PARAMS)
+# Lowering of the CLC scheduler's credit arrive (``tile_dsl.scheduler.read_tile_id_arrive``, every call site below): False =
+# the lane-compare BRANCH form, True = the single predicated arrive of PR #1169.  Both land the same arrives from the same
+# lanes (READ_TILE_ARRIVERS unchanged), so this is a per-SPECIALIZATION tuning constant, keyed on the compile-time mask bits
+# that select the dense and the masked softmax arms (``CFG.MASK_FLAGS == 0`` is this kernel's dense gate, the same bits
+# MERGE_SOFTMAX_WGS below folds on): the branch form on the UNMASKED specialization, the predicated form (develop's) wherever
+# a mask arm -- causal / SWA / padded -- is compiled in.  MEASURED on B200 (A/B/A x3, CUPTI medians, O / Stats / Amax_O
+# bit-identical, 2026-09-22); branch form vs predicated form:
+#   B=1 H=128/128 S=8K dense (MASK_FLAGS == 0), NATURAL         +6.84 % (ctrl 0.04)  -> branch form here (False)
+#   d128 MXFP8 sibling, H=24/8 S=16K dense                       +8.14 % (ctrl 0.15)  -> branch form there too
+#   d128 MXFP8 sibling, H=24/8 S=16K top_left causal, LPT        -5.13 % (ctrl 0.10)  -> predicated form kept on every
+#                                                                                        masked specialization (this
+#                                                                                        kernel's masked cells: not measured)
+# Mechanism OPEN: a kernel-wide ptxas reschedule of the softmax body (the predicated form moves the dense arm's stats
+# publish; the branch form is what loses on the d128 sibling's masked body).  Per-specialization tuning constant;
+# re-measure before changing.  Pinned by test_sdpa_fwd_mxfp8_sm100.py: the source scan (this exact expression, every site
+# passes it, no other sm100 kernel passes the kwarg) and the module value per specialization.
+PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
+
 Cfg = type(CFG)
 # LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
 # cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software
@@ -1351,7 +1369,7 @@ def _tmaldg_warp_group(
     V_SF_EXPECT_BYTES = 0 if CFG.PV_BF16 else SF_SMEM_SIZE_V * CFG.CTA_MMA
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         # Empty-kv tile: MMA's empty-mainloop branch handles the matching mbar phases.
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1616,7 +1634,7 @@ def _tmastg_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         q_row_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
         o_batch = _partial_batch(batch_idx, split_idx, n_batch)
@@ -1690,7 +1708,7 @@ def _mma_warp_quiet(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS))
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -1987,7 +2005,7 @@ def _mma_warp_group(
     sched_state = PipelineState.start()
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         skip_s0_tail = cutlass.Boolean(False)
         if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
@@ -2688,7 +2706,7 @@ def _softmax_masked_kv_loops(one_sided_swa: bool, bounds, segment_bounds, contex
         )
     for index, (apply_mask, may_need_padding, mask_flags, begin, end) in enumerate(regions):
         if cutlass.const_expr((CFG.MASK_FLAGS & MASK_CAUSAL) and index == len(regions) - 1):
-            read_tile_id_arrive(context.sched.mb_read_tile_id.subview(context.sched_state.idx), CGA_SIZE)
+            read_tile_id_arrive(context.sched.mb_read_tile_id.subview(context.sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         state = _softmax_kv_range(
             apply_mask,
             may_need_padding,
@@ -2774,7 +2792,7 @@ def _softmax_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
-            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
         bars.mb_o_empty[0].wait(epilogue_state)
@@ -2960,7 +2978,7 @@ def _correction_warp_group(
     bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         # Iter-0 skip — MMA's iter-0 BMM2 uses init_d=False to overwrite O, no α-rescale needed.
         if bounds.right > bounds.left:
             for qs in cutlass.range_constexpr(CFG.TILES_Q):

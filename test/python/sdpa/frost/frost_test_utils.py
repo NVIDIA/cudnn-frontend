@@ -10,6 +10,15 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from typing import NamedTuple
+
 import pytest
 
 
@@ -235,3 +244,150 @@ def launch_f16(
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
+
+
+# ---------------------------------------------------------------------------- SASS pins: trace-compile a kernel for a target arch and count opcodes
+# A perf lever that is invisible to every numerics test (the exp2 MUFU / FMA split, the Amax_O FMNMX3 fold, a spill) has
+# exactly one tripwire: the SASS.  These helpers compile ONE kernel module for ONE arch in a fresh subprocess
+# (`CUTE_DSL_ARCH` needs no matching device -- the suite-level `requires_blackwell` is what confines the pins to the
+# Blackwell-line lanes), dump the cubin, disassemble it with the first nvdisasm on $CUDA_PATH/bin or $PATH that decodes
+# the arch, and hand the caller the opcode counts plus whatever module-derived expectations the probe body printed.
+# SKIPS (never fails) when no nvdisasm decodes the cubin; a compile failure IS a failure.
+
+# Opcode -> the substrings a listing line must all contain.  The leading space on the packed ops keeps `FFMA2` from
+# matching a hypothetical `XFFMA2`; `MUFU.EX2` also matches `MUFU.EX2.F16x2`-style variants on purpose.  `BSSY` and the
+# per-lane ` SYNCS.ARRIVE` (the leading space excludes the uniform `USYNCS.ARRIVE`) are the two opcodes that tell the
+# scheduler credit arrive's lowerings apart: the lane-compare branch form costs one BSSY reconverge and `cga_size` arrives
+# per call site, the predicated form none and one (`tile_dsl/scheduler.py::read_tile_id_arrive`).
+SASS_OPCODE_COUNTS = {
+    "MUFU_EX2": ("MUFU.EX2",),
+    "FFMA2": (" FFMA2",),
+    "FADD2": (" FADD2",),
+    "FSETP": ("FSETP",),
+    "FSEL": ("FSEL",),
+    "FMNMX3": ("FMNMX3",),
+    "STL": ("STL",),
+    "LDL": ("LDL",),
+    "BSSY": ("BSSY",),
+    "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
+}
+
+_SASS_PROBE_TEMPLATE = """
+import glob, hashlib, json, os, subprocess, sys
+dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
+os.environ["CUTE_DSL_ARCH"] = arch               # unconditional: an inherited value would pin the wrong target's SASS
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
+from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+params_kw = json.loads(params_json)
+%(body)s
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+nvd = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("REJECT", c, "->", repr(exc)); continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        nvd = c; print("NVDISASM", c); break
+    print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+if nvd is None:
+    print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+def cnt(*subs):
+    return sum(1 for ln in sass if all(sb in ln for sb in subs))
+for key, subs in json.loads(%(counts)r).items():
+    print("SASS", key, cnt(*subs))
+print("SASS LINES", len(sass))
+"""
+
+
+def sass_probe_source(body: str, counts: dict = SASS_OPCODE_COUNTS) -> str:
+    """The source of a SASS-probe subprocess.  ``body`` (dedented, column-0 statements) builds ``params`` from
+    ``TemplateParams(..., **params_kw)``, loads the module with ``_load_sm100_kernel_module``, prints any
+    module-derived expectation as ``<UPPER_NAME> <int>`` lines (e.g. ``EXPECT_MUFU_EX2 194``) and calls
+    ``mod.compile(...)``; the template around it fixes the arch, dumps the cubin, picks an nvdisasm and prints one
+    ``SASS <key> <count>`` line per entry of ``counts``."""
+    return _SASS_PROBE_TEMPLATE % {"body": textwrap.dedent(body).strip("\n"), "counts": json.dumps(counts)}
+
+
+def nvdisasm_candidates() -> list:
+    """Every nvdisasm the pins may try, in preference order: $CUDA_PATH/bin first (an internal toolkit that decodes a
+    newer arch than the wheel's), then $PATH.  Only existing executables."""
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
+
+
+def arch_known_to_the_dsl(arch: str) -> bool:
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string(arch)
+        return True
+    except Exception:
+        return False
+
+
+# Spill counts are a property of the TOOLCHAIN at a fixed geometry, so a pin on them is a BOUND, never a compiler-specific
+# literal.  The causal specializations of the three exp2-split kernels read STL / LDL 0 / 0 under cutlass-dsl 4.8.0.dev0 +
+# the CUDA 13.5 ptxas and 1 / 1 under the CI lane's 4.7.0 + CUDA 13.3 ptxas, on sm_100a and sm_103a alike, on develop AND
+# on the branch (review on PR #1178) -- an exact zero there fails a lane on which nothing changed.  A pin records the count
+# MEASURED on the branch's own toolchain and :func:`assert_no_new_spills` accepts up to SPILL_TOLERANCE more per opcode: a
+# real regression (a fold site or an emulated exp2 pair spilling its operands into local memory) adds tens of STL / LDL,
+# the DSL / ptxas jitter one or two.
+SPILL_TOLERANCE = 4
+
+
+def assert_no_new_spills(stats: dict, pins: dict, tag: str = "") -> None:
+    """``stats["STL"]`` / ``stats["LDL"]`` at or below ``pins["STL"]`` / ``pins["LDL"]`` plus :data:`SPILL_TOLERANCE`."""
+    for key in ("STL", "LDL"):
+        assert stats[key] <= pins[key] + SPILL_TOLERANCE, (
+            f"{tag}{key} {stats[key]} > {pins[key]} + {SPILL_TOLERANCE}: new spills -- the pin is the count measured on the branch's own "
+            f"toolchain, the tolerance the DSL / ptxas jitter (SPILL_TOLERANCE): {stats}"
+        )
+
+
+class SassProbe(NamedTuple):
+    stats: dict  # opcode key -> count, one per SASS_OPCODE_COUNTS entry (plus LINES)
+    expect: dict  # every `<UPPER_NAME> <int>` line the probe body printed (module-derived expectations)
+    cubin_md5: str
+
+
+def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: str, timeout: int = 1500) -> SassProbe:
+    """Run ``probe_src`` (from :func:`sass_probe_source`) for ``arch`` with the per-build ``params`` (the TemplateParams
+    fields the adapter would derive for that device -- JSON-serialised into ``params_kw``) in a fresh interpreter and
+    parse its output.  Skips when the DSL has no such arch or no nvdisasm decodes the cubin; a non-zero exit fails."""
+    if not arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch}")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    # One dump dir per (arch, tag, params): two probes of the same kernel that differ only in ``params`` (the dense and the
+    # causal specialization of one pin) must not share a dir, or the second compile trips over the first's.
+    dump = tmp_path / f"{arch}_{tag}_{hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()[:8]}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", probe_src, str(dump), arch, json.dumps(params), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    assert proc.returncode == 0, f"{arch} trace-compile of {tag} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    expect = {}
+    for ln in out:
+        parts = ln.split()
+        if len(parts) == 2 and parts[0].isupper() and parts[0] not in ("SASS", "CUBIN_MD5", "NVDISASM") and parts[1].lstrip("-").isdigit():
+            expect[parts[0]] = int(parts[1])
+    md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
+    print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
+    return SassProbe(stats, expect, md5)
