@@ -1746,7 +1746,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Block-scaled O (sf_o): per-tensor FP8, d128 flavor, dense/unsplit/unpacked.
         self._dtype_o_code = _SM100_DTYPE_QKV_CODE.get(self.dtype_o)
         if self.sf_o_desc is not None or self.dtype_o == _torch_fp4():
-            self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
+            self._not_implemented_error_if(not self._fp8, "a block-scaled O (sf_o / FP4 O) is served by the quantized paths (per-tensor FP8, MXFP8) only")
             if self.dtype_o == _torch_fp4():
                 self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
@@ -2771,6 +2771,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     current_stream,
                     workspace=workspace,
                     gate=gate,
+                    sf_o=sf_o,
+                    scale_o=scale_o,
                 )
             return
 
@@ -3301,8 +3303,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         current_stream=None,
         workspace=None,
         gate=None,
+        sf_o=None,
+        scale_o=None,
     ):
         """MXFP8 execute: FP8 Q/K/V + per-32-block E8M0 SF → half/FP8 O.
+
+        Block-scaled O (``sample_sf_o``): ``sf_o`` is the scale-factor buffer laid
+        out per the declared geometry; ``scale_o`` (1-element fp32 device tensor)
+        is the FP4 global scale the epilogue folds into O -- required for an FP4
+        O, a cached 1.0 when omitted with the UE8M0 mode. Amax_O stays the
+        PRE-scale output amax (divided back out here, as on the fp8 path).
 
         SF tensors come from cuDNN in F8_128x4 layout and are reshaped into the
         kernel's per-tile view; ``Amax_O`` (if requested) is produced in-kernel
@@ -3401,10 +3411,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         Q = self._to_bshd(q_tensor)
         K = self._to_bshd(k_tensor)
         V = self._to_bshd(v_tensor)
+        if self.o_block_scale == 16:
+            # FP4 O arrives as its byte container ((B, H, S, d/2) in
+            # float4_e2m1fn_x2 / uint8 / fp8 spelling); the kernel binds it as
+            # FP8-typed bytes and writes two E2M1 per byte.
+            self._value_error_if(
+                o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}"
+            )
+            o_tensor = o_tensor.view(torch.float8_e4m3fn) if o_tensor.dtype != torch.float8_e4m3fn else o_tensor
         O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
         O = O_scratch if o_needs_copy_back else O_view
         # Epilogue gate (bf16, O's shape): a view at the compiled strides, never a copy.
         G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
+        # Block-scaled O: the SF_O buffer + its geometry, and scale_o as the FP4
+        # global scale (a cached 1.0 when the caller gave none: legal for UE8M0).
+        sf_o_kwargs = self._sf_o_kernel_kwargs(sf_o, device) if self.o_block_scale else {}
+        if self.o_block_scale:
+            sf_o_kwargs["scale_o_t"] = self._scale_view(scale_o, "scale_o", device)
 
         n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
@@ -3484,6 +3507,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The gate tensor is the LAST (keyword) parameter of the gated
             # kernel's _host, after `stream`; absent on ungated builds.
             **({"gate_tensor": G} if G is not None else {}),
+            **sf_o_kwargs,
             stream=current_stream,
         )
         if self.split_kv > 1:
@@ -3499,6 +3523,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 stream=current_stream,
             )
         with _torch_stream_context(current_stream, device):
+            if self.o_block_scale and amax_o is not None and amax_o_buf is not None:
+                # The epilogue folded scale_o into O; Amax_O reports the PRE-scale amax.
+                amax_o_buf.div_(sf_o_kwargs["scale_o_t"])
             if o_needs_copy_back:
                 O_view.copy_(O)
         self._logger.debug("execute (MXFP8) completed")

@@ -1140,6 +1140,8 @@ class pygraph:
                 return node  # an op attribute the backend has no field for is SET: python engines only
             if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
                 return node  # an output the backend cannot produce (sf_o) is requested: python engines only
+            if any(node.inputs.get(port) is not None for port in spec_entry[1].get("python_only_in_kwargs", ())):
+                return node  # an input the backend has no field for (sdpa_mxfp8 scale_o) is bound: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -2466,9 +2468,10 @@ class pygraph:
                     # user callbacks (score_mod, ...) get a shimmed graph so
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
+                python_only_ins = spec.get("python_only_in_kwargs", ())
                 for port, t in node.inputs.items():
-                    if not port.startswith("dropout_"):
-                        kw[port] = tensor_map[t.uid]
+                    if not port.startswith("dropout_") and port not in python_only_ins:
+                        kw[port] = tensor_map[t.uid]  # python-only inputs never reach C++ (_unlowerable_node keeps a SET one off the backend)
                 python_only_outs = spec.get("python_only_out_kwargs", ())
                 for port in spec.get("out_kwargs", ()):
                     if port in node.outputs and port not in python_only_outs:  # classic passes these descriptors as args
@@ -3580,6 +3583,15 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_MXFP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v"),
         outputs=("O", "Stats", "Amax_O"),
+        # Block-scaled O, as on sdpa_fp8: ``sf_o`` (E4M3 scales per 16 d for an
+        # FP4_E2M1 O, UE8M0 per 32 d for an FP8_E4M3 O) is an OUTPUT the cuDNN
+        # backend has no field for, and ``scale_o`` -- the FP4 global scale the
+        # epilogue folds into O (required for an FP4 O, optional with an
+        # UE8M0-scaled E4M3 O) -- an INPUT it has none for either: setting one
+        # makes the node python-engines-only (python_only_* / _unlowerable_node).
+        out_kwargs=("sf_o",),
+        python_only_out_kwargs=("sf_o",),
+        python_only_in_kwargs=("scale_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),

@@ -1110,7 +1110,12 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1423,7 +1428,12 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset(
+                {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+            ),
+            # Block-scaled O epilogues (FP4_E2M1 + E4M3/16, FP8_E4M3 + UE8M0/32) on
+            # the d128 MXFP8 kernel; the adapter declines the wider flavors.
+            o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -1962,7 +1972,7 @@ def lower_dsl_prefill(
         for name, tid in quant_ids.items():
             execute_kwargs[name] = resolved.get(tid)
         if facts.o_block_scale and execute_kwargs.get("sf_o") is None:
-            raise ValueError("cudnn.sdpa_fp8: the graph requests the sf_o output but no buffer was provided for it")
+            raise ValueError("cudnn.sdpa: the graph requests the sf_o output but no buffer was provided for it")
         if forward_bias:
             execute_kwargs["bias_tensor"] = bias_buf  # SM80 feature operand (mismatch admitted it for this row)
         if gate_src is not None:

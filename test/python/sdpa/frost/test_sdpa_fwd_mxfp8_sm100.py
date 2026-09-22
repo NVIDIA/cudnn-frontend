@@ -73,6 +73,9 @@ _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
 _BLOCK = 32
+# Block-scaled O (sdpa_mxfp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d (needs
+# scale_o, the FP4 global scale), "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d.
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
 
 
 class _ReferenceWithStats(NamedTuple):
@@ -183,6 +186,15 @@ def _ref(
     return finalize(o, torch.logsumexp(scores, dim=-1) if return_stats else None)
 
 
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in scale_o units
+    reference: torch.Tensor  # fp32 reference O * scale_o
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
+
+
 def _run(
     B,
     H_q,
@@ -205,6 +217,9 @@ def _run(
     k_tile_growth: float = 1.0,
     gate: Optional[torch.Tensor] = None,
     amax: bool = True,
+    block_scaled_o=None,
+    sf_o_layout="planes",
+    scale_o=None,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -242,7 +257,14 @@ def _run(
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("the packed FP4 dtype (torch.float4_e2m1fn_x2) needs torch >= 2.8")
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype.
+        Ob = torch.full((B, S, H_q, d_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    else:
+        Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = make_dense_stats(B, H_q, S, stats_layout)
     amax_buf = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     sfq_g = sfq.view(torch.uint8).reshape(B, H_q, sqp, dsc)
@@ -282,6 +304,31 @@ def _run(
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(d_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_stride = [H_q * R * C, R * C, C, 1]
+        else:
+            # token-major: one [B*S (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S are caller-owned (pre-zeroed here).
+            R = S
+            sf_o_buf = torch.full((round_up(B * S, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S :] = 0
+            sf_o_stride = [R * H_q * C, C, H_q * C, 1]
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=sf_o_stride, data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
+        if scale_o is not None:
+            # sdpa_mxfp8 has no per-tensor O scale otherwise: scale_o is the FP4
+            # global scale the block-scaled epilogue folds into O (python-only input).
+            so_g = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+            kw["scale_o"] = so_g
+            vp[so_g] = torch.tensor([[[[float(scale_o)]]]], dtype=torch.float32, device=dev)
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     if gate is not None:
         # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
@@ -289,7 +336,12 @@ def _run(
         gate_t = g.tensor_like(gate)
         vp[gate_t] = gate
         o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
+    if blk == 16:
+        assert gate is None, "the epilogue gate and a block-scaled O are separate epilogues"
+        # The FP4 O is declared with its LOGICAL element extent; the binding is the byte container.
+        o.set_output(True).set_dim([B, H_q, S, d_v]).set_stride([S * H_q * d_v, d_v, H_q * d_v, 1]).set_data_type(cudnn.data_type.FP4_E2M1)
+    else:
+        o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     if amax:
@@ -311,6 +363,8 @@ def _run(
     vp[o] = Ob
     if amax:
         vp[amax_o] = amax_buf
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     if stats:
         vp[stats_t] = lse
     workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -332,6 +386,15 @@ def _run(
     def _gated(o_ref):
         return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
 
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times scale_o (what the epilogue quantizes).
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        so = float(scale_o) if scale_o is not None else 1.0
+        o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kwargs)
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S, d_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * so, amax_buf.item(), o_ref.abs().max().item(), sf_pad_ok, so)
     if return_lse:
         assert stats, "return_lse requires stats=True"
         o_ref, lse_ref = _ref(
@@ -1970,3 +2033,81 @@ def test_mxfp8_stats_log2_every_flavor(d_qk, d_v):
         torch.testing.assert_close(o, torch.full_like(o, 0.5), atol=1e-2, rtol=1e-2)
         outputs.append(o)
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+
+# --- Block-scaled O (sf_o): NVFP4 / MXFP8 output on the MXFP8-input kernel -------------
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int, in_key: str):
+    """Kernel dequant vs fp32 reference: within the MXFP8 pipeline tolerance (in
+    scale_o units) plus three times the pure block-quantization floor of the
+    reference itself; per-plane pad rows zero; Amax_O the pre-scale amax."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(_half_atol(in_key, 128) * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=71)
+def test_mxfp8_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o) on the d128 MXFP8-input kernel: FP4 O + E4M3/16
+    scales with scale_o as the FP4 global scale, or E4M3 O + UE8M0/32 scales without
+    a scale. The causal case runs S = 300 -- a partially valid tail tile whose
+    per-plane pad rows must come back zero (the MXFP8 kernel takes a dense KV
+    tail only under a mask that covers it, so the unmasked case runs S = 256) --
+    B > 1 the plane / token-major row bookkeeping, GQA the head -> plane mapping.
+    Runs on the whole SM100 line (_ARCH picks the Rubin kernel there)."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300 if mask == "causal" else 256,
+        "e4m3",
+        torch.float8_e4m3fn,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+        scale_o=3.0 if mode == "nvfp4" else None,
+    )
+    _check_block_scaled(res, blk, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=72)
+def test_mxfp8_block_scaled_mxfp8_out_with_scale_o():
+    """The UE8M0 mode accepts an optional scale_o too (folded into O, divided back
+    out of Amax_O), so both modes share one contract with sdpa_fp8."""
+    res = _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="mxfp8", scale_o=0.5)
+    _check_block_scaled(res, 32, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=73)
+def test_mxfp8_block_scaled_fp4_requires_scale_o():
+    """An FP4 O without scale_o is rejected at validate: the E4M3 block scale alone
+    cannot span O's range, and sdpa_mxfp8 has no other per-tensor O scale."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="nvfp4", scale_o=None)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=74)
+def test_mxfp8_block_scaled_output_declines_wide_flavor():
+    """sf_o is a d128-only epilogue: a d256 MXFP8 graph requesting it has no engine."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="mxfp8")
