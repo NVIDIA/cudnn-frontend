@@ -413,6 +413,39 @@ def test_nsa_swa_wrapper_thd_derives_max_seq_len_and_restrides_offsets(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_nsa_swa_wrapper_handle_only_thd_derives_offsets_on_the_handle_stream(request):
+    """Handle-only call (``stream=None``, handle re-streamed to a side stream): the wrapper derives the packed
+    ragged offsets, allocates the outputs and the workspace and launches on the HANDLE's stream, so a busy ambient
+    torch stream neither delays the offsets behind the launch nor lets the launch read them before they exist
+    (Rule 5). The explicit-stream call is the control."""
+    NSA, cfg, _, _, (Q, K, V, _, _, actual_s_q, actual_s_kv, max_s_q, max_s_kv) = _thd_swa_case(request)
+    common = dict(
+        q_tensor=Q,
+        k_tensor=K,
+        v_tensor=V,
+        seq_len_q_tensor=actual_s_q,
+        seq_len_kv_tensor=actual_s_kv,
+        left_bound=cfg["window_size"],
+        right_bound=0,
+        attn_scale=cfg["scale_softmax"],
+        max_seq_len_q=max_s_q,
+        max_seq_len_kv=max_s_kv,
+    )
+    side = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, side.cuda_stream)
+    torch.cuda.synchronize()  # the inputs are complete; from here the ambient stream only carries the delay below
+    torch.cuda._sleep(1_000_000_000)  # ambient torch stream busy: work enqueued there runs after the handle-stream launch
+    O_h, Stats_h = NSA.sliding_window_attention_wrapper(**common, cudnn_handle=handle)  # stream=None: the handle's stream
+    O_s, Stats_s = NSA.sliding_window_attention_wrapper(**common, cudnn_handle=cudnn.create_handle(), stream=side.cuda_stream)
+    torch.cuda.synchronize()
+    assert cudnn.get_stream(handle) == side.cuda_stream
+    check_ref_nsa_swa(Q, K, V, O_h, Stats_h, actual_s_q, actual_s_kv, max_s_q, max_s_kv, cfg)
+    check_ref_nsa_swa(Q, K, V, O_s, Stats_s, actual_s_q, actual_s_kv, max_s_q, max_s_kv, cfg)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 def test_nsa_swa_packed_thd_ragged_offsets_match_reference(request):
     """NSA.packed_thd_ragged_offsets reproduces the test reference offsets for a fully packed batch."""
     NSA, cfg, _, execute_kwargs, (Q, K, V, O, Stats, actual_s_q, actual_s_kv, _, _) = _thd_swa_case(request)
