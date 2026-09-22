@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from cuda.bindings import driver as cuda
 import torch
 
-from cudnn._torch_stream import as_torch_stream, record_streams
+from cudnn._torch_stream import as_torch_stream, copy_into_on_stream, record_streams
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 
@@ -1097,10 +1097,10 @@ def hstu_attention_backward(
         current_stream=stream,
         workspace=_allocate_workspace(api, q_tensor.device, stream),
     )
-    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+    with torch.cuda.device(q_tensor.device):
         for caller, scratch in ((dq_caller, dq_tensor), (dk_caller, dk_tensor), (dv_caller, dv_tensor)):
             if caller is not None:
-                caller.copy_(scratch)
+                copy_into_on_stream(caller, scratch, stream, q_tensor.device)  # R1 staging: the destination is recorded first
     return TupleDict(
         dq_tensor=dq_tensor if dq_caller is None else dq_caller,
         dk_tensor=dk_tensor if dk_caller is None else dk_caller,
