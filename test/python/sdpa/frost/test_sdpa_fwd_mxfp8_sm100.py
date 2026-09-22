@@ -35,7 +35,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2170,7 +2170,9 @@ _SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
 # falling back to MUFU adds 2 MUFU.EX2 and drops 3 FFMA2 (the MUFU count is pinned EXACTLY, derived from the module).
 # The cc 10.3 arm (sm_103a, fused_ldtm_stat=True, exp2_fma_split=False), MEASURED the same day: MUFU.EX2 258, FFMA2 130,
 # FADD2 126 (develop's counts: no emulated pair), FSETP 19 (the fold stays), FMNMX3 128 (the fused LDTM.STAT row-max
-# replaces the software tree), STL 3 / LDL 3.
+# replaces the software tree), STL 3 / LDL 3.  The STL / LDL entries are the counts of THIS toolchain (cutlass-dsl 4.8.0.dev0 +
+# CUDA 13.5 ptxas) and are bounds, not literals (frost_test_utils.SPILL_TOLERANCE): the CI lane's 4.7.0 + CUDA 13.3 ptxas spills
+# differently at the same geometry on develop and on the branch alike.
 _SM100_SASS_SLACK = 16
 _SM100_D128_MXFP8_SASS_PINS = {"FFMA2": 226, "FADD2": 222, "FSETP": 19, "FMNMX3": 252, "STL": 3, "LDL": 3}
 _SM103_D128_MXFP8_SASS_PINS = {"FFMA2": 130, "FADD2": 126, "FSETP": 19, "STL": 3, "LDL": 3}
@@ -2199,7 +2201,7 @@ def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
     """cc 10.0 record (exp2_fma_split=True): 32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 ==
     2 x 97 exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222
     minus slack) and the Amax_O fold is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no
-    new spill (STL / LDL <= 3, the pre-existing count).  Compiled for sm_100a at the production geometry -- no
+    new spill (STL / LDL within SPILL_TOLERANCE of the pinned 3 / 3, this toolchain's count).  Compiled for sm_100a at the production geometry -- no
     Blackwell device needed for the compile, only for this module's gate."""
     stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", _CC100_D128_MXFP8_PARAMS)
     assert expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
@@ -2214,7 +2216,7 @@ def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
     assert (
         stats["FSETP"] <= _SM100_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
     ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
-    assert stats["STL"] <= _SM100_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM100_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
+    assert_no_new_spills(stats, _SM100_D128_MXFP8_SASS_PINS)
 
 
 @pytest.mark.L0
@@ -2223,7 +2225,7 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
     the split is OFF because GB300 doubles the MUFU.EX2 rate to Rubin's 32/clk/SM, where the same split MEASURED
     -9..-10 %.  The kernel must issue develop's MUFU.EX2 count exactly (2 x 129 = 258, derived from the module's
     `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at or below develop's 130 / 126 plus
-    slack), while the arch-independent Amax_O fold stays FMNMX3 (FSETP <= 19 + 16) and nothing spills (STL / LDL <= 3).
+    slack), while the arch-independent Amax_O fold stays FMNMX3 (FSETP <= 19 + 16) and nothing new spills (STL / LDL within SPILL_TOLERANCE of 3 / 3).
     Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
     stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_103a", _CC103_D128_MXFP8_PARAMS)
     assert expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
@@ -2238,7 +2240,7 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
     assert (
         stats["FSETP"] <= _SM103_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
     ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
-    assert stats["STL"] <= _SM103_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM103_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
+    assert_no_new_spills(stats, _SM103_D128_MXFP8_SASS_PINS)
 
 
 # ============================================================================ sm100 MXFP8: the scheduler credit arrive's lowering is a PER-SPECIALIZATION constant (PREDICATED_CREDIT_ARRIVE = CFG.MASK_FLAGS != 0)

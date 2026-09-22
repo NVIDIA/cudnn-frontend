@@ -338,6 +338,25 @@ def arch_known_to_the_dsl(arch: str) -> bool:
         return False
 
 
+# Spill counts are a property of the TOOLCHAIN at a fixed geometry, so a pin on them is a BOUND, never a compiler-specific
+# literal.  The causal specializations of the three exp2-split kernels read STL / LDL 0 / 0 under cutlass-dsl 4.8.0.dev0 +
+# the CUDA 13.5 ptxas and 1 / 1 under the CI lane's 4.7.0 + CUDA 13.3 ptxas, on sm_100a and sm_103a alike, on develop AND
+# on the branch (review on PR #1178) -- an exact zero there fails a lane on which nothing changed.  A pin records the count
+# MEASURED on the branch's own toolchain and :func:`assert_no_new_spills` accepts up to SPILL_TOLERANCE more per opcode: a
+# real regression (a fold site or an emulated exp2 pair spilling its operands into local memory) adds tens of STL / LDL,
+# the DSL / ptxas jitter one or two.
+SPILL_TOLERANCE = 4
+
+
+def assert_no_new_spills(stats: dict, pins: dict, tag: str = "") -> None:
+    """``stats["STL"]`` / ``stats["LDL"]`` at or below ``pins["STL"]`` / ``pins["LDL"]`` plus :data:`SPILL_TOLERANCE`."""
+    for key in ("STL", "LDL"):
+        assert stats[key] <= pins[key] + SPILL_TOLERANCE, (
+            f"{tag}{key} {stats[key]} > {pins[key]} + {SPILL_TOLERANCE}: new spills -- the pin is the count measured on the branch's own "
+            f"toolchain, the tolerance the DSL / ptxas jitter (SPILL_TOLERANCE): {stats}"
+        )
+
+
 class SassProbe(NamedTuple):
     stats: dict  # opcode key -> count, one per SASS_OPCODE_COUNTS entry (plus LINES)
     expect: dict  # every `<UPPER_NAME> <int>` line the probe body printed (module-derived expectations)

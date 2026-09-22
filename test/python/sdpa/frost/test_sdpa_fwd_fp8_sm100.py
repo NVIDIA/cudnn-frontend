@@ -27,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2191,7 +2191,9 @@ _D128_FP8_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}
 # warpgroups) MUFU.EX2 516 -> 388 (4 x 97), FFMA2 260 -> 452, FADD2 252 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a,
 # cubin md5-identical to develop's): develop's counts exactly.  The MUFU count is pinned EXACTLY (derived from the
 # module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches one emulated pair falling
-# back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.
+# back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries are the counts of THIS
+# toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins read 1 / 1 under the CI
+# lane's 4.7.0 + 13.3 ptxas on develop and on the branch alike (frost_test_utils.SPILL_TOLERANCE).
 _D128_FP8_SASS_SLACK = 16
 _D128_FP8_ON_PINS = {
     "dense": {"MUFU_EX2": 194, "FFMA2": 226, "FADD2": 222, "STL": 3, "LDL": 3},
@@ -2209,7 +2211,7 @@ def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
     """cc 10.0 record (exp2_fma_split=True, what api_dsl.template_params() builds for a d128 per-tensor FP8 build on a
     B200): 32 of the 128 softmax columns are evaluated on the FMA pipe -- MUFU.EX2 == 2 x 97 (dense) / 4 x 97 (causal)
     exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured counts minus slack;
-    no new spill.  Compiled for sm_100a at the chart-layer geometry."""
+    no new spill (STL / LDL within SPILL_TOLERANCE of this toolchain's count).  Compiled for sm_100a at the chart-layer geometry."""
     from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
 
     assert _exp2_fma_split_for((10, 0), kind="fp8", flavor=(128, 128)) is True, "the cc 10.0 record must switch the split ON for this kernel"
@@ -2224,7 +2226,7 @@ def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
     ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
     for key in ("FFMA2", "FADD2"):
         assert probe.stats[key] >= pins[key] - _D128_FP8_SASS_SLACK, f"{key} {probe.stats[key]} < {pins[key]} - {_D128_FP8_SASS_SLACK}: {probe.stats}"
-    assert probe.stats["STL"] <= pins["STL"] and probe.stats["LDL"] <= pins["LDL"], f"new spills: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
 
 
 @pytest.mark.L0
@@ -2233,7 +2235,7 @@ def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
     """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
     Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (2 x 129
     dense / 4 x 129 causal, derived from `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at
-    or below develop's plus slack) and no spill beyond develop's.  Compiled for sm_103a; skips where this cutlass-dsl has
+    or below develop's plus slack) and no spill beyond develop's plus SPILL_TOLERANCE.  Compiled for sm_103a; skips where this cutlass-dsl has
     no sm_103a."""
     from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
 
@@ -2251,4 +2253,4 @@ def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
         assert (
             probe.stats[key] <= pins[key] + _D128_FP8_SASS_SLACK
         ), f"{key} {probe.stats[key]} > {pins[key]} + {_D128_FP8_SASS_SLACK}: emulation instructions with the gate off: {probe.stats}"
-    assert probe.stats["STL"] <= pins["STL"] and probe.stats["LDL"] <= pins["LDL"], f"new spills: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
