@@ -138,7 +138,8 @@ bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o
 `execute()` allocates nothing, reads nothing back to the host and converts nothing: every intermediate is a
 strided view of the caller's workspace, sized honestly by `get_workspace_size()`, so the call is CUDA-graph
 friendly. All stages run on one launch stream (torch's current stream, or `current_stream`), on both the FROST
-GEMM route and the DSL stages. Dtype, layout and shape mismatches, an unsupported architecture, or a feature the
+GEMM route and the DSL stages. Under FP8 / MXFP8 the per-tensor scale scalars occupy a 256-B slot at the end of the
+workspace, written on the launch stream by `execute()` (no plan-owned device memory). Dtype, layout and shape mismatches, an unsupported architecture, or a feature the
 selected specialization cannot serve raise typed errors at construction (`check_support`) rather than at launch.
 
 Quantization specs:

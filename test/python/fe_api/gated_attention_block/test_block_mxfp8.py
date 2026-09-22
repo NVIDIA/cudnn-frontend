@@ -389,7 +389,8 @@ def test_mxfp8_stage_list_and_workspace():
     fp8 = GatedAttentionBlockFwd(*args, geom, quant=_PT_SPEC)._layout()
     assert (lay.proj, lay.q8, lay.k8, lay.v8, lay.o, lay.o8) == (fp8.proj, fp8.q8, fp8.k8, fp8.v8, fp8.o, fp8.o8)
     assert lay.total_bytes == fp8.total_bytes + _align_up(q_sf) + 2 * _align_up(kv_sf) == lay.engine_scratch
-    assert lay.sf_q == fp8.total_bytes
+    assert lay.sf_q == fp8.quant, "the SF slots sit where the FP8 layout's (last) quant slot was; quant stays last"
+    assert lay.quant == lay.sf_v + _align_up(kv_sf) and lay.total_bytes == lay.quant + _align_up(4 * 9)
     # The SDPA stage is the production adapter on the BLOCK-SCALE kernel: pertensor_fp8=False, bf16 O, no amax.
     st = blk._sdpa
     assert st.mxfp8 and not st.pertensor and st.token_stride == 0 and not st.fuse_gate and st.o_dtype == torch.bfloat16
@@ -417,7 +418,8 @@ def test_mxfp8_fused_stage_list_and_workspace():
     fp8 = GatedAttentionBlockFwd(*args, geom, quant=_PT_SPEC, **_FUSED)._layout()
     assert (lay.q8, lay.k8, lay.v8, lay.gate16, lay.o8) == (fp8.q8, fp8.k8, fp8.v8, fp8.gate16, fp8.o8)
     q_sf, kv_sf = _sf_slot_bytes(b, g.h_q, s, g.d_head), _sf_slot_bytes(b, g.h_kv, s, g.d_head)
-    assert lay.sf_q == fp8.total_bytes and lay.total_bytes == fp8.total_bytes + _align_up(q_sf) + 2 * _align_up(kv_sf)
+    assert lay.sf_q == fp8.quant and lay.total_bytes == fp8.total_bytes + _align_up(q_sf) + 2 * _align_up(kv_sf)
+    assert lay.quant == lay.sf_v + _align_up(kv_sf) and lay.total_bytes == lay.quant + _align_up(4 * 9)
     st = blk._sdpa
     assert st.mxfp8 and st.fuse_gate and st.o_dtype == E4M3 and st.gate_dtype == torch.bfloat16 and st.gate_token_stride == g.h_q * g.d_head
     impl = st._build_impl()
@@ -439,11 +441,6 @@ def _dispatch_trace(blk, monkeypatch):
     blk._ws = lay
     blk._is_supported = True
     monkeypatch.setattr(blk, "get_workspace_size", lambda: lay.total_bytes)
-    q = blk.quant
-    blk._quant_dev = dict(
-        alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device="cuda"),
-        scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device="cuda"),
-    )
     calls = []
     for st in blk._stages:
         for meth in ("execute", "execute_mxfp8", "execute_fp8"):
@@ -763,3 +760,85 @@ def test_mxfp8_dense_kv_tail_is_declined_not_computed_wrong():
     mask or a causal mask -- the block surfaces that at check_support, typed."""
     with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
         _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000)
+
+
+# ---------------------------------------------------------------------------
+# Rule 8: the out projection's per-tensor pair lives in the workspace quant slot, filled at execute (R4 + R2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_mxfp8_quant_slot_holds_only_the_out_projection_pair(kw):
+    """Any GPU: under an ``MxQuantSpec`` only ``alpha_o`` / ``scale_o`` exist (D1), so ``_fill_quant_slot`` writes
+    words 4..5 of the nine-word slot -- two driver memsets on the given stream, no torch op, no allocation -- and
+    leaves the other seven words (and everything else) untouched; the views carry those two names and no ``qscal``."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _QUANT_WORDS
+
+    blk = _decl_block(**kw)
+    q = blk.quant
+    assert blk._quant_values() == {"alpha_o": float(q.alpha_o), "scale_o": float(q.scale_o)}
+    lay = blk._layout()
+    blk._ws = lay
+    ws = torch.full((lay.total_bytes,), 0xFF, dtype=torch.uint8, device="cuda")
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        qd = blk._fill_quant_slot(ws, side.cuda_stream)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    side.synchronize()
+    words = ws[lay.quant : lay.quant + _QUANT_SLOT_BYTES].view(torch.float32).cpu()
+    i_alpha, i_scale = _QUANT_WORDS.index("alpha_o"), _QUANT_WORDS.index("scale_o")
+    assert (i_alpha, i_scale) == (4, 5)
+    torch.testing.assert_close(words[[i_alpha, i_scale]], torch.tensor([q.alpha_o, q.scale_o], dtype=torch.float32), rtol=0, atol=0)
+    untouched = [i for i in range(len(_QUANT_WORDS)) if i not in (i_alpha, i_scale)]
+    assert (words[untouched].view(torch.int32) == -1).all(), "a word without a value must not be written"
+    assert (ws[: lay.quant] == 0xFF).all() and (ws[lay.quant + _QUANT_SLOT_BYTES :] == 0xFF).all()
+    assert set(qd) == {"alpha_o", "scale_o"}, "no qscal under an MxQuantSpec (the block-scale fork reads no scalars)"
+    assert qd["alpha_o"].data_ptr() == ws.data_ptr() + lay.quant + 4 * i_alpha and qd["scale_o"].data_ptr() == ws.data_ptr() + lay.quant + 4 * i_scale
+
+
+@requires_rubin
+@pytest.mark.parametrize("kw", [{}, _FUSED], ids=["unfused", "fused"])
+def test_mxfp8_quant_slot_is_filled_on_launch_stream_and_matches_spec(kw):
+    """After an execute on a side stream (ambient AND ``current_stream``), words 4..5 of the quant slot hold the
+    spec's ``alpha_o`` / ``scale_o`` and the other seven words are untouched; the output is bit-identical to the
+    default-stream run (the fills are ordered with the kernels that read them)."""
+    from cuda.bindings import driver as cuda_drv
+
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES
+
+    missing = _mxfp8_fork_missing() if kw else None
+    if missing is not None:
+        pytest.skip(missing)
+    out_ref, ref, blk, mx, spec = _run_mx_block(_GEOM, batch=1, seq_len=512, **kw)
+    ws = torch.full((blk.get_workspace_size(),), 0xFF, dtype=torch.uint8, device="cuda")
+    out = torch.empty_like(out_ref)
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        blk.execute(
+            mx["h"],
+            mx["w_qkvg"],
+            mx["w_q_norm"],
+            mx["w_k_norm"],
+            mx["cos"],
+            mx["sin"],
+            mx["w_o"],
+            out,
+            ws,
+            h_sf=mx["h_sf"],
+            w_qkvg_sf=mx["w_qkvg_sf"],
+            current_stream=cuda_drv.CUstream(side.cuda_stream),
+        )
+    side.synchronize()
+    lay = blk._ws
+    words = ws[lay.quant : lay.quant + _QUANT_SLOT_BYTES].view(torch.float32).cpu()
+    torch.testing.assert_close(words[4:6], torch.tensor([spec.alpha_o, spec.scale_o], dtype=torch.float32), rtol=0, atol=0)
+    assert (words[[0, 1, 2, 3, 6, 7, 8]].view(torch.int32) == -1).all(), "only alpha_o / scale_o are written under MXFP8"
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    assert _cos(out, ref) > 0.99

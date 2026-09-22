@@ -669,6 +669,10 @@ def build_fused_qkvg_weight(
 
 
 _WS_ALIGN = 256
+# FP8 / MXFP8 scale scalars, one fp32 word each, written into the workspace ``quant`` slot at execute (R4);
+# words 0..3 double as the fused FP8 fork's ``qscal`` ``[alpha_qkvg, scale_q, scale_k, scale_v]``.
+_QUANT_WORDS = ("alpha_qkvg", "scale_q", "scale_k", "scale_v", "alpha_o", "scale_o", "descale_q", "descale_k", "descale_v")
+_QUANT_SLOT_BYTES = 4 * len(_QUANT_WORDS)
 
 
 def _align_up(n: int, a: int = _WS_ALIGN) -> int:
@@ -760,6 +764,9 @@ class _Intermediates:
     # so never reserved); on the fused arm ``o`` (bf16) takes its place, since the gated SDPA then writes bf16 O.
     o4: int = -1
     sf_o: int = -1
+    # FP8 / MXFP8 pipelines only (-1 otherwise): the quant spec's scalars as fp32 words in ``_QUANT_WORDS`` order,
+    # filled on the launch stream by ``execute()`` (``_fill_quant_slot``).  The LAST slot, so no other offset moves.
+    quant: int = -1
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -809,6 +816,10 @@ def _plan_workspace(
     takes ``o8``'s place.  Every layout with ``o_fp4=None`` is byte-identical to
     before (pinned by ``test_workspace_layout_is_byte_identical_without_fp4``).
 
+    ``fp8`` (either quant family) appends the ``quant`` slot (:data:`_QUANT_SLOT_BYTES`,
+    one aligned unit) LAST in both layouts: every other offset is unchanged and the
+    bf16 layouts are byte-identical.
+
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
     write four compact buffers deletes ``proj`` and stage (3b) together.
@@ -844,6 +855,8 @@ def _plan_workspace(
             slots += _sf_slots(geom, b, s)
         if o_fp4 is not None:
             slots += _o_fp4_slots(geom, t, o_fp4)
+        if fp8:
+            slots.append(("quant", _QUANT_SLOT_BYTES))
         for name, nbytes in slots:
             offsets[name] = off
             off += _align_up(nbytes)
@@ -868,6 +881,7 @@ def _plan_workspace(
             sf_v=offsets.get("sf_v", -1),
             o4=offsets.get("o4", -1),
             sf_o=offsets.get("sf_o", -1),
+            quant=offsets.get("quant", -1),
         )
     # IN-PLACE: Q and K are normed back over their own columns of `proj`, and V
     # is never moved, so the SDPA reads all three straight out of the slab at
@@ -906,6 +920,8 @@ def _plan_workspace(
     if o_fp4 is not None:
         # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
         slots += _o_fp4_slots(geom, t, o_fp4)
+    if fp8:
+        slots.append(("quant", _QUANT_SLOT_BYTES))
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -930,6 +946,7 @@ def _plan_workspace(
         sf_v=offsets.get("sf_v", -1),
         o4=offsets.get("o4", -1),
         sf_o=offsets.get("sf_o", -1),
+        quant=offsets.get("quant", -1),
     )
 
 
@@ -1064,9 +1081,9 @@ class QuantSpec:
     Passing a ``QuantSpec`` (and FP8 ``h`` / weights) selects the FP8 pipeline;
     ``None`` is the bf16/f16 block.  All scales are Python floats fixed at plan
     time -- calibrated offline, like the weights' own scales -- so the execute
-    path does NO amax pass and NO host readback; the block materialises them as
-    1-element fp32 device tensors ONCE in ``compile()`` (the SDPA adapter does
-    the same for its identity descales).
+    path does NO amax pass and NO host readback; ``execute()`` writes them as
+    fp32 words into the workspace's ``quant`` slot on the launch stream (one
+    ``cuMemsetD32Async`` each) and hands the kernels 1-element views of it.
 
     Conventions (``x_real = x_fp8 * descale``; ``x_fp8 = sat_e4m3(x_real * scale)``):
 
@@ -1786,8 +1803,9 @@ class _FusedQkvProjection(_Stage):
     as bf16 into ``gate16`` -- four TMA-store descriptors, tile class -> buffer
     + column remap (round 2; round 1's single ``qkv8`` slab made the SDPA read
     strided and cost +7.2 % at 32K).  The four scalars ride as ONE fp32 ``[4]``
-    device vector ``[alpha_qkvg, scale_q, scale_k, scale_v]`` (``qscal``)
-    materialised in :meth:`compile`, read in-kernel -- never module-param floats.
+    device vector ``[alpha_qkvg, scale_q, scale_k, scale_v]`` (``qscal``), the
+    block's workspace quant slot filled at execute, read in-kernel -- never
+    module-param floats.
     Inference only (``want_rstd`` must be False).  Launched through
     ``run_fused_proj_gemm_fp8`` (the bf16 runner is not overloaded).
 
@@ -1825,7 +1843,6 @@ class _FusedQkvProjection(_Stage):
         want_rstd: bool,
         norm_source: str = "ldg_early",
         quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,
-        device=None,
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
@@ -1837,14 +1854,12 @@ class _FusedQkvProjection(_Stage):
         self.want_rstd = bool(want_rstd)
         self.norm_source = str(norm_source)
         # FP8: the QuantSpec whose alpha_qkvg / scale_q / scale_k / scale_v the
-        # fork's epilogue applies; `device` is where `qscal` is materialised.
+        # fork's epilogue applies (the block hands them in as `qscal` at execute).
         # MXFP8: an MxQuantSpec selects the block-scale twin (no scalars ride in).
         if quant is not None and not isinstance(quant, (QuantSpec, MxQuantSpec)):
             raise TypeError(f"{self.name}: quant must be a QuantSpec or an MxQuantSpec, got {type(quant).__name__}")
         self.quant = quant
-        self.device = device
         self._plan = None
-        self._qscal = None
 
     @property
     def fp8(self) -> bool:
@@ -2046,12 +2061,6 @@ class _FusedQkvProjection(_Stage):
         # a compile() reached without check_support() cannot build a norm-ON
         # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
-        if self.fp8:
-            # Plan-time constant (contract § 10): the fork reads these four once
-            # per epilogue warp; the execute path never allocates or converts.
-            q = self.quant
-            dev = self.device if self.device is not None else torch.device("cuda")
-            self._qscal = torch.tensor([q.alpha_qkvg, q.scale_q, q.scale_k, q.scale_v], dtype=torch.float32, device=dev)
 
     def workspace_bytes(self) -> int:
         """None: no split-K, no scratch -- the kernel writes the slab directly."""
@@ -2076,7 +2085,7 @@ class _FusedQkvProjection(_Stage):
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
         run_fused_proj_gemm(self._plan, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q, rstd_k, stream=stream)
 
-    def execute_fp8(self, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, *, stream) -> None:
+    def execute_fp8(self, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, *, qscal, stream) -> None:
         """FP8 arm: COMPACT e4m3 ``q8 [M, h_q*d]`` / ``k8 [M, h_kv*d]`` / ``v8 [M, h_kv*d]``
         + bf16 ``gate16 [M, h_q*d]`` out (all 2-D, contiguous; the SDPA views the
         same bytes ``[B, S, H, d]``).
@@ -2087,11 +2096,12 @@ class _FusedQkvProjection(_Stage):
         ``a`` is the e4m3 ``[M, K]`` view of ``h`` (the runner binds it rank-3
         ``[1, M, K]`` exactly as the bf16 runner does), ``w`` the e4m3
         ``[N_qkvg, K]`` checkpoint-layout weight; ``qscal`` is the fp32 ``[4]``
-        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` materialised in :meth:`compile`.
+        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` -- the block's workspace quant
+        slot, filled on the launch stream at execute (the runner validates it).
         """
         from .kernels.proj_gemm import run_fused_proj_gemm_fp8
 
-        if self._plan is None or self._qscal is None:
+        if self._plan is None:
             raise RuntimeError("call compile() before execute_fp8()")
         if not self.fp8:
             raise ValueError(f"{self.name}: this stage was declared bf16; use execute(...)")
@@ -2099,7 +2109,7 @@ class _FusedQkvProjection(_Stage):
         if not self._runner_writes_compact_qkv():
             # Never hand the round-1 slab runner three compact buffers positionally.
             raise NotImplementedError(f"{self.name}: {self._fp8_fork_available()}")
-        run_fused_proj_gemm_fp8(self._plan, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, self._qscal, stream=stream)
+        run_fused_proj_gemm_fp8(self._plan, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, qscal, stream=stream)
 
     def execute_mxfp8(
         self, a, sf_a, w, sf_w, out_q8, out_k8, out_v8, out_gate16, out_sf_q, out_sf_k, out_sf_v, w_q_norm, w_k_norm, cos, sin, *, stream
@@ -3220,7 +3230,6 @@ class GatedAttentionBlockFwd(APIBase):
         self.mxfp8_fused = mxfp8 and self.fuse_gate and self.fuse_norm_rope
         self.quant_fused = self.fp8_fused or self.mxfp8_fused
         act = self.act_dtype
-        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars, materialised in compile()
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -3229,9 +3238,7 @@ class GatedAttentionBlockFwd(APIBase):
             # bf16: writes the [T, N] slab.  FP8: the second rendering writes the
             # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its
             # epilogue.  MXFP8: the block-scale twin (typed decline until S6 lands).
-            self._proj = _FusedQkvProjection(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=want_rstd, quant=quant, device=self.device
-            )
+            self._proj = _FusedQkvProjection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=want_rstd, quant=quant)
             self._norm_rope = None  # lives in the fused epilogue
         else:
             # FP8: e4m3 x e4m3 -> fp32 -> * (descale_h * descale_w_qkvg) -> bf16 slab.
@@ -3549,43 +3556,60 @@ class GatedAttentionBlockFwd(APIBase):
         for st in self._stages:
             st.compile()
         self._ws = self._layout()
-        self._quant_dev = self._make_quant_dev()
+        from .kernels.proj_gemm import ProjGemmPlan, graph_handle
 
-    def _make_quant_dev(self) -> Optional[dict]:
-        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants, contract § 10;
-        the execute path never allocates).  ``None`` for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o``
-        nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has no alpha epilogue and the fp4
-        quantizer takes no scale)."""
+        # R7: the graph route's one-per-device handle is created here, never at a (possibly captured) execute.
+        if any(isinstance(st._plan, ProjGemmPlan) and st._plan.route == "graph" for st in (self._proj, self._out_proj)):
+            graph_handle(self.device)
+
+    def _quant_values(self) -> Optional[dict]:
+        """The quant spec's scalars by ``_QUANT_WORDS`` name: ``None`` for bf16; ``{}`` under ``o_fp4`` (neither
+        ``alpha_o`` nor ``scale_o`` exists there, both pinned 1.0); MXFP8 the out projection's per-tensor pair
+        (D1); FP8 all nine, ``descale_* = 1 / scale_*``."""
+        if self.quant is None:
+            return None
         if self.o_fp4 is not None:
             return {}
+        q = self.quant
         if self.mxfp8:
-            # MXFP8: only the out projection's per-tensor pair survives (D1) --
-            # `alpha_o` for the GEMM epilogue, `scale_o` for the unfused quantize_o.
-            q = self.quant
-            return dict(
-                alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device=self.device),
-                scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device=self.device),
-            )
-        if self.quant is not None:
-            # Plan-time constants (contract § 10 allows compile-time buffers; the
-            # execute path never allocates): one fp32 device scalar per scale.
-            q = self.quant
+            return {"alpha_o": float(q.alpha_o), "scale_o": float(q.scale_o)}
+        return {
+            "alpha_qkvg": float(q.alpha_qkvg),
+            "scale_q": float(q.scale_q),
+            "scale_k": float(q.scale_k),
+            "scale_v": float(q.scale_v),
+            "alpha_o": float(q.alpha_o),
+            "scale_o": float(q.scale_o),
+            "descale_q": 1.0 / float(q.scale_q),
+            "descale_k": 1.0 / float(q.scale_k),
+            "descale_v": 1.0 / float(q.scale_v),
+        }
 
-            def _dev(v: float) -> torch.Tensor:
-                return torch.full((1,), float(v), dtype=torch.float32, device=self.device)
+    def _quant_views(self, workspace: torch.Tensor) -> Optional[dict]:
+        """1-element fp32 VIEWS of the workspace quant slot, one per present ``_QUANT_WORDS`` name, plus
+        ``qscal`` (words 0..3, the fused FP8 fork's ``[4]`` vector) under a ``QuantSpec``."""
+        vals = self._quant_values()
+        if vals is None:
+            return None
+        tab = _view(workspace, self._ws.quant, (len(_QUANT_WORDS),), torch.float32)
+        views = {name: tab[i : i + 1] for i, name in enumerate(_QUANT_WORDS) if name in vals}
+        if isinstance(self.quant, QuantSpec):
+            views["qscal"] = tab[0:4]
+        return views
 
-            return dict(
-                alpha_qkvg=_dev(q.alpha_qkvg),
-                alpha_o=_dev(q.alpha_o),
-                scale_q=_dev(q.scale_q),
-                scale_k=_dev(q.scale_k),
-                scale_v=_dev(q.scale_v),
-                scale_o=_dev(q.scale_o),
-                descale_q=_dev(1.0 / q.scale_q),
-                descale_k=_dev(1.0 / q.scale_k),
-                descale_v=_dev(1.0 / q.scale_v),
-            )
-        return None
+    def _fill_quant_slot(self, workspace: torch.Tensor, stream) -> Optional[dict]:
+        """R4: write each present scalar into its word of the quant slot with one ``cuMemsetD32Async`` on the
+        launch stream (a captured memset node under CUDA graph), then return :meth:`_quant_views`."""
+        from cudnn.frost.buffers import fill_word_async, init_word
+
+        vals = self._quant_values()
+        if vals is None:
+            return None
+        base = workspace.data_ptr() + self._ws.quant
+        for i, name in enumerate(_QUANT_WORDS):
+            if name in vals:
+                fill_word_async(base + 4 * i, 1, init_word("fp32", vals[name]), stream)
+        return self._quant_views(workspace)
 
     # -- execute ------------------------------------------------------------
 
@@ -3659,8 +3683,8 @@ class GatedAttentionBlockFwd(APIBase):
         # current stream on h's device -- resolved once, here, and handed to EVERY
         # stage.  The CuTe-DSL kernels take the raw CUstream int directly; the two
         # FROST GEMMs take it through ``run_proj_gemm(stream=)`` (the JIT plan's
-        # own ``stream=``, or a cached per-(device, stream) cuDNN handle bound to
-        # it on the graph route); the SDPA adapter takes it as ``current_stream``.
+        # own ``stream=``, or the per-device cuDNN handle re-streamed to it on
+        # the graph route); the SDPA adapter takes it as ``current_stream``.
         # No stage derives its own stream from torch's current one, so a block
         # run under ``with torch.cuda.stream(s):`` -- or with an explicit stream --
         # cannot split across two streams (the GEMMs used to launch on the
@@ -3670,15 +3694,16 @@ class GatedAttentionBlockFwd(APIBase):
         req = self.get_workspace_size()
         if workspace.numel() < req:
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
+        qd = self._fill_quant_slot(workspace, stream)
 
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8
         act = self.act_dtype
         if self.fp8_fused:
-            self._execute_fp8_fused(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream)
+            self._execute_fp8_fused(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, qd)
             return
         if self.mxfp8_fused:
-            self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=w_o_sf)
+            self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, qd, w_o_sf=w_o_sf)
             return
         proj = _view(workspace, ws.proj, (t, g.n_qkvg), act)
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
@@ -3698,7 +3723,6 @@ class GatedAttentionBlockFwd(APIBase):
             k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
             v8 = _view(workspace, ws.v8, (t, g.h_kv, g.d_head), e4)
             o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if ws.o8 >= 0 else None  # not reserved under o_fp4
-            qd = self._quant_dev
         o4 = sfo = None
         if self.o_fp4 is not None:
             o4, sfo = self._fp4_o_views(workspace, ws, t)
@@ -3837,7 +3861,7 @@ class GatedAttentionBlockFwd(APIBase):
         sfo = _view(workspace, ws.sf_o, (sf_blob_bytes(t, g.h_q * g.d_head, self.o_fp4.block_size),), torch.uint8)
         return o4, sfo
 
-    def _execute_fp8_fused(self, h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream) -> None:
+    def _execute_fp8_fused(self, h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, qd) -> None:
         """The FULLY FUSED FP8 pipeline: three launches, three workspace buffers.
 
         ::
@@ -3855,12 +3879,12 @@ class GatedAttentionBlockFwd(APIBase):
 
         ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
         -- already checked by ``execute``; the fork's runner receives them as-is.
+        ``qd`` is :meth:`_fill_quant_slot`'s view dict (the slot is already filled on ``stream``).
         """
         g = self.geom
         b, s = self.batch, self.seq_len
         t = b * s
         ws = self._ws
-        qd = self._quant_dev
         e4 = torch.float8_e4m3fn
         q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
         k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
@@ -3868,7 +3892,7 @@ class GatedAttentionBlockFwd(APIBase):
         gate16 = _view(workspace, ws.gate16, (t, g.h_q, g.d_head), self.act_dtype)
         o8 = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4)
         engine_ws = workspace[ws.engine_scratch :]
-        # (1'): alpha_qkvg / scale_q / scale_k / scale_v ride the stage's qscal vector.
+        # (1'): alpha_qkvg / scale_q / scale_k / scale_v ride as `qscal` (words 0..3 of the quant slot).
         # The runner takes the four outputs 2-D ([T, h*d]); the [T, H, D] / [B, S, H, D] views are for the SDPA.
         self._proj.execute_fp8(
             h.view(t, g.d_model),
@@ -3881,6 +3905,7 @@ class GatedAttentionBlockFwd(APIBase):
             w_k_norm,
             cos,
             sin,
+            qscal=qd["qscal"],
             stream=stream,
         )
         # (4'): e4m3 in, e4m3 out; the SDPA gates the SUBSTITUTED O (after the
@@ -3903,7 +3928,9 @@ class GatedAttentionBlockFwd(APIBase):
         # (6): e4m3 O_gated @ W_o^T with (1/scale_o) * descale_w_o in the epilogue.
         self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
 
-    def _execute_mxfp8_fused(self, h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=None) -> None:
+    def _execute_mxfp8_fused(
+        self, h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, qd, w_o_sf=None
+    ) -> None:
         """The FULLY FUSED MXFP8 pipeline: three launches, eight workspace slots.
 
         ::
@@ -3923,12 +3950,12 @@ class GatedAttentionBlockFwd(APIBase):
         ``w_o_sf`` (appended) -- fp4 O (config row 10, FOUR launches): the gated SDPA writes **bf16** ``o``
         (``o8`` is not reserved), ``quantize_fp4_o`` turns it into ``o4`` + ``sf_o``, and the out projection
         is the fp4 x fp4 block-scale GEMM over ``sf_o`` / ``w_o_sf`` (no alpha).
+        ``qd`` is :meth:`_fill_quant_slot`'s view dict (``alpha_o`` only; ``{}`` under ``o_fp4``).
         """
         g = self.geom
         b, s = self.batch, self.seq_len
         t = b * s
         ws = self._ws
-        qd = self._quant_dev
         e4 = torch.float8_e4m3fn
         q8 = _view(workspace, ws.q8, (t, g.h_q, g.d_head), e4)
         k8 = _view(workspace, ws.k8, (t, g.h_kv, g.d_head), e4)
