@@ -214,7 +214,7 @@ class EngramGateSavedBackward(_SavedGate):
     """Deterministic saved-state backward producing contiguous packed dKV.
 
     The supplied saved state must come from forward with the same X/KV/weight.
-    N must be a multiple of64. dWeight is FP32; dX and packed dKV are BF16.
+    N must be a multiple of 64. dWeight is FP32; dX and packed dKV are BF16.
     """
 
     def __init__(self, x, kv, weight, saved, grad_out, *, backend="frost"):
@@ -240,8 +240,8 @@ class EngramGateSavedBackward(_SavedGate):
 
     def check_support(self):
         self._check_common()
-        self._value_error_if(self._tokens % 64 != 0, "saved backward requires tokens divisible by64")
-        self._value_error_if(self._tokens > 8192, "saved backward currently supports at most8192 tokens")
+        self._value_error_if(self._tokens % 64 != 0, "saved backward requires tokens divisible by 64")
+        self._value_error_if(self._tokens > 8192, "saved backward currently supports at most 8192 tokens")
         _reductions()
         self._is_supported = True
         return True

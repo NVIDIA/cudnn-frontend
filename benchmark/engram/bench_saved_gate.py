@@ -4,7 +4,7 @@
 
 Includes the native projection, gate, projection/input GEMM gradients, and
 product-rule gradients for both normalization weights. Synthetic inputs use
-the model's four streams, H5120 and embedding width6144. This floating training
+the model's four streams, H5120 and embedding width 6144. This floating training
 surrogate does not measure lookup, FP8/QAT, collectives, or a whole model step.
 """
 
