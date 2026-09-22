@@ -439,21 +439,25 @@ class SlidingWindowAttention(APIBase):
                         f"q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, and stats_ragged_offset_tensor must be all provided or all None, got {q_ragged_offset_tensor}, {k_ragged_offset_tensor}, {v_ragged_offset_tensor}, {o_ragged_offset_tensor}, and {stats_ragged_offset_tensor}"
                     )
                 self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
-                (
-                    q_ragged_offset_tensor,
-                    k_ragged_offset_tensor,
-                    v_ragged_offset_tensor,
-                    o_ragged_offset_tensor,
-                    stats_ragged_offset_tensor,
-                ) = self._calculate_ragged_offsets(
-                    seq_len_q_tensor,
-                    seq_len_kv_tensor,
-                    self.sample_q,
-                    self.sample_k,
-                    self.sample_v,
-                    self.sample_o,
-                    self.sample_stats,
-                )
+                # Produced AND allocated on the handle's stream (R1): the graph reads these on that
+                # stream after this call returns, and the caching allocator orders a block's reuse
+                # only against the stream it was allocated on.
+                with torch.cuda.device(q_tensor.device), stream_context(cudnn.get_stream(cudnn_handle), q_tensor.device):
+                    (
+                        q_ragged_offset_tensor,
+                        k_ragged_offset_tensor,
+                        v_ragged_offset_tensor,
+                        o_ragged_offset_tensor,
+                        stats_ragged_offset_tensor,
+                    ) = self._calculate_ragged_offsets(
+                        seq_len_q_tensor,
+                        seq_len_kv_tensor,
+                        self.sample_q,
+                        self.sample_k,
+                        self.sample_v,
+                        self.sample_o,
+                        self.sample_stats,
+                    )
 
         variant_pack = {
             self.q_cudnn: q_tensor,

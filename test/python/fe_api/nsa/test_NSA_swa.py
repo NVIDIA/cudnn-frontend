@@ -112,19 +112,21 @@ def test_nsa_swa_compile_execute(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_nsa_swa_execute_allocates_scratch_on_the_handle_stream(request, monkeypatch):
+@pytest.mark.parametrize("layout", ["bshd", "thd"])
+def test_nsa_swa_execute_allocates_scratch_on_the_handle_stream(layout, request, monkeypatch):
     """The handle is re-streamed to a side stream while torch stays on its default stream.
-    execute()'s per-call scratch must be allocated on the handle's (launch) stream (R1):
-    the caching allocator orders a block's reuse only against the stream it was allocated
-    on, so scratch allocated on the default stream could be handed to the next allocation
-    while the graph is still reading it on the side stream."""
+    Everything execute() allocates per call -- the backend workspace and, for THD without
+    caller offsets, the five internally generated ragged-offset tensors -- must be produced
+    on the handle's (launch) stream (R1): the caching allocator orders a block's reuse only
+    against the stream it was allocated on, so a buffer produced on the default stream could
+    be handed to the next allocation while the graph is still reading it on the side stream."""
     try:
         from cudnn import NSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     cfg = nsa_init(
         request=request,
-        layout="bshd",
+        layout=layout,
         dtype=torch.float16,
         acc_dtype=torch.float32,
         scale_softmax=None,
@@ -156,13 +158,14 @@ def test_nsa_swa_execute_allocates_scratch_on_the_handle_stream(request, monkeyp
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())  # the inputs were written on the default stream
     allocation_streams = []
-    real_empty = torch.empty
+    for name in ("empty", "zeros", "cat", "cumsum"):  # the workspace + the ragged-offset producers
+        real = getattr(torch, name)
 
-    def recording_empty(*args, **kwargs):
-        allocation_streams.append(torch.cuda.current_stream().cuda_stream)
-        return real_empty(*args, **kwargs)
+        def recording(*args, _real=real, **kwargs):
+            allocation_streams.append(torch.cuda.current_stream().cuda_stream)
+            return _real(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "empty", recording_empty)
+        monkeypatch.setattr(torch, name, recording)
     swa.execute(
         q_tensor=Q,
         k_tensor=K,
@@ -174,8 +177,9 @@ def test_nsa_swa_execute_allocates_scratch_on_the_handle_stream(request, monkeyp
         current_stream=side.cuda_stream,
     )
     seen = set(allocation_streams)
-    assert allocation_streams, "execute() allocated nothing; the test no longer covers the scratch allocation"
-    assert seen == {side.cuda_stream}, f"scratch allocated on stream(s) {seen}, the graph runs on {side.cuda_stream}"
+    expected_calls = 1 if layout == "bshd" else 1 + 5 * 2  # workspace (+ zeros/cumsum per generated offset, cat once each)
+    assert len(allocation_streams) >= expected_calls, f"execute() made {len(allocation_streams)} allocating calls; the test no longer covers them all"
+    assert seen == {side.cuda_stream}, f"allocations on stream(s) {seen}, the graph runs on {side.cuda_stream}"
     assert cudnn.get_stream(cudnn_handle) == side.cuda_stream
 
     torch.cuda.current_stream().wait_stream(side)
