@@ -8,6 +8,7 @@ Tests for Discrete-weight Grouped GEMM dGLU Backward Kernel (SM100+)
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_dswiglu_utils import (
     discrete_dswiglu_init,
@@ -286,6 +287,7 @@ def _test_discrete_dswiglu_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     check_ref_discrete_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
