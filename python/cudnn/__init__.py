@@ -424,6 +424,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
+    "AlignedHCABackward": (".deepseek_sparse_attention", "AlignedHCABackward"),
+    "aligned_hca_backward_wrapper": (".deepseek_sparse_attention", "aligned_hca_backward_wrapper"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
     "CSACompressorBackward": (".csa", "CSACompressorBackward"),
