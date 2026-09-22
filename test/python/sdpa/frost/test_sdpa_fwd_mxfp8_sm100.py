@@ -25,14 +25,7 @@ Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (mxfp8 support).
 Skips cleanly otherwise.
 """
 
-import glob
-import json
 import math
-import os
-import shutil
-import subprocess
-import sys
-import textwrap
 from typing import NamedTuple, Optional
 
 import pytest
@@ -41,7 +34,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2151,20 +2144,12 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
 # sm_103a with the cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate,
 # so the split is folded OUT and the kernel issues develop's 258 MUFU.EX2).  SKIPS when no nvdisasm on $CUDA_PATH/bin or
 # $PATH decodes the cubin; a compile failure is a FAIL.
-_SM100_D128_MXFP8_SASS_PROBE = textwrap.dedent("""
-    import glob, json, os, subprocess, sys
-    dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
-    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
-    os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
-    os.environ["CUTE_DSL_ARCH"] = arch               # unconditional: an inherited value would pin the wrong target's SASS
-    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
-    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+_SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
     # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
     # come from the caller as the record api_dsl.template_params() builds for that device.
     (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
-    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **json.loads(params_json))
+    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **params_kw)
     mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
     # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern (and the gate) rather
@@ -2174,32 +2159,6 @@ _SM100_D128_MXFP8_SASS_PROBE = textwrap.dedent("""
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
     mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
-    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
-    if not cubins:
-        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
-    nvd = None
-    for c in cands:
-        try:
-            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.SubprocessError) as exc:
-            print("REJECT", c, "->", repr(exc)); continue
-        if proc.returncode == 0 and proc.stdout.strip():
-            nvd = c; print("NVDISASM", c); break
-        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
-    if nvd is None:
-        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
-    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
-    def cnt(*subs):
-        return sum(1 for ln in sass if all(sb in ln for sb in subs))
-    print("SASS MUFU_EX2", cnt("MUFU.EX2"))
-    print("SASS FFMA2", cnt(" FFMA2"))
-    print("SASS FADD2", cnt(" FADD2"))
-    print("SASS FSETP", cnt("FSETP"))
-    print("SASS FSEL", cnt("FSEL"))
-    print("SASS FMNMX3", cnt("FMNMX3"))
-    print("SASS STL", cnt("STL"))
-    print("SASS LDL", cnt("LDL"))
-    print("SASS LINES", len(sass))
     """)
 
 # sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
@@ -2219,46 +2178,11 @@ _CC100_D128_MXFP8_PARAMS = {"fused_ldtm_stat": False, "exp2_fma_split": True}
 _CC103_D128_MXFP8_PARAMS = {"fused_ldtm_stat": True, "exp2_fma_split": False}
 
 
-def _nvdisasm_candidates():
-    cands = []
-    if os.environ.get("CUDA_PATH"):
-        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
-    on_path = shutil.which("nvdisasm")
-    if on_path:
-        cands.append(on_path)
-    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
-
-
-def _arch_known_to_the_dsl(arch: str) -> bool:
-    try:
-        from cutlass.base_dsl.enums import Arch
-
-        Arch.from_string(arch)
-        return True
-    except Exception:
-        return False
-
-
 def _d128_mxfp8_sass_probe(tmp_path, arch: str, params: dict):
     """Trace-compile the d128 MXFP8 kernel for ``arch`` with the per-cc ``params`` and return (stats, expect):
     the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state)."""
-    if not _arch_known_to_the_dsl(arch):
-        pytest.skip(f"this cutlass-dsl has no {arch}")
-    cands = _nvdisasm_candidates()
-    if not cands:
-        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"{arch}_mxfp8_d128"
-    dump.mkdir()
-    argv = [sys.executable, "-c", _SM100_D128_MXFP8_SASS_PROBE, str(dump), arch, json.dumps(params), *cands]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"{arch} trace-compile of the d128 mxfp8 kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-    out = proc.stdout.splitlines()
-    if any(ln.startswith("SKIP") for ln in out):
-        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
-    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
-    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith(("EXPECT_MUFU_EX2 ", "EMULATED_COLS ", "E2E_ENABLED "))}
-    print(f"\nsm100 d128 mxfp8 {arch} {params} SASS: {stats}; module says {expect}")
-    return stats, expect
+    probe = run_sass_probe(tmp_path, probe_src=_SM100_D128_MXFP8_SASS_PROBE, arch=arch, params=params, tag="mxfp8_d128")
+    return probe.stats, probe.expect
 
 
 @pytest.mark.L0
