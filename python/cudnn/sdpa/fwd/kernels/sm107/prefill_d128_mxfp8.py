@@ -513,8 +513,10 @@ def _kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
     # Rule 3: the O scale is a 1-element DEVICE tensor read in-kernel (no host readback).
+    # A None scale_o (compile(has_scale_o=False)) is the identity fold: the operand
+    # is compiled out, so no device constant exists for it at any level.
     o_scale_fused = cutlass.Float32(1.0)
-    if cutlass.const_expr(CFG.O_BLOCK_SCALE > 0):
+    if cutlass.const_expr(CFG.O_BLOCK_SCALE > 0 and scale_o_t is not None):
         o_scale_fused = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
 
     bidx = cute.arch.block_idx()[0]
@@ -2935,6 +2937,9 @@ def compile(  # noqa: A001
     d_v: int = CFG.TILE_O,
     has_lse: bool = True,
     lse_stride: Optional[tuple] = None,
+    # Block-scaled O: whether the scale_o operand exists. False None-specializes
+    # it and the kernel folds an identity (no device constant anywhere).
+    has_scale_o: bool = True,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
 
@@ -3095,7 +3100,7 @@ def compile(  # noqa: A001
             ()
             if CFG.O_BLOCK_SCALE == 0
             else (
-                cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4),
+                (cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None),
                 cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
                 cutlass.Int32(0),
                 cutlass.Int32(0),

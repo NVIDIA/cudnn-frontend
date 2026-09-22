@@ -877,7 +877,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
-    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o", "sample_sf_o"], params[extension_start:]
+    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o", "sample_sf_o", "sample_scale_o"], params[
+        extension_start:
+    ]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
     # Both gate parameters default OFF, so every pre-gate call site is untouched.

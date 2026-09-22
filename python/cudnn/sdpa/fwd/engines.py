@@ -1745,6 +1745,10 @@ def lower_dsl_prefill(
         # per-(b,h)-plane or token-major scale-factor layout (see
         # SdpaFwdDsl._sf_o_geometry).
         sample_sf_o=ga.tensor_desc_from_ir(facts.sf_o_t, name="sf_o") if facts.sf_o_t is not None else None,
+        # MXFP8 input: scale_o is a python-only OPTIONAL input (the FP4 global
+        # scale) and its presence is a compile form of the kernel (identity fold
+        # otherwise). The per-tensor FP8 op's scale_o is a required execute operand.
+        sample_scale_o=ga.tensor_desc_from_ir(facts.scale_o_t, name="scale_o") if (facts.is_mxfp8 and facts.scale_o_t is not None) else None,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,

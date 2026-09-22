@@ -71,6 +71,21 @@ def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
 
 
 @pytest.mark.L0
+def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy():
+    """sdpa_mxfp8's scale_o is optional. A graph that declares none must get the
+    kernel's None-specialized identity fold (constructor ``sample_scale_o=None``
+    -> ``compile(has_scale_o=False)``), NEVER a cached ``torch.ones`` created on
+    the first execute: when that first execute is under CUDA-graph capture the
+    dummy is allocated but its fill is only captured, so an eager execute before
+    the first replay reads garbage (review on #1180; Rule 8)."""
+    source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
+    assert "self._scale_view(None" not in source
+    assert "self.has_scale_o" in source
+    # Append-only public signature: sample_scale_o is the last constructor parameter.
+    assert list(inspect.signature(SdpaFwdDsl.__init__).parameters)[-1] == "sample_scale_o"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("api_cls", [SdpaFwdDslSm100, SdpaFwdDslSm120], ids=["sm100", "sm120"])
 def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cls):
     """The lowering hands ``sf_o`` to ``execute()`` for every graph whose engine

@@ -538,6 +538,7 @@ class SdpaFwdDsl(APIBase):
         sample_gate: Optional[torch.Tensor | TensorDesc] = None,
         has_amax_o: bool = True,
         sample_sf_o: Optional[torch.Tensor | TensorDesc] = None,
+        sample_scale_o: Optional[torch.Tensor | TensorDesc] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -548,6 +549,16 @@ class SdpaFwdDsl(APIBase):
         order, declared either as per-(b, h) planes (BHRC strides, rows >=
         S_q rounded up to 128) or token-major (BRHC strides: one
         ``[B*rows, H*cols]`` matrix a downstream GEMM consumes).
+
+        ``sample_scale_o`` (MXFP8 input only -- the per-tensor FP8 op's
+        ``scale_o`` is a required execute operand): declares that ``execute()``
+        binds a 1-element fp32 ``scale_o``, the FP4 global scale folded into the
+        row normalization (optional with an E4M3 O). Its presence is a compile
+        form of the kernel: without it the ``scale_o`` operand is
+        None-specialized and the kernel folds an identity -- no device constant
+        is allocated or filled for it (Rule 8), so a first execute under CUDA
+        graph capture followed by an eager execute reads no half-initialized
+        dummy.
 
         Optional operands are accepted by every adapter. A concrete
         implementation that cannot lower one raises :class:`NotImplementedError`
@@ -616,6 +627,9 @@ class SdpaFwdDsl(APIBase):
         # decided by check_support exactly like the Q/K/V/O zero-copy strides.
         self._gate_declared: Optional[tuple] = None
         self.sf_o_desc = self._make_tensor_desc(sample_sf_o, name="sf_o")
+        # MXFP8 input: whether execute() binds scale_o (see the constructor doc);
+        # False compiles the operand out and the kernel folds an identity.
+        self.has_scale_o = sample_scale_o is not None
         # Block-scaled O: 0 (plain), 16 (FP4 O + E4M3 SF), 32 (E4M3 O + UE8M0
         # SF); set by check_support together with the SF_O layout geometry.
         self.o_block_scale = 0
@@ -2334,6 +2348,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Both quantized families: the Rubin d256 per-tensor AND block-scale
             # (MXFP8) kernels carry gate_stride / has_amax.
             fp8_kwargs.update(**_stride_kw, **_gate_kw, **_amax_kw)
+            if "has_scale_o" in _kc:
+                # Block-scaled O on the MXFP8 kernels: whether the scale_o operand
+                # exists (None-specialized identity fold otherwise; has_scale_o).
+                fp8_kwargs["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
             self._compiled_kernel = self._k_mod.compile(**fp8_kwargs)
         self._combine_kernel = None
         # What the combine's amax slot is COMPILED for.  Under a split the main
@@ -3424,10 +3442,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Epilogue gate (bf16, O's shape): a view at the compiled strides, never a copy.
         G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
         # Block-scaled O: the SF_O buffer + its geometry, and scale_o as the FP4
-        # global scale (a cached 1.0 when the caller gave none: legal for UE8M0).
+        # global scale. The scale operand exists only in a specialization built
+        # with sample_scale_o; otherwise the kernel folds an identity and NO
+        # device constant is created here -- a cached torch.ones whose fill ran
+        # on a first execute that was being CAPTURED is never filled for an
+        # eager execute that precedes the replay (Rule 8; review on #1180).
         sf_o_kwargs = self._sf_o_kernel_kwargs(sf_o, device) if self.o_block_scale else {}
         if self.o_block_scale:
-            sf_o_kwargs["scale_o_t"] = self._scale_view(scale_o, "scale_o", device)
+            if self.has_scale_o:
+                self._value_error_if(scale_o is None, "this specialization was compiled with a scale_o (sample_scale_o); pass scale_o to execute")
+                sf_o_kwargs["scale_o_t"] = self._scale_view(scale_o, "scale_o", device)
+            else:
+                self._value_error_if(scale_o is not None, "this specialization was compiled without scale_o; construct the API with sample_scale_o")
 
         n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
@@ -3523,8 +3549,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 stream=current_stream,
             )
         with _torch_stream_context(current_stream, device):
-            if self.o_block_scale and amax_o is not None and amax_o_buf is not None:
-                # The epilogue folded scale_o into O; Amax_O reports the PRE-scale amax.
+            if self.o_block_scale and amax_o is not None and amax_o_buf is not None and "scale_o_t" in sf_o_kwargs:
+                # The epilogue folded scale_o into O; Amax_O reports the PRE-scale amax
+                # (an identity fold leaves nothing to divide).
                 amax_o_buf.div_(sf_o_kwargs["scale_o_t"])
             if o_needs_copy_back:
                 O_view.copy_(O)

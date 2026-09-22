@@ -220,6 +220,7 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     scale_o=None,
+    capture_first: bool = False,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -376,6 +377,15 @@ def _run(
         g.execute(poison_vp, workspace)
         torch.cuda.synchronize()
         amax_buf.zero_()
+    if capture_first:
+        # The plan's FIRST execute is CAPTURED and never replayed here: anything
+        # a plan lazily creates and fills on its first execute (a cached identity
+        # scale, say) is allocated but its fill only captured, so the eager
+        # execute below would read it half-initialized (Rule 8; review on #1180).
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            g.execute(vp, workspace)
+        torch.cuda.synchronize()
     g.execute(vp, workspace)
     torch.cuda.synchronize()
 
@@ -2089,6 +2099,18 @@ def test_mxfp8_block_scaled_mxfp8_out_with_scale_o():
     """The UE8M0 mode accepts an optional scale_o too (folded into O, divided back
     out of Amax_O), so both modes share one contract with sdpa_fp8."""
     res = _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="mxfp8", scale_o=0.5)
+    _check_block_scaled(res, 32, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=75)
+def test_mxfp8_block_scaled_omitted_scale_o_first_execute_captured_then_eager():
+    """UE8M0 mode without scale_o: the identity scale is a compile-time fold of
+    the kernel, not a device constant the plan creates on its first execute.
+    First execute CAPTURED (never replayed), then an eager execute -- O and the
+    pre-scale Amax_O must be right (review on #1180: the cached-dummy version
+    returned all-zero O and a NaN amax here)."""
+    res = _run(2, 4, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="mxfp8", scale_o=None, capture_first=True)
     _check_block_scaled(res, 32, "e4m3")
 
 

@@ -789,6 +789,48 @@ def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):
     return s_qo + right_bound <= s_kv
 
 
+def _mxfp8_block_scaled_engine_covers(sm):
+    """Whether a FROST MXFP8 forward engine row that carries the block-scaled O
+    epilogue serves this arch (``engines.py`` is the source of truth: the SM100
+    and SM107 lines today; SM120 has no MXFP8 kernel, so a draw there must fold)."""
+    from cudnn.sdpa.fwd import engines
+
+    return any(
+        c.is_mxfp8 and c.phase == "prefill" and {16, 32} <= set(c.o_block_scales) and c.sm_lo <= sm <= c.sm_hi
+        for c in (spec.capabilities for spec in engines.ENGINE_SPECS)
+    )
+
+
+def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fma, d_qk, d_vo, s_qo, s_kv, right_bound, diag_align, engines_enabled=None, has_fp4=None):
+    """The ``o_block_scale`` a drawn config actually runs with: the draw itself where
+    the FROST d128 MXFP8 epilogue serves it, else 0 (a plain MXFP8 forward).
+
+    Mirrors the engine's rules, so a draw admitted here and then declined is a
+    FAILURE, not a waive: an MXFP8 engine row for this arch (and the opt-in FROST
+    engines enabled), a dense unpaged inference forward, no backend-only
+    ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile or covered
+    by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure function
+    (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
+    if not o_block_scale:
+        return 0
+    engines_enabled = opt_in_engines_enabled() if engines_enabled is None else engines_enabled
+    has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
+    if not (
+        engines_enabled
+        and _mxfp8_block_scaled_engine_covers(sm)
+        and is_infer
+        and not is_paged
+        and not with_unfuse_fma
+        and d_qk == 128
+        and d_vo == 128
+        and _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align)
+    ):
+        return 0
+    if o_block_scale == 16 and not has_fp4:
+        return 0  # the packed FP4 dtype arrived in torch 2.8; older builds run the draw as plain mxfp8
+    return o_block_scale
+
+
 def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     """Execute MXFP8 SDPA test."""
     if request.config.option.dryrun:
@@ -819,29 +861,26 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
     torch_otype = cfg.output_type if hasattr(cfg, 'output_type') and cfg.output_type else torch.bfloat16
 
-    # Block-scaled O (sf_o): the FROST d128 MXFP8 epilogue (SM100 and newer, an
-    # opt-in engine) serves dense, unpaged forward graphs with d_qk = d_v = 128,
-    # without the backend-only unfuse_fma attribute, whose KV tail is a whole
-    # 128-tile or is covered by the causal band (the engine's S_kv rule) -- laid
-    # out BSHD-physical, see generate_graph_fwd. Fold the knob to 0 elsewhere so
-    # the drawn config still runs as a plain MXFP8 forward: the sf_o output has
-    # no backend lowering, so an admitted draw that is declined below is a
-    # failure, not a waive.
-    o_block_scale = int(getattr(cfg, 'o_block_scale', 0) or 0)
-    block_scaled_o_arch = torch.cuda.get_device_capability()[0] >= 10
-    if o_block_scale and not (
-        block_scaled_o_arch
-        and opt_in_engines_enabled()
-        and cfg.is_infer
-        and not getattr(cfg, 'is_paged', False)
-        and not with_unfuse_fma
-        and d_qk == 128
-        and d_vo == 128
-        and _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align)
-    ):
-        o_block_scale = 0
-    if o_block_scale == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
-        o_block_scale = 0  # the packed FP4 dtype arrived in torch 2.8; older builds run the draw as plain mxfp8
+    # Block-scaled O (sf_o): run the draw where the FROST d128 MXFP8 epilogue
+    # serves it (block_scaled_o_draw mirrors the engine rows: arch range, dense
+    # unpaged inference forward, no unfuse_fma, d = 128, KV-tail rule) -- laid
+    # out BSHD-physical, see generate_graph_fwd. Elsewhere the draw folds to a
+    # plain MXFP8 forward: the sf_o output has no backend lowering, so an
+    # admitted draw that is declined below is a failure, not a waive.
+    cc = torch.cuda.get_device_capability()
+    o_block_scale = block_scaled_o_draw(
+        int(getattr(cfg, 'o_block_scale', 0) or 0),
+        sm=10 * cc[0] + cc[1],
+        is_infer=cfg.is_infer,
+        is_paged=getattr(cfg, 'is_paged', False),
+        with_unfuse_fma=with_unfuse_fma,
+        d_qk=d_qk,
+        d_vo=d_vo,
+        s_qo=s_qo,
+        s_kv=s_kv,
+        right_bound=right_bound,
+        diag_align=diag_align,
+    )
     if o_block_scale:
         # The quantized O container is E4M3 (mxfp8 out) or the E2M1 byte container
         # (nvfp4); the reference stays fp32 and is compared after dequantization.
