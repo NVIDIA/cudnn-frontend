@@ -426,10 +426,10 @@ class SlidingWindowAttention(APIBase):
         v_ragged_offset_tensor: Optional[torch.Tensor] = None,
         o_ragged_offset_tensor: Optional[torch.Tensor] = None,
         stats_ragged_offset_tensor: Optional[torch.Tensor] = None,
-        workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
         cudnn_handle: Optional[cudnn.handle] = None,
         skip_compile: bool = False,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled graph. ``workspace``: ``get_workspace_size()`` bytes (uint8, graph's device); required
         when that size is non-zero. ``T,H,D``: the ragged-offset tensors are required (see the class docstring)."""
