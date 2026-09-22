@@ -2834,11 +2834,19 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { S, Stats, Max, Sum_exp };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs)
+    // Emit Stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp). Only affects Stats.
+    bool stats_use_log2 = false;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs, stats_use_log2)
 
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
         inputs[Softmax_attributes::input_names::SINK] = value;
+        return *this;
+    }
+
+    Softmax_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 };

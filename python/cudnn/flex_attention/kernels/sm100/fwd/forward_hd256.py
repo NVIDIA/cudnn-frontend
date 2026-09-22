@@ -12,6 +12,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from cudnn.flex_attention.kernels.common.max_logit import init_max_logit, store_max_logit, update_max_logit
 from cudnn.flex_attention._compat import copy_utils
 
 import cuda.bindings.driver as cuda
@@ -169,6 +170,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_id=2,
             num_threads=self.threads_per_warp * len(self.correction_warp_ids),
         )
+        self.max_logit_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_warp * len(self.softmax_warp_ids),
+        )
 
         self.tmem_s_offset = 0
         self.tmem_o_offset = 256
@@ -197,6 +202,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -221,6 +227,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert len(blocksparse_tensors.mask_block_masks.shape) == 4, "SM100 hd256 arbitrary forward payload must be rank 4"
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
         lse_tensor = mLSE
+        max_logit_tensor = mMaxLogit
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
 
@@ -356,6 +363,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if cutlass.const_expr(lse_tensor is not None and lse_tensor.element_type != Float32):
+            raise TypeError("LSE tensor must be Float32")
+        if cutlass.const_expr(max_logit_tensor is not None and max_logit_tensor.element_type != Float32):
+            raise TypeError("max_logit tensor must be Float32")
         self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -513,6 +524,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             sequence_desc_qk,
             sequence_desc_qk,
             lse,
+            max_logit_tensor,
             scale_softmax_log2,
             scale_softmax,
             scale_output,
@@ -549,6 +561,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mSequenceDescQ: Optional[cute.Tensor],
         mSequenceDescK: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
@@ -737,6 +750,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             layout=cute.make_layout(len(self.softmax_warp_ids) * self.threads_per_warp),
             byte_alignment=128,
         )
+        sMaxLogit = None
+        if cutlass.const_expr(mMaxLogit is not None):
+            sMaxLogit = smem.allocate_tensor(
+                element_type=Float32,
+                layout=cute.make_layout((1,)),
+                byte_alignment=16,
+            )
         qk_thr_mma = qk_tiled_mma.get_slice(mma_tile_coord_v)
         pv_thr_mma = pv_tiled_mma.get_slice(mma_tile_coord_v)
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
@@ -1240,8 +1260,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     sum_producer = self.store_sum_max(
                         row_max,
                         mLSE,
+                        mMaxLogit,
                         row_sum,
                         sSum,
+                        sMaxLogit,
                         sum_producer,
                         curr_block_coord,
                         seqlen_q,
@@ -1795,8 +1817,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self,
         row_max,
         mLSE,
+        mMaxLogit,
         row_sum,
         sSum,
+        sMaxLogit,
         sum_producer,
         current_block_coord,
         seqlen_q,
@@ -1811,6 +1835,26 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.arch.fence_view_async_shared()
         sum_handle.commit()
         row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+
+        if cutlass.const_expr(mMaxLogit is not None):
+            init_max_logit(sMaxLogit, thread_idx)
+            self.max_logit_barrier.arrive_and_wait()
+            q_idx = current_block_coord[0] * self.cta_tiler[0] + thread_idx
+            update_max_logit(
+                sMaxLogit,
+                row_max,
+                cute.elem_less(q_idx, seqlen_q) and (not row_sum_is_zero_or_nan or scale_softmax == Float32(0.0)),
+                Int32(0),
+                scale_softmax,
+            )
+            self.max_logit_barrier.arrive_and_wait()
+            store_max_logit(
+                sMaxLogit,
+                mMaxLogit,
+                thread_idx,
+                current_block_coord[2][0],
+            )
+            self.max_logit_barrier.arrive_and_wait()
 
         if cutlass.const_expr(mLSE is not None):
             q_idx = current_block_coord[0] * self.cta_tiler[0] + tidx

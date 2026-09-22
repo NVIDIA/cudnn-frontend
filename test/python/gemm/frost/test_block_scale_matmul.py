@@ -567,6 +567,78 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo,a_dtype,b_dtype,out_dtype",
+    [
+        ("nvfp4", "fp4_e2m1", "fp4_e2m1", "bf16"),
+        ("mxfp4", "fp4_e2m1", "fp4_e2m1", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e4m3", "bf16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e4m3", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("profile_device", ["b200", "rubin"])
+def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, combo, a_dtype, b_dtype, out_dtype):
+    from gemm_test_utils import skip_unless_pipeline_active
+    from cudnn.engines import is_python_engine
+    from cudnn.gemm.frost import planning, tile_config
+    from cudnn.gemm.frost.dtypes import CUDNN_FROM_DTYPE
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    skip_unless_pipeline_active(by_name(_SPLITK_BS_CFG))
+    if profile_device == "b200":
+        monkeypatch.setattr(planning, "current_device_properties", lambda: planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864))
+        monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
+        monkeypatch.setattr(C, "_sm_count", lambda: 148)
+    elif torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rubin profile requires an SM107 GPU")
+    m, n, k = 192, 160, 4160
+    torch.manual_seed(919)
+    a, b, sfa, sfb, reference, bs, sf_dt, _ = _make_block_scale_inputs(combo, m, n, k)
+    if combo == "mxfp8":
+        torch_dtypes = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+        a = torch.randint(-2, 3, (1, m, k), device="cuda").to(torch_dtypes[a_dtype])
+        b = torch.randint(-2, 3, (1, n, k), device="cuda").to(torch_dtypes[b_dtype])
+        reference = (a[0].double() * sfa.double().repeat_interleave(bs, -1)) @ (b[0].double() * sfb.double().repeat_interleave(bs, -1)).t()
+    output_torch = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    reference = reference.to(output_torch)
+    sfa = _to_blocked(sfa).view(1, _ceil_div(m, 128) * 128, -1)
+    sfb = _to_blocked(sfb).view(1, _ceil_div(n, 128) * 128, -1)
+
+    def graph():
+        g = _build_nvfp4_graph(m, n, k, block_size=bs, sf_dt=sf_dt, a_dt=CUDNN_FROM_DTYPE[a_dtype], b_dt=CUDNN_FROM_DTYPE[b_dtype])
+        _, binding = analyze_with_binding(g)
+        binding.outputs[0].set_data_type(CUDNN_FROM_DTYPE[out_dtype])
+        g.validate()
+        g.build_operation_graph()
+        return g, binding
+
+    g, _ = graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    records = [g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())]
+    records = [(engine, knobs) for engine, knobs in records if is_python_engine(engine)]
+    assert len(records) == 8
+    assert len({GemmKnobs.from_public(knobs).to_config() for _, knobs in records}) == 8
+    if profile_device == "rubin":
+        assert all(GemmKnobs.from_public(knobs).to_config().mma_tile_k_bytes == 64 for _, knobs in records)
+    for engine, knobs in records:
+        replay, binding = graph()
+        replay.create_execution_plan(engine, knobs)
+        index = replay.get_execution_plan_count() - 1
+        replay.select_plan(index)
+        replay.check_support()
+        replay.build_plans()
+        assert replay.get_engine_and_knobs_at_index(index) == (engine, knobs)
+        y = torch.full((1, m, n), float("nan"), device="cuda", dtype=output_torch)
+        workspace = torch.empty(max(1, replay.get_workspace_size()), device="cuda", dtype=torch.uint8)
+        pack = {binding.a_operands[0]: a, binding.b_operands[0]: b, binding.sfa_operands[0]: sfa, binding.sfb_operands[0]: sfb, binding.outputs[0]: y}
+        replay.execute_plan_at_index(pack, workspace, index=index)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y[0], reference, rtol=0, atol=0)
+
+
 def _splitk_workspace(compiled):
     """(Workspace, buffer); the caller keeps both alive across the launch."""
     from cudnn.frost.workspace import Workspace
@@ -578,27 +650,37 @@ def _splitk_workspace(compiled):
 
 
 def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False):
-    """Block-scale matmul vs a torch dequant-matmul reference."""
+    """Block-scale matmul vs a torch dequant-matmul reference.
+
+    ``combo`` is ``nvfp4`` / ``mxfp4`` / ``mxfp8`` (both sides alike) or ``mxfp8_x_mxfp4`` -- the
+    MIXED catalog row: e4m3 A against an e2m1 B under E8M0 / 32 scales (the gated attention
+    block's stage (1) with an MXFP4 weight), so the shape/cluster sweep covers it beyond the
+    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``."""
     dev = "cuda"
     torch.manual_seed(0)
-    is_fp4 = combo in ("nvfp4", "mxfp4")
+    mixed = combo == "mxfp8_x_mxfp4"
+    a_fp4 = combo in ("nvfp4", "mxfp4")
+    b_fp4 = a_fp4 or mixed
     bs = 16 if combo == "nvfp4" else 32
     sf_k = K // bs
-    a_dt = cudnn.data_type.FP4_E2M1 if is_fp4 else cudnn.data_type.FP8_E4M3
+    a_dt = cudnn.data_type.FP4_E2M1 if a_fp4 else cudnn.data_type.FP8_E4M3
+    b_dt = cudnn.data_type.FP4_E2M1 if b_fp4 else cudnn.data_type.FP8_E4M3
     sf_dt = cudnn.data_type.FP8_E4M3 if combo == "nvfp4" else cudnn.data_type.FP8_E8M0
 
-    if is_fp4:
-        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    if a_fp4:
         a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
-        b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
         a_rt = a_u8.view(torch.float4_e2m1fn_x2)
-        b_rt = b_u8.view(torch.float4_e2m1fn_x2)
         a_deq = _unpack_fp4(a_u8, lut).view(M, K)
-        b_deq = _unpack_fp4(b_u8, lut).view(N, K)
     else:
         a_rt = (torch.randn(1, M, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
-        b_rt = (torch.randn(1, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
         a_deq = a_rt.float().view(M, K)
+    if b_fp4:
+        b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+        b_rt = b_u8.view(torch.float4_e2m1fn_x2)
+        b_deq = _unpack_fp4(b_u8, lut).view(N, K)
+    else:
+        b_rt = (torch.randn(1, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
         b_deq = b_rt.float().view(N, K)
 
     if combo == "nvfp4":
@@ -608,9 +690,11 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
         sfa_log = _rand_e8m0((M, sf_k), dev)
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
-    g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
+    g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, b_dt=b_dt, out_major=out_major)
     compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k), force_stg_epi=force_stg)
     assert compiled.block_scale
+    if mixed:
+        assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
     ws, _ws_buf = _splitk_workspace(compiled)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
@@ -2213,6 +2297,13 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
         ("mxfp8", "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma", 384, 512, 256),
         ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
         ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster1x4_1ctamma", 512, 1024, 512),
+        # The MIXED row (e4m3 A x e2m1 B, E8M0 / 32) beyond its single 256x256x512 case: the gated
+        # attention block's forced stage-(1) config in BOTH MMA K forms (K32 padded E2M1, Rubin K64
+        # native-packed), a tail M, a multi-tile N and a deep K -- the shapes its numerics are read at.
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", 1000, 512, 4096),
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma", 1000, 512, 4096),
+        ("mxfp8_x_mxfp4", _SM107_128 + "_1ctamma", 256, 384, 768),
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
     ],
     ids=lambda v: v if isinstance(v, str) else str(v),
 )

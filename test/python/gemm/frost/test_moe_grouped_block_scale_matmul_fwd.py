@@ -276,12 +276,9 @@ def test_e2e_moe_swap_ab_graph_coordinates_and_public_replay(aligned):
         try:
             with torch.cuda.stream(stream):
                 graph.execute(
-                    vp,
+                    {**vp, binding.sfa_operands[0]: sf_tok.view(torch.uint8).view(-1)},
                     workspace,
                     handle=handle,
-                    override_uids=[binding.sfa_operands[0].get_uid()],
-                    override_shapes=[list(sf_tok.shape)],
-                    override_strides=[list(sf_tok.stride())],
                 )
                 base_expected = torch.full_like(base_buf, K)
                 torch.testing.assert_close(base_buf, base_expected, atol=0, rtol=0)

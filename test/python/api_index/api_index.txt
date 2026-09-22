@@ -131,11 +131,8 @@ cudnn.behavior_note.value
 cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
 cudnn.block_sparse_attention.block_sparse_attention_backward
-cudnn.block_sparse_attention.block_sparse_attention_backward_jax
 cudnn.block_sparse_attention.block_sparse_attention_forward
-cudnn.block_sparse_attention.block_sparse_attention_forward_jax
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
-cudnn.block_sparse_attention.block_sparse_attention_jax
 cudnn.build_plan_policy
 cudnn.build_plan_policy.ALL
 cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -296,7 +293,9 @@ cudnn.engines.is_backend_engine
 cudnn.engines.is_python_engine
 cudnn.engines.public_knobs_repr
 cudnn.experimental.ops
+cudnn.experimental.ops.layer_norm
 cudnn.experimental.ops.moe_grouped_matmul
+cudnn.experimental.ops.rms_norm
 cudnn.experimental.ops.swiglu_mlp
 cudnn.fla
 cudnn.fla.accelerate_fla
@@ -373,8 +372,13 @@ cudnn.hstu.hstu_lmsd.hstu_lmsd_forward
 cudnn.is_frontend_knob_type
 cudnn.jax
 cudnn.jax.TensorSpec
+cudnn.jax.block_sparse_attention
+cudnn.jax.block_sparse_attention_backward
+cudnn.jax.block_sparse_attention_forward
 cudnn.jax.call
 cudnn.jax.gemm_operand_spec
+cudnn.jax.grouped_gemm_dswiglu
+cudnn.jax.grouped_gemm_swiglu
 cudnn.jax.neg_inf_init
 cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec
@@ -708,6 +712,7 @@ cudnn.sdpa.fwd.SdpaFwdDslSm100.compile
 cudnn.sdpa.fwd.SdpaFwdDslSm100.execute
 cudnn.sdpa.fwd.SdpaFwdDslSm100.paged
 cudnn.sdpa.fwd.SdpaFwdDslSm100.scratch_workspace_bytes
+cudnn.sdpa.fwd.SdpaFwdDslSm100.template_params
 cudnn.sdpa.fwd.SdpaFwdDslSm120
 cudnn.sdpa.fwd.SdpaFwdDslSm120.check_support
 cudnn.sdpa.fwd.SdpaFwdDslSm120.compile
@@ -759,7 +764,12 @@ cudnn.tensor_reordering.NONE
 cudnn.tensor_reordering.name
 cudnn.tensor_reordering.value
 cudnn.torch
+cudnn.torch.block_sparse_attention_backward
+cudnn.torch.block_sparse_attention_forward
+cudnn.torch.block_sparse_attention_fp8_forward
 cudnn.torch.calls
+cudnn.torch.grouped_gemm_dswiglu
+cudnn.torch.grouped_gemm_swiglu
 cudnn.torch.install
 cudnn.torch.served_plan_names
 cudnn.wrapper

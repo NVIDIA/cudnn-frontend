@@ -44,9 +44,11 @@ def _sdpa_graph(
     s_q=64,
     s_kv=64,
     d=64,
+    with_sink=False,
     **sdpa_kwargs,
 ):
-    """A minimal SDPA forward pygraph; returns (graph, tensors-by-name)."""
+    """A minimal SDPA forward pygraph; returns (graph, tensors-by-name).
+    ``with_sink`` binds a (1, H_q, 1, 1) fp32 ``sink_token`` (cuDNN's contract)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -55,6 +57,8 @@ def _sdpa_graph(
     q = g.tensor(name="q", dim=[b, h_q, s_q, d], stride=[h_q * s_q * d, s_q * d, d, 1])
     k = g.tensor(name="k", dim=[b, h_kv, s_kv, d], stride=[h_kv * s_kv * d, s_kv * d, d, 1])
     v = g.tensor(name="v", dim=[b, h_kv, s_kv, d], stride=[h_kv * s_kv * d, s_kv * d, d, 1])
+    if with_sink:
+        sdpa_kwargs["sink_token"] = g.tensor(name="sink", dim=[1, h_q, 1, 1], stride=[h_q, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
     o, stats = g.sdpa(q, k, v, generate_stats=True, **sdpa_kwargs)
     o.set_output(True)
     if stats is not None:
@@ -213,6 +217,32 @@ def test_sliding_window_sq_gt_skv_rejected(frost_candidate):
     g, _ = _sdpa_graph(s_q=128, s_kv=64, use_causal_mask=True, sliding_window_length=16)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Sliding window attention"):
         g.validate()
+
+
+def test_sink_at_decode_is_not_a_validity_rule(frost_candidate):
+    """sink_token at s_q == 1 (decode) passes the python-native validator without
+    lowering. Whether a decode graph with a sink is SERVED is a support-surface
+    answer each engine gives at planning time (the FROST SM100 row folds the sink
+    into its epilogue independent of S_q; the backend engines decline it there),
+    not a graph-validity answer -- so the classic rule is deliberately absent
+    here, like every other backend-capability gate."""
+    for kwargs in (dict(), dict(use_causal_mask_bottom_right=True), dict(diagonal_band_left_bound=16, diagonal_band_right_bound=0)):
+        g, _ = _sdpa_graph(s_q=1, s_kv=128, with_sink=True, **kwargs)
+        g.validate()
+        assert g._lowered_graph is None, "sink at s_q == 1 must validate natively (no eager C++ lowering)"
+        assert g._is_validated is True
+
+
+@requires_sm80
+def test_sink_at_decode_classic_path_still_rejects(no_candidates):
+    """Backend-only configuration (no python candidate): the C++ support surface
+    keeps its rule, so sink_token at s_q == 1 is still rejected at validate()
+    with the classic message -- lifting the python twin must not widen what the
+    backend path accepts."""
+    g, _ = _sdpa_graph(s_q=1, s_kv=128, with_sink=True)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="decode only mode"):
+        g.validate()
+    assert g._is_validated is False and g._lowered_graph is None
 
 
 def test_bwd_sq1_skv1_rejected(frost_candidate):

@@ -335,8 +335,9 @@ def _half_atol(in_key, d_v=None):
     return 7.5e-2 if d_v == 256 else 4e-2
 
 
-def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = _half_atol(in_key, out.shape[-1])
+def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref, atol=None):
+    if atol is None:
+        atol = _half_atol(in_key, out.shape[-1])
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -1134,7 +1135,10 @@ def test_fp8_pack_gqa_d192_d128_e5m2_sink():
     out, o_ref, a_o, a_ref = _run(
         2, 8, 2, 40, 256, "e5m2", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink, d_qk=192, d_v=128, pack_gqa=True
     )
-    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
+    # This path's residual against the P-cast reference is 0.044 on B200 (DSL 4.7 and 4.8), unchanged since
+    # #709 (0.050 under the previous reference); the shared e5m2 bound #971 tightened to 0.04 was set
+    # without this L1 case.
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref, atol=5e-2)
 
 
 @pytest.mark.L0

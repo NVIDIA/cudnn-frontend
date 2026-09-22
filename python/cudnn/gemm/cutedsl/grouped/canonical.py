@@ -46,7 +46,7 @@ def is_canonical_b(tensor) -> bool:
     """
     if tensor is None or tensor.ndim != 3:
         return False
-    stride = tensor.stride()
+    stride = tensor.stride() if callable(tensor.stride) else tensor.stride
     return stride[2] == 1 and stride[1] != 1 and stride[0] != 1
 
 

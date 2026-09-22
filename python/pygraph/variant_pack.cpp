@@ -160,7 +160,29 @@ struct Operand {
     std::vector<int64_t> shape;
     std::vector<int64_t> stride;  // empty means compact row-major
     bool filled = false;
+    // What the PRODUCER said about its buffer, kept apart from the effective (graph-described /
+    // overridden) geometry above: the element span it guarantees addressable (-1: unknown, a bare
+    // address) and its DLPack device (-1: unknown). An engine deriving a capacity reads these.
+    int64_t observed_bytes       = -1;  // producer's guaranteed span, in BYTES (its own element width)
+    int32_t observed_device_type = -1;
+    int32_t observed_device_id   = -1;
 };
+
+// Emit effective strides into either a native vector or a Python tuple without
+// materializing an intermediate container. Empty producer strides mean compact.
+template <typename Store>
+void
+write_effective_strides(const Operand &operand, Store &&store) {
+    if (!operand.stride.empty()) {
+        for (size_t d = 0; d < operand.stride.size(); ++d) store(d, operand.stride[d]);
+        return;
+    }
+    int64_t running = 1;
+    for (int d = operand.ndim - 1; d >= 0; --d) {
+        store(d, running);
+        if (d > 0) running *= operand.shape[d];
+    }
+}
 
 // Slots from the base to one past the last addressed slot.
 int64_t
@@ -184,6 +206,49 @@ dense_stride_of(const std::vector<int64_t> &shape) {
     return dense;
 }
 
+// A cuDNN (element) geometry as the STORAGE-slot geometry a buffer reports
+// (graph_types.storage_geometry): fp4 packs two elements per slot along the
+// unit-stride axis, so that extent halves and every other stride halves with it.
+// False when the packed extent is odd (no slot geometry spells it).
+bool
+storage_geometry_of(std::vector<int64_t> &shape, std::vector<int64_t> &stride, bool fp4) {
+    if (stride.empty()) stride = dense_stride_of(shape);
+    if (!fp4) return true;
+    for (size_t c = 0; c < shape.size(); c++) {
+        if (stride[c] != 1 || shape[c] <= 1 || shape[c] % 2) continue;
+        bool ok = true;
+        for (size_t j = 0; j < stride.size(); j++)
+            if (j != c && stride[j] != 1 && stride[j] % 2) ok = false;
+        if (!ok) continue;
+        shape[c] /= 2;
+        for (size_t j = 0; j < stride.size(); j++)
+            if (j != c && stride[j] != 1) stride[j] /= 2;
+        return true;
+    }
+    return false;
+}
+
+// (shape, stride) re-expressed in the axis order `reference` uses (_pygraph._in_axis_order_of):
+// both orders rank their axes the same way by stride, which gives the permutation.
+void
+in_axis_order_of(std::vector<int64_t> &shape, std::vector<int64_t> &stride, const std::vector<int64_t> &reference) {
+    const size_t n = shape.size();
+    if (n != stride.size() || n != reference.size()) return;
+    std::vector<size_t> by_stride(n), ref(n);
+    for (size_t i = 0; i < n; i++) by_stride[i] = ref[i] = i;
+    std::stable_sort(by_stride.begin(), by_stride.end(), [&](size_t a, size_t b) { return stride[a] > stride[b]; });
+    std::stable_sort(ref.begin(), ref.end(), [&](size_t a, size_t b) { return reference[a] > reference[b]; });
+    std::vector<size_t> perm(n);
+    for (size_t rank = 0; rank < n; rank++) perm[ref[rank]] = by_stride[rank];
+    std::vector<int64_t> s2(n), t2(n);
+    for (size_t i = 0; i < n; i++) {
+        s2[i] = shape[perm[i]];
+        t2[i] = stride[perm[i]];
+    }
+    shape  = std::move(s2);
+    stride = std::move(t2);
+}
+
 }  // namespace
 
 // The STORAGE-slot geometry every variant-pack slot was declared with. A
@@ -195,10 +260,11 @@ class DeclaredLayout {
     struct Slot {
         std::vector<int64_t> shape;
         std::vector<int64_t> stride;
-        int64_t slot_bytes = 0;  // 0: width unknown, never re-described from
-        int64_t span       = 0;
-        DLDataType dtype   = {0, 0, 1};  // bits == 0: no DLPack spelling, the buffer's own dtype stands
-        bool present       = false;
+        int64_t slot_bytes   = 0;  // 0: width unknown, never re-described from
+        int64_t span         = 0;
+        DLDataType dtype     = {0, 0, 1};  // bits == 0: no DLPack spelling, the buffer's own dtype stands
+        bool present         = false;
+        bool preserve_extent = false;
     };
 
     explicit DeclaredLayout(size_t n) : slots_(n) {}
@@ -208,9 +274,10 @@ class DeclaredLayout {
         std::vector<int64_t> shape,
         std::vector<int64_t> stride,
         int64_t slot_bytes,
-        int dtype_code  = 0,
-        int dtype_bits  = 0,
-        int dtype_lanes = 1) {
+        int dtype_code       = 0,
+        int dtype_bits       = 0,
+        int dtype_lanes      = 1,
+        bool preserve_extent = false) {
         if (shape.size() != stride.size()) {
             throw py::value_error("declared shape and stride must have the same rank; got " +
                                   std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
@@ -223,7 +290,17 @@ class DeclaredLayout {
         slot.slot_bytes = slot_bytes;
         slot.dtype      = DLDataType{
             static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), static_cast<uint16_t>(dtype_lanes)};
-        slot.present = true;
+        slot.present         = true;
+        slot.preserve_extent = preserve_extent;
+    }
+
+    // A slot whose declaration has a dtype but no storage geometry (no dims, or an
+    // fp4 extent no slot geometry spells): overrides still speak its dtype.
+    void
+    set_dtype(size_t index, int dtype_code, int dtype_bits, int dtype_lanes) {
+        Slot &slot = slots_.at(index);
+        slot.dtype = DLDataType{
+            static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), static_cast<uint16_t>(dtype_lanes)};
     }
 
     const std::vector<Slot> &
@@ -541,8 +618,18 @@ class VariantPackNative {
         } else {
             operand.stride.clear();
         }
-        operand.filled   = true;
-        pointers_[index] = operand.data;
+        operand.filled = true;
+        {
+            // A zero-element producer spans nothing: the affine formula assumes a nonempty index domain.
+            const int64_t elems    = numel_of(operand.shape) == 0 ? 0
+                                     : operand.stride.empty()     ? numel_of(operand.shape)
+                                                                  : span_of(operand.shape, operand.stride);
+            const int64_t bytes    = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
+            operand.observed_bytes = elems * bytes;
+        }
+        operand.observed_device_type = static_cast<int32_t>(t.device.device_type);
+        operand.observed_device_id   = t.device.device_id;
+        pointers_[index]             = operand.data;
         return true;
     }
 
@@ -585,11 +672,17 @@ class VariantPackNative {
                 std::vector<int64_t> stride,
                 int dtype_code,
                 int dtype_bits,
-                int dtype_lanes = 1) {
-        Operand &operand = operands_.at(index);
-        operand.data     = reinterpret_cast<void *>(ptr);
-        operand.ndim     = static_cast<int32_t>(shape.size());
-        operand.dtype    = DLDataType{
+                int dtype_lanes          = 1,
+                int64_t observed_bytes   = -1,
+                int observed_device_type = -1,
+                int observed_device_id   = -1) {
+        Operand &operand             = operands_.at(index);
+        operand.observed_bytes       = observed_bytes;
+        operand.observed_device_type = observed_device_type;
+        operand.observed_device_id   = observed_device_id;
+        operand.data                 = reinterpret_cast<void *>(ptr);
+        operand.ndim                 = static_cast<int32_t>(shape.size());
+        operand.dtype                = DLDataType{
             static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), static_cast<uint16_t>(dtype_lanes)};
         operand.shape    = std::move(shape);
         operand.stride   = std::move(stride);
@@ -636,6 +729,52 @@ class VariantPackNative {
         operand.stride = std::move(stride);
     }
 
+    // Every execute-time override in one crossing (_pygraph._normalize): per slot the
+    // override's element geometry becomes storage-slot geometry (fp4 packing), is
+    // re-expressed in the buffer's own axis order, and is applied like override_operand
+    // with the declared dtype.
+    void
+    override_many(const DeclaredLayout &declared,
+                  const std::vector<size_t> &indices,
+                  std::vector<std::vector<int64_t>> shapes,
+                  std::vector<std::vector<int64_t>> strides) {
+        if (shapes.size() != indices.size() || strides.size() != indices.size()) {
+            throw py::value_error("override_many: indices, shapes and strides must have the same length");
+        }
+        const auto &slots = declared.slots();
+        for (size_t j = 0; j < indices.size(); j++) {
+            const size_t i = indices[j];
+            if (i >= operands_.size())
+                throw py::index_error("override_many: slot " + std::to_string(i) + " out of range");
+            const DLDataType dtype      = i < slots.size() ? slots[i].dtype : DLDataType{0, 0, 1};
+            const bool fp4              = dtype.bits == 4 && dtype.lanes == 2;
+            std::vector<int64_t> shape  = std::move(shapes[j]);
+            std::vector<int64_t> stride = std::move(strides[j]);
+            if (shape.size() != stride.size() && !stride.empty()) {
+                throw py::value_error("override shape and stride must have the same rank; got " +
+                                      std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                      " for operand " + std::to_string(i));
+            }
+            if (!storage_geometry_of(shape, stride, fp4)) {
+                std::string geom;
+                for (size_t d = 0; d < shape.size(); d++) geom += (d ? ", " : "") + std::to_string(shape[d]);
+                throw py::value_error("override_shapes for operand " + std::to_string(i) +
+                                      ": an fp4 tensor packs two elements per storage slot, so its unit-stride extent "
+                                      "must be even; got (" +
+                                      geom + ")");
+            }
+            Operand &operand = operands_[i];
+            if (!operand.filled) {
+                throw py::value_error("variant-pack operand " + std::to_string(i) + " has no buffer to re-describe");
+            }
+            // the buffer's EFFECTIVE strides: an empty vector is valid DLPack for compact row-major storage
+            const std::vector<int64_t> reference =
+                operand.stride.empty() ? dense_stride_of(operand.shape) : operand.stride;
+            in_axis_order_of(shape, stride, reference);
+            override_operand(i, std::move(shape), std::move(stride), dtype.code, dtype.bits, dtype.lanes);
+        }
+    }
+
     void
     skip_operand(size_t index) {
         operands_.at(index).filled = false;
@@ -666,6 +805,20 @@ class VariantPackNative {
             // spell (bits == 0) never qualifies.
             const int64_t own_bytes = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes + 7) / 8;
             if (own_bytes <= 0) continue;
+            if (want.preserve_extent) {
+                if (own_bytes == want.slot_bytes && want.dtype.bits > 0) operand.dtype = want.dtype;
+                if (want.shape.size() == 3 && operand.shape.size() != 3) {
+                    const int64_t elements = numel_of(operand.shape);
+                    const int64_t batches  = want.shape[0];
+                    if (operand_contiguous(i) && batches > 0 && elements % batches == 0) {
+                        const int64_t per_batch = elements / batches;
+                        operand.ndim            = 3;
+                        operand.shape           = {batches, per_batch, 1};
+                        operand.stride          = {per_batch, 1, 1};
+                    }
+                }
+                continue;
+            }
             if (operand.shape == want.shape) {
                 if (own_bytes == want.slot_bytes && want.dtype.bits > 0) operand.dtype = want.dtype;
                 continue;
@@ -739,6 +892,50 @@ class VariantPackNative {
         return reinterpret_cast<int64_t>(pointers_.at(index));
     }
 
+    // The producer's guaranteed span in BYTES (-1 unknown) and DLPack (device_type, device_id) (-1, -1 unknown).
+    int64_t
+    observed_bytes(size_t index) const {
+        return operands_.at(index).observed_bytes;
+    }
+
+    // Build the consumer's immutable records in one native crossing, without
+    // intermediate Python lists or a second observation/validation path.
+    // Effective dtype/geometry and observed producer span/device remain separate.
+    py::list
+    facts_as(const std::vector<size_t> &indices, const py::object &constructor, const py::dict &dtype_names) const {
+        py::list out(indices.size());
+        const py::str unknown_dtype("");
+        for (size_t i = 0; i < indices.size(); ++i) {
+            const size_t index     = indices[i];
+            const Operand &operand = operands_.at(index);
+            py::tuple shape(operand.shape.size());
+            for (size_t d = 0; d < operand.shape.size(); ++d) shape[d] = py::int_(operand.shape[d]);
+
+            py::tuple strides(operand.stride.empty() ? operand.shape.size() : operand.stride.size());
+            write_effective_strides(operand, [&strides](size_t d, int64_t value) { strides[d] = py::int_(value); });
+            const auto dtype_key =
+                py::make_tuple(static_cast<int>(operand.dtype.code), static_cast<int>(operand.dtype.bits));
+            PyObject *dtype = PyDict_GetItem(dtype_names.ptr(), dtype_key.ptr());
+            // Match the facts consumer: producer bytes in the EFFECTIVE element width.
+            const int64_t width = std::max<int64_t>(1, (static_cast<int64_t>(operand.dtype.bits) + 7) / 8);
+            const int64_t span  = operand.observed_bytes < 0 ? -1 : operand.observed_bytes / width;
+            out[i] =
+                constructor(reinterpret_cast<int64_t>(pointers_.at(index)),
+                            dtype == nullptr ? py::object(unknown_dtype) : py::reinterpret_borrow<py::object>(dtype),
+                            py::make_tuple(operand.observed_device_type, operand.observed_device_id),
+                            span,
+                            shape,
+                            strides);
+        }
+        return out;
+    }
+
+    std::pair<int32_t, int32_t>
+    observed_device(size_t index) const {
+        const Operand &operand = operands_.at(index);
+        return {operand.observed_device_type, operand.observed_device_id};
+    }
+
     std::vector<int64_t>
     shape(size_t index) const {
         return operands_.at(index).shape;
@@ -749,7 +946,7 @@ class VariantPackNative {
         const Operand &operand = operands_.at(index);
         if (!operand.stride.empty()) return operand.stride;
         std::vector<int64_t> dense(operand.ndim, 1);
-        for (int d = operand.ndim - 2; d >= 0; d--) dense[d] = dense[d + 1] * operand.shape[d + 1];
+        write_effective_strides(operand, [&dense](size_t d, int64_t value) { dense[d] = value; });
         return dense;
     }
 
@@ -987,8 +1184,15 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
              py::arg("shape"),
              py::arg("stride"),
              py::arg("slot_bytes"),
-             py::arg("dtype_code")  = 0,
-             py::arg("dtype_bits")  = 0,
+             py::arg("dtype_code")      = 0,
+             py::arg("dtype_bits")      = 0,
+             py::arg("dtype_lanes")     = 1,
+             py::arg("preserve_extent") = false)
+        .def("set_dtype",
+             &DeclaredLayout::set_dtype,
+             py::arg("index"),
+             py::arg("dtype_code"),
+             py::arg("dtype_bits"),
              py::arg("dtype_lanes") = 1)
         .def("__len__", &DeclaredLayout::size);
 
@@ -1012,7 +1216,10 @@ its parts.
              py::arg("stride"),
              py::arg("dtype_code"),
              py::arg("dtype_bits"),
-             py::arg("dtype_lanes") = 1)
+             py::arg("dtype_lanes")          = 1,
+             py::arg("observed_bytes")       = -1,
+             py::arg("observed_device_type") = -1,
+             py::arg("observed_device_id")   = -1)
         .def("override_operand",
              &VariantPackNative::override_operand,
              py::arg("index"),
@@ -1021,11 +1228,20 @@ its parts.
              py::arg("dtype_code")  = 0,
              py::arg("dtype_bits")  = 0,
              py::arg("dtype_lanes") = 1)
+        .def("override_many",
+             &VariantPackNative::override_many,
+             py::arg("declared"),
+             py::arg("indices"),
+             py::arg("shapes"),
+             py::arg("strides"))
         .def("describe_from", &VariantPackNative::describe_from)
         .def("skip_operand", &VariantPackNative::skip_operand)
         .def("operand_contiguous", &VariantPackNative::operand_contiguous)
         .def("is_filled", &VariantPackNative::is_filled)
         .def("pointer", &VariantPackNative::pointer)
+        .def("observed_bytes", &VariantPackNative::observed_bytes)
+        .def("_facts_as", &VariantPackNative::facts_as)
+        .def("observed_device", &VariantPackNative::observed_device)
         .def("shape", &VariantPackNative::shape)
         .def("stride", &VariantPackNative::stride)
         .def("dtype", &VariantPackNative::dtype)
