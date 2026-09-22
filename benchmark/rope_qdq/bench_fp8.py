@@ -162,7 +162,7 @@ def main():
             cudnn=cudnn.__file__,
             cudnn_version=cudnn.__version__,
             kernel_sha256=sha(Path(cudnn.__file__).parent / "rope/frost/kernels.py"),
-            api_sha256=sha(Path(cudnn.__file__).parent / "rope/api.py"),
+            api_sha256=sha(Path(cudnn.__file__).parent / "rope/qdq.py"),
             references_sha256=sha(HERE / "references_fp8.py"),
         )
         spec = importlib.util.spec_from_file_location("deepseek_rope_qdq_reference", SOURCE / "kernel.py")
