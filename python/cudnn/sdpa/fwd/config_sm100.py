@@ -30,6 +30,9 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_O_MXFP8,
+    DTYPE_O_NVFP4,
+    O_BLOCK_SCALE_BY_DTYPE,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -210,8 +213,15 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
-    if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
+    if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8):
+        raise ValueError(f"{flavor}: DTYPE_O must be 0..5; got {dtype_o}")
+    if dtype_o in (DTYPE_O_NVFP4, DTYPE_O_MXFP8):
+        if not fp8:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) requires FP8 inputs")
+        if flavor != "d128":
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) is only supported on d128")
+        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense, unsplit, unpacked graphs only")
     if not fp8 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires DTYPE_O == DTYPE_QKV; got dtype_o={dtype_o}")
     if k.window_left is not None and k.window_left < 0:
@@ -311,9 +321,20 @@ def _mask_flags_from(params: TemplateParams) -> int:
 
 
 def bpe(dtype: int) -> int:
-    if dtype <= 1:
+    """Bytes per STORAGE element: the block-scaled O codes are byte containers
+    (E2M1 packs two per byte -- see ``o_pack_div``)."""
+    if dtype in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_O_NVFP4, DTYPE_O_MXFP8):
         return 1
     return 2
+
+
+def o_pack_div(dtype_o: int) -> int:
+    """Logical O elements per storage byte-container: 2 for E2M1, else 1."""
+    return 2 if dtype_o == DTYPE_O_NVFP4 else 1
+
+
+def o_row_bytes(tile_o: int, dtype_o: int) -> int:
+    return tile_o * bpe(dtype_o) // o_pack_div(dtype_o)
 
 
 def tile_k_hw(dtype_qkv: int) -> int:
@@ -337,8 +358,8 @@ def v_swz_bytes(tile_o: int, cta_mma: int, bpe_val: int) -> int:
     raise ValueError(f"V inner bytes {inner} not multiple of 32/64/128")
 
 
-def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
-    return 128 if (tile_o * bpe_o) % 128 == 0 else 64
+def o_swz_bytes(tile_o: int, bpe_o: int, pack_div: int = 1) -> int:
+    return 128 if (tile_o * bpe_o // pack_div) % 128 == 0 else 64
 
 
 def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
@@ -1279,6 +1300,11 @@ class CfgD128:
     PV_BF16: int = 0
     EMIT_AMAX_O: int = 1
     BPE_O: int = 2
+    # Block-scaled O (per-tensor FP8 fprop only): scale-factor block along d
+    # (16 = E2M1 + E4M3 SF, 32 = E4M3 + UE8M0 SF, 0 = plain O) and logical
+    # O elements per storage byte (2 for E2M1).
+    O_BLOCK_SCALE: int = 0
+    O_PACK_DIV: int = 1
 
     CGA_M: int = 2
     CGA_N: int = 1
@@ -1395,7 +1421,7 @@ def _d128_smem_bytes(cfg) -> int:
         cga1, alias    : 64(Q u O)     + 64(K) + 64(V) = 192 KiB
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
-    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
@@ -1439,8 +1465,16 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.BPE_V == (2 if cfg.PV_BF16 else cfg.BPE), "d128: V bytes/element must match the PV specialization"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d128: V/O swizzle out of range"),
         (
-            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
+            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
             "d128: DTYPE_O must equal DTYPE_QKV for half input; fp8/mxfp8 allows an independent output dtype",
+        ),
+        (
+            cfg.O_BLOCK_SCALE == O_BLOCK_SCALE_BY_DTYPE[cfg.DTYPE_O] and cfg.O_PACK_DIV == o_pack_div(cfg.DTYPE_O),
+            "d128: O_BLOCK_SCALE / O_PACK_DIV must follow DTYPE_O",
+        ),
+        (
+            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA),
+            "d128: block-scaled O serves dense, unsplit, unpacked graphs only",
         ),
     )
     for ok, msg in checks:
@@ -1454,6 +1488,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    o_div = o_pack_div(dtype_o)
     b_v = 2 if params.pv_bf16 else b
     # FP8/MXFP8 pins the Blackwell K=32 QMMA path (TILE_K_HW=32) and STAGES_KV=4
     # (BPE=1 → 8 KiB/stage, fits 4); f16/bf16 keep 16 / 2.
@@ -1466,6 +1501,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         PV_BF16=int(params.pv_bf16),
         EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
+        O_BLOCK_SCALE=O_BLOCK_SCALE_BY_DTYPE[dtype_o],
+        O_PACK_DIV=o_div,
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
         # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
@@ -1474,7 +1511,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
         V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
-        O_SWZ_BYTES=o_swz_bytes(128, b_o),
+        O_SWZ_BYTES=o_swz_bytes(128, b_o, o_div),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
         TILE_K_HW_BMM2=16 if params.pv_bf16 else tile_k_hw_fp8,
@@ -1695,7 +1732,7 @@ def _d192_smem_bytes(cfg) -> int:
         cga1, STAGES_KV=1 : 96        + 48    + 32    = 176 KiB
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
-    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)

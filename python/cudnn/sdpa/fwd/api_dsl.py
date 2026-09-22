@@ -25,6 +25,8 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_O_MXFP8,
+    DTYPE_O_NVFP4,
     SCHED_LPT,
     SCHED_LPT_L2,
     SCHED_NATURAL,
@@ -123,6 +125,24 @@ _SM100_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _torch_fp4():
+    """``torch.float4_e2m1fn_x2`` when this torch build has it, else ``None``.
+
+    The packed FP4 dtype arrived in torch 2.8 and the torch dependency group is
+    unversioned, so every ORDINARY path resolves it lazily: a missing symbol
+    never matches a dtype comparison and never enters a dtype list. Only a
+    caller that actually hands over an FP4 O needs it (and cannot without it)."""
+    return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _with_fp4(dtypes):
+    """``dtypes`` plus the packed FP4 dtype when the torch build exposes it."""
+    fp4 = _torch_fp4()
+    return [*dtypes, fp4] if fp4 is not None else list(dtypes)
+
+
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
 # Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
@@ -517,8 +537,17 @@ class SdpaFwdDsl(APIBase):
         stats_log2: bool = False,
         sample_gate: Optional[torch.Tensor | TensorDesc] = None,
         has_amax_o: bool = True,
+        sample_sf_o: Optional[torch.Tensor | TensorDesc] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
+
+        ``sample_sf_o`` (per-tensor FP8 only): the block-scaled O scale-factor
+        output. With an FP4 (``torch.float4_e2m1fn_x2``) O it holds one E4M3
+        scale per 16 d elements; with an E4M3 O it holds one UE8M0 scale per
+        32 (MXFP8 output). Rank-4 ``[B, H, rows, cols]`` in the F8_128x4 atom
+        order, declared either as per-(b, h) planes (BHRC strides, rows >=
+        S_q rounded up to 128) or token-major (BRHC strides: one
+        ``[B*rows, H*cols]`` matrix a downstream GEMM consumes).
 
         Optional operands are accepted by every adapter. A concrete
         implementation that cannot lower one raises :class:`NotImplementedError`
@@ -586,6 +615,11 @@ class SdpaFwdDsl(APIBase):
         # The gate's BSHD strides the artifact is COMPILED at (None = compact),
         # decided by check_support exactly like the Q/K/V/O zero-copy strides.
         self._gate_declared: Optional[tuple] = None
+        self.sf_o_desc = self._make_tensor_desc(sample_sf_o, name="sf_o")
+        # Block-scaled O: 0 (plain), 16 (FP4 O + E4M3 SF), 32 (E4M3 O + UE8M0
+        # SF); set by check_support together with the SF_O layout geometry.
+        self.o_block_scale = 0
+        self._sfo_geometry: Optional[tuple[int, int, int, int]] = None
 
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
@@ -1013,6 +1047,62 @@ class SdpaFwdDsl(APIBase):
             return tensor.view(-1)[:1]
         except RuntimeError as exc:
             raise ValueError(f"{name} must be contiguous — the kernel writes it in place; got strides {tuple(tensor.stride())}") from exc
+
+    # -- block-scaled O (sf_o) ------------------------------------------------
+
+    def _sf_o_geometry(self, block: int, d_v: int) -> tuple[int, int, int, int]:
+        """Kernel offsets for the declared SF_O tensor: ``(plane_stride, row_off_b, col_off_h, cols)``.
+
+        The kernel writes byte ``(r, c)`` of a ``[rows, cols]`` matrix in the
+        F8_128x4 atom order at ``plane + (r//128)*128*cols + (c//4)*512 +
+        (r%32)*16 + ((r//32)%4)*4 + c%4`` with ``r = q_row + b*row_off_b``,
+        ``c = block_idx + h*col_off_h``, ``plane = (b*H + h)*plane_stride``.
+        Per-(b,h) planes (BHRC strides) and the token-major matrix (BRHC
+        strides) are the two declared layouts.
+        """
+        d = self.sf_o_desc
+        b, h_q = int(self.q_desc.shape[0]), int(self.q_desc.shape[1])
+        s_q = int(self.q_desc.shape[2])
+        c_need = d_v // block
+        self._value_error_if(len(d.shape) != 4, f"sf_o must be rank-4 [B, H, rows, cols]; got {tuple(d.shape)}")
+        B_, H_, R, C = (int(x) for x in d.shape)
+        st = tuple(int(x) for x in d.stride)
+        self._value_error_if((B_, H_) != (b, h_q), f"sf_o batch/head extents {(B_, H_)} must match Q {(b, h_q)}")
+        self._value_error_if(C % 4 != 0 or C < c_need, f"sf_o cols must be a multiple of 4 and >= d_v/{block} = {c_need}; got {C}")
+        self._value_error_if(st[3] != 1, f"sf_o innermost stride must be 1; got {st}")
+        rows_pad = -(-s_q // 128) * 128
+        if st[2] == C and st[1] == R * C and st[0] == H_ * R * C:
+            # per-(b, h) planes: each plane is its own 128-row-padded atom matrix
+            self._value_error_if(R < rows_pad or R % 128 != 0, f"sf_o plane rows must be S_q rounded up to 128 (>= {rows_pad}, %128); got {R}")
+            return (R * C, 0, 0, C)
+        if st[1] == C and st[2] == H_ * C and st[0] == R * H_ * C:
+            # token-major: one [B*R, H*C] matrix; rows of batch b start at b*R
+            self._value_error_if(R < s_q, f"sf_o token-major rows must cover S_q = {s_q}; got {R}")
+            self._value_error_if((H_ * C) % 4 != 0, f"sf_o token-major needs H*cols % 4 == 0; got {H_ * C}")
+            return (0, R, C, H_ * C)
+        raise ValueError(f"sf_o strides {st} are neither per-(b,h) planes (BHRC) nor token-major (BRHC) for dims {(B_, H_, R, C)}")
+
+    def _sf_o_kernel_kwargs(self, sf_o, device: torch.device) -> dict:
+        import cutlass
+
+        self._value_error_if(
+            not isinstance(sf_o, torch.Tensor) or sf_o.device.type != "cuda" or sf_o.element_size() != 1,
+            "sf_o must be a 1-byte-element CUDA tensor (float8_e4m3fn / float8_e8m0fnu / uint8)",
+        )
+        plane_stride, row_off_b, col_off_h, cols = self._sfo_geometry
+        b, h_q = int(self.q_desc.shape[0]), int(self.q_desc.shape[1])
+        R = int(self.sf_o_desc.shape[2])
+        needed = b * h_q * plane_stride if plane_stride else (-(-(b * R) // 128) * 128) * cols
+        self._value_error_if(sf_o.numel() < needed, f"sf_o holds {sf_o.numel()} bytes; the declared geometry needs at least {needed}")
+        flat = sf_o.view(torch.int8).reshape(-1) if sf_o.is_contiguous() else None
+        self._value_error_if(flat is None, f"sf_o must be contiguous; got strides {tuple(sf_o.stride())}")
+        return {
+            "sf_o_tensor": flat,
+            "sfo_plane_stride": cutlass.Int32(plane_stride),
+            "sfo_row_off_b": cutlass.Int32(row_off_b),
+            "sfo_col_off_h": cutlass.Int32(col_off_h),
+            "sfo_cols": cutlass.Int32(cols),
+        }
 
     def _scale_view(self, t, name: str, device: torch.device) -> torch.Tensor:
         """A per-tensor scale as the kernel's 1-element fp32 device view.
@@ -1515,8 +1605,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             self._check_dtype(self.v_desc, self.dtype, name=self.v_desc.name, extra_error_msg=f"{self.v_desc.name} must match Q dtype")
         if self._fp8:
-            # MXFP8 block-scale input: O may be BF16/FP16 (half) or FP8, decoupled from the input dtype.
-            self.dtype_o = self._check_dtype(self.o_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="O")
+            # FP8 input: O may be BF16/FP16 (half), FP8, or (per-tensor FP8 with
+            # sample_sf_o) the packed FP4 container -- decoupled from the input dtype.
+            self.dtype_o = self._check_dtype(self.o_desc, _with_fp4([torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES]), name="O")
         else:
             self._check_dtype(
                 self.o_desc,
@@ -1652,6 +1743,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial),
                 f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
             )
+        # Block-scaled O (sf_o): per-tensor FP8, d128 flavor, dense/unsplit/unpacked.
+        self._dtype_o_code = _SM100_DTYPE_QKV_CODE.get(self.dtype_o)
+        if self.sf_o_desc is not None or self.dtype_o == _torch_fp4():
+            self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
+            if self.dtype_o == _torch_fp4():
+                self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
+                self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
+                self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
+            else:
+                self._value_error_if(
+                    self.dtype_o != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)"
+                )
+                self._check_dtype(self.sf_o_desc, [torch.uint8, torch.float8_e8m0fnu], name="sf_o")
+                self.o_block_scale, self._dtype_o_code = 32, DTYPE_O_MXFP8
+            self._not_implemented_error_if(
+                self.flavor != (128, 128), f"block-scaled O is served by the d128 flavor only; got head dims {(int(d_qk), int(d_v))}"
+            )
+            self._not_implemented_error_if(int(d_v) != 128, "block-scaled O needs d_v == 128 (no head-dim envelope)")
+            self._not_implemented_error_if(
+                self.thd or self.seq_q_lens_present or self.pack_gqa or self.split_kv > 1,
+                "block-scaled O serves dense, untrimmed, unsplit, unpacked graphs only",
+            )
+            self._sfo_geometry = self._sf_o_geometry(self.o_block_scale, int(d_v))
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -2020,7 +2134,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             # A quantized-O split compiles the kernel to write HALF partials;
             # the combine performs the single cast to the real O dtype.
-            dtype_o=(_SM100_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else _SM100_DTYPE_QKV_CODE[self.dtype_o]),
+            dtype_o=(_SM100_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else self._dtype_o_code),
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
@@ -2483,6 +2597,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table: Optional[torch.Tensor] = None,
         block_table_v: Optional[torch.Tensor] = None,
         gate: Optional[torch.Tensor] = None,
+        sf_o: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
 
@@ -2490,6 +2605,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``sample_gate`` -- logical BHSD, O's shape, bound as a zero-copy BSHD
         view (compact, or the declared strides check_support pinned; never a
         hidden copy). Required iff ``sample_gate`` was given.
+
+        ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
+        ``sample_sf_o``); its bytes are laid out per the declared geometry.
 
         ``workspace``: optional caller-provided scratch buffer (uint8, at
         least ``scratch_workspace_bytes()`` bytes). When given, every
@@ -2591,6 +2709,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             not self.has_amax_o and amax_o is not None,
             "this specialization was compiled with has_amax_o=False; it produces no Amax_O",
         )
+        self._value_error_if(
+            self.o_block_scale > 0 and sf_o is None,
+            "sf_o is required by this compiled specialization (block-scaled O)",
+        )
+        self._value_error_if(
+            self.o_block_scale == 0 and sf_o is not None,
+            "this specialization was compiled without a block-scaled O; construct the API with sample_sf_o",
+        )
         if self.thd:
             pass  # bound in _execute_thd (declared packed layout)
         elif lse_tensor is not None:
@@ -2619,6 +2745,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     current_stream,
                     workspace=workspace,
                     gate=gate,
+                    sf_o=sf_o,
                 )
             return
 
@@ -3395,6 +3522,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         current_stream=None,
         workspace=None,
         gate=None,
+        sf_o=None,
     ):
         """Per-tensor FP8 execute: scalar descales fold into scale_softmax_log2
         (attn·descale_q·descale_k·log2 e) and o_scale_fused (descale_v·scale_o) —
@@ -3505,10 +3633,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         Q = self._to_bshd(q_tensor, _decl[0])
         K = self._to_bshd(k_tensor, _decl[1])
         V = self._to_bshd(v_tensor, _decl[2])
-        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
+        o_decl = _decl[3]
+        if self.o_block_scale == 16:
+            # FP4 O arrives as its byte container ((B, H, S, d/2) in
+            # float4_e2m1fn_x2 / uint8 / fp8 spelling); the kernel binds it as
+            # FP8-typed bytes and writes two E2M1 per byte. The declared strides
+            # describe the logical element grid, so the byte view takes the
+            # compact-view-or-copy path.
+            self._value_error_if(
+                o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}"
+            )
+            o_tensor = o_tensor.view(torch.float8_e4m3fn) if o_tensor.dtype != torch.float8_e4m3fn else o_tensor
+            o_decl = None
+        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, o_decl)
         O = O_scratch if o_needs_copy_back else O_view
         # Epilogue gate (bf16, O's shape): a view at the compiled strides, never a copy.
         G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
+        sf_o_kwargs = self._sf_o_kernel_kwargs(sf_o, device) if self.o_block_scale else {}
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -3567,6 +3708,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The gate tensor is the LAST (keyword) parameter of the gated
             # kernel's _host, after `stream`; absent on ungated builds.
             **({"gate_tensor": G} if G is not None else {}),
+            **sf_o_kwargs,
             stream=current_stream,
         )
         if self.split_kv > 1:
@@ -3843,7 +3985,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
         )
-
         self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
         if self.thd:
@@ -3951,6 +4092,26 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
+        # Block-scaled O (sf_o): per-tensor FP8, d_v = 128, dense/unsplit/unpacked.
+        self._dtype_o_code = _SM120_DTYPE_QKV_CODE.get(self.o_desc.dtype)
+        if self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4():
+            self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
+            if self.o_desc.dtype == _torch_fp4():
+                self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
+                self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
+                self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
+            else:
+                self._value_error_if(
+                    self.o_desc.dtype != torch.float8_e4m3fn, "sf_o with a non-FP4 O requires an FP8 E4M3 O (MXFP8 output: one UE8M0 scale per 32 d elements)"
+                )
+                self._check_dtype(self.sf_o_desc, [torch.uint8, torch.float8_e8m0fnu], name="sf_o")
+                self.o_block_scale, self._dtype_o_code = 32, DTYPE_O_MXFP8
+            self._not_implemented_error_if(int(d_v) != 128 or int(d_q) != 128, f"block-scaled O needs d_qk = d_v = 128; got {(int(d_q), int(d_v))}")
+            self._not_implemented_error_if(
+                self.thd or self.seq_q_lens_present or self.pack_gqa or self.split_kv > 1,
+                "block-scaled O serves dense, untrimmed, unsplit, unpacked graphs only",
+            )
+            self._sfo_geometry = self._sf_o_geometry(self.o_block_scale, int(d_v))
         # Head dims above the general template's cap exist only where a flavor's
         # tiles reach (d512: both dims in (256, 512]), so the flavor sets the cap.
         head_tile_max = _SM120_FP8_GENERAL_HEAD_TILE_MAX if self._fp8 else _SM120_GENERAL_HEAD_TILE_MAX
@@ -3988,7 +4149,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if self._fp8 and desc is self.o_desc:
                 # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the
                 # staging epilogue, fp8 the direct quantizing store.
-                self._check_dtype(desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="O")
+                self._check_dtype(desc, _with_fp4([torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES]), name="O")
             else:
                 self._check_dtype(
                     desc,
@@ -4153,7 +4314,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             # A quantized-O split writes HALF partials; the combine performs
             # the single cast to the real O dtype.
-            dtype_o=(_SM120_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else _SM120_DTYPE_QKV_CODE[self.o_desc.dtype]),
+            dtype_o=(_SM120_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else self._dtype_o_code),
             sched_policy=sched_policy,
             window_left=self.window_left,
             window_right=self.window_right,
@@ -4240,11 +4401,24 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_q: Optional[torch.Tensor] = None,
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
+        sf_o: Optional[torch.Tensor] = None,
     ) -> None:
-        """Execute tensors matching the compiled specialization."""
+        """Execute tensors matching the compiled specialization.
+
+        ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
+        ``sample_sf_o``); its bytes are laid out per the declared geometry.
+        """
 
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
+        self._value_error_if(
+            self.o_block_scale > 0 and sf_o is None,
+            "sf_o is required by this compiled specialization (block-scaled O)",
+        )
+        self._value_error_if(
+            self.o_block_scale == 0 and sf_o is not None,
+            "this specialization was compiled without a block-scaled O; construct the API with sample_sf_o",
+        )
         self._value_error_if(
             self.has_sink and sinks is None,
             "sinks is required by this compiled specialization",
@@ -4286,6 +4460,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     seq_q_lens=seq_q_lens,
                     workspace=workspace,
                     current_stream=current_stream,
+                    sf_o=sf_o,
                 )
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
@@ -4398,6 +4573,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         seq_q_lens=None,
         workspace=None,
         current_stream=None,
+        sf_o=None,
     ):
         """Per-tensor FP8 execute: SM100 convention on the SM120 kernel.
 
@@ -4508,9 +4684,20 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             q = self._to_bshd(q_tensor)
             k = self._to_bshd(k_tensor)
             v = self._to_bshd(v_tensor)
+            if self.o_block_scale == 16:
+                # FP4 O arrives as its byte container ((B, H, S, d/2)); the kernel
+                # binds it as E4M3-typed bytes and writes two E2M1 per byte.
+                self._value_error_if(
+                    o_tensor.shape[-1] * 2 != self.head_dim_v, f"FP4 O must carry d_v/2 = {self.head_dim_v // 2} bytes per row; got {tuple(o_tensor.shape)}"
+                )
+                o_tensor = o_tensor.view(torch.float8_e4m3fn) if o_tensor.dtype != torch.float8_e4m3fn else o_tensor
             o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
             o = o_scratch if o_needs_copy_back else o_view
             lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+        sf_o_args = ()
+        if self.o_block_scale:
+            _kw = self._sf_o_kernel_kwargs(sf_o, device)
+            sf_o_args = (_kw["sf_o_tensor"], _kw["sfo_plane_stride"], _kw["sfo_row_off_b"], _kw["sfo_col_off_h"], _kw["sfo_cols"])
 
         # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
         # at 0, reset on the LAUNCH stream (ordering vs the kernel).
@@ -4559,6 +4746,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # flavor (it walks the units and prefetches Q); 0 (unread) elsewhere.
             cutlass.Int32(self._persistent_ctas(device) if (pack is not None or self.flavor == _SM120_D512_FLAVOR) else 0),
             current_stream,
+            *sf_o_args,
         )
         # Both of these consume what the kernel just wrote, so they belong on
         # the launch stream for the same reason the resets above do.
@@ -5194,6 +5382,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._not_implemented_error_if(
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+        )
+        self._not_implemented_error_if(
+            self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4(),
+            "block-scaled O (sf_o / FP4 O) is served by the SM100-family per-tensor FP8 engines only",
         )
 
         from cudnn.sdpa.graph_analyzer import dense_layout_ok
