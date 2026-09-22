@@ -8,14 +8,61 @@ import torch
 
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 from cudnn._torch_stream import stream_context
 from typing import Optional
 
 from ..utils import make_tensor_strided_like
 
 
+def packed_thd_ragged_offsets(
+    seq_len_q: torch.Tensor,
+    seq_len_kv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    stats: Optional[torch.Tensor] = None,
+):
+    """Ragged offsets for a FULLY PACKED ``T,H,D`` batch: ``(q, k, v, o, stats)`` int64 ``(b+1, 1, 1, 1)`` tensors.
+
+    ``offset[i] = sum(seq_len[:i]) * tensor.stride(0)`` (element offsets, exclusive prefix sum). ``stats`` is
+    ``None`` -> the stats offset is ``None``. Runs a few small torch kernels on the CALLER's current stream;
+    build the offsets once per batch and pass them to ``SlidingWindowAttention.execute`` -- the engine never
+    derives them itself (per-execute torch.cat/cumsum on the execute path, Rule 1/8).
+    """
+
+    def exclusive_prefix_sum(seq_len: torch.Tensor) -> torch.Tensor:
+        seq_len = seq_len.reshape(-1)
+        zero = torch.zeros((1,), dtype=torch.int64, device=seq_len.device)
+        return torch.cat((zero, torch.cumsum(seq_len, dim=0, dtype=torch.int64))).view(-1, 1, 1, 1)
+
+    cum_q = exclusive_prefix_sum(seq_len_q)
+    cum_kv = exclusive_prefix_sum(seq_len_kv)
+    return (
+        cum_q * q.stride(0),
+        cum_kv * k.stride(0),
+        cum_kv * v.stride(0),
+        cum_q * o.stride(0),
+        cum_q * stats.stride(0) if stats is not None else None,
+    )
+
+
 class SlidingWindowAttention(APIBase):
+    """Sliding-window SDPA on the cuDNN backend graph API.
+
+    Contract (Rule 8: the graph owns no device memory and never blocks the host):
+        * ``compile()`` builds the plans; ``get_workspace_size()`` then reports the backend workspace in bytes.
+          ``execute()`` takes that buffer as ``workspace=`` (uint8, on the graph's device) and never allocates
+          one; when the size is 0 ``workspace`` may be ``None``.
+        * ``T,H,D`` layout: ``q/k/v/o`` (and ``stats`` in training mode) ragged-offset tensors -- int64,
+          ``(b+1, 1, 1, 1)`` -- are REQUIRED at ``execute()``; the engine does not derive them. For the fully
+          packed layout build them once per batch with ``cudnn.NSA.packed_thd_ragged_offsets``. The
+          ``sample_*_ragged_offset`` arguments are optional and only validated; the graph descriptors are built
+          from the batch shape.
+        * ``current_stream`` re-streams the cuDNN handle (``cudnn.set_stream``) before the launch.
+    """
+
     def __init__(
         self,
         sample_q: torch.Tensor,
@@ -78,48 +125,10 @@ class SlidingWindowAttention(APIBase):
         self._cudnn_handle = cudnn_handle if cudnn_handle is not None else cudnn.create_handle()
         self._cudnn_swa_graph = None
         self._cudnn_compiled = False
+        self._workspace_bytes = None
+        self.batch_size = None
         self._logger.debug(
             f"__init__ completed with args: sample_q {tuple(sample_q.shape)}, sample_k {tuple(sample_k.shape)}, sample_v {tuple(sample_v.shape)}, sample_o {tuple(sample_o.shape)}, sample_stats {None if sample_stats is None else tuple(sample_stats.shape)}, left_bound {left_bound}, right_bound {right_bound}, sample_seq_len_q {None if sample_seq_len_q is None else tuple(sample_seq_len_q.shape)}, sample_seq_len_kv {None if sample_seq_len_kv is None else tuple(sample_seq_len_kv.shape)}, max_seq_len_q {max_seq_len_q}, max_seq_len_kv {max_seq_len_kv}, is_infer {self.is_infer}, attn_scale {attn_scale}, intermediate_data_type {intermediate_data_type}, compute_data_type {compute_data_type}"
-        )
-
-    def _calculate_ragged_offsets(
-        self,
-        seq_len_q,
-        seq_len_kv,
-        sample_q,
-        sample_k,
-        sample_v,
-        sample_o,
-        sample_stats,
-    ):
-        """Calculate ragged offsets for fully packed THD layout."""
-
-        def compute_exclusive_prefix_sum(tensor):
-            assert tensor.shape[1:] == (
-                1,
-                1,
-                1,
-            ), f"Expected shape (b,1,1,1), got {tensor.shape}"
-            return torch.cat(
-                (
-                    torch.zeros((1, 1, 1, 1), dtype=tensor.dtype, device=tensor.device),
-                    torch.cumsum(tensor, dim=0),
-                )
-            )
-
-        # Calculate ragged offsets
-        q_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_q.stride()[0]).to(dtype=torch.int64)
-        k_ragged_offset = (compute_exclusive_prefix_sum(seq_len_kv) * self.sample_k.stride()[0]).to(dtype=torch.int64)
-        v_ragged_offset = (compute_exclusive_prefix_sum(seq_len_kv) * self.sample_v.stride()[0]).to(dtype=torch.int64)
-        o_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_o.stride()[0]).to(dtype=torch.int64)
-        stats_ragged_offset = (compute_exclusive_prefix_sum(seq_len_q) * self.sample_stats.stride()[0]).to(dtype=torch.int64) if not self.is_infer else None
-
-        return (
-            q_ragged_offset,
-            k_ragged_offset,
-            v_ragged_offset,
-            o_ragged_offset,
-            stats_ragged_offset,
         )
 
     def check_support(self) -> bool:
@@ -222,41 +231,22 @@ class SlidingWindowAttention(APIBase):
             if self.max_seq_len_q is None or self.max_seq_len_kv is None:
                 raise ValueError(f"max_seq_len_q and max_seq_len_kv must be provided for thd layout, got {self.max_seq_len_q} and {self.max_seq_len_kv}")
 
-            if (
-                self.sample_q_ragged_offset is None
-                or self.sample_k_ragged_offset is None
-                or self.sample_v_ragged_offset is None
-                or self.sample_o_ragged_offset is None
-                or (self.sample_stats_ragged_offset is None and not self.is_infer)
-            ):
-                if (
-                    self.sample_q_ragged_offset is not None
-                    or self.sample_k_ragged_offset is not None
-                    or self.sample_v_ragged_offset is not None
-                    or self.sample_o_ragged_offset is not None
-                    or (not self.is_infer and self.sample_stats_ragged_offset is not None)
-                ):
-                    raise ValueError(
-                        f"sample_q_ragged_offset, sample_k_ragged_offset, sample_v_ragged_offset, sample_o_ragged_offset, and sample_stats_ragged_offset must be all provided or all None, got {self.sample_q_ragged_offset}, {self.sample_k_ragged_offset}, {self.sample_v_ragged_offset}, {self.sample_o_ragged_offset}, and {self.sample_stats_ragged_offset}"
-                    )
-                self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
-                (
-                    self.sample_q_ragged_offset,
-                    self.sample_k_ragged_offset,
-                    self.sample_v_ragged_offset,
-                    self.sample_o_ragged_offset,
-                    self.sample_stats_ragged_offset,
-                ) = self._calculate_ragged_offsets(
-                    self.sample_seq_len_q,
-                    self.sample_seq_len_kv,
-                    self.sample_q,
-                    self.sample_k,
-                    self.sample_v,
-                    self.sample_o,
-                    self.sample_stats,
-                )
-
             b = len(self.sample_seq_len_q)
+            self.batch_size = b
+            # The sample ragged offsets are optional metadata: validated when given (all or none), never read, and
+            # not what the descriptors are built from -- the graph only needs the (b+1, 1, 1, 1) int64 shape.
+            sample_ragged = self._ragged_offset_set(
+                self.sample_q_ragged_offset,
+                self.sample_k_ragged_offset,
+                self.sample_v_ragged_offset,
+                self.sample_o_ragged_offset,
+                self.sample_stats_ragged_offset,
+                prefix="sample_",
+                suffix="",
+                required=False,
+            )
+            for name, tensor in sample_ragged.items():
+                self._check_ragged_offset(tensor, name, b)
             self.q_cudnn = swa_graph.tensor(
                 dim=(b, h_q, self.max_seq_len_q, d_qk),
                 stride=(
@@ -286,12 +276,16 @@ class SlidingWindowAttention(APIBase):
             )
             self.seq_len_q_cudnn = swa_graph.tensor_like(self.sample_seq_len_q)
             self.seq_len_kv_cudnn = swa_graph.tensor_like(self.sample_seq_len_kv)
-            self.q_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_q_ragged_offset)
-            self.k_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_k_ragged_offset)
-            self.v_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_v_ragged_offset)
-            self.o_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_o_ragged_offset)
+
+            def ragged_offset_desc(name: str):
+                return swa_graph.tensor(name=name, dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64)
+
+            self.q_ragged_offset_cudnn = ragged_offset_desc("q_ragged_offset")
+            self.k_ragged_offset_cudnn = ragged_offset_desc("k_ragged_offset")
+            self.v_ragged_offset_cudnn = ragged_offset_desc("v_ragged_offset")
+            self.o_ragged_offset_cudnn = ragged_offset_desc("o_ragged_offset")
             if not self.is_infer:
-                self.stats_ragged_offset_cudnn = swa_graph.tensor_like(self.sample_stats_ragged_offset)
+                self.stats_ragged_offset_cudnn = ragged_offset_desc("stats_ragged_offset")
 
             self.q_cudnn.set_ragged_offset(self.q_ragged_offset_cudnn)
             self.k_cudnn.set_ragged_offset(self.k_ragged_offset_cudnn)
@@ -371,9 +365,52 @@ class SlidingWindowAttention(APIBase):
         self._cudnn_swa_graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         self._cudnn_swa_graph.check_support()
         self._cudnn_swa_graph.build_plans()
+        self._workspace_bytes = int(self._cudnn_swa_graph.get_workspace_size())
 
         self._cudnn_compiled = True
         self._logger.debug("SlidingWindowAttention kernel compiled successfully")
+
+    def get_workspace_size(self) -> int:
+        """Backend workspace bytes ``execute()`` needs (R2); allocate this much uint8 on the graph's device and pass it as ``workspace=``."""
+        if not self._cudnn_compiled:
+            raise RuntimeError("SlidingWindowAttention.get_workspace_size(): compile() first")
+        return self._workspace_bytes
+
+    def _ragged_offset_set(self, q, k, v, o, stats, *, prefix: str, suffix: str, required: bool) -> dict:
+        """The ragged-offset tensors as a validated SET (Rule 1): all given, or -- when not ``required`` -- all None."""
+        names = {
+            f"{prefix}q_ragged_offset{suffix}": q,
+            f"{prefix}k_ragged_offset{suffix}": k,
+            f"{prefix}v_ragged_offset{suffix}": v,
+            f"{prefix}o_ragged_offset{suffix}": o,
+        }
+        stats_name = f"{prefix}stats_ragged_offset{suffix}"
+        if self.is_infer:
+            if stats is not None:
+                raise ValueError(f"SlidingWindowAttention: {stats_name} was given but the graph was built in inference mode (no stats); pass None")
+        else:
+            names[stats_name] = stats
+        given = {n: t for n, t in names.items() if t is not None}
+        if len(given) == len(names):
+            return given
+        if given or required:
+            missing = [n for n, t in names.items() if t is None]
+            raise ValueError(
+                f"SlidingWindowAttention: {', '.join(names)} are required for the T,H,D layout as a set; missing {missing}. "
+                "The engine does not derive them (per-execute torch.cat/cumsum, Rule 1/8) -- build them once per batch "
+                "(see cudnn.NSA.packed_thd_ragged_offsets) and pass them in"
+            )
+        return {}
+
+    def _check_ragged_offset(self, tensor: torch.Tensor, name: str, b: int) -> None:
+        if tensor.dtype != torch.int64:
+            raise ValueError(f"SlidingWindowAttention: {name} must be int64, got {tensor.dtype}")
+        if not tensor.is_cuda:
+            raise ValueError(f"SlidingWindowAttention: {name} must be a CUDA tensor, got device {tensor.device}")
+        if tuple(tensor.shape) != (b + 1, 1, 1, 1):
+            raise ValueError(f"SlidingWindowAttention: {name} must have shape (b+1, 1, 1, 1) = {(b + 1, 1, 1, 1)}, got {tuple(tensor.shape)}")
+        if not tensor.is_contiguous():  # the graph declares stride (1, 1, 1, 1); a strided view would be read as packed
+            raise ValueError(f"SlidingWindowAttention: {name} must be contiguous, got strides {tuple(tensor.stride())}")
 
     def execute(
         self,
@@ -389,10 +426,13 @@ class SlidingWindowAttention(APIBase):
         v_ragged_offset_tensor: Optional[torch.Tensor] = None,
         o_ragged_offset_tensor: Optional[torch.Tensor] = None,
         stats_ragged_offset_tensor: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
         cudnn_handle: Optional[cudnn.handle] = None,
         skip_compile: bool = False,
     ) -> None:
+        """Launch the compiled graph. ``workspace``: ``get_workspace_size()`` bytes (uint8, graph's device); required
+        when that size is non-zero. ``T,H,D``: the ragged-offset tensors are required (see the class docstring)."""
         self._logger.debug("Entering execute")
         cudnn_handle = self._cudnn_handle if cudnn_handle is None else cudnn_handle
         if current_stream is not None:
@@ -421,43 +461,26 @@ class SlidingWindowAttention(APIBase):
         if self.input_layout == "thd":
             if seq_len_q_tensor is None or seq_len_kv_tensor is None:
                 raise ValueError(f"seq_len_q_tensor and seq_len_kv_tensor must be provided for thd layout, got {seq_len_q_tensor} and {seq_len_kv_tensor}")
-            if (
-                q_ragged_offset_tensor is None
-                or k_ragged_offset_tensor is None
-                or v_ragged_offset_tensor is None
-                or o_ragged_offset_tensor is None
-                or (stats_ragged_offset_tensor is None and not self.is_infer)
-            ):
-                if (
-                    q_ragged_offset_tensor is not None
-                    or k_ragged_offset_tensor is not None
-                    or v_ragged_offset_tensor is not None
-                    or o_ragged_offset_tensor is not None
-                    or (not self.is_infer and stats_ragged_offset_tensor is not None)
-                ):
-                    raise ValueError(
-                        f"q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, and stats_ragged_offset_tensor must be all provided or all None, got {q_ragged_offset_tensor}, {k_ragged_offset_tensor}, {v_ragged_offset_tensor}, {o_ragged_offset_tensor}, and {stats_ragged_offset_tensor}"
-                    )
-                self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
-                # Produced AND allocated on the handle's stream (R1): the graph reads these on that
-                # stream after this call returns, and the caching allocator orders a block's reuse
-                # only against the stream it was allocated on.
-                with torch.cuda.device(q_tensor.device), stream_context(cudnn.get_stream(cudnn_handle), q_tensor.device):
-                    (
-                        q_ragged_offset_tensor,
-                        k_ragged_offset_tensor,
-                        v_ragged_offset_tensor,
-                        o_ragged_offset_tensor,
-                        stats_ragged_offset_tensor,
-                    ) = self._calculate_ragged_offsets(
-                        seq_len_q_tensor,
-                        seq_len_kv_tensor,
-                        self.sample_q,
-                        self.sample_k,
-                        self.sample_v,
-                        self.sample_o,
-                        self.sample_stats,
-                    )
+            ragged = self._ragged_offset_set(
+                q_ragged_offset_tensor,
+                k_ragged_offset_tensor,
+                v_ragged_offset_tensor,
+                o_ragged_offset_tensor,
+                stats_ragged_offset_tensor,
+                prefix="",
+                suffix="_tensor",
+                required=True,
+            )
+            for name, tensor in ragged.items():
+                self._check_ragged_offset(tensor, name, self.batch_size)
+        elif (
+            q_ragged_offset_tensor is not None
+            or k_ragged_offset_tensor is not None
+            or v_ragged_offset_tensor is not None
+            or o_ragged_offset_tensor is not None
+            or stats_ragged_offset_tensor is not None
+        ):
+            raise ValueError("SlidingWindowAttention.execute: ragged offset tensors are only defined for the T,H,D layout; pass None for bshd")
 
         variant_pack = {
             self.q_cudnn: q_tensor,
@@ -475,15 +498,11 @@ class SlidingWindowAttention(APIBase):
             variant_pack[self.stats_cudnn] = stats_tensor
             variant_pack[self.stats_ragged_offset_cudnn] = stats_ragged_offset_tensor
 
-        # Scratch is allocated on the handle's stream (R1): the graph runs there, and the caching
-        # allocator only orders a block's reuse against the stream it was allocated on.
-        with torch.cuda.device(q_tensor.device), stream_context(cudnn.get_stream(cudnn_handle), q_tensor.device):
-            workspace = torch.empty(
-                self._cudnn_swa_graph.get_workspace_size(),
-                device=q_tensor.device,
-                dtype=torch.uint8,
-            )
-        self._cudnn_swa_graph.execute(variant_pack, workspace, handle=cudnn_handle)
+        required = self.get_workspace_size()
+        if required > 0:
+            WorkspaceCarver(workspace, required, "SlidingWindowAttention")  # validates None / undersized / unaligned (R2)
+        # pygraph.execute lowers workspace=None to a null pointer, legal only when the plan needs 0 bytes.
+        self._cudnn_swa_graph.execute(variant_pack, workspace if required > 0 else None, handle=cudnn_handle)
         self._logger.debug("Executed successfully")
 
     def __call__(self, *args, **kwargs) -> None:
@@ -516,10 +535,26 @@ def sliding_window_attention_wrapper(
     compute_data_type: torch.dtype = torch.float32,
     cudnn_handle: Optional[cudnn.handle] = None,
     stream: Optional[cuda.CUstream] = None,
+    max_seq_len_q: Optional[int] = None,
+    max_seq_len_kv: Optional[int] = None,
 ) -> TupleDict:
+    """Allocate ``o`` (and ``stats`` unless ``is_infer``) and run sliding-window attention; objects are memoized per shape.
+
+    ``T,H,D`` (rank-3 q): ``max_seq_len_q`` / ``max_seq_len_kv`` are REQUIRED plan-time ints (the graph's launch
+    envelope, also part of the memo key); they are not read back from ``seq_len_*_tensor``. When no ragged-offset
+    tensor is given the batch is taken as fully packed and the offsets are derived here, per call, with
+    ``NSA.packed_thd_ragged_offsets`` (a few small torch kernels on ``stream`` / the current stream). The backend
+    workspace (``get_workspace_size()`` bytes) is allocated here per call. Pass the offsets and use the class API
+    with a caller-owned workspace to avoid both.
+    """
     o_tensor, stats_tensor = None, None
     o_dtype = o_dtype if o_dtype is not None else q_tensor.dtype
     if q_tensor.ndim == 3:  # thd
+        if max_seq_len_q is None or max_seq_len_kv is None:
+            raise ValueError(
+                "sliding_window_attention_wrapper: max_seq_len_q and max_seq_len_kv are required for the T,H,D layout (plan-time launch "
+                f"envelope); they are not inferred from seq_len_q/seq_len_kv (a device read, Rule 8). Got {max_seq_len_q}, {max_seq_len_kv}"
+            )
         _logger.debug("sliding_window_attention_wrapper: Creating empty output tensor o for thd layout")
         t, h_q, d = q_tensor.shape
         _, h_k, d_v = v_tensor.shape
@@ -566,7 +601,28 @@ def sliding_window_attention_wrapper(
         attn_scale,
         intermediate_data_type,
         compute_data_type,
+        max_seq_len_q,
+        max_seq_len_kv,
     )
+    ragged_given = [q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, stats_ragged_offset_tensor]
+    if q_tensor.ndim == 3 and all(t is None for t in ragged_given):
+        if seq_len_q_tensor is None or seq_len_kv_tensor is None:
+            raise ValueError(
+                "sliding_window_attention_wrapper: seq_len_q_tensor and seq_len_kv_tensor are required for the T,H,D layout when no ragged-offset tensors are supplied"
+            )
+        with torch.cuda.device(q_tensor.device), stream_context(stream, q_tensor.device):
+            (
+                q_ragged_offset_tensor,
+                k_ragged_offset_tensor,
+                v_ragged_offset_tensor,
+                o_ragged_offset_tensor,
+                stats_ragged_offset_tensor,
+            ) = packed_thd_ragged_offsets(seq_len_q_tensor, seq_len_kv_tensor, q_tensor, k_tensor, v_tensor, o_tensor, stats_tensor)
+
+    def allocate_workspace(obj: SlidingWindowAttention) -> torch.Tensor:
+        with torch.cuda.device(q_tensor.device), stream_context(stream, q_tensor.device):
+            return torch.empty(max(obj.get_workspace_size(), 1), dtype=torch.uint8, device=q_tensor.device)
+
     sliding_window_attention_object = None
     if cache_key in _cache_of_SlidingWindowAttentionObjects:
         _logger.debug("sliding_window_attention_wrapper: Using previously cached SlidingWindowAttention object")
@@ -585,6 +641,7 @@ def sliding_window_attention_wrapper(
             v_ragged_offset_tensor=v_ragged_offset_tensor,
             o_ragged_offset_tensor=o_ragged_offset_tensor,
             stats_ragged_offset_tensor=stats_ragged_offset_tensor,
+            workspace=allocate_workspace(sliding_window_attention_object),
             current_stream=stream,
             cudnn_handle=cudnn_handle,
         )
@@ -603,8 +660,8 @@ def sliding_window_attention_wrapper(
             sample_v_ragged_offset=v_ragged_offset_tensor,
             sample_o_ragged_offset=o_ragged_offset_tensor,
             sample_stats_ragged_offset=stats_ragged_offset_tensor,
-            max_seq_len_q=(max(seq_len_q_tensor).item() if seq_len_q_tensor is not None else None),
-            max_seq_len_kv=(max(seq_len_kv_tensor).item() if seq_len_kv_tensor is not None else None),
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_kv=max_seq_len_kv,
             left_bound=left_bound,
             right_bound=right_bound,
             attn_scale=attn_scale,
@@ -628,6 +685,7 @@ def sliding_window_attention_wrapper(
             v_ragged_offset_tensor=v_ragged_offset_tensor,
             o_ragged_offset_tensor=o_ragged_offset_tensor,
             stats_ragged_offset_tensor=stats_ragged_offset_tensor,
+            workspace=allocate_workspace(sliding_window_attention_object),
             current_stream=stream,
         )
         _cache_of_SlidingWindowAttentionObjects[cache_key] = sliding_window_attention_object
