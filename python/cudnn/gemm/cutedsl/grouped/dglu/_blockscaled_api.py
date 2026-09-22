@@ -45,21 +45,6 @@ def _get_rubin_kernel():
     return RubinBlockScaledMoEGroupedGemmDgluKernel
 
 
-_GEGGLU_ALPHA_DEFAULT = 1.702
-_GLU_CLAMP_MAX_DEFAULT = 7.0
-_GLU_CLAMP_MIN_DEFAULT = -7.0
-
-
-def _reject_unsupported_rubin_glu_tune_params(
-    is_rubin_kernel: bool,
-    geglu_alpha: float,
-    glu_clamp_max: float,
-    glu_clamp_min: float,
-) -> None:
-    if is_rubin_kernel and (geglu_alpha != _GEGGLU_ALPHA_DEFAULT or glu_clamp_max != _GLU_CLAMP_MAX_DEFAULT or glu_clamp_min != _GLU_CLAMP_MIN_DEFAULT):
-        raise NotImplementedError("Rubin grouped GEMM dGLU does not support geglu_alpha, glu_clamp_max, or glu_clamp_min tuning")
-
-
 class GroupedGemmDgluBlockScaledAPI(APIBase):
     """Unified API for grouped GEMM dGLU backward operation on SM100+ GPUs.
 
@@ -316,12 +301,6 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 not math.isfinite(self.situ_beta2) or self.situ_beta2 <= 0.0,
                 f"situ_beta2 must be finite and positive, got {self.situ_beta2}",
             )
-        _reject_unsupported_rubin_glu_tune_params(
-            self._is_rubin_kernel,
-            self.geglu_alpha,
-            self.glu_clamp_max,
-            self.glu_clamp_min,
-        )
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
@@ -1005,14 +984,14 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
             linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": self.geglu_alpha,
-                    "glu_clamp_max": self.glu_clamp_max,
-                    "glu_clamp_min": self.glu_clamp_min,
                     "situ_beta1": self.situ_beta1,
                     "situ_beta2": self.situ_beta2,
                 }
@@ -1206,14 +1185,14 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
             linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": self.geglu_alpha,
-                    "glu_clamp_max": self.glu_clamp_max,
-                    "glu_clamp_min": self.glu_clamp_min,
                     "situ_beta1": self.situ_beta1,
                     "situ_beta2": self.situ_beta2,
                 }

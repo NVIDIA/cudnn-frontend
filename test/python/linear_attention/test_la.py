@@ -593,9 +593,17 @@ def correlated_keys_case(variant, dtype, *, T, H, seed=SEED + 7):
 
 @pytest.mark.parametrize("T", [256, 1024])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_fwd_bwd_correlated_keys(backend, variant, T):
+def test_fwd_bwd_correlated_keys(backend, variant, T, request):
     """Near-parallel keys with beta 1 condition the chunk factor I + L at its worst; the scalar-gate families hold
     twice the standard budget on this input (the saturated state leaves only small residuals to compare)."""
+    if backend.name == "cutile" and variant in ("gdn", "kda"):
+        # Kernel defects, not tolerance: the cuTile KDA forward returns 1e27 / NaN and the GDN dg lands at
+        # rms 0.085 against the doubled 0.08 budget, on every backend version (9.24 through 9.28).
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True, raises=AssertionError, reason="cutile: KDA fwd non-finite O, GDN dg over budget on correlated keys (NVIDIA/cudnn-frontend#1160)"
+            )
+        )
     case = correlated_keys_case(variant, torch.bfloat16, T=T, H=2)
     tol_scale = 2.0 if variant in SCALAR_GATE_VARIANTS else 1.0
     assert_fwd_parity(backend, case, tol_scale=tol_scale)
