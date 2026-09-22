@@ -25,7 +25,13 @@ Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (mxfp8 support).
 Skips cleanly otherwise.
 """
 
+import glob
 import math
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
 from typing import NamedTuple, Optional
 
 import pytest
@@ -2133,3 +2139,183 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
 
     with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
         _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="mxfp8")
+
+
+# ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the sm_100a SASS
+# Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
+# worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
+# this pin compiles the kernel for sm_100a here (`CUTE_DSL_ARCH=sm_100a` needs no matching device -- the module-level
+# `requires_blackwell` is what confines it to the Blackwell-line lanes) and counts the instructions.  SKIPS when no
+# nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin; a compile failure is a FAIL.
+_SM100_D128_MXFP8_SASS_PROBE = textwrap.dedent("""
+    import glob, os, subprocess, sys
+    dump, cands = sys.argv[1], sys.argv[2:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
+    os.environ["CUTE_DSL_ARCH"] = "sm_100a"       # unconditional: an inherited value would pin the wrong target's SASS
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    # The PRODUCTION geometry from the adapter itself (cga2), the cc 10.0 specialization (fused_ldtm_stat=False: the
+    # manual tcgen05_ld + software row-max, i.e. B200), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape the
+    # split was tuned and measured on (B=1 H=24/8 S=16K dense).
+    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
+    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, fused_ldtm_stat=False, emit_amax_o=True)
+    mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
+    # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
+    # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern rather than a literal.
+    n_bodies = 2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
+    print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    print("SASS MUFU_EX2", cnt("MUFU.EX2"))
+    print("SASS FFMA2", cnt(" FFMA2"))
+    print("SASS FADD2", cnt(" FADD2"))
+    print("SASS FSETP", cnt("FSETP"))
+    print("SASS FSEL", cnt("FSEL"))
+    print("SASS FMNMX3", cnt("FMNMX3"))
+    print("SASS STL", cnt("STL"))
+    print("SASS LDL", cnt("LDL"))
+    print("SASS LINES", len(sass))
+    """)
+
+# sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
+# trace-compiled cubin that is md5-identical to the one A/B'd on B200:  MUFU.EX2 258 -> 194 (2 x 97), FFMA2 130 -> 226
+# and FADD2 126 -> 222 (+3 each per emulated pair), FSETP 782 -> 19, FSEL 780 -> 270 (the 256 row_dead selects stay),
+# FMNMX3 124 -> 252, STL 3 / LDL 3 unchanged (none in the softmax loops), REG 128.  Slack 16 tolerates unrelated ptxas
+# drift and still catches one site: a fold site regressing to compare+select adds >= 384 FSETP, one emulated pair
+# falling back to MUFU adds 2 MUFU.EX2 and drops 3 FFMA2 (the MUFU count is pinned EXACTLY, derived from the module).
+_SM100_SASS_SLACK = 16
+_SM100_D128_MXFP8_SASS_PINS = {"FFMA2": 226, "FADD2": 222, "FSETP": 19, "FMNMX3": 252, "STL": 3, "LDL": 3}
+
+
+def _nvdisasm_candidates():
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
+
+
+@pytest.mark.L0
+def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
+    """32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 == 2 x 97 exactly, derived from the
+    module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222 minus slack) and the Amax_O fold
+    is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no new spill (STL / LDL <= 3, the
+    pre-existing count).  Compiled for sm_100a at the production geometry -- no Blackwell device needed for the
+    compile, only for this module's gate."""
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / "sm100a_mxfp8_d128"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM100_D128_MXFP8_SASS_PROBE, str(dump), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_100a trace-compile of the d128 mxfp8 kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith(("EXPECT_MUFU_EX2 ", "EMULATED_COLS "))}
+    print(f"\nsm100 d128 mxfp8 sm_100a SASS: {stats}; expected MUFU.EX2 {expect}")
+    assert expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 194
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
+    for key in ("FFMA2", "FADD2", "FMNMX3"):
+        assert (
+            stats[key] >= _SM100_D128_MXFP8_SASS_PINS[key] - _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} < {_SM100_D128_MXFP8_SASS_PINS[key]} - {_SM100_SASS_SLACK}: {stats}"
+    assert (
+        stats["FSETP"] <= _SM100_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert stats["STL"] <= _SM100_D128_MXFP8_SASS_PINS["STL"] and stats["LDL"] <= _SM100_D128_MXFP8_SASS_PINS["LDL"], f"new spills: {stats}"
+
+
+# ============================================================================ sm100 d128 MXFP8: Stats is the exact fp32 log-sum-exp (fp64 reference), with the exp2 split in place
+@pytest.mark.L0
+@pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 106),
+    reason="the sm100 MXFP8 d128 kernel serves cc 10.0-10.6 (the Rubin sibling has its own pin in test_sdpa_fwd_dsl_sm107.py)",
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
+    """B=1 H=24/8 S=2048 (the split's tuning shape at a reference-friendly length): (1) the PUBLISHED Stats is within
+    1e-4 of the fp64 log-sum-exp of the DEQUANTIZED inputs -- the exp2 emulation's 8.8e-5 per-element error averages
+    to ~6e-6 on a dense row and ~2e-5 on a causal one (MEASURED on B200: 6.06e-6 / 1.90e-5; the all-MUFU kernel
+    1.6e-6, the cuDNN backend kernel 6.05e-6 / 3.07e-5); (2) O is finite, sentinel-free and within the bf16 output
+    rounding of the reference; (3) O is bit-identical with and without Stats (sdpa-invariants s4)."""
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
+
+    torch.manual_seed(0)
+    b, hq, hkv, s, d = 1, 24, 8, 2048, 128
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+
+    def mx(x, h, columnwise):
+        data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+        # sf_*_ref are the per-element fp32 DEQUANT SCALES [b, h, s, d]; fp64 so the reference logits are exact
+        # (fp32 matmul runs in TF32 in the DLFW containers, a 1e-4-class LSE error on a causal row with few columns).
+        deq = data.double().reshape(b, h, s, d) * sf.double().reshape(b, h, s, d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
+
+    q8, q_deq, sfq = mx(qf, hq, False)
+    k8, k_deq, sfk = mx(kf, hkv, False)
+    v8, v_deq, sfv = mx(vf, hkv, True)
+    (cga,) = supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, s, hq, d), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+        api = SdpaFwdDslSm100(
+            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=cga
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested"
+    rep = hq // hkv
+    logits = q_deq @ k_deq.repeat_interleave(rep, 1).transpose(-1, -2) * d**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits, dim=-1)
+    o_ref = torch.softmax(logits, dim=-1) @ v_deq.repeat_interleave(rep, 1)
+    o = outs[True]
+    assert not (o.float() == 1.5e30).any(), "sentinel survived: O rows never written"
+    assert torch.isfinite(o.float()).all() and torch.isfinite(lse).all(), "non-finite O / unwritten LSE rows"
+    bf16_floor = (o_ref - o_ref.to(torch.bfloat16).double()).abs().max().item()
+    d_o = (o.double() - o_ref).abs().max().item()
+    assert d_o <= 4 * bf16_floor + 1e-3, f"max |dO| {d_o:.3e} vs the bf16 rounding floor {bf16_floor:.3e} of the fp64 reference"
+    err = (lse.double() - lse_ref).abs()
+    print(
+        f"\nsm100 d128 mxfp8 {'causal' if causal else 'dense'}: max|dLSE| {err.max().item():.3e} rms {err.pow(2).mean().sqrt().item():.3e}, max|dO| {d_o:.3e} (bf16 floor {bf16_floor:.3e})"
+    )
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"
