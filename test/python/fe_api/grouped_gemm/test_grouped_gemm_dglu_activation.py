@@ -437,3 +437,62 @@ def compile_allocates_nothing():
         assert after == before, f"{type(api).__name__}.compile() made {after - before} torch allocation(s) (Rule 8, recipe R11)"
 
     return run
+
+
+@pytest.mark.parametrize("kind", ["offsets", "pointers"])
+@pytest.mark.parametrize("valid", [True, False])
+def test_debug_device_values_use_requested_stream(monkeypatch, kind, valid):
+    from cudnn.gemm.cutedsl.grouped import backend_utils as utils
+
+    caller, producer = torch.cuda.Stream(), torch.cuda.Stream()
+    values = [256, 512] if valid else [256, 255]
+    if kind == "pointers":
+        values = [16, 32] if valid else [16, 0]
+    with torch.cuda.stream(producer):
+        tensor = torch.tensor(values, device="cuda", dtype=torch.int64)
+    producer.synchronize()
+    helper = "_host_int_values" if kind == "offsets" else "_host_pointer_values"
+    original = getattr(utils, helper)
+    calls = []
+
+    def read(tensor):
+        # Check the actual D2H boundary directly: no scheduling race or sleep
+        # is needed for the old implementation to fail this stream contract.
+        handle = torch.cuda.current_stream(tensor.device).cuda_stream
+        assert handle == producer.cuda_stream
+        calls.append(handle)
+        return original(tensor)
+
+    monkeypatch.setattr(utils, "DEBUG_VALIDATE_DEVICE_VALUES", True)
+    monkeypatch.setattr(utils, helper, read)
+
+    def validate():
+        if kind == "offsets":
+            utils.debug_validate_offsets(tensor, expert_cnt=2, limit=512, mode="padded", stream=producer.cuda_stream)
+        else:
+            utils.debug_validate_pointer_values(tensor, "b_ptrs", stream=producer.cuda_stream)
+
+    with torch.cuda.stream(caller):
+        if valid:
+            validate()
+        else:
+            with pytest.raises(ValueError, match="non-decreasing|non-null"):
+                validate()
+        assert torch.cuda.current_stream().cuda_stream == caller.cuda_stream
+    assert calls == [producer.cuda_stream]
+
+
+@pytest.mark.parametrize("kind", ["offsets", "pointers"])
+def test_debug_device_values_disabled_never_reads_host(monkeypatch, kind):
+    from cudnn.gemm.cutedsl.grouped import backend_utils as utils
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled validation touched stream or device data")
+
+    monkeypatch.setattr(utils, "DEBUG_VALIDATE_DEVICE_VALUES", False)
+    for name in ("_check_not_capturing", "_host_int_values", "_host_pointer_values"):
+        monkeypatch.setattr(utils, name, forbidden)
+    if kind == "offsets":
+        utils.debug_validate_offsets(None, expert_cnt=2, limit=512, mode="padded", stream=None)
+    else:
+        utils.debug_validate_pointer_values(None, "b_ptrs", stream=None)

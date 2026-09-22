@@ -94,7 +94,12 @@ def debug_validate_offsets(offsets, *, expert_cnt: int, limit: int, mode: str, s
     if not DEBUG_VALIDATE_DEVICE_VALUES:
         return
     _check_not_capturing(stream, f"validating {name} values")
-    check_offsets_sequence(_host_int_values(offsets), expert_cnt=expert_cnt, limit=limit, mode=mode, alignment=alignment, name=name)
+    if is_torch_tensor(offsets):
+        with _torch_stream_context(stream, offsets.device):
+            values = _host_int_values(offsets)
+    else:
+        values = _host_int_values(offsets)
+    check_offsets_sequence(values, expert_cnt=expert_cnt, limit=limit, mode=mode, alignment=alignment, name=name)
 
 
 def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
@@ -103,7 +108,12 @@ def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
     if not DEBUG_VALIDATE_DEVICE_VALUES:
         return
     _check_not_capturing(stream, f"validating {name} entries")
-    if any(value == 0 or value % 16 != 0 for value in _host_pointer_values(ptrs)):
+    if is_torch_tensor(ptrs):
+        with _torch_stream_context(stream, ptrs.device):
+            values = _host_pointer_values(ptrs)
+    else:
+        values = _host_pointer_values(ptrs)
+    if any(value == 0 or value % 16 != 0 for value in values):
         raise ValueError(f"{name} entries must be non-null and 16-byte aligned")
 
 

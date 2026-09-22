@@ -662,7 +662,7 @@ Providing both or neither raises `ValueError`.
 - `geglu_alpha`: dGeGLU sigmoid input scale. Default: `1.702`
 - `glu_clamp_max`: dGeGLU upper bound for gate and up. Default: `7.0`
 - `glu_clamp_min`: dGeGLU lower bound for up only. Default: `-7.0`
-- These activation parameters must match forward and specialize the block-scaled backward cache on Blackwell and Rubin; the BF16 backend retains its fixed alpha/clamp values
+- These activation parameters must match forward; on block-scaled Blackwell and Rubin, they specialize the backward cache. BF16 accepts finite positive `geglu_alpha` and finite ordered `glu_clamp_min < glu_clamp_max`.
 - `situ_beta1`: Positive finite gate tanh scale for dSiTU-GLU. Default: `4.0`
 - `situ_beta2`: Positive finite up-branch tanh scale for dSiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
