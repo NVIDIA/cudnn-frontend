@@ -2527,7 +2527,7 @@ def _correction_warp_group(
                         q_elems = [o_elems[i] * inv_sf for i in range(_GROUP)]
 
                         if g == 0:
-                            bars.mb_o_empty[qs].wait(o_empty_phase)
+                            bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
                         for cj in cutlass.range_constexpr(_CHUNKS_PER_GROUP):
                             _chunk = g * _CHUNKS_PER_GROUP + cj
                             col_elems = _chunk * O_CHUNK

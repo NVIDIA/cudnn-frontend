@@ -132,7 +132,7 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 # test_sm107_ring_wait_form_sass_pins.
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
     ("f16", (128, 128)): (True, 31, 11),
-    ("fp8", (128, 128)): (False, 43, 12),
+    ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 35, 13),
     ("f16", (192, 128)): (True, 31, 11),
     ("fp8", (192, 128)): (True, 42, 12),
