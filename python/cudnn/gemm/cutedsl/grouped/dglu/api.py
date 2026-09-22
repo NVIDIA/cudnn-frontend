@@ -25,6 +25,7 @@ import math
 from ..backend_utils import (
     GroupedGemmBackend,
     _torch_stream_context,
+    allocate_wrapper_workspace,
     backend_cache_key,
     block_scaled_sfd_tensors,
     select_grouped_gemm_backend,
@@ -34,7 +35,10 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-from typing import Any, Literal, Tuple, Optional, overload
+from typing import TYPE_CHECKING, Any, Literal, Tuple, Optional, overload
+
+if TYPE_CHECKING:
+    import torch
 
 import cutlass
 
@@ -125,6 +129,8 @@ class DgluCall:
     weight_mode: Optional[MoEWeightMode] = None
     b_shape: Optional[Tuple[int, ...]] = None
     num_experts: Optional[int] = None
+    round_dgrad_to_input_dtype: bool = False
+    activation_tensor: Optional[torch.Tensor] = None
 
 
 class GroupedGemmDgluSm100(APIBase):
@@ -207,6 +213,8 @@ class GroupedGemmDgluSm100(APIBase):
         glu_clamp_min: float = -7.0,
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
+        round_dgrad_to_input_dtype: bool = False,
+        sample_activation: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -238,9 +246,6 @@ class GroupedGemmDgluSm100(APIBase):
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
                     ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
-                    ("geglu_alpha", kwargs["geglu_alpha"] if kwargs["geglu_alpha"] != 1.702 else None),
-                    ("glu_clamp_max", kwargs["glu_clamp_max"] if kwargs["glu_clamp_max"] != 7.0 else None),
-                    ("glu_clamp_min", kwargs["glu_clamp_min"] if kwargs["glu_clamp_min"] != -7.0 else None),
                     ("epilogue_op", kwargs["epilogue_op"] if kwargs["epilogue_op"] not in (None, "none", "identity") else None),
                 ),
                 block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
@@ -276,11 +281,24 @@ class GroupedGemmDgluSm100(APIBase):
                     act_func=kwargs["act_func"],
                     b_major=kwargs["b_major"],
                     use_dynamic_sched=kwargs["use_dynamic_sched"],
+                    geglu_alpha=kwargs["geglu_alpha"],
+                    glu_clamp_max=kwargs["glu_clamp_max"],
+                    glu_clamp_min=kwargs["glu_clamp_min"],
+                    round_dgrad_to_input_dtype=kwargs["round_dgrad_to_input_dtype"],
+                    sample_activation=kwargs["sample_activation"],
                 )
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
+                self._value_error_if(
+                    block_kwargs.pop("sample_activation") is not None,
+                    "activation output is supported only by the BF16 kernel",
+                )
+                self._value_error_if(
+                    block_kwargs.pop("round_dgrad_to_input_dtype"),
+                    "round_dgrad_to_input_dtype is supported only by the BF16 kernel",
+                )
                 # The block-scaled implementation is torch-native: hand it torch dtypes.
                 block_kwargs["acc_dtype"] = framework_dtype(block_kwargs["acc_dtype"], "torch")
                 if block_kwargs.get("b_dtype") is not None:
@@ -302,6 +320,12 @@ class GroupedGemmDgluSm100(APIBase):
         self._implementation.compile()
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
+
+    def scratch_workspace_bytes(self) -> int:
+        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires."""
+        if self._implementation is None:
+            self.check_support()
+        return self._implementation.scratch_workspace_bytes()
 
     # BF16 implementation
     @overload
@@ -325,6 +349,8 @@ class GroupedGemmDgluSm100(APIBase):
         sfd_col_tensor: None = None,
         amax_tensor: None = None,
         norm_const_tensor: None = None,
+        workspace: Any = None,
+        activation_tensor: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -349,6 +375,7 @@ class GroupedGemmDgluSm100(APIBase):
         sfd_col_tensor: Optional[torch.Tensor] = None,
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
+        workspace: Any = None,
     ) -> None: ...
 
     def execute(
@@ -373,6 +400,9 @@ class GroupedGemmDgluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        activation_tensor: Optional[torch.Tensor] = None,
+        *,
+        workspace: Any = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -404,8 +434,12 @@ class GroupedGemmDgluSm100(APIBase):
                 dbias_tensor=dbias_tensor,
                 linear_offset=self.linear_offset,
                 current_stream=current_stream,
+                workspace=workspace,
+                activation_tensor=activation_tensor,
             )
         else:
+            if activation_tensor is not None:
+                raise ValueError("activation output is supported only by the BF16 kernel")
             self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
@@ -427,6 +461,7 @@ class GroupedGemmDgluSm100(APIBase):
                 amax_tensor=amax_tensor,
                 norm_const_tensor=norm_const_tensor,
                 current_stream=current_stream,
+                workspace=workspace,
             )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -877,6 +912,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         amax_tensor=outputs["amax_tensor"],
         norm_const_tensor=call.norm_const_tensor,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
     )
     return outputs
 
@@ -950,15 +986,6 @@ def _normalize_dglu_call(
                 "discrete_col_sfd",
                 call.discrete_col_sfd if call.discrete_col_sfd else None,
             ),
-            ("geglu_alpha", call.geglu_alpha if call.geglu_alpha != 1.702 else None),
-            (
-                "glu_clamp_max",
-                call.glu_clamp_max if call.glu_clamp_max != 7.0 else None,
-            ),
-            (
-                "glu_clamp_min",
-                call.glu_clamp_min if call.glu_clamp_min != -7.0 else None,
-            ),
             (
                 "epilogue_op",
                 call.epilogue_op if call.epilogue_op not in (None, "none", "identity") else None,
@@ -977,7 +1004,17 @@ def _normalize_dglu_call(
         num_experts=num_experts,
     )
     if backend is GroupedGemmBackend.BLOCK_SCALED:
+        if call.activation_tensor is not None:
+            raise ValueError("activation output is supported only by the BF16 kernel")
+        if call.round_dgrad_to_input_dtype:
+            raise ValueError("round_dgrad_to_input_dtype is supported only by the BF16 kernel")
         return normalized, backend
+
+    if call.activation_tensor is not None:
+        if detect_framework(call.a_tensor) != "torch":
+            raise ValueError("activation output currently requires torch tensors")
+        if call.act_func != "dgeglu" or _convert_to_cutlass_data_type(call.c_tensor.dtype) != cutlass.BFloat16 or call.d_dtype != cutlass.BFloat16:
+            raise ValueError("activation output requires BF16 C/D and dgeglu")
 
     if call.use_single_group_runtime_offsets:
         raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")
@@ -1102,6 +1139,11 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         GroupedGemmBackend.BF16,
         call.weight_mode,
         call.act_func,
+        call.geglu_alpha,
+        call.glu_clamp_max,
+        call.glu_clamp_min,
+        call.round_dgrad_to_input_dtype,
+        _dglu_tensor_signature(call.activation_tensor, dynamic_m=True),
         _dglu_tensor_signature(call.a_tensor, dynamic_m=True),
         _dglu_tensor_signature(call.b_tensor),
         call.b_shape,
@@ -1164,9 +1206,11 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
             epilogue_op=None,
             use_dynamic_sched=call.use_dynamic_sched,
             linear_offset=call.linear_offset,
-            geglu_alpha=1.702,
-            glu_clamp_max=7.0,
-            glu_clamp_min=-7.0,
+            geglu_alpha=call.geglu_alpha,
+            glu_clamp_max=call.glu_clamp_max,
+            glu_clamp_min=call.glu_clamp_min,
+            round_dgrad_to_input_dtype=call.round_dgrad_to_input_dtype,
+            sample_activation=call.activation_tensor,
         )
         if not api.check_support():
             raise RuntimeError("Unsupported BF16 configuration")
@@ -1190,6 +1234,8 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         dbias_tensor=dbias_tensor,
         linear_offset=call.linear_offset,
         current_stream=call.current_stream,
+        workspace=allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, call.current_stream),
+        activation_tensor=call.activation_tensor,
     )
     return TupleDict(
         d_row_tensor=d_row_tensor,
@@ -1199,6 +1245,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         amax_tensor=None,
         sfd_row_tensor=None,
         sfd_col_tensor=None,
+        **({"activation_tensor": call.activation_tensor} if call.activation_tensor is not None else {}),
     )
 
 
@@ -1241,6 +1288,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    round_dgrad_to_input_dtype: bool = False,
+    activation_tensor: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
@@ -1265,6 +1314,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         wrapper_operand_meta(b_ptrs),
         wrapper_operand_meta(sfb_ptrs),
         wrapper_operand_meta(norm_const_tensor),
+        wrapper_operand_meta(activation_tensor),
         use_single_group_runtime_offsets,
         generate_dbias,
         n,
@@ -1284,6 +1334,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         geglu_alpha,
         glu_clamp_max,
         glu_clamp_min,
+        round_dgrad_to_input_dtype,
         situ_beta1,
         situ_beta2,
         epilogue_op,
@@ -1314,6 +1365,8 @@ def grouped_gemm_dglu_wrapper_sm100(
             dbias_tensor=dbias_tensor,
             linear_offset=resolved_linear_offset,
             current_stream=current_stream,
+            workspace=allocate_wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream),
+            activation_tensor=activation_tensor,
         )
         return TupleDict(
             d_row_tensor=d_row_tensor,
@@ -1323,6 +1376,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             amax_tensor=None,
             sfd_row_tensor=None,
             sfd_col_tensor=None,
+            **({"activation_tensor": activation_tensor} if activation_tensor is not None else {}),
         )
 
     call = DgluCall(
@@ -1358,6 +1412,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         geglu_alpha=geglu_alpha,
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
+        round_dgrad_to_input_dtype=round_dgrad_to_input_dtype,
+        activation_tensor=activation_tensor,
         situ_beta1=situ_beta1,
         situ_beta2=situ_beta2,
         epilogue_op=epilogue_op,

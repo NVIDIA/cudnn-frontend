@@ -3,19 +3,108 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from enum import Enum
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence, Tuple
 
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import ceil_div
-from cudnn.tensor_adapter import get_device, get_shape, get_strides
+from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
 
 
 class GroupedGemmBackend(str, Enum):
     BF16 = "bf16"
     BLOCK_SCALED = "block_scaled"
+
+
+# Offset / pointer-table VALUES are a device-data contract: the kernels read them on
+# device, and checking them on the host needs a D2H read that blocks the launch stream
+# and is illegal under CUDA-graph capture (python/cudnn/AGENTS.md Rule 3, recipe R6).
+# This switch restores the blocking checks for debugging. Read once at import; never
+# on by default; never memoized.
+DEBUG_VALIDATE_DEVICE_VALUES_ENV = "CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES"
+DEBUG_VALIDATE_DEVICE_VALUES = os.getenv(DEBUG_VALIDATE_DEVICE_VALUES_ENV, "0") == "1"
+
+
+def _check_not_capturing(stream, what: str) -> None:
+    err, status = cuda.cuStreamIsCapturing(cuda.CUstream(int(stream)))
+    if int(err) != 0:
+        raise RuntimeError(f"cuStreamIsCapturing failed: {err}")
+    if status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+        raise RuntimeError(
+            f"{what}: {DEBUG_VALIDATE_DEVICE_VALUES_ENV}=1 reads device values back to the host "
+            "and cannot run under CUDA graph capture; unset it for captured graphs"
+        )
+
+
+def _host_int_values(tensor) -> Tuple[int, ...]:
+    """Blocking D2H read of a small integer tensor (debug path only)."""
+    if is_torch_tensor(tensor):
+        return tuple(int(v) for v in tensor.detach().cpu().flatten().tolist())
+    import numpy as np
+
+    return tuple(int(v) for v in np.asarray(tensor).flatten().tolist())
+
+
+def _host_pointer_values(ptrs) -> Tuple[int, ...]:
+    """Pointer-table entries as ints, decoding the packed little-endian uint8 JAX form."""
+    import cutlass
+
+    from cudnn.datatypes import _convert_to_cutlass_data_type
+
+    if not is_torch_tensor(ptrs) and _convert_to_cutlass_data_type(ptrs.dtype) is cutlass.Uint8:
+        import numpy as np
+
+        return tuple(int(v) for v in np.asarray(ptrs).view(np.int64))
+    return _host_int_values(ptrs)
+
+
+def check_offsets_sequence(values: Sequence[int], *, expert_cnt: int, limit: int, mode: str, alignment: int = 256, name: str = "padded_offsets") -> None:
+    """Host rules on offset values; pure Python, no device access.
+
+    ``mode="padded"`` (unfused / GLU / dGLU): one cumulative end per expert, non-decreasing,
+    every end ``alignment``-aligned, last in ``(0, limit]``. ``mode="wgrad"``: one cumulative
+    end per expert, non-decreasing, every group size ``alignment``-aligned, last ``== limit``.
+    """
+    if mode not in ("padded", "wgrad"):
+        raise ValueError(f"unknown offsets mode {mode!r}")
+    if len(values) != expert_cnt:
+        raise ValueError(f"{name} length mismatch: expected {expert_cnt}, got {len(values)}")
+    previous = 0
+    for index, value in enumerate(values):
+        if value < previous:
+            raise ValueError(f"{name} must be a non-decreasing cumulative sum; index {index} is {value} after {previous}")
+        if mode == "padded" and value % alignment != 0:
+            raise ValueError(f"{name}[{index}] must be {alignment}-aligned, got {value}")
+        if mode == "wgrad" and (value - previous) % alignment != 0:
+            raise ValueError(f"{name} group {index} must be {alignment}-aligned, got {value - previous}")
+        previous = value
+    last = values[-1] if values else None
+    if mode == "padded" and (last is None or last <= 0 or last > limit):
+        raise ValueError(f"{name} last value must be in [1, {limit}], got {last}")
+    if mode == "wgrad" and last != limit:
+        raise ValueError(f"{name} last value must equal total tokens {limit}, got {last}")
+
+
+def debug_validate_offsets(offsets, *, expert_cnt: int, limit: int, mode: str, stream, alignment: int = 256, name: str = "padded_offsets") -> None:
+    """No-op unless ``CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1``; then a blocking
+    host check of the offset values that refuses to run under stream capture (R6)."""
+    if not DEBUG_VALIDATE_DEVICE_VALUES:
+        return
+    _check_not_capturing(stream, f"validating {name} values")
+    check_offsets_sequence(_host_int_values(offsets), expert_cnt=expert_cnt, limit=limit, mode=mode, alignment=alignment, name=name)
+
+
+def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
+    """No-op unless ``CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1``; then a blocking
+    host check that every table entry is non-null and 16-byte aligned (R6 under capture)."""
+    if not DEBUG_VALIDATE_DEVICE_VALUES:
+        return
+    _check_not_capturing(stream, f"validating {name} entries")
+    if any(value == 0 or value % 16 != 0 for value in _host_pointer_values(ptrs)):
+        raise ValueError(f"{name} entries must be non-null and 16-byte aligned")
 
 
 @contextmanager
@@ -29,6 +118,25 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
 
     with stream_context(current_stream, device):
         yield
+
+
+def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
+    """Caller-layer allocation of an APIBase's ``scratch_workspace_bytes()`` (recipe R2).
+
+    The ``*_wrapper_sm100`` functions allocate here, on the launch stream (R1), and pass
+    ``workspace=``; an APIBase never allocates one. Returns None when ``nbytes`` is 0.
+    """
+    if nbytes <= 0:
+        return None
+    if framework == "torch":
+        import torch
+
+        with _torch_stream_context(current_stream, device):
+            return torch.empty(nbytes, dtype=torch.uint8, device=device)
+    import jax
+    import jax.numpy as jnp
+
+    return jax.block_until_ready(jnp.empty((nbytes,), dtype=jnp.uint8, device=device))
 
 
 def wrapper_operand_meta(tensor):
