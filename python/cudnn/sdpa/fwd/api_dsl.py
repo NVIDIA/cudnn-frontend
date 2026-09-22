@@ -940,6 +940,10 @@ class SdpaFwdDsl(APIBase):
                 f"cudnn.sdpa: {label} requires a {required}-byte workspace but execute() received none; "
                 "allocate graph.get_workspace_size() bytes (uint8, on the graph's device) and pass the buffer to execute()"
             )
+        if not workspace.is_cuda or workspace.device != self.q_desc.device:
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be on the plan's device {self.q_desc.device}, got {workspace.device}")
+        if not workspace.is_contiguous():
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be contiguous, got strides {tuple(workspace.stride())}")
         nbytes = workspace.numel() * workspace.element_size()
         if nbytes < required:
             raise ValueError(
@@ -2517,9 +2521,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
 
-        ``workspace``: the caller's scratch buffer (uint8, at least
-        ``scratch_workspace_bytes()`` bytes, 16-byte aligned, on the plan's
-        device), REQUIRED whenever ``scratch_workspace_bytes()`` is non-zero:
+        ``workspace``: the caller's scratch buffer (uint8, contiguous, at least
+        ``scratch_workspace_bytes()`` bytes, on the plan's device; 16-byte
+        aligned, 128-byte aligned for a THD plan whose scratch holds TMA
+        descriptors), REQUIRED whenever ``scratch_workspace_bytes()`` is non-zero:
         every per-execute scratch buffer (THD metadata / O descriptors, the
         split partials) is carved from it, and a missing one raises the R2
         contract error.

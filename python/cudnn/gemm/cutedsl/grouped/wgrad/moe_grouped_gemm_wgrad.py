@@ -117,8 +117,8 @@ class MoEGroupedGemmWgradBF16Kernel:
         if m <= 0 or n <= 0 or expert_cnt <= 0:
             result = False
         if group_k_list is None:
-            if tokens_sum is None or int(tokens_sum) < 0:
-                return False
+            if tokens_sum is None or int(tokens_sum) < 0 or int(tokens_sum) % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
+                return False  # every cumulative offset, the total included, is a FIX_PAD_SIZE multiple
         else:
             if len(group_k_list) != expert_cnt:
                 result = False
