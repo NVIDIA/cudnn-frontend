@@ -9,8 +9,9 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream, torch_stream_context
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.frost.buffers import memset_zero_async
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
 
@@ -210,14 +211,17 @@ def flash_attn_bwd_sm100(
     topk_length: Optional[torch.Tensor] = None,
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
+    d_sink: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     current_stream=None,
     workspace: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
-    Accepts flat (unbatched) tensors with global topk indices.
-    Internally wraps as batch=1 for the CuTe DSL kernel.
+    Accepts flat (unbatched) contiguous tensors with global topk indices.
+    Internally wraps as batch=1 for the CuTe DSL kernel. Never allocates or
+    repacks: ``dq``/``dkv``/``d_sink`` are caller-provided (``None`` raises
+    ``ValueError``) and a strided input raises ``ValueError``.
 
     Args:
         q: (total_S_q, nheads, headdim) float16 or bfloat16
@@ -229,8 +233,9 @@ def flash_attn_bwd_sm100(
         topk_idxs: (total_S_q, topk_max) int32, global indices
         softmax_scale: float (default: 1/sqrt(headdim))
         topk_length: (total_S_q,) int32, per-query valid count, optional
-        dq: pre-allocated (total_S_q, nheads, headdim), optional
-        dkv: pre-allocated (total_S_kv, headdim), optional
+        dq: preallocated (total_S_q, nheads, headdim), same dtype as q
+        dkv: preallocated (total_S_kv, headdim), same dtype as kv
+        d_sink: preallocated (nheads,) float32
         deterministic: use the bounded-wave deterministic M64 kernel
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
@@ -274,6 +279,33 @@ def flash_attn_bwd_sm100(
         assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
         assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
 
+    # check_support() declines strided inputs; execute re-validates (Rule 1) and never repacks (Rule 2).
+    for name, tensor in zip(("q", "kv", "out", "dout", "lse", "attn_sink", "topk_idxs", "topk_length"), tensors_to_check):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
+    if lse.data_ptr() % 8 != 0:
+        raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
+
+    # The compile cache is keyed without output strides, so a caller-provided
+    # output must match the contiguous layout the kernel was compiled for (it
+    # is not copied: that would break out-parameter identity).
+    for name, tensor in (("dq", dq), ("dkv", dkv), ("d_sink", d_sink)):
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
+    assert dq.shape == q.shape, f"dq shape mismatch: expected {q.shape}, got {dq.shape}"
+    assert dq.dtype == q.dtype, f"dq dtype mismatch: expected {q.dtype}, got {dq.dtype}"
+    assert dq.device == device, f"dq device mismatch: expected {device}, got {dq.device}"
+    assert dq.is_contiguous(), "dq must be contiguous"
+    expected_dkv_shape = (total_S_kv, head_dim)
+    assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
+    assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
+    assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
+    assert dkv.is_contiguous(), "dkv must be contiguous"
+    assert d_sink.shape == (num_head,), f"d_sink shape mismatch: expected {(num_head,)}, got {d_sink.shape}"
+    assert d_sink.dtype == torch.float32, f"d_sink dtype mismatch: expected torch.float32, got {d_sink.dtype}"
+    assert d_sink.device == device, f"d_sink device mismatch: expected {device}, got {d_sink.device}"
+    assert d_sink.is_contiguous(), "d_sink must be contiguous"
+
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
@@ -287,7 +319,6 @@ def flash_attn_bwd_sm100(
         max_topk=max_topk,
         device_capability=device_capability,
         deterministic=deterministic,
-        is_contiguous=all(t.is_contiguous() for t in tensors_to_check),
     )
     if backend == "h128_d576_2cta_m64":
         # The D576 two-CTA kernel has its own plan-time compile and launch
@@ -307,6 +338,7 @@ def flash_attn_bwd_sm100(
             topk_length=topk_length,
             dq=dq,
             dkv=dkv,
+            d_sink=d_sink,
             current_stream=current_stream,
             workspace=workspace,
         )
@@ -335,53 +367,11 @@ def flash_attn_bwd_sm100(
         assert kernel_cls._get_workspace_size_LSE_OdO(total_S_q, head_dim, num_head, batch_size, cutlass.Float32) == tuple(workspace_lse_odo_shape)
         assert kernel_cls._get_workspace_size_dKV(total_S_kv, head_dim, batch_size, cutlass.Float32) == tuple(workspace_dkv_shape)
 
-    # Normalize inputs and allocate outputs on the execution stream:
-    # the kernel below launches on `current_stream`, so the semantically
-    # required output initialization and any contiguity copies must be
-    # stream-ordered with it, not with the ambient torch stream the caller
-    # happens to be on. Caller scratch is initialized inside the compiled
-    # kernel sequence.
-    with torch_stream_context(current_stream):
-        # Ensure contiguous
-        q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
-        lse = lse.contiguous()
-        if lse.data_ptr() % 8 != 0:
-            raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
-        attn_sink = attn_sink.contiguous()
-        topk_idxs = topk_idxs.contiguous()
-        if topk_length is not None:
-            topk_length = topk_length.contiguous()
-
-        # Allocate output tensors
-        if dq is None:
-            dq = torch.empty_like(q)
-        else:
-            assert dq.shape == q.shape, f"dq shape mismatch: expected {q.shape}, got {dq.shape}"
-            assert dq.dtype == q.dtype, f"dq dtype mismatch: expected {q.dtype}, got {dq.dtype}"
-            assert dq.device == device, f"dq device mismatch: expected {device}, got {dq.device}"
-            # The compile cache is keyed without output strides, so a caller
-            # provided output must match the contiguous layout the kernel was
-            # compiled for (it is not copied: that would break out-parameter
-            # identity).
-            assert dq.is_contiguous(), "dq must be contiguous"
-        if dkv is None:
-            dkv = (
-                torch.empty(total_S_kv, head_dim, dtype=kv.dtype, device=device)
-                if uses_h128_two_cta
-                else torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
-            )
-        else:
-            expected_dkv_shape = (total_S_kv, head_dim)
-            assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
-            assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
-            assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
-            assert dkv.is_contiguous(), "dkv must be contiguous"
-            # The H128 two-CTA kernel accumulates into a separate zeroed FP32
-            # workspace and its conversion kernel overwrites every public dKV
-            # element. Keep caller poison intact to enforce that contract.
-            if not uses_h128_two_cta:
-                dkv.fill_(0)
-        d_sink = torch.empty_like(attn_sink) if uses_h128_two_cta else torch.zeros_like(attn_sink)
+    # Every route clears its FP32 dKV accumulator in-kernel and its finalizer
+    # overwrites every public dKV element, so dkv needs no reset. d_sink is
+    # atomic-added by sum_dSink; only the H128 two-CTA zero_init clears it (R4).
+    if not uses_h128_two_cta:
+        memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 

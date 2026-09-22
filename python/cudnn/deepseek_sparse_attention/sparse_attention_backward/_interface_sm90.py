@@ -9,12 +9,13 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.api_base import WorkspaceCarver, ws_align
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
-    maybe_contiguous,
     resolve_stream,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.frost.buffers import memset_zero_async
 
 from .dsa_bwd_sm90 import (
     FlashAttentionDSABackwardSm90,
@@ -28,6 +29,27 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
+_M_BLOCK_SIZE = 64
+_N_BLOCK_SIZE = 64
+_HEAD_DIM_MULTIPLE = 32
+_WORKSPACE_OWNER = "SparseAttentionBackward (SM90)"
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (int(value) + multiple - 1) // multiple * multiple
+
+
+def _workspace_extents(total_s_q: int, total_s_kv: int, head_dim: int) -> Tuple[int, int, int]:
+    """Rounded (S_q, S_kv, head_dim) extents of the FP32 scratch the SM90 kernels index."""
+    return _round_up(total_s_q, _M_BLOCK_SIZE), _round_up(total_s_kv, _N_BLOCK_SIZE), _round_up(head_dim, _HEAD_DIM_MULTIPLE)
+
+
+def flash_attn_bwd_sm90_workspace_size(total_s_q: int, total_s_kv: int, head_dim: int, num_heads: int) -> int:
+    """Caller scratch for one SM90 launch: FP32 dPsum, log2-scaled LSE, and the dKV accumulator."""
+    seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
+    stats_bytes = ws_align(seqlen_q_rounded * int(num_heads) * torch.float32.itemsize)
+    return 2 * stats_bytes + ws_align(seqlen_k_rounded * head_dim_rounded * torch.float32.itemsize)
+
 
 def flash_attn_bwd_sm90(
     q: torch.Tensor,
@@ -35,43 +57,44 @@ def flash_attn_bwd_sm90(
     out: torch.Tensor,
     dout: torch.Tensor,
     lse: torch.Tensor,
-    attn_sink: Optional[torch.Tensor] = None,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    dq: torch.Tensor,
+    dkv: torch.Tensor,
+    d_sink: torch.Tensor,
+    workspace: torch.Tensor,
     softmax_scale: Optional[float] = None,
-    dq: Optional[torch.Tensor] = None,
-    dkv: Optional[torch.Tensor] = None,
-    d_sink: Optional[torch.Tensor] = None,
-    dkv_accum: Optional[torch.Tensor] = None,
-    topk_idxs: torch.Tensor = None,
-    topk_length: torch.Tensor = None,
-    need_d_sink: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
     current_stream=None,
-) -> Tuple[torch.Tensor, ...]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
-    Accepts flat (unbatched) tensors with global topk indices.
-    Internally wraps as batch=1 for the CuTe DSL kernel.
+    Accepts flat (unbatched) contiguous tensors with global topk indices.
+    Internally wraps as batch=1 for the CuTe DSL kernel. Never allocates:
+    the outputs are caller-provided and the FP32 scratch is carved from
+    ``workspace`` (sized by ``flash_attn_bwd_sm90_workspace_size``).
 
     Args:
-        q: (total_S_q, nheads, headdim) bfloat16
-        kv: (total_S_kv, headdim) bfloat16  (K=V, MQA h_kv=1)
-        out: (total_S_q, nheads, headdim_v) bfloat16
-        dout: (total_S_q, nheads, headdim_v) bfloat16
-        lse: (total_S_q, nheads) float32
-        attn_sink: (nheads,) float32, optional. When provided, the backward
-            probabilities use sink-aware LSE.
-        softmax_scale: float (default: 1/sqrt(headdim))
-        dq: pre-allocated (total_S_q, nheads, headdim), optional
-        dkv: pre-allocated (total_S_kv, headdim), optional
-        d_sink: pre-allocated (nheads,), optional
+        q: (total_S_q, nheads, headdim) bfloat16/float16
+        kv: (total_S_kv, headdim) bfloat16/float16  (K=V, MQA h_kv=1)
+        out: (total_S_q, nheads, headdim_v)
+        dout: (total_S_q, nheads, headdim_v)
+        lse: (total_S_q, nheads) float32, KV-only LSE
+        attn_sink: (nheads,) float32
         topk_idxs: (total_S_q, topk_max) int32, global KV indices.
             Entries outside `[0, S_kv)` are ignored in both compact and
             non-compact modes.
+        dq: preallocated (total_S_q, nheads, headdim), same dtype as q
+        dkv: preallocated (total_S_kv, headdim), same dtype as kv
+        d_sink: preallocated (nheads,) float32
+        workspace: uint8 CUDA scratch of at least
+            ``flash_attn_bwd_sm90_workspace_size`` bytes
+        softmax_scale: float (default: 1/sqrt(headdim))
         topk_length: (total_S_q,) int32, optional per-query valid prefix
             length, clamped to `[0, topk_max]` by the kernel.
-        need_d_sink: return and compute d_sink when True
 
     Returns:
-        (dq, dkv) or (dq, dkv, d_sink) — flat layout gradients
+        (dq, dkv, d_sink) -- flat layout gradients
     """
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"Only SM90, got SM{compute_capability}0"
@@ -81,98 +104,75 @@ def flash_attn_bwd_sm90(
     head_dim_v = 512 if head_dim == 576 else head_dim
     num_head_kv = 1
 
-    # --- wrap flat tensors as batch=1 4D for the CuTe DSL kernel ---
-    q4 = q.unsqueeze(0)  # (1, total_S_q, H, D)
-    kv4 = kv.unsqueeze(0).unsqueeze(2)  # (1, total_S_kv, 1, D)
-    out4 = out.unsqueeze(0)  # (1, total_S_q, H, D_v)
-    dout4 = dout.unsqueeze(0)  # (1, total_S_q, H, D_v)
-    lse4 = lse.unsqueeze(0)  # (1, total_S_q, H)
-    topk4 = topk_idxs.unsqueeze(0) if topk_idxs is not None else None  # (1, total_S_q, TopK)
-    tlen4 = topk_length.unsqueeze(0) if topk_length is not None else None  # (1, total_S_q)
-
-    m_block_size = 64
-    n_block_size = 64
-    KV_stage = 1
-    PdS_stage = 1
-    SdP_swapAB = False
-    dKV_swapAB = False
-    dQ_swapAB = False
-
-    q4, kv4, out4, dout4, lse4 = [maybe_contiguous(t) for t in (q4, kv4, out4, dout4, lse4)]
-
-    batch_size = 1
-    seqlen_q = total_S_q
-    seqlen_k = total_S_kv
-
-    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
-
-    assert q4.dtype in [torch.float16, torch.bfloat16]
-    assert q4.dtype == kv4.dtype == out4.dtype == dout4.dtype
-    assert lse4.dtype == torch.float32
-    assert all(t.is_cuda for t in (q4, kv4, out4, dout4, lse4))
-    if attn_sink is not None:
-        assert attn_sink.dtype == torch.float32
-        assert attn_sink.shape == (num_head,)
-        assert attn_sink.is_cuda
+    assert q.dtype in [torch.float16, torch.bfloat16]
+    assert q.dtype == kv.dtype == out.dtype == dout.dtype
+    assert lse.dtype == torch.float32
+    assert attn_sink.dtype == torch.float32
+    assert attn_sink.shape == (num_head,)
+    assert topk_idxs.dtype == torch.int32
+    if topk_length is not None:
+        assert topk_length.dtype == torch.int32
+    assert all(t.is_cuda for t in (q, kv, out, dout, lse, attn_sink, topk_idxs))
     assert num_head > num_head_kv, "MLA/MQA requires num_head > num_head_kv"
     assert head_dim in [512, 576]
+
+    # check_support() declines strided inputs; execute re-validates (Rule 1) and never repacks (Rule 2).
+    for name, tensor in (
+        ("q", q),
+        ("kv", kv),
+        ("out", out),
+        ("dout", dout),
+        ("lse", lse),
+        ("attn_sink", attn_sink),
+        ("topk_idxs", topk_idxs),
+        ("topk_length", topk_length),
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous; got shape {tuple(tensor.shape)} strides {tuple(tensor.stride())}")
+    for name, tensor, reference in (("dq", dq, q), ("dkv", dkv, kv), ("d_sink", d_sink, attn_sink)):
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{name} must be preallocated; use sparse_attention_backward_wrapper for automatic output allocation")
+        if tuple(tensor.shape) != tuple(reference.shape) or tensor.dtype != reference.dtype or tensor.device != reference.device:
+            raise ValueError(f"{name} must have shape {tuple(reference.shape)}, dtype {reference.dtype}, and device {reference.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous; got strides {tuple(tensor.stride())}")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
 
-    device = q.device
+    current_stream = resolve_stream(current_stream)
 
-    # Allocate flat output buffers, then view as 4D for the kernel
-    if dq is None:
-        dq = torch.empty_like(q)  # (total_S_q, H, D)
-    if dkv is None:
-        dkv = torch.empty(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+    seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
+    carver = WorkspaceCarver(workspace, flash_attn_bwd_sm90_workspace_size(total_S_q, total_S_kv, head_dim, num_head), _WORKSPACE_OWNER)
+    dpsum = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
+    lse_log2 = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
+    dkv_accum = carver.take(seqlen_k_rounded * head_dim_rounded, torch.float32).view(1, num_head_kv, seqlen_k_rounded * head_dim_rounded)
+    # The main kernel atomic-adds into dkv_accum and the preprocess kernel into d_sink (R4).
+    memset_zero_async(dkv_accum.data_ptr(), dkv_accum.numel() * dkv_accum.element_size(), int(current_stream))
+    memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 
+    # --- wrap flat tensors as batch=1 4D views for the CuTe DSL kernel ---
+    q4 = q.unsqueeze(0)  # (1, total_S_q, H, D)
+    kv4 = kv.unsqueeze(0).unsqueeze(2)  # (1, total_S_kv, 1, D)
+    out4 = out.unsqueeze(0)  # (1, total_S_q, H, D_v)
+    dout4 = dout.unsqueeze(0)  # (1, total_S_q, H, D_v)
+    lse4 = lse.unsqueeze(0)  # (1, total_S_q, H)
+    topk4 = topk_idxs.unsqueeze(0)  # (1, total_S_q, TopK)
+    tlen4 = topk_length.unsqueeze(0) if topk_length is not None else None  # (1, total_S_q)
     dq4 = dq.unsqueeze(0)  # (1, total_S_q, H, D)
     dkv4 = dkv.unsqueeze(0).unsqueeze(2)  # (1, total_S_kv, 1, D)
 
-    sink_enabled = attn_sink is not None
-    return_d_sink = need_d_sink or d_sink is not None
-    if return_d_sink:
-        assert attn_sink is not None, "attn_sink is required when requesting d_sink"
-        if d_sink is None:
-            d_sink = torch.zeros_like(attn_sink)
-        else:
-            d_sink.fill_(0)
-    write_d_sink = sink_enabled and return_d_sink
+    m_block_size = _M_BLOCK_SIZE
+    n_block_size = _N_BLOCK_SIZE
+    KV_stage = 1
+    PdS_stage = 1
+    SdP_swapAB = False
+    dKV_swapAB = False
+    dQ_swapAB = False
+    seqlen_k = total_S_kv
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
-
-    dpsum = torch.empty(
-        batch_size,
-        seqlen_q_rounded,
-        num_head,
-        dtype=torch.float32,
-        device=device,
-    )
-    lse_log2 = torch.empty(
-        batch_size,
-        seqlen_q_rounded,
-        num_head,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    if dkv_accum is None:
-        dkv_accum = torch.zeros(
-            batch_size,
-            num_head_kv,
-            seqlen_k_rounded * head_dim_rounded,
-            dtype=torch.float32,
-            device=device,
-        )
-    else:
-        dkv_accum.fill_(0)
-
-    dtype = torch2cute_dtype_map[q4.dtype]
-    current_stream = resolve_stream(current_stream)
+    dtype = torch2cute_dtype_map[q.dtype]
     arch = 90
     num_threads = 256
 
@@ -182,15 +182,13 @@ def flash_attn_bwd_sm90(
         head_dim_v,
         m_block_size,
         num_threads,
-        sink_enabled,
-        write_d_sink,
     )
     if compile_key_pre not in flash_attn_bwd_sm90.compile_cache_pre:
         o_tensor, do_tensor = [to_cute_tensor(t) for t in (out4, dout4)]
         dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dpsum, lse_log2)]
         lse_tensor = to_cute_tensor(lse4, assumed_align=4)
-        attn_sink_tensor = to_cute_tensor(attn_sink) if sink_enabled else None
-        d_sink_tensor = to_cute_tensor(d_sink) if write_d_sink else None
+        attn_sink_tensor = to_cute_tensor(attn_sink)
+        d_sink_tensor = to_cute_tensor(d_sink)
         fa_bwd_pre = _FlashAttentionDSABackwardPreprocessSm90(
             dtype,
             head_dim_v,
@@ -219,8 +217,8 @@ def flash_attn_bwd_sm90(
         dpsum,
         lse4,
         lse_log2,
-        attn_sink if sink_enabled else None,
-        d_sink if write_d_sink else None,
+        attn_sink,
+        d_sink,
         None,
         None,
         None,
@@ -228,15 +226,10 @@ def flash_attn_bwd_sm90(
     )
 
     # --- main kernel ---
-    assert topk4 is not None
-    assert topk4.dtype == torch.int32
     have_topk_length = tlen4 is not None
-    if have_topk_length:
-        assert tlen4.dtype == torch.int32
     # else: mTopkLength is read only under const_expr(have_topk_length); None at compile and launch (Rule 8).
     max_topk = topk4.shape[-1]
 
-    num_threads = 256
     compile_key = (
         dtype,
         head_dim,
@@ -351,10 +344,8 @@ def flash_attn_bwd_sm90(
         current_stream,
     )
 
-    # dq / dkv are already the flat tensors (unsqueeze was a view)
-    if return_d_sink:
-        return dq, dkv, d_sink
-    return dq, dkv
+    # dq / dkv are the caller's flat tensors (unsqueeze was a view)
+    return dq, dkv, d_sink
 
 
 flash_attn_bwd_sm90.compile_cache_pre = {}
