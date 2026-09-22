@@ -23,10 +23,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   `_checked_seq_lens` in `sdpa/fwd/api_dsl.py`.
 - **No per-execute allocations.** No `torch.empty`/`torch.zeros` inside
   `execute()`: scratch is carved from the caller's workspace
-  (`scratch_workspace_bytes()` contract), and a dead ABI slot may use a
-  one-time cached dummy (`_dummy`) at most. Prefer compiling the unused
-  operand out entirely (CuTeDSL specializes on `None` via
-  `cutlass.const_expr` — see the SM120 SDPA kernel's optional lse/sinks).
+  (`scratch_workspace_bytes()` contract; a missing workspace raises, never
+  allocates). No new `_dummy` callers: the remaining sites are enumerated by
+  the ratchet test (`test_sdpa_fwd_rule8_ratchet.py`) and retired per R3.
+  Prefer compiling the unused operand out entirely (CuTeDSL specializes on
+  `None` via `cutlass.const_expr` — see the SM120 SDPA kernel's optional
+  lse/sinks).
 - **Init-time flags are compile-time specializations; `execute()` must match
   them exactly, in both directions.** A required-but-missing tensor must
   raise, never fall back to a zeros dummy (zeros sinks change the softmax
@@ -141,11 +143,6 @@ none is precedent:
   the graph's envelope `S_max` and turns the per-batch lengths into
   `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
   violation on the wrapper surface (a caller contract, documented there).
-- wgrad discrete `execute()` called with `wgrad_tensor` but no `wgrad_ptrs`
-  builds the per-expert pointer table with `torch.tensor(values, device=...)`
-  per call (`gemm/cutedsl/grouped/wgrad/_bf16_api.py::_generate_wgrad_ptrs`,
-  pageable H2D + implicit sync). Pass `wgrad_ptrs` to avoid it; the follow-up
-  PR moves the derivation to the wrapper layer (R4) and requires the table.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -430,6 +427,34 @@ the workspace BASE pointer — the `OperandBuffer` capsule owns its own
 shape/stride, so the memo holds no device memory; a caller rotating workspaces
 pays the conversions again and nothing else (`hopper/kda_engine.py`; detector
 `test_kda_sm90_cuda.py::test_alternating_workspaces_recarve`).
+A direct adapter caller (a standalone `<op>_wrapper`, a test, downstream code
+constructing `SdpaFwdDsl*` itself) is a caller: it allocates
+`scratch_workspace_bytes()` and passes it (`sdpa_fwd_wrapper_sm80` does, under
+`stream_context(<launch stream>)`). An adapter never keeps a `workspace is
+None` allocation branch, not even for "standalone use" —
+`SdpaFwdDsl._scratch_base` and `WorkspaceCarver` raise the same contract error.
+Test suites get the buffer from an autouse shim
+(`test/python/gemm/frost/conftest.py::_moe_plan_workspace`,
+`test/python/sdpa/frost/conftest.py::_sdpa_adapter_workspace`);
+`@pytest.mark.no_workspace_shim` turns it off to test the error itself.
+A CuTeDSL APIBase that serves torch and JAX carves with the framework-neutral
+`cudnn.frost.workspace.Workspace(workspace, nbytes, type(self).__name__).take(nbytes,
+"uint8")` (`buffers.probe` reads torch via `__cuda_array_interface__`, anything
+else via `__dlpack__`); a Pointer-typed kernel parameter gets `view.data_ptr()`
+(tvm-ffi carries `cute.Pointer` as int), a Tensor-typed one gets the
+`DeviceView`. `scratch_workspace_bytes()` is `max(align_up(kernel.get_workspace_bytes(),
+128), 128)` from a kernel instance memoised at plan time and reused by
+`compile()`, so the workspace is always required and a mode that needs 0 bytes
+has no NULL case; legal because the helper kernel rewrites every launch's
+descriptor slots and zeroes its own scheduler counter, so one buffer serves
+non-overlapping executions and carries no cross-launch state. The
+`*_wrapper_sm100` functions allocate via
+`backend_utils.allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(),
+device, current_stream)` exactly where they allocate outputs, memo and cold path
+alike; an eager-JAX workspace has no `record_stream`, so the API holds it until
+the next execute the way it holds `_live_ptrs`
+(`gemm/cutedsl/grouped/**`, `discrete_grouped/**`; detectors
+`fe_api/test_grouped_gemm_rule8.py`, `fe_api/grouped_gemm/test_grouped_gemm_rule8_fusions.py`).
 An APIBase whose kernel needs per-execute metadata built on device (HSTU
 block-sparse CSR from `func`) plus a wide-dtype accumulator (fp32 dQ) declares
 both in `scratch_workspace_bytes()` from plan-time geometry
@@ -469,17 +494,45 @@ with the flag off, plus the compile key carrying it (`mDenom` in
 `sparse_score_recompute_sm100.py`;
 `test_DSA_indexer_forward.py::test_denom_slot_compiled_out`,
 `test_DSA_sparse_score_recompute.py::..._sm100_topk_length_none_compiles_out`).
+Grandfathered `_dummy` sites in `sdpa/fwd/api_dsl.py` (23; ratchet
+`test_sdpa_fwd_rule8_ratchet.py::test_no_new_dummy_callers`) are retired by
+their family's kernel-side change — the fp8/mxfp8 SM100/SM107 sites by the fp8
+pointer-ABI migration (dead slots bind 0, absent amax/scales compile out), the
+SM120 and SM80 sites by `Optional`-typing the kernel slot. Do not convert one to
+a workspace borrow when that flips a dense plan's `get_workspace_size()` from 0
+(tests pin 0 for dense fp8/mxfp8 and SM100 f16); borrow only where the path
+already carves (THD: the SM100 sinks slot, the SM120 V stub), and never fill a
+dead slot.
+`cute.compile` placeholders never allocate: a `cute.Pointer` parameter's
+compile stand-in is `cute.runtime.make_ptr(dtype, <aligned dummy address>,
+cute.AddressSpace.gmem, assumed_align=...)` — `make_ptr(cutlass.Int64, 16, gmem,
+assumed_align=8)` for a pointer table, `make_ptr(cutlass.Uint8, 128, gmem,
+assumed_align=128)` for `workspace_ptr` — never
+`from_dlpack(torch.empty(...)).iterator` (the 8·E-byte `_compile_*_ptrs` device
+buffers existed only for `.iterator`). A `cute.Tensor` workspace parameter's fake
+is `_make_fake_cute_tensor(cutlass.Uint8, (scratch_workspace_bytes(),), (1,),
+assumed_align=128)` with the SAME static extent the execute-time `DeviceView`
+carries (tvm-ffi checks static dims); when the API's `_interpret_uint8_as_fp4x2`
+default is True, pass `interpret_uint8_as_fp4x2=False` or Uint8 silently becomes
+FP4x2 (`wgrad/_blockscaled_api.py`).
 
 **R4 — a live per-batch table the caller did not give you (lengths, offsets,
 scale scalars).** R2 (carve) + fill on the launch stream with one async op
 (`cuMemsetD32Async`, `cuMemcpyHtoDAsync`, `buffers.memset_zero_async`), or make
 it a scalar kernel argument. Never `torch.tensor(values, device=...)` per execute
 (pageable H2D + implicit sync), never build it at `compile()` into a plan-owned
-tensor. A pointer table over a uniformly strided tensor is derived on device:
-`torch.arange(n, dtype=torch.int64, device=dev).mul_(stride_bytes).add_(base)`
-under `stream_context(launch)` (wgrad `_generate_wgrad_ptrs`) — or the kernel
-takes `(base, stride)` as scalars. The fe_api sync detector (R9) flags the host
-list on the first call, so the failure is loud, not a silent serialisation.
+tensor. A pointer table over a uniformly strided output is CALLER-layer work:
+the APIBase REQUIRES the table (`ValueError` naming the helper), a public helper
+next to the wrapper derives it once per buffer on the launch stream
+(`gemm/cutedsl/grouped/wgrad/api.py::wgrad_expert_ptrs`: `torch.arange(base,
+base + E*stride_bytes, stride_bytes, dtype=torch.int64)` under
+`_torch_stream_context`, `torch.full` for E <= 1; JAX eager: packed uint8), and
+the wrapper calls it when the caller passed none. Never derive it per execute
+inside `execute()` (the API cannot memoize it and it hides an R1
+`record_stream`), never a host list through `torch.tensor(..., device=)`; or the
+kernel takes `(base, stride)` as scalars. The fe_api sync detector (R9) flags
+the host list on the first call, so the failure is loud, not a silent
+serialisation (`fe_api/test_grouped_gemm_rule8.py::test_wgrad_discrete_requires_wgrad_ptrs`).
 A device-side scheduler counter / ticket / semaphore the kernel self-resets is
 still caller scratch: carve it (R2) and `memset_zero_async` it on the launch
 stream EVERY execute, not once — the buffer is shared scratch another engine may
@@ -641,6 +694,17 @@ allocations, so a before/after around the `with` is red on innocent code
 `::test_workspace_contract`, `::test_check_support_declines_unaligned_layouts`,
 `test_hstu_block_sparse.py::test_builder_workspace_bytes_match_carve` (the
 carver's final offset equals the bytes function for every geometry).
+For a grouped / pointer-table API: compile eagerly, run the FIRST execute of
+the plan over an offsets tensor and pointer table it has never seen inside
+`torch.cuda.graph` with a torch workspace, read `allocation.all.allocated`
+inside the window (must be 0), replay twice and compare bit-exact with an eager
+execute (atomically accumulated outputs such as dGLU `dprob` get a tolerance);
+feed the allocation/sync detector fresh tables per execute; check the workspace
+contract with None / undersized / a 64-byte-offset slice; a metadata-only
+`TensorDesc` for the sample offsets proves the build reads no values
+(`fe_api/test_grouped_gemm_rule8.py`, `fe_api/grouped_gemm/test_grouped_gemm_rule8_fusions.py`).
+A wrapper cache-smoke test that stubs `check_support` / `compile` / `execute`
+must stub `scratch_workspace_bytes` too, since the wrapper now sizes from it.
 
 **R10 — a launch envelope the caller already knows (max sequence length, packed
 total, batch count, top-k width).** It is a required host int at plan time (an
