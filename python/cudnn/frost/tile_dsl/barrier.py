@@ -35,9 +35,54 @@ def advance(state, stages):
 
 
 @cute.jit
-def wait(mb, phase):
-    while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=WAIT_TIMEOUT):
+def wait_try(mb, phase):
+    """Untimed ``mbarrier.try_wait.parity`` loop through the DSL wrapper (no suspend hint, no inline PTX)."""
+    while not nvvm.mbarrier_wait_parity(mb, phase, nvvm.MBarrierWait.TRY):
         pass
+
+
+@cute.jit
+def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
+    """Spin on ``mb`` until its phase parity differs from ``phase``.
+
+    ``spin=False`` (the default; an untouched call site compiles to the same cubin as before this kwarg existed) is the DSL
+    wrapper's ``mbarrier.try_wait.parity`` with the ``time_limit`` suspend hint.  ``spin=True`` is the C++ reference's
+    hint-less ``MBarrier::wait`` as inline PTX (the public wrapper always emits the 4-operand ``.timelimit`` form, so the
+    hint-less one has to be spelled by hand).  Both arms keep ``.acquire.cta`` ordering, the same parity test and the same
+    termination condition (spin until the phase flips; neither form has a real time limit, so ``timeout`` stays the hang
+    detector).  Only the retry mechanics differ, and the difference is a PER-CALL-SITE choice, not a library default.
+
+    MEASURED (host sm_107a trace-compiles at S=8K dense; perf on the Rubin node locked at 2376 MHz, A/B/A x3 with a control
+    pair, CUPTI medians, TFLOPS ratios against develop): on sm_107a the default lowers per lane, ``SYNCS.PHASECHK.TRANS64.TRYWAIT
+    P0 / @!P0 NANOSLEEP.SYNCS 0x1 / @!P0 SYNCS.PHASECHK / @!P0 BRA`` plus a ``BSSY`` reconverge (the warp is parked in hardware
+    and woken by the phase event), while ``spin=True`` lowers to the uniform ``USYNCS.PHASECHK.TRANS64.TRYWAIT UP0 /
+    BRA.U !UP0`` pair (two uniform instructions, no sleep; with every wait spun the d512 fp8 prefill goes 110 -> 8 divergent
+    SYNCS.PHASECHK, 57 -> 6 NANOSLEEP, 57 -> 108 USYNCS.PHASECHK, 0 spills either way).  Spinning the per-KV-iteration RING
+    waits gains +4.9 % on d128 bf16 @2K, +3.5 % on d512 fp8 @8K, +9.4 % on d192x128 mxfp8 @32K and +1.1..+4.3 % on d128
+    mxfp8 / d192x128 f16 / d192x128 fp8 / d512 f16 (those four measured together with the predicated credit arrive), but
+    LOSES -5.8 % @2K and -2.5 % @32K on d128 per-tensor fp8 and -2.2 % @32K on d512 mxfp8 (the loss follows the hint-less
+    first check on the ring waits: keeping the sleeping retry after a hint-less first check, or spinning only the whole-tile
+    idle waits, does not remove it), and spinning every wait is a loss on the linear-attention forward kernels (KDA -2.2 %
+    @32K, GDP -5.0 % @8K).  On sm_100a ptxas lowers the hint-less form to ONE divergent ``SYNCS.PHASECHK`` plus a branch and
+    emits no ``USYNCS.PHASECHK`` at all, so none of the sm_107a reasoning transfers and the sm100 kernels stay on the default.
+    Hence the sm107 prefill kernels that gain opt their ring waits in through one module constant (``SPIN_RING_WAITS``);
+    the waits a warp parks in for a whole tile (scheduler credits and CLC responses, the TMA-STG's O-ready wait,
+    ``tmem_dealloc``, the end-of-kernel drains) and every other consumer keep the default.
+
+    The inline-PTX labels are scoped to the ``{ }`` block, so the fixed names are legal at every instantiation.  No
+    ``predicate=`` is passed (the DSL can lower one onto the last operand's VALUE, see ``arrive_expect_tx``); if this loop
+    is ever predicated, branch around it instead.
+    """
+    if cutlass.const_expr(spin):
+        nvvm.inline_ptx(
+            "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+            "@P1 bra.uni DONE;\n\tbra.uni LAB_WAIT;\n\tDONE:\n\t}",
+            read_only_args=[mb, cutlass.Int32(phase)],
+        )
+    else:
+        while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=WAIT_TIMEOUT):
+            pass
 
 
 @cute.jit
@@ -160,6 +205,8 @@ class MBarrier:
     init_count: cutlass.Constexpr[object]
     producer: cutlass.Constexpr[int] = int(Producer.THREAD)
     scope: cutlass.Constexpr[int] = int(Scope.LOCAL)
+    try_wait: cutlass.Constexpr[bool] = False
+    spin: cutlass.Constexpr[bool] = False
     stage_idx: object = 0
 
     def __getitem__(self, i):
@@ -182,8 +229,15 @@ class MBarrier:
             count = int(self.init_count)
         nvvm.mbarrier_init(self.smem_ptr, count)
 
-    def wait(self, phase):
-        wait(self.smem_ptr, phase)
+    def wait(self, phase, spin: bool = False):
+        # spin=True opts THIS call site into the hint-less uniform spin (see wait()); a barrier declared with spin=True opts
+        # every wait on it in; the default is the sleeping form.  A barrier declared with try_wait=True waits through the
+        # DSL wrapper's untimed try_wait loop instead (the linear attention kernels: one SYNCS.PHASECHK + branch on sm100,
+        # no inline PTX, so their cubins are unchanged).
+        if cutlass.const_expr(self.try_wait):
+            wait_try(self.smem_ptr, phase)
+        else:
+            wait(self.smem_ptr, phase, spin=spin or self.spin)
 
     def arrive(
         self,

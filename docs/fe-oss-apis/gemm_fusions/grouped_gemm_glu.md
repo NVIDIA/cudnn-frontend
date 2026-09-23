@@ -12,14 +12,15 @@ For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point
 
 **Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a
 plain BF16 or legacy block-scaled grouped GEMM fused with a GLU epilogue
-(SwiGLU, GeGLU, or block-scaled SiTU-GLU) on NVIDIA Blackwell GPUs (SM100+). The operation is
+(SwiGLU, GeGLU, or block-scaled SiTU-GLU) on NVIDIA Blackwell GPUs (SM100/SM103),
+with a block-scaled forward path on Rubin (SM107). The operation is
 implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
 - **Discrete mode**: Per-expert weight pointers (no weight stacking required)
 
-And both activation functions:
+Supported activation functions:
 - **SwiGLU**: `act_func="swiglu"` (default)
 - **GeGLU**: `act_func="geglu"`
 - **SiTU-GLU**: `act_func="situglu"` (block-scaled SM100/SM103 only)
@@ -36,6 +37,11 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
 SiTU-GLU is not available on the BF16 or Rubin backends.
+The block-scaled GeGLU forward path supports runtime activation alpha, clamp
+limits, and linear offset on both Blackwell and Rubin. The corresponding
+[dGeGLU backward path](grouped_gemm_dglu.md) supports the same activation
+configuration, with the parameter values included in the backward compiled-kernel
+cache key.
 
 ## BF16 contract
 
@@ -142,20 +148,44 @@ $$
 **Step 2: GLU epilogue** (performed by pairing 32-column blocks along `N`):
 
 Let block size `G = 32`. For each pair of consecutive 32-wide column blocks:
-- Input block: `X_b = C[:, 2·b·G : 2·b·G + G]`
-- Gate block: `G_b = C[:, 2·b·G + G : 2·b·G + 2·G]`
+- Gate block: `G_b = C[:, 2·b·G : 2·b·G + G]`
+- Up block: `U_b = C[:, 2·b·G + G : 2·b·G + 2·G]`
 
 For **SwiGLU** (`act_func="swiglu"`):
 
 $$
-D[:, bG:(b+1)G] = \text{prob} \cdot X_b \cdot \text{swish}(G_b), \quad \text{swish}(x) = x \cdot \sigma(x)
+D[:, bG:(b+1)G] = \text{prob} \cdot U_b \cdot \text{swish}(G_b), \quad \text{swish}(x) = x \cdot \sigma(x)
 $$
 
 For **GeGLU** (`act_func="geglu"`):
 
 $$
-D[:, bG:(b+1)G] = \text{prob} \cdot (X_b + 1) \cdot G_b \cdot \sigma(1.702 \cdot G_b)
+\widehat{G}_b = \min(G_b, \text{glu\_clamp\_max}), \qquad
+\widehat{U}_b = \operatorname{clamp}(U_b, \text{glu\_clamp\_min}, \text{glu\_clamp\_max})
 $$
+
+$$
+D[:, bG:(b+1)G] = \text{prob} \cdot
+    (\widehat{U}_b + \text{linear\_offset}) \cdot
+    \widehat{G}_b \cdot \sigma(\text{geglu\_alpha} \cdot \widehat{G}_b)
+$$
+
+Only the gate's upper bound is clamped. The offset is added after clamping
+the up branch. The gate nonlinearity is `g * sigmoid(geglu_alpha * g)`;
+`silu(geglu_alpha * g)` would introduce an extra factor of `geglu_alpha`.
+The optional `C` output stores the GEMM result before clamping. The epilogue
+uses the FP32 accumulator, without rounding it to the `C` output dtype first.
+
+The defaults are `geglu_alpha=1.702`, `glu_clamp_max=7.0`,
+`glu_clamp_min=-7.0`, and `linear_offset=1.0`. For DeepSeek V4 clamped SwiGLU,
+select `act_func="geglu"` with `geglu_alpha=1.0`, `linear_offset=0.0`,
+`glu_clamp_max=L`, and `glu_clamp_min=-L`, where `L` is the model's clamp
+limit. `act_func="swiglu"` does not apply these clamp parameters.
+
+For block-scaled dense and discrete calls, these four activation parameters
+are runtime FP32 scalars: changing their values reuses the same compiled
+kernel. `geglu_alpha` scales the sigmoid input and is independent of the
+per-expert GEMM scaling tensor `alpha_tensor`.
 
 **Step 3: Optional output quantization** (when SFD outputs are generated):
 
@@ -182,9 +212,10 @@ $$
                     v
                C (valid_m×N×1)
                     |
-                    | Pair 32-col blocks: [X0|G0|X1|G1|...]
-                    |     X_b × swish(G_b)  [SwiGLU]
-                    |     (X_b+1) × x·σ(1.702·G_b)  [GeGLU]
+                    | Pair 32-col blocks: [G0|U0|G1|U1|...]
+                    |     U_b × swish(G_b)  [SwiGLU]
+                    |     clamp gate/up, then
+                    |     (U_b+offset) × G_b·σ(alpha·G_b)  [GeGLU]
                     v
                     | × prob
                     v
@@ -486,6 +517,11 @@ Providing both or neither raises `ValueError`.
 - `m_aligned`: Must be `256` (FIX_PAD_SIZE). Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
 - `act_func`: Activation function. `"swiglu"` (default), `"geglu"`, or block-scaled `"situglu"`
+- `linear_offset`: Offset added to the clamped GeGLU up branch. Default: `1.0` for GeGLU
+- `geglu_alpha`: GeGLU sigmoid input scale. Default: `1.702`
+- `glu_clamp_max`: GeGLU upper bound for gate and up. Default: `7.0`
+- `glu_clamp_min`: GeGLU lower bound for up only. Default: `-7.0`
+- The activation alpha and clamp controls above are supported by the block-scaled forward backend on Blackwell and Rubin; the BF16 contract retains its fixed values
 - `situ_beta1`: Positive finite gate tanh scale for SiTU-GLU. Default: `4.0`
 - `situ_beta2`: Positive finite up-branch tanh scale for SiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
@@ -549,7 +585,8 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ### Environment
 
-- Requires CUDA with **SM100+ compute capability** (Blackwell GPUs)
+- Requires CUDA with **SM100/SM103** (Blackwell), or **SM107** (Rubin) for the block-scaled forward backend
+- Rubin MXFP8 uses matching FP8 A/B operands, E8M0 scale factors, and `sf_vec_size=32`
 
 ---
 

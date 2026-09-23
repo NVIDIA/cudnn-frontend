@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 from typing import Optional
 from dataclasses import dataclass
@@ -75,10 +78,10 @@ class AttentionMask:
         col_limit_right = limit_right(row)
         col_limit_left = limit_left(row)
 
-        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+        for i in cutlass.range(cute.size(preds), unroll_full=True):
             preds[i] = True
 
-        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+        for i in cutlass.range(cute.size(preds), unroll_full=True):
             block_col = cute.get(tScS_t2r[i], mode=[col_id])
             col = block_col + base_col
 
@@ -220,7 +223,7 @@ class AttentionMask:
         base_row = m_block * self.kBlockM - self.offset_dynamic
         base_col = n_block * self.kBlockN
 
-        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+        for i in cutlass.range(cute.size(preds), unroll_full=True):
             block_row = cute.get(tScS_t2r[i], mode=[row_id])
             block_col = cute.get(tScS_t2r[i], mode=[col_id])
             preds[i] = Boolean(block_row + base_row >= 0 and block_row + base_row < self.seqlen_q and block_col + base_col < self.seqlen_k)

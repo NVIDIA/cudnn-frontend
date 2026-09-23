@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import math
 import operator
 from functools import partial
@@ -14,7 +15,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass._mlir.dialects import arith
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.copy import (
     load_s2r,
@@ -881,7 +882,7 @@ class FlashAttentionDSABackwardSm90:
             cpasync.prefetch_descriptor(tma_atom_dQ)
             cpasync.prefetch_descriptor(tma_atom_dQ_64)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         mbar_QdO_ptr = storage.mbar_QdO.data_ptr()

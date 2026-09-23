@@ -156,12 +156,17 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_co
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
+# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
+MASK_FORM: str = MASK_FORM_BITS
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 2:
@@ -1693,7 +1698,7 @@ def _softmax_kv_body(
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
-            apply_mask_chunk(
+            apply_mask_chunk_form(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * CHUNK),
@@ -1705,6 +1710,7 @@ def _softmax_kv_body(
                 causal_diag=causal_diag,
                 mask_value=float("-inf"),
                 window_right=CFG.WINDOW_RIGHT,
+                form=MASK_FORM,
             )
             for c in range(N_CHUNKS)
         ]
@@ -2399,11 +2405,11 @@ def _host(
     meta_ptr: cute.Pointer,
     o_desc_ptr: cute.Pointer,
     problem_size: Tuple[int, int, int, int, int, int],
-    q_strides: Tuple[int, int, int],
-    k_strides: Tuple[int, int, int],
-    v_strides: Tuple[int, int, int],
-    o_strides: Tuple[int, int, int],
-    lse_strides: Tuple[int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_ext: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
@@ -2414,7 +2420,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -2427,9 +2433,11 @@ def _host(
     Operands are ``[B, S, H, D]`` with the head dim innermost (element stride 1);
     ``*_strides`` carry the (seq, head) element strides, K/V additionally the
     outer stride, which is the page stride of a paged pool and unused otherwise.
+    Every stride leaf is Int64 (the ``compile()`` fakes fix the width): a 16-bit
+    operand with S * H * D >= 2^27 elements would wrap the Int32 TMA-unit scaling.
     ``problem_size`` = (B, QH, KH, SQ, SKV, 0); under THD SQ/SKV are the packed
     token totals, under paged KV SKV is ``max_pages * PAGE_SIZE``. The batch
-    stride of a dense operand is ``S * seq_stride`` (Int64); a packed THD operand
+    stride of a dense operand is ``S * seq_stride``; a packed THD operand
     has batch extent 1 and binds the seq stride there (never stepped).
 
     ``lse_kind``: "dense" (B*SPLIT_KV, QH, SQ) in ``lse_strides``; "token" (SQ, QH)
@@ -2655,6 +2663,7 @@ def compile(  # noqa: A001
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
     thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
@@ -2667,11 +2676,11 @@ def compile(  # noqa: A001
         P(cutlass.Int32),
         P(cutlass.Int64),
         (0, 0, 0, 0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
         i32,
         cutlass.Float32(0.0),
         i32,
@@ -2682,7 +2691,7 @@ def compile(  # noqa: A001
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

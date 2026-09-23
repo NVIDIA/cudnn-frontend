@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, get_num_tmem_alloc_cols
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T
 import cutlass.utils as utils
@@ -196,7 +197,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
 
         self.vectorized_f32 = vectorized_f32
         self.use_dynamic_sched = use_dynamic_sched
@@ -291,7 +292,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         # matching the plain BF16 grouped GEMM kernel instead of always reserving 512.
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = get_num_tmem_alloc_cols(tCtAcc_fake)
 
         # Compute A/B/C/D shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -448,14 +449,14 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type  # B must match A dtype
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         # dBias configuration
         self.generate_dbias = dbias_tensor is not None
@@ -1188,7 +1189,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1271,7 +1272,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2227,9 +2228,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: LayoutEnum,
         num_smem_capacity: int,
         occupancy: int,
         store_d_directly: bool,
