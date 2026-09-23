@@ -3,8 +3,8 @@
 
 """MXFP8 scale-factor repack for the SM100 D256 backward kernels.
 
-The D256 dQ / dKdV kernels (``bprop_dq_d256_mxfp8_sm100`` /
-``bprop_dkdv_d256_mxfp8_sm100``) read their E8M0 scale factors through TMA in
+The D256 dQ / dKdV kernels (``bprop_dq_d256_mxfp8`` /
+``bprop_dkdv_d256_mxfp8``) read their E8M0 scale factors through TMA in
 a **2-CTA slot layout** the source repo's quantizer emits: every logical scale
 plane is stored twice, once canonical and once shifted by 64 rows for the
 peer CTA of the pair (the ``SFB`` form), or four times with an extra 64-row

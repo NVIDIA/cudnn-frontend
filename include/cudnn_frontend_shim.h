@@ -358,6 +358,86 @@ cuda_stream_is_capturing(cudaStream_t stream, cudaStreamCaptureStatus *capture_s
 }
 
 inline cudaError_t
+cuda_thread_exchange_stream_capture_mode(cudaStreamCaptureMode *mode) {
+    NV_FE_CALL_TO_CUDA(cuda_thread_exchange_stream_capture_mode, cudaThreadExchangeStreamCaptureMode, mode);
+}
+
+// cudaStreamGetCaptureInfo: CUDA 12 exports the graph-returning variant as
+// cudaStreamGetCaptureInfo_v2 (6 parameters); CUDA 13 exports it as cudaStreamGetCaptureInfo
+// with an additional edge-data out-parameter. The shims mirror the exact prototypes.
+#if (CUDART_VERSION >= 13000)
+inline cudaError_t
+cuda_stream_get_capture_info_v3(cudaStream_t stream,
+                                cudaStreamCaptureStatus *captureStatus_out,
+                                unsigned long long *id_out,
+                                cudaGraph_t *graph_out,
+                                const cudaGraphNode_t **dependencies_out,
+                                const cudaGraphEdgeData **edgeData_out,
+                                size_t *numDependencies_out) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_get_capture_info_v3,
+                       cudaStreamGetCaptureInfo,
+                       stream,
+                       captureStatus_out,
+                       id_out,
+                       graph_out,
+                       dependencies_out,
+                       edgeData_out,
+                       numDependencies_out);
+}
+#else
+inline cudaError_t
+cuda_stream_get_capture_info_v2(cudaStream_t stream,
+                                cudaStreamCaptureStatus *captureStatus_out,
+                                unsigned long long *id_out,
+                                cudaGraph_t *graph_out,
+                                const cudaGraphNode_t **dependencies_out,
+                                size_t *numDependencies_out) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_get_capture_info_v2,
+                       cudaStreamGetCaptureInfo_v2,
+                       stream,
+                       captureStatus_out,
+                       id_out,
+                       graph_out,
+                       dependencies_out,
+                       numDependencies_out);
+}
+#endif
+
+// Reports the capture status of `stream` and, when it is capturing, the graph it records into.
+inline cudaError_t
+cuda_stream_get_capture_info(cudaStream_t stream, cudaStreamCaptureStatus *capture_status, cudaGraph_t *graph) {
+#if (CUDART_VERSION >= 13000)
+    return cuda_stream_get_capture_info_v3(stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
+#else
+    return cuda_stream_get_capture_info_v2(stream, capture_status, nullptr, graph, nullptr, nullptr);
+#endif
+}
+
+inline cudaError_t
+cuda_user_object_create(cudaUserObject_t *object_out,
+                        void *ptr,
+                        cudaHostFn_t destroy,
+                        unsigned int initialRefcount,
+                        unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_user_object_create, cudaUserObjectCreate, object_out, ptr, destroy, initialRefcount, flags);
+}
+
+inline cudaError_t
+cuda_user_object_release(cudaUserObject_t object, unsigned int count) {
+    NV_FE_CALL_TO_CUDA(cuda_user_object_release, cudaUserObjectRelease, object, count);
+}
+
+inline cudaError_t
+cuda_graph_retain_user_object(cudaGraph_t graph, cudaUserObject_t object, unsigned int count, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_retain_user_object, cudaGraphRetainUserObject, graph, object, count, flags);
+}
+
+inline cudaError_t
+cuda_get_last_error() {
+    NV_FE_CALL_TO_CUDA(cuda_get_last_error, cudaGetLastError);
+}
+
+inline cudaError_t
 cuda_stream_create(cudaStream_t *stream) {
     NV_FE_CALL_TO_CUDA(cuda_stream_create, cudaStreamCreate, stream);
 }

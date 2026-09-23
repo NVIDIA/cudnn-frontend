@@ -550,8 +550,17 @@ class SdpaFwdDsl(APIBase):
         has_amax_o: bool = True,
         sample_sf_o: Optional[torch.Tensor | TensorDesc] = None,
         sample_scale_o: Optional[torch.Tensor | TensorDesc] = None,
+        ragged_divisors: Optional[tuple[int, int, int]] = None,
+        ragged_offsets_int64: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
+
+        ``ragged_divisors`` (THD only): the (Q, O, Stats) elements-per-token
+        divisors of the graph's ragged-offset tensors -- ``row_elems /
+        ragged_offset_multiplier`` (``engines._thd_decode_leg_divisors``), so the
+        kernel reads ``offset[b] // divisor`` as the token row. Read by the SM100
+        decode tile's ragged-Q leg, which addresses the packed rows from the
+        ragged offsets themselves; the prefill tile's THD leg never reads them.
 
         ``sample_sf_o`` (per-tensor FP8 only): the block-scaled O scale-factor
         output. With an FP4 (``torch.float4_e2m1fn_x2``) O it holds one E4M3
@@ -684,6 +693,8 @@ class SdpaFwdDsl(APIBase):
         # final LSE converts.
         self.stats_log2 = bool(stats_log2)
         self.thd = bool(thd)
+        self.ragged_divisors = (1, 1, 1) if ragged_divisors is None else tuple(int(m) for m in ragged_divisors)
+        self.ragged_offsets_int64 = bool(ragged_offsets_int64)
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -1493,6 +1504,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.thd_stats_head_stride = 0
         self._lse_stride: Optional[tuple[int, int, int]] = None
         self._k_mod = None
+        # The decode tile's ragged-Q leg (resolved in check_support): a THD
+        # graph over PAGED K/V at S_q(max) == 1 on the (128, 128) f16 flavor
+        # with cga=1 rides sm100/decode_d128_f16.py's RAGGED_Q mode -- the
+        # dense prepared launch with the Q rows at the ragged offsets and the
+        # split combine placing the final O / Stats rows -- instead of the
+        # prefill tile's THD leg.
+        self.thd_decode_leg = False
 
     @property
     def _quantized_q_lens_abi(self) -> bool:
@@ -1601,10 +1619,32 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
 
+        # The decode tile's ragged-Q leg: ragged Q/O/Stats over PAGED K/V at
+        # S_q(max) == 1 on the native (128, 128) half flavor with cga=1 -- the
+        # FlashInfer prefill-style graph at one token per sequence.  The
+        # kernel reads the batch's Q ragged offset as its row coordinate and
+        # the split combine places the final rows, so the leg needs ragged
+        # Stats (a per-batch padded Stats has no ragged base), int32 offsets
+        # whose multiplier divides the row (checked with the ragged tensors
+        # in engines.mismatch), per-batch KV lengths (the dense kernel's
+        # SEQ_KV read; the cu form is not plumbed) and no sink (sink + split is
+        # declined everywhere).  Twin of engines._thd_decode_leg; keep in lockstep.
+        self.thd_decode_leg = bool(
+            self.thd
+            and self.paged
+            and self.cga == 1
+            and self.q_desc.dtype not in _SM100_FP8_DTYPES
+            and int(s_qo) == 1
+            and (int(d_qk), int(d_v)) == _SM100_DECODE_FLAVOR
+            and not self.thd_stats_padded
+            and not self.has_sink
+            and not self.cu_seq_kv_lens
+        )
+
         if self.pack_gqa:
             self._not_implemented_error_if(
-                self.thd,
-                "PackGQA is dense-only (THD/ragged runs unpacked)",
+                self.thd and not self.thd_decode_leg,
+                "PackGQA is dense-only (THD/ragged runs unpacked, except the decode tile's ragged-Q leg)",
             )
             # The group-vs-tile rule is checked once the flavor is known (below):
             # the d128 / d256 f16 kernels pack a proper divisor of the group.
@@ -1689,6 +1729,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode; Rubin has
+        # no decode tile (supported_cgas_for never offers cga=1 there).
+        self._not_implemented_error_if(
+            self.thd_decode_leg and self._device_cc == (10, 7),
+            "the d128 decode tile's ragged-Q leg is not wired on cc10.7 (Rubin); THD graphs keep the prefill tile there",
+        )
         # cc10.7 (Rubin) now runs every dtype family through its own SM107
         # sibling kernels (f16/bf16, per-tensor FP8 and MXFP8 -- the SM107 port).
         # The per-arch-line split lives in the kernel FILES and the engine rows;
@@ -1818,11 +1864,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "D192 split_kv > 1 is validated only with cga=2",
         )
         # cga=1 on the d128 f16/bf16 flavor is the DECODE tile
-        # (sm100/decode_d128_f16.py), which carries no THD leg.  Mirrors the
-        # engine row's mismatch line; keep the two in lockstep.
+        # (sm100/decode_d128_f16.py), which carries no THD_VARLEN leg: a THD
+        # graph rides it only as the ragged-Q-over-paged-KV leg (thd_decode_leg,
+        # S_q(max) == 1).  Mirrors the engine row's mismatch line; keep the two
+        # in lockstep.
         self._not_implemented_error_if(
-            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd,
-            "cga=1 on the d128 flavor selects the dense decode tile; THD (ragged) graphs run the cga2 prefill tile",
+            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not self.thd_decode_leg,
+            "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
+            "other THD (ragged) graphs run the cga2 prefill tile",
+        )
+        self._not_implemented_error_if(
+            self.thd_decode_leg and self.split_kv < 2,
+            "the d128 decode tile's ragged-Q leg rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2",
         )
         self._not_implemented_error_if(
             self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),
@@ -1871,7 +1924,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # sm100/split_combine (which also owns the FP8 amax of the
             # recombined O). Structural limits mirror mismatch()'s
             # facts x knobs gate so the standalone API declines identically.
-            self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
+            self._not_implemented_error_if(
+                self.thd and not self.thd_decode_leg,
+                "split_kv > 1 is dense-only (THD packs its own flat grid), except the decode tile's ragged-Q leg",
+            )
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             # Paged KV is padded by construction; its split composes with the
             # per-batch lengths (validated in test_sdpa_fwd_paged_sm100).
@@ -2171,7 +2227,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
-            thd_varlen=self.thd,
+            # The ragged-Q decode leg is a mode of the dense decode tile, not
+            # the prefill tile's THD_VARLEN leg (mutually exclusive params).
+            thd_varlen=self.thd and not self.thd_decode_leg,
+            ragged_q=self.thd_decode_leg,
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
@@ -2405,7 +2464,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _explicit_compile_kwargs(self) -> dict:
         """The compile key of an explicit-ABI template: only what specializes the
         traced code (every extent and stride is a runtime argument)."""
-        if not self.thd:
+        if not self.thd or self.thd_decode_leg:
+            # The ragged-Q decode leg's in-kernel LSE is the dense split-major
+            # partial slab; the combine writes the ragged Stats rows.
             kind = "dense"
         elif self.thd_stats_padded:
             kind = "padded"
@@ -2423,6 +2484,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "paged_hnd" in accepted and self.paged:
             ps = self._paged_pool_stride(self.k_desc)  # kernel order: page, row, head, d
             kw["paged_hnd"] = ps[1] < ps[2]
+        if "ragged_i64" in accepted and self.thd_decode_leg:
+            # The ragged-Q leg's offset read width (int32 or int64 offsets).
+            kw["ragged_i64"] = self.ragged_offsets_int64
         return kw
 
     def _build_prepared_specs(self) -> None:
@@ -2432,10 +2496,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         from cudnn.sdpa.fwd.prepared import build_dense_spec, build_thd_spec
 
         self._thd_spec = self._dense_spec = None
-        if self.thd:
+        if self.thd and not self.thd_decode_leg:
             if self.split_kv == 1:
                 self._thd_spec = build_thd_spec(self, scale_softmax=None)
         else:
+            # Dense plans and the ragged-Q decode leg (a dense split launch whose
+            # Q rows sit at the ragged offsets and whose combine places the rows).
             self._dense_spec = build_dense_spec(self, scale_softmax=None)
 
     def _execute_dense_prepared(
@@ -2454,11 +2520,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table,
         block_table_v,
         gate=None,
+        ragged=None,
     ) -> None:
         """Dense (padded) launch through the prepared spec (``prepared.bind_dense``) from this call's
         torch tensors. Operands whose layout TMA cannot bind zero-copy are repacked into compact BSHD
         scratch (and O copied back), as the tensor path did; a split writes the partial slabs and
-        recombines through the plan-time-compiled combine pass."""
+        recombines through the plan-time-compiled combine pass. ``ragged`` (the decode tile's ragged-Q
+        leg): the (Q, O, Stats) ragged-offset tensors; Q / O / Stats then bind AS PASSED (packed, no
+        repack) and the binder addresses their rows from the offsets."""
         spec = self._dense_spec
         device = q_tensor.device
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
@@ -2481,6 +2550,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 block_table,
                 block_table_v,
                 gate,
+                ragged,
             )
 
     def _execute_dense_prepared_on_stream(
@@ -2501,24 +2571,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table,
         block_table_v,
         gate,
+        ragged=None,
     ) -> None:
         from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, facts_of_tensor
 
         _decl = getattr(self, "_bshd_declared", (None, None, None, None))
-        Q = self._to_bshd(q_tensor, _decl[0])
+        if ragged is not None:
+            # Ragged-Q decode leg: Q / O / Stats are the caller's PACKED buffers
+            # (the graph's (B, H, S_max, D) declaration or a (T, H, D) view);
+            # the binder reads their token / head strides and the ragged offsets
+            # place the rows, so nothing is repacked (Rule 1) -- a repack would
+            # also read the batch stride the THD contract says is never stepped.
+            Q, o_arg, o_needs_copy_back = q_tensor, o_tensor, False
+            q_facts = facts_of_tensor(Q)
+        else:
+            Q = self._to_bshd(q_tensor, _decl[0])
+            q_facts = facts_of_tensor(Q.transpose(1, 2))  # BSHD storage described as the (B, H, S, D) operand
+            if self.split_kv > 1:
+                # The combine stores the caller's layout directly, without an O scratch/copy-back.
+                o_arg, o_needs_copy_back = o_tensor, False
+            else:
+                O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
+                o_arg = (O_scratch if o_needs_copy_back else O_view).transpose(1, 2)
         if self.paged:
             K, V = k_tensor, v_tensor
         else:
             K, V = self._to_bshd(k_tensor, _decl[1]), self._to_bshd(v_tensor, _decl[2])
-        if self.split_kv > 1:
-            # The combine stores the caller's layout directly, without an O scratch/copy-back.
-            o_arg, o_needs_copy_back = o_tensor, False
-        else:
-            O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
-            o_arg = (O_scratch if o_needs_copy_back else O_view).transpose(1, 2)
         G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
         facts = dict(
-            q=facts_of_tensor(Q.transpose(1, 2)),  # BSHD storage described as the (B, H, S, D) operand
+            q=q_facts,
             k=facts_of_tensor(k_tensor if self.paged else K.transpose(1, 2)),
             v=facts_of_tensor(v_tensor if self.paged else V.transpose(1, 2)),
             o=facts_of_tensor(o_arg),
@@ -2530,6 +2611,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table_v=facts_of_tensor(block_table_v),
             gate=facts_of_tensor(G.transpose(1, 2)) if G is not None else None,
         )
+        if ragged is not None:
+            facts.update(ragged_q=facts_of_tensor(ragged[0]), ragged_o=facts_of_tensor(ragged[1]), ragged_lse=facts_of_tensor(ragged[2]))
         if self.split_kv > 1:
             required = self.scratch_workspace_bytes()
             if workspace is None:
@@ -2540,7 +2623,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
             if ws.numel * workspace.element_size() < required:
                 raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
-            frame, combine_args = bind_dense_split(spec, facts, ws.ptr, current_stream, stream_int)
+            bound = bind_dense_split(spec, facts, ws.ptr, current_stream, stream_int)
+            if bound is None:
+                self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
+                return
+            frame, combine_args = bound
         else:
             frame = bind_dense(spec, facts, current_stream, stream_int)
         if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
@@ -2577,7 +2664,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """
         self._ensure_support_checked()
         b, qh = self.batch_size, self.h_q
-        if self.thd:
+        if self.thd and not self.thd_decode_leg:
             # [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
             # No packed-LSE chunk: with a Stats output the kernel writes the
             # caller's ragged Stats buffer directly (token-major (T, H) or
@@ -2631,8 +2718,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table_v: Optional[torch.Tensor] = None,
         gate: Optional[torch.Tensor] = None,
         sf_o: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
+
+        ``ragged_q`` / ``ragged_o`` / ``ragged_lse`` (the decode tile's ragged-Q
+        leg only, ``thd_decode_leg``): the graph's (B+1,) int32 or int64 ragged-offset
+        tensors of Q, O and Stats; the kernel reads them on device (Rule 3).
 
         ``gate``: the fused epilogue gate ``G`` of a specialization built with
         ``sample_gate`` -- logical BHSD, O's shape, bound as a zero-copy BSHD
@@ -2809,7 +2903,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 )
             return
 
-        if self.thd:
+        if self.thd and not self.thd_decode_leg:
             self._execute_thd(
                 q_tensor,
                 k_tensor,
@@ -2827,6 +2921,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             return
 
+        ragged = None
+        if self.thd_decode_leg:
+            self._value_error_if(
+                ragged_q is None or ragged_o is None or (self.lse_desc is not None and ragged_lse is None),
+                "the decode tile's ragged-Q leg needs the Q, O (and Stats, when declared) ragged-offset tensors (ragged_q= / ragged_o= / ragged_lse=)",
+            )
+            ragged = (ragged_q, ragged_o, ragged_lse if self.lse_desc is not None else None)
+        else:
+            self._value_error_if(
+                ragged_q is not None or ragged_o is not None or ragged_lse is not None,
+                "ragged offsets are read only by the decode tile's ragged-Q leg (thd_decode_leg); this specialization does not take them",
+            )
+
         self._execute_dense_prepared(
             q_tensor,
             k_tensor,
@@ -2842,6 +2949,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table,
             block_table_v,
             gate,
+            ragged=ragged,
         )
 
     def _kernel_compile_accepts(self) -> frozenset:
