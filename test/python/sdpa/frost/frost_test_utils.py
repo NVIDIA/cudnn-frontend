@@ -57,6 +57,13 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+# Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
+# sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
+# marker mirrors that range rather than pinning (10, 7)).
+requires_rubin = pytest.mark.skipif(
+    _SM is None or not (107 <= _SM <= 119),
+    reason="needs a Rubin-line GPU (107 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 
 
 def _dsl_usable():

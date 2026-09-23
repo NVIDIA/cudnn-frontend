@@ -341,9 +341,13 @@ python/cudnn/
         sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
         sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+        sm107/                        Rubin (empty until its d256 chain lands)
         sm120/bprop_f16.py            fused SM120 main kernel
-        sm120/bprop_chain_f16.py      its launch chain (dot, dq2k, converts,
-                                      reduce, dsink)
+        sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
+                                      (dq2k, converts)
+        bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
+                                  GQA reduce, dsink): sm120/ re-exports them,
+                                  the sm100 chain imports them
         bprop_matmul_blackwell.py SHARED stage-3 GEMM: codegen targets span
                                   SM100/SM103/SM107/SM110, so it sits ABOVE
                                   the arch packages like _common_blackwell.py
