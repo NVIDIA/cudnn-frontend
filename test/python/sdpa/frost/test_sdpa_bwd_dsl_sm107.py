@@ -858,7 +858,9 @@ def test_fp8_adapter_backstop_and_workspace():
 
 
 @requires_rubin
-@pytest.mark.parametrize("sq,skv,bottom_right", [(512, 512, False), (512, 1024, True), (768, 512, True)], ids=["square", "br-rect-kv", "br-rect-q"])
+# S_q > S_kv is TOP-LEFT only: the frontend validator rejects a bottom-right causal graph with max_s_q > max_s_kv
+# ("virtually slice the Q tensor") before any engine runs, so that combination is not a shape this row can be asked for.
+@pytest.mark.parametrize("sq,skv,bottom_right", [(512, 512, False), (512, 1024, True), (768, 512, False)], ids=["square", "br-rect-kv", "tl-rect-q"])
 def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq, skv, bottom_right):
     """The dK / dQ GEMMs' causal K-trim (plan s5: LO on dK, HI on dQ, over the kv-major workspace) is an OPTIMIZATION,
     made exact by the zero-filled workspace: rendering both GEMMs untrimmed (``STAGE3_CAUSAL_TRIM = False``, every
@@ -1137,7 +1139,7 @@ def test_sm107_q_loop_bounds_come_from_the_tile_dsl_primitive(family):
 
 
 # =========================================================================== SASS pins: trace-compile both bodies for sm_107a on ANY box
-# What no numerics test can see: whether the 232 / 40 register split reached the binary (ptxas C7508 drops every
+# What no numerics test can see: whether the 224 / 56 (f16) or 232 / 40 (fp8) register split reached the binary (ptxas C7508 drops every
 # setmaxregister when it cannot determine the entry count -- the 8-warp d512 launches lose it; these 12-warp bodies must
 # keep it), stack spills in the tight 40-register roles, a GPU-scope drain before a cluster arrive, and the TMEM-load /
 # publish-arrive order (an arrive scheduled BETWEEN two LDTMs of one accumulator slot lets the parked MMA overwrite the
@@ -1291,7 +1293,7 @@ def _sass_probe(tmp_path, family, mask):
 
 @pytest.mark.parametrize("family, mask", _SASS_PIN_ROWS)
 def test_sm107_register_split_spills_and_drains_sass_pins(tmp_path, family, mask):
-    """USETMAXREG > 0 (the 232 / 40 split is real in the binary, not dropped by C7508), no new stack spills, and no
+    """USETMAXREG > 0 (the register split is real in the binary, not dropped by C7508), no new stack spills, and no
     GPU-scope drain (MEMBAR.ALL.GPU == CGAERRBAR == 0) on a per-tile path."""
     stats, _order = _sass_probe(tmp_path, family, mask)
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508 -- the entry register count is undetermined)"
