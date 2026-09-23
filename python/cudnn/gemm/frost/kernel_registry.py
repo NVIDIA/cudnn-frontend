@@ -672,14 +672,35 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     return 64 if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) else 32
 
 
+def dense_k64_envelope(config: TileConfig) -> bool:
+    """Whether ``config`` is a geometry the DENSE 64-byte-K MMA is rendered for:
+    a 128-tall CTA in a 2-CTA pair -- the envelope :func:`tile_config.select_config`
+    emits it at and the one the sweep validated. The compiler rejects every other
+    geometry (``compiler._check_mma_k_dim``: dense K64 needs ``mma_tile_m == 128``
+    per CTA), so a shorter or 1-CTA pick must keep the 32-byte form. Block-scale
+    is a different instruction with its own rules and does not go through here."""
+    return config.cta_tile_m >= 128 and config.mma_tile_m == 128 and getattr(config, "cta_group", 1) == 2
+
+
 def preferred_strategy(chain: FusionChain, config: TileConfig) -> TileConfig:
     """Re-target an auto pick at the family :func:`preferred_pipeline` chooses and
     the MMA-inst K width :func:`preferred_mma_tile_k_bytes` wants. ``cta_group``
     rides the geometry, and family-fixed axes (sm120's warp-MMA pair, cluster and
     default warp grid) are snapped by :func:`as_pipeline`, so nothing is clamped
-    here."""
+    here.
+
+    The dense-FP8 64-byte-K width is taken only where the kernel exists for it
+    (:func:`dense_k64_envelope`). Re-stamping it onto a 64-tall or 1-CTA pick
+    produced a config the compiler rejects, and because the auto path probes its
+    ONE pick, that rejection declined the whole graph: every gated-attention-block
+    fp8 projection GEMM on sm_107 lost its ``frost_gemm`` plan at small M
+    (``CONFIG_sm100_64x32x128_64x32x64_cluster2x4_2ctamma`` ->
+    ``plain FP8 mma_tile_k_bytes=64 requires mma_tile_m=128 per CTA``)."""
     pipeline = preferred_pipeline(chain)
-    config = as_mma_tile_k(config, preferred_mma_tile_k_bytes(chain))
+    k_bytes = preferred_mma_tile_k_bytes(chain)
+    if k_bytes == 64 and not chain.has_block_scale and not dense_k64_envelope(config):
+        k_bytes = 32
+    config = as_mma_tile_k(config, k_bytes)
     if pipeline != config.pipeline:
         config = as_pipeline(config, pipeline)
     return config

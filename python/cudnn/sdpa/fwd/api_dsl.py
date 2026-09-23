@@ -326,6 +326,44 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
     raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
+# The exp2 MUFU / FMA split of the sm100 softmax (``TemplateParams.exp2_fma_split``, the ``_E2E_*`` block of
+# sm100/prefill_d128_mxfp8.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
+# ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate -- MEASURED
+# 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
+# costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, so the split
+# stays off there until a GB300 A/B says otherwise.  Positive gate on the measured cc, never a negative gate on
+# 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with
+# the gate OFF the three kernels trace develop's exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at both
+# softmax sites), and the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold
+# (``fmax_f32``, not behind this gate -- MEASURED +0.5..+1.8 % on B200, unmeasured on GB300), so a cc 10.3 build of
+# that kernel is develop's exp burst plus the fold, not develop's kernel byte for byte.
+#
+# Per kernel, keyed by (quantization kind, flavor) -- the spelling ``_load_sm100_kernel_module`` selects the
+# kernel file by.  ON = MEASURED wins on B200 (A/B/A x3, CUPTI medians, 2026-09-22): ("mxfp8", (128, 128))
+# +7.8 % S=16K dense / +9.6 % causal (B=1 H=24/8); ("fp8", (128, 128), E4M3 / E5M2 per-tensor) +4.5 % S=8K
+# dense (H=64/8), causal +0.3 % = noise; ("f16", (192, 128), bf16 / fp16) +1.9 % S=8K dense / +1.75 % causal
+# (H=128/128).  OFF = MEASURED losses or no measurement: ("f16", (128, 128)) dense +3.9 % but causal -1.9 /
+# -2.4 %; ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %; ("mxfp8", (192, 128)) -3.3..-4.0 % dense
+# (that kernel already carries its own exp2 emulation); every d256 / d512 flavor unmeasured.  Widening
+# either set is a per-cc, per-kernel measurement -- never a default.
+_EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
+_EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset({("mxfp8", (128, 128)), ("fp8", (128, 128)), ("f16", (192, 128))})
+
+
+def _quant_kind(fp8: bool, pertensor: bool) -> str:
+    """The quantization-kind tag of one SM100-family build -- ``"fp8"`` (per-tensor E4M3 / E5M2), ``"mxfp8"``
+    (block-scale) or ``"f16"`` (fp16 / bf16) -- the same spelling ``_load_sm100_kernel_module`` keys the kernel
+    file by."""
+    return ("fp8" if pertensor else "mxfp8") if fp8 else "f16"
+
+
+def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[int, int]) -> bool:
+    """``TemplateParams.exp2_fma_split`` for one build: the (quantization kind, flavor) kernels that carry the split
+    AND measured a win, on a cc where it was measured (``_EXP2_FMA_SPLIT_KERNELS`` x ``_EXP2_FMA_SPLIT_CC``); False
+    everywhere else.  ``kind`` is ``_quant_kind(fp8, pertensor)``."""
+    return bool((kind, tuple(flavor)) in _EXP2_FMA_SPLIT_KERNELS and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
+
+
 def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
     """CGA widths the STANDALONE adapter serves for a kernel flavor.
 
@@ -2026,6 +2064,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # picks the fused path with no user action.
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
+        # d192x128 f16 kernels) -- see _exp2_fma_split_for; the kernels not listed there never read the field.
+        exp2_fma_split = _exp2_fma_split_for(self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor)
         # None = the standalone-wrapper tier stated no preference: derive the
         # causal-balancing policy here. The graph path never hits this branch —
         # the heuristic emits an explicit policy (the same primary this
@@ -2087,6 +2128,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             split_kv=self.split_kv,
             cta_mma=(1 if self._fp8 and self.flavor == (256, 256) else 2) if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
+            exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             paged_kv=self.paged,
             page_size=self.paged_page_size,
