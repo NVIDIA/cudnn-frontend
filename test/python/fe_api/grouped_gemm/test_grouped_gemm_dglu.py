@@ -2502,6 +2502,7 @@ def _execute_rubin_mxfp8_dglu(api, p):
         sfd_col_tensor=p["sfd_col"],
         amax_tensor=p["amax"],
         norm_const_tensor=p["norm"],
+        workspace=ws(api, p["a"].device),
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         **rubin_mxfp8_weight_arguments(p),
     )
