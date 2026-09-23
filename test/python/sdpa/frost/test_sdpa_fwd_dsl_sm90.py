@@ -108,6 +108,78 @@ def test_dsl_sm90_dense_unmasked_partial_kv_tile(sm100):
     torch.testing.assert_close(o, sm100._ref_sdpa_full(q, k, v, scale=_SCALE), atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("singleton_stride", [0, 1, 2**31 + 1], ids=["zero", "odd", "int64"])
+@pytest.mark.parametrize("b,h,s_q,s_kv", [(1, 1, 1, 65), (2, 1, 3, 65), (2, 2, 3, 1)], ids=["batch-head-query", "head", "kv-sequence"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_stride, b, h, s_q, s_kv):
+    """Bind the compiled strides even when the IR declares different size-1 strides."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+    from frost_test_utils import select_engine
+
+    q, k, v = (_bhsd(b, h, s, _D, dtype) for s in (s_q, s_kv, s_kv))
+    # A gapped output with a nonzero aligned offset; padding must stay untouched.
+    o_storage = torch.full((b * s_q * h * (_D + 8) + 16,), float("nan"), dtype=dtype, device="cuda")
+    o = o_storage[8:-8].view(b, s_q, h, _D + 8)[..., :_D].transpose(1, 2)
+    compile_api = SdpaFwdDslSm90.compile
+    launches = []
+
+    def compile_checked(api):
+        compile_api(api)
+        launch = api._compiled_kernel
+
+        def checked_launch(*args):
+            # The current FFI tolerates singleton-stride mismatches, so numerics alone miss them.
+            for bound, original, expected in zip(args[:4], (q, k, v, o), api._strides):
+                assert bound.stride() == expected
+                assert bound.data_ptr() == original.data_ptr()
+                assert bound.storage_offset() == original.storage_offset()
+            launches.append(True)
+            return launch(*args)
+
+        api._compiled_kernel = checked_launch
+
+    monkeypatch.setattr(SdpaFwdDslSm90, "compile", compile_checked)
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+
+    def ir_strides(tensor):
+        return tuple(singleton_stride if size == 1 else stride for size, stride in zip(tensor.shape, tensor.stride()))
+
+    q_ir, k_ir, v_ir = (graph.tensor_like(t).set_stride(ir_strides(t)) for t in (q, k, v))
+    o_ir, _ = graph.sdpa(q=q_ir, k=k_ir, v=v_ir, generate_stats=False, attn_scale=_SCALE)
+    o_ir.set_output(True).set_dim(o.shape).set_stride(ir_strides(o))
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    select_engine(graph, _ROW, pack_gqa=False)
+    graph.check_support()
+    graph.build_plans()
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    graph.execute({q_ir: q, k_ir: k, v_ir: v, o_ir: o}, workspace)
+    assert len(launches) == 1
+    torch.testing.assert_close(o, sm100._ref_sdpa_full(q, k, v, scale=_SCALE), atol=5e-2, rtol=3e-2)
+    assert torch.isnan(o_storage[:8]).all() and torch.isnan(o_storage[-8:]).all()
+    assert torch.isnan(o_storage[8:-8].view(b, s_q, h, _D + 8)[..., _D:]).all()
+
+
+@pytest.mark.parametrize("port", range(4), ids=["q", "k", "v", "o"])
+@pytest.mark.parametrize("mismatch", ["stride", "shape"])
+def test_sm90_dense_rebinding_rejects_live_layout_changes(port, mismatch):
+    """Singleton re-viewing must not conceal a different shape or a stride on a live axis."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    tensors = [torch.empty(2, 2, 3, _D, dtype=torch.float16, device="cuda") for _ in range(4)]
+    api = SdpaFwdDslSm90(*tensors)
+    api.compile()
+    if mismatch == "stride":
+        tensors[port] = torch.empty(2, 2, 3, _D + 8, dtype=torch.float16, device="cuda")[..., :_D]
+    else:
+        tensors[port] = tensors[port][:, :1].as_strided((2, 1, 3, _D), (6 * _D, 1, _D, 1))
+    with pytest.raises(ValueError, match=f"{mismatch} mismatch"):
+        api.execute(*tensors)
+
+
 @pytest.mark.parametrize("scale", [-0.25, 0.0], ids=["negative", "zero"])
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm90_scale_sign(sm100, scale):

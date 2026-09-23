@@ -4375,7 +4375,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             (scale == 0) != (self.scale_softmax == 0) or (scale < 0) != (self.scale_softmax < 0), "SM90 SDPA scale does not match its compile-time sign mode"
         )
         stream = self._get_default_stream(current_stream)
-        # Dense ports bind as given: the launcher refuses a layout other than the compiled one. THD binds packed (1, H, T, D) views.
+        # Dense size-1 axes use the compiled strides; THD binds packed (1, H, T, D) views.
         data = []
         for i, (tensor, desc, strides) in enumerate(
             zip((q_tensor, k_tensor, v_tensor, o_tensor), (self.q_desc, self.k_desc, self.v_desc, self.o_desc), self._strides)
@@ -4384,6 +4384,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 limit = self.max_total_seq_len_q if i in (0, 3) else self.max_total_seq_len_kv
                 tokens = self._thd_declared_total(self._thd_capacity(tensor, desc), limit)
                 tensor = tensor.as_strided((1, desc.shape[1], tokens, desc.shape[3]), strides)
+            elif tuple(tensor.stride()) != strides:
+                self._check_tensor_shape(tensor, desc.shape, name=desc.name)
+                self._value_error_if(
+                    any(size != 1 and actual != expected for size, actual, expected in zip(desc.shape, tensor.stride(), strides)),
+                    f"{desc.name} tensor stride mismatch: expected {strides} (size-1 axes ignored), got {tensor.stride()}",
+                )
+                # Only size-1 axes differ: preserve every element address and the caller's output storage.
+                tensor = tensor.as_strided(tuple(tensor.shape), strides)
             data.append(tensor)
         lse = None
         if lse_tensor is not None and self.thd:
