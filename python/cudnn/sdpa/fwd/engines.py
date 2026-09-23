@@ -867,20 +867,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
 
     if facts.has_paged_kv:
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
-        # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
-        # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
-        # as its backstop and each unwired kernel file backstops with a
-        # module-scope guard on paged_kv). The attention sink composes with it
-        # on the f16/bf16 kernels: the sink is a per-row epilogue fold and
-        # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
-        # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
-        # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
-        # stays declined above (the combine is not sink-aware), so sink decode
-        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
-        # epilogue (sf_o) over pools are not validated, so those two pairs stay
-        # declined on the fp8 row.
+        # flavors in paged_d_shapes, of the d128 per-tensor FP8 kernel and of the
+        # MXFP8 kernels on every native flavor (each row's paged_d_shapes;
+        # config_sm100._validate_params mirrors these as its backstop and each
+        # unwired kernel file backstops with a module-scope guard on paged_kv).
+        # The attention sink composes with it on the f16/bf16 and MXFP8 kernels:
+        # the sink is a per-row epilogue fold and PAGED_KV only changes the K/V
+        # TMA-LDG warp (validated together in test_sdpa_fwd_paged_sm100 /
+        # test_sdpa_fwd_paged_mxfp8_sm100). Sink + split-KV stays declined above
+        # (the combine is not sink-aware), so sink decode runs unsplit. The FP8
+        # kernel's sink fold and its block-scaled O epilogue (sf_o) over pools
+        # are not validated, so those two pairs stay declined on the fp8 row.
         if facts.is_mxfp8:
-            return "paged KV is served by the f16/bf16 and per-tensor FP8 kernels only (MXFP8 block-scale atoms bundle 128 rows of one head)"
+            if facts.page_size % 128 != 0:
+                # A page must hold whole 128-row F8_128x4 SF atoms.
+                return f"paged MXFP8 KV needs page_size to be a multiple of 128; got {facts.page_size}"
+            if facts.thd:
+                return "paged MXFP8 KV with THD queries is not wired"
         if facts.is_fp8 and facts.thd:
             return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
         if facts.is_fp8 and facts.has_sink:
@@ -1250,6 +1253,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_padded_stats=True,
             padded_stats=True,
             cu_seq_len=True,
+            # The SF pools page with K/V; mismatch() gates page_size % 128.
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),

@@ -1832,10 +1832,10 @@ def test_paged_fp8_probe_accepts_and_declines():
 
 
 def test_paged_quantized_rows_mismatch_reasons():
-    """The row-level reasons, by field: the MXFP8 rows do not admit paged pools at all
-    (block-scale SF atoms are 128-row bundles), the Rubin per-tensor FP8 row does not
-    either (its sibling kernel has no PAGED_KV specialization), and the SM100 FP8 row's
-    paged sub-gates name THD and the d128 envelope."""
+    """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
+    page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
+    kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
+    THD and the d128 envelope."""
 
     def paged_facts(**kw):
         base = dict(
@@ -1860,10 +1860,10 @@ def test_paged_quantized_rows_mismatch_reasons():
     fp8 = spec[engines.engine_name(fp8=True)].capabilities
     mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
     fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
-    assert fp8.paged_kv and not fp8_rubin.paged_kv and not mxfp8.paged_kv
+    assert fp8.paged_kv and mxfp8.paged_kv and not fp8_rubin.paged_kv
     assert engines.mismatch(fp8, paged_facts(is_fp8=True)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
-    assert "paged attention" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
+    assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
     # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(128, 128)} on the fp8 row).
@@ -2305,3 +2305,91 @@ def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
     for split in (1, 2):
         knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
         assert engines.mismatch(spec.capabilities, facts, knobs) is None
+
+
+# --- paged MXFP8 (block-scale pools behind the block tables) ------------------
+
+MXFP8_ENGINE = engines.engine_name(mxfp8=True)
+
+
+def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3):
+    """sdpa_mxfp8 over HND page pools + pool-shaped descales."""
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    num_pages = B * max_pages + 3
+    q_dims = (B, H, s_q, d)
+    q_strides = (H * s_q * d, s_q * d, d, 1) if q_bhsd else (s_q * H * d, d, H * d, 1)
+    pool_dims = (num_pages, kh, page, d)
+    hnd = (kh * page * d, page * d, d, 1)
+    nhd = (page * kh * d, d, kh * d, 1)
+    q = g.tensor(dim=q_dims, stride=q_strides, data_type=dtype, name="q")
+    k = g.tensor(dim=pool_dims, stride=hnd, data_type=dtype, name="k")
+    v = g.tensor(dim=pool_dims, stride=nhd if v_nhd else hnd, data_type=dtype, name="v")
+
+    def sf(dims):
+        return g.tensor(
+            dim=dims,
+            stride=(dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1),
+            data_type=cudnn.data_type.FP8_E8M0,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+
+    dq = sf((B, H, 128, d // 32))
+    dk = sf((num_pages, kh, page, d // 32))
+    dv = sf((num_pages, kh, page // 32, d))
+    i32 = cudnn.data_type.INT32
+    tk = g.tensor(dim=(B, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=i32, name="tk")
+    tv = g.tensor(dim=(B, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=i32, name="tv")
+    sq_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32, name="sq")
+    sk_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32, name="sk")
+    if thd:  # ragged Q/O: packed tokens + (B+1,) offsets
+        q.set_ragged_offset(g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32, name="qro"))
+    o, _, amax_o = g.sdpa_mxfp8(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=dq,
+        descale_k=dk,
+        descale_v=dv,
+        attn_scale=0.1,
+        generate_stats=False,
+        use_padding_mask=True,
+        seq_len_q=sq_t,
+        seq_len_kv=sk_t,
+        paged_attention_k_table=tk,
+        paged_attention_v_table=tv,
+        paged_attention_max_seq_len_kv=max_pages * page,
+    )
+    _finish_output(o, q_dims, q_strides, cudnn.data_type.BFLOAT16)
+    if thd:
+        o.set_ragged_offset(g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32, name="oro"))
+    amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+def _mxfp8_reason(g):
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == MXFP8_ENGINE)
+    return engines.analyze_for(spec, g)[1]
+
+
+def test_paged_mxfp8_probe_accepts_and_declines():
+    """Facts of an MXFP8 graph over F8_128x4 pools, and the row's plan-time gates."""
+    g = _mk_paged_mxfp8()
+    facts = _facts(g)
+    assert facts.is_mxfp8 and facts.has_paged_kv and facts.page_size == 128 and facts.s_kv == 8 * 128
+    assert tuple(facts.sf_k_t.get_dim()) == (B * 8 + 3, 2, 128, 8)
+    assert tuple(facts.sf_v_t.get_dim()) == (B * 8 + 3, 2, 4, 256)
+    assert MXFP8_ENGINE in _eligible(g)
+    for kw in (dict(page=256), dict(d=128), dict(d=512)):
+        assert _mxfp8_reason(_mk_paged_mxfp8(**kw)) is None, kw
+    # a page holds whole 128-row SF atoms
+    reason = _mxfp8_reason(_mk_paged_mxfp8(page=64))
+    assert reason is not None and "multiple of 128" in reason, reason
+    reason = _mxfp8_reason(_mk_paged_mxfp8(thd=True))
+    assert reason is not None and "THD" in reason, reason
+    reason = _mxfp8_reason(_mk_paged_mxfp8(q_bhsd=True, s_q=4))  # s_q > 1: at s_q == 1 the two layouts coincide
+    assert reason is not None and "BSHD" in reason, reason
+
+
+def test_paged_mxfp8_mixed_pool_layouts_are_invalid():
+    facts = ga.analyze(_mk_paged_mxfp8(v_nhd=True))
+    assert facts is not None and facts.invalid is not None and "in-page layout" in facts.invalid, facts.invalid

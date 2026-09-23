@@ -604,7 +604,10 @@ class PyGraph {
                py::object const& max_total_seq_len_q,
                py::object const& max_total_seq_len_kv,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
+               py::object const& paged_attention_max_seq_len_kv);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute
