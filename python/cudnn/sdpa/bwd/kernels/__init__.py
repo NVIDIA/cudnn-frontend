@@ -21,13 +21,17 @@ Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:
 
 - ``bprop_matmul_blackwell.py`` -- the stage-3 batched GEMM (dV / dK / dQ) of
-  the large-head-dim backward chain; its codegen targets span the Blackwell
+  the large-head-dim backward chains; its codegen targets span the Blackwell
   line (SM100/SM103/SM107/SM110), which is why it does not sit in ``sm100/``.
+  The sm100 chain renders it over an ``[S_q, S_kv]`` workspace, the sm107 d256
+  chain over a kv-major ``[S_kv, S_q]`` one (the operand majors flip, the
+  causal K-trim modes do not).
 - ``thd_helpers.py`` -- the THD/varlen metadata + setup kernels, used by
   ``sm80/`` and the sm100 chain.
 - ``bprop_chain_common.py`` -- the arch-neutral launch-chain kernels (the
-  ``dot`` delta preprocess, the GQA dK/dV reduce, ``dsink``), used by the
-  sm120 chain (which re-exports them) and the sm100 chain.
+  ``dot`` delta preprocess and its per-tensor FP8 arm, the GQA dK/dV reduce,
+  the fold + FP8-quantize pass, ``dsink``), used by the sm120 chain (which
+  re-exports them), the sm100 chain and the sm107 chains.
 
 Loading
 -------

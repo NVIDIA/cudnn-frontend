@@ -702,6 +702,180 @@ def test_unserved_d256_graph_never_surfaces_a_bare_runtime_error():
         return
 
 
+# --------------------------------------------------------------------------- the adapter (api_dsl_sm107): host pins + the stage-3 K-trim bitwise pin
+
+
+def _adapter_desc(shape, dtype, name):
+    """A logical-BHSD TensorDesc over BSHD-physical storage (what lower_dsl_bwd hands the adapter)."""
+    from cudnn.api_base import TensorDesc
+
+    b, h, s_, d = shape
+    stride = (s_ * h * d, d, h * d, 1)
+    return TensorDesc(
+        dtype=dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device=torch.device("cuda", 0), name=name
+    )
+
+
+def _adapter(cls, b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, grad_dt=None, **kw):
+    from cudnn.api_base import TensorDesc
+
+    hkv = hq if hkv is None else hkv
+    grad_dt = dt if grad_dt is None else grad_dt
+    stats = TensorDesc(
+        dtype=torch.float32, shape=(b, hq, sq, 1), stride=(hq * sq, sq, 1, 1), stride_order=(3, 2, 1, 0), device=torch.device("cuda", 0), name="stats"
+    )
+    return cls(
+        sample_q=_adapter_desc((b, hq, sq, _D), dt, "q"),
+        sample_k=_adapter_desc((b, hkv, skv, _D), dt, "k"),
+        sample_v=_adapter_desc((b, hkv, skv, _D), dt, "v"),
+        sample_o=_adapter_desc((b, hq, sq, _D), dt, "o"),
+        sample_do=_adapter_desc((b, hq, sq, _D), dt, "dO"),
+        sample_stats=stats,
+        sample_dq=_adapter_desc((b, hq, sq, _D), grad_dt, "dQ"),
+        sample_dk=_adapter_desc((b, hkv, skv, _D), grad_dt, "dK"),
+        sample_dv=_adapter_desc((b, hkv, skv, _D), grad_dt, "dV"),
+        scale_softmax=1.0 / math.sqrt(_D),
+        **kw,
+    )
+
+
+def test_adapter_chunks_are_divisors_that_fit_the_budget():
+    """The dS workspace chunk: a divisor of B and of H_q, a multiple of the GQA group, the LARGEST that fits the budget;
+    heads shrink before batches; the fp8 row never chunks the batch (its body has no batch_base); nothing fitting ->
+    the smallest legal chunk (an honest oversize), never 0."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _sm107_chunks
+
+    per = 512 * 512 * 2  # one (batch, head) of a 512 x 512 bf16 workspace
+    assert _sm107_chunks(2, 8, 2, 512, 512, 2, budget=16 * per) == (2, 8)
+    assert _sm107_chunks(2, 8, 2, 512, 512, 2, budget=8 * per) == (2, 4)
+    assert _sm107_chunks(2, 8, 2, 512, 512, 2, budget=3 * per) == (1, 2), "group=2 caps the head chunk at 2, so the batch is chunked next"
+    assert _sm107_chunks(2, 8, 2, 512, 512, 2, budget=3 * per, batch_chunking=False) == (2, 2), "fp8: the batch stays whole even when the chunk overflows"
+    assert _sm107_chunks(3, 6, 3, 512, 512, 2, budget=per) == (1, 3), "nothing fits: (1, group), still a legal chunk"
+    for b, h, g in ((1, 128, 1), (4, 64, 8), (2, 6, 3)):
+        bc, hc = _sm107_chunks(b, h, g, 8192, 8192, 2)
+        assert b % bc == 0 and h % hc == 0 and hc % g == 0 and bc >= 1 and hc >= 1
+
+
+def test_stage3_renderings_pair_operand_major_with_trim_mode():
+    """Plan s5: the kv-major [S_kv, S_q] workspace flips the operand majors relative to the SM100 chain (dK reads dS
+    K-major, dQ reads dS^T M-major) but NOT the causal trim modes (dK trims the low q tiles, dQ the high kv blocks).
+    Untrimmed / dense renderings carry CAUSAL_K_NONE on both; the shift and the 256-row kv block ride along."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE
+
+    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, trim=True)
+    assert (dk.a_is_m_major, dk.causal_mode) == (False, CAUSAL_K_LO)
+    assert (dq.a_is_m_major, dq.causal_mode) == (True, CAUSAL_K_HI)
+    assert dk.causal_shift == dq.causal_shift == 512 and dk.causal_gran == dq.causal_gran == 256
+    assert dk.b_is_n_major and dq.b_is_n_major and dk.dtype_qkv == DTYPE_BF16
+    for causal, trim in ((True, False), (False, True), (False, False)):
+        dk, dq = _stage3_params(DTYPE_BF16, causal=causal, shift=0, gran=256, trim=trim)
+        assert dk.causal_mode == dq.causal_mode == CAUSAL_K_NONE, (causal, trim)
+        assert (dk.a_is_m_major, dq.a_is_m_major) == (False, True), "the majors are a layout fact, not a mask fact"
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(),
+        dict(dt=torch.float16),
+        dict(hq=8, hkv=2, sq=256, skv=256),
+        dict(sq=500, skv=500, is_causal=True, window_size_left=256),
+        dict(b=1, hq=4, hkv=2, sq=512, skv=1024, is_causal=True, causal_bottom_right=True),
+        dict(sq=257, skv=129),
+    ],
+    ids=["dense", "fp16", "gqa", "swa-padded", "br-rect", "257x129"],
+)
+def test_half_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_build(kw):
+    """The adapter's check_support admits every graph the row claims, and its workspace is a pure function of the
+    compile geometry: the carve plan's aligned sum, identical on every call, every planned buffer 128-B aligned."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    api = _adapter(SdpaBwdDslSm107, **kw)
+    assert api.check_support()
+    plan = api._scratch_plan()
+    names = [n for n, _n, _d in plan]
+    assert names[:4] == ["delta", "ds_ws", "seq_kv", "desc_words"] and len(set(names)) == len(names)
+    total = api.scratch_workspace_bytes()
+    assert total == api.scratch_workspace_bytes() == sum(ws_align(n * d.itemsize) for _, n, d in plan) > 0
+    assert ("q_pad" in names) == (api.s_q_max % 128 != 0) and ("k_pad" in names) == (api.s_k_max % 256 != 0)
+    assert ("dk_part" in names) == (api.h_q != api.h_kv)
+    assert api._b_chunk * api._qh_chunk * api._skv_pad * api._sq_pad * 2 <= 4 << 30 or api._qh_chunk == api._gqa_group
+
+
+@pytest.mark.parametrize(
+    "kw, needle",
+    [
+        (dict(dt=torch.float32), "dtype"),
+        (dict(hq=6, hkv=4), "multiple of h_kv"),
+        (dict(sq=1), "decode"),
+        (dict(is_causal=True, window_size_right=16), "right-band"),
+        (dict(window_size_left=0), "window_left > 0"),
+        (dict(causal_bottom_right=True), "requires a causal mask"),
+        (dict(deterministic=True), "deterministic"),
+        (dict(seq_kv_lens_present=True), "padding masks"),
+        (dict(thd=True), "THD"),
+    ],
+    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "br-without-causal", "deterministic", "padded", "thd"],
+)
+def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
+    """Reaching one of these raises means the row lied; each is a ValueError naming the reason, never an assert."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    with pytest.raises(ValueError, match=needle):
+        _adapter(SdpaBwdDslSm107, **kw).check_support()
+
+
+def test_fp8_adapter_backstop_and_workspace():
+    """The fp8 row's twin: E4M3 payloads with e4m3 / bf16 / fp16 gradients pass; E5M2, a mixed gradient triple, a half
+    O payload and an off-contract gradient dtype raise.  Its workspace adds the bf16 Q / K copies, the three bf16
+    partials and the amax scratch, and never chunks the batch."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+
+    e4m3 = torch.float8_e4m3fn
+    for grad in (e4m3, torch.bfloat16, torch.float16):
+        api = _adapter(SdpaBwdDslSm107Fp8, b=2, hq=8, hkv=2, sq=257, skv=129, dt=e4m3, grad_dt=grad, is_causal=True)
+        assert api.check_support()
+        names = [n for n, _n, _d in api._scratch_plan()]
+        for n in ("dv_part", "dk_part", "dq_ws", "q_bf16", "k_bf16", "amax_scratch", "q_pad", "k_pad", "lse_pad"):
+            assert n in names, n
+        assert api._b_chunk == 2, "the fp8 body has no batch_base: the whole batch is in-grid"
+        assert api.scratch_workspace_bytes() == api.scratch_workspace_bytes() > 0
+    with pytest.raises(ValueError, match="not served"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e5m2, grad_dt=e4m3).check_support()
+    with pytest.raises(ValueError, match="not in"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=torch.float32).check_support()
+    api = _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)
+    api.dk_desc = _adapter_desc((2, 2, 512, _D), torch.bfloat16, "dK")
+    with pytest.raises(ValueError, match="share one dtype"):
+        api.check_support()
+    api = _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)
+    api.o_desc = _adapter_desc((2, 2, 512, _D), torch.bfloat16, "o")
+    with pytest.raises(ValueError, match="FP8 payload"):
+        api.check_support()
+
+
+@requires_rubin
+@pytest.mark.parametrize("sq,skv,bottom_right", [(512, 512, False), (512, 1024, True), (768, 512, True)], ids=["square", "br-rect-kv", "br-rect-q"])
+def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq, skv, bottom_right):
+    """The dK / dQ GEMMs' causal K-trim (plan s5: LO on dK, HI on dQ, over the kv-major workspace) is an OPTIMIZATION,
+    made exact by the zero-filled workspace: rendering both GEMMs untrimmed (``STAGE3_CAUSAL_TRIM = False``, every
+    k tile read) must give the SAME BITS for dQ / dK / dV.  A trim mode paired with the wrong operand major, or a
+    shift off by the bottom-right diagonal, drops real tiles here and shows up as a non-zero diff."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else dict(use_causal_mask=True)
+    keep = _causal_keep(sq, skv, bottom_right=bottom_right)
+    trimmed = _run(b=2, hq=4, hkv=2, sq=sq, skv=skv, keep=keep, poison=float("nan"), **kw).check()
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
+    untrimmed = _run(b=2, hq=4, hkv=2, sq=sq, skv=skv, keep=keep, poison=float("nan"), **kw).check()
+    for name, x, y in zip(("dQ", "dK", "dV"), trimmed.outs[0], untrimmed.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        assert n_diff == 0, f"{name}: trimmed vs untrimmed stage 3 differ in {n_diff} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+
+
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
 
 

@@ -45,6 +45,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
+- [SDPA Backward, d = 256 (SM107 / Rubin)](attention/sdpa_bwd_sm107.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 - [DSv4.1 mHC projection/RMS backward](gemm_fusions/mhc_projection_bwd.md)
