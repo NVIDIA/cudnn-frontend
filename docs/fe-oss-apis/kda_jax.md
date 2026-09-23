@@ -1,11 +1,11 @@
-# Kimi Delta Attention in JAX (draft)
+# Kimi Delta Attention in JAX
 
 `cudnn.jax.kimi_delta_attention` returns `(output, final_state_or_None)` and
 supports `jax.jit` and first-order reverse-mode differentiation. It uses the
 existing Frost KDA kernels, including their backward, checkpoint recompute,
 split scheduler, gate gradients, and grouped-head reductions.
 
-This draft is pinned to Frost. Other engines have different launch/runtime
+This implementation is pinned to Frost. Other engines have different launch/runtime
 contracts; accepting their graph plans would not make them executable through
 this bridge. The existing torch API retains its engine routing.
 
@@ -49,7 +49,7 @@ Install GPU-enabled JAX and CuTeDSL separately from the framework-neutral packag
 pip install 'jax[cuda13]' 'nvidia-cutlass-dsl[cu13]>=4.7.0'
 ```
 
-Select one visible supported GPU before starting Python. This draft requires
+Select one visible supported GPU before starting Python. This implementation requires
 one local GPU to avoid guessing a target from tracers. The tested combination is
 JAX 0.11.1, CuTeDSL 4.7.1, SM100; broader version/architecture qualification is
 still required.
@@ -132,7 +132,7 @@ checkpoints; any positive multiple of 16 fitting signed INT32 is supported.
 
 ## Bounded support
 
-| Feature | Draft contract |
+| Feature | Supported behavior |
 |---|---|
 | Engine / GPU | Frost; SM100 or SM103; one visible GPU. SM103 not yet tested here. |
 | Head dimensions | K and V independently 64 or 128 |
