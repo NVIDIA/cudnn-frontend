@@ -106,18 +106,22 @@ def _combine_kernel(
     if cutlass.const_expr(ragged_q is not None):
         # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
         # buffer's element offset can exceed 2^31) and keep the token index in 32.
+        # Bounds are checked in 64 bits BEFORE narrowing: a negative or wrapped
+        # offset must fail the capacity test, not alias a valid token after the cast.
         rq = cutlass.make_array_view(ragged_q)
         q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
-        q_len = cutlass.Int32(cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base)
-        in_seq = q_row < q_len
+        q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+        in_seq = cutlass.Int64(q_row) < q_len64
         o_batch = cutlass.Int32(0)
-        o_tok = cutlass.Int32(cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div)) + q_row
-        row_live = in_seq & (o_tok < ragged_o_cap)
+        o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
+        row_live = in_seq & (o_tok64 >= cutlass.Int64(0)) & (o_tok64 < cutlass.Int64(ragged_o_cap))
+        o_tok = cutlass.Int32(o_tok64)
         lse_live = row_live
         if cutlass.const_expr(ragged_lse is not None):
             lse_batch = cutlass.Int32(0)
-            lse_tok = cutlass.Int32(cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div)) + q_row
-            lse_live = in_seq & (lse_tok < ragged_lse_cap)
+            lse_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div) + cutlass.Int64(q_row)
+            lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
+            lse_tok = cutlass.Int32(lse_tok64)
 
     # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
     # Every lane redundantly walks the (very short) split axis; the values are
