@@ -67,7 +67,11 @@ b.execute(x, kv, weight, saved, grad_out, dx, dkv, dw, workspace,
 ```
 
 Forward needs no scratch. Backward scratch size is
-`4 * (16*N + 4*5120*(N//64))` bytes. Saved state is a separate forward output.
+`4 * (16*N + 4*5120*(N//16))` bytes: 20.25 MiB at N=4096 and 40.5 MiB at N=8192. The 16-token
+backward tile limits register pressure; its partial weight gradients use a
+fixed reduction order without atomics. Query `scratch_workspace_bytes()` when
+allocating scratch rather than retaining a size from an older plan. Saved state
+is a separate forward output.
 Compile initializes all CuTe and Triton artifacts and launchers; execute
 performs no allocation, conversion, compilation, or synchronization. The
 convenience wrappers allocate and are intended for eager use.

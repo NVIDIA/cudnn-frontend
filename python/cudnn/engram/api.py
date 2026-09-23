@@ -25,6 +25,13 @@ from cutlass.cute.runtime import make_ptr
 import torch
 from cudnn.api_base import APIBase, TupleDict
 
+# Two tokens per warp keep the backward apply live range small on SM100.
+# The same geometry sizes the partial-gradient workspace and reduction grid.
+_APPLY_STEPS = 2
+_APPLY_WARPS = 8
+_APPLY_VECTOR = 4
+_APPLY_TOKEN_TILE = _APPLY_STEPS * _APPLY_WARPS
+
 
 @lru_cache(maxsize=1)
 def _reductions():
@@ -60,9 +67,11 @@ def _compile_backward(tokens, d, device_index, capability):
     from ._backward import launch_apply
 
     types = (torch.bfloat16, torch.bfloat16, torch.float32, torch.bfloat16, torch.float32, torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.float32)
-    splits = tokens // 64
+    splits = tokens // _APPLY_TOKEN_TILE
     with torch.cuda.device(device_index):
-        apply = cute.compile(launch_apply, *(_ptr(t, 0) for t in types), cutlass.Int32(0), cuda.CUstream(0), d, 5 * d, 5 * d, 5 * d)
+        apply = cute.compile(
+            launch_apply, *(_ptr(t, 0) for t in types), cutlass.Int32(0), cuda.CUstream(0), d, 5 * d, 5 * d, 5 * d, _APPLY_STEPS, _APPLY_WARPS, _APPLY_VECTOR
+        )
         moments = kernels.cudnn_engram_gate_saved_moments.warmup(
             torch.bfloat16,
             torch.bfloat16,
@@ -219,7 +228,7 @@ class EngramGateSavedBackward(_SavedGate):
 
     def __init__(self, x, kv, weight, saved, grad_out, *, backend="frost"):
         super().__init__(dict(x=x, kv=kv, weight=weight, saved=saved, grad_out=grad_out), eps=1e-20, backend=backend)
-        self._workspace_bytes = (self._tokens * 4 * 4 + (self._tokens // 64) * 4 * self._d) * 4
+        self._workspace_bytes = (self._tokens * 4 * 4 + (self._tokens // _APPLY_TOKEN_TILE) * 4 * self._d) * 4
 
     def _declarations(self):
         n, d = self._tokens, self._d
@@ -268,7 +277,7 @@ class EngramGateSavedBackward(_SavedGate):
         n, d = self._tokens, self._d
         coef = workspace.data_ptr()
         partial = coef + n * 4 * 4 * 4
-        splits = n // 64
+        splits = n // _APPLY_TOKEN_TILE
         bs = 1 << (splits - 1).bit_length()
         with torch.cuda.device(self._device):
             stream = self._stream(current_stream)
