@@ -93,12 +93,18 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_co
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
+# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
+MASK_FORM: str = MASK_FORM_BITS
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
@@ -190,7 +196,7 @@ def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv, mask_value:
     """Apply the per-element padding predicate only to a partial KV chunk."""
     result = reg_s
     if kv_col_base + cutlass.Int32(int(reg_s.shape[0])) > eff_seqlen_kv:
-        result = apply_mask_chunk(
+        result = apply_mask_chunk_form(
             reg_s,
             cutlass.Int32(0),
             kv_col_base,
@@ -199,6 +205,7 @@ def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv, mask_value:
             MASK_PADDED,
             N=int(reg_s.shape[0]),
             mask_value=mask_value,
+            form=MASK_FORM,
         )
     return result
 
@@ -1894,7 +1901,7 @@ def _softmax_kv_body(
             mask_q_abs = cute.math.min(q_abs, eff_seqlen_kv - cutlass.Int32(1))
             chunk_mask_flags = MASK_CAUSAL
         chunks_S = [
-            apply_mask_chunk(
+            apply_mask_chunk_form(
                 raw_chunks[c],
                 mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                 cutlass.Int32(0),
@@ -1904,6 +1911,7 @@ def _softmax_kv_body(
                 N=CHUNK,
                 mask_value=mask_value,
                 window_right=CFG.WINDOW_RIGHT,
+                form=MASK_FORM,
             )
             for c in range(N_CHUNKS)
         ]
