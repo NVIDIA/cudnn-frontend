@@ -11,9 +11,16 @@ cast -- what the C++ node's reduction sits on -- NOT the amax of ``dO V^T``).
 
 ACCEPT tests run the graph with the engine PINNED against the repo's fp8
 backward oracle (``sdpa.fp8_ref.compute_ref_backward``, the reference the cuDNN
-backend's fp8 suite passes against, which models the e4m3 quantization of P
-and dS exactly as the contract does), under the backend suite's tolerance
-recipe and ``assert_close_fp8_grad``'s midpoint-flip budget; REJECT tests
+backend's fp8 suite passes against) with ``quantize_ds=False``: it models the
+e4m3 quantization of P (the dV BMM2 consumes e4m3 P on both sides) but holds dS
+in fp32 for the dQ / dK products, because this chain's dQ / dK consume a bf16 dS
+workspace (plan Q2(b)) -- the backend recipe's e4m3 dS would misreport the row
+by its own rounding noise (measured on correct inputs: 0.56 % of dQ and
+0.54 % of dK outside atol 0.08 at B1 H2 S512, ~2 near-cancelling elements in
+3 of 4 d-rows, max |diff| 0.17; the fp32-dS reference gives 0 outside, max
+|diff| one e4m3 output step) -- under the
+backend suite's tolerance recipe and ``assert_close_fp8_grad``'s midpoint-flip
+budget (which now only P-side flips can spend); REJECT tests
 assert the decline through the row's own ``mismatch()`` on REAL graphs with a
 faked cc 10.7 device.  The two graph-admission cases of the bring-up
 placeholder are kept (Rubin only).  The host-only static and sm_107a SASS pins
@@ -477,12 +484,21 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
     o8, stats, o_amax = compute_ref(
         q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align
     )
+    # compute_ref hands O back as a [B, S, H, D]-SHAPED VIEW over B,H,S,D-contiguous memory (its strides are BHSD).  The
+    # graph declares O with BSHD strides, so without this the kernel reads O scrambled -> delta wrong on ~all rows (max
+    # 5.1 at B1 H2 S512) -> dS off by attn_scale * P * ddelta -> ~4 dQ elements past atol and amax_dP 5.6 % high, while
+    # dV (no delta) stays bitwise.  q8 / k8 / v8 / do8 come from `draw(...).to(...)` and are contiguous already.
+    o8 = o8.contiguous()
     o_ds = get_fp8_descale_factor(o_amax, _T_E4M3)
 
-    def ref_bwd(return_intermediates=False):
+    def ref_bwd(return_intermediates=False, quantize_ds=False):
+        # quantize_ds=False: this chain's dQ / dK consume dS in bf16 (plan Q2(b)), never e4m3, so the reference must
+        # not round dS either (sdpa-invariants s8: the reference composes the SAME conditions).  P stays quantized
+        # (the dV BMM2 consumes e4m3 P on both sides).  quantize_ds=True is the backend recipe, kept for the report.
         return compute_ref_backward(
             q8, k8, v8, o8, do8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, o_ds, do_ds, grad_dtype,
-            left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=return_intermediates
+            left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=return_intermediates,
+            quantize_ds=quantize_ds,
         )  # fmt: skip
 
     dq_ref, dk_ref, dv_ref, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True)
