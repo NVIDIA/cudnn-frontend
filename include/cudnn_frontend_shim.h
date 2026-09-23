@@ -177,24 +177,6 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
     return symbol;
 }
 
-// Version of the CUDA runtime this process actually loaded, as major * 1000 +
-// minor * 10 (12.8 -> 12080, 13.2 -> 13020).  cudaRuntimeGetVersion has one ABI
-// on every CUDA 12 and 13 runtime, so it can be resolved before the version is
-// known, and the answer cannot change within a process.
-inline int
-get_cuda_runtime_version() {
-    static int const version = []() {
-        auto get_runtime_version =
-            reinterpret_cast<cudaError_t (*)(int *)>(get_cuda_symbol(CudaLibrary::CUDART, "cudaRuntimeGetVersion"));
-        int value = 0;
-        if (get_runtime_version(&value) != cudaSuccess) {
-            return 0;
-        }
-        return value;
-    }();
-    return version;
-}
-
 #endif
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -240,6 +222,27 @@ get_cuda_runtime_version() {
 #define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
 
 #endif
+
+inline cudaError_t
+cuda_runtime_get_version(int *version) {
+    NV_FE_CALL_TO_CUDA(cuda_runtime_get_version, cudaRuntimeGetVersion, version);
+}
+
+// Version of the CUDA runtime this process actually loaded, as major * 1000 +
+// minor * 10 (12.8 -> 12080, 13.2 -> 13020).  cudaRuntimeGetVersion has one ABI
+// on every CUDA 12 and 13 runtime, so it can be resolved before the version is
+// known, and the answer cannot change within a process.
+inline int
+get_cuda_runtime_version() {
+    static int const version = []() {
+        int value = 0;
+        if (cuda_runtime_get_version(&value) != cudaSuccess) {
+            return 0;
+        }
+        return value;
+    }();
+    return version;
+}
 
 inline cudaError_t
 cuda_graph_create(cudaGraph_t *pGraph, unsigned int flags) {
@@ -327,14 +330,20 @@ cuda_graph_node_get_dependent_nodes_v2(cudaGraphNode_t node,
     // BASE symbol only from CUDA 13 on: on CUDA 12 the base symbol still takes
     // three parameters and the edge-data form is the _v2 one, so resolving by
     // name alone would pass edgeData where the count is expected.
-    using get_dependent_nodes_t = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, cudaGraphEdgeData *, size_t *);
     if (get_cuda_runtime_version() >= 13000) {
-        return reinterpret_cast<get_dependent_nodes_t>(
-            get_cuda_symbol(CudaLibrary::CUDART, "cudaGraphNodeGetDependentNodes"))(
-            node, pDependentNodes, edgeData, pNumDependentNodes);
+        NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
+                           cudaGraphNodeGetDependentNodes,
+                           node,
+                           pDependentNodes,
+                           edgeData,
+                           pNumDependentNodes);
     }
-    return reinterpret_cast<get_dependent_nodes_t>(get_cuda_symbol(
-        CudaLibrary::CUDART, "cudaGraphNodeGetDependentNodes_v2"))(node, pDependentNodes, edgeData, pNumDependentNodes);
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
+                       cudaGraphNodeGetDependentNodes_v2,
+                       node,
+                       pDependentNodes,
+                       edgeData,
+                       pNumDependentNodes);
 #else
     NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
                        cudaGraphNodeGetDependentNodes,
@@ -356,9 +365,11 @@ cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
     if (get_cuda_runtime_version() < 13000) {
         // A CUDA 12 runtime's base symbol IS the three-parameter function, so
         // call it directly instead of routing through the edge-data shim.
-        using get_dependent_nodes_t = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
-        return reinterpret_cast<get_dependent_nodes_t>(get_cuda_symbol(
-            CudaLibrary::CUDART, "cudaGraphNodeGetDependentNodes"))(node, pDependentNodes, pNumDependentNodes);
+        NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes,
+                           cudaGraphNodeGetDependentNodes,
+                           node,
+                           pDependentNodes,
+                           pNumDependentNodes);
     }
 #endif
     // The 3-parameter version of cudaGraphNodeGetDependentNodes was removed in CUDA 13.0,
@@ -382,13 +393,20 @@ cuda_graph_node_get_dependencies_v2(cudaGraphNode_t node,
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
     // Same dispatch as the DependentNodes shim above: the base symbol carries the
     // edge-data form only from CUDA 13 on, the _v2 symbol carries it on CUDA 12.
-    using get_dependencies_t = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, cudaGraphEdgeData *, size_t *);
     if (get_cuda_runtime_version() >= 13000) {
-        return reinterpret_cast<get_dependencies_t>(get_cuda_symbol(
-            CudaLibrary::CUDART, "cudaGraphNodeGetDependencies"))(node, pDependencies, edgeData, pNumDependencies);
+        NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                           cudaGraphNodeGetDependencies,
+                           node,
+                           pDependencies,
+                           edgeData,
+                           pNumDependencies);
     }
-    return reinterpret_cast<get_dependencies_t>(get_cuda_symbol(
-        CudaLibrary::CUDART, "cudaGraphNodeGetDependencies_v2"))(node, pDependencies, edgeData, pNumDependencies);
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                       cudaGraphNodeGetDependencies_v2,
+                       node,
+                       pDependencies,
+                       edgeData,
+                       pNumDependencies);
 #else
     NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
                        cudaGraphNodeGetDependencies,
@@ -407,9 +425,8 @@ cuda_graph_node_get_dependencies(cudaGraphNode_t node, cudaGraphNode_t *pDepende
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
     if (get_cuda_runtime_version() < 13000) {
         // A CUDA 12 runtime's base symbol IS the three-parameter function.
-        using get_dependencies_t = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
-        return reinterpret_cast<get_dependencies_t>(get_cuda_symbol(
-            CudaLibrary::CUDART, "cudaGraphNodeGetDependencies"))(node, pDependencies, pNumDependencies);
+        NV_FE_CALL_TO_CUDA(
+            cuda_graph_node_get_dependencies, cudaGraphNodeGetDependencies, node, pDependencies, pNumDependencies);
     }
 #endif
     // The 3-parameter version of cudaGraphNodeGetDependencies was removed in CUDA 13.0,
