@@ -189,47 +189,34 @@ def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
     assert code.count("spin=") == n_ring, f"{mod.__name__}: a spin= outside a .wait( call"
 
 
-# The per-cell softmax mask has two lowerings behind one signature (`tile_dsl.mask.apply_mask_chunk_form`):
-# "cells" = compare + select per cell per mask term (3-7 instructions per cell, 51-72 % of a masked softmax
-# tile's instructions serialized ahead of the exp burst) and "bits" = one keep-word per 32 columns from two
-# saturating shifts, then a register-to-predicate `R2P` + one `FSEL` per cell (1.4-1.6 per cell, independent
-# of the number of active terms).  Same masked set, same sentinel -> O / LSE bitwise identical; the forms differ
-# ONLY in instruction count (sm_107a listings, 2026-09-22: masked body -208 (1 term) / -466 (2 terms) / -903 (the
-# mxfp8 d512 SWA build, whose 128 live i1 values had spilled into GPR bits through predicate-to-register moves and LOP3) instructions per KV tile per lane).
-# Every sm107 kernel picks the form with ONE module constant, `MASK_FORM`, the way it picks `DESC_VERSION`.
-_MASK_FORM_EXPECTED = "bits"
+# The per-cell softmax mask is ONE tile_dsl op, `tile_dsl.mask.apply_mask_chunk`: a keep-word per 32 columns from two
+# saturating shifts, then a register-to-predicate `R2P` + one `FSEL` per cell (1.4-1.6 instructions per cell, independent
+# of the number of active terms).  It replaced a per-cell compare + select (3-7 instructions per cell, 51-72 % of a masked
+# softmax tile's instructions serialized ahead of the exp burst; sm_107a listings, 2026-09-22: masked body -208 (1 term)
+# / -466 (2 terms) / -903 (the mxfp8 d512 SWA build, whose 128 live i1 values had spilled into GPR bits through
+# predicate-to-register moves and LOP3) instructions per KV tile per lane) -- first behind a per-kernel `MASK_FORM`
+# constant (#1192 / #1197), then collapsed into the op itself.  Same masked set, same sentinel -> O / LSE bitwise
+# identical.  What is left to pin: every masked site calls the op DIRECTLY, and no per-kernel form vocabulary comes back.
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
 @pytest.mark.parametrize("flavor", _FLAVORS)
-def test_sm107_mask_form_is_the_bits_form(flavor, kind, load_kw):
-    """Every sm107 prefill kernel masks in the register-to-predicate form.  Asserted on the module's own
-    constant (what the call sites read at trace time), not on a substring a comment could supply.  Flipping a
-    kernel back to "cells" is a legitimate A/B -- do it on a branch and re-measure, do not delete the check."""
-    from cudnn.frost.tile_dsl.mask import MASK_FORMS
-
-    mod = _load(flavor, rubin=True, **load_kw)
-    assert mod.MASK_FORM in MASK_FORMS, f"{mod.__name__}: MASK_FORM={mod.MASK_FORM!r} is not one of {MASK_FORMS}"
-    assert mod.MASK_FORM == _MASK_FORM_EXPECTED, f"{mod.__name__}: MASK_FORM={mod.MASK_FORM!r}, expected {_MASK_FORM_EXPECTED!r}"
-
-
-@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
-@pytest.mark.parametrize("flavor", _FLAVORS)
-def test_sm107_every_mask_site_takes_the_module_mask_form(flavor, kind, load_kw):
-    """MASK_FORM is only meaningful if EVERY masked call site passes it.  A site that calls `apply_mask_chunk`
-    directly, or re-literals `form="cells"`, silently keeps the per-cell lowering on that one arm (the d256 and
-    mxfp8 kernels have 2-4 masked arms each), so count the sites against the constant."""
+def test_sm107_every_mask_site_calls_apply_mask_chunk(flavor, kind, load_kw):
+    """Every masked call site of every sm107 prefill kernel is a direct `apply_mask_chunk(` call -- no dispatcher, no
+    `form=` kwarg, no module `MASK_FORM` constant (the vocabulary the collapse removed).  A reintroduced per-kernel
+    selector would let one arm (the d256 and mxfp8 kernels have 2-4 masked arms each) drift to a slower lowering with
+    bitwise-identical output, which no numerics test sees; the lowering itself is held by
+    test_sm107_masked_softmax_sass_is_register_to_predicate."""
     import re
 
     mod = _load(flavor, rubin=True, **load_kw)
+    assert not hasattr(mod, "MASK_FORM"), f"{mod.__name__}: a MASK_FORM constant is back"
     with open(mod.__file__, encoding="utf-8") as fh:
         code = _code_lines(fh.read())
-    n_sites = len(re.findall(r"\bapply_mask_chunk_form\(", code))
+    n_sites = len(re.findall(r"\bapply_mask_chunk\(", code))
     assert n_sites > 0, f"{mod.__name__}: no masked call site found"
-    n_wired = code.count("form=MASK_FORM,")
-    assert n_wired == n_sites, f"{mod.__name__}: {n_sites} apply_mask_chunk_form site(s) but {n_wired} pass form=MASK_FORM"
-    assert not re.search(r"\bapply_mask_chunk(_bits)?\(", code), f"{mod.__name__}: a direct apply_mask_chunk / apply_mask_chunk_bits call bypasses MASK_FORM"
-    assert not re.search(r"""form=["']""", code), f"{mod.__name__}: a re-literalled form= bypasses MASK_FORM"
+    for spelling in (r"\bapply_mask_chunk_form\b", r"\bapply_mask_chunk_bits\b", r"\bMASK_FORM", r"(?<!\w)form="):
+        assert not re.search(spelling, code), f"{mod.__name__}: {spelling!r} -- the per-kernel mask-form selector was collapsed into apply_mask_chunk"
 
 
 @pytest.mark.parametrize("flavor", _FLAVORS)
@@ -2753,12 +2740,12 @@ def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
     return {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
 
 
-# The masked softmax arm's SASS pin (sm_107a listings of both forms, 2026-09-22).  Under MASK_FORM="bits" every masked KV-tile body carries
-# 4 R2P per 32-column word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and 1 ISETP per cell per mask term
-# (611-764 ISETP whole-kernel on these two builds vs 107-108 now), and the mxfp8 d512 causal+SWA build ran out of predicate
-# registers (152 predicate-to-register moves, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask spec, ISETP ceiling,
-# predicate-to-register-move ceiling, spill ceiling); the
-# ceilings are the measured "bits" counts (2026-09-22, sm_107a, production geometry) plus slack -- one masked arm falling back
+# The masked softmax arm's SASS pin (sm_107a listings of both forms, 2026-09-22).  In the bit-word form (`tile_dsl.mask.apply_mask_chunk`)
+# every masked KV-tile body carries 4 R2P per 32-column word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced
+# carried 0 R2P and 1 ISETP per cell per mask term (611-764 ISETP whole-kernel on these two builds vs 107-108 now), and the mxfp8 d512
+# causal+SWA build ran out of predicate registers (152 predicate-to-register moves, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask
+# spec, ISETP ceiling, predicate-to-register-move ceiling, spill ceiling); the
+# ceilings are the measured bit-word counts (2026-09-22, sm_107a, production geometry) plus slack -- one masked arm falling back
 # to per-cell compares adds >= 128 ISETP, so a slack of 32 still catches a single arm.
 _SM107_MASK_SASS_ROWS = [
     pytest.param("mxfp8", 512, _BF16_OUT, "causal_swa640", 108 + 32, 2 + 6, 0, id="mxfp8-d512-causal_swa640"),
@@ -2768,7 +2755,7 @@ _SM107_MASK_SASS_ROWS = [
 
 @pytest.mark.parametrize("quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max", _SM107_MASK_SASS_ROWS)
 def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max):
-    """The masked softmax arm masks through R2P + FSEL (the "bits" form), not one ISETP + FSEL per cell per term: R2P > 0,
+    """The masked softmax arm masks through R2P + FSEL (the bit-word form of apply_mask_chunk), not one ISETP + FSEL per cell per term: R2P > 0,
     whole-kernel ISETP within the measured ceiling, no predicate-register spill storm (predicate-to-register moves) and no new stack spills
     (the d128 causal builds carry 5 STL / 9 LDL per TILE on develop already -- that is the row's pre-existing count)."""
     if not _sm107a_known_to_the_dsl():
@@ -2780,7 +2767,7 @@ def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, 
     dump.mkdir()
     stats = _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands)
     print(f"\nsm107 {quant} d={d} {mask} sm_107a SASS: {stats}")
-    assert stats["R2P"] > 0, "no R2P: the masked arm is back to per-cell compare + select (MASK_FORM or apply_mask_chunk_bits regressed)"
+    assert stats["R2P"] > 0, "no R2P: the masked arm is back to per-cell compare + select (tile_dsl.mask.apply_mask_chunk regressed)"
     assert stats["ISETP"] <= isetp_max, f"{stats['ISETP']} ISETP > {isetp_max}: a masked arm is comparing per cell again"
     assert (
         stats["PRED2GPR"] <= pred_spill_max

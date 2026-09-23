@@ -73,16 +73,11 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk_form,
-    MASK_FORM_BITS,
+    apply_mask_chunk,
     MASK_NONE,
     MASK_CAUSAL,
     MASK_PADDED,
 )
-
-# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
-# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
-MASK_FORM: str = MASK_FORM_BITS
 
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
@@ -1818,7 +1813,7 @@ def _softmax_warp_group(
                             for c in range(N_CHUNKS)
                         ]
                         chunks_S = [
-                            apply_mask_chunk_form(
+                            apply_mask_chunk(
                                 raw_chunks[c],
                                 mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                                 cutlass.Int32(0),
@@ -1830,7 +1825,6 @@ def _softmax_warp_group(
                                 causal_diag=causal_diag,
                                 window_right=CFG.WINDOW_RIGHT,
                                 mask_value=float("-inf"),
-                                form=MASK_FORM,
                             )
                             for c in range(N_CHUNKS)
                         ]
@@ -1861,7 +1855,7 @@ def _softmax_warp_group(
                         # store into cols 96-111 (mb_softmax_hi_loaded, #981).
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         mb_softmax_hi_loaded[parity_rt].arrive()
-                        masked_chunk = apply_mask_chunk_form(
+                        masked_chunk = apply_mask_chunk(
                             raw_chunk,
                             mask_q_abs - (kv_col_base + cutlass.Int32(CHUNK)),
                             cutlass.Int32(0),
@@ -1873,7 +1867,6 @@ def _softmax_warp_group(
                             causal_diag=causal_diag,
                             window_right=CFG.WINDOW_RIGHT,
                             mask_value=float("-inf"),
-                            form=MASK_FORM,
                         )
                         reg_S_half = RegTile(masked_chunk, size=CHUNK)
 
@@ -1968,7 +1961,7 @@ def _softmax_warp_group(
                     mask_bottom_right = CFG.BOTTOM_RIGHT
                     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
                 chunks_S = [
-                    apply_mask_chunk_form(
+                    apply_mask_chunk(
                         raw_chunks[c],
                         mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         cutlass.Int32(0),
@@ -1980,7 +1973,6 @@ def _softmax_warp_group(
                         causal_diag=causal_diag,
                         window_right=CFG.WINDOW_RIGHT,
                         mask_value=float("-inf"),
-                        form=MASK_FORM,
                     )
                     for c in range(N_CHUNKS)
                 ]
@@ -2174,7 +2166,7 @@ def _softmax_warp_group(
                     mask_bottom_right = CFG.BOTTOM_RIGHT
                     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
                 chunks_S = [
-                    apply_mask_chunk_form(
+                    apply_mask_chunk(
                         raw_chunks[c],
                         mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         cutlass.Int32(0),
@@ -2186,7 +2178,6 @@ def _softmax_warp_group(
                         causal_diag=causal_diag,
                         window_right=CFG.WINDOW_RIGHT,
                         mask_value=float("-inf"),
-                        form=MASK_FORM,
                     )
                     for c in range(N_CHUNKS)
                 ]

@@ -71,17 +71,12 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk_form,
-    MASK_FORM_BITS,
+    apply_mask_chunk,
     MASK_NONE,
     MASK_CAUSAL,
     MASK_PADDED,
     MASK_SWA,
 )
-
-# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
-# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
-MASK_FORM: str = MASK_FORM_BITS
 
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
@@ -2185,7 +2180,7 @@ def _softmax_warp_group(
                     mask_bottom_right = CFG.BOTTOM_RIGHT
                     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
                 chunks_S = [
-                    apply_mask_chunk_form(
+                    apply_mask_chunk(
                         raw_chunks[c],
                         q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         cutlass.Int32(0),
@@ -2197,7 +2192,6 @@ def _softmax_warp_group(
                         causal_diag=causal_diag,
                         window_right=CFG.WINDOW_RIGHT,
                         mask_value=float("-inf"),
-                        form=MASK_FORM,
                     )
                     for c in range(N_CHUNKS)
                 ]
@@ -2433,7 +2427,7 @@ def _softmax_warp_group(
                         mask_q_abs = cute.math.min(q_abs, eff_seqlen_kv - cutlass.Int32(1))
                         mask_flags = MASK_CAUSAL
                     chunks_S = [
-                        apply_mask_chunk_form(
+                        apply_mask_chunk(
                             raw_chunks[c],
                             mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                             cutlass.Int32(0),
@@ -2445,7 +2439,6 @@ def _softmax_warp_group(
                             causal_diag=causal_diag,
                             window_right=CFG.WINDOW_RIGHT,
                             mask_value=float("-inf"),
-                            form=MASK_FORM,
                         )
                         for c in range(N_CHUNKS)
                     ]
@@ -2711,7 +2704,7 @@ def _correction_warp_group(
             if cutlass.const_expr(_PADDED_TOP_LEFT_CAUSAL):
                 mask_q_abs = cute.math.min(mask_q_abs, mask_seq_kv - cutlass.Int32(1))
                 mask_flags = MASK_CAUSAL
-            raw_hi = apply_mask_chunk_form(
+            raw_hi = apply_mask_chunk(
                 raw_hi,
                 mask_q_abs,
                 cutlass.Int32(0),
@@ -2723,7 +2716,6 @@ def _correction_warp_group(
                 causal_diag=None,
                 window_right=CFG.WINDOW_RIGHT,
                 mask_value=float("-inf"),
-                form=MASK_FORM,
             )
         reg_S_half = RegTile(raw_hi, size=64)
 
