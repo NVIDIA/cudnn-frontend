@@ -2683,7 +2683,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """Launch the compiled kernel.
 
         ``ragged_q`` / ``ragged_o`` / ``ragged_lse`` (the decode tile's ragged-Q
-        leg only, ``thd_decode_leg``): the graph's (B+1,) int32 ragged-offset
+        leg only, ``thd_decode_leg``): the graph's (B+1,) int32 or int64 ragged-offset
         tensors of Q, O and Stats; the kernel reads them on device (Rule 3).
 
         ``gate``: the fused epilogue gate ``G`` of a specialization built with

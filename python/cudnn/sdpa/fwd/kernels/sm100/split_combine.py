@@ -67,7 +67,7 @@ def _combine_kernel(
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
-    # Ragged final rows (the decode tile's RAGGED_Q leg): (B+1,) int32 ragged
+    # Ragged final rows (the decode tile's RAGGED_Q leg): (B+1,) int32 / int64 ragged
     # offsets of Q, O and Stats in ELEMENTS and their elements-per-token
     # divisors.  The partials stay dense; only the final O / LSE rows move to
     # ``offset[b] / div + q_row`` on the packed [1, T, ...] outputs, and a row
