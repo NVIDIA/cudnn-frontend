@@ -433,8 +433,8 @@ def _bprop_kernel(
     # internal dQ accumulator always are), a packed THD port declared as a view
     # into a wider per-token record (a K/V slice of an interleaved [T, 2, H, D]
     # buffer) walks its own stride.  Every row is addressed as
-    # ``row * token_stride + head * D + col`` -- the head stride is D on every
-    # port (the adapters admit nothing else), so no head stride is read here.
+    # ``row * token_stride + head * head_stride + col``; the head stride rides
+    # the fake too (D for a compact port, wider for a head-interleaved one).
     QK_RS = cutlass.Int32(Q.stride[1])  # Q read row stride
     V_RS = cutlass.Int32(dO.stride[1])  # dO read row stride
     K_RS = cutlass.Int32(K.stride[1])  # K read row stride (H_kv heads)
@@ -477,8 +477,8 @@ def _bprop_kernel(
 
     # K/V tile (row 0) GMEM element pointers — at the KV head (GQA-mapped).
     # kv_row_origin = batch*SKV (dense) or cu_k[b] (THD packed).
-    k_tile_base = (kv_row_origin + kv_base) * K_RS + kv_head * cutlass.Int32(d_qk)
-    v_tile_base = (kv_row_origin + kv_base) * VV_RS + kv_head * cutlass.Int32(d_v)
+    k_tile_base = (kv_row_origin + kv_base) * K_RS + kv_head * cutlass.Int32(K.stride[2])
+    v_tile_base = (kv_row_origin + kv_base) * VV_RS + kv_head * cutlass.Int32(V.stride[2])
     k_tile_gmem = K_view.data_ptr() + k_tile_base
     v_tile_gmem = V_view.data_ptr() + v_tile_base
 
@@ -652,8 +652,8 @@ def _bprop_kernel(
     # Q/dO row-gate bound (per-seq under THD) + packed seq origin for the GMEM
     # base (q_row_origin = batch*SQ dense / cu_q[b] THD).
     SQ_rt = q_bound
-    bhead_qk = q_row_origin * QK_RS + head * cutlass.Int32(d_qk)
-    bhead_v = q_row_origin * V_RS + head * cutlass.Int32(d_v)
+    bhead_qk = q_row_origin * QK_RS + head * cutlass.Int32(Q.stride[2])
+    bhead_v = q_row_origin * V_RS + head * cutlass.Int32(dO.stride[2])
 
     # Prologue: prefetch Q/dO tile 0 into ring stage 0.  Predicated row-gate
     # (rows >= SQ → zero-size cp.async) keeps the per-iter group count uniform
@@ -1172,8 +1172,8 @@ def _bprop_kernel(
         for nf in cutlass.range_constexpr(d_v // 8):
             d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
-            base_top = (kv_row_origin + kv_base + kv_row_g) * DV_RS + head * cutlass.Int32(d_v) + d0
-            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DV_RS + head * cutlass.Int32(d_v) + d0
+            base_top = (kv_row_origin + kv_base + kv_row_g) * DV_RS + head * cutlass.Int32(dV.stride[2]) + d0
+            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DV_RS + head * cutlass.Int32(dV.stride[2]) + d0
             _vt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
             _vb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
             if cutlass.const_expr(GATE_KV):
@@ -1215,8 +1215,8 @@ def _bprop_kernel(
         for nf in cutlass.range_constexpr(d_qk // 8):
             d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
-            base_top = (kv_row_origin + kv_base + kv_row_g) * DK_RS + head * cutlass.Int32(d_qk) + d0
-            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DK_RS + head * cutlass.Int32(d_qk) + d0
+            base_top = (kv_row_origin + kv_base + kv_row_g) * DK_RS + head * cutlass.Int32(dK.stride[2]) + d0
+            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DK_RS + head * cutlass.Int32(dK.stride[2]) + d0
             _kt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
             _kb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
             if cutlass.const_expr(GATE_KV):
@@ -1316,8 +1316,8 @@ def _do_dot_kernel(
         # Row = token: each operand at ITS compile-time token stride (compact
         # folds to H*d_v; a packed port may carry a wider per-token record).
         tok = b * cutlass.Int32(SQ) + q
-        o_base = tok * cutlass.Int32(O.stride[1]) + h * cutlass.Int32(d_v)
-        do_base = tok * cutlass.Int32(dO.stride[1]) + h * cutlass.Int32(d_v)
+        o_base = tok * cutlass.Int32(O.stride[1]) + h * cutlass.Int32(O.stride[2])
+        do_base = tok * cutlass.Int32(dO.stride[1]) + h * cutlass.Int32(dO.stride[2])
         Ob = cutlass.make_array_view(O).data_ptr()
         dOb = cutlass.make_array_view(dO).data_ptr()
         acc = cutlass.Float32(0.0)
@@ -1466,8 +1466,8 @@ def _cast_thd_kernel(
         t_live = Pointer(cutlass.make_array_view(CU_Q).data_ptr() + n_seq, dtype=cutlass.Int32).load()
         if row < t_live:
             src = cutlass.make_array_view(dQ_acc).data_ptr() + (row * cutlass.Int32(H) + h) * cutlass.Int32(fd) + c
-            # The caller's dQ at ITS token stride (compact folds to H*d_out).
-            dst = cutlass.make_array_view(dQ_out).data_ptr() + row * cutlass.Int32(dQ_out.stride[1]) + h * cutlass.Int32(d_out) + c
+            # The caller's dQ at ITS token and head stride (compact folds to H*d_out / d_out).
+            dst = cutlass.make_array_view(dQ_out).data_ptr() + row * cutlass.Int32(dQ_out.stride[1]) + h * cutlass.Int32(dQ_out.stride[2]) + c
             v = Pointer(src, dtype=cutlass.Float32).load(count=2)
             Pointer(dst, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
 
@@ -1544,8 +1544,8 @@ def _dkv_reduce_thd_kernel(
             acc = cutlass.Float32(0.0)
             for g in cutlass.range_constexpr(ratio):
                 acc = acc + Pointer(src + in_base + cutlass.Int32(g * d_in), dtype=io_dtype).load().to(cutlass.Float32)
-            # The caller's dK/dV at ITS token stride (compact folds to Hk*d_out).
-            out_off = row * cutlass.Int32(OUT.stride[1]) + hk * cutlass.Int32(d_out) + di
+            # The caller's dK/dV at ITS token and head stride (compact folds to Hk*d_out / d_out).
+            out_off = row * cutlass.Int32(OUT.stride[1]) + hk * cutlass.Int32(OUT.stride[2]) + di
             Pointer(cutlass.make_array_view(OUT).data_ptr() + out_off, dtype=io_dtype).store(acc.to(io_dtype))
 
 
@@ -1862,6 +1862,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     out_d_qk: int = 0,
     out_d_v: int = 0,
     thd_token_strides: "Optional[tuple[int, ...]]" = None,
+    thd_head_strides: "Optional[tuple[int, ...]]" = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1905,6 +1906,14 @@ def compile(  # noqa: A001 — the template contract's entry point
     envelope) are compact at the kernel regardless, as are the per-query-head
     dK/dV partials (GQA or padded): their caller stride reaches only the
     bounded fold that writes the caller's buffer.
+
+    ``thd_head_strides`` (THD only, plan-time): the CALLER's head strides for
+    the same eight ports, 0 = ``D``.  A head-interleaved record (head stride
+    ``D + gap``) is addressed as ``row * token_stride + head * head_stride``;
+    the fake carries the head stride like the token stride.  Each must be
+    ``>= D`` and a multiple of 8 elements (every head base stays 16-byte
+    aligned); the token stride must cover ``H * head_stride``.  Ports the host
+    stages are compact at the kernel regardless.
     """
     _cache_key = _template_key(globals(), locals(), "compile")
     p = PARAMS
@@ -1918,25 +1927,32 @@ def compile(  # noqa: A001 — the template contract's entry point
     d_out_v = int(out_d_v) if out_d_v else p.d_v
     if d_out_qk % 2 or d_out_v % 2 or d_out_qk > p.d_qk or d_out_v > p.d_v or d_out_qk <= 0 or d_out_v <= 0:
         raise ValueError(f"sm80 bwd: out head dims must be even and within the envelope ({p.d_qk}, {p.d_v}); got ({out_d_qk}, {out_d_v})")
-    if thd_token_strides is not None and not p.thd_varlen:
-        raise ValueError("sm80 bwd: thd_token_strides describe PACKED (THD) ports; the dense path stages its operands compact")
+    if (thd_token_strides is not None or thd_head_strides is not None) and not p.thd_varlen:
+        raise ValueError("sm80 bwd: thd_token_strides / thd_head_strides describe PACKED (THD) ports; the dense path stages its operands compact")
+    hs_q = hs_k = hs_v = hs_o = hs_do = hs_dq = hs_dk = hs_dv = 0
+    if thd_head_strides is not None:
+        if len(thd_head_strides) != 8:
+            raise ValueError(f"sm80 bwd: thd_head_strides must be the 8 (Q, K, V, O, dO, dQ, dK, dV) head strides; got {thd_head_strides}")
+        hs_q, hs_k, hs_v, hs_o, hs_do, hs_dq, hs_dk, hs_dv = (int(x) for x in thd_head_strides)
     ts_q = ts_k = ts_v = ts_o = ts_do = ts_dq = ts_dk = ts_dv = 0
     if thd_token_strides is not None:
         if len(thd_token_strides) != 8:
             raise ValueError(f"sm80 bwd: thd_token_strides must be the 8 (Q, K, V, O, dO, dQ, dK, dV) token strides; got {thd_token_strides}")
         ts_q, ts_k, ts_v, ts_o, ts_do, ts_dq, ts_dk, ts_dv = (int(x) for x in thd_token_strides)
-        for name, ts, hh, dd in (
-            ("Q", ts_q, h, d_out_qk),
-            ("K", ts_k, h_kv, d_out_qk),
-            ("V", ts_v, h_kv, d_out_v),
-            ("O", ts_o, h, d_out_v),
-            ("dO", ts_do, h, d_out_v),
-            ("dQ", ts_dq, h, d_out_qk),
-            ("dK", ts_dk, h_kv, d_out_qk),
-            ("dV", ts_dv, h_kv, d_out_v),
+        for name, ts, hs, hh, dd in (
+            ("Q", ts_q, hs_q, h, d_out_qk),
+            ("K", ts_k, hs_k, h_kv, d_out_qk),
+            ("V", ts_v, hs_v, h_kv, d_out_v),
+            ("O", ts_o, hs_o, h, d_out_v),
+            ("dO", ts_do, hs_do, h, d_out_v),
+            ("dQ", ts_dq, hs_dq, h, d_out_qk),
+            ("dK", ts_dk, hs_dk, h_kv, d_out_qk),
+            ("dV", ts_dv, hs_dv, h_kv, d_out_v),
         ):
-            if ts and (ts < hh * dd or ts % 8):
-                raise ValueError(f"sm80 bwd: {name} token stride {ts} must cover the packed row (>= {hh * dd}) and be a multiple of 8 elements")
+            if hs and (hs < dd or hs % 8):
+                raise ValueError(f"sm80 bwd: {name} head stride {hs} must cover the head (>= {dd}) and be a multiple of 8 elements")
+            if ts and (ts < hh * (hs or dd) or ts % 8):
+                raise ValueError(f"sm80 bwd: {name} token stride {ts} must cover the packed row (>= {hh * (hs or dd)}) and be a multiple of 8 elements")
     # Ports the host stages into compact scratch (a head dim inside the flavor
     # envelope) reach the kernels compact whatever the caller declared.
     pad_qk = d_out_qk < p.d_qk
@@ -1973,19 +1989,22 @@ def compile(  # noqa: A001 — the template contract's entry point
 
     r4 = (3, 2, 1, 0)
 
-    def _fake_rows(dtype, tokens, hh, dd, ts):
-        """A ``[1, T, hh, dd]`` operand at token stride ``ts`` (0 = compact): the
-        stride is plan-time and rides the fake, so the kernels' row arithmetic
-        folds it like the compact ``hh * dd`` it replaces."""
-        if not ts:
+    def _fake_rows(dtype, tokens, hh, dd, ts, hs=0):
+        """A ``[1, T, hh, dd]`` operand at token stride ``ts`` and head stride
+        ``hs`` (0 = compact): both are plan-time and ride the fake, so the
+        kernels' row arithmetic folds them like the compact ``hh * dd`` / ``dd``
+        they replace."""
+        if not ts and not hs:
             return _fake(dtype, (1, tokens, hh, dd), r4)
-        return cute.runtime.make_fake_tensor(dtype, (1, tokens, hh, dd), (tokens * ts, ts, dd, 1), assumed_align=16)
+        hs = hs or dd
+        ts = ts or hh * hs
+        return cute.runtime.make_fake_tensor(dtype, (1, tokens, hh, dd), (tokens * ts, ts, hs, 1), assumed_align=16)
 
     if p.thd_varlen:
-        fq = _fake_rows(io_dtype, _sq, h, p.d_qk, 0 if pad_qk else ts_q)
-        fk = _fake_rows(io_dtype, _skv, h_kv, p.d_qk, 0 if pad_qk else ts_k)
-        fv = _fake_rows(io_dtype, _skv, h_kv, p.d_v, 0 if pad_v else ts_v)
-        fdo = _fake_rows(io_dtype, _sq, h, p.d_v, 0 if pad_v else ts_do)
+        fq = _fake_rows(io_dtype, _sq, h, p.d_qk, 0 if pad_qk else ts_q, 0 if pad_qk else hs_q)
+        fk = _fake_rows(io_dtype, _skv, h_kv, p.d_qk, 0 if pad_qk else ts_k, 0 if pad_qk else hs_k)
+        fv = _fake_rows(io_dtype, _skv, h_kv, p.d_v, 0 if pad_v else ts_v, 0 if pad_v else hs_v)
+        fdo = _fake_rows(io_dtype, _sq, h, p.d_v, 0 if pad_v else ts_do, 0 if pad_v else hs_do)
     else:
         fq = _fake(io_dtype, (_b, _sq, h, p.d_qk), r4)
         fk = _fake(io_dtype, (_b, _skv, h_kv, p.d_qk), r4)
@@ -1999,8 +2018,8 @@ def compile(  # noqa: A001 — the template contract's entry point
     if p.thd_varlen:
         dk_direct = not gqa and not pad_qk
         dv_direct = not gqa and not pad_v
-        fdk_ws = _fake_rows(io_dtype, _skv, h, p.d_qk, ts_dk if dk_direct else 0)
-        fdv_ws = _fake_rows(io_dtype, _skv, h, p.d_v, ts_dv if dv_direct else 0)
+        fdk_ws = _fake_rows(io_dtype, _skv, h, p.d_qk, ts_dk if dk_direct else 0, hs_dk if dk_direct else 0)
+        fdv_ws = _fake_rows(io_dtype, _skv, h, p.d_v, ts_dv if dv_direct else 0, hs_dv if dv_direct else 0)
     else:
         fdk_ws = _fake(io_dtype, (_b, _skv, h, p.d_qk), r4)
         fdv_ws = _fake(io_dtype, (_b, _skv, h, p.d_v), r4)
@@ -2083,7 +2102,7 @@ def compile(  # noqa: A001 — the template contract's entry point
         cache_key=_cache_key,
         symbol="frost_sdpa_bwd",
     )
-    fo = _fake_rows(io_dtype, _sq, h, p.d_v, 0 if pad_v else ts_o) if p.thd_varlen else _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
+    fo = _fake_rows(io_dtype, _sq, h, p.d_v, 0 if pad_v else ts_o, 0 if pad_v else hs_o) if p.thd_varlen else _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
     do_dot = _compile_cached(
         _do_dot_host, fo, fdo, fdt, p.d_v, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi", cache_key=_cache_key, symbol="frost_sdpa_bwd_1"
     )
@@ -2091,7 +2110,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     if p.thd_varlen:
         # Row-bounded, caller-width outputs at the caller's token strides (see
         # out_d_qk / out_d_v and thd_token_strides above).
-        fdq_out = _fake_rows(io_dtype, _sq, h, d_out_qk, ts_dq)
+        fdq_out = _fake_rows(io_dtype, _sq, h, d_out_qk, ts_dq, hs_dq)
         cast = _compile_cached(
             _cast_thd_host,
             fdq_acc,
@@ -2108,8 +2127,8 @@ def compile(  # noqa: A001 — the template contract's entry point
             cache_key=_cache_key,
             symbol="frost_sdpa_bwd_2",
         )
-        fdk_out = _fake_rows(io_dtype, _skv, h_kv, d_out_qk, ts_dk)
-        fdv_out = _fake_rows(io_dtype, _skv, h_kv, d_out_v, ts_dv)
+        fdk_out = _fake_rows(io_dtype, _skv, h_kv, d_out_qk, ts_dk, hs_dk)
+        fdv_out = _fake_rows(io_dtype, _skv, h_kv, d_out_v, ts_dv, hs_dv)
         reduce_k = _compile_cached(
             _dkv_reduce_thd_host,
             fdk_ws,
