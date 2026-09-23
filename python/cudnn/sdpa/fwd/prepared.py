@@ -1082,7 +1082,7 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
     combine = spec.combine
     if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
         raise ValueError("cudnn.sdpa: split workspace must be non-null and 16-byte aligned")
-    ragged_args = (None, None, None, (1, 1, 1), (0, 0))
+    ragged_args = ()  # the dense pointer ABI is unchanged; the ragged entry appends offsets / divisors / capacities
     if getattr(spec, "ragged", False):
         # Ragged-Q leg: the final O / Stats are the caller's PACKED buffers; the
         # combine places row ``offset[b] / div + q_row`` with batch coord 0, so only
@@ -1175,7 +1175,8 @@ def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: 
         raise ValueError(f"cudnn.sdpa: ragged Stats is (B, H, S_max[, 1]) or packed rank-2; got {tuple(lse.shape)}")
     from cudnn.sdpa.graph_analyzer import thd_stats_packing
 
-    if thd_stats_packing(stride_h, stride_s, spec.qh) is None:
+    packing = thd_stats_packing(stride_h, stride_s, spec.qh)
+    if packing is None:
         raise ValueError(f"cudnn.sdpa: ragged Stats must be packed token-major (stride_h == 1, stride_s == H) or head-major (stride_s == 1); got strides {st}")
     # Packed token capacity: the last token whose row still lies inside the span.
     head_span = (spec.qh - 1) * stride_h + 1
@@ -1185,9 +1186,11 @@ def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: 
         cap = 0
     else:
         cap = (lse.span - head_span) // stride_s + 1
-    if stride_s == 1:
+    if packing == "head_major":
         # Head-major (H, head_stride): heads are head_stride tokens apart, so the head
-        # stride bounds the tokens too (a shorter one would let heads overlap).
+        # stride bounds the tokens too (a shorter one would let heads overlap).  The
+        # CLASSIFIER decides the packing (Rule S1): at H == 1 a token-major (T, 1)
+        # buffer also has stride_s == 1 and must keep its full token capacity.
         cap = min(cap, stride_h)
         if spec.total_q is not None and stride_h < int(spec.total_q):
             raise ValueError(f"cudnn.sdpa: head-major ragged Stats head stride {stride_h} does not cover the declared packed Q total {spec.total_q}")

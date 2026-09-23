@@ -1119,7 +1119,7 @@ def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, 
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     plan = select_engine(g, ENGINE)
-    assert plan.knobs.cga == 1 and plan.knobs.split_kv >= 2 and plan.knobs.pack_gqa is True, plan.knobs
+    assert plan.knobs.cga == 1 and plan.knobs.split_kv >= 2 and plan.knobs.pack_gqa is (H != KH), plan.knobs  # MHA has no group to pack
     g.check_support()
     g.build_plans()
     compiled = g._compiled_plans[g._plan_index]
@@ -1181,6 +1181,17 @@ def test_graph_thd_paged_decode_short_outputs_are_bounded():
     import cudnn
 
     _thd_decode_graph(dtype=torch.bfloat16, offset_dtype=cudnn.data_type.INT64, hnd=True, q_lens=[1, 1, 1, 1, 1], kv_lens=[40, 300, 17, 129, 8], out_cap=2)
+
+
+@pytest.mark.L0
+def test_graph_thd_paged_decode_single_head_stats_every_row():
+    """H = KH = 1: a token-major (T, 1) Stats buffer has stride_s == 1 too, so the
+    capacity bound must follow the packing CLASSIFIER (token-major, T tokens), not
+    the head-major head-stride rule -- every valid Stats row is written (codex
+    review on #1191: the earlier `stride_s == 1` test capped it at one token)."""
+    import cudnn
+
+    _thd_decode_graph(dtype=torch.bfloat16, offset_dtype=cudnn.data_type.INT32, hnd=False, q_lens=[1, 1, 0, 1], kv_lens=[64, 300, 17, 129], H=1, KH=1)
 
 
 @pytest.mark.L0

@@ -280,11 +280,6 @@ def _host_ptr(
     n_splits: cutlass.Int32,
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    ragged_q_ptr: Optional[cute.Pointer],
-    ragged_o_ptr: Optional[cute.Pointer],
-    ragged_lse_ptr: Optional[cute.Pointer],
-    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
-    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -292,13 +287,57 @@ def _host_ptr(
 
     Partial workspaces are compact; final O and Stats use the actual caller
     strides. Widen before computing compact strides, including split batches.
-
-    ``ragged_*_ptr`` (the decode tile's ragged-Q leg; None-specialized off
-    otherwise): (B+1,) int32 ragged offsets of Q / O / Stats in elements with
-    their elements-per-token divisors; the final O / Stats are then the packed
-    outputs addressed at ``offset[b] / div + q_row`` with batch coord 0, so
-    ``o_strides[0]`` / ``lse_strides[0]`` are never stepped.
+    This is the dense placement's positional ABI (unchanged); the ragged-Q
+    decode leg compiles :func:`_host_ptr_ragged` instead.
     """
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _host_ptr_ragged(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """The ragged-Q decode leg's pointer ABI: :func:`_host_ptr` plus the (B+1,)
+    ragged offsets of Q / O / Stats (int32 or int64 elements), their
+    elements-per-token divisors and the (O, Stats) packed token capacities; the
+    final O / Stats are the packed outputs addressed at ``offset[b] / div +
+    q_row`` with batch coord 0 (``o_strides[0]`` / ``lse_strides[0]`` are never
+    stepped), bounded by the capacities."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    B = problem_size[0]
+    n_off = cutlass.Int32(B) + cutlass.Int32(1)
+    ragged_q = cute.make_tensor(ragged_q_ptr, cute.make_layout((n_off,), stride=(1,)))
+    ragged_o = cute.make_tensor(ragged_o_ptr, cute.make_layout((n_off,), stride=(1,)))
+    ragged_lse = None
+    if cutlass.const_expr(ragged_lse_ptr is not None):
+        ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, ragged_q, ragged_o, ragged_lse, ragged_divs, ragged_caps, stream
+    )
+
+
+@cute.jit
+def _ptr_operands(o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides):
+    """The compact split-major partial slabs and the strided final O / Stats views of a pointer entry."""
     B, H, SQ, D = problem_size
     b64, h64, sq64, d64 = cutlass.Int64(B), cutlass.Int64(H), cutlass.Int64(SQ), cutlass.Int64(D)
     split_batches = b64 * cutlass.Int64(n_splits)
@@ -308,16 +347,7 @@ def _host_ptr(
     lse_out = None
     if cutlass.const_expr(lse_out_ptr is not None):
         lse_out = cute.make_tensor(lse_out_ptr, cute.make_layout((B, H, SQ), stride=lse_strides))
-    ragged_q = ragged_o = ragged_lse = None
-    if cutlass.const_expr(ragged_q_ptr is not None):
-        n_off = cutlass.Int32(B) + cutlass.Int32(1)
-        ragged_q = cute.make_tensor(ragged_q_ptr, cute.make_layout((n_off,), stride=(1,)))
-        ragged_o = cute.make_tensor(ragged_o_ptr, cute.make_layout((n_off,), stride=(1,)))
-        if cutlass.const_expr(ragged_lse_ptr is not None):
-            ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
-    _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, ragged_q, ragged_o, ragged_lse, ragged_divs, ragged_caps, stream
-    )
+    return o_partial, lse_partial, o_out, lse_out
 
 
 @lru_cache(maxsize=None)
@@ -350,9 +380,7 @@ def compile_ptr(
     def P(dtype):
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=dtype.width // 8)
 
-    off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
-    return _compile_cached(
-        _host_ptr,
+    common = (
         P(_ELEM[dtype_partial]),
         P(cutlass.Float32),
         P(_ELEM[dtype_o]),
@@ -361,11 +389,18 @@ def compile_ptr(
         cutlass.Int32(0),
         (cutlass.Int64(0),) * 4,
         (cutlass.Int64(0),) * 3,
-        P(off_t) if ragged else None,
-        P(off_t) if ragged else None,
-        P(off_t) if (ragged and has_lse) else None,
-        (cutlass.Int32(1),) * 3,
-        (cutlass.Int32(0),) * 2,
+    )
+    if ragged:
+        # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
+        # dense entry's positional ABI stays exactly what its callers pass.
+        off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
+        entry, extra = _host_ptr_ragged, (P(off_t), P(off_t), P(off_t) if has_lse else None, (cutlass.Int32(1),) * 3, (cutlass.Int32(0),) * 2)
+    else:
+        entry, extra = _host_ptr, ()
+    return _compile_cached(
+        entry,
+        *common,
+        *extra,
         bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
