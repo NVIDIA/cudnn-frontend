@@ -588,6 +588,45 @@ def test_sdpa_fwd_paged_gqa_partial_pack_frost_L0(env_info, test_no, request, cu
     _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
 
 
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=48, rng_seed=6607857), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_thd_decode_frost_L0(env_info, test_no, request, cudnn_handle):
+    """FlashInfer's prefill-style paged graph at one token per sequence (nvbug
+    6607857): ragged Q/O/Stats (ragged offsets + per-batch lengths) over page
+    pools + block tables at S_q == 1, d128, GQA.  Every other ragged graph keeps
+    the cga2 prefill THD leg; this one must ride the d128 decode tile's ragged-Q
+    leg (TILE_CGA_M=1, PackGQA, KV split + combine placing the ragged rows) --
+    asserted through the routing tally and the serving template."""
+
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=32, with_high_probability=[4, 8]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=16, s_kv_max=8192, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=128, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}),
+        head_count=RandomChoice({(64, 8, 8) : 2, (32, 8, 8) : 2, (16, 2, 2) : 1, (8, 8, 8) : 1}),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=1),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1}),
+        # page sizes the FROST paged contract serves (a multiple of 8 dividing the 128-row KV tile)
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1, template="decode_d128_f16")
+
+
 PARTIAL_PACK_PINNED_S_Q = [1, 2]
 
 

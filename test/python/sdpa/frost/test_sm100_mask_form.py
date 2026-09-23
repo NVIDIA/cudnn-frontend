@@ -49,7 +49,7 @@ _KERNELS = {
     ("mxfp8", (256, 256)): ("prefill_d256_mxfp8.py", 3),
     ("mxfp8", (512, 512)): ("prefill_d512_mxfp8.py", 3),
     ("decode", (128, 128)): ("decode_d128_f16.py", 1),
-    ("bwd", (512, 512)): ("bprop_d512_f16_sm100.py", 1),
+    ("bwd", (512, 512)): ("bprop_d512_f16.py", 1),
 }
 _KERNEL_IDS = [f"{k}-d{f[0]}" if f[0] == f[1] else f"{k}-d{f[0]}x{f[1]}" for k, f in _KERNELS]
 
