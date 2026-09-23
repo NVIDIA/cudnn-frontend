@@ -24,6 +24,17 @@ namespace cudnn_frontend {
 
 namespace detail {
 
+// If the handle's stream is being captured, the CUDA graph being recorded will keep launching
+// this plan's kernels after the plan is gone. cuDNN releases runtime-compiled kernel code with
+// the plan, so give the graph a reference to the plan first.
+inline error_t
+retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
+    cudaStream_t stream = nullptr;
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+    _CUDNN_CHECK_CUDA_ERROR(plan->retain_on_capturing_stream(stream));
+    return {error_code_t::OK, ""};
+}
+
 inline error_t
 execute(cudnnHandle_t handle,
         ExecutionPlan* plan,
@@ -45,6 +56,7 @@ execute(cudnnHandle_t handle,
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
         variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -69,6 +81,7 @@ execute(cudnnHandle_t handle,
                                    "Failed to create variant pack's backend descriptor.");
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -95,6 +108,7 @@ execute(cudnnHandle_t handle,
                                    "Failed to create variant pack's backend descriptor.");
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -122,6 +136,7 @@ execute(cudnnHandle_t handle,
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
         variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
