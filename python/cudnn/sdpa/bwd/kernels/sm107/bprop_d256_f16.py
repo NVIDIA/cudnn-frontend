@@ -31,12 +31,16 @@ the S_acc WAR, so there is no ``s_acc_empty`` and no ``p_empty``.
 
 Warp roles (per CTA, 12 warps; ids from ``CFG``)::
 
-    0..3   softmax wg0  -- q[0:64]   of every q tile        (SOFTMAX_REGS = 232)
-    4..7   softmax wg1  -- q[64:128]                          (SOFTMAX_REGS = 232)
+    0..3   softmax wg0  -- q[0:64]   of every q tile        (SOFTMAX_REGS = 224)
+    4..7   softmax wg1  -- q[64:128]                          (SOFTMAX_REGS = 224)
     8      MMA          -- leader CTA: the 3-matmul stream; follower: quiet (alloc / dealloc only)
-    9      TMA-LDG      -- K, V once per kv block; Q, dO, dO_dv per q tile   (OTHER_REGS = 40)
+    9      TMA-LDG      -- K, V once per kv block; Q, dO, dO_dv per q tile   (OTHER_REGS = 56)
     10     TMA-STG      -- dS ring -> workspace per q tile; dV -> GMEM per kv block
     11     scheduler    -- CLC try_cancel protocol FUSED with the lse / do_dot SMEM prefetch
+
+    8 x 224 + 4 x 56 = 2016 = 12 warps x the 168-register ENTRY count: the pool ``setmaxnreg``
+    redistributes is the LAUNCH allocation (``USETMAXREG.*.CTAPOOL``), not the 2048-register file;
+    a split summing past it parks the last softmax INCREASE forever (``config_sm107.reg_entry_pool``).
 
 TMEM (576 columns, one ``tcgen05.alloc.cta_group::2`` per CTA, ``is_exclusive``)::
 

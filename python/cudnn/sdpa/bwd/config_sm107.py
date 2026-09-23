@@ -107,6 +107,7 @@ __all__ = [
     "TMEM_TOTAL_COLS",
     "TMEM_IS_EXCLUSIVE",
     "REG_BUDGET_PER_CTA",
+    "reg_entry_pool",
     "make_cfg_d256_bwd",
     "bpe",
     "buffer_elems",
@@ -167,6 +168,19 @@ TMEM_IS_EXCLUSIVE = True
 # Register file: 65 536 x 32-bit per SM, one CTA per SM, so the sum of the
 # per-warp counts over the LAUNCHED warps must fit 65536 / 32.
 REG_BUDGET_PER_CTA = 65536 // 32  # 2048
+
+
+def reg_entry_pool(total_warps: int) -> int:
+    """The per-CTA register POOL that ``setmaxnreg`` redistributes = what the LAUNCH allocated: ptxas's entry
+    count (65536 / 32 / total_warps, rounded DOWN to the 8-register allocation granule) times the warps -- NOT
+    the 65536 / 32 register file.  ``setmaxnreg.inc`` can only draw what the ``.dec`` warps released into that
+    pool, so a split whose per-warp sum exceeds it leaves the last INCREASE warp parked forever: a HANG at 100 %
+    SM utilization at EVERY shape, no fault, no message, and no SASS pin sees it (the split is present and the
+    counts look fine).  2026-09-23: the f16 body's 8 x 232 + 4 x 48 = 2048 > 12 x 168 = 2016 hung the very first
+    Rubin launch of the port (1 cluster, 1 tile); the pre-port 8 x 232 + 4 x 40 = 2016 balanced exactly, as
+    every CUTLASS warp-specialized split does.  Same rule as the "`.maxnreg 128` HANGS" dead end on d512."""
+    return (REG_BUDGET_PER_CTA // total_warps) // 8 * 8 * total_warps
+
 
 _SMEM_SLAB_ALIGN = 1024  # every slab is a 1024-B-aligned cutlass.Array
 
@@ -881,9 +895,11 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{cfg.MMA_REGS}/{cfg.TMALDG_REGS}/{cfg.TMASTG_REGS}/{cfg.SCHEDULER_REGS} -- a violation is wrong results or a crash with no diagnostic",
             ),
             (
-                reg_total <= REG_BUDGET_PER_CTA,
-                f"{flavor}: register budget {reg_total} over {REG_BUDGET_PER_CTA} (65536/32) across the {cfg.TOTAL_WARPS} launched warps "
-                f"({compute_warps} softmax @ {cfg.SOFTMAX_REGS} + 4 service @ {cfg.MMA_REGS})",
+                reg_total <= reg_entry_pool(cfg.TOTAL_WARPS),
+                f"{flavor}: register split {reg_total} over the {cfg.TOTAL_WARPS}-warp ENTRY pool {reg_entry_pool(cfg.TOTAL_WARPS)} "
+                f"(= {reg_entry_pool(cfg.TOTAL_WARPS) // cfg.TOTAL_WARPS}/thread at launch; the 65536/32 = {REG_BUDGET_PER_CTA} register file is NOT the bound) "
+                f"({compute_warps} softmax @ {cfg.SOFTMAX_REGS} + 4 service @ {cfg.MMA_REGS}) -- setmaxnreg.inc can only take what .dec released: "
+                f"the last softmax warp parks forever = a HANG at 100 % SM utilization at every shape, no fault, no message",
             ),
             (
                 all(r % 8 == 0 for r in (cfg.MMA_REGS, cfg.SOFTMAX_REGS, cfg.OTHER_REGS, cfg.CORRECTION_REGS)),
@@ -1173,14 +1189,16 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     dtype_ds = DTYPE_BF16 if is_fp8 else params.dtype_qkv
     mask_flags = _mask_flags_from(params)
     tile_k_hw = 64 if is_fp8 else 16
-    # Service-warp (MMA / TMA-LDG / TMA-STG / scheduler) register count.  The pre-port bodies ran at 40.
-    # f16: 48 -- at 40 the MMA warp is exactly at the allocation edge on sm_107a (2026-09-23: the bf16
-    # builds spill ONE 4-byte slot, the per-thread shared-storage base the sleeping wait-retry loops
-    # reload, 1 STL / 8-11 LDL; the fp16 build fits) and 48 clears it.  8 x 232 + 4 x 48 = 2048 is the
-    # whole register file (65536 / 32), which the budget predicate admits at equality; the entry
-    # allocation (168 / thread at .reqntid 384 = 64512) plus the four DEALLOCs frees exactly the
-    # 8 x 32 x 64 the softmax ALLOC needs.  fp8: keeps the pre-port 40 until its own port measures.
-    service_regs = 40 if is_fp8 else 48
+    # Register split.  The pool setmaxnreg redistributes is the LAUNCH allocation, 12 x 168 = 2016 (reg_entry_pool),
+    # so the per-warp sum must not exceed it -- 8 x 232 + 4 x 48 = 2048 (the whole register file) HUNG the first
+    # Rubin launch (2026-09-23): the four DEALLOCs release 4 x 120 = 480, the eight ALLOCs ask 8 x 64 = 512, the
+    # last softmax warp parks forever.  The pre-port 8 x 232 + 4 x 40 = 2016 balanced exactly but the bf16 f16 builds
+    # then spill ONE 4-byte slot in the 40-register MMA warp (the per-thread shared-storage base the sleeping
+    # wait-retry loops reload: 1 STL / 8-11 LDL on sm_107a; the fp16 build fits).  f16 therefore moves 8 registers
+    # from the softmax warps to the service warps: 8 x 224 + 4 x 56 = 2016, spill-free on both sides (SASS pin
+    # test_sm107_register_split_spills_and_drains_sass_pins).  fp8: the pre-port 232 / 40 until its own port measures.
+    softmax_regs = 232 if is_fp8 else 224
+    service_regs = 40 if is_fp8 else 56
     cfg = CfgBwdD256(
         TILE_M=128,
         TILE_N=128,
@@ -1220,7 +1238,7 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         SOFTMAX_WARPGROUPS=2,
         SOFTMAX_WG_WARPS=4,
         CORRECTION_WARPS=0,
-        SOFTMAX_REGS=232,
+        SOFTMAX_REGS=softmax_regs,
         CORRECTION_REGS=0,
         MMA_REGS=service_regs,
         TMALDG_REGS=service_regs,
