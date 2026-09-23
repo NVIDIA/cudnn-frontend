@@ -26,6 +26,7 @@ Skips cleanly otherwise.
 """
 
 import math
+import re
 from typing import NamedTuple, Optional
 
 import pytest
@@ -34,7 +35,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -2133,3 +2134,325 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
 
     with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
         _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="mxfp8")
+
+
+# ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the SASS per arch
+# Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
+# worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
+# these pins compile the kernel here for the target arch (`CUTE_DSL_ARCH` needs no matching device -- the module-level
+# `requires_blackwell` is what confines them to the Blackwell-line lanes) and count the instructions.  Two arms, one per
+# cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True: the split is ON) and
+# sm_103a with the cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate,
+# so the split is folded OUT and the kernel issues develop's 258 MUFU.EX2).  SKIPS when no nvdisasm on $CUDA_PATH/bin or
+# $PATH decodes the cubin; a compile failure is a FAIL.
+_SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
+    # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
+    # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
+    # come from the caller as the record api_dsl.template_params() builds for that device.
+    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
+    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **params_kw)
+    mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
+    # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
+    # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern (and the gate) rather
+    # than a literal.
+    n_bodies = 2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
+    print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    print("E2E_ENABLED", int(mod._E2E_ENABLED))
+    mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
+    """)
+
+# sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
+# trace-compiled cubin that is md5-identical to the one A/B'd on B200:  MUFU.EX2 258 -> 194 (2 x 97), FFMA2 130 -> 226
+# and FADD2 126 -> 222 (+3 each per emulated pair), FSETP 782 -> 19, FSEL 780 -> 270 (the 256 row_dead selects stay),
+# FMNMX3 124 -> 252, STL 3 / LDL 3 unchanged (none in the softmax loops), REG 128.  Slack 16 tolerates unrelated ptxas
+# drift and still catches one site: a fold site regressing to compare+select adds >= 384 FSETP, one emulated pair
+# falling back to MUFU adds 2 MUFU.EX2 and drops 3 FFMA2 (the MUFU count is pinned EXACTLY, derived from the module).
+# The cc 10.3 arm (sm_103a, fused_ldtm_stat=True, exp2_fma_split=False), MEASURED the same day: MUFU.EX2 258, FFMA2 130,
+# FADD2 126 (develop's counts: no emulated pair), FSETP 19 (the fold stays), FMNMX3 128 (the fused LDTM.STAT row-max
+# replaces the software tree), STL 3 / LDL 3.  The STL / LDL entries are the counts of THIS toolchain (cutlass-dsl 4.8.0.dev0 +
+# CUDA 13.5 ptxas) and are bounds, not literals (frost_test_utils.SPILL_TOLERANCE): the CI lane's 4.7.0 + CUDA 13.3 ptxas spills
+# differently at the same geometry on develop and on the branch alike.
+_SM100_SASS_SLACK = 16
+_SM100_D128_MXFP8_SASS_PINS = {"FFMA2": 226, "FADD2": 222, "FSETP": 19, "FMNMX3": 252, "STL": 3, "LDL": 3}
+_SM103_D128_MXFP8_SASS_PINS = {"FFMA2": 130, "FADD2": 126, "FSETP": 19, "STL": 3, "LDL": 3}
+# The per-cc TemplateParams fields exactly as api_dsl.template_params() derives them for an MXFP8 d128 build.
+_CC100_D128_MXFP8_PARAMS = {"fused_ldtm_stat": False, "exp2_fma_split": True}
+_CC103_D128_MXFP8_PARAMS = {"fused_ldtm_stat": True, "exp2_fma_split": False}
+
+
+_D128_MXFP8_SASS_PROBES: dict = {}  # (arch, params) -> SassProbe: one trace-compile per cubin per session, however many pins read it
+
+
+def _d128_mxfp8_sass_probe(tmp_path, arch: str, params: dict):
+    """Trace-compile the d128 MXFP8 kernel for ``arch`` with the per-cc ``params`` and return (stats, expect):
+    the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state).  Memoized per
+    (arch, params): the exp2-split pin and the dense credit-arrive pin below read the SAME sm_100a cubin, so it is compiled once;
+    the causal credit-arrive pin (``window_right=0`` in ``params``) is its own compile."""
+    key = (arch, tuple(sorted(params.items())))
+    if key not in _D128_MXFP8_SASS_PROBES:
+        _D128_MXFP8_SASS_PROBES[key] = run_sass_probe(tmp_path, probe_src=_SM100_D128_MXFP8_SASS_PROBE, arch=arch, params=params, tag="mxfp8_d128")
+    probe = _D128_MXFP8_SASS_PROBES[key]
+    return probe.stats, probe.expect
+
+
+@pytest.mark.L0
+def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
+    """cc 10.0 record (exp2_fma_split=True): 32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 ==
+    2 x 97 exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222
+    minus slack) and the Amax_O fold is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no
+    new spill (STL / LDL within SPILL_TOLERANCE of the pinned 3 / 3, this toolchain's count).  Compiled for sm_100a at the production geometry -- no
+    Blackwell device needed for the compile, only for this module's gate."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", _CC100_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
+    assert expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 194
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
+    for key in ("FFMA2", "FADD2", "FMNMX3"):
+        assert (
+            stats[key] >= _SM100_D128_MXFP8_SASS_PINS[key] - _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} < {_SM100_D128_MXFP8_SASS_PINS[key]} - {_SM100_SASS_SLACK}: {stats}"
+    assert (
+        stats["FSETP"] <= _SM100_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert_no_new_spills(stats, _SM100_D128_MXFP8_SASS_PINS)
+
+
+@pytest.mark.L0
+def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
+    """cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300):
+    the split is OFF because GB300 doubles the MUFU.EX2 rate to Rubin's 32/clk/SM, where the same split MEASURED
+    -9..-10 %.  The kernel must issue develop's MUFU.EX2 count exactly (2 x 129 = 258, derived from the module's
+    `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at or below develop's 130 / 126 plus
+    slack), while the arch-independent Amax_O fold stays FMNMX3 (FSETP <= 19 + 16) and nothing new spills (STL / LDL within SPILL_TOLERANCE of 3 / 3).
+    Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_103a", _CC103_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 258
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
+    for key in ("FFMA2", "FADD2"):
+        assert (
+            stats[key] <= _SM103_D128_MXFP8_SASS_PINS[key] + _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} > {_SM103_D128_MXFP8_SASS_PINS[key]} + {_SM100_SASS_SLACK}: emulation instructions with the gate off: {stats}"
+    assert (
+        stats["FSETP"] <= _SM103_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert_no_new_spills(stats, _SM103_D128_MXFP8_SASS_PINS)
+
+
+# ============================================================================ sm100 MXFP8: the scheduler credit arrive's lowering is a PER-SPECIALIZATION constant (PREDICATED_CREDIT_ARRIVE = CFG.MASK_FLAGS != 0)
+# PR #1169 turned `tile_dsl.scheduler.read_tile_id_arrive` into ONE predicated arrive per warp.  On B200 that re-lowering is a
+# kernel-wide ptxas reschedule whose sign is per kernel AND per mask specialization (A/B/A x3, CUPTI medians, O / Stats / Amax_O
+# bit-identical): +3.1 % on per-tensor fp8 d128, +1.3 % on bf16 d192x128, neutral on bf16 d128 and fp8 d192x128; on the two MXFP8
+# prefill kernels the BRANCH form wins the UNMASKED specialization (stacked on this branch's exp2 split: d128 +8.14 % at B=1
+# H=24/8 S=16K dense, d192x128 +6.84 % at H=128 S=8K dense) and LOSES the d128 kernel's causal one (-5.13 % at the same shape,
+# top_left, under the LPT plan the heuristics propose; -0.84 % with NATURAL pinned).  So those two spell
+# `PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0` once -- the same compile-time bits that select the dense vs the masked
+# softmax arms -- and pass it at EVERY `read_tile_id_arrive` site: the branch form on the dense specialization (its sm_100a cubin
+# is the pre-#1169 one), develop's predicated form wherever a mask arm (causal / SWA / padded) is compiled in (that cubin is
+# develop's).  No other sm100 kernel passes the kwarg.  Three tripwires: the source scan (this exact expression, defined once,
+# every site passes it, no literal, no leak into a sibling); the module VALUE under a dense, a causal and a padded
+# TemplateParams; and the sm_100a SASS of BOTH d128 specializations -- the branch form costs one BSSY reconverge and `cga_size`
+# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 / SYNCS.ARRIVE 55 on
+# the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
+# form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
+# like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
+_CREDIT_ARRIVE_SITES = {(128, 128): 7, (192, 128): 7}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the two softmax mask arms
+_SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
+_PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
+# The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
+_CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
+# d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
+_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
+    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 55}),  # the branch form; the predicated form read 8 / 48 here
+    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 56}),  # the predicated form (develop's cubin); the branch form read 15 / 63 here
+}
+
+
+def _code_lines(src):
+    """Source with whole-line comments dropped -- the prose in these modules quotes the spellings the scans look for."""
+    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _credit_arrive_sites(code):
+    """Every ``read_tile_id_arrive(`` call site of a kernel source, as its balanced argument text (black wraps some calls, so
+    the kwarg is not necessarily on the ``read_tile_id_arrive(`` line)."""
+    out = []
+    for m in re.finditer(r"\bread_tile_id_arrive\(", code):
+        i, depth = m.end(), 1
+        while depth:
+            depth += (code[i] == "(") - (code[i] == ")")
+            i += 1
+        out.append(code[m.end() : i - 1])
+    return out
+
+
+def _sm100_kernel_dir():
+    import pathlib
+
+    import cudnn.sdpa.fwd.kernels.sm100 as _sm100
+
+    return pathlib.Path(_sm100.__file__).parent
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flavor", sorted(_CREDIT_ARRIVE_SITES), ids=lambda f: f"d{f[0]}" if f[0] == f[1] else f"d{f[0]}x{f[1]}")
+def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
+    """The kernel's ``PREDICATED_CREDIT_ARRIVE`` is the mask-derived expression ``CFG.MASK_FLAGS != 0`` (the module's own value,
+    checked under a dense, a causal and a padded TemplateParams: False on the unmasked specialization, True wherever a mask arm
+    is compiled in), defined exactly once and never as a literal, no call site carries a ``predicated=True`` / ``False``
+    literal, and EVERY ``read_tile_id_arrive`` site -- the pinned count -- passes ``predicated=PREDICATED_CREDIT_ARRIVE``.  One
+    site dropping the kwarg re-lowers that warp role to the predicated arrive on the dense specialization and hands the
+    -5.5 % / -6.3 % back; a literal ``False`` re-lowers the causal specialization to the branch form and hands its -5.1 % back --
+    both with O / Stats / Amax_O bit-identical, so only this scan (and the SASS pins below) sees it."""
+    from cudnn.frost.tile_dsl.constants import MASK_NONE
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    cta_mma = max(supported_cgas_for(flavor, fp8=True, device_cc=(10, 0), pertensor=False))
+    mods = {}
+    for name, (extra, want) in _CREDIT_ARRIVE_SPECIALIZATIONS.items():
+        mod = _load_sm100_kernel_module(flavor, TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, **extra), fp8=True, pertensor=False, rubin=False)
+        assert (mod.CFG.MASK_FLAGS == MASK_NONE) == (
+            name == "dense"
+        ), f"{mod.__name__} [{name}]: MASK_FLAGS={mod.CFG.MASK_FLAGS}, the probe params select the wrong specialization"
+        assert (
+            isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool) and mod.PREDICATED_CREDIT_ARRIVE is want
+        ), f"{mod.__name__} [{name}, MASK_FLAGS={mod.CFG.MASK_FLAGS}]: PREDICATED_CREDIT_ARRIVE={mod.PREDICATED_CREDIT_ARRIVE!r}, want {want}"
+        mods[name] = mod
+    assert len({m.__file__ for m in mods.values()}) == 1, "the three specializations must come from one kernel file"
+    with open(mods["dense"].__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    defs = re.findall(r"^PREDICATED_CREDIT_ARRIVE\b.*$", code, re.M)
+    assert defs == [
+        _PREDICATED_CREDIT_ARRIVE_DEF
+    ], f"{mods['dense'].__name__}: PREDICATED_CREDIT_ARRIVE must be defined exactly once as `{_PREDICATED_CREDIT_ARRIVE_DEF}`, found {defs}"
+    assert not re.search(
+        r"predicated=(?:True|False)\b", code
+    ), f"{mods['dense'].__name__}: a predicated= literal at a call site bypasses PREDICATED_CREDIT_ARRIVE"
+    sites = _credit_arrive_sites(code)
+    assert (
+        len(sites) == _CREDIT_ARRIVE_SITES[flavor]
+    ), f"{mods['dense'].__name__}: {len(sites)} read_tile_id_arrive sites, the pin says {_CREDIT_ARRIVE_SITES[flavor]}"
+    bare = [args for args in sites if "predicated=PREDICATED_CREDIT_ARRIVE" not in args]
+    assert not bare, f"{mods['dense'].__name__}: {len(bare)} read_tile_id_arrive site(s) take the default (predicated) lowering: {bare}"
+    assert code.count("predicated=") == len(sites), f"{mods['dense'].__name__}: a predicated= outside a read_tile_id_arrive call"
+
+
+@pytest.mark.L0
+def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
+    """Every OTHER sm100 kernel takes ``read_tile_id_arrive``'s default (the predicated arrive: +3.1 % on fp8 d128, +1.3 % on
+    bf16 d192x128, neutral elsewhere): no ``predicated=`` kwarg and no ``PREDICATED_CREDIT_ARRIVE`` constant anywhere else under
+    ``kernels/sm100/``.  Widening the opt-out to a third kernel is a MEASURED, per-specialization decision that adds its file to
+    ``_SM100_MXFP8_OPTED_OUT`` (and a row to ``_CREDIT_ARRIVE_SITES``), never a copy-paste."""
+    kdir = _sm100_kernel_dir()
+    files = sorted(p.name for p in kdir.glob("*.py") if p.name != "__init__.py")
+    assert set(_SM100_MXFP8_OPTED_OUT) <= set(files), f"opted-out kernels missing from {kdir}: {files}"
+    leaked = {}
+    for name in files:
+        if name in _SM100_MXFP8_OPTED_OUT:
+            continue
+        code = _code_lines((kdir / name).read_text(encoding="utf-8"))
+        hits = [tok for tok in ("predicated=", "PREDICATED_CREDIT_ARRIVE") if tok in code]
+        if hits:
+            leaked[name] = hits
+    assert not leaked, f"sm100 kernels other than the two MXFP8 prefill kernels touch the credit-arrive lowering: {leaked}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
+def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
+    """On the sm_100a cubin at the production geometry the 7 credit arrives lower to the form the specialization selects: the
+    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
+    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
+    form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
+    (derived from the module) and 2 x 194 == 388 on the causal one, whose warpgroups each trace the softmax body twice (the
+    unmasked segment's and the masked one's, shared by the left- and right-masked segments).  The dense case reads the SAME
+    cubin as test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins (memoized probe); the causal one is a second compile."""
+    extra, pins = _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS[specialization]
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", {**_CC100_D128_MXFP8_PARAMS, **extra})
+    for key, want in pins.items():
+        assert (
+            stats[key] == want
+        ), f"[{specialization}] {key} {stats[key]} != {want}: a credit-arrive site lowered to the other form (or PREDICATED_CREDIT_ARRIVE no longer follows CFG.MASK_FLAGS): {stats}"
+    bodies = 1 if specialization == "dense" else 2
+    assert (
+        stats["MUFU_EX2"] == bodies * expect["EXPECT_MUFU_EX2"] == bodies * 194
+    ), f"[{specialization}] MUFU.EX2 {stats['MUFU_EX2']}: the credit-arrive lowering must not touch the exp2 split"
+
+
+# ============================================================================ sm100 d128 MXFP8: Stats is the exact fp32 log-sum-exp (fp64 reference), with the exp2 split in place
+@pytest.mark.L0
+@pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 106),
+    reason="the sm100 MXFP8 d128 kernel serves cc 10.0-10.6 (the Rubin sibling has its own pin in test_sdpa_fwd_dsl_sm107.py)",
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
+    """B=1 H=24/8 S=2048 (the split's tuning shape at a reference-friendly length): (1) the PUBLISHED Stats is within
+    1e-4 of the fp64 log-sum-exp of the DEQUANTIZED inputs -- the exp2 emulation's 8.8e-5 per-element error averages
+    to ~6e-6 on a dense row and ~2e-5 on a causal one (MEASURED on B200: 6.06e-6 / 1.90e-5; the all-MUFU kernel
+    1.6e-6, the cuDNN backend kernel 6.05e-6 / 3.07e-5); (2) O is finite and sentinel-free; (3) O is bit-identical
+    with and without Stats (sdpa-invariants s4).  This probe pins the LSE; O ACCURACY is covered by the suite's
+    kernel-numerics cases (the ``-k d128`` masks / output-dtype / GQA cases against the mxfp8 reference), not here:
+    the kernel's O error is set by the e4m3 quantization of P (max |O - O_fp64| 1.68e-3 dense / 2.63e-2 causal at this
+    shape, identical to four digits with and without the exp2 split), an order of magnitude above the bf16 output
+    rounding of the fp64 reference, so a bf16-floor bound on O would be miscalibrated by construction.  The O error
+    against the fp64 reference is still PRINTED as a diagnostic."""
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
+
+    torch.manual_seed(0)
+    b, hq, hkv, s, d = 1, 24, 8, 2048, 128
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+
+    def mx(x, h, columnwise):
+        data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+        # sf_*_ref are the per-element fp32 DEQUANT SCALES [b, h, s, d]; fp64 so the reference logits are exact
+        # (fp32 matmul runs in TF32 in the DLFW containers, a 1e-4-class LSE error on a causal row with few columns).
+        deq = data.double().reshape(b, h, s, d) * sf.double().reshape(b, h, s, d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
+
+    q8, q_deq, sfq = mx(qf, hq, False)
+    k8, k_deq, sfk = mx(kf, hkv, False)
+    v8, v_deq, sfv = mx(vf, hkv, True)
+    (cga,) = supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, s, hq, d), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+        api = SdpaFwdDslSm100(
+            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=cga
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested"
+    rep = hq // hkv
+    logits = q_deq @ k_deq.repeat_interleave(rep, 1).transpose(-1, -2) * d**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits, dim=-1)
+    o_ref = torch.softmax(logits, dim=-1) @ v_deq.repeat_interleave(rep, 1)
+    o = outs[True]
+    assert not (o.float() == 1.5e30).any(), "sentinel survived: O rows never written"
+    assert torch.isfinite(o.float()).all() and torch.isfinite(lse).all(), "non-finite O / unwritten LSE rows"
+    bf16_floor = (o_ref - o_ref.to(torch.bfloat16).double()).abs().max().item()
+    d_o = (o.double() - o_ref).abs().max().item()  # diagnostic only (docstring): the e4m3 P quantization sets it, not the split
+    err = (lse.double() - lse_ref).abs()
+    print(
+        f"\nsm100 d128 mxfp8 {'causal' if causal else 'dense'}: max|dLSE| {err.max().item():.3e} rms {err.pow(2).mean().sqrt().item():.3e}, max|dO| {d_o:.3e} (bf16 floor {bf16_floor:.3e})"
+    )
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"

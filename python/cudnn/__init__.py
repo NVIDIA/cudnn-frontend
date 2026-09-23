@@ -144,7 +144,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.30.0"
+__version__ = "1.31.0"
 
 
 def _tensor(
@@ -342,6 +342,8 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "pack_forward_weights",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
+    "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
     "rope_qdq_inplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
     "EngramGateSavedForward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
@@ -354,6 +356,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "TailRoPEForward": (".rope", "TailRoPEForward"),
+    "tail_rope": (".rope", "tail_rope"),
     "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
     "vision_rope_backward_wrapper": (".rope", "vision_rope_backward_wrapper"),
     "RopeQDQInplace": (".rope", "RopeQDQInplace"),
@@ -433,6 +437,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     ),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
+    "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
     "gemm_srelu_wrapper_sm100": (

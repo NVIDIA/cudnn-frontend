@@ -322,6 +322,12 @@ cudnn.flex_attention.MaskPlan.metadata
 cudnn.flex_attention.create_mask_plan
 cudnn.flex_attention.flex_attn_func
 cudnn.gemm
+cudnn.gemm.MhcProjectionBackward
+cudnn.gemm.MhcProjectionBackward.check_support
+cudnn.gemm.MhcProjectionBackward.compile
+cudnn.gemm.MhcProjectionBackward.execute
+cudnn.gemm.MhcProjectionBackward.scratch_workspace_bytes
+cudnn.gemm.mhc_projection_backward
 cudnn.gemm.moe_grouped_matmul
 cudnn.gemm.ops
 cudnn.gemm.ops.moe_grouped_matmul

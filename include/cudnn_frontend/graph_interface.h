@@ -706,6 +706,8 @@ class Graph : public ICudnn, public INode {
                                                            plans.execution_plans[candidate]->get_raw_desc(),
                                                            variant_pack_descriptor.get_ptr(),
                                                            backend_cuda_graph));
+        // The updated node may now launch a plan the graph does not hold a reference to yet.
+        _CUDNN_CHECK_CUDA_ERROR(plans.execution_plans[candidate]->retain_on_cuda_graph(cudnn_cuda_graph));
 
         // There should be nothing after the backend graph
         size_t num_dependent_nodes;
@@ -846,25 +848,30 @@ class Graph : public ICudnn, public INode {
 
         // Finally get the backend cuda graph.
         cudaGraph_t backend_cuda_graph;
-        // Initialize the cudnn cuda graph.
-        // The responsibility to destroy is on the user.
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_create(&backend_cuda_graph, 0));
+        // The backend graph is temporary (it gets cloned into cudnn_cuda_graph below); destroy it
+        // on every early return. The success path destroys it explicitly, with error checking.
+        std::unique_ptr<std::remove_pointer<cudaGraph_t>::type, void (*)(cudaGraph_t)> backend_cuda_graph_guard(
+            backend_cuda_graph, [](cudaGraph_t graph) { (void)detail::cuda_graph_destroy(graph); });
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
                                                              plans.execution_plans[candidate]->get_raw_desc(),
                                                              variant_pack_descriptor.get_ptr(),
                                                              backend_cuda_graph));
+        // The graph keeps launching this plan's kernels after the plan is gone; cuDNN releases
+        // runtime-compiled kernel code with the plan. Give the graph a reference to the plan.
+        _CUDNN_CHECK_CUDA_ERROR(plans.execution_plans[candidate]->retain_on_cuda_graph(cudnn_cuda_graph));
 
         // Clone BE graph into a graph_node
         // This same call also places the newly created into FE's graph
         // TODO: BE graph is at the end, so put in appropriate dependencies
         cudaGraphNode_t backend_cuda_graph_node;
-        detail::cuda_graph_add_child_graph_node(
-            &backend_cuda_graph_node, cudnn_cuda_graph, &last_node, last_node != nullptr, backend_cuda_graph);
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_child_graph_node(
+            &backend_cuda_graph_node, cudnn_cuda_graph, &last_node, last_node != nullptr, backend_cuda_graph));
 
         // Destroy the BE graph as it now has been cloned into a node
         // It was initialized by internals of backend, but the responsibility to destroy it is on FE.
-        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph_guard.release()));
 
         return {error_code_t::OK, ""};
     }
