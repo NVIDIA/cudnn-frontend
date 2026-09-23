@@ -4,30 +4,22 @@
 """
 GLM-5.3 sparse attention (DSA) benchmark configuration.
 
-GLM-5.3 (same architecture as GLM-5.2) runs DeepSeek-V3.2-style DSA on the
-MLA latent: the absorbed query attends a shared 576-wide record — the 512 KV
-latent plus 64 RoPE channels — and the 512 latent channels are read back as
-V. The indexer (32 heads x 128) selects 2048 tokens per query; there is no
-sliding-window fold and no sink, so the whole logical K is indexer-selected
-and the plain LSE is the indexer's training signal (``indexer_topk = 0``).
+GLM-5.3 (GLM-5.2's architecture) runs V3.2-style DSA on the MLA latent: the
+absorbed query attends a shared 576-wide record (512 KV latent + 64 RoPE)
+and reads the 512 latent channels back as V; token top-2048 with no window
+fold and no sink, so the plain LSE is the indexer's training signal and
+``indexer_topk = 0``. GLM-5.3-Flash's sparse layers are NoPE MLA, so the
+record is 512 wide; its indexer selects 512 four-token pools = 2048 raw
+tokens (the incomplete tail pool, at most 3 tokens, is omitted). 64 heads
+for both.
 
-GLM-5.3-Flash is the hybrid sibling: 34 KDA layers and 11 sparse NoPE MLA
-layers whose latent has no RoPE slice (``qk_rope_head_dim = 0``), so the
-record is 512 wide. Its indexer scores 4-token pools (``index_kpool = 4``)
-and selects 512 of them = 2048 raw tokens, always adding the incomplete tail
-pool (at most 3 tokens, left out of the preset's round 2048).
-
-Heads: 64 for both, from the official HF configs (zai-org/GLM-5.3,
-zai-org/GLM-5.3-Flash). As in ``deepseek_v4``, the sweep sizes the KV pool
-as ``s_kv == s_q`` and every query gathers its full top-k as independent
-unique random rows (the per-token upper bound). The 4-row pool locality of
-GLM-5.3-Flash's selection is not modeled: its 2048 rows are a random-row
-proxy for the pooled gather.
+As in ``deepseek_v4``, ``s_kv == s_q`` and every query gathers its full top-k
+as independent unique random rows, the per-token upper bound; the 4-row pool
+locality of GLM-5.3-Flash is not modeled.
 
 Usage:
     python -m benchmark.dsa.runner --config glm53
     python -m benchmark.dsa.runner --config glm53 --dry-run
-    python -m benchmark.dsa.runner --config glm53 --filter flash --pass bwd
 """
 
 from ..config_types import DsaBenchmarkConfig, ModelPreset
@@ -45,9 +37,9 @@ GLM53 = ModelPreset(
 GLM53_FLASH = ModelPreset(
     name="glm53_flash",
     num_q_heads=64,
-    head_dim_qk=512,  # NoPE latent, no RoPE slice
+    head_dim_qk=512,  # NoPE latent
     head_dim_vo=512,
-    topk=2048,  # 512 pools x 4 tokens, gathered as 2048 random rows; forced tail (<= 3 tokens) omitted
+    topk=2048,  # 512 pools x 4 raw tokens
     indexer_topk=0,
     has_sink=False,
 )

@@ -4,24 +4,17 @@
 """
 DeepSeek-V4.1 sparse attention (DSA) benchmark configuration.
 
-V4.1-Flash keeps V4's sparse core — flat MQA over one shared K=V record of
-head_dim=512 with RoPE in place on the trailing 64 channels, a 128-token
-sliding window and a per-head sink — and changes what the indexer selects
-from: the pool is 2x-compressed (layers 2-19) or uncompressed raw tokens
-(layers 20-39), the KV record and the index picks are produced by a few
-source layers and reused by the layers after them, and a candidate set of
-2048 blocks of 8 tokens narrows the later layers' top-512 selection
-(``compress_ratios``, ``kv_source_layer_ids``, ``index_source_layer_ids``,
-``candidate_topk_blocks`` in the official HF config). None of that changes
-the per-query gather the kernel performs — 512 indexer-selected rows plus
-the 128-token window — so the preset is V4-Flash's: logical K = 640 with
-``indexer_topk = 512``, 64 heads. Only a Flash checkpoint is published for
-V4.1; add a Pro preset when one appears.
+V4.1-Flash keeps V4's sparse core: flat MQA over a shared K=V record of
+head_dim=512, 512 indexer-selected entries plus a 128-token window folded
+into the index list, and a per-head sink. Its changes — 2x-compressed and
+uncompressed pools, KV and index picks shared across layers — alter what
+the indexer selects from, not the per-query gather, so the preset is
+V4-Flash's (K = 640, indexer_topk = 512, 64 heads). Only a Flash
+checkpoint is published.
 
 Usage:
     python -m benchmark.dsa.runner --config deepseek_v41
     python -m benchmark.dsa.runner --config deepseek_v41 --dry-run
-    python -m benchmark.dsa.runner --config deepseek_v41 --pass bwd
 """
 
 from ..config_types import DsaBenchmarkConfig, ModelPreset
