@@ -408,6 +408,14 @@ def test_shape_inference():
     assert residual.checkpoints.dtype == jnp.bfloat16
 
 
+def test_helper_types_not_exported():
+    import cudnn.jax
+
+    for name in ("KdaResidual", "KdaGradients"):
+        assert name not in cudnn.jax.__all__
+        assert not hasattr(cudnn.jax, name)
+
+
 def test_bad_metadata():
     args, cu = inputs()
     with pytest.raises(ValueError, match="beta must have shape"):

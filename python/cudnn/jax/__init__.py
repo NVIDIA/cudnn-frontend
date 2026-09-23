@@ -41,8 +41,6 @@ __all__ = [
     "kimi_delta_attention",
     "kimi_delta_attention_fwd",
     "kimi_delta_attention_bwd",
-    "KdaResidual",
-    "KdaGradients",
 ]
 
 
@@ -62,13 +60,7 @@ def __getattr__(name):
         value = getattr(module, name)
         globals()[name] = value
         return value
-    if name in (
-        "kimi_delta_attention",
-        "kimi_delta_attention_fwd",
-        "kimi_delta_attention_bwd",
-        "KdaResidual",
-        "KdaGradients",
-    ):
+    if name in ("kimi_delta_attention", "kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
         from cudnn.linear_attention import jax_api as kda
 
         value = getattr(kda, name)
