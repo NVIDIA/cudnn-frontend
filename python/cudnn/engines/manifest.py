@@ -140,6 +140,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
     "SDPA_BWD": "frost_sdpa_bwd",
+    "SDPA_FP8_BWD": "frost_sdpa_bwd",
     "SDPA_MXFP8_BWD": "frost_sdpa_bwd",
     "GDN": "gdn",
     "GDN_BWD": "gdn",
