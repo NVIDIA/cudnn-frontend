@@ -4252,6 +4252,16 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("MoE grouped matmul")
     if chain.is_multi_gemm:
         reasons.append("multi-GEMM")
+    if chain.has_block_scale:
+        # The block-scale mainloop faults under split-K on silicon
+        # (cudaErrorIllegalInstruction / cudaErrorIllegalAddress): roughly a
+        # third of the swept (layer, config) population crashes -- across both
+        # cta_groups, every swept slice count and both MMA-K widths, and no
+        # swept feature separates the safe configs from the faulting ones.
+        # Dense split-K never faulted in the same sweep. A pick that cannot
+        # tell whether its kernel faults is worse than a slower one that
+        # works, so decline split-K here until the kernel is fixed.
+        reasons.append("block-scale mainloop (device faults across the split-K config family)")
     if chain.quants:
         reasons.append("block-scale quantize")
     if chain.output_dtype == "fp4_e2m1":
