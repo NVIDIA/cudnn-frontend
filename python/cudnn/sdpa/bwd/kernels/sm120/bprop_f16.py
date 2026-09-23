@@ -49,7 +49,7 @@ fused chain and orders the dq_accum adds per q-tile with turn counters.
 The ``det_2kernel`` split instead streams unscaled dS (io dtype) to a
 ``[B, H_q, S_q, S_kv]`` workspace, drops the main kernel's dQ section
 (GEMM 4, scatter, relay), and computes dQ = attn_scale * dS @ K in a
-separate ``dq2k`` kernel (``bprop_chain_f16_sm120.py``) that replaces
+separate ``dq2k`` kernel (``bprop_chain_f16.py``) that replaces
 ``cvt``. The adapter falls back to the relay when the dS workspace does
 not fit in device memory.
 """
@@ -71,7 +71,7 @@ from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.sdpa.bwd.config_sm120 import DEFAULT_TILES, ROW_ROUND, SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
-from cudnn.sdpa.bwd.kernels._common_sm120 import (
+from cudnn.sdpa.bwd.kernels.sm120._common import (
     _COPY_ELEMS,
     _LOG2E,
     ceil_div,
@@ -83,7 +83,7 @@ from cudnn.sdpa.bwd.kernels._common_sm120 import (
     pack_half2,
     tile_ptr,
 )
-from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import (
+from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import (
     SM120DetDqGemmKernel,
     convert_dbias_host,
     convert_dq_host,
