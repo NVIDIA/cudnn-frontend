@@ -53,7 +53,7 @@ class _HcaPlan:
         if gt == 32:
             local_reduction = (reduce_local_rows, (4224 * d // 2048, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 2048), dict(num_warps=4))
         else:
-            local_reduction = (reduce_local_keys, (4224 * 4, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 128, False), dict(num_warps=4))
+            local_reduction = (reduce_local_keys, (4224 * 4, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 128), dict(num_warps=4))
         return (
             preparation,
             (pack_rank_major_keys, (k * d // 1024, g, 1), ("kv", "packed_keys"), (k, nc, gt, 1024, w.rank * 4096), {}),

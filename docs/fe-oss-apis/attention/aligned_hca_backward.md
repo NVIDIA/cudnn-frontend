@@ -156,8 +156,11 @@ reuse the same scratch for overlapping calls on different streams.
 From `test/python` in a GB300 environment:
 
 ```bash
-pytest fe_api/dsa/test_DSA_aligned_hca_backward.py -m 'L0 or L1'
+pytest fe_api/dsa/test_DSA_aligned_hca_backward.py \
+    fe_api/dsa/test_DSA_aligned_hca_backward_boundaries.py -m 'L0 or L1'
 ```
 
 Coverage includes reference gradients, changed-input graph replay, explicit
 streams, workspace ownership, support validation and allocation/JIT guards.
+Boundary cases cover positive-infinite sinks, unused KV rows with nonfinite
+values, and very negative LSE with large dO.

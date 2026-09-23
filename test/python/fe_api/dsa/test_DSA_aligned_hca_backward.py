@@ -83,7 +83,7 @@ def test_workspace_has_no_paired_input_buffer():
         assert schedule[3][0] is (reduce_local_rows if layout.group_tokens == 32 else reduce_local_keys)
         assert schedule[3][1] == ((1056 if layout.group_tokens == 32 else 16896), 1, 1)
         assert schedule[3][2] == ("dk", "dv", "dkv")
-        assert schedule[3][3] == (layout.keys, layout.groups, 512, layout.group_tokens, *((2048,) if layout.group_tokens == 32 else (128, False)))
+        assert schedule[3][3] == (layout.keys, layout.groups, 512, layout.group_tokens, *((2048,) if layout.group_tokens == 32 else (128,)))
 
 
 @pytest.mark.L0

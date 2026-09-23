@@ -342,6 +342,8 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "pack_forward_weights",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "AlignedHCABackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "aligned_hca_backward_wrapper": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
