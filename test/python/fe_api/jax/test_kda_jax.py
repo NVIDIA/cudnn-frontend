@@ -420,9 +420,9 @@ def test_bad_metadata():
     args, cu = inputs()
     with pytest.raises(ValueError, match="beta must have shape"):
         kda(*args[:4], jnp.ones((35,), jnp.float32), cu)
-    with pytest.raises(ValueError, match="cu_seqlens must be int32"):
+    with pytest.raises(NotImplementedError, match="cu_seqlens.*int32"):
         kda(*args[:5], cu.astype(jnp.float32))
-    with pytest.raises(ValueError, match="matching float16 or bfloat16"):
+    with pytest.raises(NotImplementedError, match="q/k/v dtypes must match"):
         kda(args[0].astype(jnp.float32), *args[1:5], cu)
     _, _, residual = fwd(*args[:5], cu)
     with pytest.raises(ValueError, match="doutput"):

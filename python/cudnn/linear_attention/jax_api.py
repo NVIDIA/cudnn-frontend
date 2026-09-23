@@ -23,8 +23,8 @@ GRADIENT_NAMES = ("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log",
 class KdaConfig:
     output_final_state: bool = False
     scale: float | None = None
-    use_qk_l2norm_in_kernel: bool = False
-    use_beta_sigmoid_in_kernel: bool = False
+    use_qk_l2norm: bool = False
+    use_beta_sigmoid: bool = False
     allow_neg_eigval: bool = False
     safe_gate: bool = False
     gate_lower_bound: float | None = None
@@ -67,10 +67,8 @@ def validate_inputs(primals, config):
         raise ValueError("KDA requires positive token, head, and sequence counts")
     if total >= 2**31 or batch * ho >= 2**31:
         raise ValueError("KDA token and scheduler counts must fit signed int32")
-    if dk not in (64, 128) or dv not in (64, 128):
-        raise NotImplementedError("JAX KDA supports head dimensions 64 and 128")
-    if ho % min(hq, hv) or ho // min(hq, hv) not in (1, 2, 4, 8) or k.shape[1] not in (hq, hv):
-        raise NotImplementedError("JAX KDA supports head ratios 1/2/4/8 with HK=HQ or HV")
+    if ho % min(hq, hv) or ho // min(hq, hv) not in (1, 2, 4, 8):
+        raise NotImplementedError("JAX KDA supports head ratios 1/2/4/8")
     expected = (
         (k, (total, k.shape[1], dk), "k"),
         (v, (total, hv, dv), "v"),
@@ -83,21 +81,9 @@ def validate_inputs(primals, config):
     for value, shape, name in expected:
         if value is not None and value.shape != shape:
             raise ValueError(f"{name} must have shape {shape}; got {value.shape}")
-    if q.dtype not in (jnp.float16, jnp.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
-        raise ValueError("q/k/v must have matching float16 or bfloat16 dtype")
-    if cu.dtype not in (jnp.int32, jnp.int64):
-        raise ValueError("cu_seqlens must be int32 or int64")
     cadence = config.checkpoint_every_n_tokens
-    if not isinstance(cadence, (int, np.integer)) or cadence < 0 or cadence >= 2**31 or cadence % 16:
-        raise ValueError("checkpoint_every_n_tokens must be 0 or a positive multiple of 16 fitting signed int32")
-    if config.gate_domain not in ("log", "linear"):
-        raise ValueError("gate_domain must be 'log' or 'linear'")
-    if config.gate_domain == "linear" and config.safe_gate:
-        raise ValueError("gate_domain='linear' cannot combine with safe_gate=True")
-    if config.allow_neg_eigval and not config.use_beta_sigmoid_in_kernel:
-        raise ValueError("allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    if not config.safe_gate and (a is not None or dt is not None or config.gate_lower_bound is not None):
-        raise ValueError("gate parameters require safe_gate=True")
+    if not isinstance(cadence, (int, np.integer)) or not -(2**31) <= cadence < 2**31:
+        raise ValueError("checkpoint_every_n_tokens must be an integer fitting signed int32")
     if config.gate_lower_bound is not None and not -5 <= config.gate_lower_bound < 0:
         raise ValueError("gate_lower_bound must be in [-5, 0)")
     if config.scale is not None and not math.isfinite(config.scale):
@@ -107,7 +93,7 @@ def validate_inputs(primals, config):
 def target_device():
     devices = jax.local_devices(backend="gpu")
     if len(devices) != 1:
-        raise NotImplementedError("Draft JAX KDA requires one visible GPU; set CUDA_VISIBLE_DEVICES")
+        raise NotImplementedError("JAX KDA requires one visible GPU; set CUDA_VISIBLE_DEVICES")
     device = devices[0].local_hardware_id
     from cudnn.frost.device import compute_capability
 
@@ -123,7 +109,6 @@ def build_call(metadata, config, device):
     from cudnn.frost.device import build_device
     from .frost.kda_engine import KdaFrostEngine, build_kda
     from .frost.kda_jax import make_launcher
-    from cutlass.jax import TensorSpec
 
     data_types = dict(
         float16=cudnn.data_type.HALF,
@@ -139,8 +124,6 @@ def build_call(metadata, config, device):
             raise ValueError(f"unsupported KDA dtype: {dtype}")
         tensors[name] = graph.tensor(shape, data_type=data_types[dtype], name=name)
     attributes = asdict(config)
-    attributes["use_qk_l2norm"] = attributes.pop("use_qk_l2norm_in_kernel")
-    attributes["use_beta_sigmoid"] = attributes.pop("use_beta_sigmoid_in_kernel")
     if "dO" in tensors:
         attributes.pop("output_final_state")
         attributes["checkpoint_every_n_tokens"] = config.checkpoint_every_n_tokens or None
@@ -165,14 +148,9 @@ def build_call(metadata, config, device):
     workspace = jax.ShapeDtypeStruct((plan.workspace_bytes(),), jnp.uint8)
     initialized = {i: zeros_init for i, name in enumerate(output_names) if name == "state_checkpoints"}
 
-    def specs(shapes):
-        return tuple(TensorSpec(layout=tuple(reversed(range(len(s))))) for s in shapes)
-
     invoke = call(
         make_launcher(plan, input_names + output_names),
         output_shape_dtype=shapes + (workspace,),
-        input_spec=specs([t.dim for t in node.inputs.values()]),
-        output_spec=specs([s.shape for s in shapes + (workspace,)]),
         initialized_outputs=initialized,
         use_static_tensors=True,
     )
@@ -217,16 +195,16 @@ def kimi_delta_attention_fwd(
 ):
     """Return ``(output, final_state_or_None, residual)``; see the JAX KDA guide."""
     config = KdaConfig(
-        output_final_state,
-        scale,
-        use_qk_l2norm_in_kernel,
-        use_beta_sigmoid_in_kernel,
-        allow_neg_eigval,
-        safe_gate,
-        gate_lower_bound,
-        batch_invariant,
-        checkpoint_every_n_tokens,
-        gate_domain,
+        output_final_state=output_final_state,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_lower_bound=gate_lower_bound,
+        batch_invariant=batch_invariant,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        gate_domain=gate_domain,
     )
     return forward((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)
 
@@ -293,18 +271,18 @@ def kimi_delta_attention(
     Supports jit and first-order reverse-mode AD. cu_seqlens must start at zero,
     end at T, and be nondecreasing; these device values are not read on the host.
     Options are static under jit. Forward AD, higher derivatives, vmap and
-    distributed execution are not supported by this draft.
+    distributed execution are not supported.
     """
     config = KdaConfig(
-        output_final_state,
-        scale,
-        use_qk_l2norm_in_kernel,
-        use_beta_sigmoid_in_kernel,
-        allow_neg_eigval,
-        safe_gate,
-        gate_lower_bound,
-        batch_invariant,
-        checkpoint_every_n_tokens,
-        gate_domain,
+        output_final_state=output_final_state,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_lower_bound=gate_lower_bound,
+        batch_invariant=batch_invariant,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        gate_domain=gate_domain,
     )
     return differentiable((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)

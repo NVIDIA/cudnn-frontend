@@ -160,53 +160,21 @@ sharding/multiple GPUs, portable executable export, and full FLA compatibility.
 JAX supplies compact row-major operands to the custom call; upstream transposes
 may require materialization.
 
-## Execution and review notes
+## Execution
 
-`linear_attention/jax_api.py` owns metadata, argument binding and autodiff.
-`linear_attention/frost/kda_engine.py` owns scheduling and workspace layout.
-`linear_attention/frost/kda_jax.py` binds XLA buffers and the engine's workspace
-regions to the existing `kda_{chain,warmup}_{forward,backward}_f16.py` host
-functions. Those functions own the multi-kernel sequence for both frameworks.
-The adapter adds the existing gate-gradient and grouped-head reductions after
-backward; it does not implement KDA kernels or choose a different schedule.
+Frost chooses the schedule and workspace layout. JAX uses the same kernel
+configuration builders and multi-kernel hosts as the native executor, with
+XLA-owned outputs, per-call workspace and stream. Compilation metadata is
+cached; workspace is never shared between calls. Execution needs no torch
+import or Python callback.
 
-The native executor retains its compiled-artifact caches, dynamic tensor
-annotations, output strides and execution path. JAX tracing specializes buffer
-bindings to static shapes; it does not replace or populate the native caches.
-Frost's automatic piece-chain selection applies to both paths, including
-checkpoint-aligned piece boundaries. Coarse checkpoints, linear gate inputs
-and INT64 sequence offsets use the native forward/backward hosts. State-pool
-indexing remains outside the JAX API; native support is unchanged.
-Value-dimension splits use the engine's tile count and optional preprocessing
-buffers, through the same forward host as torch.
+SM103, additional CUDA/JAX/CuTeDSL versions, independent-stream stress and
+customer workloads still need qualification. The 10–20 us CPU dispatch target
+and JAX/native performance parity have not been established by numerical tests.
 
-Graph tensors come directly from JAX shape/dtype metadata; the existing
-`graph.kda` / `graph.kda_bwd` methods infer output shapes and validate the graph.
-The CuTeDSL bridge exports one XLA FFI call per JAX forward/backward. It receives
-XLA's stream and runs the existing hosts, including runtime TMA descriptors and
-PDL dependencies. No Python callback or torch tensor is used at runtime.
+## Tests
 
-XLA allocates outputs and per-invocation byte workspace. Backward carves the
-same scheduler, descriptor, recompute, gate-reduction and head-reduction regions
-as torch. Workspace is never cached across calls. Graph/shape/launch metadata
-is cached at trace time; executable caching belongs to the CuTeDSL/JAX bridge.
-Checkpoints use the shared bridge's initialized-output support, with aliased
-outputs restored to their declared argument positions.
-
-Alternatives considered: a native C++ XLA FFI wrapper around the engine would
-require exporting its Python-compiled launch artifacts and maintaining a new
-ABI; Python callbacks or torch/DLPack would add host overhead and weaken stream
-and capture guarantees. The composite CuTe path is the smallest working bridge.
-
-Before production release, qualify customer shapes, CUDA/JAX/CuTeDSL versions,
-SM103, true independent-stream stress and long-sequence numerical limits. The
-10–20 us CPU dispatch target and JAX/native kernel-performance parity are not
-yet qualified: measure warm dispatch separately from blocking end-to-end latency
-and GPU kernel time, against the same Frost schedule and checkpoint policy.
-Numerical tests alone do not establish either target. BSA and quantized grouped
-GEMM are separate work.
-
-Run coverage with:
+Run JAX coverage without the torch-based parent fixtures:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
@@ -214,41 +182,13 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   --confcutdir=test/python/fe_api/jax
 ```
 
-Native executor regressions (from `test/python`):
+The suite covers forward/backward parity, state and gate gradients, repeated
+calls, packed boundaries, recurrent scans, command-buffer replay, concurrent
+dispatch and torch-free execution. Tests skip when JAX, a supported GPU or
+CuTeDSL >=4.7.0 is unavailable.
+
+Run native cache and output-stride regressions from `test/python`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m pytest -s -q linear_attention/test_kda_execution.py
 ```
-
-## Container tests
-
-The NGC JAX container can build the frontend from this checkout and run the full
-JAX KDA and shared-call suites without installing torch. Use an SM100/SM103 GPU:
-
-```bash
-set -o pipefail
-git archive HEAD | docker run --rm -i --gpus device=0 --shm-size=8g \
-  -e CUDA_VISIBLE_DEVICES=0 -e XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  -e JAX_PLATFORMS=cuda -e CMAKE_BUILD_PARALLEL_LEVEL=8 \
-  --entrypoint bash nvcr.io/nvidia/jax:26.07-py3 -lc '
-    set -euo pipefail
-    mkdir -p /workspace
-    cd /workspace
-    tar -xf -
-    python -m pip install ".[cutedsl]" "nvidia-cutlass-dsl[cu13]==4.7.1" pytest
-    python -c "import importlib.util; assert importlib.util.find_spec(\"torch\") is None"
-    python -m pytest -s -q test/python/fe_api/jax --confcutdir=test/python/fe_api/jax
-  '
-```
-
-The archive contains committed files only. The container builds its own frontend
-extension; no host virtualenv or compiled extension is mounted. The KDA tests are also collected by the normal `test/python/fe_api` CI sweep.
-They skip before kernel imports when JAX or a supported CuTeDSL is unavailable.
-The standalone command uses `--confcutdir` to exclude the torch-based parent
-fixtures; an import-only check does not run KDA forward/backward kernels.
-
-The SM100 suite covers eager and jitted forward/backward parity, state and gate
-gradients, repeated calls, changing packed boundaries, recurrent scans,
-command-buffer replay, concurrent dispatch and torch-free import/execution.
-Native regressions additionally check compiled-host reuse across token/head
-counts and strided gradient destinations, including untouched output padding.

@@ -11,17 +11,10 @@ import cutlass as ct
 import cutlass.cute as cute
 
 from .common import gate_bwd, head_reduce, piece_chain, split_k
-from .kernel import kda_bprop_f16 as bwd
-from .kernel import kda_bprop_summary_f16 as bwd_summary
-from .kernel import kda_prefill_f16 as fwd
-from .kernel import kda_prep_f16 as prep
-from .kernel import kda_prep_prefill_f16 as prep_fwd
-from .kernel import kda_recompute_f16 as recompute
-from .kernel import kda_summary_f16 as summary
-from .kernel.kda_chain_backward_f16 import chain_backward_host
-from .kernel.kda_chain_forward_f16 import chain_forward_host
-from .kernel.kda_warmup_backward_f16 import warmup_backward_host
-from .kernel.kda_warmup_forward_f16 import warmup_forward_host
+from .kernel import kda_chain_backward_f16 as chain_bwd
+from .kernel import kda_chain_forward_f16 as chain_fwd
+from .kernel import kda_warmup_backward_f16 as warmup_bwd
+from .kernel import kda_warmup_forward_f16 as warmup_fwd
 
 
 def contiguous_view(pointer, shape):
@@ -68,58 +61,23 @@ def make_launcher(plan, names):
         d_k=dk,
         d_v=dv,
     )
-    config = dict(b_t=16, scale=plan.scale, io_dtype=io_dtype, checkpoint_every_n=16 if is_bwd else checkpoint)
+    config = dict(b_t=plan.b_t, scale=plan.scale, io_dtype=io_dtype, checkpoint_every_n=plan.b_t if is_bwd else checkpoint)
     if is_bwd:
         config.update(
-            bprop_cfg=bwd.build_cfg(
-                io_dtype,
-                gate_dtype,
-                use_dstate_in=chain or "d_final_state" in node.inputs,
-                use_dstate0="d_initial_state" in node.outputs,
-                use_initial_state=chain or state is not None,
-                **flags,
-            ),
-            recompute_cfg=(
-                recompute.build_cfg(
-                    io_dtype,
-                    ct.Float32 if chain or coarse else state_dtype,
-                    gate_dtype,
-                    use_initial_state=not coarse and (chain or state is not None),
-                    store_final_state=False,
-                    enable_checkpoints=True,
-                    seed_checkpoints=coarse,
-                    **flags,
-                )
-                if needs_recompute
-                else None
-            ),
             recompute=needs_recompute,
             recompute_orders=not coarse,
             recompute_order_gen=not coarse and not split,
             coarse=coarse,
             bwd_orders=saved,
             bwd_order_gen=not split,
-            seed_span_chunks=span // 16,
+            seed_span_chunks=span // plan.b_t,
             seed_every_n=checkpoint if coarse else 0,
         )
     else:
-        prefill = prep_fwd if plan.prep else fwd
-        prep_flags = {name: value for name, value in flags.items() if name not in ("max_active_clusters", "d_v")}
         config.update(
             order_gen=not split,
             tiles_per_head=plan.tiles_per_head,
             prep=plan.prep,
-            prep_cfg=prep.build_cfg(io_dtype, gate_dtype, num_sm=plan.num_sm, **prep_flags) if plan.prep else None,
-            prefill_cfg=prefill.build_cfg(
-                io_dtype,
-                ct.Float32 if chain else state_dtype,
-                gate_dtype,
-                use_initial_state=chain or state is not None,
-                store_final_state=plan.has_final_state,
-                enable_checkpoints=saved,
-                tiles_per_head=plan.tiles_per_head,
-                **dict(flags, d_v=dv // plan.tiles_per_head),
-            ),
         )
     if chain:
         config.update(
@@ -132,34 +90,56 @@ def make_launcher(plan, names):
             pieces=plan.pieces,
             heads_out=ho,
             num_seqs=batch,
-            summary_cfg=summary.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags) if not is_bwd or not saved else None,
         )
         if is_bwd:
+            config["summary_cfg"], config["transition_cfg"], config["series_cfg"], config["bwd_summary_cfg"], config["bprop_cfg"] = chain_bwd.build_configs(
+                io_dtype,
+                ct.Float32,
+                ct.Float32,
+                gate_dtype,
+                fused_h_m=not saved,
+                series=needs_recompute,
+                coarse=coarse,
+                use_dstate0="d_initial_state" in node.outputs,
+                **flags,
+            )
             config.update(
                 fused_h_m=not saved,
                 series=needs_recompute,
-                series_cfg=config["recompute_cfg"],
-                series_span_chunks=span // 16,
-                bwd_summary_cfg=bwd_summary.build_cfg(io_dtype, gate_dtype, use_dstate_in=False, **flags),
+                series_span_chunks=span // plan.b_t,
                 has_dseed="d_final_state" in node.inputs,
-                transition_cfg=(
-                    recompute.build_cfg(
-                        io_dtype,
-                        ct.Float32,
-                        gate_dtype,
-                        use_initial_state=False,
-                        store_final_state=True,
-                        enable_checkpoints=False,
-                        seed_identity=True,
-                        v_is_zero=True,
-                        **dict(flags, d_v=dk),
-                    )
-                    if saved
-                    else None
-                ),
             )
-        host = chain_backward_host if is_bwd else chain_forward_host
+        else:
+            config["summary_cfg"], config["prefill_cfg"] = chain_fwd.build_configs(
+                io_dtype, ct.Float32, gate_dtype, store_final_state=plan.has_final_state, enable_checkpoints=saved, **flags
+            )
+        host = chain_bwd.chain_backward_host if is_bwd else chain_fwd.chain_forward_host
     else:
+        if is_bwd:
+            config["recompute_cfg"], config["bprop_cfg"] = warmup_bwd.build_configs(
+                io_dtype,
+                ct.Float32 if coarse else state_dtype,
+                gate_dtype,
+                recompute=needs_recompute,
+                coarse=coarse,
+                has_state_in=not coarse and state is not None,
+                use_initial_state=state is not None,
+                use_dstate_in="d_final_state" in node.inputs,
+                use_dstate0="d_initial_state" in node.outputs,
+                **flags,
+            )
+        else:
+            config["prefill_cfg"], config["prep_cfg"] = warmup_fwd.build_configs(
+                io_dtype,
+                state_dtype,
+                gate_dtype,
+                use_initial_state=state is not None,
+                store_final_state=plan.has_final_state,
+                enable_checkpoints=saved,
+                tiles_per_head=plan.tiles_per_head,
+                prep=plan.prep,
+                **flags,
+            )
         facts = split_k.split_table_facts(
             SimpleNamespace(shape=tuple(g.dim), dtype={ct.Float16: "float16", ct.BFloat16: "bfloat16", ct.Float32: "float32"}[gate_dtype]),
             SimpleNamespace(shape=tuple(node.inputs["cu_seqlens"].dim)),
@@ -167,7 +147,7 @@ def make_launcher(plan, names):
             n_tiles=plan.n_tiles,
             ideal_chunks=plan.ideal,
             num_sms=plan.num_sm,
-            b_t=16,
+            b_t=plan.b_t,
             log2_threshold=None,
             log_gate=log_gate,
             safe_gate=safe_gate,
@@ -176,7 +156,7 @@ def make_launcher(plan, names):
         )
         config.update(facts._asdict())
         config["log2_thresh"] = facts.log2_threshold
-        host = warmup_backward_host if is_bwd else warmup_forward_host
+        host = warmup_bwd.warmup_backward_host if is_bwd else warmup_fwd.warmup_forward_host
     parameters = inspect.signature(host).parameters
     scalar_types = {name: p.annotation for name, p in parameters.items() if p.annotation in (ct.Int32, ct.Float32)}
     regions = plan.workspace_regions
