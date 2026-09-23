@@ -6,9 +6,10 @@
 Listed in ``cudnn/engines/manifest.py`` as ONE row owning the
 ``FROST_SDPA_FWD_ID_BASE`` block, so ``FrostSdpaFwdEngines()`` returns the whole
 family and a graph containing an sdpa() node reaches them through the ordinary
-lifecycle — no registration call. The row is opt-in
-(``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until these engines have the arch
-coverage to serve graphs unasked.
+lifecycle — no registration call. The SM100 and SM120 f16/bf16 slots are default
+candidates, ranked against the backend per measured shard (``placement.py``); the
+other slots stay opt-in (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until they have
+the arch coverage to serve graphs unasked.
 
 The capability table, the probe and the lowering are unchanged and stay in
 ``engines.py`` (``ENGINE_SPECS`` / ``analyze_for`` / ``build``); this file is
@@ -76,6 +77,9 @@ class _FrostSdpaFwdPlan(CompiledPlan):
                     raise ValueError(
                         f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
                     )
+                device = getattr(ctx.workspace, "__dlpack_device__", None)
+                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                    raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
             raw_stream = ctx.stream
             if raw_stream is None:
                 # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does

@@ -47,6 +47,11 @@ FROST_CONV_ID_BASE = PYTHON_ENGINE_ID_BASE + 800  # 20_800..20_899
 # (engine_id, knobs) pair to replay — C++ builds and runs it itself.
 BACKEND_HEURISTIC_ENGINE_ID = -1
 
+# The placement marker a family hook may put in its proposal list: "the backend's
+# own ranked block for this mode goes here". Expanded by
+# ``engines/heuristics._assemble``; it never reaches ``graph.plans``.
+BACKEND_BLOCK_ENGINE_ID = -2
+
 
 def is_python_engine(engine_id: int) -> bool:
     """True iff ``engine_id`` names a python engine (vs a backend engine)."""

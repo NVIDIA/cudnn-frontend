@@ -19,9 +19,11 @@ Example (pass torch tensors directly):
     >>> graph.execute({C: c_tensor})  # routes to a supporting engine, else cuDNN
 """
 
+import atexit
 import ctypes
 from dataclasses import dataclass
 import logging
+import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -37,6 +39,53 @@ from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_t
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
+
+# A handle-less graph used to let the C++ PyGraph cudnnCreate a handle of its own
+# at lowering and cudnnDestroy it from the destructor: a GC-timed backend release
+# that, inside someone else's stream capture, poisons every later launch (Rule 8,
+# #1151). Lend it a process default instead: one per (thread, device) -- cuDNN
+# forbids sharing a handle across threads -- never re-streamed (a fresh handle
+# runs on stream 0, exactly like the owned one did), destroyed at interpreter exit.
+_DEFAULT_HANDLES = threading.local()
+_DEFAULT_HANDLE_REGISTRY: List[Handle] = []
+_DEFAULT_HANDLE_LOCK = threading.Lock()
+
+
+def _default_backend_handle() -> int:
+    from .frost.device import ambient_device
+
+    device = ambient_device()
+    by_device = getattr(_DEFAULT_HANDLES, "by_device", None)
+    if by_device is None:
+        by_device = _DEFAULT_HANDLES.by_device = {}
+    handle = by_device.get(device)
+    if handle is None:
+        handle = by_device[device] = cudnn.create_handle()
+        with _DEFAULT_HANDLE_LOCK:
+            _DEFAULT_HANDLE_REGISTRY.append(handle)
+    return to_backend_handle(handle)
+
+
+def _destroy_default_handles() -> None:
+    with _DEFAULT_HANDLE_LOCK:
+        handles, _DEFAULT_HANDLE_REGISTRY[:] = list(_DEFAULT_HANDLE_REGISTRY), []
+    for handle in handles:
+        try:
+            cudnn.destroy_handle(handle)
+        except Exception:  # noqa: BLE001 -- CUDA may already be torn down at exit
+            pass
+
+
+atexit.register(_destroy_default_handles)
+
+
+def _detached_exception(exc: Exception) -> Exception:
+    """Preserve the backend error type/message without retaining traceback frames.
+
+    Clearing only __traceback__ leaves chained exceptions pointing at the graph.
+    Never raise the stored copy either: raising attaches a new traceback to it.
+    """
+    return type(exc)(*exc.args)
 
 
 def _is_dense(dim, stride) -> bool:
@@ -219,6 +268,7 @@ class pygraph:
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
         self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
+        self._slot_of_uid = None  # uid -> slot of that order, built with the layout
         self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
@@ -1063,7 +1113,7 @@ class pygraph:
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
             _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             self._reset_lowered_state()
 
     def _attach_facts(self) -> None:
@@ -1128,6 +1178,10 @@ class pygraph:
                 return node  # declared python-only: lowering raises by design
             if any(node.params.get(attr) is not None for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
+            if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
+                return node  # an output the backend cannot produce (sf_o) is requested: python engines only
+            if any(node.inputs.get(port) is not None for port in spec_entry[1].get("python_only_in_kwargs", ())):
+                return node  # an input the backend has no field for (sdpa_mxfp8 scale_o) is bound: python engines only
         return None
 
     def _backend_lowerable(self) -> bool:
@@ -1180,7 +1234,7 @@ class pygraph:
             # our own translator bug and must not read as a decline.
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             # RuntimeError here is overloaded by the binding: a rejected
             # descriptor (cannot represent) and a failing device look the same.
             # Treat it as a decline so a python engine can still serve the
@@ -1200,7 +1254,7 @@ class pygraph:
         except cudnn.cudnnGraphNotSupportedError as exc:
             # Lowering succeeded, so the only decline left is "no engine for it";
             # an AttributeError here is a binding mismatch, not an absent backend.
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.debug("backend has no engine for this graph: %s", exc)
             self._backend_entries = []
             return self._backend_entries
@@ -1372,6 +1426,18 @@ class pygraph:
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+
+    def _backend_handle_for_lowering(self, cpp_kwargs: Dict[str, Any]) -> Optional[int]:
+        """The raw handle the C++ graph is constructed with: the caller's, else the
+        process default for this thread and device. None only on the deviceless
+        (``device_property``) AOT path, which lowers without any handle. The graph
+        never owns a handle (Rule 8); ``self._handle`` stays as the caller set it, so
+        execute-time stream resolution is unchanged."""
+        if self._handle is not None:
+            return to_backend_handle(self._handle)
+        if cpp_kwargs.get("device_property") is not None:
+            return None
+        return _default_backend_handle()
 
     def _reset_lowered_state(self) -> None:
         """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
@@ -1548,7 +1614,7 @@ class pygraph:
             others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
             if self._plan_pinned or not others:
                 raise
-            self._backend_declined = exc
+            self._backend_declined = _detached_exception(exc)
             _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
@@ -1607,7 +1673,7 @@ class pygraph:
         if self._is_built:
             return
         if self._backend_declined is not None and not failures:
-            raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
+            raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
         raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
@@ -1889,7 +1955,9 @@ class pygraph:
                        ExecutionContext; plans that need one require it)
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
-            override_uids/shapes/strides: dynamic-shape overrides (backend path)
+            override_uids/shapes/strides: runtime geometry for the backend or a
+                         compatible VariantPack plan; legacy uid-map plans raise
+                         rather than ignoring these arguments
         """
         if not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
@@ -1902,9 +1970,8 @@ class pygraph:
             self.build(ctx=caller_ctx)
 
         uid_to_data = self._uid_to_data(tensor_dict)
-        # The dynamic-shape overrides live only on the backend's uid-map
-        # overload, so a call carrying them takes that path and normalizes
-        # nothing.
+        # Backend overrides use its uid-map overload. Python plans must consume
+        # them through VariantPack; a legacy uid-map executor cannot honor them.
         overriding = override_uids is not None or override_shapes is not None or override_strides is not None
         eng = self.selected_engine
 
@@ -1928,6 +1995,8 @@ class pygraph:
                 pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
                 plan.execute(self, pack, ctx)
             else:
+                if overriding:
+                    raise ValueError(f"{eng.name}: this plan does not support execute-time shape or stride overrides")
                 plan.execute(self, uid_to_data, ctx)
             return
 
@@ -2088,21 +2157,16 @@ class pygraph:
                     f"override_uids, override_shapes and override_strides must name the same tensors: got "
                     f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
                 )
-            slot_of = {uid: i for i, uid in enumerate(order)}
-            for j, uid in enumerate(override_uids):
-                i = slot_of.get(uid)
-                if i is None:
-                    raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                # Overrides speak cuDNN element units; the slot speaks storage slots.
-                declared = self._tensor_by_uid.get(uid)
-                storage = storage_geometry(override_shapes[j], override_strides[j], declared.data_type if declared is not None else None)
-                if storage is None:
-                    raise ValueError(
-                        f"override_shapes for tensor uid {uid}: an fp4 tensor packs two elements per storage slot, so its "
-                        f"unit-stride extent must be even; got {tuple(override_shapes[j])} / {tuple(override_strides[j])}"
-                    )
-                dtype = (*_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type)) if declared is not None else (0, 0, 1)
-                native.override_operand(i, *_in_axis_order_of(storage[0], storage[1], native.stride(i)), *dtype)
+            # One crossing for every override: the native side turns each element geometry into
+            # storage-slot geometry (fp4 packing), re-expresses it in the buffer's own axis order and
+            # applies it with the declared dtype (see VariantPackNative::override_many).
+            layout = self._declared_layout(order)
+            slot_of = self._slot_of_uid
+            try:
+                indices = [slot_of[uid] for uid in override_uids]
+            except KeyError as exc:
+                raise ValueError(f"override_uids names tensor uid {exc.args[0]}, which is not an operand of this graph") from None
+            native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -2128,12 +2192,14 @@ class pygraph:
         layout = self._declared_layout_native
         if layout is None:
             layout = _pybind_module.DeclaredLayout(len(order))
+            self._slot_of_uid = {uid: i for i, uid in enumerate(order)}
             for i, uid in enumerate(order):
                 declared = self._tensor_by_uid.get(uid)
-                if declared is None or not declared.dim:
+                if declared is None:
                     continue
-                storage = storage_geometry(declared.dim, declared.stride, declared.data_type)
+                storage = storage_geometry(declared.dim, declared.stride, declared.data_type) if declared.dim else None
                 if storage is None:
+                    layout.set_dtype(i, *_dlpack_code_bits(declared.data_type), _dlpack_lanes(declared.data_type))  # overrides still speak its dtype
                     continue
                 layout.set(
                     i,
@@ -2325,8 +2391,9 @@ class pygraph:
                 for _k in ("name", "kernel_cache", "device_property"):
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
-                if self._handle is not None:
-                    deser_kwargs["handle"] = to_backend_handle(self._handle)
+                backend_handle = self._backend_handle_for_lowering(deser_kwargs)
+                if backend_handle is not None:
+                    deser_kwargs["handle"] = backend_handle
                 self._lowered_graph = cudnn._pybind_module.backend_graph(**deser_kwargs)
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
@@ -2334,6 +2401,7 @@ class pygraph:
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
         self._declared_layout_native = None
+        self._slot_of_uid = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""
@@ -2351,8 +2419,9 @@ class pygraph:
             pg_kwargs["io_data_type"] = _library_type(self._context.io_data_type)
         pg_kwargs["intermediate_data_type"] = _library_type(self._context.intermediate_data_type or cudnn.data_type.FLOAT)
         pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
-        if self._handle is not None:
-            pg_kwargs["handle"] = to_backend_handle(self._handle)
+        backend_handle = self._backend_handle_for_lowering(pg_kwargs)
+        if backend_handle is not None:
+            pg_kwargs["handle"] = backend_handle
         graph = cudnn._pybind_module.backend_graph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
@@ -2453,11 +2522,13 @@ class pygraph:
                     # user callbacks (score_mod, ...) get a shimmed graph so
                     # closures over IR tensors keep working (see _CallbackGraphShim)
                     kw[pk] = _wrap_callback(pv, lower_tensor) if callable(pv) else pv
+                python_only_ins = spec.get("python_only_in_kwargs", ())
                 for port, t in node.inputs.items():
-                    if not port.startswith("dropout_"):
-                        kw[port] = tensor_map[t.uid]
+                    if not port.startswith("dropout_") and port not in python_only_ins:
+                        kw[port] = tensor_map[t.uid]  # python-only inputs never reach C++ (_unlowerable_node keeps a SET one off the backend)
+                python_only_outs = spec.get("python_only_out_kwargs", ())
                 for port in spec.get("out_kwargs", ()):
-                    if port in node.outputs:  # classic passes these descriptors as args
+                    if port in node.outputs and port not in python_only_outs:  # classic passes these descriptors as args
                         kw[port] = lower_tensor(node.outputs[port])
                 n_drop = node.params.get("_dropout_n")
                 if n_drop:
@@ -3504,7 +3575,13 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_FP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o"),
         outputs=("O", "Stats", "Amax_S", "Amax_O"),
-        out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
+        # ``sf_o``: block-scaled O scale factors (O declared FP4_E2M1 -> one
+        # E4M3 scale per 16 d elements; O FP8_E4M3 + sf_o -> one UE8M0 scale
+        # per 32). The caller passes its descriptor like rng_dump; the cuDNN
+        # backend has no field for it, so a graph that sets it is served by
+        # python engines only (see python_only_out_kwargs / _unlowerable_node).
+        out_kwargs=("rng_dump", "score_max", "score_sum_exp", "sf_o"),
+        python_only_out_kwargs=("sf_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
         python_only_attrs=("softmax_precision",),  # see "sdpa"
@@ -3560,6 +3637,15 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_MXFP8,
         pos=("q", "k", "v", "descale_q", "descale_k", "descale_v"),
         outputs=("O", "Stats", "Amax_O"),
+        # Block-scaled O, as on sdpa_fp8: ``sf_o`` (E4M3 scales per 16 d for an
+        # FP4_E2M1 O, UE8M0 per 32 d for an FP8_E4M3 O) is an OUTPUT the cuDNN
+        # backend has no field for, and ``scale_o`` -- the FP4 global scale the
+        # epilogue folds into O (required for an FP4 O, optional with an
+        # UE8M0-scaled E4M3 O) -- an INPUT it has none for either: setting one
+        # makes the node python-engines-only (python_only_* / _unlowerable_node).
+        out_kwargs=("sf_o",),
+        python_only_out_kwargs=("sf_o",),
+        python_only_in_kwargs=("scale_o",),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),

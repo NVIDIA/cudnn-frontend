@@ -589,6 +589,7 @@ def _empty_bwd_workspace_with_zeroed_accum(
     round_d_to: int,
     zero_dq_accum: bool,
     device: torch.device,
+    zero_kv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
@@ -614,7 +615,9 @@ def _empty_bwd_workspace_with_zeroed_accum(
     if not zero_dq_accum:
         accum_offset += q_rounded * d_rounded
     flat_accum_offset = batch_size * num_heads * accum_offset
-    workspace.reshape(-1)[flat_accum_offset:].zero_()
+    flat_accum_end = workspace.numel() if zero_kv_accum else batch_size * num_heads * (2 * q_rounded + q_rounded * d_rounded)
+    if flat_accum_offset < flat_accum_end:
+        workspace.reshape(-1)[flat_accum_offset:flat_accum_end].zero_()
     return workspace
 
 
@@ -1841,7 +1844,7 @@ def bsa_attn_fwd(
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.
-        sparse_block_size: Sparse Q/KV block size. SM90 supports 64, SM120
+        sparse_block_size: Sparse Q/KV block size. SM90 supports 64 or 128, SM120
             supports 64 or 128, and this SM100/SM110 path supports 128.
         allow_empty_block_nums: When True (default), q2k_block_nums may contain 0 (empty tiles
             produce O=0, LSE=-inf). When False, all values must be >= 1, enabling compile-time
@@ -1877,8 +1880,15 @@ def bsa_attn_fwd(
     assert num_head % num_head_kv == 0
     if sparse_block_size is None:
         sparse_block_size = 64 if arch // 10 in (9, 12) else 128
+    if arch // 10 == 9 and sparse_block_size == 128:
+        from ._sm90_blk128 import forward
+
+        if out is not None or lse is not None:
+            raise NotImplementedError("SM90 blk128 forward allocates its outputs")
+        result = forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, softmax_scale, layout, int(kv_splits))
+        return result if return_lse else result[0]
     if arch // 10 == 9:
-        assert sparse_block_size == 64, "SM90 fwd only supports sparse_block_size=64"
+        assert sparse_block_size == 64, "SM90 fwd only supports sparse_block_size=64 or 128"
     elif arch // 10 == 12:
         assert sparse_block_size in (64, 128), "SM120 fwd only supports sparse_block_size=64 or 128"
     else:
@@ -2241,7 +2251,7 @@ def bsa_attn_bwd(
         bwd_head_dim = SM90_BWD_HEAD_DIM
         if sparse_block_size is None:
             sparse_block_size = SM90_BWD_SPARSE_BLOCK_SIZE
-        assert sparse_block_size == SM90_BWD_SPARSE_BLOCK_SIZE, "SM90 bwd only supports sparse_block_size=64"
+        assert sparse_block_size in (64, 128), "SM90 bwd only supports sparse_block_size=64 or 128"
         assert head_dim == bwd_head_dim, f"sm90 bwd only supports head_dim={bwd_head_dim}, got {head_dim}"
     else:
         bwd_head_dim = SM100_BWD_HEAD_DIM
@@ -2304,6 +2314,28 @@ def bsa_attn_bwd(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if arch // 10 == 9 and sparse_block_size == 128:
+        from ._sm90_blk128 import backward
+
+        result = backward(
+            dout_bwd,
+            q_bwd,
+            k_bwd,
+            v_bwd,
+            out_bwd,
+            lse,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums,
+            softmax_scale,
+            dq_bwd,
+            dk_bwd,
+            dv_bwd,
+            bucket_size_blocks,
+        )
+        return tuple(t.transpose(1, 2) for t in result) if layout == "bshd" else result
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:

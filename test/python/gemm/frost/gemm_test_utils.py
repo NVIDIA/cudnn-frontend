@@ -133,6 +133,11 @@ class Plan:
         self.workspace_bytes = getattr(self._compiled, "workspace_bytes", 0)
 
     def __call__(self, variant_pack, workspace=None):
+        if workspace is None and self.workspace_bytes:
+            # The plan owns no workspace (Rule 8); the test harness supplies it.
+            import torch
+
+            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device="cuda")
         return self._compiled(variant_pack, workspace=workspace)
 
 

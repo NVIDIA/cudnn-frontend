@@ -11,6 +11,8 @@ from typing import Optional
 from cuda.bindings import driver as cuda
 import torch
 
+from cudnn._torch_stream import as_torch_stream
+
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.flex_attention.dispatch import (
     _BwdPreallocated,
@@ -95,14 +97,7 @@ def _sequence_args(mask_plan: MaskPlan) -> tuple[Optional[torch.Tensor], Optiona
 
 
 def _as_torch_stream(stream: cuda.CUstream | torch.cuda.Stream, device: torch.device) -> torch.cuda.Stream:
-    if isinstance(stream, torch.cuda.Stream):
-        if stream.device != device:
-            raise ValueError(f"stream must be on {device}, got {stream.device}")
-        return stream
-    handle = int(stream)
-    if handle in (0, 1, 2):
-        return torch.cuda.default_stream(device)
-    return torch.cuda.ExternalStream(handle, device=device)
+    return as_torch_stream(stream, device)
 
 
 def _stream_context(stream: Optional[cuda.CUstream | torch.cuda.Stream], device: torch.device):

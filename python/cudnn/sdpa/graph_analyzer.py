@@ -41,6 +41,10 @@ _TORCH_FROM_CUDNN = {
     cudnn.data_type.FP8_E5M2: "float8_e5m2",
     cudnn.data_type.FLOAT: "float32",
     cudnn.data_type.INT32: "int32",
+    # Block-scaled O of the per-tensor FP8 forward: two E2M1 per byte, and the
+    # UE8M0 scale factors of its MXFP8 output.
+    cudnn.data_type.FP4_E2M1: "float4_e2m1fn_x2",
+    cudnn.data_type.FP8_E8M0: "float8_e8m0fnu",
 }
 _KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
 
@@ -63,7 +67,13 @@ def to_torch_dtype(dt):
 
     if dt not in _TORCH_FROM_CUDNN:
         raise NotImplementedError(f"cudnn.sdpa: no lowering for data type {dt}")
-    return getattr(torch, _TORCH_FROM_CUDNN[dt])
+    name = _TORCH_FROM_CUDNN[dt]
+    dtype = getattr(torch, name, None)
+    if dtype is None:
+        # The packed FP4 dtype arrived in torch 2.8: on an older build a graph
+        # that declares it is DECLINED, like any type without a lowering.
+        raise NotImplementedError(f"cudnn.sdpa: this torch build has no torch.{name} for data type {dt}")
+    return dtype
 
 
 # BHSD logical / BSHD physical, size-1 dims wildcarded.
@@ -295,6 +305,9 @@ class SdpaGraphFacts:
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
     dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
+    # Block-scaled O (sdpa_fp8 with an ``sf_o`` output): scale-factor block
+    # along d_v — 16 = E2M1 O + E4M3 SF, 32 = E4M3 O + UE8M0 SF, 0 = plain O.
+    o_block_scale: int = 0
 
     # masks (resolved cuDNN semantics)
     causal: bool = False  # effective causal upper bound (right band == 0)
@@ -405,6 +418,8 @@ class SdpaGraphFacts:
     sf_k_t: Any = None
     sf_v_t: Any = None
     amax_o_t: Any = None
+    # Block-scaled O scale-factor output (sdpa_fp8 ``sf_o``; see o_block_scale).
+    sf_o_t: Any = None
     # Per-tensor FP8 scalar descale tensors + Amax_S output.
     descale_q_t: Any = None
     descale_k_t: Any = None
@@ -455,6 +470,7 @@ class SdpaGraphFacts:
     # instead of admitting a plan that dies in the lowering (rule 8b).  Mirrors
     # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
+    shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
 
     @property
     def band(self) -> "band.BandFacts":
@@ -544,7 +560,7 @@ def _record_from_node(node: Any, tail: Optional[GateTail] = None) -> dict:
     # node.outputs): fold each one in so engines see every requested output.
     # Missing one here lets an engine that never writes it pass the probe and
     # silently leave that output buffer as garbage (see score_max/score_sum_exp).
-    for out_kwarg in ("rng_dump", "score_max", "score_sum_exp"):
+    for out_kwarg in ("rng_dump", "score_max", "score_sum_exp", "sf_o"):
         if rec.get(out_kwarg) is None:
             rec[out_kwarg] = node.outputs.get(out_kwarg)
     # MXFP8 / per-tensor FP8: descale_q/k/v (+ scale_o, etc. for FP8) arrive via
@@ -733,6 +749,30 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
+    # Block-scaled O (the quantized forwards, sdpa_fp8 and sdpa_mxfp8): FP4 O
+    # needs the sf_o output (E4M3 scale per 16 d); an E4M3 O with sf_o is the
+    # MXFP8 output (UE8M0 scale per 32 d). Any other pairing is not a graph any
+    # engine serves. sdpa_mxfp8 carries no per-tensor O scale otherwise, so its
+    # scale_o (the FP4 global scale) is legal only with sf_o and mandatory for FP4.
+    _quant_fwd = (is_fp8 or is_mxfp8) and not is_backward
+    sf_o = rec.get("sf_o") if _quant_fwd else None
+    o_block_scale = 0
+    if _quant_fwd:
+        _op = "sdpa_fp8" if is_fp8 else "sdpa_mxfp8"
+        if o.get_data_type() == cudnn.data_type.FP4_E2M1:
+            if sf_o is None:
+                return _invalid(f"{_op}: an FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements)")
+            if is_mxfp8 and rec.get("scale_o") is None:
+                return _invalid("sdpa_mxfp8: an FP4_E2M1 O requires scale_o (the FP4 global scale)")
+            o_block_scale = 16
+        elif sf_o is not None:
+            if o.get_data_type() != cudnn.data_type.FP8_E4M3:
+                return _invalid(f"{_op}: sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output, UE8M0 scale per 32 d elements)")
+            o_block_scale = 32
+        if is_mxfp8 and rec.get("scale_o") is not None and sf_o is None:
+            return _invalid("sdpa_mxfp8: scale_o is accepted only together with the sf_o output (block-scaled O)")
+    elif rec.get("sf_o") is not None:
+        return _invalid("sf_o is an output of the quantized forwards (sdpa_fp8 / sdpa_mxfp8) only")
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
@@ -885,6 +925,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         is_mxfp8=is_mxfp8,
         is_fp8=is_fp8,
         dtype_o=(o_dtype if _fp8_family else q_dtype),
+        o_block_scale=o_block_scale,
         causal=causal,
         bottom_right=bool(align_is_br),
         window_left=window_left,
@@ -960,10 +1001,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # virtual one used to enter SdpaBinding and make the plan demand a buffer
         # for it (engine._FrostSdpaFwdPlan: "missing buffers").
         amax_o_t=_real_output(rec.get("amax_o")),
+        sf_o_t=sf_o,
         descale_q_t=(dsc_q if is_fp8 else None),
         descale_k_t=(dsc_k if is_fp8 else None),
         descale_v_t=(dsc_v if is_fp8 else None),
-        scale_o_t=(rec.get("scale_o") if is_fp8 else None),
+        scale_o_t=(rec.get("scale_o") if (is_fp8 or is_mxfp8) else None),
         descale_s_t=(rec.get("descale_s") if is_fp8 else None),
         scale_s_t=(rec.get("scale_s") if is_fp8 else None),
         # Amax_S: the op RETURNS the port unconditionally; only a real
@@ -992,6 +1034,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     if node is None:
         return None
     facts = _extract_facts(_record_from_node(node, tail))
+    if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
+        facts = replace(facts, shape_overrides=True)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see
@@ -1032,6 +1076,8 @@ class SdpaBinding:
     sf_k: Any = None
     sf_v: Any = None
     amax_o: Any = None
+    # Block-scaled O scale-factor output (sdpa_fp8 sf_o).
+    sf_o: Any = None
     # Per-tensor FP8 scalar descales + Amax_S output.
     descale_q: Any = None
     descale_k: Any = None
@@ -1098,6 +1144,7 @@ class SdpaBinding:
                 self.sf_k,
                 self.sf_v,
                 self.amax_o,
+                self.sf_o,
                 self.descale_q,
                 self.descale_k,
                 self.descale_v,
