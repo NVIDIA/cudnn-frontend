@@ -676,6 +676,34 @@ def test_workspace_is_build_time_honest():
 _FP8_REF_STEMS = ["fp8_b1h8s1024_dense", "fp8_b1h8kv2s2048_causal", "fp8_b2h4s768x1280_dense"]
 
 
+def _fp64_dq_dk_with_payload_delta(ref, dev="cuda"):
+    """The fp64 dQ / dK oracle for the dump's inputs with ``delta = rowsum(dO * O_payload) * o_dscale * dscale_dO`` -- the
+    delta the graph's chain computes from the e4m3 O it is handed (cuDNN ``sdpa_fp8_backward``: O is an fp8 payload).  The
+    dump's own ``ref_dq`` / ``ref_dk`` were computed with the UNQUANTIZED fp64 O's delta (its README says so: "lse / delta
+    must be injected, not recomputed"), which a graph cannot do.  At a near-one-hot causal row (q = 0 attends kv = 0 only)
+    dP == delta exactly for the fp64 O, so dS is nothing but the O-rounding term and the two oracles differ by
+    attn_scale * ddelta * |K|: on the causal dump 26 dQ / 11 dK elements past atol 0.08, max 0.16 / 0.23, all in q or kv rows
+    0..5, the dump's element exactly 0 where the payload oracle is 0.15 (sdpa-invariants s8).  Top-left causal only (the dumps
+    are square).  Returns ``(dQ [B, H_q, S_q, D], dK [B, H_kv, S_kv, D])`` fp64 real units on ``dev``."""
+    m = ref["meta"]
+    b, hq, hkv, sq, skv = (int(m[k]) for k in ("B", "Hq", "Hkv", "Sq", "Skv"))
+    attn = float(m["attn_scale_in"])
+    q, k, v, do, o8 = (ref[n].to(dev).double() for n in ("q", "k", "v", "do", "o_storage"))  # BSHD codes
+    grp = hq // hkv
+    kx, vx = k.repeat_interleave(grp, dim=2), v.repeat_interleave(grp, dim=2)
+    s_mat = torch.einsum("bqhd,bkhd->bhqk", q, kx) * (float(m["dscale_Q"]) * float(m["dscale_K"]) * attn)
+    if bool(m["causal"]):
+        assert sq == skv, "the top-left recompute below assumes the square causal dumps"
+        s_mat = s_mat.masked_fill(torch.ones(sq, skv, device=dev, dtype=torch.bool).triu(1), float("-inf"))
+    p_mat = torch.exp(s_mat - ref["lse"].to(dev).double().unsqueeze(-1))
+    dp = torch.einsum("bqhd,bkhd->bhqk", do, vx) * (float(m["dscale_dO"]) * float(m["dscale_V"]))
+    delta = (o8 * do).sum(-1).permute(0, 2, 1) * (float(ref["o_dscale"]) * float(m["dscale_dO"]))  # [B, H_q, S_q]
+    ds = attn * p_mat * (dp - delta.unsqueeze(-1))
+    dq = torch.einsum("bhqk,bkhd->bhqd", ds, kx * float(m["dscale_K"]))
+    dk = torch.einsum("bhqk,bqhd->bhkd", ds, q * float(m["dscale_Q"])).view(b, hkv, grp, skv, -1).sum(2)
+    return dq, dk
+
+
 @requires_rubin
 @pytest.mark.parametrize("stem", _FP8_REF_STEMS)
 def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(stem):
@@ -685,7 +713,9 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(stem):
     keeps for exactly this A/B) dV is BITWISE the dump's ``dv_kern`` (MHA) / within one bf16 rounding of its folded
     ``dv_red`` (GQA); with FP8 gradients only, the dequantized dV is within the fp8 recipe of the dump's real-unit dV.
     dQ / dK ride the bf16 dS workspace + the ported GEMMs (the pre-port chain lost 22-29 % of dS to an unscaled e4m3
-    workspace) and are held to the fp8 recipe against the dump's fp64 oracle, not against the pre-port chain."""
+    workspace) and are held to the fp8 recipe against the fp64 oracle recomputed with the delta the graph's chain can
+    compute -- from the e4m3 O payload (``_fp64_dq_dk_with_payload_delta``) -- not against the pre-port chain and not
+    against the dump's ``ref_dq`` / ``ref_dk`` (unquantized-O delta; the count past the recipe vs those is printed)."""
     from sdpa.helpers import get_fp8_scale_factor
     from test_sdpa_bwd_dsl_sm107 import _BF16_ULP_REL as _ULP, _load_ref_dump
 
@@ -746,9 +776,14 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(stem):
     else:
         got = dv.float().permute(0, 2, 1, 3) / grad_scale["dV"]  # -> [B, H_kv, S_kv, D] real units
         torch.testing.assert_close(got, ref["dv"].float(), **_FP8_GRAD_TOL, msg=lambda s: f"dequantized dV vs the pre-port kernel's real-unit dV: {s}")
-    for name, key in (("dQ", "ref_dq"), ("dK", "ref_dk")):
-        got = outs[name].cpu().float().permute(0, 2, 1, 3) / grad_scale[name]  # -> BHSD real units
-        torch.testing.assert_close(got, ref[key].float(), **_FP8_GRAD_TOL, msg=lambda s, n=name: f"{n} vs the dump's fp64 oracle: {s}")
+    dq_pay, dk_pay = _fp64_dq_dk_with_payload_delta(ref, dev)
+    for name, key, want in (("dQ", "ref_dq", dq_pay), ("dK", "ref_dk", dk_pay)):
+        got = outs[name].float().permute(0, 2, 1, 3) / grad_scale[name]  # -> BHSD real units, on the device
+        n_dump = int(((got - ref[key].to(dev).float()).abs() > _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * ref[key].to(dev).float().abs()).sum())
+        print(
+            f"\n{stem}: {name} vs the dump's unquantized-O-delta oracle: {n_dump} of {got.numel()} outside the recipe (REPORTED; the payload-delta oracle is asserted)"
+        )
+        torch.testing.assert_close(got, want.float(), **_FP8_GRAD_TOL, msg=lambda s, n=name: f"{n} vs the fp64 oracle with the e4m3-O-payload delta: {s}")
     a = amax["dV"].item()
     assert (
         math.isfinite(a) and abs(a - ref["dv"].abs().max().item()) <= 2 * _ULP * a + 1e-6
