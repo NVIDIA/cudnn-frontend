@@ -101,13 +101,19 @@ def _read_tile_id_lane_geometry(cga_size: int):
 
 
 @cute.jit
-def read_tile_id_arrive(mb, cga_size: int):
+def read_tile_id_arrive(mb, cga_size: int, predicated: cutlass.Constexpr[bool] = True):
     """Credit the scheduler for one decoded ``mb_read_tile_id`` slot: this warp lands ONE arrive on EVERY CTA of the cluster.
 
     Each CTA's ``mb_read_tile_id[slot]`` is initialised to ``READ_TILE_ARRIVERS`` = the number of warps in the WHOLE cluster
     that call this per work item (25 on the d512 cga4x1 role-split kernels, 29 on the 2-CTA d128 / d192x128 kernels and 30
     on their MXFP8 siblings, whose non-leader MMA warp also credits), so every calling warp has to deliver exactly one arrive
     to each of the ``cga_size`` CTAs.
+
+    ``predicated`` selects the LOWERING of the cluster arm only: the single predicated arrive (default) or the lane-compare
+    branch form.  Both fire the same lanes at the same peers -- SUM(issuing lanes with peer == c) == 1 per calling warp for
+    every CTA c -- so no ``READ_TILE_ARRIVERS`` init count depends on it.  A kernel spells its choice ONCE as a module
+    constant (``PREDICATED_CREDIT_ARRIVE``), a plain Python bool derived from its compile-time mask bits where the sign
+    differs per specialization; the sign is MEASURED per kernel and per specialization (see the branch arm below).
     """
     # const_expr, not a plain ``if``: the DSL stages every ``if`` into both arms even when the condition is a Python bool, so
     # a plain ``if cga_size == 1`` also TRACES the cluster arm at cga_size == 1 (the old spelling got away with it because
@@ -115,6 +121,30 @@ def read_tile_id_arrive(mb, cga_size: int):
     if cutlass.const_expr(cga_size == 1):
         if nvvm.elect_sync():
             nvvm.mbarrier_arrive(mb)
+    elif cutlass.const_expr(not predicated):
+        # The BRANCH form -- the spelling every kernel used before the predicated arrive below landed (PR #1169): one
+        # lane-compare arm per peer CTA.  Same lanes (0, lane_stride, 2 * lane_stride, ...), same peers, same ``.release.cta``
+        # arrive, so SUM(issuing lanes with peer == c) == 1 per calling warp for every CTA c and every READ_TILE_ARRIVERS init
+        # count is the one the predicated form needs -- only the lowering differs (LDC + BRX jump table + BSSY / BSYNC per arm
+        # on sm_107a; ISETP + BSSY + two divergent BRA on sm_100a).  Which form a kernel takes is a MEASURED per-kernel,
+        # per-SPECIALIZATION choice, spelled once per kernel as a module constant (the ``SPIN_RING_WAITS`` precedent), never
+        # a library default: on sm_100a (B200, A/B/A x3, CUPTI medians, O / Stats / Amax_O bit-identical) the predicated
+        # form is a win on per-tensor fp8 d128 (+3.1 %) and bf16 d192x128 (+1.3 %), neutral on bf16 d128 and fp8 d192x128,
+        # and a LOSS on the UNMASKED specialization of the two MXFP8 prefill kernels (d128 -5.5 % at B=1 H=24/8 S=16K
+        # dense, -5.1 / -5.9 % at S=8K / 32K; d192x128 -6.3 % at H=128 S=8K dense) -- not at the credit sites, which shrink
+        # there too, but through a kernel-wide ptxas reschedule that sinks the softmax alpha / stats publish to the end of
+        # the exp burst -- while on the d128 kernel's CAUSAL specialization the branch form is the loss (-5.1 % at S=16K,
+        # LPT).  So those two pass ``predicated=(CFG.MASK_FLAGS != 0)``: the branch form on their unmasked specialization
+        # (byte-identical to the pre-#1169 cubin; +8.1 % / +6.8 % on top of the exp2 split), the predicated form on every
+        # masked one (byte-identical to develop's).  A kernel that does not pass the kwarg is untouched.  On every sm107
+        # cga >= 2 kernel the predicated form is the measured win (-3.6 % time on d512 fp8), so the default stays True.
+        lane_stride = 32 // cga_size
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
+        for i in cutlass.range_constexpr(cga_size):
+            target_lane = i * lane_stride
+            if lane == cutlass.Int32(target_lane):
+                peer_mb = nvvm.mapa(mb, cutlass.Int32(i))
+                nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA)
     else:
         # ONE predicated arrive per warp, no lane branches.  The previous spelling,
         #     for i in range_constexpr(cga_size): if lane == i * lane_stride: mbarrier_arrive(mapa(mb, i), ...)
