@@ -67,6 +67,24 @@ def _combine_kernel(
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
+    # Ragged final rows (the decode tile's RAGGED_Q leg): (B+1,) int32 / int64 ragged
+    # offsets of Q, O and Stats in ELEMENTS and their elements-per-token
+    # divisors.  The partials stay dense; only the final O / LSE rows move to
+    # ``offset[b] / div + q_row`` on the packed [1, T, ...] outputs, and a row
+    # at or past this sequence's Q length (offset[b+1] - offset[b]) / div --
+    # every row of a zero-length sequence -- is not written at all.  None
+    # (None-specialized) keeps the dense (batch, q_row) placement.
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_lse: Optional[cute.Tensor] = None,
+    ragged_q_div: cutlass.Int32 = 1,
+    ragged_o_div: cutlass.Int32 = 1,
+    ragged_lse_div: cutlass.Int32 = 1,
+    # Packed token capacities of the final O and Stats buffers (ragged only): a
+    # row whose ragged placement lands at or past them is not written, so a
+    # short buffer or a bad offset can never store outside the caller's bytes.
+    ragged_o_cap: cutlass.Int32 = 0,
+    ragged_lse_cap: cutlass.Int32 = 0,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     q_row = cute.arch.block_idx()[0]
@@ -76,6 +94,34 @@ def _combine_kernel(
     op = cutlass.make_array_view(o_partial)
     lp = cutlass.make_array_view(lse_partial)
     oo = cutlass.make_array_view(o_out)
+
+    # Where the recombined row lands: dense (batch, q_row), or the ragged
+    # placement on the packed outputs (batch coord 0).
+    o_batch = batch
+    o_tok = q_row
+    lse_batch = batch
+    lse_tok = q_row
+    row_live = cutlass.Int32(1) == cutlass.Int32(1)
+    lse_live = row_live
+    if cutlass.const_expr(ragged_q is not None):
+        # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
+        # buffer's element offset can exceed 2^31) and keep the token index in 32.
+        # Bounds are checked in 64 bits BEFORE narrowing: a negative or wrapped
+        # offset must fail the capacity test, not alias a valid token after the cast.
+        rq = cutlass.make_array_view(ragged_q)
+        q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
+        q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+        in_seq = cutlass.Int64(q_row) < q_len64
+        o_batch = cutlass.Int32(0)
+        o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
+        row_live = in_seq & (o_tok64 >= cutlass.Int64(0)) & (o_tok64 < cutlass.Int64(ragged_o_cap))
+        o_tok = cutlass.Int32(o_tok64)
+        lse_live = row_live
+        if cutlass.const_expr(ragged_lse is not None):
+            lse_batch = cutlass.Int32(0)
+            lse_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div) + cutlass.Int64(q_row)
+            lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
+            lse_tok = cutlass.Int32(lse_tok64)
 
     # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
     # Every lane redundantly walks the (very short) split axis; the values are
@@ -136,7 +182,8 @@ def _combine_kernel(
             o_val = o_val * q_scale
         # Index all modes: ArrayView's row slice is a pointer and drops the
         # final mode's stride, so a subsequent [d0] would assume contiguous D.
-        oo[batch, q_row, head, d0] = o_val.to(o_out.element_type)
+        if row_live:
+            oo[o_batch, o_tok, head, d0] = o_val.to(o_out.element_type)
 
     # One atomic per lane.  The value is non-negative, so its fp32 bit pattern
     # orders the same as the float and an integer atomicMax is exact -- the same
@@ -147,7 +194,7 @@ def _combine_kernel(
 
     # --- the recombined LSE (only when the caller asked for Stats) ---
     if cutlass.const_expr(lse_out is not None):
-        if tidx == cutlass.Int32(0):
+        if (tidx == cutlass.Int32(0)) & lse_live:
             lo = cutlass.make_array_view(lse_out)
             lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
@@ -155,7 +202,7 @@ def _combine_kernel(
             # above needs them); only the final value converts. -inf stays -inf.
             if cutlass.const_expr(stats_log2):
                 lse_val = lse_val * cutlass.Float32(1.4426950408889634)
-            lo[batch, head, q_row] = lse_val
+            lo[lse_batch, head, lse_tok] = lse_val
 
 
 _combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -174,6 +221,32 @@ def _host(
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Tensor ABI (dense placement). The runtime signature is the one every
+    positional ``_combine_kernel`` call site in api_dsl matches."""
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _launch_combine(
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_out: cute.Tensor,
+    lse_out: Optional[cute.Tensor],
+    amax_o: Optional[cute.Tensor],
+    scale_o: Optional[cute.Tensor],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
+    ragged_q: Optional[cute.Tensor],
+    ragged_o: Optional[cute.Tensor],
+    ragged_lse: Optional[cute.Tensor],
+    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """One launch for both ABIs: dense placement (ragged tensors None) or the
+    ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
+    token capacities."""
     B, H, SQ, D = problem_size
     _combine_kernel(
         o_partial,
@@ -186,6 +259,14 @@ def _host(
         n_splits,
         cutlass.Int32(D),
         stats_log2,
+        ragged_q,
+        ragged_o,
+        ragged_lse,
+        cutlass.Int32(ragged_divs[0]),
+        cutlass.Int32(ragged_divs[1]),
+        cutlass.Int32(ragged_divs[2]),
+        cutlass.Int32(ragged_caps[0]),
+        cutlass.Int32(ragged_caps[1]),
     ).launch(
         grid=(SQ, H, B),
         block=[THREADS, 1, 1],
@@ -210,7 +291,57 @@ def _host_ptr(
 
     Partial workspaces are compact; final O and Stats use the actual caller
     strides. Widen before computing compact strides, including split batches.
+    This is the dense placement's positional ABI (unchanged); the ragged-Q
+    decode leg compiles :func:`_host_ptr_ragged` instead.
     """
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _host_ptr_ragged(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """The ragged-Q decode leg's pointer ABI: :func:`_host_ptr` plus the (B+1,)
+    ragged offsets of Q / O / Stats (int32 or int64 elements), their
+    elements-per-token divisors and the (O, Stats) packed token capacities; the
+    final O / Stats are the packed outputs addressed at ``offset[b] / div +
+    q_row`` with batch coord 0 (``o_strides[0]`` / ``lse_strides[0]`` are never
+    stepped), bounded by the capacities."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    B = problem_size[0]
+    n_off = cutlass.Int32(B) + cutlass.Int32(1)
+    ragged_q = cute.make_tensor(ragged_q_ptr, cute.make_layout((n_off,), stride=(1,)))
+    ragged_o = cute.make_tensor(ragged_o_ptr, cute.make_layout((n_off,), stride=(1,)))
+    ragged_lse = None
+    if cutlass.const_expr(ragged_lse_ptr is not None):
+        ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, ragged_q, ragged_o, ragged_lse, ragged_divs, ragged_caps, stream
+    )
+
+
+@cute.jit
+def _ptr_operands(o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides):
+    """The compact split-major partial slabs and the strided final O / Stats views of a pointer entry."""
     B, H, SQ, D = problem_size
     b64, h64, sq64, d64 = cutlass.Int64(B), cutlass.Int64(H), cutlass.Int64(SQ), cutlass.Int64(D)
     split_batches = b64 * cutlass.Int64(n_splits)
@@ -220,7 +351,7 @@ def _host_ptr(
     lse_out = None
     if cutlass.const_expr(lse_out_ptr is not None):
         lse_out = cute.make_tensor(lse_out_ptr, cute.make_layout((B, H, SQ), stride=lse_strides))
-    _host(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, stream=stream)
+    return o_partial, lse_partial, o_out, lse_out
 
 
 @lru_cache(maxsize=None)
@@ -229,25 +360,31 @@ def compile_ptr(
     dtype_partial: str = "f32",
     has_lse: bool = False,
     stats_log2: bool = False,
+    ragged: bool = False,
+    ragged_i64: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared f16/bf16 execution.
 
     The runtime arguments are partial-O/partial-LSE/O/optional-LSE pointers,
-    ``(B, H, S_q, D_v)``, split count, O strides in BSHD order, and LSE strides
-    in BHS order. Every stride is Int64, including singleton dimensions. This
-    entry shares the reduction and launch with :func:`compile`; the tensor ABI
-    remains available for quantized outputs with their amax/scale operands.
+    ``(B, H, S_q, D_v)``, split count, O strides in BSHD order, LSE strides
+    in BHS order, the three ragged-offset pointers (``ragged``: (B+1,) Q / O /
+    Stats offsets, int32 or -- ``ragged_i64`` -- int64; None-specialized off
+    otherwise) and their elements-per-token divisors. Every stride is Int64,
+    including singleton dimensions. This entry shares the reduction and launch
+    with :func:`compile`; the tensor ABI remains available for quantized
+    outputs with their amax/scale operands.
     """
     if dtype_o not in ("f16", "bf16") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires f16/bf16 O and f16/bf16/f32 partials")
+    if ragged_i64 and not ragged:
+        raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype):
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=dtype.width // 8)
 
-    return _compile_cached(
-        _host_ptr,
+    common = (
         P(_ELEM[dtype_partial]),
         P(cutlass.Float32),
         P(_ELEM[dtype_o]),
@@ -256,6 +393,18 @@ def compile_ptr(
         cutlass.Int32(0),
         (cutlass.Int64(0),) * 4,
         (cutlass.Int64(0),) * 3,
+    )
+    if ragged:
+        # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
+        # dense entry's positional ABI stays exactly what its callers pass.
+        off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
+        entry, extra = _host_ptr_ragged, (P(off_t), P(off_t), P(off_t) if has_lse else None, (cutlass.Int32(1),) * 3, (cutlass.Int32(0),) * 2)
+    else:
+        entry, extra = _host_ptr, ()
+    return _compile_cached(
+        entry,
+        *common,
+        *extra,
         bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

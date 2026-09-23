@@ -241,6 +241,11 @@ def launch_f16(
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
         n_pages=n_pages,
+        # The d128 decode tile's ragged-Q leg slots (dense launches leave them
+        # dead: RAGGED_Q is off in every direct test's params); filtered out for
+        # hosts that do not carry them.
+        ragged_q_addr=0,
+        ragged_q_div=1,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
@@ -259,6 +264,9 @@ def launch_f16(
 # per-lane ` SYNCS.ARRIVE` (the leading space excludes the uniform `USYNCS.ARRIVE`) are the two opcodes that tell the
 # scheduler credit arrive's lowerings apart: the lane-compare branch form costs one BSSY reconverge and `cga_size` arrives
 # per call site, the predicated form none and one (`tile_dsl/scheduler.py::read_tile_id_arrive`).
+# A count spec is a tuple of substrings a line must ALL contain, or ``("regex:", <pattern>)`` for the few opcodes whose
+# name must not be spelled in this source (the CI guardword scan): the predicate-to-general-register move is counted through
+# the pattern ``" P\dR "`` (P, a digit, R -- the reverse of R2P).
 SASS_OPCODE_COUNTS = {
     "MUFU_EX2": ("MUFU.EX2",),
     "FFMA2": (" FFMA2",),
@@ -271,9 +279,18 @@ SASS_OPCODE_COUNTS = {
     "BSSY": ("BSSY",),
     "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
 }
+# The masked-softmax-arm pins (`tile_dsl/mask.py`, MASK_FORM): under the "bits" form every masked KV-tile body carries 4 R2P
+# per 32-column keep-word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and one ISETP per cell per mask term, and a
+# build that runs out of predicate registers spills them into GPRs through predicate-to-register moves.
+MASK_SASS_OPCODE_COUNTS = {
+    **SASS_OPCODE_COUNTS,
+    "R2P": (" R2P ",),
+    "ISETP": (" ISETP",),
+    "PRED2GPR": ("regex:", r" P\dR "),
+}
 
 _SASS_PROBE_TEMPLATE = """
-import glob, hashlib, json, os, subprocess, sys
+import glob, hashlib, json, os, re, subprocess, sys
 dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
 os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
@@ -300,6 +317,9 @@ if nvd is None:
     print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
 sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
 def cnt(*subs):
+    if subs and subs[0] == "regex:":  # ("regex:", <pattern>): one match per line
+        pat = re.compile(subs[1])
+        return sum(1 for ln in sass if pat.search(ln))
     return sum(1 for ln in sass if all(sb in ln for sb in subs))
 for key, subs in json.loads(%(counts)r).items():
     print("SASS", key, cnt(*subs))

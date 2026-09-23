@@ -45,11 +45,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Int32, Float32, Boolean
 
-from . import _bprop_mxfp8_masks_sm100 as fmha_masks
-from . import _bprop_mxfp8_common_sm100 as cute_common
-from . import _bprop_mxfp8_common_sm100 as d256_primitives
-from ._bprop_mxfp8_common_sm100 import LOW_PRECISION_TYPE, SF_DTYPE, SF_VEC_SIZE
-from ._bprop_mxfp8_common_sm100 import (
+from . import _bprop_mxfp8_masks as fmha_masks
+from . import _bprop_mxfp8_common as cute_common
+from . import _bprop_mxfp8_common as d256_primitives
+from ._bprop_mxfp8_common import LOW_PRECISION_TYPE, SF_DTYPE, SF_VEC_SIZE
+from ._bprop_mxfp8_common import (
     make_kv_head_batch_tensor,
     make_lse_head_batch_tensor,
     make_q_head_batch_tensor,
