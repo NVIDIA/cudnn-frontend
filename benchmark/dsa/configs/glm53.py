@@ -18,8 +18,11 @@ and selects 512 of them = 2048 raw tokens, always adding the incomplete tail
 pool (at most 3 tokens, left out of the preset's round 2048).
 
 Heads: 64 for both, from the official HF configs (zai-org/GLM-5.3,
-zai-org/GLM-5.3-Flash). The sweep sizes the KV pool as ``s_kv == s_q`` and
-every query gathers the full top-k, as in ``deepseek_v4``.
+zai-org/GLM-5.3-Flash). As in ``deepseek_v4``, the sweep sizes the KV pool
+as ``s_kv == s_q`` and every query gathers its full top-k as independent
+unique random rows (the per-token upper bound). The 4-row pool locality of
+GLM-5.3-Flash's selection is not modeled: its 2048 rows are a random-row
+proxy for the pooled gather.
 
 Usage:
     python -m benchmark.dsa.runner --config glm53
@@ -44,7 +47,7 @@ GLM53_FLASH = ModelPreset(
     num_q_heads=64,
     head_dim_qk=512,  # NoPE latent, no RoPE slice
     head_dim_vo=512,
-    topk=2048,  # 512 pools x 4 tokens; forced tail (<= 3 tokens) omitted
+    topk=2048,  # 512 pools x 4 tokens, gathered as 2048 random rows; forced tail (<= 3 tokens) omitted
     indexer_topk=0,
     has_sink=False,
 )

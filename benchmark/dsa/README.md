@@ -105,7 +105,8 @@ back as V; token top-2048, no window fold, no sink, so `indexer_topk = 0`
 sibling (11 of 45 layers are sparse, the rest KDA): NoPE MLA, so the record
 is 512 wide; its indexer scores 4-token pools and selects 512 of them =
 2048 raw tokens, always adding the incomplete tail pool (<= 3 tokens, left
-out of the round 2048).
+out of the round 2048). Like every preset here, those rows are gathered as
+independent random rows, not as 4-row pools.
 
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
