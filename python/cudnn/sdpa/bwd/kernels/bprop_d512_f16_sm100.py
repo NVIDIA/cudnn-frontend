@@ -60,7 +60,7 @@ from cudnn.frost.tile_dsl.barrier import (
     cga_wait,
 )
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile, tma_slice_runtime_desc
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_PADDED, apply_mask_chunk, compute_kv_loop_bounds
+from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_FORM_BITS, MASK_NONE, MASK_PADDED, apply_mask_chunk_form, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.mma import mma_ts
 from cudnn.frost.tile_dsl.scheduler import Sched, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent, read_clc_payload
 from cudnn.frost.tile_dsl.tma import (
@@ -85,6 +85,16 @@ from cudnn.sdpa.bwd.config_sm100 import (
     tmem_cols,
     xfer_bytes,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline):
+# the masked call site below passes `form=MASK_FORM`, so the two forms of the
+# same mask -- "cells" (per-cell compare + select, 3-7 instructions per cell) and
+# "bits" (one keep-word per 32 columns, register-to-predicate R2P + one FSEL per
+# cell, 1.4-1.6 per cell) -- are an A/B by flipping this line.  Both produce the
+# same masked set with the same sentinel (0.0 here: S is masked AFTER exp2), so
+# S and every gradient downstream of it are bitwise identical;
+# test_sm100_every_mask_site_takes_the_module_mask_form counts the sites.
+MASK_FORM: str = MASK_FORM_BITS
 
 # Injected by the loader before this body executes; a plain import gets the
 # all-defaults config (dense bf16), which keeps `python bprop_d512_f16_sm100.py`
@@ -859,7 +869,7 @@ def _compute_kv_iter(
             # split (sg1 receives the already-masked S).  `q_row` is this
             # CTA's own row; only the tile bound is cluster-wide.
             if cutlass.const_expr(apply_mask):
-                s_post = apply_mask_chunk(
+                s_post = apply_mask_chunk_form(
                     s_post,
                     q_row,
                     kv_loop * cutlass.Int32(CFG.TILE_N) + cutlass.Int32(chunk * S_D_BLOCK),
@@ -871,6 +881,7 @@ def _compute_kv_iter(
                     causal_diag=(seqlen_kv - seqlen_q) if CFG.BOTTOM_RIGHT else None,
                     mask_value=0.0,
                     window_right=CFG.WINDOW_RIGHT,
+                    form=MASK_FORM,
                 )
             # Rows past the real S_q: zero the whole row. Their LSE came from a
             # CLAMPED index and is meaningless, so the value must be discarded
