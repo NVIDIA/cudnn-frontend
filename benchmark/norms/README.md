@@ -8,6 +8,7 @@ This directory contains benchmarking tools for normalization operations (RMSNorm
 
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_norm.py` - Single norm benchmark script
+- `benchmark_torch_norm_ops.py` - Experimental PyTorch custom-op benchmark
 - `configs/` - Benchmark configuration files (one per model)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration

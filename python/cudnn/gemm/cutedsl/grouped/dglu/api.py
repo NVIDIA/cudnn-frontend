@@ -77,10 +77,7 @@ def _block_scaled_dtype_pairs():
 
 
 from ._bf16_api import GroupedGemmDgluBf16API
-from ._blockscaled_api import (
-    GroupedGemmDgluBlockScaledAPI,
-    _reject_unsupported_rubin_glu_tune_params,
-)
+from ._blockscaled_api import GroupedGemmDgluBlockScaledAPI
 
 
 @dataclass(frozen=True)
@@ -570,12 +567,6 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     if linear_offset is None:
         linear_offset = 1.0 if act_func == "dgeglu" else 0.0
     device_type = get_device_type()
-    _reject_unsupported_rubin_glu_tune_params(
-        device_type == "rubin",
-        geglu_alpha,
-        glu_clamp_max,
-        glu_clamp_min,
-    )
     activation_cache_signature = None
     if act_func == "dgeglu":
         activation_cache_signature = (

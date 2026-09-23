@@ -84,6 +84,7 @@ This file intentionally does not touch the ratio=4 path; launch machinery mirror
 """
 
 from __future__ import annotations
+from cudnn._cutlass_compat import SmemAllocator
 
 import threading
 
@@ -180,7 +181,7 @@ def _compressor_fwd_r128_kernel(
     col = bidy * threads_x + tidx
     bb = bidx  # one output row per CTA
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     # Partial-merge buffer, [tchunks][threads_x][vec] per quantity; unused (0 B) when
     # tchunks == 1 (the allocation below is skipped at trace time).
     if cutlass.const_expr(tchunks > 1):
@@ -724,7 +725,7 @@ def _compressor_bwd_r128_kernel(
     cvec = col * vec
     ZERO_BF16 = cutlass.BFloat16(0.0)
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     # [win][cols_pc] fp32 tile: holds s_k after stage, e_k after the e-pass (``p_k``
     # is formed at store time as ``e_k * (1/den)``). [win][cols_pc] bf16 tile: staged
     # kv. Small buffers for the chunk maxes and the published per-column den / S.

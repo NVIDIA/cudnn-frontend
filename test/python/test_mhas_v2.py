@@ -104,18 +104,21 @@ implementation_names   = ['cudnn.attention_implementation.AUTO', 'cudnn.attentio
 # the rng identically and a config differs between them in the sink flag alone (CPython's
 # randint rejection-samples 32-bit words, so the total weight, not the number of options,
 # fixes the consumption; checked identical over 20000 seeds).
-def _frost_engines_enabled():
-    # The frontend's own reading of CUDNN_FRONTEND_ENABLE_FROST_ENGINES ("1"/"true"/"yes"/"on").
-    from cudnn.engines.manifest import opt_in_engines_enabled
-    return opt_in_engines_enabled()
+def _frost_engines_enabled(engine="sdpa_fwd_prefill_sm100"):
+    # Whether the manifest OFFERS the row: the SM100/SM120 f16 rows are default
+    # candidates (placed per measured shard), the others still answer to
+    # CUDNN_FRONTEND_ENABLE_FROST_ENGINES.
+    from cudnn.engines.manifest import MANIFEST
+    fam = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    return engine in fam.offered_ids()
 
 def _frost_sm100_unavailable_reason(engine="sdpa_fwd_prefill_sm100"):
     """Why the FROST SM100 f16/bf16 row would NOT serve a graph here, or None when it
-    would: the engines must be opted in, the device a pre-Rubin Blackwell (cc 10.0-10.6,
+    would: the engine must be offered by the manifest, the device a pre-Rubin Blackwell (cc 10.0-10.6,
     the row's arch domain) and a CuTe DSL at the FROST floor importable (the row declines
     without one and the native backend then serves the graph)."""
-    if not _frost_engines_enabled():
-        return "CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)"
+    if not _frost_engines_enabled(engine):
+        return f"{engine} is not offered by the manifest (opt-in row without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)"
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         return f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}"
@@ -393,8 +396,21 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
         pytest.skip("no unified backend plan on this device")
     graph.select_plan(backend_plans[0])
     graph.check_support()
-    graph.build_plans()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1:
+        # NVBug 6813175: the native decode codegen does not reduce the Q tile for ragged s_q == 1 graphs
+        # and emits a TMEM Stats round-trip wider than the ISA allows, so build_plans fails NVRTC
+        # (cuDNN 9.26 GA through the 9.28 nightlies; the s_q == 2 control builds). The plan also fails
+        # on SM100, but only the Rubin heuristic ranks it first. A backend that builds it is an
+        # XPASS that asks us to retire this marker.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                raises=cudnn.cudnnGraphNotSupportedError,
+                reason="Rubin ranks the native ragged-decode plan first and it fails NVRTC (NVBug 6813175, cuDNN 9.26-9.28)",
+            )
+        )
+    graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
     graph.execute(pack, workspace, handle=cudnn_handle)
@@ -523,7 +539,12 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
     keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
     before = [frost_routing.snapshot().get(k, 0) for k in keys]
-    exec_sdpa(cfg, request, cudnn_handle)
+    # The assertion is "FROST served it": opt FROST in for the call so the placement
+    # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
+    # the backend -- the routing, not the default winner, is under test here.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        exec_sdpa(cfg, request, cudnn_handle)
     after  = [frost_routing.snapshot().get(k, 0) for k in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
@@ -1536,6 +1557,11 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        # Block-scaled O epilogue (FROST d128 per-tensor FP8 only): FP4 O + E4M3
+        # scales per 16 d (16) or E4M3 O + UE8M0 scales per 32 d (32), with the
+        # sf_o output. exec_sdpa_fp8 folds it to 0 on configs the epilogue does
+        # not serve (paged / ragged / d != 128), so the draw stays a plain fp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         # KNOWN GAP: a dense "padded" draw currently runs as full — exec_sdpa_fp8
@@ -1799,6 +1825,12 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         # the NaN-poisoned capacity tails that catch the GitHub #624 class.
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
+        # Block-scaled O on the FROST d128 MXFP8 kernel: FP4 O + E4M3/16 scales (16)
+        # or E4M3 O + UE8M0/32 scales (32) with the sf_o output. exec_sdpa_mxfp8
+        # folds it to 0 on configs the epilogue does not serve (d != 128, unfuse_fma,
+        # a ragged KV tail without a covering causal band, FROST engines off, an arch
+        # without an MXFP8 engine row such as SM120), so the draw stays a plain mxfp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 

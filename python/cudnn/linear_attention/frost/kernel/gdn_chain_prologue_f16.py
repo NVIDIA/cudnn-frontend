@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Chunked Gated Delta Net (GDN / GDP) piece-chain prologue for Blackwell SM100 (Cutlass primitives): the one launch that
+Chunked Gated Delta Net (GDN / GDP) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass primitives): the one launch that
 builds every table the chain's kernels read, so each consumer keeps its body and skips its own prologue.
 
 Phases (two blocks: both build the piece table, block 0 the work-item tables, block 1 the descriptor arrays):
@@ -392,11 +392,15 @@ def chain_prologue(
     tinv: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
-    swz128 = tma.TensorMapSwizzle.s128b
+    swizzle_128b = tma.TensorMapSwizzle.s128b
     k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[1], k.shape[2]), stride=(k.stride[0], k.stride[1], 1)))
-    base_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(b_t, 1, 128 // (k.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swz128)
+    base_k = tma.create_tensor_map_tiled_from_view(
+        k_headed, box_dims=(b_t, 1, 128 // (k.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
+    )
     vk_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[2], k.shape[1], k.shape[0]), stride=(1, k.stride[1], k.stride[0])))
-    base_vk = tma.create_tensor_map_tiled_from_view(vk_headed, box_dims=(128 // (k.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128)
+    base_vk = tma.create_tensor_map_tiled_from_view(
+        vk_headed, box_dims=(128 // (k.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
+    )
     base_q = base_k
     base_v = base_k
     base_o = base_k
@@ -410,17 +414,23 @@ def chain_prologue(
     base_tinv = base_k
     if cutlass.const_expr(q is not None):
         q_headed = cute.make_tensor(q.iterator, cute.make_layout((q.shape[0], q.shape[1], q.shape[2]), stride=(q.stride[0], q.stride[1], 1)))
-        base_q = tma.create_tensor_map_tiled_from_view(q_headed, box_dims=(b_t, 1, 128 // (q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swz128)
+        base_q = tma.create_tensor_map_tiled_from_view(
+            q_headed, box_dims=(b_t, 1, 128 // (q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
+        )
     if cutlass.const_expr(v is not None):
         v_headed = cute.make_tensor(v.iterator, cute.make_layout((v.shape[2], v.shape[1], v.shape[0]), stride=(1, v.stride[1], v.stride[0])))
-        base_v = tma.create_tensor_map_tiled_from_view(v_headed, box_dims=(128 // (v.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128)
+        base_v = tma.create_tensor_map_tiled_from_view(
+            v_headed, box_dims=(128 // (v.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
+        )
     if cutlass.const_expr(o is not None):
         o_headed = cute.make_tensor(o.iterator, cute.make_layout((o.shape[2], o.shape[1], o.shape[0]), stride=(1, o.stride[1], o.stride[0])))
-        base_o = tma.create_tensor_map_tiled_from_view(o_headed, box_dims=(128 // (o.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128)
+        base_o = tma.create_tensor_map_tiled_from_view(
+            o_headed, box_dims=(128 // (o.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
+        )
     if cutlass.const_expr(do_ is not None):
         do_headed = cute.make_tensor(do_.iterator, cute.make_layout((do_.shape[2], do_.shape[1], do_.shape[0]), stride=(1, do_.stride[1], do_.stride[0])))
         base_do = tma.create_tensor_map_tiled_from_view(
-            do_headed, box_dims=(128 // (do_.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128
+            do_headed, box_dims=(128 // (do_.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(checkpoints is not None):
         checkpoint_view = cute.make_tensor(
@@ -431,22 +441,25 @@ def chain_prologue(
             ),
         )
         base_checkpoint = tma.create_tensor_map_tiled_from_view(
-            checkpoint_view, box_dims=(128 // (checkpoints.element_type.width // 8), checkpoints.shape[2], 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz128
+            checkpoint_view,
+            box_dims=(128 // (checkpoints.element_type.width // 8), checkpoints.shape[2], 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=swizzle_128b,
         )
     if cutlass.const_expr(dq is not None):
         dq_headed = cute.make_tensor(dq.iterator, cute.make_layout((dq.shape[2], dq.shape[1], dq.shape[0]), stride=(1, dq.stride[1], dq.stride[0])))
         base_dq = tma.create_tensor_map_tiled_from_view(
-            dq_headed, box_dims=(128 // (dq.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128
+            dq_headed, box_dims=(128 // (dq.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(dk is not None):
         dk_headed = cute.make_tensor(dk.iterator, cute.make_layout((dk.shape[2], dk.shape[1], dk.shape[0]), stride=(1, dk.stride[1], dk.stride[0])))
         base_dk = tma.create_tensor_map_tiled_from_view(
-            dk_headed, box_dims=(128 // (dk.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128
+            dk_headed, box_dims=(128 // (dk.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(dv is not None):
         dv_headed = cute.make_tensor(dv.iterator, cute.make_layout((dv.shape[2], dv.shape[1], dv.shape[0]), stride=(1, dv.stride[1], dv.stride[0])))
         base_dv = tma.create_tensor_map_tiled_from_view(
-            dv_headed, box_dims=(128 // (dv.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128
+            dv_headed, box_dims=(128 // (dv.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(summary_q is not None):
         if cutlass.const_expr(summary_q_step > 1):
@@ -463,7 +476,7 @@ def chain_prologue(
                 cute.make_layout((summary_q.shape[0], summary_q.shape[1], summary_q.shape[2]), stride=(summary_q.stride[0], summary_q.stride[1], 1)),
             )
         base_summary_q = tma.create_tensor_map_tiled_from_view(
-            summary_q_headed, box_dims=(b_t, 1, 128 // (summary_q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swz128
+            summary_q_headed, box_dims=(b_t, 1, 128 // (summary_q.element_type.width // 8)), stride_order=(2, 1, 0), swizzle=swizzle_128b
         )
     if cutlass.const_expr(summary_do is not None):
         summary_do_headed = cute.make_tensor(
@@ -471,14 +484,14 @@ def chain_prologue(
             cute.make_layout((summary_do.shape[2], summary_do.shape[1], summary_do.shape[0]), stride=(1, summary_do.stride[1], summary_do.stride[0])),
         )
         base_summary_do = tma.create_tensor_map_tiled_from_view(
-            summary_do_headed, box_dims=(128 // (summary_do.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz128
+            summary_do_headed, box_dims=(128 // (summary_do.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(tinv is not None):
         tinv_tiles = cute.make_tensor(
             tinv.iterator,
             cute.make_layout((tinv.shape[0], tinv.shape[1], tinv.shape[2], tinv.shape[3]), stride=(tinv.stride[0], tinv.stride[1], tinv.stride[2], 1)),
         )
-        base_tinv = tma.create_tensor_map_tiled_from_view(tinv_tiles, box_dims=(1, 1, b_t, b_t), stride_order=(3, 2, 1, 0), swizzle=swz128)
+        base_tinv = tma.create_tensor_map_tiled_from_view(tinv_tiles, box_dims=(1, 1, b_t, b_t), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b)
     frost_gdn_chain_prologue(
         pieces,
         unit_chunks,
