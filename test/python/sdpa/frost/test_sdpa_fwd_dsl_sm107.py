@@ -422,6 +422,70 @@ def test_sm107_f16_declines_split_kv_and_pack_gqa():
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
 
+def test_sm107_fp8_pack_gqa_is_d128_only():
+    """The Rubin per-tensor FP8 row packs GQA on the d128 flavor only (`pack_gqa_d_shapes = {(128, 128)}`: the
+    d192x128 / d256 / d512 siblings carry no PackGQA path) while it serves those flavors UNPACKED.  This is the
+    typed decline behind `_skip_pack_gqa_wide_on_rubin` in test_sdpa_fwd_fp8_sm100.py -- the one Rubin marker that
+    survived retiring the d128-only-era skips -- so it is asserted on real facts here, where no GPU is needed: a
+    packed d192 / d256 / d512 graph is ineligible with a reason naming the knob, the same graph unpacked is eligible,
+    and packed d128 is eligible.  When a wider kernel gains PackGQA: widen the row, INVERT that shape's packed
+    assertion and drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert caps.pack_gqa_d_shapes == frozenset({(128, 128)})
+    for d_qk, d_v in ((192, 128), (256, 256), (512, 512)):
+        facts = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
+        assert engines.mismatch(caps, facts) is None, (d_qk, d_v, "the unpacked graph must be served")
+        why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+        assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
+    packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
+    assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+
+
+# The sm107 kernels that still raise at `compile()` on a DENSE strided Stats layout (`lse_stride` given, no padded
+# rows): the guard reads "strided Stats not ported (contiguous [B, H, S] only)".  The fp8 row's d128 / d192x128
+# kernels ported it (Rubin run 2026-09-23: test_fp8_strided_stats + test_fp8_strided_stats_other_flavors[d192_d128_*]
+# PASS on cc 10.7); the fp8 d256 / d512 kernels and every MXFP8 kernel did not.
+_SM107_STRIDED_STATS_NOT_PORTED = {
+    "fp8": {(256, 256), (512, 512)},
+    "mxfp8": {(128, 128), (192, 128), (256, 256), (512, 512)},
+}
+
+
+def test_sm107_fp8_strided_stats_is_not_ported_beyond_d192():
+    """A Capabilities GAP, pinned so it is visible: the sm107 per-tensor FP8 row declares Stats on all four flavors and
+    `engines.mismatch` admits any dense-compatible Stats layout (`ga.dense_layout_ok`, no per-flavor field), but the
+    d256 and d512 sm107 fp8 kernels raise `NotImplementedError("strided Stats not ported ...")` from `compile()` on a
+    strided dense layout -- so on cc 10.7 the pinned engine dies at build_plans on `test_fp8_d256_strided_stats`
+    (measured 2026-09-23; that test carries `_skip_strided_stats_d256_on_rubin` with this reason).  The raise is at
+    the top of `compile()`, before any JIT work, so this is host-only.  The d128 / d192x128 kernels take the layout.
+    Follow-up (not this PR): port strided Stats to the d256 / d512 fp8 kernels (the d256 f16 sibling's `lse_strides`
+    is the model) OR declare the layout per flavor on the row; then INVERT the raise assertion for that shape and
+    drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert not any(f.startswith("stats_layout") or f.startswith("strided_stats") for f in caps.__dataclass_fields__), "a per-flavor field exists now: use it"
+    fp8_kw = dict(_DTYPE_FAMILIES[1][1])
+    for flavor in _FLAVORS:
+        mod = _load(flavor, rubin=True, **fp8_kw)
+        d_qk, d_v = flavor
+        sq = 128
+        strided = (sq * 4 * 2, sq * 2, 2)  # any declared (B, H, S) stride: the guard fires on `is not None`
+        with open(mod.__file__, encoding="utf-8") as fh:
+            has_guard = "strided Stats not ported" in _code_lines(fh.read())
+        if flavor in _SM107_STRIDED_STATS_NOT_PORTED["fp8"]:
+            assert has_guard, f"{mod.__name__}: the guard is gone -- strided Stats ported?  Invert this arm and drop the marker."
+            with pytest.raises(NotImplementedError, match="strided Stats not ported"):
+                mod.compile(b=2, qh=4, kh=2, sq=sq, skv=128, d_qk=d_qk, d_v=d_v, has_lse=True, lse_stride=strided)
+        else:
+            assert not has_guard, f"{mod.__name__}: a strided-Stats guard appeared on a flavor that had ported it"
+    for flavor in _FLAVORS:
+        mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[2][1])
+        with open(mod.__file__, encoding="utf-8") as fh:
+            assert ("strided Stats not ported" in _code_lines(fh.read())) == (flavor in _SM107_STRIDED_STATS_NOT_PORTED["mxfp8"]), mod.__name__
+
+
 def test_sm107_rows_carry_the_padded_stats_trim():
     """Every Rubin template carries the per-batch seq_len_q trim (padded q
     rows write LSE=-inf, O=0), so the rows serve dense padded Stats and the
