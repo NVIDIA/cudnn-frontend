@@ -23,10 +23,12 @@ template-file selection."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 
-from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
+from . import arch_family
+from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain, MoeSwapAbSpec, swap_ab as swap_ab_graph
 from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
 
@@ -48,6 +50,25 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm120": ((100, 130),),
 }
 
+# The per-arch SOURCE TREE (``cudnn/gemm/frost/<family>/``, see ``arch_family``)
+# a pipeline family's templates ship in. sm103 is a tcgen05 pipeline and rides
+# the sm100 tree. A new pipeline needs an entry here AND in PIPELINE_ARCH_RANGES.
+PIPELINE_FAMILY: dict[str, str] = {
+    "sm100": "sm100",
+    "sm103": "sm100",
+    "sm120": "sm120",
+}
+
+
+def template_path(template_file: str) -> Path:
+    """Where ``template_file`` ships: the ``kernel_templates/`` of the arch tree
+    its pipeline prefix names (:data:`PIPELINE_FAMILY`). Resolved off the
+    TEMPLATE, not off whichever compiler copy is running, because one family may
+    render another's template where both run (an sm120 config on an SM 10.x
+    part, or a render-only host with no GPU at all)."""
+    return arch_family.template_dir(PIPELINE_FAMILY[_pipeline_from_file(template_file)]) / template_file
+
+
 # SM ranges whose dense FP8 / block-scale MMA issues a 64-byte K (half the
 # instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
 # kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
@@ -68,12 +89,16 @@ class GraphType(Enum):
     MATMUL = "matmul"
     BLOCK_SCALE_MATMUL = "block_scale_matmul"
     MOE = "moe"
-    MOE_BLOCK_SCALE = "moe_block_scale"  # MoE grouped matmul, block-scaled inputs
+    MOE_SWAP_AB = "moe_grouped_matmul_swap_ab"
+    MOE_BLOCK_SCALE = "moe_block_scale"
+    MOE_BLOCK_SCALE_SWAP_AB = "moe_grouped_block_scale_matmul_swap_ab"
     CONVOLUTION = "convolution"  # placeholder — no template yet
 
 
 def classify_graph_type(chain: FusionChain) -> GraphType:
     """Stage-1 classifier: which graph type this chain is."""
+    if isinstance(chain.moe, MoeSwapAbSpec):
+        return GraphType.MOE_BLOCK_SCALE_SWAP_AB if chain.has_block_scale else GraphType.MOE_SWAP_AB
     if chain.has_moe and chain.has_block_scale:
         return GraphType.MOE_BLOCK_SCALE
     if chain.has_block_scale:
@@ -173,7 +198,9 @@ _MATMUL_CASES = frozenset(
 # lookups fold to the base graph type, so MMA_TYPE_SUPPORT never carries MoE rows.
 _MMA_BASE_GRAPH_TYPE: dict[GraphType, GraphType] = {
     GraphType.MOE: GraphType.MATMUL,
+    GraphType.MOE_SWAP_AB: GraphType.MATMUL,
     GraphType.MOE_BLOCK_SCALE: GraphType.BLOCK_SCALE_MATMUL,
+    GraphType.MOE_BLOCK_SCALE_SWAP_AB: GraphType.BLOCK_SCALE_MATMUL,
 }
 
 # Per-graph-type mma-type key extractors (key SHAPES differ per graph type, so
@@ -294,7 +321,7 @@ class KernelTemplate:
     it is a TileConfig axis, and which modes a pipeline issues is a fact of the
     config family (``_CTA_GROUPS_BY_PIPELINE``), not of the template."""
 
-    file: str  # template filename under kernel_templates/
+    file: str  # template filename; ships under <family>/kernel_templates/ (see template_path)
     pipeline: str  # pipeline family from the filename; pairs with config_<pipeline>
     graph_type: GraphType  # the single graph type this template supports
     # ``None`` = take the config's. The warp count is a config axis; a template
@@ -316,7 +343,19 @@ class KernelTemplate:
         return self.graph_type in (
             GraphType.BLOCK_SCALE_MATMUL,
             GraphType.MOE_BLOCK_SCALE,
+            GraphType.MOE_BLOCK_SCALE_SWAP_AB,
         )
+
+    @property
+    def family(self) -> str:
+        """The arch tree (``cudnn/gemm/frost/<family>/``) whose compiler renders
+        this template (:data:`PIPELINE_FAMILY`); every other tree declines it."""
+        return PIPELINE_FAMILY[self.pipeline]
+
+    @property
+    def path(self) -> Path:
+        """The template source on disk (:func:`template_path`)."""
+        return template_path(self.file)
 
     # stage 0: active-GPU SM ranges (from the template's pipeline-family prefix)
 
@@ -513,6 +552,10 @@ def _mm(
         raise KeyError(
             f"template {file!r}: pipeline family {pipeline!r} has no SM-range entry in " f"PIPELINE_ARCH_RANGES — add one when introducing a new family"
         )
+    if pipeline not in PIPELINE_FAMILY:
+        raise KeyError(
+            f"template {file!r}: pipeline family {pipeline!r} has no arch-tree entry in " f"PIPELINE_FAMILY — say which cudnn/gemm/frost/<family>/ it ships in"
+        )
     cls = template_cls or (MainloopKernelTemplate if supports_mainloop_fusion else KernelTemplate)
     return cls(
         file=file,
@@ -545,6 +588,16 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
+        "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.MOE_SWAP_AB,
+    ),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+        smem_fixed_reserve=4096,
+        graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+    ),
+    _mm(
         "sm103_block_scale_matmul.py",
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
@@ -557,6 +610,22 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     _mm(
         "sm120_block_scale_matmul.py",
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # The warp-MMA MoE kernel: grouped persistent scheduler, A addressed by
+        # coordinate on one global descriptor (no tensormap scratch to reserve).
+        "sm120_moe_grouped_matmul_fwd.py",
+        graph_type=GraphType.MOE,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # Its block-scale sibling: the same scheduler carrying each group's first
+        # SFA block; A and SFA both addressed by coordinate.
+        "sm120_moe_grouped_block_scale_matmul_fwd.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE,
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),
@@ -573,12 +642,17 @@ _AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm100", "sm120")
 
 def preferred_pipeline(chain: FusionChain) -> str:
     """Pipeline family the auto path should build ``chain`` with: the first
-    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type
-    and whose SM range covers the active GPU. A graph type the newer family
-    does not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type,
+    whose SM range covers the active GPU, and whose arch tree is the one a
+    process on that GPU runs (:func:`arch_family.serving_family` -- each tree's
+    compiler renders only its own family). A graph type the newer family does
+    not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    from . import compiler as C
+
     gt = classify_graph_type(chain)
+    family = arch_family.serving_family(C._current_arch())
     for pipeline in _AUTO_PIPELINE_ORDER:
-        if any(t.pipeline == pipeline and t.graph_type is gt and t.arch_active_reject() is None for t in TEMPLATES):
+        if any(t.pipeline == pipeline and t.graph_type is gt and t.family == family and t.arch_active_reject() is None for t in TEMPLATES):
             return pipeline
     return _AUTO_PIPELINE_ORDER[-1]
 
@@ -588,7 +662,9 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     block-scale MMA halves the instruction count at a wide tile, so take it
     whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
     asks the arch and not the config family. Everything else stays at 32."""
-    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE):
+    mm = chain.matmul
+    dense_fp8 = mm.a_dtype.startswith("fp8_") and mm.b_dtype.startswith("fp8_")
+    if not dense_fp8 and classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
         return 32
     from . import compiler as C
 
@@ -635,10 +711,17 @@ def select_template(
     raise ValueError(f"ambiguous template match (registry bug): {[t.file for t in matches]}")
 
 
-def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:
+def candidates(chain: FusionChain, *, sweep_swap_ab: bool = False) -> list[tuple[KernelTemplate, TileConfig]]:
     """Traversal-mode candidate set for ``chain`` via the funnel. Each accepted
     (template, geometry) is a JIT-able point; one geometry expands across the
     templates that accept it ({1,2}ctamma, etc.)."""
+    if sweep_swap_ab:
+        out = candidates(chain)
+        try:
+            swapped = swap_ab_graph(chain)
+        except (ValueError, NotImplementedError):
+            return out
+        return out + [(template, replace(config, swap_ab=True)) for template, config in candidates(swapped)]
     gt = classify_graph_type(chain)
     tmpls = [t for t in TEMPLATES if t.graph_type is gt]  # stage 1
     if not tmpls:

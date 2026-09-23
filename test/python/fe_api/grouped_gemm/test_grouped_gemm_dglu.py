@@ -15,12 +15,18 @@ from unittest.mock import Mock
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
+    RUBIN_MXFP8_CUSTOM,
+    RUBIN_MXFP8_DEFAULTS,
+    RUBIN_MXFP8_DSV4,
+    rubin_mxfp8_weight_arguments,
     grouped_gemm_swiglu_init,
     allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
 )
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_dswiglu_utils import (
+    make_rubin_mxfp8_dglu_problem,
+    check_rubin_mxfp8_dglu_quantized,
     GROUPED_GEMM_DSWIGLU_COMMON_MARKS,
     GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS,
     with_grouped_gemm_dswiglu_params_fp4,
@@ -956,8 +962,9 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_m_cache_behavior(request, monk
     if use_full_dynamic:
         monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
     else:
-        monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "0")
 
+    monkeypatch.setattr(grouped_gemm_dglu_api, "_dglu_wrapper_memo", {})
     grouped_gemm_dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -1055,6 +1062,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_nk_cache_behavior(request, mon
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    monkeypatch.setattr(grouped_gemm_dglu_api, "_dglu_wrapper_memo", {})
     grouped_gemm_dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -1586,6 +1594,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper_dynamic_m_cache_behavior(request, m
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
+    monkeypatch.setattr(grouped_gemm_dglu_api, "_dglu_wrapper_memo", {})
     grouped_gemm_dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -2414,3 +2423,164 @@ def test_grouped_gemm_dglu_bf16_rejects_sf_fp8_dtype_override():
     cudnn.grouped_gemm_dglu_wrapper_sm100(**kwargs, sf_fp8_dtype_override=None)
     with pytest.raises(ValueError, match="BF16 forbids scale control sf_fp8_dtype_override"):
         cudnn.grouped_gemm_dglu_wrapper_sm100(**kwargs, sf_fp8_dtype_override="e5m3")
+
+
+# =============================================================================
+# Focused Rubin MXFP8 clamped GLU regression tests
+# =============================================================================
+
+
+@pytest.fixture
+def require_rubin_mxfp8():
+    """Gate only the explicitly marked Rubin regressions, not the generic suite."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires Rubin SM107")
+
+
+def _make_rubin_mxfp8_dglu_api(p, parameters, vector_f32):
+    api = cudnn.GroupedGemmDgluSm100(
+        sample_a=p["a"],
+        sample_c=p["c"],
+        sample_d_row=p["d_row"],
+        sample_d_col=p["d_col"],
+        sample_sfa=p["sfa"],
+        sample_padded_offsets=p["offsets"],
+        sample_alpha=p["alpha"],
+        sample_beta=p["beta"],
+        sample_prob=p["prob"],
+        sample_dprob=p["dprob"],
+        sample_sfd_row=p["sfd_row"],
+        sample_sfd_col=p["sfd_col"],
+        sample_amax=p["amax"],
+        sample_norm_const=p["norm"],
+        act_func="dgeglu",
+        sf_vec_size=32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        vector_f32=vector_f32,
+        **rubin_mxfp8_weight_arguments(p, samples=True),
+        **parameters,
+    )
+    assert api.check_support()
+    assert api._implementation._is_rubin_kernel
+    assert api._implementation._kernel.__module__.endswith("moe_blockscaled_grouped_gemm_dglu_rubin")
+    api.compile()
+    return api
+
+
+def _execute_rubin_mxfp8_dglu(api, p):
+    from cuda.bindings import driver as cuda
+
+    p["dprob"].zero_()
+    p["amax"].fill_(float("-inf"))
+    api.execute(
+        a_tensor=p["a"],
+        c_tensor=p["c"],
+        d_row_tensor=p["d_row"],
+        d_col_tensor=p["d_col"],
+        sfa_tensor=p["sfa"],
+        padded_offsets=p["offsets"],
+        alpha_tensor=p["alpha"],
+        beta_tensor=p["beta"],
+        prob_tensor=p["prob"],
+        dprob_tensor=p["dprob"],
+        sfd_row_tensor=p["sfd_row"],
+        sfd_col_tensor=p["sfd_col"],
+        amax_tensor=p["amax"],
+        norm_const_tensor=p["norm"],
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        **rubin_mxfp8_weight_arguments(p),
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L0
+@pytest.mark.parametrize("parameters", [RUBIN_MXFP8_DSV4, {}], ids=["dsv4", "default-nonunit-gemm-alpha"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_dgeglu_smoke(parameters):
+    p = make_rubin_mxfp8_dglu_problem(discrete=False)
+    api = _make_rubin_mxfp8_dglu_api(p, parameters, vector_f32=False)
+    _execute_rubin_mxfp8_dglu(api, p)
+    check_rubin_mxfp8_dglu_quantized(p, parameters)
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L1
+@pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar", "packed"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_dgeglu_gradients(discrete, vector_f32, monkeypatch):
+    import cutlass.cute as cute
+
+    p = make_rubin_mxfp8_dglu_problem(discrete=discrete)
+    for parameters in (RUBIN_MXFP8_DSV4, RUBIN_MXFP8_DEFAULTS, RUBIN_MXFP8_CUSTOM):
+        api = _make_rubin_mxfp8_dglu_api(p, parameters, vector_f32)
+        _execute_rubin_mxfp8_dglu(api, p)
+        check_rubin_mxfp8_dglu_quantized(p, parameters)
+        saved = p["d_row"].clone()
+        saved_dprob = p["dprob"].clone()
+        compiled = api._implementation._compiled_kernel
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail("Executing the same specialized dGLU object must reuse its kernel")
+
+        with monkeypatch.context() as scope:
+            scope.setattr(cute, "compile", unexpected_compile)
+            p["beta"].mul_(2.0)
+            _execute_rubin_mxfp8_dglu(api, p)
+        torch.testing.assert_close(p["d_row"].float(), saved.float(), rtol=0, atol=0)
+        torch.testing.assert_close(p["dprob"], saved_dprob, rtol=2e-6, atol=2e-4)
+        assert api._implementation._compiled_kernel is compiled
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L1
+@pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_dgeglu_wrapper_quantization_cache(discrete, monkeypatch):
+    from cuda.bindings import driver as cuda
+    from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
+
+    p = make_rubin_mxfp8_dglu_problem(discrete=discrete)
+    monkeypatch.setattr(dglu_api, "_cache_of_GroupedGemmDgluSm100Objects", {})
+    monkeypatch.setattr(dglu_api, "_dglu_wrapper_memo", {})
+    original_compile = cudnn.GroupedGemmDgluSm100.compile
+    compile_count = 0
+
+    def count_compile(self, *args, **kwargs):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(self, *args, **kwargs)
+
+    monkeypatch.setattr(cudnn.GroupedGemmDgluSm100, "compile", count_compile)
+    weights = rubin_mxfp8_weight_arguments(p)
+    if discrete:
+        weights.update(n=p["n"], b_dtype=p["a"].dtype)
+    common = dict(
+        a_tensor=p["a"],
+        c_tensor=p["c"],
+        sfa_tensor=p["sfa"],
+        padded_offsets=p["offsets"],
+        alpha_tensor=p["alpha"],
+        beta_tensor=p["beta"],
+        prob_tensor=p["prob"],
+        dprob_tensor=p["dprob"],
+        norm_const_tensor=p["norm"],
+        d_dtype=torch.float8_e4m3fn,
+        act_func="dgeglu",
+        sf_vec_size=32,
+        cluster_shape_mn=(2, 1),
+        vector_f32=True,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        **weights,
+    )
+    for parameters, expected_compiles in ((RUBIN_MXFP8_DSV4, 1), ({}, 2), (RUBIN_MXFP8_CUSTOM, 3), (RUBIN_MXFP8_DSV4, 3), (RUBIN_MXFP8_DEFAULTS, 3)):
+        p["dprob"].zero_()
+        output = cudnn.grouped_gemm_dglu_wrapper_sm100(**common, **parameters)
+        torch.cuda.synchronize()
+        assert compile_count == expected_compiles, "dGLU cache must specialize parameter values and reuse repeated configurations"
+        for name in ("d_row", "d_col", "sfd_row", "sfd_col"):
+            p[name] = output[f"{name}_tensor"]
+        p["amax"] = output["amax_tensor"]
+        check_rubin_mxfp8_dglu_quantized(p, parameters)

@@ -32,7 +32,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.buffers import DTYPE_ITEMSIZE, DeviceView, data_ptr
+from cudnn.frost.buffers import DeviceView
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import (
@@ -57,7 +57,7 @@ CHAIN_MIN_PIECES_REVERSE = 2
 CHAIN_MAX_PIECES = 16
 LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
-CU_DTYPES = ("int32", "int64")
+DV_SPLIT_TILES = 2
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -82,6 +82,15 @@ def dtype_name(dtype) -> str:
 # ---- piece rule -----------------------------------------------------------------------------------
 
 
+def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+    """The one-wave slot budget of a plan without ``batch_invariant``: ``num_sm // tiles`` capped at ``CHAIN_MAX_PIECES``
+    and at ``CHAIN_MIN_UNITS_PER_PIECE`` units of ``unit_chunks`` chunks per piece."""
+    num_seqs = max(1, int(num_seqs))
+    tiles = num_seqs * max(1, int(heads_out))
+    total_chunks = -(-(int(total_tokens) * max(1, int(expand_num))) // int(b_t))
+    return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
+
+
 def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
@@ -103,13 +112,22 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
-    num_seqs = max(1, int(num_seqs))
-    tiles = num_seqs * max(1, int(heads_out))
-    total_chunks = -(-(int(total_tokens) * expand_num) // b_t)
-    pieces = min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * unit_chunks))
+    pieces = piece_budget(
+        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+    )
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
     return 0, unit_chunks
+
+
+def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
+    """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
+    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
+    is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
+    budget = piece_budget(
+        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+    )
+    return budget == DV_SPLIT_TILES and int(dim_v) == 128
 
 
 # ---- piece table ----------------------------------------------------------------------------------
@@ -139,13 +157,8 @@ def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTable
     return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, num_seqs * int(pieces) * int(heads_out), nbytes)
 
 
-def piece_table_workspace_bytes(num_seqs: int, pieces: int, heads_out: int) -> int:
-    """Total bytes of the piece-table workspace (``piece_table_layout(...).nbytes``)."""
-    return piece_table_layout(num_seqs, pieces, heads_out).nbytes
-
-
 @cute.jit
-def span_chunks_of(unit_chunks: cutlass.Constexpr[int], total_chunks, slots):
+def chunks_per_slot(unit_chunks: cutlass.Constexpr[int], total_chunks, slots):
     """Chunks per slot when ``total_chunks`` are shared by ``slots`` slots: ``ceil(total_chunks / slots)`` rounded up to a
     whole number of ``unit_chunks``, at least one unit."""
     span = (total_chunks + slots - cutlass.Int32(1)) // slots
@@ -156,7 +169,7 @@ def span_chunks_of(unit_chunks: cutlass.Constexpr[int], total_chunks, slots):
 
 @cute.jit
 def piece_count(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
@@ -176,7 +189,7 @@ def piece_count(
 
 @cute.jit
 def piece_span(
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
@@ -200,32 +213,14 @@ def piece_span(
 
 
 @cute.jit
-def cta_sum(value, sWarp, lane, warp, num_warps: cutlass.Constexpr[int]):
-    """CTA-wide sum of one Int32 per thread, returned to every thread; ``sWarp`` holds ``num_warps`` words and is free
-    again on return (two CTA barriers)."""
-    incl = value
-    for off in [1, 2, 4, 8, 16]:
-        other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, incl, off, 0, kind=nvvm.Shfl.UP))
-        incl = incl + (other if lane >= cutlass.Int32(off) else cutlass.Int32(0))
-    if lane == cutlass.Int32(31):
-        sWarp[warp] = incl
-    nvvm.barrier_cta_sync()
-    total = cutlass.Int32(0)
-    for w in cutlass.range_constexpr(num_warps):
-        total = total + sWarp[w]
-    nvvm.barrier_cta_sync()
-    return total
-
-
-@cute.jit
 def piece_table_body(
     n_threads: cutlass.Constexpr[int],
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     tidx,
     num_seqs: cutlass.Int32,
     mCu: cute.Tensor,
@@ -258,7 +253,7 @@ def piece_table_body(
     # ---- the slot span: one wave shared by the whole batch, guarded against the per-sequence ceilings ----------------
     total_chunks = (total_tokens * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
     wave = num_seqs * cutlass.Int32(pieces)
-    span_chunks = span_chunks_of(unit_chunks, total_chunks, wave)
+    span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave)
     if cutlass.const_expr(not length_rule):
         if num_seqs > cutlass.Int32(1):
             taken = cutlass.Int32(0)
@@ -271,10 +266,22 @@ def piece_table_body(
                     b_read = b if valid else num_seqs - cutlass.Int32(1)
                     length = cutlass.Int32(mCu[b_read + 1]) - cutlass.Int32(mCu[b_read])
                 count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks)
-                taken = taken + cta_sum(count if valid else cutlass.Int32(0), sWarpMain, lane, warp, num_warps)
+                # ---- CTA sum of the counts: warp scan, lane 31 parks the warp total, every thread adds the words ----
+                inclusive = count if valid else cutlass.Int32(0)
+                for offset in [1, 2, 4, 8, 16]:
+                    other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, inclusive, offset, 0, kind=nvvm.Shfl.UP))
+                    inclusive = inclusive + (other if lane >= cutlass.Int32(offset) else cutlass.Int32(0))
+                if lane == cutlass.Int32(31):
+                    sWarpMain[warp] = inclusive
+                nvvm.barrier_cta_sync()
+                total = cutlass.Int32(0)
+                for i in cutlass.range_constexpr(num_warps):
+                    total = total + sWarpMain[i]
+                nvvm.barrier_cta_sync()
+                taken = taken + total
                 probe_start = probe_start + cutlass.Int32(n_threads)
             if taken > wave:
-                span_chunks = span_chunks_of(unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1))
+                span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1))
 
     running_main = cutlass.Int32(0)
     running_summary = cutlass.Int32(0)
@@ -353,11 +360,11 @@ def piece_table_body(
 
 @cute.kernel
 def frost_state_chain(
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     transpose: cutlass.Constexpr[bool],
     has_seed: cutlass.Constexpr[bool],
     has_tail: cutlass.Constexpr[bool],
@@ -370,6 +377,7 @@ def frost_state_chain(
     mTail: cute.Tensor | None,
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
+    mSeedIndices: cute.Tensor | None,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -380,8 +388,8 @@ def frost_state_chain(
     ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is walked."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
-    HO = cutlass.const_expr(heads_out)
-    P = cutlass.const_expr(pieces)
+    HO = heads_out
+    P = pieces
     product_rows = cutlass.const_expr(K * rows // V if emit_summary else 0)
     walk_state = cutlass.const_expr(has_seed or has_tail or not emit_summary)
     cols_per_lane = cutlass.const_expr(K // CHAIN_LANES)
@@ -405,6 +413,9 @@ def frost_state_chain(
     bid = cute.arch.block_idx()
     seq = cutlass.Int32(bid[0])
     h = cutlass.Int32(bid[1])
+    seed_seq = seq
+    if cutlass.const_expr(mSeedIndices is not None):
+        seed_seq = cutlass.Int32(mSeedIndices[seq])
     row0 = cutlass.Int32(bid[2]) * cutlass.Int32(rows)
     product_row0 = cutlass.Int32(bid[2]) * cutlass.Int32(product_rows)
 
@@ -439,7 +450,7 @@ def frost_state_chain(
                 if cutlass.const_expr(has_seed):
                     seed_state_row = row0 + seed_row
                     seed_offset = (
-                        cutlass.Int64(seq) * cutlass.Int64(mSeed.stride[0])
+                        cutlass.Int64(seed_seq) * cutlass.Int64(mSeed.stride[0])
                         + cutlass.Int64(h) * cutlass.Int64(mSeed.stride[1])
                         + cutlass.Int64(seed_state_row) * cutlass.Int64(mSeed.stride[2])
                         + cutlass.Int64(col0)
@@ -485,7 +496,7 @@ def frost_state_chain(
             if cutlass.const_expr(has_seed):
                 seed_state_row = row0 + seed_row
                 seed_offset = (
-                    cutlass.Int64(seq) * cutlass.Int64(mSeed.stride[0])
+                    cutlass.Int64(seed_seq) * cutlass.Int64(mSeed.stride[0])
                     + cutlass.Int64(h) * cutlass.Int64(mSeed.stride[1])
                     + cutlass.Int64(seed_state_row) * cutlass.Int64(mSeed.stride[2])
                     + cutlass.Int64(col0)
@@ -793,11 +804,11 @@ def frost_state_chain(
 
 @cute.jit
 def launch_state_chain(
-    heads_out: cutlass.Constexpr[int],
+    heads_out: cutlass.Int32,
     dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
-    pieces: cutlass.Constexpr[int],
+    pieces: cutlass.Int32,
     transpose: cutlass.Constexpr[bool],
     has_seed: cutlass.Constexpr[bool],
     has_tail: cutlass.Constexpr[bool],
@@ -810,11 +821,29 @@ def launch_state_chain(
     mTail: cute.Tensor | None,
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
+    mSeedIndices: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
     frost_state_chain(
-        heads_out, dim_v, dim_k, rows, pieces, transpose, has_seed, has_tail, emit_summary, num_seqs, mH, mM, mX, mSeed, mTail, mSummaryM, mMainRows
+        heads_out,
+        dim_v,
+        dim_k,
+        rows,
+        pieces,
+        transpose,
+        has_seed,
+        has_tail,
+        emit_summary,
+        num_seqs,
+        mH,
+        mM,
+        mX,
+        mSeed,
+        mTail,
+        mSummaryM,
+        mMainRows,
+        mSeedIndices,
     ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -839,6 +868,7 @@ class CompiledStateChain(NamedTuple):
     tail_dtype: str
     summary_dtype: str
     device: int
+    has_seed_indices: bool
 
 
 def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
@@ -866,12 +896,17 @@ def build_state_chain(
     tail_dtype="float32",
     summary_dtype="float32",
     device,
+    opt_level,
+    has_seed_indices=False,
 ) -> CompiledStateChain:
-    """Compile (cached per geometry, flags, dtypes and device) the chain over ``pieces`` slots per sequence, ``rows_per_cta``
+    """Compile (cached per state geometry, flags, dtypes, device and ``opt_level``, the family's main-kernel level so the
+    standalone chain is the one its hosts nest; ``heads_out`` and ``pieces`` are launch arguments and
+    every tensor's layout is dynamic) the chain over ``pieces`` slots per sequence, ``rows_per_cta``
     state rows per CTA (default ``dim_v // 8``).  ``filled_only`` binds the piece table's ``main_rows``; without ``has_tail``
     and ``emit_summary`` one-slot sequences receive the seed copy and only multi-piece sequences are summarized, with
     either every filled slot carries a summary and the tail / product come out of the one-slot walk too.
-    ``summary_dtype`` is the dtype of ``summary_m`` (fp32 or bf16, round to nearest even)."""
+    ``summary_dtype`` is the dtype of ``summary_m`` (fp32 or bf16, round to nearest even); ``has_seed_indices`` binds an int32
+    ``[num_seqs]`` table naming the row of ``seed`` each sequence reads."""
     HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
     rows = V // 8 if rows_per_cta is None else int(rows_per_cta)
     walk_state = bool(has_seed or has_tail or not emit_summary)
@@ -879,10 +914,8 @@ def build_state_chain(
     tail_name = dtype_name(tail_dtype) if has_tail else "float32"
     summary_name = dtype_name(summary_dtype) if emit_summary else "float32"
     key = (
-        HO,
         V,
         K,
-        P,
         rows,
         bool(transpose),
         bool(has_seed),
@@ -893,49 +926,36 @@ def build_state_chain(
         tail_name,
         summary_name,
         int(device),
+        int(opt_level),
+        bool(has_seed_indices),
     )
     if key not in state_chain_cache:
         state_chain_cache[key] = cute.compile(
             launch_state_chain,
-            HO,
+            cutlass.Int32(HO),
             V,
             K,
             rows,
-            P,
+            cutlass.Int32(P),
             bool(transpose),
             bool(has_seed),
             bool(has_tail),
             bool(emit_summary),
             cutlass.Int32(1),
-            (
-                from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_compact_shape_dynamic(
-                    mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-                )
-                if walk_state
-                else None
-            ),
-            from_dlpack(DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-            ),
-            (
-                from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_compact_shape_dynamic(
-                    mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-                )
-                if walk_state
-                else None
-            ),
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
+            from_dlpack(DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
             from_dlpack(DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
             from_dlpack(DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_tail else None,
             (
-                from_dlpack(DeviceView(256, (1, HO, K, K), summary_name, int(device)), assumed_align=16).mark_compact_shape_dynamic(
-                    mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-                )
+                from_dlpack(DeviceView(256, (1, HO, K, K), summary_name, int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
                 if emit_summary
                 else None
             ),
             from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if filled_only else None,
+            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
             cuda.CUstream(0),
-            options="--enable-tvm-ffi",
+            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
     return CompiledStateChain(
         state_chain_cache[key],
@@ -953,16 +973,20 @@ def build_state_chain(
         tail_name,
         summary_name,
         int(device),
+        bool(has_seed_indices),
     )
 
 
-def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None) -> None:
+def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None) -> None:
     """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
     (None for a product-only chain), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``, ``seed`` / ``tail`` ``[num_seqs, HO, V, K]``
     and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when not built), the piece table's ``main_rows``
-    int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in sequence order)."""
+    int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in sequence order), ``seed_indices`` int32 ``[num_seqs]`` when
+    built with ``has_seed_indices``."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(
+        int(compiled.heads_out),
+        int(compiled.pieces),
         int(num_seqs),
         H if walk_state else None,
         M,
@@ -971,6 +995,7 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
         tail if compiled.has_tail else None,
         summary_m if compiled.emit_summary else None,
         main_rows if compiled.filled_only else None,
+        seed_indices if compiled.has_seed_indices else None,
         cuda.CUstream(int(stream)),
     )
 

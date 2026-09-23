@@ -168,6 +168,7 @@ def _run_case(
     scale: float | None = None,
     with_sink: bool = False,
     check_stats: bool = False,
+    stats_use_log2: bool = False,
     pack_gqa: bool | None = None,
     stats_layout: str = "contiguous",
 ) -> None:
@@ -194,12 +195,15 @@ def _run_case(
         pack_gqa=pack_gqa,
         scale=scale,
         return_stats=check_stats,
+        stats_use_log2=stats_use_log2,
         stats_layout=stats_layout,
         **mask_kwargs,
     )
     if check_stats:
         output, stats = result
         expected, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **mask_kwargs)
+        if stats_use_log2:
+            expected_lse = expected_lse * math.log2(math.e)
         torch.testing.assert_close(stats.squeeze(-1), expected_lse, atol=2e-2, rtol=2e-2)
     else:
         output = result
@@ -246,6 +250,7 @@ def _run_dsl_graph(
     kv_tile: int | None = None,
     pack_gqa: bool | None = None,
     return_stats: bool = False,
+    stats_use_log2: bool = False,
     stats_layout: str = "contiguous",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
@@ -284,6 +289,8 @@ def _run_dsl_graph(
         "generate_stats": return_stats,
         "attn_scale": scale,
     }
+    if stats_use_log2:
+        sdpa_kwargs["stats_use_log2"] = True
     variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu}
 
     _apply_mask_kwargs(
@@ -709,11 +716,12 @@ def test_dsl_sm120_fully_masked_rows():
     ],
     ids=["dense", "causal", "causal_br", "causal_swa"],
 )
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
 @torch_fork_set_rng(seed=13)
-def test_dsl_sm120_stats(mask_kwargs):
-    """generate_stats=True: the Stats output matches the natural-log LSE."""
+def test_dsl_sm120_stats(mask_kwargs, stats_use_log2):
+    """generate_stats=True: the Stats output matches the LSE in the requested base."""
 
-    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, **mask_kwargs)
+    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, stats_use_log2=stats_use_log2, **mask_kwargs)
 
 
 @pytest.mark.L0
@@ -1863,3 +1871,55 @@ def test_dsl_sm120_d512_pack_gqa_sliding_window():
 def test_dsl_sm120_d512_long_causal_bf16():
     """A multi-wave causal grid on an MQA head layout at head_dim 512 (bf16)."""
     _run_case(batch=1, h_q=16, h_kv=1, s_q=2048, s_kv=2048, head_dim=512, dtype=torch.bfloat16, is_causal=True, check_stats=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm120_thd_padded_stats_execute_checks_the_buffer():
+    """The f16 THD path binds a per-batch padded Stats buffer through the
+    DECLARED (b, h, s_max) strides and seeds it with -inf; execute() must
+    reject a buffer that is not exactly B*H_q*s_max fp32 values BEFORE the
+    seed (a 60-byte bf16 buffer would otherwise take a 120-byte fp32 fill)."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 2, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    assert api.check_support() and api.thd_stats_padded
+    api.compile()
+    bad_dtype = lse.to(torch.bfloat16)
+    with pytest.raises(ValueError, match="lse_tensor must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=bad_dtype)
+    torch.cuda.synchronize()
+    assert torch.isnan(bad_dtype).all()  # rejected before the seed: an fp32 -inf fill would have left 0 / -inf bf16 pairs
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=o,
+            seq_q_lens=lens,
+            seq_kv_lens=lens,
+            lse_tensor=torch.empty(b, h, s + 1, dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="padded lse_tensor must have"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
+    with pytest.raises(ValueError, match="lse_tensor must be on"):  # a host pointer would reach the raw CUDA fill
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+    torch.cuda.synchronize()
+    for i, n in enumerate(lens.tolist()):
+        assert torch.isfinite(lse[i, :, :n]).all(), f"batch {i}: valid rows not written"
+        assert torch.isneginf(lse[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
+@torch_fork_set_rng(seed=13)
+def test_dsl_sm120_wide_stats(head_dim, stats_use_log2):
+    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=head_dim, check_stats=True, stats_use_log2=stats_use_log2, is_causal=True)

@@ -1996,8 +1996,9 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
     std::optional<bool> generate_stats;
-    bool alibi_mask   = false;
-    bool padding_mask = false;
+    bool stats_use_log2 = false;
+    bool alibi_mask     = false;
+    bool padding_mask   = false;
     std::optional<int64_t> left_bound;
     std::optional<int64_t> right_bound;
     DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
@@ -2088,6 +2089,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    inputs,
                                    outputs,
                                    generate_stats,
+                                   stats_use_log2,
                                    alibi_mask,
                                    padding_mask,
                                    dropout_probability,
@@ -2104,6 +2106,16 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_generate_stats(bool const value) {
         generate_stats = value;
+        return *this;
+    }
+
+    /// Convert the "Stats" (LSE) output from cuDNN's natural-log convention to base-2
+    /// ((max + ln(sum_exp)) * log2(e)), matching attention kernels
+    /// that fold log2(e) into their softmax scale. Only affects Stats; Max and Sum_exp (if
+    /// requested instead) remain in their natural units.
+    SDPA_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 
@@ -2822,11 +2834,19 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { S, Stats, Max, Sum_exp };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs)
+    // Emit Stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp). Only affects Stats.
+    bool stats_use_log2 = false;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs, stats_use_log2)
 
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
         inputs[Softmax_attributes::input_names::SINK] = value;
+        return *this;
+    }
+
+    Softmax_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 };

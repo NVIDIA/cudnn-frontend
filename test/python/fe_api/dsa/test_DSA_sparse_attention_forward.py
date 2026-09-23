@@ -884,6 +884,38 @@ def test_DSA_sparse_attention_forward_nondefault_stream_layout_normalization_run
 
 
 @pytest.mark.L1
+def test_DSA_sparse_attention_forward_graph_replay_uses_capture_stream():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    from cudnn import DSA
+
+    torch.manual_seed(1932)
+    q = torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    kv = torch.randn(73, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.arange(64, device="cuda", dtype=torch.int32).expand(2, -1).contiguous()
+    DSA.sparse_attention_forward_wrapper(q, kv, indices)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        DSA.sparse_attention_forward_wrapper(q, kv, indices)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = DSA.sparse_attention_forward_wrapper(q, kv, indices)
+
+    # A cached default-stream handle can silently capture an empty graph.
+    # Change the data and poison every output so replay must do real work.
+    kv.mul_(2)
+    for name in ("out", "max_logits", "lse"):
+        result[name].fill_(float("nan"))
+    graph.replay()
+    ref_out, ref_max, ref_lse, _ = ref_sparse_attention_forward(q, kv, None, indices, return_full=True)
+    torch.testing.assert_close(result["out"].float(), ref_out.float(), atol=8e-4, rtol=3.01 / 128)
+    torch.testing.assert_close(result["max_logits"], ref_max, atol=1e-6, rtol=2.01 / 65536)
+    torch.testing.assert_close(result["lse"], ref_lse, atol=1e-6, rtol=2.01 / 65536)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize(
     "num_heads,indexer_topk,logical_topk",
     [(64, 512, 576), (128, 1024, 1152)],

@@ -105,6 +105,10 @@ class KdaCakeEngine(BaseEngine):
             _decline("beta_guard is not supported")
         if facts.batch_invariant:
             _decline("batch_invariant is not supported (dynamic work-item scheduling)")
+        if facts.overwrite_initial_state:
+            _decline("overwrite_initial_state is not supported (dynamic work-item scheduling)")
+        if facts.has_state_indices:
+            _decline("state_indices is not supported (dynamic work-item scheduling)")
         if facts.gate_lower_bound is not None and facts.gate_lower_bound != LOWER_BOUND:
             _decline(f"gate_lower_bound is fixed at {LOWER_BOUND}, got {facts.gate_lower_bound}")
         if facts.scale is not None and not math.isclose(facts.scale, SCALE, rel_tol=1e-9, abs_tol=1e-12):

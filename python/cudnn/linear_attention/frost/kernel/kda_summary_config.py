@@ -17,7 +17,7 @@
 
 """KDA fused state-summary kernel config: fixed compile-time constants of the BT=16 schedule (H and M recurrences in
 lockstep on one 16-warp CTA per (piece, head)).  Derived SMEM / TMEM sizes and offsets are stamped by ``build_cfg`` in
-``kda_summary_f16.py``.  Target arch: Blackwell SM100 / SM103.
+``kda_summary_f16.py``.  Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass
@@ -32,10 +32,10 @@ class Cfg:
     # --- warp assignments (16 warps = 512 threads) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
-    SUPER_MMA_WARP_ID: int = 12
+    REGISTER_MMA_WARP_ID: int = 12
     TCGEN05_MMA_WARP_ID: int = 13
     TMA_WARP_ID: int = 14
-    SUPER_MMA_TWIN_WARP_ID: int = 15
+    REGISTER_MMA_TWIN_WARP_ID: int = 15
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 160

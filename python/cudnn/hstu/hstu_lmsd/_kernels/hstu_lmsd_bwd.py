@@ -215,7 +215,7 @@ class HSTULMSDBackward:
                         xh = _cm.fma(xf, rstd, norm_bias)
                         ln = _cm.fma(xh, rW_tiles[j][e].to(cutlass.Float32), rB_tiles[j][e].to(cutlass.Float32))
                         if const_expr(self.apply_u_silu):
-                            den = cutlass.Float32(1.0) + cute.arch.exp2(-uf * cutlass.Float32(LOG2E))
+                            den = cutlass.Float32(1.0) + cute.math.exp2(-uf * cutlass.Float32(LOG2E), fastmath=True)
                             sig = cute.arch.rcp_approx(den)
                             activated_u = uf * sig
                             dactivated_u = _cm.fma(activated_u, cutlass.Float32(1.0) - sig, sig)
@@ -264,8 +264,8 @@ class HSTULMSDBackward:
             for j in cutlass.range_constexpr(num_column_tiles):
                 vector_index = j * self.threads_per_row + thread_in_row
                 if const_expr(self.hidden_size % (self.threads_per_row * self.vector_size) == 0) or vector_index < self.hidden_size // self.vector_size:
-                    row_tile_coord = ((None, None), (0, j))
-                    tXgDX = thread_copy.partition_D(gDX_row[row_tile_coord])
+                    dx_tile_coord = ((None, None), (0, j))
+                    tXgDX = thread_copy.partition_D(gDX_row[dx_tile_coord])
                     rDX = cute.make_fragment_like(tXgDX)
                     for e in cutlass.range_constexpr(self.vector_size):
                         rDX[e] = (rDirectDX_tiles[j][e] + (rWdy_tiles[j][e] - (rXhat_tiles[j][e] * sum_xhat_wdy + sum_wdy)) * rstd).to(gX.element_type)

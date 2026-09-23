@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -10,6 +11,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import LoadCacheMode, OperandMajorMode, cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from typing import Tuple
 
@@ -267,12 +269,12 @@ class BlockSparseAttnBackwardSm100Blk64:
         )
         # (b, h, edge) -> (edge, (h, b))
         bucketed_k2q_indices = cute.make_tensor(bucketed_k2q_indices.iterator, cute.group_modes(cute.select(bucketed_k2q_indices.layout, mode=[2, 1, 0]), 1, 3))
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.dQ_major_mode = utils.LayoutEnum.from_tensor(dQ).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.Q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.dQ_major_mode = LayoutEnum.from_tensor(dQ).mma_major_mode()
+        self.K_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = LayoutEnum.from_tensor(dV).mma_major_mode()
         if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
         if cutlass.const_expr(self.dQ_major_mode != OperandMajorMode.K):
@@ -712,7 +714,7 @@ class BlockSparseAttnBackwardSm100Blk64:
             cpasync.prefetch_descriptor(tma_atom_V)
             cpasync.prefetch_descriptor(tma_atom_dO)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_Q_pipeline = self.make_and_init_load_mma_Q_pipeline(storage.load_mma_Q_mbar_ptr.data_ptr())
@@ -740,7 +742,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
 
         tmem_holding_buf = storage.tmem_holding_buf.ptr
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

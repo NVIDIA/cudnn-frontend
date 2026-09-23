@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
@@ -114,13 +114,15 @@ def _select_sm100_backend(
     max_topk: int = 0,
     device_capability: Optional[Tuple[int, int]] = None,
     deterministic: bool = False,
+    is_contiguous: bool = True,
 ) -> Tuple[str, int]:
     """Return the tuned SM100 kernel variant and its sparse-row tile size.
 
-    The two-CTA specialization is deliberately fail-closed.  It is selected
-    only for the Blackwell SM100/SM103 BF16 H128/D512 envelope validated by
-    its kernel; every other supported configuration retains the established
-    backend.  ``deterministic=True`` takes precedence over every tuned variant.
+    The two-CTA specializations are deliberately fail-closed.  They are
+    selected only for the Blackwell SM100/SM103 BF16 H128 envelopes validated
+    by their kernels (D512, and contiguous D576 with D_v512); every other
+    supported configuration retains the established backend.
+    ``deterministic=True`` takes precedence over every tuned variant.
     """
     if deterministic:
         # Deterministic execution always uses the generic M64 kernel: its
@@ -138,12 +140,29 @@ def _select_sm100_backend(
         and max_topk in (128, 512, 1024, 1152, 2048)
     ):
         return "h128_2cta_m64", 64
+    if (
+        device_capability in _BLACKWELL_CAPABILITIES
+        and dtype == torch.bfloat16
+        and num_heads == 128
+        and head_dim == 576
+        and head_dim_v == 512
+        and max_topk in (128, 512, 1024, 1152, 2048)
+        and is_contiguous
+    ):
+        # The D576 two-CTA plan launches without copies, so it only accepts
+        # contiguous inputs; strided inputs keep the generic path below.
+        return "h128_d576_2cta_m64", 64
     if num_heads == 16 and head_dim == 576:
         # The H16 KV-major specialization can use the full M128 UMMA tile,
         # halving the top-k loop count while keeping one CTA per query token.
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
+    if num_heads == 96 and head_dim == 576:
+        # Compose the established H64 kernel with the tuned H32 tail. Both
+        # components accumulate into one FP32 dKV workspace, which is cleared
+        # by H64 and converted once after H32 completes.
+        return "h96_h64_h32", 64
     return "generic_m64", 64
 
 
@@ -158,6 +177,10 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
         from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA
 
         return FlashAttentionDSABackwardSm100H128TwoCTA
+    if backend == "h128_d576_2cta_m64":
+        from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA
+
+        return FlashAttentionDSABackwardSm100H128D576TwoCTA
     if backend == "h16_m128":
         from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
@@ -166,6 +189,10 @@ def _get_sm100_kernel_class(backend: str, deterministic: bool = False):
         from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
 
         return FlashAttentionDSABackwardSm100H32
+    if backend == "h96_h64_h32":
+        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96
+
+        return FlashAttentionDSABackwardSm100H96
     if deterministic:
         return FlashAttentionDSABackwardSm100Deterministic
     return FlashAttentionDSABackwardSm100
@@ -251,7 +278,7 @@ def flash_attn_bwd_sm100(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     max_topk = topk_idxs.shape[1]
-    device_capability = torch.cuda.get_device_capability(q.device)
+    device_capability = _device_capability(q.device)
     backend, block_tile = _select_sm100_backend(
         num_head,
         head_dim,
@@ -260,7 +287,29 @@ def flash_attn_bwd_sm100(
         max_topk=max_topk,
         device_capability=device_capability,
         deterministic=deterministic,
+        is_contiguous=all(t.is_contiguous() for t in tensors_to_check),
     )
+    if backend == "h128_d576_2cta_m64":
+        # The D576 two-CTA kernel has its own plan-time compile and launch
+        # contract (see ``_interface_sm100_d576``); it shares this entry point
+        # only so direct callers get the same selection as the plan.
+        from ._interface_sm100_d576 import flash_attn_bwd_sm100_h128_d576
+
+        return flash_attn_bwd_sm100_h128_d576(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            dq=dq,
+            dkv=dkv,
+            current_stream=current_stream,
+            workspace=workspace,
+        )
     kernel_cls = _get_sm100_kernel_class(backend, deterministic)
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1

@@ -1,5 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -26,6 +29,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 import math
 from typing import Type, Tuple, Union, Optional
 
@@ -365,11 +369,11 @@ class BlackwellFmhaBackwardDQ256:
         dO = cute.make_tensor(dO.iterator, Q.layout)
         LSE = make_lse_head_batch_tensor(LSE, hb)
 
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.Q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.K_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = LayoutEnum.from_tensor(dV).mma_major_mode()
         if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
         if cutlass.const_expr(self.K_major_mode != OperandMajorMode.K):
@@ -385,6 +389,7 @@ class BlackwellFmhaBackwardDQ256:
         # compute S - using self.cta_group for 2-CTA support
         QK_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -396,6 +401,7 @@ class BlackwellFmhaBackwardDQ256:
         # SMEM-sourced variant for d>128 (Q operand read from SMEM directly).
         QK_tiled_mma_smem = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -405,6 +411,7 @@ class BlackwellFmhaBackwardDQ256:
             tcgen05.OperandSource.SMEM,
         )
         QK_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -417,6 +424,7 @@ class BlackwellFmhaBackwardDQ256:
         # SFA-specific tiled MMA: CtaGroup.TWO with doubled M so shape_mnk[0]=256
         # This ensures mma_tile_inst_m=1 in make_smem_layout_sfa → per-inst M=128=atom_m
         QK_tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -431,6 +439,7 @@ class BlackwellFmhaBackwardDQ256:
         # OperandSource.SMEM: dO is read directly from smem (no tmem needed)
         DOV_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -441,6 +450,7 @@ class BlackwellFmhaBackwardDQ256:
         )
         DOV_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             self.sf_dtype,
@@ -450,6 +460,7 @@ class BlackwellFmhaBackwardDQ256:
             tcgen05.OperandSource.TMEM,
         )
         DOV_tiled_mma_sfa = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -463,6 +474,7 @@ class BlackwellFmhaBackwardDQ256:
         # compute dQ - using self.cta_group for 2-CTA support
         dSK_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             LOW_PRECISION_TYPE,
+            LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
             self.sf_dtype,
@@ -471,6 +483,7 @@ class BlackwellFmhaBackwardDQ256:
             self.dSK_mma_tiler[:2],
         )
         dSK_tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            LOW_PRECISION_TYPE,
             LOW_PRECISION_TYPE,
             OperandMajorMode.K,
             OperandMajorMode.MN,
@@ -656,8 +669,8 @@ class BlackwellFmhaBackwardDQ256:
         SF_K_mn = cute.make_tensor(SF_KT.iterator, sfK_mn_layout)
 
         # Setup TMA for scale factors with correct ops for 2-CTA:
-        # - SFA (A operand's SF): multicast, CtaGroup.TWO, real cluster layout
-        # - SFB (B operand's SF): multicast, CtaGroup.ONE, real cluster layout for num_multicast
+        # Both SFA and SFB use CtaGroup.TWO completion with the real cluster
+        # layout: leader readiness must include the peer CTA's local SF loads.
 
         # SF_Q is SFA (A operand's scale factor) - CtaGroup.TWO (shared::cluster barrier)
         sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -672,8 +685,8 @@ class BlackwellFmhaBackwardDQ256:
             internal_type=cutlass.Int16,
         )
 
-        # SF_K is SFB (B operand's scale factor) - multicast
-        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
+        # SF_K is SFB (B operand's scale factor), with paired-CTA completion.
+        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
         sfK_smem_layout = cute.slice_(sSFK_smem_layout_staged, (None, None, None, 0, 0))
         tma_atom_sfK, tma_tensor_sfK = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_mcast_op,
@@ -685,7 +698,7 @@ class BlackwellFmhaBackwardDQ256:
             internal_type=cutlass.Int16,
         )
 
-        # SF_V is SFB (B operand's scale factor) - multicast
+        # SF_V uses the same paired-CTA completion as SF_K.
         sfV_smem_layout = cute.slice_(SFV_smem_layout_staged, (None, None, None, 0, 0))
         tma_atom_sfV, tma_tensor_sfV = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_mcast_op,
@@ -697,7 +710,7 @@ class BlackwellFmhaBackwardDQ256:
             internal_type=cutlass.Int16,
         )
 
-        # SF_K_mn is SFB (B operand's scale factor for dQ computation) - multicast
+        # SF_K_mn is SFB for dQ computation, also with paired-CTA completion.
         sSFK_mn_smem_layout = cute.slice_(sSFK_mn_smem_layout_staged, (None, None, None, 0, 0))
         tma_atom_sfK_mn, tma_tensor_sfK_mn = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_mcast_op,
@@ -970,6 +983,14 @@ class BlackwellFmhaBackwardDQ256:
         tile_sched_params: Union[utils.ClcDynamicPersistentTileSchedulerParams, None],
     ):
         bidx, bidy, bidz = cute.arch.block_idx()
+        # Process long causal query tiles first across heads, reducing the
+        # final-wave tail. Dense/varlen callers retain their established order.
+        if cutlass.const_expr(not self.is_persistent and not self.varlen and self.mask_type == fmha_masks.MaskEnum.WINDOW_MASK):
+            cluster_count = cute.ceil_div(problem_shape[0], self.tile_shape_Q * 2)
+            head_count = problem_shape[3][0][0] * problem_shape[3][0][1]
+            physical_cluster = bidx // 2 + cluster_count * bidy
+            bidx = (cluster_count - 1 - physical_cluster // head_count) * 2 + bidx % 2
+            bidy = physical_cluster % head_count
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # For 2-CTA MMA: determine which CTA in the pair (0 or 1)
@@ -1006,7 +1027,7 @@ class BlackwellFmhaBackwardDQ256:
             cpasync.prefetch_descriptor(tma_atom_sfV)
             cpasync.prefetch_descriptor(tma_atom_sfDO)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_K_pipeline = self.make_and_init_load_mma_K_pipeline(
@@ -1126,12 +1147,12 @@ class BlackwellFmhaBackwardDQ256:
 
         tmem_holding_buf = storage.tmem_holding_buf
         # Create TmemAllocator for 2-CTA support
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id_0[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
         if warp_idx == self.compute_warp_id_0[0]:
             # tmem_alloc_cols = cutlass.Int32(self.tmem_alloc_cols)
@@ -1311,7 +1332,7 @@ class BlackwellFmhaBackwardDQ256:
             #  LOAD warp - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.load_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
                 cumulative_trip_count_load = Int32(0)
                 while work_tile.is_valid_tile:
                     cur_tile = work_tile.tile_idx
@@ -1459,7 +1480,7 @@ class BlackwellFmhaBackwardDQ256:
             #  SCHED warp (CTA 0 only) - CLC producer loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx == self.sched_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
                 if is_first_cta_in_cluster:
                     clc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage)
                     while work_tile.is_valid_tile:
@@ -1479,7 +1500,7 @@ class BlackwellFmhaBackwardDQ256:
             #  MMA warp 0 (warp 8) - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx == self.mma_warp_id_0:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+                cute.arch.setmaxregister_decrease(self.num_regs_mma)
                 persistent_iter = Int32(0)
                 cumulative_trip_count_mma0 = Int32(0)
                 while work_tile.is_valid_tile:
@@ -1640,7 +1661,7 @@ class BlackwellFmhaBackwardDQ256:
             #  SF helper warp (warp 9) - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx == self.sfv_s2t_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
                 cumulative_trip_count_sfv = Int32(0)
                 while work_tile.is_valid_tile:
                     cur_tile = work_tile.tile_idx
@@ -1743,7 +1764,7 @@ class BlackwellFmhaBackwardDQ256:
             #  Compute warps - persistent loop
             # ///////////////////////////////////////////////////////////////////////////////
             elif warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
-                cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                cute.arch.setmaxregister_increase(self.num_regs_compute)
                 persistent_iter = Int32(0)
                 cumulative_trip_count_compute = Int32(0)
                 while work_tile.is_valid_tile:
@@ -2008,7 +2029,7 @@ class BlackwellFmhaBackwardDQ256:
                 #  LOAD (warp 10)
                 # ///////////////////////////////////////////////////////////////////////////////
                 if warp_idx == self.load_warp_id:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+                    cute.arch.setmaxregister_decrease(self.num_regs_load)
 
                     self.load(
                         K_in,
@@ -2069,7 +2090,7 @@ class BlackwellFmhaBackwardDQ256:
                 #  MMA warp 0 (warp 8) — K-tile interleaves Q sub-block 0 and 1
                 # ///////////////////////////////////////////////////////////////////////////////
                 elif warp_idx == self.mma_warp_id_0:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+                    cute.arch.setmaxregister_decrease(self.num_regs_mma)
                     mma_compute_dKdV_producer_state_0 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_dQ_stage)
                     mma_compute_dKdV_producer_state_1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_dQ_stage)
                     self.mma_interleaved(
@@ -2137,7 +2158,7 @@ class BlackwellFmhaBackwardDQ256:
                     )
 
                 elif warp_idx == self.sfv_s2t_warp_id:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                    cute.arch.setmaxregister_decrease(self.num_regs_empty)
                     self.sfv_s2t_helper(
                         tDPtSFV_s2t=tDPtSFV_s2t_0,
                         tDPtSFV_s2t_h1=tDPtSFV_s2t_h1_0,
@@ -2156,13 +2177,13 @@ class BlackwellFmhaBackwardDQ256:
                     )
 
                 elif warp_idx == self.mma_warp_id_1:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                    cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
                 # ///////////////////////////////////////////////////////////////////////////////
                 #  Compute group 0 (warps 0-3) — handles MMA warp 0
                 # ///////////////////////////////////////////////////////////////////////////////
                 elif warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_0[-1]:
-                    cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                    cute.arch.setmaxregister_increase(self.num_regs_compute)
                     self.compute(
                         tStS=tStS[None, None, None, 0],
                         tDPtDP=tDPtDP[None, None, None, 0],
@@ -2207,7 +2228,7 @@ class BlackwellFmhaBackwardDQ256:
                 #  Compute group 1 (warps 4-7) — handles Q sub-block 1
                 # ///////////////////////////////////////////////////////////////////////////////
                 elif warp_idx >= self.compute_warp_id_1[0] and warp_idx <= self.compute_warp_id_1[-1]:
-                    cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+                    cute.arch.setmaxregister_increase(self.num_regs_compute)
                     self.compute(
                         tStS=tStS[None, None, None, self.tmem_S_stages - 1],
                         tDPtDP=tDPtDP_1_alias[None, None, None, 0],
@@ -2249,22 +2270,24 @@ class BlackwellFmhaBackwardDQ256:
                     )
                     self.epilogue_sync_barrier_1.arrive_and_wait()
                 else:
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                    cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         # Cluster-wide sync before TMEM deallocation: in persistent mode, one CTA
         # may exit its while loop and reach tmem.free() while the partner CTA's MMA
         # warp still accesses shared TMEM. Sync all warps within CTA first, then
         # sync across the 2-CTA cluster.
-        if cutlass.const_expr(self.is_persistent):
-            self.cta_sync_barrier.arrive_and_wait()
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+        # Join every TMEM user before freeing, in both execution modes.
+        self.cta_sync_barrier.arrive_and_wait()
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
 
         if warp_idx == self.compute_warp_id_0[0]:
             # Dealloc the tensor memory buffer for 2-CTA support
             tmem.relinquish_alloc_permit()
             tmem._num_allocated_columns = self.tmem_alloc_cols
             tmem.free(tmem_ptr)
+
+    bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def load(
@@ -2992,50 +3015,8 @@ class BlackwellFmhaBackwardDQ256:
             self.sfv_s2t_start_barrier.arrive_and_wait()
             if is_leader_cta:
                 load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
-                if iter_count != iter_count_origin:
-                    cute.copy(
-                        tiled_copy_s2t_sfk,
-                        tCsSFK_compact_s2t[s2t_sfk_stage_coord],
-                        tCtSFK_compact_s2t,
-                    )
-                    cute.copy(
-                        tiled_copy_s2t_sfk_h1,
-                        tCsSFK_compact_s2t_h1[s2t_sfk_stage_coord_h1],
-                        tCtSFK_compact_s2t_h1,
-                    )
-                cute.copy(
-                    tiled_copy_s2t_sfv,
-                    tCsSFV_compact_s2t[s2t_sfv_stage_coord],
-                    tCtSFV_compact_s2t,
-                )
-                cute.copy(
-                    tiled_copy_s2t_sfv_h1,
-                    tCsSFV_compact_s2t_h1[s2t_sfv_stage_coord_h1],
-                    tCtSFV_compact_s2t_h1,
-                )
-                if iter_count == iter_count_origin:
-                    cute.copy(
-                        tiled_copy_s2t_sfdo_0,
-                        tCsSFDO_compact_s2t_0[None, None, None, None, 0],
-                        tCtSFDO_compact_s2t_0,
-                    )
-                    cute.copy(
-                        tiled_copy_s2t_sfdo_h1_0,
-                        tCsSFDO_compact_s2t_h1_0[None, None, None, None, 1],
-                        tCtSFDO_compact_s2t_h1_0,
-                    )
-                    cute.copy(
-                        tiled_copy_s2t_sfdo_1,
-                        tCsSFDO_compact_s2t_1[None, None, None, None, self.k_halves],
-                        tCtSFDO_compact_s2t_1,
-                    )
-                    cute.copy(
-                        tiled_copy_s2t_sfdo_h1_1,
-                        tCsSFDO_compact_s2t_h1_1[None, None, None, None, self.k_halves + 1],
-                        tCtSFDO_compact_s2t_h1_1,
-                    )
-                cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_view_async_tmem_load()
+                # Keep the stage handshake; input SF copies and their TMEM
+                # fences are now issued by the consuming MMA warp itself.
             self.sfv_s2t_done_barrier.arrive_and_wait()
 
             load_mma_K_consumer_state.advance()
@@ -3044,7 +3025,7 @@ class BlackwellFmhaBackwardDQ256:
     @cute.jit
     def mma_interleaved(
         self,
-        tmem: utils.TmemAllocator,
+        tmem: TmemAllocator,
         QK_tiled_mma: cute.TiledMma,
         DOV_tiled_mma: cute.TiledMma,
         dSK_tiled_mma: cute.TiledMma,
@@ -3113,8 +3094,6 @@ class BlackwellFmhaBackwardDQ256:
             compute_mma_dS_pipeline_1,
             mma_compute_dQ_pipeline_1,
         ) = pipeline_args
-
-        tmem.wait_for_alloc()
 
         load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
         if cutlass.const_expr(self.is_persistent):
@@ -3187,6 +3166,38 @@ class BlackwellFmhaBackwardDQ256:
             tCtSFK_mn_compact_s2t_mn,
         ) = cute_common.mainloop_s2t_copy_and_partition_sf_2x64(self, sSFK_mn, tdQtSFK_mn, is_SFA=False)
 
+        (
+            tiled_copy_s2t_sfdo_0,
+            tCsSFDO_compact_s2t_0,
+            tCtSFDO_compact_s2t_0,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sf_2x64(self, sSFDO, tDPtSFDO_0, is_SFA=True)
+        (
+            tiled_copy_s2t_sfdo_h1_0,
+            tCsSFDO_compact_s2t_h1_0,
+            tCtSFDO_compact_s2t_h1_0,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sf_2x64(self, sSFDO, tDPtSFDO_h1_0, is_SFA=True)
+        (
+            tiled_copy_s2t_sfdo_1,
+            tCsSFDO_compact_s2t_1,
+            tCtSFDO_compact_s2t_1,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sf_2x64(self, sSFDO, tDPtSFDO_1, is_SFA=True)
+        (
+            tiled_copy_s2t_sfdo_h1_1,
+            tCsSFDO_compact_s2t_h1_1,
+            tCtSFDO_compact_s2t_h1_1,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sf_2x64(self, sSFDO, tDPtSFDO_h1_1, is_SFA=True)
+
+        (
+            tiled_copy_s2t_sfv,
+            tCsSFV_compact_s2t,
+            tCtSFV_compact_s2t,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sfb_mn_2x64(self, sSFV, tDPtSFV_s2t)
+        (
+            tiled_copy_s2t_sfv_h1,
+            tCsSFV_compact_s2t_h1,
+            tCtSFV_compact_s2t_h1,
+        ) = cute_common.mainloop_s2t_copy_and_partition_sfb_mn_2x64(self, sSFV, tDPtSFV_s2t_h1)
+
         QK_tiled_mma = QK_tiled_mma_smem
         tSrQ_h0_0 = QK_tiled_mma_smem.make_fragment_A(sQ[(None, None, (None, 0), 0)])
         tSrQ_h1_0 = QK_tiled_mma_smem.make_fragment_A(sQ[(None, None, (None, 1), 0)])
@@ -3210,6 +3221,52 @@ class BlackwellFmhaBackwardDQ256:
 
             if is_leader_cta:
                 load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
+                if iter_count != iter_count_origin:
+                    # Issue input SF copies from the MMA warp so its TMEM
+                    # fences order these copies before their consuming MMAs.
+                    cute.copy(
+                        tiled_copy_s2t_sfk,
+                        tCsSFK_compact_s2t[(None, None, None, None, load_mma_K_consumer_state.index * self.k_halves)],
+                        tCtSFK_compact_s2t,
+                    )
+                    cute.copy(
+                        tiled_copy_s2t_sfk_h1,
+                        tCsSFK_compact_s2t_h1[(None, None, None, None, load_mma_K_consumer_state.index * self.k_halves + 1)],
+                        tCtSFK_compact_s2t_h1,
+                    )
+                cute.copy(
+                    tiled_copy_s2t_sfv,
+                    tCsSFV_compact_s2t[(None, None, None, None, load_mma_K_consumer_state.index * self.k_halves)],
+                    tCtSFV_compact_s2t,
+                )
+                cute.copy(
+                    tiled_copy_s2t_sfv_h1,
+                    tCsSFV_compact_s2t_h1[(None, None, None, None, load_mma_K_consumer_state.index * self.k_halves + 1)],
+                    tCtSFV_compact_s2t_h1,
+                )
+                if iter_count == iter_count_origin:
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_0,
+                        tCsSFDO_compact_s2t_0[None, None, None, None, 0],
+                        tCtSFDO_compact_s2t_0,
+                    )
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_h1_0,
+                        tCsSFDO_compact_s2t_h1_0[None, None, None, None, 1],
+                        tCtSFDO_compact_s2t_h1_0,
+                    )
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_1,
+                        tCsSFDO_compact_s2t_1[None, None, None, None, self.k_halves],
+                        tCtSFDO_compact_s2t_1,
+                    )
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_h1_1,
+                        tCsSFDO_compact_s2t_h1_1[None, None, None, None, self.k_halves + 1],
+                        tCtSFDO_compact_s2t_h1_1,
+                    )
+                cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_view_async_tmem_load()
             if iter_count == iter_count_origin:
                 self.sfv_s2t_start_barrier.arrive_and_wait()
 
@@ -3265,6 +3322,9 @@ class BlackwellFmhaBackwardDQ256:
                 # Previous tile used tStS0 as WG1's aliased dP slot. Wait until
                 # WG1 has copied that dP before S0 overwrites tStS0.
                 self.dS_sync_barrier_compute1.arrive_and_wait()
+                if is_leader_cta:
+                    # The local named barrier does not join the peer's read.
+                    mma_compute_dP_pipeline_1.producer_acquire(mma_compute_dP_producer_state_1)
 
             if is_leader_cta:
                 mma_compute_S_pipeline_0.producer_acquire(mma_compute_S_producer_state_0)
@@ -3353,6 +3413,8 @@ class BlackwellFmhaBackwardDQ256:
             self.dS_sync_barrier_compute0.arrive_and_wait()
 
             if is_leader_cta:
+                # S0 and dP1 alias: both CTAs must release S0 before overwrite.
+                mma_compute_S_pipeline_0.producer_acquire(mma_compute_S_producer_state_0)
                 mma_compute_dP_pipeline_1.producer_acquire(mma_compute_dP_producer_state_1)
                 DOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_half in cutlass.range_constexpr(self.k_halves):
@@ -3391,12 +3453,14 @@ class BlackwellFmhaBackwardDQ256:
 
             if cutlass.const_expr(self.online_ds_scale):
                 self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                if tidx % 32 == 0:
-                    d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange_0, tDQtSFDS_0)
-                cute.arch.fence_view_async_tmem_store()
-                self.dS_scale_exchange_barrier_0.arrive_and_wait()
             if is_leader_cta:
                 compute_mma_dS_pipeline_0.consumer_wait(compute_mma_dS_consumer_state_0)
+                # Copy exchanged SF only after both CTAs publish dS readiness;
+                # only the leader issues the shared TMEM scale update.
+                if cutlass.const_expr(self.online_ds_scale):
+                    if tidx % 32 == 0:
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange_0, tDQtSFDS_0)
+                    cute.arch.fence_view_async_tmem_store()
                 if iter_count == iter_count_origin:
                     dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 else:
@@ -3418,12 +3482,12 @@ class BlackwellFmhaBackwardDQ256:
 
             if cutlass.const_expr(self.online_ds_scale):
                 self.dS_scale_exchange_barrier_1.arrive_and_wait()
-                if tidx % 32 == 0:
-                    d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange_1, tDQtSFDS_1)
-                cute.arch.fence_view_async_tmem_store()
-                self.dS_scale_exchange_barrier_1.arrive_and_wait()
             if is_leader_cta:
                 compute_mma_dS_pipeline_1.consumer_wait(compute_mma_dS_consumer_state_1)
+                if cutlass.const_expr(self.online_ds_scale):
+                    if tidx % 32 == 0:
+                        d256_primitives.copy_mxfp8_scale_tile_to_tmem(sDS_scale_exchange_1, tDQtSFDS_1)
+                    cute.arch.fence_view_async_tmem_store()
                 if iter_count == iter_count_origin:
                     dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 else:
@@ -3463,7 +3527,7 @@ class BlackwellFmhaBackwardDQ256:
     @cute.jit
     def mma(
         self,
-        tmem: utils.TmemAllocator,
+        tmem: TmemAllocator,
         QK_tiled_mma: cute.TiledMma,
         DOV_tiled_mma: cute.TiledMma,
         dSK_tiled_mma: cute.TiledMma,
@@ -3524,8 +3588,6 @@ class BlackwellFmhaBackwardDQ256:
             compute_mma_dS_pipeline,
             mma_compute_dQ_pipeline,
         ) = pipeline_args
-        tmem.wait_for_alloc()
-
         load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
         n_advance = cumulative_trip_count % Int32(2 * self.load_mma_K_stage)
         for _ in cutlass.range_constexpr(2 * self.load_mma_K_stage):
@@ -4211,16 +4273,6 @@ class BlackwellFmhaBackwardDQ256:
             if cutlass.const_expr(wg_idx == 0):
                 self.dS_sync_barrier_compute0.arrive()
 
-            # Wait for dP
-            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state, peak_mma_compute_dP_status)
-            # Compute dS = dsoftmax(P, dP, sum_OdO)
-            cute.copy(tiled_t2r, tTR_tDP, tTR_rDP)
-            cute.arch.fence_view_async_tmem_load()
-            if cutlass.const_expr(wg_idx == 1):
-                if iter_count > 1:
-                    self.dS_sync_barrier_compute1.arrive()
-            mma_compute_dP_pipeline.consumer_release(mma_compute_dP_consumer_state)
-
             if is_masked_tile:
                 fmha_masks.FusedMask.apply_mask(
                     self.mask_type,
@@ -4247,6 +4299,16 @@ class BlackwellFmhaBackwardDQ256:
 
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+
+            # S is already in registers: overlap softmax with the independent
+            # dO @ V MMA, then wait only when dP is actually consumed.
+            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state, peak_mma_compute_dP_status)
+            cute.copy(tiled_t2r, tTR_tDP, tTR_rDP)
+            cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(wg_idx == 1):
+                if iter_count > 1:
+                    self.dS_sync_barrier_compute1.arrive()
+            mma_compute_dP_pipeline.consumer_release(mma_compute_dP_consumer_state)
 
             # Read sum_OdO directly from global memory (q_global_idx computed earlier for LSE)
             for i in cutlass.range(0, cute.size(tTR_rDP), 2, unroll_full=True):
@@ -4281,6 +4343,14 @@ class BlackwellFmhaBackwardDQ256:
                 cp_scale_tile[cp_row, cp_col, dS_group + 1] = dS_scale_1
                 cp_scale_tile[cp_row, cp_col + 2, dS_group + 1] = dS_scale_1
 
+                # Scale storage is protected by the one-stage dS pipeline.
+                # Hand it to MMA now while compute quantizes the payload.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr(wg_idx == 0):
+                    self.dS_scale_exchange_barrier_0.arrive()
+                else:
+                    self.dS_scale_exchange_barrier_1.arrive()
+
                 tTR_rdS_normalized = cute.make_rmem_tensor_like(tTR_rDP)
                 for i in cutlass.range_constexpr(0, 32, 2):
                     tTR_rdS_normalized[i], tTR_rdS_normalized[i + 1] = cute.arch.mul_packed_f32x2(
@@ -4292,13 +4362,6 @@ class BlackwellFmhaBackwardDQ256:
                         (inv_scale_1, inv_scale_1),
                     )
                 tTR_rdST = cute_common.quantize(tTR_rdS_normalized, 4, LOW_PRECISION_TYPE)
-                cute.arch.fence_proxy("async.shared", space="cta")
-                if cutlass.const_expr(wg_idx == 0):
-                    self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                    self.dS_scale_exchange_barrier_0.arrive_and_wait()
-                else:
-                    self.dS_scale_exchange_barrier_1.arrive_and_wait()
-                    self.dS_scale_exchange_barrier_1.arrive_and_wait()
             else:
                 tTR_rdST = cute_common.quantize(tTR_rDP, 4, LOW_PRECISION_TYPE)
 
@@ -4393,10 +4456,11 @@ class BlackwellFmhaBackwardDQ256:
         mma_compute_dQ_consumer_state.advance()
 
     def make_and_init_load_mma_K_pipeline(self, load_mma_K_mbar_ptr, cluster_layout_vmnk):
-        sfv_tx_multiplier = 2 * self.k_halves
-        sfk_tx_multiplier = 2 * self.SFK_halves
+        # SFB TWO accounts for both CTAs' transfers, including both SF halves.
+        sfv_tx_multiplier = 4 * self.k_halves
+        sfk_tx_multiplier = 4 * self.SFK_halves
         kt_tx_multiplier = 2 * self.d_halves
-        sfkmn_tx_multiplier = 2 * self.d_halves
+        sfkmn_tx_multiplier = 4 * self.d_halves
         tx_count = (
             2 * self.tma_copy_K_bytes
             + kt_tx_multiplier * self.tma_copy_KT_bytes

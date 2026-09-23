@@ -1,6 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+r"""BSA forward correctness tests, including native SM120 blk128.
+
+Install this checkout with its CUDA/cuDNN and Python test dependencies as
+described in the repository agent guide. SM120 FA4-style tests require a
+CUDA-enabled PyTorch build and CuTe DSL >= 4.7.0. Verify the actual imported
+kernel path before testing, especially with multiple editable checkouts.
+From the repository root:
+
+    python -c 'import cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 as k; print(k.__file__)'
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa/test_BSA_attention_forward.py -k sm120)
+    (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q fe_api/bsa)
+
+The full directory also contains other BSA tests. Unsupported configurations
+skip.
+
+For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
+
+    CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_blk128.py \
+      --sequence 142720 --heads 8 --densities 0.15 0.20 \
+      --patterns strided local --warmup 5 --repeats 21 --fail-below-target
+
+This benchmark uses BF16 BHSD [1, 8, 142720, 128] and native KV128; its 4.5x
+gate applies to the slowest 20%-density case. A missed performance gate is
+not itself an accuracy failure. Measure on an idle GPU without a profiler.
+
+Production blk128 consumes original sparse metadata with no KV128-to-KV64
+expansion. FP16/BF16 reference tests cover fixed/variable counts, partial Q/KV,
+GQA, layouts, and full/tail scheduling. The FA4-style path keeps FP32 accumulators
+and BF16 probabilities for BF16 inputs; it does not use FP8/INT8 quantization.
+These are single-GPU tests; multi-GPU overlap prototypes are not in this PR.
+"""
+
+import builtins
 import importlib
 from types import SimpleNamespace
 
@@ -14,7 +47,38 @@ from fe_api.bsa.bsa_utils import make_fixed_metadata, make_variable_metadata, su
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
-def _import_bsa():
+@pytest.mark.L0
+def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
+    """Reject an unsupported installed DSL before importing the FA4 kernel."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("FA4-style blk128 is specific to SM120")
+    BSA = _import_bsa()
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        """Fail if the unsupported-DSL path reaches the specialized kernel import."""
+        if name == "cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4":
+            raise AssertionError("The FA4 kernel must not be imported with an unsupported DSL")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+        BSA.block_sparse_attention_forward(q, q, q, indices, block_sparse_num=1, sparse_block_size=128)
+
+
+def _import_bsa(require_fa4=False):
+    """Load BSA or skip unavailable dependencies, optionally checking the FA4 floor."""
+    if require_fa4:
+        from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+        installed, version = cutedsl_state()
+        if not installed or cutedsl_too_old(version):
+            pytest.skip("FA4-style blk128 requires a supported CuTe DSL version")
     try:
         from cudnn import BSA
 
@@ -64,6 +128,245 @@ def test_bsa_attention_forward_fixed_blocks():
         )
         torch.testing.assert_close(split_result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
         torch.testing.assert_close(split_result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+def test_bsa_attention_forward_sm120_native_blk128():
+    """Compare native blk128 forward output and LSE with the FP32 reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 12:
+        pytest.skip("native blk128 forward is specific to SM120")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+    )
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("block_sparse_num", (1, 2, 3, 4, 5))
+@torch_fork_set_rng(seed=20)
+def test_bsa_attention_forward_sm120_fa4_blk128_fixed_topk(dtype, block_sparse_num):
+    """Cover fixed top-k 1-5, GQA, partial Q, and query-dependent KV selections."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 12:
+        pytest.skip("FA4-style blk128 forward is specific to SM120")
+
+    BSA = _import_bsa(require_fa4=True)
+    block_size = 128
+    batch, q_heads, kv_heads, seqlen_q, seqlen_k, dim = 2, 4, 2, block_size + 1, 6 * block_size, 128
+    q = torch.randn((batch, q_heads, seqlen_q, dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    q_block = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 1, 2, 1)
+    batch_head = torch.arange(batch * q_heads, device="cuda", dtype=torch.int32).view(batch, q_heads, 1, 1)
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((q_block + batch_head + slots) % 6).contiguous()
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num=block_sparse_num,
+        sparse_block_size=block_size,
+    )
+    block_sizes = torch.full((6,), block_size, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("wave_kind,block_sparse_num", (("tail_only", 3), ("unsplit", 1), ("full", 5), ("mixed", 3)))
+@torch_fork_set_rng(seed=20)
+def test_bsa_attention_forward_sm120_blk128_wave_boundaries(dtype, wave_kind, block_sparse_num):
+    """Validate all query rows across full, split-tail, mixed, and unsplit waves."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("native blk128 wave scheduling requires SM120")
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    full_wave_q_blocks = sm_count // 2 if sm_count % 2 == 0 else sm_count
+    q_blocks = {
+        "tail_only": 2,
+        "unsplit": sm_count // 4 + 1,
+        "full": full_wave_q_blocks,
+        "mixed": full_wave_q_blocks + 2,
+    }[wave_kind]
+    sequence = (q_blocks - 1) * 128 + 1
+    BSA = _import_bsa(require_fa4=True)
+    q = torch.randn((1, 2, sequence, 128), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, 768, 128), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    q_block = torch.arange(q_blocks, device="cuda", dtype=torch.int32).view(1, 1, -1, 1)
+    head = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 2, 1, 1)
+    slots = torch.tensor([0, 2, 3, 5, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 5)
+    q2k = ((3 * q_block + 7 * head + slots) % 6).contiguous()
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, block_sparse_num=block_sparse_num, sparse_block_size=128)
+
+    # Exercise every output row, including the Q64 boundary inside blk128 and
+    # the final partial Q tile. Per-query metadata prevents accidental reuse
+    # of the first sparse row from passing this check.
+    block_sizes = torch.full((6,), 128, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, sequence, 768, 128)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+def test_bsa_sm120_wave_planning_is_not_repeated_on_cache_hits(monkeypatch):
+    """Ensure cached launches reuse the SM-count decision made during tracing."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("native blk128 wave scheduling requires SM120")
+    BSA = _import_bsa(require_fa4=True)
+    from cudnn.block_sparse_attention import _interface
+    from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128 import bsa_fwd_sm120_fa4
+
+    query_count = 0
+    original_query = bsa_fwd_sm120_fa4._device_sm_count
+
+    def counted_query():
+        """Count device-metadata queries while preserving the actual SM count."""
+        nonlocal query_count
+        query_count += 1
+        return original_query()
+
+    monkeypatch.setattr(bsa_fwd_sm120_fa4, "_device_sm_count", counted_query)
+    monkeypatch.setattr(_interface.bsa_attn_fwd, "compile_cache", {})
+    q = torch.zeros((1, 1, 129, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.ones_like(k)
+    indices = torch.zeros((1, 1, 2, 1), device="cuda", dtype=torch.int32)
+    first = BSA.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count > 0
+    trace_query_count = query_count
+    second = BSA.block_sparse_attention_forward(q, k, v, indices, block_sparse_num=1, sparse_block_size=128)
+    assert query_count == trace_query_count
+    torch.testing.assert_close(first["o_tensor"], torch.ones_like(q), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(second["o_tensor"], first["o_tensor"], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=18)
+def test_bsa_attention_forward_sm120_native_blk128_variable_blocks_and_layout():
+    """Check variable counts, valid block sizes, empty rows, and BHSD/BSHD layouts."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 12:
+        pytest.skip("native blk128 forward is specific to SM120")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_nums, block_sizes = make_variable_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sizes=block_sizes,
+        q2k_block_nums=block_nums,
+        sparse_block_size=block_size,
+    )
+    mask = block_sparse_mask(q2k, 0, block_sizes, seqlen_q, seqlen_k, block_size, block_nums)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+    result_bshd = BSA.block_sparse_attention_forward(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        q2k,
+        block_sizes=block_sizes,
+        q2k_block_nums=block_nums,
+        sparse_block_size=block_size,
+        layout="bshd",
+    )
+    torch.testing.assert_close(result_bshd["o_tensor"].transpose(1, 2), result["o_tensor"], atol=0, rtol=0)
+    torch.testing.assert_close(result_bshd["lse_tensor"], result["lse_tensor"], atol=0, rtol=0)
+
+    empty_block_nums = block_nums.clone()
+    empty_block_nums[..., 0] = 0
+    empty_result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sizes=block_sizes,
+        q2k_block_nums=empty_block_nums,
+        sparse_block_size=block_size,
+        allow_empty_block_nums=True,
+    )
+    empty_mask = block_sparse_mask(q2k, 0, block_sizes, seqlen_q, seqlen_k, block_size, empty_block_nums)
+    empty_o_ref, empty_lse_ref = attention_reference(q, k, v, empty_mask)
+    torch.testing.assert_close(empty_result["o_tensor"].float(), empty_o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(empty_result["lse_tensor"], empty_lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_bsa_attention_forward_sm120_native_blk128_partial_q_and_kv_tiles():
+    """Verify native128 masking for partial final query and key/value tiles."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 12:
+        pytest.skip("native blk128 forward is specific to SM120")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 1, block_size + 1, 2 * block_size + 1, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([0, 2], device="cuda", dtype=torch.int32).view(1, 1, 1, 2).expand(1, 1, 2, 2).contiguous()
+    block_sizes = torch.tensor([block_size, block_size, 1], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num=2,
+        block_sizes=block_sizes,
+        sparse_block_size=block_size,
+    )
+    mask = block_sparse_mask(q2k, 2, block_sizes, seqlen_q, seqlen_k, block_size)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0

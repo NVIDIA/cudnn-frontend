@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cudnn
 import pytest
 import torch
@@ -39,11 +41,12 @@ def _fake_sm100(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
 
 
-def _mk_graph() -> cudnn.pygraph:
+def _mk_graph(**kwargs) -> cudnn.pygraph:
     return cudnn.pygraph(
         io_data_type=DTYPE,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
+        **kwargs,
     )
 
 
@@ -101,6 +104,93 @@ def test_probe_accepts_dsv4_causal():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, dims, strides)
     assert engines.engine_name() in _eligible(g)
+
+
+@pytest.mark.parametrize("unsupported", ["sm120", "synth_kv"])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
+    """Graph admission declines legacy executors before loading a DSL adapter."""
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from cudnn.engines.base import PlanConfig
+    from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
+
+    arch = "sm120" if unsupported == "sm120" else "sm100"
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0) if arch == "sm120" else (10, 0))
+    if opt_in:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    else:
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch=arch))
+    lower = Mock(side_effect=AssertionError("legacy override graph must decline before compilation"))
+    engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
+    for enabled in (False, True):
+        graph = _mk_graph(is_override_shape_enabled=enabled)
+        q, k, v, dims, strides = _mk_qkv(graph, d=128)
+        if unsupported == "synth_kv":
+            k.set_dim((B, H, 129, 128))
+            v.set_dim((B, H, 129, 128))
+        o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        _finish_output(o, dims, strides)
+        if not enabled:
+            engine.check_support(graph)
+            continue
+        with pytest.raises(NotImplementedError, match="prepared"):
+            engine.check_support(graph)
+        with pytest.raises(NotImplementedError, match="prepared"):
+            engine.build_plan(graph, PlanConfig(engine.engine_id))
+        from cudnn.engines.heuristics import rank
+
+        backend = [PlanConfig(7, {}, mode=cudnn.heur_mode.A)]
+        assert rank(graph, [engine], backend, [cudnn.heur_mode.A]) == [PlanConfig(7, {})]
+    lower.assert_not_called()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
+    """A plain-store O may serve split plans even when TMA cannot bind it unsplit."""
+    from cudnn.sdpa.fwd import heuristics
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=d)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    # Odd token pitch is legal for the combine's ordinary global stores, not TMA.
+    output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
+    _finish_output(o, dims, output_strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    unsplit = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
+    from dataclasses import replace
+
+    split = replace(unsplit, split_kv=2)
+    assert engines.analyze_for(spec, graph)[1] is None  # provider has a compatible plan
+    assert engines.analyze_for(spec, graph, unsplit)[1] is not None
+    assert engines.analyze_for(spec, graph, split)[1] is None
+    monkeypatch.setattr(heuristics, "_knob_sets", lambda *_: [unsplit, split])
+    plans = heuristics.recommend("A", facts, {spec.name: 20511})
+    assert [p.knobs for p in plans] == [split]
+    # Restore a TMA-bindable output: both contracts become eligible, regardless of ranking.
+    o.set_stride(strides)
+    fresh = ga.analyze(graph)
+    assert engines.mismatch(spec.capabilities, fresh, unsplit) is None
+    assert engines.mismatch(spec.capabilities, fresh, split) is None
+
+
+@pytest.mark.parametrize("feature", ["fp8", "mxfp8", "bias", "synth_kv"])
+def test_prepared_override_capability_declines_legacy_features(feature):
+    """The same pure predicate serves candidate filtering and runtime executor selection."""
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    changed = dict(fp8=dict(is_fp8=True), mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    assert engines._prepared_decline_reason(caps, facts, 1) is None
+    assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
 def test_probe_accepts_bf16():
@@ -214,6 +304,20 @@ def test_probe_rejects_alibi():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_alibi_mask=True)
     _finish_output(o, dims, strides)
     assert not _eligible(g)
+
+
+@pytest.mark.parametrize("stats_use_log2", [False, True])
+def test_probe_stats_log2_keeps_eligibility(stats_use_log2):
+    """A base-2 Stats request (stats_use_log2) is a plan-time epilogue specialization
+    of every FROST forward kernel, so the fact is recorded and the graph stays eligible
+    in both bases."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True, stats_use_log2=stats_use_log2)
+    _finish_output(o, dims, strides)
+    _finish_output(stats, (B, H, S, 1), (H * S, S, 1, 1), cudnn.data_type.FLOAT)
+    assert _facts(g).has_stats_log2 is stats_use_log2
+    assert _eligible(g)
 
 
 def test_probe_rejects_second_op_on_graph():
@@ -565,10 +669,39 @@ def test_knob_request_outside_domain_rejects_engine():
     # A value no row's domain contains: honored or ineligible, never degraded.
     g = _mk_eligible_graph()
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # softmax_precision=1 is cudnn.data_type.DOUBLE — in no row's domain (the
-    # fp8 rows serve FLOAT, and the sm107 row additionally HALF), so an
-    # explicit request declines everywhere.
-    assert not _eligible(g, engines.SdpaFwdKnobs(softmax_precision=1))
+
+
+def _mk_softmax_precision_graph(precision):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, softmax_precision=precision)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_softmax_precision_is_an_op_attribute_not_a_knob():
+    """sdpa(softmax_precision=) is numerics-changing, so it is a graph FACT the
+    capability rows gate on — not a tuning axis an autotuner could pick."""
+    import cudnn as _c
+
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # FLOAT is the pipeline every row runs: same eligibility as no request.
+    assert _eligible(_mk_softmax_precision_graph(_c.data_type.FLOAT)) == _eligible(_mk_eligible_graph())
+    # HALF exists only in the per-tensor-FP8 SM107 arm; a bf16 graph declines everywhere.
+    g_half = _mk_softmax_precision_graph(_c.data_type.HALF)
+    assert ga.analyze(g_half).softmax_precision == _c.data_type.HALF
+    assert not _eligible(g_half)
+    # Anything else is a malformed request, reported on the facts.
+    g_bad = _mk_softmax_precision_graph(_c.data_type.DOUBLE)
+    assert "softmax_precision must be" in (ga.analyze(g_bad).invalid or "")
+    assert not _eligible(g_bad)
+    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
+    assert g_half._unlowerable_node() is not None
+    assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
+    # serialize() is the backend format, which has no field for the attribute:
+    # refused rather than emitted as (and later executed as) the f32 pipeline.
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
+        g_half.serialize()
 
 
 def test_knob_request_lpt_sched_is_in_domain():
@@ -627,9 +760,84 @@ def test_knob_request_pack_gqa_on_mha_is_identity():
 
 
 def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
-    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    # GQA ratios 3 and 5 share no factor with tile_m (128): nothing can be
+    # packed, so an explicit pack_gqa=True is not honorable (never degraded).
     g = _mk_gqa_graph(6, 2)
     assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(10, 2), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
+    # Partial PackGQA (Capabilities.pack_gqa_partial_d_shapes): a ratio that
+    # shares a factor with tile_m but does not divide it packs that factor on
+    # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
+    for h_q, h_kv in ((24, 2), (12, 2)):
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
+    # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
+    # HEADS_PER_TILE = G), so the same request is declined there.
+    assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    # A group larger than the tile (256/1 MQA) packs the whole tile (p = 128,
+    # two packed heads per KV head) on the partial flavors; declined on d512.
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert not _eligible(_mk_gqa_graph(256, 1, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
+    # The standalone adapter (api_dsl.SdpaFwdDslSm100.check_support) mirrors
+    # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
+    # adapter has no engine row in hand when it validates a knob request.  Pin
+    # the two together so the gate cannot drift: the f16 SM100 row declares
+    # exactly the adapter's flavors, and no other row (fp8 / mxfp8, the cc 10.7
+    # line, SM120) declares partial packing -- the adapter excludes those too.
+    from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
+
+    by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
+    assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name != engines.engine_name()}
+    assert all(v is None for v in others.values()), others
+
+
+def test_capabilities_positional_prefix_is_append_only():
+    # Capabilities evolves APPEND-ONLY (the contract stated above
+    # pack_gqa_d_shapes): a positional construction written against an older
+    # field order must keep binding the same fields.  Prove it the way it
+    # breaks -- construct positionally in the pre-partial-PackGQA order with
+    # thd_padded_stats=True and check nothing rebinds (inserted mid-class, the
+    # True landed on pack_gqa_partial_d_shapes, thd_padded_stats fell back to
+    # False and the flavor membership test raised TypeError on a bool) -- then
+    # pin the legacy tail and the new field's place after it.
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(engines.Capabilities)}
+    names = list(fields)
+    required = {"sm_lo": 100, "sm_hi": 100, "phase": "prefill", "d_shapes": frozenset({(128, 128)})}
+
+    def legacy_value(name):
+        f = fields[name]
+        if name == "thd_padded_stats":
+            return True
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            return f.default_factory()
+        return required[name]
+
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes")]
+    caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
+    assert caps.thd_padded_stats is True
+    assert caps.pack_gqa_partial_d_shapes is None
+    assert caps.paged_d_shapes is None
+    assert caps.epilogue_gate is False
+    assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
+
+    legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
+    start = names.index("pack_gqa_d_shapes")
+    assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
+    # ... and every later field is appended after it, in the order it landed.
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
@@ -1423,20 +1631,23 @@ def test_bwd_dsink_fact():
 # --- paged KV caches (issue #920) -------------------------------------------
 
 
-def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False):
+def _mk_paged_graph(*, d=128, d_v=None, page_size=16, max_pages=8, hnd=True, padding=True, max_seq_len=None, one_table=False, sink=False):
     """cuDNN's paged-cache contract: K/V page pools [num_pages, H_kv, page_size, D]
     (HND compact, or NHD storage declared via strides) + (B, 1, max_pages, 1)
-    int32 block tables + per-batch lengths."""
+    int32 block tables + per-batch lengths. ``d_v`` (default ``d``) is the V
+    pool's row width: the two pools may differ (MLA-style d_qk != d_v). ``sink``
+    adds the (1, H, 1, 1) fp32 sink_token (a decode graph: s_q = 1)."""
     g = _mk_graph()
     b, h, kh = B, H, 2
+    d_v = d if d_v is None else d_v
     q = g.tensor(dim=(b, h, 1, d), stride=(h * d, d, d, 1), data_type=DTYPE, name="q")
     num_pages = b * max_pages
-    if hnd:
-        strides = (kh * page_size * d, page_size * d, d, 1)
-    else:
-        strides = (page_size * kh * d, d, kh * d, 1)
-    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="k")
-    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=DTYPE, name="v")
+
+    def _pool_strides(dd):
+        return (kh * page_size * dd, page_size * dd, dd, 1) if hnd else (page_size * kh * dd, dd, kh * dd, 1)
+
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=_pool_strides(d), data_type=DTYPE, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d_v), stride=_pool_strides(d_v), data_type=DTYPE, name="v")
     tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
     tv = tk if one_table else g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
     slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
@@ -1444,8 +1655,10 @@ def _mk_paged_graph(*, d=128, page_size=16, max_pages=8, hnd=True, padding=True,
     kw = dict(paged_attention_k_table=tk, paged_attention_v_table=tv)
     if max_seq_len is not None:
         kw["paged_attention_max_seq_len_kv"] = max_seq_len
+    if sink:
+        kw["sink_token"] = g.tensor(dim=(1, h, 1, 1), stride=(h, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=padding, seq_len_q=slq, seq_len_kv=slk, **kw)
-    _finish_output(o, (b, h, 1, d), (h * d, d, d, 1))
+    _finish_output(o, (b, h, 1, d_v), (h * d_v, d_v, d_v, 1))
     return g
 
 
@@ -1469,10 +1682,25 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d192x128 / d256 flavors only"
+    assert not _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, which carries no PAGED_KV specialization"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
+    # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
+    facts = _facts(_mk_paged_graph(sink=True))
+    assert facts.has_paged_kv and facts.has_sink and facts.s_q == 1
+    assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
+
+
+def test_paged_mixed_head_dims_are_served():
+    """The head-dim gate tests the flavor the lowering SELECTS
+    (``Capabilities.paged_d_shapes``), not the raw dims: (192, 128) is the
+    native d192x128 flavor, (256, 128) / (64, 192) / (136, 72) ride the d256 and
+    d192x128 envelopes. The previous "exactly one dim > 128" approximation
+    declined all of them (INVERTED from a decline)."""
+    for d_qk, d_v in ((192, 128), (256, 128), (64, 192), (136, 72)):
+        assert engines.engine_name() in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
 
 
 def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
@@ -1486,3 +1714,421 @@ def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
     facts = _facts(g)
     knob_sets = _knob_sets(spec, facts)
     assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+
+
+@pytest.mark.parametrize("max_seq_len", [4000, 4001, 16641])
+def test_paged_split_kv_is_proposed_with_a_ragged_declared_max(monkeypatch, max_seq_len):
+    """A declared ``paged_attention_max_seq_len_kv`` that is NOT a multiple of
+    the 128-row KV tile (FlashInfer passes its true max verbatim, e.g. 4000)
+    must not cost the paged decode launch its split: the per-batch lengths
+    bound the walk on device, so a paged graph never rides the synthesized
+    KV-tail padding that excludes the split on a mask-free dense graph. The
+    heuristic must still propose a split on the same B=2, H_kv=2 launch (tables
+    padded past the declared max, as frameworks do), and a pinned split must
+    still pass the knob probe."""
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+    from cudnn.sdpa.fwd.heuristics import _knob_sets
+
+    g = _mk_paged_graph(page_size=16, max_pages=-(-max_seq_len // 16) + 6, max_seq_len=max_seq_len)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = _facts(g)
+    assert facts.s_kv == max_seq_len and facts.s_kv % 128 != 0 and facts.padded and facts.has_paged_kv
+    knob_sets = _knob_sets(spec, facts)
+    assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(split_kv=2))
+
+
+def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
+    """FlashInfer declares its packed THD Q/O with the batch stride equal to the
+    token stride (h * d): not BSHD-physical over all four axes, but every
+    sequence base comes from the ragged offsets, so only the (H, S, D) order
+    the THD lowering addresses has to hold."""
+    from cudnn.sdpa.graph_analyzer import bshd_layout_ok, packed_layout_ok
+
+    b, h, s, d = 2, 8, 87, 128
+    flashinfer_q = ((b, h, s, d), (h * d, d, h * d, 1))
+    assert not bshd_layout_ok(*flashinfer_q) and packed_layout_ok(*flashinfer_q)
+    dense_bshd = ((b, h, s, d), (s * h * d, d, h * d, 1))
+    assert bshd_layout_ok(*dense_bshd) and packed_layout_ok(*dense_bshd)
+    bhsd = ((b, h, s, d), (h * s * d, s * d, d, 1))  # heads outside tokens: not the packed order
+    assert not packed_layout_ok(*bhsd)
+    assert packed_layout_ok((1, h, s, d), (h * d, d, h * d, 1))  # b == 1 wildcards as before
+
+
+# ---------------------------------------------------------------------------
+# Epilogue-gate tail: sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)  (PR-A)
+#
+# The analyzer recognises EXACTLY this three-node shape (cudnn._sdpa_tail),
+# records it as FACTS (has_epilogue_gate, the G ref, its dtype, shape-ok, the
+# virtual O_v's dtype and declaration state) and rebinds ``o_t`` to the mul
+# output.  The rows judge: only the Rubin d256 rows claim it, at exact dims.
+# ---------------------------------------------------------------------------
+
+_D256 = 256
+
+
+def _mk_gated_graph(
+    *,
+    d=_D256,
+    dtype=DTYPE,
+    intermediate=cudnn.data_type.FLOAT,
+    mul_order="o_first",
+    declare_o_v=True,
+    o_v_dtype=None,
+    gate_dims=None,
+    sdpa_kwargs=None,
+    gate_strides=None,
+):
+    """(graph, tensors) for the gate tail; ``o`` (the mul output) is the REAL output.
+    ``gate_strides`` overrides G's BSHD layout (None = compact BSHD for ``gate_dims``)."""
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=intermediate, compute_data_type=cudnn.data_type.FLOAT)
+    dims = (B, H, S, d)
+    strides = (S * H * d, d, H * d, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=dtype, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=dtype, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=dtype, name="v")
+    gdims = tuple(gate_dims) if gate_dims is not None else dims
+    gstrides = tuple(gate_strides) if gate_strides is not None else _bshd_strides(*gdims[1:])  # default: G rides O's BSHD layout
+    gate = g.tensor(dim=gdims, stride=gstrides, data_type=dtype, name="gate")
+    o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, **(sdpa_kwargs or {}))
+    if declare_o_v:
+        o_v.set_dim(dims).set_stride(strides)
+    if o_v_dtype is not None:
+        o_v.set_data_type(o_v_dtype)
+    s = g.sigmoid(input=gate, name="sig")
+    o = g.mul(a=o_v, b=s, name="gated") if mul_order == "o_first" else g.mul(a=s, b=o_v, name="gated")
+    _finish_output(o, dims, strides, dtype=dtype)
+    return g, dict(q=q, k=k, v=v, gate=gate, o_v=o_v, s=s, o=o)
+
+
+def _rubin(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 7))
+
+
+@pytest.mark.parametrize("mul_order", ["o_first", "s_first"])
+@pytest.mark.parametrize("intermediate", [cudnn.data_type.FLOAT, None], ids=["intermediate-FLOAT", "intermediate-inherits-io"])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16], ids=["fp16", "bf16"])
+def test_gate_tail_is_recognised(monkeypatch, mul_order, intermediate, dtype):
+    """The three-node tail is ONE sdpa graph to the analyzer: ``has_epilogue_gate``,
+    ``epilogue_gate_t`` IS the graph's G, ``o_t`` IS the mul output (the kernel
+    writes the real O; O_v / s are never bound), in either mul operand order and
+    with or without an explicit FLOAT intermediate dtype (plan S7 Q7: O_v may be
+    FLOAT or Q's dtype -- the kernel gates the fp32 pre-cast accumulator either
+    way).  Only the Rubin f16 row is eligible at d=256 on cc10.7; at d=128 no
+    row is, and the reason names the gate."""
+    _rubin(monkeypatch)
+    g, ts = _mk_gated_graph(mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True
+    assert facts.epilogue_gate_t is ts["gate"]
+    assert facts.epilogue_gate_dtype == dtype
+    assert facts.epilogue_gate_shape_ok is True
+    assert facts.epilogue_gate_layout_ok is True, "a compact BSHD G is TMA-loadable zero-copy"
+    assert facts.o_t is ts["o"], "the REAL O is the mul output"
+    assert facts.o_t is not ts["o_v"]
+    assert facts.sdpa_o_virtual_declared is True
+    assert facts.sdpa_o_virtual_dtype in (None, cudnn.data_type.FLOAT, dtype)
+    assert facts.q_t is ts["q"] and facts.d_qk == facts.d_v == _D256 and facts.causal is True
+    assert ga._single_sdpa_node(g) is not None, "the sdpa node is still reachable through the single-node accessor"
+    assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}
+    # The 4-node SdpaBinding must demand G and never O_v / s.
+    assert "gate" in ga.SdpaBinding.__dataclass_fields__
+
+    g128, _ = _mk_gated_graph(d=128, mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    assert _facts(g128).has_epilogue_gate is True
+    assert not _eligible(g128)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    _, why = engines.analyze_for(spec, g128)
+    assert why is not None and "epilogue gate" in why, why
+    # The same tail on the SM100 line (the autouse cc) is declined by every row.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    g100, _ = _mk_gated_graph(mul_order=mul_order, intermediate=intermediate, dtype=dtype)
+    assert not _eligible(g100)
+
+
+def test_gate_tail_o_v_dtype_decision(monkeypatch):
+    """O_v carries whatever dtype the IR gives a virtual (the intermediate dtype
+    at validate(); None before): FLOAT and Q's dtype are ACCEPTED, anything else
+    is declined by message -- the kernel gates the fp32 pre-cast accumulator and
+    never materialises O_v, so only those two describe the math it does."""
+    _rubin(monkeypatch)
+    for ok in (None, cudnn.data_type.FLOAT, cudnn.data_type.HALF):
+        g, _ = _mk_gated_graph(o_v_dtype=ok)
+        assert _facts(g).sdpa_o_virtual_dtype == ok
+        assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}, ok
+    g, _ = _mk_gated_graph(o_v_dtype=cudnn.data_type.BFLOAT16)
+    assert not _eligible(g)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    assert "virtual O" in engines.analyze_for(spec, g)[1]
+
+
+def _malformed_cases():
+    """(id, builder) -> a graph the tail matcher must NOT fuse, or fuse-then-decline."""
+
+    def non_virtual_o_v():
+        g, ts = _mk_gated_graph()
+        ts["o_v"].set_output(True)  # a REAL O_v: two outputs, nothing to fuse
+        return g
+
+    def sigmoid_of_o_v_times_g():
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        gate = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="gate")
+        o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        o_v.set_dim(dims).set_stride(strides)
+        o = g.mul(a=g.sigmoid(input=o_v), b=gate)
+        _finish_output(o, dims, strides)
+        return g
+
+    def g_produced_by_a_node():
+        # G = the sdpa node's own Stats: three nodes, but G is not a graph INPUT.
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        o_v, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
+        o_v.set_dim(dims).set_stride(strides)
+        o = g.mul(a=o_v, b=g.sigmoid(input=stats))
+        _finish_output(o, dims, strides)
+        return g
+
+    def sigmoid_output_is_an_output():
+        g, ts = _mk_gated_graph()
+        ts["s"].set_output(True).set_dim((B, H, S, _D256)).set_stride((S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def second_sdpa():
+        g, ts = _mk_gated_graph()
+        o2, _ = g.sdpa(name="s2", q=ts["q"], k=ts["k"], v=ts["v"], attn_scale=0.1, is_inference=True)
+        _finish_output(o2, (B, H, S, _D256), (S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def relu_tail():
+        g, ts = _mk_gated_graph()
+        r = g.relu(input=ts["o"], name="r")
+        r.set_output(True).set_dim((B, H, S, _D256)).set_stride((S * H * _D256, _D256, H * _D256, 1))
+        return g
+
+    def mul_by_g_without_sigmoid():
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=_D256)
+        gate = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="gate")
+        o_v, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+        o_v.set_dim(dims).set_stride(strides)
+        _finish_output(g.mul(a=o_v, b=gate), dims, strides)
+        return g
+
+    return [
+        ("non-virtual-o_v", non_virtual_o_v),
+        ("sigmoid(o_v)*g", sigmoid_of_o_v_times_g),
+        ("g-produced-by-a-node", g_produced_by_a_node),
+        ("s-marked-output", sigmoid_output_is_an_output),
+        ("second-sdpa", second_sdpa),
+        ("relu-tail", relu_tail),
+        ("mul-without-sigmoid", mul_by_g_without_sigmoid),
+    ]
+
+
+@pytest.mark.parametrize("case", [pytest.param(b, id=i) for i, b in _malformed_cases()])
+def test_gate_tail_rejects_malformed_shapes(monkeypatch, case):
+    """Anything that is not EXACTLY the tail is "not ours": analyze() returns
+    None (the graph is not a single sdpa forward), so no FROST row is eligible
+    and the classic path serves it."""
+    _rubin(monkeypatch)
+    g = case()
+    assert ga.analyze(g) is None
+    assert not _eligible(g)
+
+
+def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
+    """Two LEGAL graphs (a broadcasting pointwise mul; a virtual O_v the user did
+    not declare) that the tail matcher DOES recognise and every row then
+    declines BY MESSAGE -- never facts.invalid, so the backend still serves them."""
+    _rubin(monkeypatch)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    g, ts = _mk_gated_graph(gate_dims=(B, 1, S, _D256))
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.epilogue_gate_shape_ok is False
+    assert not _eligible(g)
+    assert "shape" in engines.analyze_for(spec, g)[1]
+    g, ts = _mk_gated_graph(declare_o_v=False)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.sdpa_o_virtual_declared is False
+    assert not _eligible(g)
+    assert "set_dim" in engines.analyze_for(spec, g)[1]
+
+
+@pytest.mark.parametrize(
+    "gate_strides",
+    [(H * S * _D256, S * _D256, _D256, 1), (S * H * 260, 260, H * 260, 1)],
+    ids=["head-major", "unaligned-head-stride"],
+)
+def test_gate_tail_declines_a_g_the_kernel_cannot_tma_load(monkeypatch, gate_strides):
+    """G is TMA-loaded ZERO-COPY by the fused kernel (Q/K/V/O have a normalisation
+    copy in the lowering; G has none), so a rank-4, O-SHAPED G whose strides TMA
+    cannot express -- head-major (the seq stride does not cover the heads), or a
+    head stride that is not a 16-byte multiple -- is a legal graph that the tail
+    matcher recognises, ``epilogue_gate_layout_ok`` records as False, and the
+    row declines naming the zero-copy rule.  This is the analyzer half of the
+    adapter's ``TMA-expressible`` ValueError (rule 8b): without it the row
+    would admit a G ``check_support`` then rejects."""
+    _rubin(monkeypatch)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    g, ts = _mk_gated_graph(gate_strides=gate_strides)
+    facts = _facts(g)
+    assert facts.has_epilogue_gate is True and facts.epilogue_gate_t is ts["gate"]
+    assert facts.epilogue_gate_shape_ok is True, "the shape is O's -- only the LAYOUT is at fault"
+    assert facts.epilogue_gate_layout_ok is False
+    assert not _eligible(g)
+    assert "zero-copy" in engines.analyze_for(spec, g)[1]
+    # The same G declared BSHD-compact is served: the layout fact is the only difference.
+    assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_prefill_sm107"}
+
+
+def test_virtual_amax_o_is_not_a_fact():
+    """``sdpa_fp8`` RETURNS its Amax_O port unconditionally; only a real
+    (set_output(True), non-virtual) tensor is a requested output.  A virtual one
+    used to enter SdpaBinding and make the plan demand a buffer nobody has
+    ("missing buffers" at execute) -- and it is what has_amax_o=False folds out."""
+    import math
+
+    dims, strides = (B, H, S, 128), (S * H * 128, 128, H * 128, 1)
+
+    def build(request_amax_o):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+        ss = [gg.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        o, _stats, _amx_s, amx_o = gg.sdpa_fp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=ss[0],
+            descale_k=ss[1],
+            descale_v=ss[2],
+            descale_s=ss[3],
+            scale_s=ss[4],
+            scale_o=ss[5],
+            attn_scale=1.0 / math.sqrt(128),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        _finish_output(o, dims, strides, dtype=cudnn.data_type.HALF)
+        if request_amax_o:
+            amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg, amx_o
+
+    g, amx_o = build(request_amax_o=False)
+    assert amx_o.is_virtual
+    facts = _facts(g)
+    assert facts.amax_o_t is None, "a virtual Amax_O is not a requested output"
+    assert engines.engine_name(fp8=True) in _eligible(g), "and its absence declines nothing"
+    g, amx_o = build(request_amax_o=True)
+    assert _facts(g).amax_o_t is amx_o
+    assert engines.engine_name(fp8=True) in _eligible(g)
+
+
+def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
+    """``sdpa_mxfp8`` infers O / Stats / Amax_O dims the way ``sdpa_fp8`` does
+    (PR-B S9): an UNREQUESTED Amax_O -- virtual, never ``set_dim``'d -- passes
+    validate() (it used to fail the IR-level Tensor.validate() with
+    "dims not set" unless the caller declared the port it never asked for) and
+    is not a fact (``amax_o_t is None``), which is what has_amax_o=False folds
+    out.  The inference is PROVISIONAL: a caller's explicit set_dim / set_stride
+    on every output survives validate() byte-for-byte (a non-row-major Stats
+    layout is the witness), and a requested Amax_O is still the fact.  The
+    LOWERING mechanism is pinned too, because it was mis-stated once: the
+    sdpa-family arm of ``_lower_to_cpp`` pushes whatever dim/stride the IR
+    carries, inferred or user-set (only ``push_output_attrs`` is
+    user-assigned-only), so C++ receives the virtual ``[1, 1, 1, 1]`` scalar
+    -- the state ``sdpa_fp8`` has always produced -- not an undimensioned port."""
+    d = 256
+    dims, bshd = (B, H, S, d), (S * H * d, d, H * d, 1)
+    stats_dims, stats_bsh1 = (B, H, S, 1), (S * H, 1, H, 1)  # deliberately NOT row-major
+    e8m0, f8_128x4 = cudnn.data_type.FP8_E8M0, cudnn.tensor_reordering.F8_128x4
+
+    def build(*, request_amax_o):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=bshd, data_type=cudnn.data_type.FP8_E4M3, name="v")
+
+        def sf(sd):  # F8_128x4 scale-factor tensors: Q/K rowwise [B,H,S,d/32], V columnwise [B,H,S/32,d]
+            return gg.tensor(dim=list(sd), stride=[sd[1] * sd[2] * sd[3], sd[2] * sd[3], sd[3], 1], data_type=e8m0, reordering_type=f8_128x4)
+
+        o, stats, amx_o = gg.sdpa_mxfp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=sf((B, H, S, d // 32)),
+            descale_k=sf((B, H, S, d // 32)),
+            descale_v=sf((B, H, S // 32, d)),
+            attn_scale=1.0 / math.sqrt(d),
+            generate_stats=True,
+            use_causal_mask=True,
+        )
+        # Builder-time inference (graph-input dims are known): the three ports carry provisional dims.
+        assert list(o.dim) == list(dims) and list(stats.dim) == list(stats_dims) and list(amx_o.dim) == [1, 1, 1, 1]
+        assert amx_o.is_virtual and stats.is_virtual and o.is_virtual
+        # The caller declares what it requests -- O and Stats -- exactly as the block / harness do.
+        _finish_output(o, dims, bshd, dtype=cudnn.data_type.HALF)
+        stats.set_output(True).set_dim(stats_dims).set_stride(stats_bsh1).set_data_type(cudnn.data_type.FLOAT)
+        if request_amax_o:
+            amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg, o, stats, amx_o
+
+    mxfp8_name = engines.engine_name(mxfp8=True)
+
+    # (a) every output declared explicitly, Amax_O requested: validate() passes, nothing is overridden.
+    g, o, stats, amx_o = build(request_amax_o=True)
+    g.validate()
+    assert g._lowered_graph is None, "an mxfp8 graph a FROST row serves validates natively"
+    assert tuple(o.stride) == bshd and tuple(stats.stride) == stats_bsh1, "explicit set_stride must survive the inference"
+    assert tuple(o.dim) == dims and tuple(stats.dim) == stats_dims and tuple(amx_o.dim) == (1, 1, 1, 1)
+    assert not amx_o.is_virtual
+    facts = _facts(g)
+    assert facts.amax_o_t is amx_o and facts.is_mxfp8
+    assert mxfp8_name in _eligible(g)
+
+    # (b) Amax_O left virtual and UNSET: validate() passes on the inferred [1,1,1,1]; it is not a fact.
+    g, o, stats, amx_o = build(request_amax_o=False)
+    g.validate()
+    assert g._lowered_graph is None
+    assert amx_o.is_virtual and list(amx_o.dim) == [1, 1, 1, 1] and list(amx_o.stride) == [1, 1, 1, 1]
+    assert not amx_o.dim_assigned and not amx_o.stride_assigned, "inferred, not user-assigned (a set_dim/set_stride would flip these)"
+    assert tuple(o.stride) == bshd and tuple(stats.stride) == stats_bsh1
+    facts = _facts(g)
+    assert facts.amax_o_t is None, "a virtual Amax_O is not a requested output"
+    assert facts.is_mxfp8
+    assert mxfp8_name in _eligible(g), "and its absence declines nothing"
+    # (c) What the classic backend would receive (device-free: lowering builds the C++ graph, it does
+    # not validate it): the sdpa-family lowering pushes the IR's dim/stride whether inferred or
+    # user-set, so the undeclared Amax_O lands in C++ as a dimensioned VIRTUAL scalar -- the same
+    # state sdpa_fp8 has always produced -- and the user's O / Stats layout arrives byte-for-byte.
+    g._lower_to_cpp()
+    cpp_amax, cpp_o, cpp_stats = (g._cpp_tensors[t.uid] for t in (amx_o, o, stats))
+    assert cpp_amax.get_is_virtual() and list(cpp_amax.get_dim()) == [1, 1, 1, 1] and list(cpp_amax.get_stride()) == [1, 1, 1, 1]
+    assert not cpp_o.get_is_virtual() and tuple(cpp_o.get_dim()) == dims and tuple(cpp_o.get_stride()) == bshd
+    assert tuple(cpp_stats.get_dim()) == stats_dims and tuple(cpp_stats.get_stride()) == stats_bsh1
+
+
+def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
+    """Planning is graph metadata arithmetic, including explicit override-capable plans."""
+    import builtins
+
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] in ("torch", "cutlass", "cuda") or name.endswith("api_dsl") or name.endswith("prepared"):
+            raise AssertionError(f"planning imported a lowering dependency: {name}")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    for split in (1, 2):
+        knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
+        assert engines.mismatch(spec.capabilities, facts, knobs) is None

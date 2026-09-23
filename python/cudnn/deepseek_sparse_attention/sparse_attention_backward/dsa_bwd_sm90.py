@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import math
 import operator
 from functools import partial
@@ -14,7 +15,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass._mlir.dialects import arith
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.copy import (
     load_s2r,
@@ -881,7 +882,7 @@ class FlashAttentionDSABackwardSm90:
             cpasync.prefetch_descriptor(tma_atom_dQ)
             cpasync.prefetch_descriptor(tma_atom_dQ_64)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         mbar_QdO_ptr = storage.mbar_QdO.data_ptr()
@@ -1551,13 +1552,10 @@ class FlashAttentionDSABackwardSm90:
         acc_dP_mn = make_acc_tensor_mn_view(acc_dP, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - tLSErdPsum[r])
+                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - tLSErdPsum[r]) * softmax_scale
 
-        # Convert dS f32 -> bf16 and pre-scale
-        tdKVrdS = cvt_f16(make_acc_tensor_frgA_view(acc_dP), self.dtype)
-        tdKVrdS_scaled = cute.make_rmem_tensor_like(tdKVrdS, self.dtype)
-        for i in cutlass.range_constexpr(cute.size(tdKVrdS)):
-            tdKVrdS_scaled[i] = (tdKVrdS[i].to(Float32) * softmax_scale).to(self.dtype)
+        # Scale dS in f32 before the single conversion required by the 16-bit MMA operands.
+        tdKVrdS_scaled = cvt_f16(make_acc_tensor_frgA_view(acc_dP), self.dtype)
 
         # (6) Prepare register A operand for GEMM4 RS GEMMs
         tdQrdS_scaled = cute.make_tensor(

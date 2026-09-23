@@ -18,7 +18,7 @@ The configs sweep the two cuDNN frontend paths only:
 
 | Backend | What it measures |
 |---|---|
-| `cudnn` | cuDNN frontend graph API, native backend engines (heur A + FALLBACK), contiguous KV |
+| `cudnn` | cuDNN frontend graph API, native backend engines only (heur A + FALLBACK; the FROST SDPA engines are deselected by name, since the SM100/SM120 f16 rows are default candidates), contiguous KV |
 | `cudnn_oss` | the same graph planned with `heur_mode.OPENSOURCE` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`: only the frontend's open-source engines (frost python engines + the backend's OSS candidates) may serve it; the winning plan is recorded per case |
 
 Unsupported combinations are recorded (not hidden) and show up as blank slots
@@ -65,8 +65,8 @@ python -m benchmark.attention_inference.runner --config llama --phase generation
 ```
 
 Results are organized per architecture as `results/<config>/<gpu>/`, each
-holding the CSV plus two charts: `<config>_context.png` (subplots stacked by
-prefill kind) and `<config>_generation.png` (subplots stacked by MTP width).
+holding the CSV plus two charts: `<config>_context.webp` (subplots stacked by
+prefill kind) and `<config>_generation.webp` (subplots stacked by MTP width).
 Every expanded case owns an x slot whether or not it ran, so coverage gaps
 are visible. Architectures are reported in isolation, never merged.
 

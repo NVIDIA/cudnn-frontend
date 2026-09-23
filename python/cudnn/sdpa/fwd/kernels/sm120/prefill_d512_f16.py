@@ -61,6 +61,7 @@ Constraints:
   the target SM120 SMEM capacity
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Type
@@ -195,12 +196,14 @@ class SM120FusedMultiHeadAttentionForward:
         split_kv: int = 1,
         thd_batch: int = 1,
         thd_lse_head_major: bool = False,
+        thd_lse_padded: bool = False,
         head_tile_qk: int = 128,
         head_tile_v: int = 128,
         kv_tile: int = SEQ_KV_TILES[0],
         q_tile: int = SEQ_Q_TILES[0],
         pack_gqa: bool = False,
         qh_per_kh: int = 1,
+        stats_log2: bool = False,
     ):
         """Initialize the FMHA prefill kernel configuration.
 
@@ -271,9 +274,11 @@ class SM120FusedMultiHeadAttentionForward:
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
+        self.stats_log2 = stats_log2
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
         self.thd_lse_head_major = thd_lse_head_major
+        self.thd_lse_padded = thd_lse_padded  # THD Stats without ragged offsets: per-batch (B, H, s_max) rows
 
         self.head_tile_qk = head_tile_qk
         self.head_tile_v = head_tile_v
@@ -1480,6 +1485,8 @@ class SM120FusedMultiHeadAttentionForward:
                     lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
                     _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                     lse_out = cutlass.Float32(row_lse[row_half])
+                    if cutlass.const_expr(self.stats_log2):
+                        lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                     if cutlass.const_expr(self.thd_varlen):
                         # Packed ragged-Stats LSE, written directly in the
                         # caller's declared layout: token-major (T, H) or
@@ -1488,7 +1495,10 @@ class SM120FusedMultiHeadAttentionForward:
                         # NEXT sequence — never written, and there is no
                         # padded region to trim.
                         if lse_q_idx < seqlen_q:
-                            if cutlass.const_expr(self.thd_lse_head_major):
+                            if cutlass.const_expr(self.thd_lse_padded):
+                                # per-batch padded Stats (B, H, s_max), no ragged offsets
+                                lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
+                            elif cutlass.const_expr(self.thd_lse_head_major):
                                 lse_row = lse_arr[_lse_head, :]
                                 lse_row[q_row_base + lse_q_idx] = lse_out
                             else:
@@ -1845,6 +1855,10 @@ class SM120FusedMultiHeadAttentionForward:
         :param thd_kv_lens: THD only: same for the KV side.
         :param thd_lens_form: THD only: runtime bitmask — bit 0: Q is cu,
             bit 1: KV is cu.
+        :param thd_n_ctas: Persistent CTA count. THD: the flat machine-sized
+            grid that claims live units. Dense: caps the flat unit grid so each
+            CTA walks several units and prefetches the next Q tile; 0 = one CTA
+            per unit.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]
@@ -1889,7 +1903,10 @@ class SM120FusedMultiHeadAttentionForward:
                 # only the static modes are trace-checkable. The adapter builds
                 # the token-major view from that total; head_stride >= T is the
                 # caller's contract for head-major storage.
-                if cutlass.const_expr(self.thd_lse_head_major):
+                if cutlass.const_expr(self.thd_lse_padded):
+                    if cutlass.const_expr(len(lse.shape) != 3):
+                        raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
+                elif cutlass.const_expr(self.thd_lse_head_major):
                     if cutlass.const_expr(lse.shape[0] != q.shape[2]):
                         raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
                     if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
@@ -2069,6 +2086,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_padded_rows: int = 0,
     q_stride: Optional[tuple[int, int, int, int]] = None,
     k_stride: Optional[tuple[int, int, int, int]] = None,
     v_stride: Optional[tuple[int, int, int, int]] = None,
@@ -2100,6 +2118,7 @@ def compile(  # noqa: A001
     caller-declared head-row stride (``>= T``, a shape — part of the cache key).
     """
 
+    _cache_key = _template_key(globals(), locals(), "compile")
     if pick_flavor(d_qk, d_v, fp8=False) != D512_FLAVOR:
         raise ValueError(f"SM120 SDPA d512 kernel: head dimensions must both be in (256, 512]; got ({d_qk}, {d_v})")
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -2113,9 +2132,11 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
+        stats_log2=PARAMS.stats_log2,
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
+        thd_lse_padded=bool(lse_padded_rows),
         head_tile_qk=D512_FLAVOR[0],
         head_tile_v=D512_FLAVOR[1],
         q_tile=PARAMS.q_tile,
@@ -2126,7 +2147,7 @@ def compile(  # noqa: A001
     )
     if PARAMS.split_kv > 1 and not has_lse:
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    if lse_stride is not None and (PARAMS.thd_varlen or PARAMS.split_kv > 1):
+    if lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     fake_batch = 1 if PARAMS.thd_varlen else b
     if PARAMS.thd_varlen:
@@ -2154,7 +2175,7 @@ def compile(  # noqa: A001
     fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
     fake_o = _fake_bshd((o_fake_batch, sq, qh, d_v), o_stride)
     if PARAMS.thd_varlen:
-        fake_lse_shape = (qh, lse_head_stride) if lse_head_major else (sq, qh)
+        fake_lse_shape = (b, qh, lse_padded_rows) if lse_padded_rows else ((qh, lse_head_stride) if lse_head_major else (sq, qh))
     else:
         fake_lse_shape = (lse_fake_batch, qh, sq)
     if not has_lse:
@@ -2168,7 +2189,7 @@ def compile(  # noqa: A001
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
                 fake_lse_shape,
-                stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
+                stride_order=(1, 0) if (PARAMS.thd_varlen and not lse_padded_rows) else (2, 1, 0),
                 assumed_align=4,
             )
         )
@@ -2206,7 +2227,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
-    return cute.compile(
+    return _compile_cached(
         kernel,
         fake_q,
         fake_k,
@@ -2224,4 +2245,6 @@ def compile(  # noqa: A001
         cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

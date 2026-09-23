@@ -28,7 +28,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass import Float32, Int32, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
@@ -121,8 +121,8 @@ class IndexerForwardSm90:
         return sm90_utils_basic.make_trivial_tiled_mma(
             self.qk_dtype,
             self.qk_dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             Float32,
             atom_layout_mnk=(1, 1, 1),
             tiler_mn=(self.mma_tile_n, self.q_per_stage),
@@ -1300,7 +1300,7 @@ class IndexerForwardSm90:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         mbar_Q0_ptr = storage.mbar_Q0.data_ptr()

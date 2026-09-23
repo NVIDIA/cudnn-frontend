@@ -41,7 +41,8 @@ pytestmark = [pytest.mark.L0, requires_matmul_gpu]
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, _current_arch, _epi_chunk_elems, _epi_vec_bytes
-from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+from cudnn.gemm.frost.arch_family import active_family, template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import CATALOG, ConfigSm120, by_name
 
@@ -288,6 +289,10 @@ def _compatible(
         return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        # Each arch tree's compiler renders its own pipelines only; the process
+        # picked its tree from the GPU (or CUDNN_FRONTEND_GEMM_ARCH_FAMILY).
+        return False, f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree"
     if cfg.pipeline == "sm120":
         # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
         # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
@@ -2402,7 +2407,7 @@ def test_cache_dir_falls_back_when_unwritable(tmp_path, monkeypatch, caplog):
     try:
         _usable_cache_dir.cache_clear()
         monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(readonly / "nested"))
-        with caplog.at_level(logging.WARNING, logger="cudnn.gemm.frost.compiler"):
+        with caplog.at_level(logging.WARNING, logger=_cache_dir.__module__):  # the active family's compiler
             got = _cache_dir()
         assert got == _fallback_cache_dir()
         assert os.access(got, os.W_OK)
@@ -2480,6 +2485,8 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
         ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
         ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 2),
         ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", 4),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", 4),
     ],
 )
 def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> None:
@@ -2500,9 +2507,9 @@ def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> 
         ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_tile_m=32"),
         ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_tile_n=512"),
         ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_tile_n=12"),
-        # At most 2 instructions along M this pass...
-        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "mma_size_m=4"),
-        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "mma_size_m=4"),
+        # At most 4 instructions along M...
+        ("CONFIG_sm100_512x128x128_64x128x32_cluster1x1", "mma_size_m=8"),
+        ("CONFIG_sm100_1024x128x128_128x128x32_cluster1x1", "mma_size_m=8"),
         # ... and N is not an instruction-count axis at all.
         ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
     ],
@@ -2511,6 +2518,26 @@ def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
     with pytest.raises(NotImplementedError) as e:
         by_name(name)
     assert reason in str(e.value)
+
+
+def test_catalog_cta_pairs_stay_inside_clusters() -> None:
+    for cfg in CATALOG:
+        assert cfg.cga_size_m % cfg.ctas_per_mma == 0, cfg.name
+        assert cfg.multicast_b_factor >= 1, cfg.name
+
+
+@pytest.mark.parametrize("pipeline,k_bytes,mma_k_bytes", [("sm100", 128, 32), ("sm103", 384, 48)])
+@pytest.mark.parametrize("cga_m,cga_n", [(1, 2), (3, 1)])
+@pytest.mark.parametrize("source", ["by_name", "constructor"])
+def test_cta_pair_rejects_odd_cluster_m(pipeline, k_bytes, mma_k_bytes, cga_m, cga_n, source) -> None:
+    from dataclasses import replace
+
+    name = f"CONFIG_{pipeline}_128x128x{k_bytes}_128x128x{mma_k_bytes}_cluster{cga_m}x{cga_n}"
+    with pytest.raises(NotImplementedError, match="cga_size_m % 2 == 0"):
+        if source == "by_name":
+            by_name(f"{name}_2ctamma")
+        else:
+            replace(by_name(f"{name}_1ctamma"), cta_group=2)
 
 
 def test_catalog_enumerates_the_mma_m_axis() -> None:
@@ -2536,7 +2563,7 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     sm120_axis = {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"}
     assert sm120_axis == {c.warp_tile_m // 16 for c in CATALOG if c.pipeline == "sm120"}
     assert {1, 2} <= sm120_axis
-    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2}
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2, 4}
     assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm103"} == {1}
     # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
     assert next(c for c in sm100 if c.cta_tile_m == 128).mma_size_m == 1
@@ -2547,7 +2574,56 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     g.matmul(A=A, B=B, name="mm").set_output(True)
     # Split tiles reach the funnel: whichever families serve THIS device, the
     # candidates carry more than the unsplit tile.
-    assert {1, 2} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
+    assert {1, 2, 4} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
+
+
+@requires_sm100
+@pytest.mark.parametrize("mma_m", (64, 128))
+@pytest.mark.parametrize("cta_group,cluster", ((1, "1x1"), (2, "2x1"), (1, "2x2"), (2, "4x2")))
+@pytest.mark.parametrize("a_major,out_major,stg", (("k", "n", False), ("m", "m", False), ("k", "n", True)))
+def test_four_mma_m_tiles(mma_m, cta_group, cluster, a_major, out_major, stg):
+    """All four M blocks, a second CTA tile, M/K tails, both drains and multicast.
+
+    At MMA M=128 an unsliced A load needs two TMA boxes. Do not turn a build
+    rejection into a skip: these geometries must compile and execute.
+    """
+    cfg = by_name(f"CONFIG_sm100_{4 * mma_m}x64x128_{mma_m}x64x32_cluster{cluster}_{cta_group}ctamma")
+    M, N, K = 1152, 256, 264
+    g = _build_graph(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled = _plan(g, config=cfg, force_stg_epi=stg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
+
+
+@requires_sm100
+def test_benchmark_sweeps_four_mma_m_configs(monkeypatch):
+    bench_dir = pathlib.Path(__file__).resolve().parents[4] / "benchmark" / "gemm" / "frost"
+    monkeypatch.syspath_prepend(str(bench_dir))
+    from benchmark_matmul import _build_spec_map
+    from benchmark_utils import select_config_variants
+
+    specs = _build_spec_map(_build_graph(1152, 256, 264, "bf16", "bf16"))
+    default = select_config_variants(None, specs)
+    globbed = select_config_variants("CONFIG_sm100_512x64x128_*", specs)
+    for cta_group, cluster in ((1, "1x1"), (2, "2x1")):
+        name = f"CONFIG_sm100_512x64x128_128x64x32_cluster{cluster}_{cta_group}ctamma"
+        assert name in default and name in globbed
+        assert specs[name][0].mma_size_m == 4
+
+
+@requires_sm107
+@pytest.mark.parametrize("mma_k_bytes", (32, 64))
+@pytest.mark.parametrize("cta_group", (1, 2))
+def test_four_mma_m_fp8(mma_k_bytes, cta_group):
+    cfg = by_name(f"CONFIG_sm100_512x128x128_128x128x{mma_k_bytes}_cluster{cta_group}x1_{cta_group}ctamma")
+    M, N, K = 1152, 256, 272
+    compiled = _plan(_build_graph(M, N, K, "fp8_e4m3", "bf16"), config=cfg)
+    a, b, c = _mkdata(M, N, K, "fp8_e4m3", "bf16")
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -2808,9 +2884,8 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
-    tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
-    files = sorted(p for p in tmpl_dir.glob("sm*.py"))
-    assert len(files) == 8, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    files = template_files()
+    assert len(files) == 12, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3002,8 +3077,7 @@ def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
     from `epi_chunk_elems`, which differs per store arm."""
     import pathlib
 
-    tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
-    for path in sorted(tmpl_dir.glob("sm*.py")):
+    for path in template_files():
         src = path.read_text()
         assert "vsize = epi_chunk_elems" in src, path.name
         assert "vsize = (VEC_BYTES" not in src, path.name
@@ -3024,12 +3098,6 @@ _VERSION_GATED_KWARGS = {
 }
 
 
-def _template_dir():
-    # kernel_templates has no __init__.py (it is exec'd per render), so go
-    # through the package that does.
-    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
-
-
 def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
     """Every template must reach these ops through `_tile_helpers`, which emits
     the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
@@ -3038,7 +3106,7 @@ def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
     import ast
 
     offenders = []
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if (
@@ -3083,7 +3151,7 @@ def test_the_collector_helpers_are_one_text_across_every_template():
     import ast
 
     blobs = {}
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         lines = path.read_text().split("\n")
         defs = [n for n in ast.parse("\n".join(lines)).body if isinstance(n, ast.FunctionDef) and n.name.endswith("_collector_op")]
         if not defs:
@@ -3124,12 +3192,12 @@ def test_the_a_and_b_collectors_can_never_both_be_live():
     each other only because the two helpers bail on `mma_size_m` from opposite
     sides -- nothing else pins it, so this does."""
     both = 0
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         fns = _load_collector_helpers(path, {})
         if len(fns) < 2:
             continue
         both += 1
-        for mma_size_m in (1, 2):
+        for mma_size_m in (1, 2, 4):
             for num_gemms in (1, 2, 3):
                 for num_a_operands in (1, 2):
                     for b_ok in (True, False):
@@ -3151,7 +3219,7 @@ def test_every_a_collector_chain_starts_with_fill_and_ends_with_lastuse():
     compile-time property -- a chain that began with USE would pick up a stale
     entry and silently multiply in the wrong operand."""
     seen = 0
-    for path in sorted(_template_dir().glob("sm*.py")):
+    for path in template_files():
         for name, n_key in (("_a_collector_op", "num_gemms"), ("_b_collector_op", "mma_size_m")):
             for n in (1, 2, 3):
                 consts = dict(mma_size_m=1, num_gemms=1, num_a_operands=1, b_collector_ok=True)
@@ -3176,7 +3244,7 @@ def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
     import ast
     import inspect
 
-    import cudnn.gemm.frost.kernel_templates._tile_helpers as helpers
+    import cudnn.gemm.frost.sm100.kernel_templates._tile_helpers as helpers
 
     for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
         fn = getattr(helpers, fn_name)
@@ -3223,12 +3291,9 @@ def test_sm120_registry_wiring() -> None:
     assert ("bf16", "bf16", "fp32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
     assert ("int8", "int8", "int32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
 
-    # the template file itself ships with the package
-    from pathlib import Path
-
-    import cudnn.gemm.frost.compiler as C
-
-    assert (Path(C.__file__).parent / "kernel_templates" / "sm120_matmul.py").is_file()
+    # the template file itself ships with the package -- in the sm120 tree,
+    # whichever family's compiler this process runs
+    assert tmpl.path.is_file() and tmpl.path.parent == template_dir("sm120")
 
 
 def test_sm120_tile_config_family() -> None:
@@ -3430,11 +3495,12 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
 
 def test_sm120_render_smoke() -> None:
     """Render the sm120 template end-to-end (real tile constants + epilogue
-    snippets) on whatever GPU is active — no cute.compile, so this covers the
-    sm100 CI too. The source must be marker-free, parseable, and carry the
-    STG-only sm120 contract constants."""
-    from cudnn.gemm.frost.compiler import _render_template
-    from cudnn.gemm.frost.epilogue_codegen import generate
+    snippets) on whatever GPU is active — no cute.compile, and through the
+    sm120 tree's compiler by name (the facade is the active GPU's tree), so this
+    covers the sm100 CI too. The source must be marker-free, parseable, and
+    carry the STG-only sm120 contract constants."""
+    from cudnn.gemm.frost.sm120.compiler import _render_template
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
 
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     for a_major in ("k", "m"):
@@ -3523,6 +3589,48 @@ def _splitk_data(B, M, N, K, torch_in=torch.bfloat16, torch_out=torch.bfloat16):
     return a, b, c, ref
 
 
+@requires_sm100
+@pytest.mark.parametrize(
+    "B,M,N,K,normal",
+    [
+        (1, 128, 128, 1024, False),
+        (1, 128, 4096, 8192, False),
+        (1, 256, 256, 16384, False),
+        (3, 96, 160, 4096, True),
+        (1, 192, 160, 2112, True),
+        (1, 129, 96, 8192, True),
+    ],
+)
+def test_joint_strategy_selected_config_executes(B, M, N, K, normal):
+    """Numerics only: replay B200-profile choices on the active tcgen05 GPU."""
+    from cudnn.gemm.frost.compiler import _auto_split_k, jit_from_cudnn_graph, probe_chain
+    from cudnn.gemm.frost.planning import DeviceProperties, select_strategy
+    from cudnn.gemm.frost.tile_config import select_config
+
+    graph, A, Bt, C = _splitk_graph(B, M, N, K)
+    chain = analyze(graph)
+    baseline = _auto_split_k(chain, select_config(M, N, 1, K=K, sm_count=148), sm_count=148)
+    config = select_strategy(chain, baseline, device=DeviceProperties(100, "NVIDIA B200", 148, 132644864), probe=probe_chain)
+    if (M, N, K) == (128, 128, 1024):
+        assert config.split_k_slices == 1
+    elif (M, N, K) == (128, 4096, 8192):
+        assert config.cta_tile_m == config.cta_tile_n == 128 and config.split_k_slices == 4
+    elif (M, N, K) == (256, 256, 16384):
+        assert config.split_k_slices > 4 and config.split_k_slices & (config.split_k_slices - 1)
+    compiled = jit_from_cudnn_graph(graph, config=config)
+    if normal:
+        torch.manual_seed(917)
+        a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        b = torch.randn(B, N, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        out = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
+        reference = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
+    else:
+        a, b, out, reference = _splitk_data(B, M, N, K)
+    out.fill_(float("nan"))
+    _run_splitk(compiled, {A: a, Bt: b, C: out})
+    torch.testing.assert_close(out, reference, rtol=0.01 if normal else 0, atol=0.005 if normal else 0)
+
+
 # Shapes cover what split-K changes: K tails, M tails, batch.
 _SPLITK_SHAPES = (
     (1, 256, 256, 4096),
@@ -3565,8 +3673,8 @@ def test_splitk_output_dtypes(io_dt, out_dt, torch_in, torch_out):
 @pytest.mark.parametrize("N", (250, 255), ids=("Nmod4", "Nodd"))
 def test_splitk_n_not_multiple_of_4(N):
     # splitk_reduce_elems clamps to divide N (2 for 250, 1 for 255), so reducer
-    # groups never cross a workspace row. fp32 output: odd N with a 2-byte dtype
-    # is rejected engine-wide (row stride must be 4-byte aligned).
+    # groups never cross a workspace row. The output store may narrow further
+    # to a byte or halfword according to its own dtype and layout alignment.
     if N % 2 and _current_arch() == 120:
         pytest.skip("the sm120 template stores whole (n, n+1) accumulator pairs; odd N is rejected")
     g, A, Bt, C = _splitk_graph(1, 256, N, 4096, out_dt=cudnn.data_type.FLOAT)

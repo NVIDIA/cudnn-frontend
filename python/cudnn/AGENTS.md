@@ -44,6 +44,16 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   defined or explicitly rejected — an unhandled overlap is an untested code
   path with unspecified semantics, and "both supplied" is exactly the case
   no per-argument check catches (raised in review on PR #266).
+- **An execute-time shape/stride override must reach the executor or raise
+  before launch.** A raw uid-map plan cannot consume it; do not silently drop
+  the override triple. Filter override-enabled graphs per plan's binding capability,
+  preserving prepared plans while declining tensor-only ones. Detectors:
+  `test_uid_map_plan_rejects_runtime_overrides_before_execute` and
+  `test_override_filter_preserves_compatible_split_candidates`.
+- **Shape overrides do not enlarge the producer's storage.** Validate metadata
+  inputs against their observed span as well as their effective shape, and check
+  pointer alignment for the element type. The host-only detector is
+  `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -124,18 +134,13 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
-  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
-  tensor even when only KV is padded, so no static rule separates "declares
-  per-batch Q lengths" from "the lengths are actually short" — declining the
-  declaration would drop the KV-only-padding population these kernels serve
-  correctly. It goes away when the FP8 kernels get the epilogue trim; until
-  then the read is what keeps a short length from being silently ignored.
-- `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
-  (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
-  wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
-  `graph.execute()` does not route here. Still a violation, and it is the one to
-  fix first if that spec ever gains THD.
+- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
+  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
+  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
+  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
+  the graph's envelope `S_max` and turns the per-batch lengths into
+  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
+  violation on the wrapper surface (a caller contract, documented there).
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -170,10 +175,12 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
-- **Known open cleanup (issue #604)**: the SM80 engines' `_compile_cached`
-  (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
-  token extents like the SM100/SM120 THD compiles rather than copying its
-  pattern.
+- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
+  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
+  plus the plan-time sequence count; the regression tests are
+  `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
+  `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
+  pattern, not a shape-keyed one.
 - **Key on exactly the contract-relevant set — no more, no less.** Both
   failure modes shipped on PR #553 and were caught in review: *under-keying*
   (the cache keyed only `x.shape`/`w.shape` while `check_support()`
@@ -214,6 +221,24 @@ the kernel that reads it).
   argument is a contract: validate device-residency and dtype (a CUDA int64
   tensor, not a host tensor) before handing its address to a kernel — both
   flagged in review on PR #517.
+- **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
+  Every eager caller on torch's default stream hands us a default-stream
+  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
+  lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
+  Torch work issued in that context is unordered with a kernel launched on
+  `CUstream(0)`: on an idle GPU the copies win the race and every isolated
+  test passes; under xdist load the kernel reads stale conversion buffers and
+  a staged output is copied back before it is written (the qa sm90
+  `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
+  Map the sentinels and torch's own default stream to
+  `torch.cuda.default_stream(device)`, the current stream to itself, and only a
+  genuine side stream to `ExternalStream(handle, device=device)`. The one
+  implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
+  with the raw-handle fast path); every engine calls it, none writes its own
+  wrapper. Detector:
+  monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
+  with handle 0 (`test_hopper_marshal_stream.py`).
 
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
@@ -267,6 +292,12 @@ DSL satisfies your kernel.**
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- **MLIR argument widths are part of a DSL API migration.**
+  `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
+  while its predecessor carried one. Custom `__new_from_mlir_values__` methods
+  must slice by the lengths recorded during extraction, rather than assuming
+  one value per field. Static coordinates can contribute zero values, too.
+  `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
@@ -274,6 +305,161 @@ DSL satisfies your kernel.**
   module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
   same way on a since-dropped 4.5.x lane, reported as "install optional
   dependencies".
+
+**Rule 8 — the graph API owns no device memory and never blocks the host: at
+build AND at execute.**
+
+Rules 1 and 3 say this for `execute()` in torch vocabulary. This rule closes
+the two gaps that produced the #1151 sm103 red: plan build, and the driver-API
+spellings the torch vocabulary does not name.
+
+- **No plan- or engine-owned device allocation, ever.** Not `cuMemAlloc` /
+  `cudaMalloc`, not `torch.empty` / `torch.zeros`, not `frost.buffers.DeviceBuffer`,
+  at build or at execute, cached or not. Execute scratch — per-batch metadata,
+  on-device TMA descriptors, an output the kernel always writes but the graph
+  did not request — is carved from the caller's workspace and declared through
+  `get_workspace_size()` (`prepared.py`: `meta_ptr = workspace_ptr`,
+  `o_desc_ptr = workspace_ptr + off_o_desc`). A path with no workspace contract
+  (the direct `jit_from_cudnn_graph` MoE call) gets one; it does not get an
+  allocation. Owned device memory has a GC-timed release, and a cyclic
+  collection inside someone else's `torch.cuda.graph` window turned three
+  per-plan dummies into `cuMemFree -> 900` and an invalidated capture (#1151 on
+  sm103). #1152's relaxed-mode guard on the two remaining finalizers is defence
+  in depth, not a licence.
+- **A dead ABI slot is compiled out, or bound to `0`, or borrowed — never
+  allocated.** Prefer `cutlass.const_expr` on `None` so the operand does not
+  exist. Otherwise `0` is a legitimate address for a slot the kernel never
+  dereferences: `cuTensorMapEncodeTiled` accepts a NULL global address (only
+  misalignment is rejected), the DSL rejects only negative pointer addresses
+  and ships `cute.runtime.nullptr`, and the tvm-ffi positional entry carries
+  `cute.Pointer` parameters as plain integers — 12 prepared THD launches with
+  `sinks_ptr = 0` pass bit-exact. A dead slot that turns out to be live then
+  faults loudly instead of reading garbage. Borrowing an aligned address the
+  contract already guarantees (`sinks_ptr = q.ptr` when `HAS_SINK` is off,
+  descriptor-only THD rows aliasing live Q/O storage) is the other acceptable
+  form. A cached `torch.zeros` dummy is not: Rule 1's `_dummy` exemption is
+  grandfathered for `sdpa/fwd/api_dsl.py` and closed for new code.
+- **No host-blocking call, build or execute.** `cuStreamSynchronize`,
+  `cuCtxSynchronize`, `cudaDeviceSynchronize`, `cuEventSynchronize`, the
+  synchronous `cuMemcpy*` / `cuMemsetD*` forms, `torch.cuda.synchronize()`,
+  `.item()`. Build is lazy — it runs on the first execute of a shape, which in
+  a serving stack is inside a stream capture (a FlashInfer graph-cache miss) —
+  so build is held to the execute standard: uploads via `cuMemcpyHtoDAsync` on
+  the launch stream, fills via `cuMemsetD32Async`, constants baked into the
+  kernel image or written by a setup kernel. `cuMemAlloc` + `cuMemsetD32` +
+  `cuStreamSynchronize(0)` at build was the #1151 anti-pattern.
+- **An engine that cannot be async declines; it does not sync.** The CAKE KDA
+  route plans its work items on the host (`cuMemcpyDtoHAsync` +
+  `cuStreamSynchronize`) and therefore checks `cuStreamIsCapturing` and raises
+  under capture (`linear_attention/cake/compiler.py::check_not_capturing`).
+  That is the only legal shape of an exception: declared in the engine, loud,
+  never on a captured stream.
+- **Detectors.** `test_execute_allocates_nothing_and_never_synchronizes`
+  (`torch.cuda.set_sync_debug_mode("error")` plus allocator accounting around
+  a prepared execute) — run the same assertion around the BUILD;
+  `test_collect_unrelated_resources_during_capture` (GC inside a global-mode
+  capture window, then replay and a native cuDNN launch); and a capture test
+  whose first execute of a shape happens inside `torch.cuda.graph`, so the lazy
+  build runs under capture.
+
+
+### Rule 8 / Rule 5 recipes — do exactly this, do not reinvent
+
+One canonical answer per situation. Every engine copies the recipe; a reviewer
+cites the recipe name. If a recipe does not fit, say so in the PR and extend the
+recipe here — do not write a local variant (the audit behind #1165/#1167/this
+section found 18 hand-rolled stream wrappers, 5 of them wrong).
+
+**R1 — a raw stream handle becomes a torch stream.**
+```python
+from cudnn._torch_stream import as_torch_stream, stream_context
+
+with stream_context(ctx.stream, device):          # torch work on the launch stream
+    buf.copy_(src)
+tensor.record_stream(as_torch_stream(ctx.stream, device))
+```
+Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
+`stream_context(None)` is a no-op; a handle equal to torch's current stream is
+a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`.
+
+**R2 — execute needs scratch (metadata, on-device descriptors, an output the
+kernel always writes but the graph did not request, staging for a dead-but-
+required tensor slot).** Declare it, carve it, never allocate it:
+```python
+def get_workspace_size(self) -> int:                 # BaseEngine / CompiledPlan
+    return ws_align(meta_bytes) + ws_align(desc_bytes) + ...
+def execute(self, graph, variant_pack, ctx):
+    ws = Workspace.over(variant_pack, self.get_workspace_size(), type(self).__name__)  # frost/workspace.py
+    meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
+```
+(APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
+in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
+`"<owner> requires a N-byte workspace but execute() received none; allocate
+graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
+that error, never fall back to `torch.empty` / `DeviceBuffer` when the caller
+passed nothing. A path with no workspace contract gets one. Where a wrapper
+allocates per call on the caller's behalf, it allocates under
+`stream_context(<launch stream>)` (R1): the caching allocator orders a block's
+reuse only against the stream it was allocated on, so scratch allocated on
+torch's ambient stream for a handle re-streamed to a side stream is a
+use-after-free waiting for load.
+
+**R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
+of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
+read only under `cutlass.const_expr(flag)`, with `flag` in the compile key, and
+`None` passed at BOTH compile and launch (DSA sm90 `mTopkIdx`, `mTopkLength`);
+(2) pointer ABI: bind `0` (`prepared.py` `sinks_ptr`, dense `o_desc_ptr` /
+`meta_ptr`); (3) tensor ABI with a required `cute.Tensor` parameter: borrow the
+bytes from the workspace via R2 (`sdpa/bwd/api_dsl.py` dense `seq_kv` /
+`desc_words`). Never a cached `torch.zeros` dummy, never `q.ptr` borrowing
+(a live read then reads Q bytes silently instead of faulting). `0` is legal at
+every layer: `cuTensorMapEncodeTiled` accepts NULL, the DSL rejects only negative
+addresses, the tvm-ffi positional entry carries pointers as ints.
+
+**R4 — a live per-batch table the caller did not give you (lengths, offsets,
+scale scalars).** R2 (carve) + fill on the launch stream with one async op
+(`cuMemsetD32Async`, `cuMemcpyHtoDAsync`, `buffers.memset_zero_async`), or make
+it a scalar kernel argument. Never `torch.tensor(values, device=...)` per execute
+(pageable H2D + implicit sync), never build it at `compile()` into a plan-owned
+tensor.
+
+**R5 — the input is not in the layout/dtype the kernel takes.** Decline in
+`check_support()` with a `NotImplementedError` naming the tensor and its
+strides/dtype (`_thd_check_strides_native` in `sdpa/fwd/api_dsl.py`), so the
+Router picks another engine. Not `.contiguous()`, not `.to(dtype)`, not a
+repack/copy-back — even into the workspace (Rule 2). If the engine is meant to
+serve that input, the kernel reads it natively.
+
+**R6 — something must block the host (host-planned work items, a D2H read
+of lengths).** The engine is non-capturable: check `cuStreamIsCapturing` and
+raise before doing it (`linear_attention/cake/compiler.py::check_not_capturing`),
+and say so in its docstring. Never a silent `cuStreamSynchronize` /
+`torch.cuda.synchronize()` / `.item()` on a build or execute path.
+
+**R7 — you need a cuDNN handle and the caller gave none.** Graph API lowering:
+`_pygraph._backend_handle_for_lowering` (process default, one per thread and
+device, stream 0, destroyed at exit) — the graph never owns one. torch-op
+layers: the per-device cached handle re-streamed to torch's current stream
+before every call (`linear_attention/ops/common.py::get_handle`,
+`ops/norm/_common.py`). Never `cudnn.create_handle()` inside a plan, engine or
+C++ graph object.
+
+**R8 — you own a CUDA resource whose release can be GC-timed (only tests and
+the C++ PyGraph may).** Release inside `cuThreadExchangeStreamCaptureMode(RELAXED)`
+and restore in `finally` (`frost/buffers.py DeviceBuffer.__del__`,
+`pygraph.h CaptureModeGuard`). Production plans and engines reach this recipe
+only if R2/R7 were skipped — fix that instead.
+
+**R9 — proving it.** Around a warm `build()` + `execute()`:
+`torch.cuda.set_sync_debug_mode("error")` (no sync), and
+`torch.cuda.memory_stats()["allocation.all.allocated"]` unchanged across three
+executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_nothing_and_never_synchronizes`,
+`test_sdpa_bwd_thd_sm80.py::test_graph_thd_execute_does_not_allocate`. For a
+capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
+window, then replay and a native launch). For R1, monkeypatch
+`torch.cuda.ExternalStream` to raise and drive the path with handle 0
+(`test_torch_stream.py`).
 
 
 ## Frontend-only kernel package layout
@@ -294,6 +480,10 @@ python/cudnn/gemm/
 │   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
 │   │                                #   quant, srelu, swiglu, unfused, wgrad
 │   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
+├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
+│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
+│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
+│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```
@@ -348,6 +538,8 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 ## Other notes
 
 - `wrapper.py` `Graph` context manager (the pythonic graph builder) requires cuDNN backend ≥ 9.12 (`backend_version() >= 91200`) and builds plans on `__exit__`.
-- Torch custom ops live in `experimental/ops/` (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
+- Torch custom-op implementations live with their owning operation family and may be re-exported from `experimental/ops/` while maturing (pattern doc: `docs/utilities/adding_torch_custom_ops.md`); they cache built graphs per config and use stable `_UIDs` enums.
 - dtype conversions go through `datatypes.py`, which probes torch/cutlass availability lazily — keep it that way.
 - Formatting: black, line length 160.
+
+CUDA-owning objects, GC-timed release and stream capture: Rule 8.

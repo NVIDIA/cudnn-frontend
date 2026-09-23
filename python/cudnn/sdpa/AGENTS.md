@@ -26,9 +26,10 @@ head-major, never dense-padded.**
   `_thd_lse_view`'s docstring), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
-  legal detector. See the THD classification sites in `fwd/api_dsl.py`
-  (duplicated at the two THD compile-key call sites — extract rather than
-  re-copy if you touch it, per Rule 3's "suspect duplicated logic first").
+  legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
+  stride_s, h_q)` — the one classifier the fwd adapters, the bwd probe and the
+  bwd lowering share; never re-implement the stride test inline (Rule 3's
+  "suspect duplicated logic first").
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
@@ -44,7 +45,7 @@ head-major, never dense-padded.**
   `out_dtypes`, `d_shapes` / `d_pad_multiple` / `d_envelope_floors` /
   `thd_d_shapes`, the mask and feature booleans (`causal`, `bottom_right`,
   `right_band_widening`, `swa`, `padded`, `padded_stats`,
-  `dense_seq_q_trim`, `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
+  `sink`, `thd`, `cu_seq_len`, `bias`, `decode`,
   `layouts`, ...), and adding or retiring an `EngineSpec` row. A change
   confined to knob domains (`tile_ms`, `sched_policies`, ...) does not
   need a matrix edit — the matrix deliberately does not track knobs.
@@ -107,3 +108,60 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+
+
+**Rule S4 — Split-K partial Stats keep the combiner's log base.**
+
+- `stats_use_log2` changes final Stats only. Partial LSE consumed by a
+  natural-log combine stays natural-log, including direct kernel entry points;
+  apply `log2(e)` exactly once at the final store.
+- Check both O and Stats against an independent reference with nonzero logits.
+  O-only checks miss a wrong Stats base; zero logits miss an unscaled row maximum.
+  See `test_fp8_graph_stats_use_log2` and the split-KV Stats tests.
+  `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
+  clears the partial-log2 flag itself, so adapter-only tests cannot detect
+  a missing guard in a directly called template.
+
+**Rule S5 — Strided outputs must retain their layout through the final store.**
+
+- `make_array_view(t)[b, s, h, :]` returns a row pointer; indexing that pointer
+  by `d` assumes a unit D stride. Use full indexing (`view[b, s, h, d]`) when
+  accepting an arbitrary declared D stride, or explicitly require D-contiguous
+  storage. Test padding canaries as well as numerical output; the detector is
+  `test_pointer_combine_strided_outputs_and_dead_splits`.
+
+**Rule S6 — A kernel feature lands on every arch line's test file, and its
+other-arch lowerings are smoke-compiled from whatever GPU you have.**
+
+- Each FROST fwd arch line has its own test file and marker:
+  `test_sdpa_fwd_fp8_sm100.py` runs under `requires_blackwell` (SM 100..119,
+  the Rubin lane included — `_D128_ARCH` picks the kernel), the sm120 line
+  under `requires_blackwell_geforce` (120..129) in `test_sdpa_fwd_fp8_sm120.py`,
+  sm80 in its own file. A test added to one file never runs on the other lanes,
+  and `_skip_on_rubin` is a d192/d256-flavor statement, not a default decorator
+  to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
+  the cases (the block-scaled O review found SM120 FP4 declining itself
+  and the Rubin lane skipping the epilogue entirely).
+- The DSL traces the kernel in Python before any arch-specific codegen, so a
+  lowering for an arch you do not have still fails or passes its trace here:
+  `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
+  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
+  `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
+  template variant you touched before pushing.
+- Inside a `def` nested in a kernel body, do not touch a free variable
+  (attribute access, store through it) inside a dynamic `if`: the DSL's region
+  rewrite yields and rebinds the names it sees written there, which makes the
+  free variable an unbound closure-local — it reads as `None` at trace time,
+  or `UnboundLocalError` if you print it at the closure's top. Hoist what the
+  closure needs into a local before the `def` (`o_ptr = o.iterator.raw_ptr()`,
+  `sfo_base_ptr`) and let the closure add offsets only.
+
+## Heuristic geometry regressions
+
+When changing tile, packing, CGA or split candidates, spy on the chooser's
+inputs for both split and unsplit legs: physical CTA count can differ from
+public MMA width, and masked KV work depends on the candidate Q span and tile
+alignment. Compare masked bounds with an independent visible-key oracle and
+verify every alternative is rescored, deduplicated and within the candidate
+cap. An exact winning-rank golden alone does not detect stale model inputs.

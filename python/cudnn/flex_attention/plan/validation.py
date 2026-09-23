@@ -180,7 +180,7 @@ def validate_create_mask_plan_inputs(
     )
 
 
-def validate_call_options(*, softmax_scale: float | None, deterministic: bool, return_lse: bool) -> None:
+def validate_call_options(*, softmax_scale: float | None, deterministic: bool, return_lse: bool, return_max_logit: bool = False) -> None:
     if softmax_scale is not None:
         if not isinstance(softmax_scale, (float, int)) or not math.isfinite(softmax_scale):
             raise ValueError("softmax_scale must be a finite number or None")
@@ -188,6 +188,10 @@ def validate_call_options(*, softmax_scale: float | None, deterministic: bool, r
         raise TypeError("deterministic must be a bool")
     if type(return_lse) is not bool:
         raise TypeError("return_lse must be a bool")
+    if type(return_max_logit) is not bool:
+        raise TypeError("return_max_logit must be a bool")
+    if return_max_logit and softmax_scale is not None and softmax_scale < 0:
+        raise ValueError("return_max_logit requires a non-negative softmax_scale")
 
 
 __all__ = [

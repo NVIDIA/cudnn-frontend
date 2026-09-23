@@ -16,6 +16,8 @@ import textwrap
 import pytest
 
 import cudnn.gemm.frost
+from cudnn.gemm.frost.arch_family import template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import template_path
 
 pytestmark = pytest.mark.L0
 
@@ -51,14 +53,25 @@ _MOE_BS_1 = [
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
 ]
+_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1)]
+_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2)]
+_MOE_SWAP_1 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1)]
+_MOE_SWAP_2 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2)]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
 # is transposed-STG only. It shares no epilogue region with the tcgen05
 # families, so it is its own family here rather than a member of one. The
 # block-scale template is the same kernel with scale words riding the AB stage
-# and a block-scaled warp MMA; its epilogue is the dense one verbatim.
-_SM120 = [("sm120_matmul.py", 1), ("sm120_block_scale_matmul.py", 1)]
+# and a block-scaled warp MMA; its epilogue is the dense one verbatim. The MoE
+# templates are the dense kernels under the grouped persistent scheduler, their
+# store masked at group_end instead of M.
+_SM120 = [
+    ("sm120_matmul.py", 1),
+    ("sm120_block_scale_matmul.py", 1),
+    ("sm120_moe_grouped_matmul_fwd.py", 1),
+    ("sm120_moe_grouped_block_scale_matmul_fwd.py", 1),
+]
 
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
 # the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA
@@ -68,10 +81,10 @@ _SM120 = [("sm120_matmul.py", 1), ("sm120_block_scale_matmul.py", 1)]
 # mma_inst_m % 128 != 0), so its two modes never differed here.
 _SETUP_GROUPS = {
     "plain": _PLAIN_1 + _PLAIN_2,
-    "moe_1ctamma": _MOE_PLAIN_1,
-    "moe_2ctamma": _MOE_PLAIN_2,
-    "block_scale_1ctamma": _BS_1 + _MOE_BS_1,
-    "block_scale_2ctamma": _BS_2 + _MOE_BS_2,
+    "moe_1ctamma": _MOE_PLAIN_1 + _MOE_PLAIN_SWAP_1,
+    "moe_2ctamma": _MOE_PLAIN_2 + _MOE_PLAIN_SWAP_2,
+    "block_scale_1ctamma": _BS_1 + _MOE_BS_1 + _MOE_SWAP_1,
+    "block_scale_2ctamma": _BS_2 + _MOE_BS_2 + _MOE_SWAP_2,
     "sm120": _SM120,
 }
 
@@ -85,20 +98,17 @@ _DRAIN_GROUPS = {
     "moe_2ctamma": _MOE_PLAIN_2,
     "moe_block_scale_1ctamma": _MOE_BS_1,
     "moe_block_scale_2ctamma": _MOE_BS_2,
+    "moe_plain_swap_ab": _MOE_PLAIN_SWAP_1 + _MOE_PLAIN_SWAP_2,
+    "moe_block_scale_swap_ab": _MOE_SWAP_1 + _MOE_SWAP_2,
     "sm120": _SM120,
 }
 
-_BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2}
-
-
-def _template_dir():
-    # kernel_templates has no __init__.py (it is exec'd per render), so go
-    # through the package that does.
-    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
+_BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2 + _MOE_SWAP_1 + _MOE_SWAP_2}
 
 
 def _templates():
-    return sorted(p for p in _template_dir().glob("sm*.py"))
+    # Every template that ships, across both arch trees (sm100/ and sm120/).
+    return template_files()
 
 
 _IMPLIED_GROUP = re.compile(r"_([12])ctamma\.py$")
@@ -168,12 +178,11 @@ def test_the_region_is_identical_within_its_group(region, group):
     names = (_SETUP_GROUPS if region == "SETUP" else _DRAIN_GROUPS)[group]
     if {n for n, _ in names} <= _STANDALONE:
         pytest.skip(f"{group} is a family of one -- it shares no region to compare")
-    d = _template_dir()
     ref_name, ref_group = names[0]
-    ref = _region(d / ref_name, region, ref_group)
+    ref = _region(template_path(ref_name), region, ref_group)
     assert ref.strip(), f"{ref_name}: empty {region} region"
     for name, cta_group in names[1:]:
-        got = _region(d / name, region, cta_group)
+        got = _region(template_path(name), region, cta_group)
         assert got == ref, (
             f"{region} region of {name} (cta_group={cta_group}) has drifted from its group '{group}'.\n"
             f"A new epilogue feature lands in EVERY template of the group, in the same shape.\n" + _diff(ref_name, ref, name, got)
@@ -255,7 +264,7 @@ def test_the_markers_do_not_break_the_template_parse():
 
 
 _MIXED_CGA = {f for f, _ in _PLAIN_1 + _PLAIN_2 + _BS_1 + _BS_2}
-_MOE = {f for f, _ in _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2}
+_MOE = {f for f, _ in _MOE_PLAIN_SWAP_1 + _MOE_PLAIN_SWAP_2 + _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2 + _MOE_SWAP_1 + _MOE_SWAP_2}
 _STANDALONE = {f for f, _ in _SM120}
 
 
@@ -277,7 +286,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
     """A pinned width of one is the identity raster.  Keep the general
     divide/modulo mapping out of every hot path in that specialization."""
 
-    helper_tree = ast.parse((_template_dir() / "_tile_helpers.py").read_text())
+    helper_tree = ast.parse((template_dir("sm100") / "_tile_helpers.py").read_text())
     helper = next(node for node in helper_tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "l2_swizzle_tile")
     assert helper.args.args[-1].arg == "identity"
     assert len(helper.args.defaults) >= 1 and isinstance(helper.args.defaults[-1], ast.Constant) and helper.args.defaults[-1].value is False
@@ -670,3 +679,26 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
                 offenders.append(f"{path.name}:{operation.lineno}: runtime cluster divisor in {ast.unparse(operation)!r}")
 
     assert not offenders, "mixed-CGA host-constant mask/shift fast path is incomplete:\n  " + "\n  ".join(offenders)
+
+
+@pytest.mark.parametrize("stem", ["sm100_moe_grouped_matmul_fwd", "sm100_moe_grouped_block_scale_matmul_fwd"])
+def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
+    def pipeline(file):
+        tree = ast.parse(template_path(file).read_text())
+        kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+        warp_regions = [
+            ast.dump(node, include_attributes=False)
+            for node in kernel.body
+            if isinstance(node, ast.If) and ast.unparse(node.test) in ("warp_idx == 0", "warp_idx == mma_warp_id")
+        ]
+        assert len(warp_regions) == 3
+        producer = next(node for node in kernel.body if isinstance(node, ast.If) and ast.unparse(node.test) == "warp_idx == tma_warp_id")
+        barriers = [
+            ast.dump(node, include_attributes=False)
+            for node in ast.walk(producer)
+            if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("nvvm.mbarrier_")
+        ]
+        assert barriers
+        return warp_regions, barriers
+
+    assert pipeline(f"{stem}_swap_ab.py") == pipeline(f"{stem}.py")

@@ -14,6 +14,7 @@ One block per (q_row, head, batch); the block's threads stride over d_v, and
 each thread walks the split axis in registers.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from typing import Callable, Optional, Tuple
 
 from functools import lru_cache
@@ -25,8 +26,8 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
-# One block per (q_row, head, batch); 128 lanes stride over d_v.  d_v <= 128 for
-# every flavor that uses this pass today, so the stride loop runs once.
+# One block per (q_row, head, batch); 128 lanes stride over d_v, including
+# the wider d256/d512 flavors.
 THREADS = 128
 
 NEG_INF = float("-inf")
@@ -65,6 +66,7 @@ def _combine_kernel(
     n_batch: cutlass.Int32,
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     q_row = cute.arch.block_idx()[0]
@@ -125,7 +127,6 @@ def _combine_kernel(
                 w = cute.math.exp(lse_s - m_safe, fastmath=True)
                 o_row = op[batch + s * n_batch, q_row, head, :]
                 acc = acc + w * cutlass.Float32(o_row[d0])
-        out_row = oo[batch, q_row, head, :]
         o_val = acc * inv_den
         if cutlass.const_expr(amax_o is not None):
             # Measured before scale_o, so this is already the pre-quant amax and
@@ -133,7 +134,9 @@ def _combine_kernel(
             amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
         if cutlass.const_expr(scale_o is not None):
             o_val = o_val * q_scale
-        out_row[d0] = o_val.to(o_out.element_type)
+        # Index all modes: ArrayView's row slice is a pointer and drops the
+        # final mode's stride, so a subsequent [d0] would assume contiguous D.
+        oo[batch, q_row, head, d0] = o_val.to(o_out.element_type)
 
     # One atomic per lane.  The value is non-negative, so its fp32 bit pattern
     # orders the same as the float and an integer atomicMax is exact -- the same
@@ -148,6 +151,10 @@ def _combine_kernel(
             lo = cutlass.make_array_view(lse_out)
             lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
+            # Base-2 Stats (stats_use_log2): the partials stay natural (the merge
+            # above needs them); only the final value converts. -inf stays -inf.
+            if cutlass.const_expr(stats_log2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
             lo[batch, head, q_row] = lse_val
 
 
@@ -164,6 +171,7 @@ def _host(
     scale_o: Optional[cute.Tensor],
     problem_size: Tuple[int, int, int, int],
     n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, H, SQ, D = problem_size
@@ -177,10 +185,82 @@ def _host(
         cutlass.Int32(B),
         n_splits,
         cutlass.Int32(D),
+        stats_log2,
     ).launch(
         grid=(SQ, H, B),
         block=[THREADS, 1, 1],
         stream=stream,
+    )
+
+
+@cute.jit
+def _host_ptr(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Bind prepared f16/bf16 pointers to the same reduction as tensor callers.
+
+    Partial workspaces are compact; final O and Stats use the actual caller
+    strides. Widen before computing compact strides, including split batches.
+    """
+    B, H, SQ, D = problem_size
+    b64, h64, sq64, d64 = cutlass.Int64(B), cutlass.Int64(H), cutlass.Int64(SQ), cutlass.Int64(D)
+    split_batches = b64 * cutlass.Int64(n_splits)
+    o_partial = cute.make_tensor(o_partial_ptr, cute.make_layout((split_batches, SQ, H, D), stride=(sq64 * h64 * d64, h64 * d64, d64, 1)))
+    lse_partial = cute.make_tensor(lse_partial_ptr, cute.make_layout((split_batches, H, SQ), stride=(h64 * sq64, sq64, 1)))
+    o_out = cute.make_tensor(o_out_ptr, cute.make_layout((B, SQ, H, D), stride=o_strides))
+    lse_out = None
+    if cutlass.const_expr(lse_out_ptr is not None):
+        lse_out = cute.make_tensor(lse_out_ptr, cute.make_layout((B, H, SQ), stride=lse_strides))
+    _host(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, stream=stream)
+
+
+@lru_cache(maxsize=None)
+def compile_ptr(
+    dtype_o: str = "f16",
+    dtype_partial: str = "f32",
+    has_lse: bool = False,
+    stats_log2: bool = False,
+) -> Callable:
+    """Compile a shape-generic pointer entry for prepared f16/bf16 execution.
+
+    The runtime arguments are partial-O/partial-LSE/O/optional-LSE pointers,
+    ``(B, H, S_q, D_v)``, split count, O strides in BSHD order, and LSE strides
+    in BHS order. Every stride is Int64, including singleton dimensions. This
+    entry shares the reduction and launch with :func:`compile`; the tensor ABI
+    remains available for quantized outputs with their amax/scale operands.
+    """
+    if dtype_o not in ("f16", "bf16") or dtype_partial not in ("f16", "bf16", "f32"):
+        raise ValueError("prepared split combine requires f16/bf16 O and f16/bf16/f32 partials")
+    _cache_key = _template_key(globals(), locals(), "compile_ptr")
+    gmem = cute.AddressSpace.gmem
+
+    def P(dtype):
+        return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=dtype.width // 8)
+
+    return _compile_cached(
+        _host_ptr,
+        P(_ELEM[dtype_partial]),
+        P(cutlass.Float32),
+        P(_ELEM[dtype_o]),
+        P(cutlass.Float32) if has_lse else None,
+        (0, 0, 0, 0),
+        cutlass.Int32(0),
+        (cutlass.Int64(0),) * 4,
+        (cutlass.Int64(0),) * 3,
+        bool(stats_log2),
+        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd_combine_ptr",
     )
 
 
@@ -197,6 +277,8 @@ def compile(  # noqa: A001
     has_amax: bool = False,
     dtype_partial: Optional[str] = None,
     has_scale_o: bool = False,
+    stats_log2: bool = False,
+    o_stride: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     """Compile the combine pass for one concrete (B, H, S_q, d_v, splits) shape.
 
@@ -207,7 +289,10 @@ def compile(  # noqa: A001
     store is None-specialized out of the traced code.  ``has_amax`` does the
     same for the FP8-family amax of the recombined O.  ``lse_stride`` describes
     the caller-visible LSE output; the per-split LSE input workspace remains
-    compact regardless of that final layout.
+    compact regardless of that final layout. ``o_stride`` likewise describes
+    final O in BSHD order; omitted, it retains the compact tensor ABI.
+    ``stats_log2`` writes the FINAL
+    LSE in base 2; the per-split partials stay natural.
 
     ``dtype_partial`` names the workspace element type, which is never narrower
     than ``dtype_o``: the split kernels write "f32" where they can store their
@@ -215,12 +300,17 @@ def compile(  # noqa: A001
     performs the only cast down to ``dtype_o``, applying ``scale_o``
     (``has_scale_o``) at that single point.  It defaults to ``dtype_o``.
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     elem = _ELEM[dtype_o]
     elem_partial = _ELEM[dtype_partial or dtype_o]
 
     fake_o_partial = cute.runtime.make_fake_compact_tensor(elem_partial, (splits * b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fake_lse_partial = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (splits * b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
-    fake_o_out = cute.runtime.make_fake_compact_tensor(elem, (b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
+    fake_o_out = (
+        cute.runtime.make_fake_tensor(elem, (b, sq, h, d_v), o_stride, assumed_align=elem.width // 8)
+        if o_stride is not None
+        else cute.runtime.make_fake_compact_tensor(elem, (b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
+    )
     fake_lse_out = (
         (
             cute.runtime.make_fake_tensor(cutlass.Float32, (b, h, sq), lse_stride, assumed_align=4)
@@ -233,7 +323,7 @@ def compile(  # noqa: A001
     fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_amax else None
     fake_scale_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_o_partial,
         fake_lse_partial,
@@ -243,6 +333,9 @@ def compile(  # noqa: A001
         fake_scale_o,
         (b, h, sq, d_v),
         cutlass.Int32(0),
+        bool(stats_log2),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_fwd",
     )

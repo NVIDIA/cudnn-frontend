@@ -111,6 +111,8 @@ class LaGraphFacts:
 
     # ports present / requested
     has_initial_state: bool = False
+    has_state_indices: bool = False
+    state_indices_dtype: Any = None
     has_a_log: bool = False
     has_dt_bias: bool = False
     wants_d_initial_state: bool = False
@@ -128,6 +130,7 @@ class LaGraphFacts:
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
     batch_invariant: bool = False
+    overwrite_initial_state: bool = False
     num_householder: int = 1
 
 
@@ -167,6 +170,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     num_householder = params.get("num_householder", 1)
     num_householder = 1 if num_householder is None else int(num_householder)
     batch_invariant = bool(params.get("batch_invariant", False))
+    overwrite_initial_state = bool(params.get("overwrite_initial_state", False))
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -176,6 +180,17 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
     elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
+    elif "state_indices" in ins and "initial_state" not in ins:
+        invalid = "state_indices selects rows of the initial_state pool, so it requires initial_state"
+    elif "state_indices" in ins and is_bwd:
+        invalid = "state_indices is a forward-only pool addressing mode"
+    elif (
+        "state_indices" in ins
+        and ins["state_indices"].dim
+        and ins["cu_seqlens"].dim
+        and (len(ins["state_indices"].dim) != 1 or int(ins["state_indices"].dim[0]) != int(ins["cu_seqlens"].dim[0]) - 1)
+    ):
+        invalid = f"state_indices must be [num_seqs] = [{int(ins['cu_seqlens'].dim[0]) - 1}], one pool slot per sequence; got {list(ins['state_indices'].dim)}"
     elif not safe_gate and ("a_log" in ins or "dt_bias" in ins):
         invalid = "a_log/dt_bias require safe_gate=True"
     elif gate_domain not in ("log", "linear"):
@@ -198,6 +213,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
     elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
         invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
+    elif overwrite_initial_state and not is_bwd and not ("initial_state" in ins and "final_state" in outs):
+        invalid = "overwrite_initial_state requires the initial_state input and the final_state output (one buffer may serve both)"
+    elif overwrite_initial_state and is_bwd and not ("d_final_state" in ins and "d_initial_state" in outs):
+        invalid = "overwrite_initial_state on a bwd node requires the d_final_state input and the d_initial_state output (one buffer may serve both)"
     elif bool(params.get("allow_neg_eigval", False)) and not bool(params.get("use_beta_sigmoid", False)):
         invalid = "allow_neg_eigval requires use_beta_sigmoid=True (the 2x rides on the fused sigmoid)"
     elif num_householder < 1:
@@ -308,6 +327,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         d_a_log_dtype=out_dt.get("d_a_log"),
         d_dt_bias_dtype=out_dt.get("d_dt_bias"),
         has_initial_state="initial_state" in ins,
+        has_state_indices="state_indices" in ins,
+        state_indices_dtype=in_dt.get("state_indices"),
         has_a_log="a_log" in ins,
         has_dt_bias="dt_bias" in ins,
         wants_d_initial_state="d_initial_state" in outs,
@@ -323,5 +344,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=batch_invariant,
+        overwrite_initial_state=overwrite_initial_state,
         num_householder=num_householder,
     )

@@ -11,7 +11,8 @@ declare one are declined and route to the native backend).
 
 SM120 envelope (see engines._sm120_fp8_spec): E4M3/E5M2 in, FP16/BF16/FP8
 out (fp8 O via a direct quantizing store, Scale_O applied pre-cast), head
-TILES any multiple of 32 up to 256 with the QK^T and P@V sides independent,
+TILES any multiple of 32 up to 256 with the QK^T and P@V sides independent
+(both dims in (256, 512] ride the d512 flavor, ``sm120/prefill_d512_fp8.py``),
 actual head dims any multiple of 16 up to the tile via TMA zero-padding
 (graphs reach the whole range: the python-native validate defers the C++
 sdpa_fp8 node's d <= 128 gate when this engine is a candidate), causal /
@@ -48,6 +49,20 @@ class _RunResult(NamedTuple):
     reference_amax: float
     stats: torch.Tensor
     reference_stats: torch.Tensor
+
+
+# Block-scaled O (sdpa_fp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d,
+# "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d (see test_sdpa_fwd_fp8_sm100.py).
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
+
+
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in Scale_O units
+    reference: torch.Tensor  # fp32 reference O * Scale_O
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
 
 
 def _quant(x, dtype=torch.float8_e4m3fn):
@@ -117,6 +132,10 @@ def _run(
     layout="bshd",
     sinks=None,
     stats_layout="contiguous",
+    with_stats=True,
+    poison_kv_pad=False,
+    block_scaled_o=None,
+    sf_o_layout="planes",
 ):
     import cudnn
 
@@ -151,7 +170,24 @@ def _run(
         Ob = torch.zeros(B, H_q, S_q + 24, D_v, device=dev, dtype=o_dtype)[:, :, :S_q, :]
     else:
         raise ValueError(f"unknown layout {layout!r}")
-    lse = make_dense_stats(B, H_q, S_q, stats_layout)
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("the packed FP4 dtype (torch.float4_e2m1fn_x2) needs torch >= 2.8")
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype, BSHD-physical.
+        assert layout == "bshd", "the block-scaled O tests run the BSHD layout"
+        Ob = torch.full((B, S_q, H_q, D_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    if poison_kv_pad:
+        # Uninitialized dense padding: fp8 NaN bit patterns in the K/V rows past
+        # each batch's KV length. The reference reads the clean K8/V8; the kernel
+        # must keep the pad rows out of both S and P @ V.
+        assert seq_lens_kv is not None and layout == "bshd"
+        Kb, Vb = Kb.clone(), Vb.clone()
+        nan8 = torch.tensor(float("nan")).to(io_dtype)
+        for b, n in enumerate(seq_lens_kv):
+            Kb[b, :, n:, :] = nan8
+            Vb[b, :, n:, :] = nan8
+    lse = make_dense_stats(B, H_q, S_q, stats_layout) if with_stats else None
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -173,7 +209,7 @@ def _run(
         return g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
     dqn, dkn, dvn, dsn, ssn, son = (_stns() for _ in range(6))
-    kw = dict(q=q, k=k, v=v, descale_q=dqn, descale_k=dkn, descale_v=dvn, descale_s=dsn, scale_s=ssn, scale_o=son, attn_scale=scale, generate_stats=True)
+    kw = dict(q=q, k=k, v=v, descale_q=dqn, descale_k=dkn, descale_v=dvn, descale_s=dsn, scale_s=ssn, scale_o=son, attn_scale=scale, generate_stats=with_stats)
     vp = {q: Qb, k: Kb, v: Vb, dqn: dqt, dkn: dkt, dvn: dvt, dsn: dst, ssn: sst, son: sot}
     if seq_lens_q is not None and seq_lens_kv is None:
         seq_lens_kv = [S_kv] * B
@@ -194,15 +230,39 @@ def _run(
         kw["sink_token"] = sink_t
         vp[sink_t] = sinks
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(D_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S_q, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_stride = [H_q * R * C, R * C, C, 1]
+        else:
+            # token-major: one [B*S_q (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S_q are caller-owned (pre-zeroed here).
+            R = S_q
+            sf_o_buf = torch.full((round_up(B * S_q, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S_q :] = 0
+            sf_o_stride = [R * H_q * C, C, H_q * C, 1]
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=sf_o_stride, data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
     o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (FROST does not produce it)
-    o_cudnn = {
-        torch.float16: cudnn.data_type.HALF,
-        torch.bfloat16: cudnn.data_type.BFLOAT16,
-        torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
-        torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
-    }[o_dtype]
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
-    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
+    if blk == 16:
+        # The FP4 O is declared with its LOGICAL element extent; the binding is the byte container.
+        o.set_output(True).set_dim([B, H_q, S_q, D_v]).set_stride([S_q * H_q * D_v, D_v, H_q * D_v, 1]).set_data_type(cudnn.data_type.FP4_E2M1)
+    else:
+        o_cudnn = {
+            torch.float16: cudnn.data_type.HALF,
+            torch.bfloat16: cudnn.data_type.BFLOAT16,
+            torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+            torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
+        }[o_dtype]
+        o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
+    if with_stats:
+        stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -211,7 +271,11 @@ def _run(
     _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
-    vp.update({o: Ob, stats: lse, amx_o: amax_o})
+    vp.update({o: Ob, amx_o: amax_o})
+    if with_stats:
+        vp[stats] = lse
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     if sync_debug:
         # Rule 3 pin: execute must not read the scale tensors (or anything
@@ -227,9 +291,18 @@ def _run(
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times Scale_O (what the kernel quantizes).
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, D_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * so_val, amax_o.item(), o_ref.abs().max().item(), sf_pad_ok, so_val)
     # O carries Scale_O; Amax_O is the pre-scale amax (the kernel divides it
     # back out), so both compare against the unscaled reference.
-    return _RunResult(Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
+    return _RunResult(
+        Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1) if with_stats else None, lse_ref if with_stats else None
+    )
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -717,12 +790,12 @@ def test_fp8_sm120_fp8_output_offered():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("D", [24, 288])
+@pytest.mark.parametrize("D", [24, 264, 528])
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_off_granule_head_dim_not_offered(D):
-    """Declined head dims: 24 breaks the envelope alignment (multiples of 16,
-    the TMA 16-byte global-stride rule at 1 byte/elem); 288 exceeds the row's
-    256 cap."""
+    """Declined head dims: 24 and 264 break the envelope alignment (multiples of
+    16, the TMA 16-byte global-stride rule at 1 byte/elem); 528 exceeds the
+    row's 512 cap."""
     import cudnn
 
     assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D)
@@ -943,25 +1016,53 @@ def test_fp8_sm120_device_scales_execute_reads_no_device_memory():
 _THD_SENTINEL = 2048.0
 
 
-def _pack_thd(seqs, s_max, dtype):
+def _pack_thd(seqs, s_max, dtype, token_pad=0):
     """Pack per-sequence ``(1, H, L_i, D)`` tensors into THD storage.
 
     Returns ``(dense_view, storage, ragged_offset)``: the ``(B, H, S_max, D)``
     packed-stride view over dense-sized storage whose first ``T*H*D`` elements
     hold the packed tokens, the raw storage, and the ``(B+1, 1, 1, 1)`` int64
-    element-unit offsets (``cu_tokens * H * D``).
+    element-unit offsets (``cu_tokens * token_stride``). ``token_pad`` widens the
+    token stride past ``H * D`` by that many elements (a padded per-token record).
     """
     b, h, d = len(seqs), seqs[0].shape[1], seqs[0].shape[3]
     cu = [0]
     for s in seqs:
         cu.append(cu[-1] + s.shape[2])
-    storage = torch.zeros(b * s_max * h * d, dtype=dtype, device="cuda")
-    packed = storage[: max(cu[-1], 1) * h * d].view(max(cu[-1], 1), h, d)
+    ts = h * d + token_pad
+    storage = torch.zeros(b * s_max * ts, dtype=dtype, device="cuda")
+    packed = storage.view(b * s_max, ts)[: max(cu[-1], 1), : h * d].unflatten(1, (h, d))
     for i, s in enumerate(seqs):
         packed[cu[i] : cu[i + 1]].copy_(s[0].permute(1, 0, 2))
-    view = storage.as_strided((b, h, s_max, d), (s_max * h * d, d, h * d, 1))
-    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * h * d).view(b + 1, 1, 1, 1)
+    view = storage.as_strided((b, h, s_max, d), (s_max * ts, d, ts, 1))
+    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * ts).view(b + 1, 1, 1, 1)
     return view, storage, ro
+
+
+def _pack_thd_record(slot_seqs, s_max, dtype):
+    """Pack several per-sequence ``(1, H, L_i, D)`` lists into the slots of ONE ``[T_cap, slots, H, D]`` record.
+
+    ``slot_seqs[i]`` fills slot ``i`` (``None`` leaves a slot untouched). Returns ``(views, storage,
+    ragged_offset)``: one declared ``(B, H, S_max, D)`` view per slot with token stride ``slots*H*D``
+    (the layout of K/V or Q/O slices of a fused projection), the shared storage, and the ``(B+1, 1, 1, 1)``
+    int64 element-unit ragged offsets under that stride.
+    """
+    slots = len(slot_seqs)
+    seqs0 = next(seqs for seqs in slot_seqs if seqs is not None)
+    b, h, d = len(seqs0), seqs0[0].shape[1], seqs0[0].shape[3]
+    cu = [0]
+    for s in seqs0:
+        cu.append(cu[-1] + s.shape[2])
+    storage = torch.zeros(b * s_max * slots * h * d, dtype=dtype, device="cuda")
+    record = storage.view(b * s_max, slots, h, d)
+    views = []
+    for slot, seqs in enumerate(slot_seqs):
+        if seqs is not None:
+            for i, s in enumerate(seqs):
+                record[cu[i] : cu[i + 1], slot].copy_(s[0].permute(1, 0, 2))
+        views.append(storage.as_strided((b, h, s_max, d), (s_max * slots * h * d, d, slots * h * d, 1), slot * h * d))
+    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * slots * h * d).view(b + 1, 1, 1, 1)
+    return views, storage, ro
 
 
 def _run_thd_fp8(
@@ -981,18 +1082,26 @@ def _run_thd_fp8(
     stats_layout="head_major",
     raw_bind=False,
     poison_pad=False,
+    attn_scale=None,
+    interleaved=False,
+    o_token_pad=0,
 ):
     """Run a ragged FP8 graph on the SM120 engine vs per-sequence references.
 
     Per-tensor FP8 means ONE descale per tensor for the whole packed batch, so
     the quantization scale is taken over every sequence at once.
+
+    ``interleaved`` binds every operand as a slice of a fused ``[T, 2, H, D]``
+    record (declared token stride ``2*H*D``): K and V share one record, Q and O
+    each sit in one slot of their own, so the kernel must address the declared
+    strides natively and leave the unused slots untouched.
     """
     import cudnn
 
     dev = "cuda"
     batch = len(seq_q_lens)
     s_q_max, s_kv_max = max(max(seq_q_lens), 1), max(max(seq_kv_lens), 1)
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(D) if attn_scale is None else float(attn_scale)
 
     def _quant_seqs(seqs):
         amax = max((s.abs().amax().item() for s in seqs if s.numel()), default=1.0)
@@ -1006,18 +1115,28 @@ def _run_thd_fp8(
     k_8, dk = _quant_seqs([s.contiguous() for s in k_f])
     v_8, dv = _quant_seqs([s.contiguous() for s in v_f])
 
-    q_view, q_storage, q_ro = _pack_thd(q_8, s_q_max, torch.float8_e4m3fn)
-    k_view, k_storage, k_ro = _pack_thd(k_8, s_kv_max, torch.float8_e4m3fn)
-    v_view, v_storage, v_ro = _pack_thd(v_8, s_kv_max, torch.float8_e4m3fn)
-    o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), D, dtype=o_dtype, device=dev)[:, :, :n] for n in seq_q_lens], s_q_max, o_dtype)
+    o_zero = [torch.zeros(1, h_q, max(n, 1), D, dtype=o_dtype, device=dev)[:, :, :n] for n in seq_q_lens]
+    assert not (interleaved and raw_bind), "fused-record slices are declared-rank views"
+    assert not (o_token_pad and (interleaved or raw_bind)), "a padded O token stride is a declared-rank view of its own"
+    if interleaved:
+        (k_view, v_view), k_storage, k_ro = _pack_thd_record([k_8, v_8], s_kv_max, torch.float8_e4m3fn)
+        v_storage, v_ro = k_storage, k_ro
+        (q_view, _), q_storage, q_ro = _pack_thd_record([q_8, None], s_q_max, torch.float8_e4m3fn)
+        (_, o_view), o_storage, o_ro = _pack_thd_record([None, o_zero], s_q_max, o_dtype)
+    else:
+        q_view, q_storage, q_ro = _pack_thd(q_8, s_q_max, torch.float8_e4m3fn)
+        k_view, k_storage, k_ro = _pack_thd(k_8, s_kv_max, torch.float8_e4m3fn)
+        v_view, v_storage, v_ro = _pack_thd(v_8, s_kv_max, torch.float8_e4m3fn)
+        o_view, o_storage, o_ro = _pack_thd(o_zero, s_q_max, o_dtype, token_pad=o_token_pad)
     if poison_pad:
         # Model uninitialized capacity: fp8 NaN bit patterns past the packed
         # KV tokens (real binders hand rounded-up allocations). The kernel
         # must keep them out of P @ V — masking S alone is not enough
         # (P = 0 times a NaN V row is still NaN).
         t_kv_total = sum(seq_kv_lens)
-        for st, heads in ((k_storage, h_kv), (v_storage, h_kv)):
-            st[t_kv_total * heads * D :] = torch.tensor(float("nan")).to(st.dtype)
+        token_elems = (2 if interleaved else 1) * h_kv * D
+        for st in {id(k_storage): k_storage, id(v_storage): v_storage}.values():
+            st[t_kv_total * token_elems :] = torch.tensor(float("nan")).to(st.dtype)
     # The kernel writes every valid packed O token; everything else must come
     # back untouched. (Clamped into the O dtype's range for fp8 outputs.)
     sentinel = min(_THD_SENTINEL, torch.finfo(o_dtype).max)
@@ -1135,12 +1254,12 @@ def _run_thd_fp8(
             # (H, t_cap): tokens contiguous within a head row (stride_s = 1);
             # element offsets = cu_q.
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((h_q * t_cap, t_cap, 1, 1))
-            stats_ro_t = (q_ro.flatten() // (D * h_q)).view(batch + 1, 1, 1, 1).contiguous()
+            stats_ro_t = torch.tensor(cu, dtype=torch.int64, device=dev).view(batch + 1, 1, 1, 1)
         else:
             # token-major packed (T, H): heads contiguous within a token row
             # (stride_s = h_q); element offsets = cu_q * h_q.
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((s_q_max * h_q, 1, h_q, 1))
-            stats_ro_t = (q_ro.flatten() // D).view(batch + 1, 1, 1, 1).contiguous()
+            stats_ro_t = (torch.tensor(cu, dtype=torch.int64, device=dev) * h_q).view(batch + 1, 1, 1, 1)
         stats_ro = g.tensor_like(stats_ro_t)
         stats.set_ragged_offset(stats_ro)
         vp[stats_ro] = stats_ro_t
@@ -1155,7 +1274,12 @@ def _run_thd_fp8(
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
-    packed_o = o_storage[: max(cu[-1], 1) * h_q * D].view(max(cu[-1], 1), h_q, D)
+    if interleaved:
+        o_record = o_storage.view(-1, 2, h_q, D)
+        packed_o = o_record[: max(cu[-1], 1), 1]
+    else:
+        o_record = o_storage.view(-1, h_q * D + o_token_pad)
+        packed_o = o_record[: max(cu[-1], 1), : h_q * D].unflatten(1, (h_q, D))
     for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
@@ -1187,8 +1311,14 @@ def _run_thd_fp8(
             ld = (got_lse[finite] - lse_ref[0][finite]).abs().max().item() if finite.any() else 0.0
             assert ld <= 5e-2, f"seq {i}: max|LSE-ref|={ld:.4f}"
 
-    # Nothing outside the packed token range may be written.
-    assert (o_storage[cu[-1] * h_q * D :] == sentinel).all(), "wrote past the packed O tokens"
+    # Nothing outside the packed token range may be written; under fused-record
+    # binding the unused slot next to every O token must stay untouched too.
+    if interleaved:
+        assert (o_record[:, 0] == sentinel).all(), "O stores landed in the neighbouring record slot"
+        assert (o_record[cu[-1] :, 1] == sentinel).all(), "wrote past the packed O tokens"
+    else:
+        assert (o_record[cu[-1] :] == sentinel).all(), "wrote past the packed O tokens"
+        assert (o_record[:, h_q * D :] == sentinel).all(), "O stores landed in the token pad"
 
 
 @pytest.mark.L0
@@ -1196,6 +1326,42 @@ def _run_thd_fp8(
 def test_fp8_sm120_thd():
     """THD self-attention: packed ragged batch vs per-sequence references."""
     _run_thd_fp8(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=61)
+def test_fp8_sm120_thd_multi_unit_per_cta(monkeypatch):
+    """THD with more live units than the machine has CTAs (issue #618).
+
+    The grid is machine-sized, so a CTA pulls units repeatedly off the
+    device-bounded counter; every other FP8 THD case here fits one unit per CTA
+    and never re-enters the K/V pipeline for a second one -- the regime where an
+    unmatched consumer arrival on bar_k/v_consumed desynchronises the next
+    unit's producer handshake, and where the K/V mbarrier parity has to continue
+    across units instead of restarting.
+
+    FROST_THD_CTAS pins the grid to 4 CTAs so the claim loop runs deep on ANY
+    device: these lengths give 160 units, so the default one-CTA-per-SM grid
+    would hand every CTA exactly one unit on a big enough part and quietly stop
+    covering the reuse path. The SM100 sibling pins its cluster count for the
+    same reason."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setenv("FROST_THD_CTAS", "4")
+    # The resolved count is memoised per device, and the env var is only read
+    # on a miss -- so a THD test that ran earlier in this session would leave
+    # the pin above with no effect. Swap in a fresh dict (restored on teardown,
+    # which also keeps the pinned 4 from leaking into later tests).
+    monkeypatch.setattr(api_dsl, "_THD_CTAS_CACHE", {})
+    _run_thd_fp8(
+        seq_q_lens=[1024, 768, 512, 256],
+        seq_kv_lens=[1024, 768, 512, 256],
+        h_q=8,
+        h_kv=2,
+        is_causal=True,
+        check_stats=True,
+        stats_layout="token_major",
+    )
 
 
 @pytest.mark.L0
@@ -1311,3 +1477,332 @@ def test_fp8_sm120_thd_all_kv_zero():
 def test_fp8_sm120_thd_right_band():
     """THD + TOP_LEFT right band: per-sequence diagonals each widened by R."""
     _run_thd_fp8(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], is_causal=False, window_size_right=24)
+
+
+# --- Block-scaled O (sf_o): NVFP4 / MXFP8 output ---------------------------
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int):
+    """Kernel dequant vs fp32 reference: within the fp8 pipeline tolerance plus
+    three times the pure block-quantization floor of the reference itself."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(5e-2 * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S_q must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=71)
+def test_fp8_sm120_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o) on the SM120 per-tensor FP8 kernel: FP4 O +
+    E4M3/16 scales, or E4M3 O + UE8M0/32 scales. S_q = 300 exercises a partially
+    valid tail tile (per-plane pad rows must come back zero), B > 1 the plane /
+    token-major row bookkeeping, GQA the head -> plane mapping. The FP4 case also
+    pins the O dtype domain: an FP4 O must be ADMITTED by check_support, not
+    declined into "no engine"."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        o_dtype=torch.float8_e4m3fn,
+        so_val=3.0 if mode == "nvfp4" else 1.0,
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+    )
+    _check_block_scaled(res, blk)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=73)
+def test_fp8_sm120_block_scaled_output_offered():
+    """The SM120 FP8 engine row must OFFER the block-scaled graph (FP4 O + E4M3
+    sf_o, and E4M3 O + UE8M0 sf_o) -- the row advertises FP4_E2M1 / o_block_scales
+    {16, 32}, and the lowering's O dtype domain has to agree with the row."""
+    for mode in _BLOCK_SCALED_O:
+        res = _run(1, 2, 2, 128, 128, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, o_dtype=torch.float8_e4m3fn, block_scaled_o=mode)
+        assert isinstance(res, _BlockScaledRunResult), mode
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=74)
+def test_fp8_sm120_block_scaled_output_tile64(mode):
+    """64-row Q tile with per-(b,h) SF_O planes: the rows between round_up(S_q, 64)
+    and round_up(S_q, 128) belong to no Q tile, so the last tile must zero them
+    (S_q = 300: tiles end at 320, the plane atom at 384)."""
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        tiles=(64, 128),
+        o_dtype=torch.float8_e4m3fn,
+        so_val=3.0 if mode == "nvfp4" else 1.0,
+        block_scaled_o=mode,
+        sf_o_layout="planes",
+    )
+    _check_block_scaled(res, _BLOCK_SCALED_O[mode])
+
+
+# --- THD declared strides: slices of fused records, and what TMA cannot express ---------------
+@pytest.mark.L0
+@torch_fork_set_rng(seed=131)
+def test_fp8_sm120_thd_fused_record_slices():
+    """THD operands bound as slices of fused ``[T, 2, H, D]`` records (declared token
+    stride 2*H*D; V at element offset H*D of the K record, Q and O each in one slot
+    of their own): the kernels address the declared strides natively, like the f16
+    row, and nothing lands in the unused slots."""
+    _run_thd_fp8(
+        seq_q_lens=[200, 150, 47], seq_kv_lens=[200, 150, 47], is_causal=True, interleaved=True, poison_pad=True, check_stats=True, stats_layout="token_major"
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512])
+@torch_fork_set_rng(seed=133)
+def test_fp8_sm120_thd_padded_output_token_stride(D):
+    """A 2-byte THD O whose token stride is a 16-byte but not a 16-element multiple
+    (H*D + 8 elements) is admitted at check_support and addressed natively by the
+    general and d512 flavors alike; the pad columns stay untouched."""
+    _run_thd_fp8(seq_q_lens=[40, 25], seq_kv_lens=[40, 25], h_q=2, h_kv=2, D=D, is_causal=True, o_dtype=torch.bfloat16, o_token_pad=8)
+
+
+@pytest.mark.L0
+def test_fp8_sm120_thd_declines_strides_tma_cannot_express():
+    """A THD token stride that is not a 16-byte multiple is declined at check_support
+    with the TMA rule rather than adapted; the quantum is dtype-aware, so the same
+    8-element padding is expressible at 2 bytes/elem and 16 elements are at 1."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    h, d, s = 4, 128, 64
+
+    def api(dtype, pad):
+        token = h * d + pad
+        padded = torch.zeros(s * token, dtype=dtype, device="cuda").as_strided((1, h, s, d), (s * token, d, token, 1))
+        compact = torch.zeros(1, s, h, d, dtype=dtype, device="cuda").transpose(1, 2)
+        kwargs = dict(sample_q=padded, sample_k=compact, sample_v=compact, sample_o=compact, thd=True)
+        if dtype == torch.float8_e4m3fn:
+            kwargs["pertensor_fp8"] = True
+        return SdpaFwdDslSm120(**kwargs)
+
+    with pytest.raises(NotImplementedError, match="not TMA-expressible"):
+        api(torch.float8_e4m3fn, 8).check_support()
+    assert api(torch.float8_e4m3fn, 16).check_support()
+    assert api(torch.bfloat16, 8).check_support()
+
+
+# --- d512 flavor: both head dims in (256, 512] on 512 x 512 tiles, 64 x 64 CTA ------------------
+_D512_SCALE = 1.0 / math.sqrt(512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
+@pytest.mark.parametrize("mask", [*_MASKS, "right_band"])
+@torch_fork_set_rng(seed=80)
+def test_fp8_sm120_d512_masks(mask, o_dtype):
+    """The d512 flavor across the mask envelope and both output epilogues (multi-tile
+    Q and KV, non-unit Scale_O)."""
+    kwargs = dict(left_bound=32, right_bound=7) if mask == "right_band" else _MASKS[mask]
+    res = _run(1, 8, 2, 130, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=kwargs, o_dtype=o_dtype, so_val=1.5)
+    _check(*res, tol_o=_O_TOL[o_dtype])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D,D_v", [(272, 496), (512, 272), (496, 512)], ids=["272x496", "512x272", "496x512"])
+@torch_fork_set_rng(seed=81)
+def test_fp8_sm120_d512_envelope(D, D_v):
+    """Head dims inside (256, 512] ride the 512 x 512 tiles with TMA zero-fill,
+    independently on the QK^T and P@V sides."""
+    res = _run(1, 4, 4, 65, 193, D=D, D_v=D_v, scale=1.0 / math.sqrt(D), sdpa_kwargs=dict(use_causal_mask=True), o_dtype=torch.bfloat16)
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "io_dtype,o_dtype",
+    [(torch.float8_e5m2, torch.float8_e4m3fn), (torch.float8_e4m3fn, torch.float16), (torch.float8_e4m3fn, torch.float8_e5m2)],
+    ids=["e5m2_in", "fp16_out", "e5m2_out"],
+)
+@torch_fork_set_rng(seed=82)
+def test_fp8_sm120_d512_dtypes(io_dtype, o_dtype):
+    """E5M2 inputs (MMA tag and P cast follow the input dtype) and the remaining
+    output epilogues; tolerances follow the mantissa widths as in the general tests."""
+    res = _run(1, 4, 2, 65, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), io_dtype=io_dtype, o_dtype=o_dtype, so_val=2.0)
+    _check(*res, tol_o=max(_O_TOL.get(o_dtype, 5e-2), 1e-1 if io_dtype == torch.float8_e5m2 else 0.0))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=83)
+def test_fp8_sm120_d512_padding_sink():
+    """Per-batch Q/KV lengths with zero-length rows and a per-head sink: trimmed
+    rows write O := 0, sink rows keep a finite LSE."""
+    sinks = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    res = _run(
+        3,
+        8,
+        2,
+        65,
+        97,
+        D=512,
+        scale=_D512_SCALE,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        seq_lens_q=[0, 33, 65],
+        seq_lens_kv=[97, 0, 79],
+        sinks=sinks,
+        o_dtype=torch.bfloat16,
+    )
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512])
+@torch_fork_set_rng(seed=85)
+def test_fp8_sm120_padded_kv_poisoned_tail(D):
+    """Dense per-batch KV padding whose pad rows hold NaN bit patterns: the masked
+    columns and the P @ V tail stay clean on the general and d512 flavors alike."""
+    res = _run(1, 4, 2, 33, 80, D=D, scale=1.0 / math.sqrt(D), sdpa_kwargs=dict(), seq_lens_kv=[17], poison_kv_pad=True, o_dtype=torch.bfloat16)
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("layout", ["bhsd", "padded_s"])
+@torch_fork_set_rng(seed=84)
+def test_fp8_sm120_d512_dense_flex_layout(layout):
+    """Non-BSHD dense layouts with an fp8 O: the shared normalization and strided
+    copy-back around the d512 flavor."""
+    res = _run(1, 4, 2, 65, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), layout=layout, o_dtype=torch.float8_e4m3fn, so_val=2.0)
+    _check(*res, tol_o=_O_TOL[torch.float8_e4m3fn])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=85)
+def test_fp8_sm120_d512_pack_gqa():
+    """MQA packed as 64 heads x 1 token per 64-row tile, the d512 flavor's one CTA tile."""
+    res = _run(1, 64, 1, 65, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), tiles=(64, 64), pack_gqa=True, o_dtype=torch.bfloat16)
+    _check(*res)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=86)
+def test_fp8_sm120_d512_persistent_units(monkeypatch):
+    """Dense d512 CTAs are persistent: with two CTAs each walks several units,
+    prefetching the next Q tile into the K/V slab and re-arming the K/V barriers
+    between units."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    res = _run(1, 8, 2, 193, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), o_dtype=torch.bfloat16)
+    _check(*res)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=87)
+def test_fp8_sm120_d512_no_stats():
+    """Without a Stats output the LSE store compiles out; O and Amax_O are unchanged."""
+    res = _run(1, 8, 2, 65, 193, D=512, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), o_dtype=torch.float8_e4m3fn, with_stats=False)
+    _check(*res, tol_o=_O_TOL[torch.float8_e4m3fn])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=88)
+def test_fp8_sm120_d512_negative_scale():
+    """A negative attention scale is folded into Q's sign so the raw-score row max
+    still bounds P: dense with a sink and envelope head dims, and ragged."""
+    sinks = torch.zeros(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    res = _run(1, 8, 1, 65, 193, D=272, D_v=496, scale=-_D512_SCALE, sdpa_kwargs={}, sinks=sinks, o_dtype=torch.bfloat16)
+    _check(*res)
+    _run_thd_fp8(
+        seq_q_lens=[0, 9, 17],
+        seq_kv_lens=[7, 0, 65],
+        h_q=2,
+        h_kv=1,
+        D=512,
+        is_causal=False,
+        with_sink=True,
+        o_dtype=torch.bfloat16,
+        check_stats=True,
+        poison_pad=True,
+        attn_scale=-_D512_SCALE,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=89)
+def test_fp8_sm120_d512_split_kv():
+    """KV split on the d512 flavor: fp32 partials over a bf16 O recombine through the
+    shared combine pass, which also owns Amax_O."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    def fp8(*shape):
+        return (torch.randn(*shape, device="cuda") * 0.5).to(torch.float8_e4m3fn).transpose(1, 2)
+
+    q, k, v = fp8(1, 9, 8, 512), fp8(1, 193, 1, 512), fp8(1, 193, 1, 512)
+    o = torch.empty(1, 9, 8, 512, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    lse = torch.empty(1, 8, 9, dtype=torch.float32, device="cuda")
+    amax = torch.zeros(1, dtype=torch.float32, device="cuda")
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    api = SdpaFwdDslSm120(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, pertensor_fp8=True, split_kv=4, sched_policy=0, scale_softmax=_D512_SCALE
+    )
+    assert api.check_support() and api.flavor == (512, 512)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    api.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=o,
+        lse_tensor=lse,
+        amax_o=amax,
+        descale_q=one,
+        descale_k=one,
+        descale_v=one,
+        scale_o=one,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    o_ref, lse_ref = _ref(q.float(), k.float(), v.float(), scale=_D512_SCALE)
+    _check(o.float(), o_ref, amax.item(), o_ref.abs().max().item(), lse, lse_ref)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("stats_layout", ["head_major", "token_major"])
+@pytest.mark.parametrize("o_dtype", [torch.float8_e4m3fn, torch.bfloat16], ids=["fp8_out", "bf16_out"])
+@pytest.mark.parametrize("interleaved", [False, True], ids=["packed", "fused_record"])
+@torch_fork_set_rng(seed=101)
+def test_fp8_sm120_d512_thd(stats_layout, o_dtype, interleaved, monkeypatch):
+    """Ragged d512: zero-length and tail sequences, a sink, both Stats layouts, two
+    persistent CTAs claiming several units each, packed or fused-record operands."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    _run_thd_fp8(
+        seq_q_lens=[0, 33, 65],
+        seq_kv_lens=[7, 0, 97],
+        h_q=8,
+        h_kv=2,
+        D=512,
+        o_dtype=o_dtype,
+        so_val=1.5,
+        with_sink=True,
+        check_stats=True,
+        stats_layout=stats_layout,
+        poison_pad=True,
+        interleaved=interleaved,
+    )

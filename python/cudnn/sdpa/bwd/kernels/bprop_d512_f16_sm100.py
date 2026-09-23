@@ -37,6 +37,7 @@ a crash -- it surfaces as an intermittent hang whose output is correct on every
 launch that completes.
 """
 
+from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -1557,6 +1558,7 @@ def compile(  # noqa: A001
     chunk.  ``head_base`` / ``batch_base`` are RUNTIME args, so one
     compiled artifact serves every chunk.
     """
+    _cache_key = _template_key(globals(), locals(), "compile")
     if CFG.THD_VARLEN:
         # Packed token totals are RUNTIME values (they change every step under
         # continuous batching), so the token extents compile DYNAMIC and the
@@ -1669,7 +1671,7 @@ def compile(  # noqa: A001
         fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
         fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
 
-    return cute.compile(
+    return _compile_cached(
         _host,
         fake_q,
         fake_k,
@@ -1692,6 +1694,8 @@ def compile(  # noqa: A001
         cutlass.Int32(0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
+        cache_key=_cache_key,
+        symbol="frost_sdpa_bwd",
     )
 
 
