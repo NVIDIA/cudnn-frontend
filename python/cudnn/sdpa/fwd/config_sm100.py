@@ -105,6 +105,12 @@ class TemplateParams:
     # default budget.
     lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
+    # Ragged Q/O/Stats over PAGED K/V on the d128 DECODE tile (S_q(max) == 1):
+    # the Q row coordinate is the batch's ragged offset over the packed Q view
+    # and the split combine places the final O / Stats rows at their ragged
+    # offsets; the dense grid, PackGQA and the split path are all kept.  Not
+    # the prefill tile's THD leg (thd_varlen), which is mutually exclusive.
+    ragged_q: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
     # tiles stay full for GQA/MQA.  When G does not divide TILE_M the d128 and
@@ -291,6 +297,21 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.pack_gqa:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+    if k.ragged_q:
+        # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
+        # over the declared batch, Q rows at the ragged offsets, final O / Stats
+        # placed by the split combine -- so the split path is mandatory and the
+        # K/V side must be the page pools (a ragged K/V needs the THD leg).
+        if flavor != "d128" or k.cta_mma != 1:
+            raise ValueError(f"{flavor}: ragged_q is wired on the d128 decode tile only (cta_mma=1)")
+        if k.thd_varlen:
+            raise ValueError("d128 decode: ragged_q and thd_varlen are mutually exclusive")
+        if k.split_kv < 2:
+            raise ValueError("d128 decode: ragged_q rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2")
+        if not k.paged_kv:
+            raise ValueError("d128 decode: ragged_q serves ragged Q/O/Stats over PAGED K/V only")
+        if k.seq_q_lens_present:
+            raise ValueError("d128 decode: ragged_q derives per-sequence Q lengths from the ragged offsets; seq_q_lens_present is dense-only")
     if k.paged_kv:
         if flavor not in _PAGED_KV_FLAVORS:
             raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
@@ -1622,6 +1643,11 @@ class CfgD128Decode(CfgD128):
     # 4 softmax + 4 corr + 1 MMA + 1 TMALDG + 1 TMASTG = 11 arrivers (cga1).
     READ_TILE_ARRIVERS: int = 11
 
+    # Ragged Q/O/Stats over paged K/V (TemplateParams.ragged_q): the TMA-LDG
+    # warp reads the batch's Q ragged offset as the row coordinate over the
+    # packed Q view; the combine places the final rows.  Split path mandatory.
+    RAGGED_Q: int = 0
+
 
 def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
     """Consistency checks on the d128 decode-tile geometry."""
@@ -1653,7 +1679,11 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d128 decode: dense graphs only (THD keeps the prefill tile)"),
+        (cfg.THD_VARLEN == 0, "d128 decode: no THD_VARLEN leg (ragged Q over paged K/V rides RAGGED_Q; other THD keeps the prefill tile)"),
+        (
+            cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
+            "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
+        ),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
             "d128 decode: 128 B swizzle on every operand",
@@ -1668,8 +1698,9 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     """Config for ``sm100/decode_d128_f16.py`` -- the d128 flavor at ``cta_mma=1``.
 
     Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
-    cga=1 on dense graphs only, and the adapter routes exactly that
-    combination here; anything else raising below is a gap in those gates.
+    cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
+    S_q(max) == 1), and the adapter routes exactly those combinations here;
+    anything else raising below is a gap in those gates.
     """
     _validate_params("d128", params)
     if params.cta_mma != 1:
@@ -1677,7 +1708,9 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
     if params.thd_varlen:
-        raise ValueError("d128 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+        raise ValueError(
+            "d128 decode: the THD_VARLEN leg is not wired on the decode tile (ragged Q over paged K/V rides ragged_q; other THD keeps the prefill tile)"
+        )
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
@@ -1713,6 +1746,7 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
         PACK_G=_pack_g(params, CfgD128Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
+        RAGGED_Q=int(params.ragged_q),
     )
     _validate_cfg_d128_decode(cfg)
     return cfg, _tma_iters(cfg)

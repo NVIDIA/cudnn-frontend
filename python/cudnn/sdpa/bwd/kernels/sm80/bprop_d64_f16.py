@@ -38,7 +38,7 @@ MHA (no GQA), dense (no mask).  Asserts ``S_q % 64 == 0`` and ``S_kv % 128 == 0`
 
 ABI: ``backward(Q,K,V,dO,O,lse,*,scale=None,do_dot=None) -> (dQ,dK,dV)`` — BSHD
 in/out; ``lse`` natural-log ``[B,H,S_q]``.  The do_dot (rowsum O∘dO) preprocessing
-reuses the shared ``bprop_f16_sm80`` device kernel.
+reuses the shared ``sm80/bprop_f16`` device kernel.
 
 Validation: f16 rel ~3.8e-4, bf16 ~3.4e-3 (dQ/dK/dV) at S=512; multi-tile
 (S_q=768) also validated.
@@ -71,7 +71,7 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 
-from cudnn.sdpa.bwd.kernels import bprop_f16_sm80 as _base  # noqa: E402
+from cudnn.sdpa.bwd.kernels.sm80 import bprop_f16 as _base  # noqa: E402
 
 _LOG2E = 1.4426950408889634
 _ELEM_BYTES = 2

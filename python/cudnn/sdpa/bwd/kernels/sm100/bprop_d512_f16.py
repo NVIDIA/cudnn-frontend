@@ -73,7 +73,7 @@ from cudnn.frost.tile_dsl.tma import (
 )
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
-from cudnn.sdpa.bwd.kernels._common_sm100 import make_bwd_decode
+from cudnn.sdpa.bwd.kernels.sm100._common import make_bwd_decode
 from cudnn.frost.tile_dsl.thd import emit_clamped_desc
 from cudnn.sdpa.bwd.config_sm100 import (
     TemplateParams,
@@ -97,7 +97,7 @@ from cudnn.sdpa.bwd.config_sm100 import (
 MASK_FORM: str = MASK_FORM_BITS
 
 # Injected by the loader before this body executes; a plain import gets the
-# all-defaults config (dense bf16), which keeps `python bprop_d512_f16_sm100.py`
+# all-defaults config (dense bf16), which keeps `python sm100/bprop_d512_f16.py`
 # usable as a standalone benchmark.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG = make_cfg_d512(PARAMS)

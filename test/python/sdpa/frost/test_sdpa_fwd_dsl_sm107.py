@@ -920,18 +920,29 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
-    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o", "sample_sf_o", "sample_scale_o"], params[
-        extension_start:
-    ]
+    # Append-only: the ragged-Q decode leg's two plan-time facts follow the block-scale tail.
+    assert params[extension_start:] == [
+        "sample_amax_o",
+        "pv_bf16",
+        "stats_log2",
+        "sample_gate",
+        "has_amax_o",
+        "sample_sf_o",
+        "sample_scale_o",
+        "ragged_divisors",
+        "ragged_offsets_int64",
+    ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
     # Both gate parameters default OFF, so every pre-gate call site is untouched.
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    assert exec_params[-3:] == ["block_table_v", "gate", "sf_o"], exec_params[-4:]
+    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o.
+    assert exec_params[-6:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse"], exec_params[-7:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
+    assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))
 
 
 # --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------

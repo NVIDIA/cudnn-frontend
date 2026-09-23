@@ -30,7 +30,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
 from cudnn.sdpa.fwd.api_dsl import _WS_ALIGN, WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
-_SM120_KERNEL_FILE = "bprop_f16_sm120.py"
+_SM120_KERNEL_FILE = "sm120/bprop_f16.py"
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
@@ -938,12 +938,12 @@ def _sm80_bwd_kernel_mod(key: str = "d64"):
     silently swallows every feature kwarg, so callers must never rely on the
     signature filter and only select it through
     :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
-    (``bprop_f16_sm80``) is a TemplateParams module loaded per-specialization
+    (``sm80/bprop_f16``) is a TemplateParams module loaded per-specialization
     via :func:`_load_sm80_bwd_module` instead.
     """
     assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        from .kernels import bprop_d64_f16_sm80 as _mod
+        from .kernels.sm80 import bprop_d64_f16 as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -1182,7 +1182,7 @@ def _sm80_thd_backward(
 _cache_of_objects: dict = {}
 
 
-_SM80_BWD_KERNEL_FILE = "bprop_f16_sm80.py"
+_SM80_BWD_KERNEL_FILE = "sm80/bprop_f16.py"
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
 from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402
@@ -1782,13 +1782,13 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch (issue #514): dense_flex gathers / head-dim pad
         staging for the five input operands, strided-stats staging, and the
-        kernel-internal buffers (``bprop_f16_sm80.scratch_bytes``; the generic
+        kernel-internal buffers (``sm80/bprop_f16.scratch_bytes``; the generic
         kernel's set covers the d64 fast path's). All plan-time state — no
         arguments."""
         self._ensure_support_checked()
         if self.thd:
             return self._thd_scratch_bytes()
-        from .kernels import bprop_f16_sm80 as _kmod
+        from .kernels.sm80 import bprop_f16 as _kmod
 
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
         b, hq, hkv = self.batch_size, self.h_q, self.h_kv
@@ -2523,8 +2523,8 @@ def sdpa_bwd_wrapper_sm80(
 _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
-_SM100_STAGE2_FILE = "bprop_d512_f16_sm100.py"
-_SM100_MATMUL_FILE = "bprop_matmul_sm100.py"
+_SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+_SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
 # do_dot's inner loop is `n_chunks = D_V // chunk_elems` with no tail, so D_V is
 # always passed ROUNDED UP to this and the kernel's padded-head-dim guard covers
 # the remainder. 64 keeps 8 threads/row, which is a 2x throughput cliff over 32.
@@ -2821,7 +2821,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             TemplateParams,
             vec_bytes_epi_for,
         )
-        from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import dot_do_o_host
+        from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
         stage2_mod = load_template(
@@ -3174,7 +3174,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 # Fold the Q-head partials onto the KV heads. Reused verbatim
                 # from the SM120 chain: arch-neutral, one thread per 16 B output
                 # vector, fixed-order fp32 accumulation (so it is deterministic).
-                from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import dkv_reduce_host
+                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
 
                 io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
                 if self._reduce_fn is None:
@@ -3454,7 +3454,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 # elementwise over rows and sizes its grid from the OUTPUT's
                 # (batch, seq, head), so a packed batch of 1 needs nothing
                 # special.
-                from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import dkv_reduce_host
+                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
 
                 io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
                 if self._reduce_fn is None:
