@@ -60,9 +60,17 @@ r // PACK_G, head r % PACK_G -- the whole group when it divides 128, else its
 largest divisor that does: partial PackGQA, 96/8 packs 4 of its 12 heads and
 three packed heads read one KV head), KV split with fp32 partials for
 ``sm100/split_combine.py``,
-and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  THD is
-NOT wired: the decode tile is dense-only (``make_cfg_d128_decode`` rejects it and
-the engine row declines cga=1 for THD graphs).
+and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  The
+prefill tile's THD leg (``THD_VARLEN``: device-built metadata, per-sequence O
+descriptors, the live-unit scheduler) is NOT wired here.  Ragged Q/O/Stats over
+PAGED K/V at ``S_q(max) == 1`` -- FlashInfer's prefill-style graph at one token
+per sequence -- rides ``CFG.RAGGED_Q`` instead: the dense grid stays (one unit
+per (packed head, batch, split)), the TMA-LDG warp reads this batch's Q ragged
+offset on device and uses it as the row coordinate over the packed ``[1, T, H,
+D]`` Q view, and the split path is mandatory so O/Stats never leave this kernel
+as final rows: the fp32 partials stay dense in the workspace and
+``sm100/split_combine.py`` places the recombined rows at the O/Stats ragged
+offsets (``make_cfg_d128_decode`` enforces ``split_kv > 1`` and ``paged_kv``).
 
 Selection: the (128, 128) f16/bf16 flavor at ``TILE_CGA_M=1`` IS this tile
 (``api_dsl._load_sm100_kernel_module``); the heuristics propose cga=1 exactly
@@ -72,8 +80,9 @@ unpacked one), i.e. when one 128-row tile covers a packed head's live Q rows.
 The kernel is correct for any S_q -- larger S_q simply launches
 ``ceil(S_q * PACK_G / 128)`` independent CTAs per packed head, each walking the
 KV range.
-The per-shape ``compile()`` ABI is the prefill kernel's (minus the THD-only
-arguments), so the adapter's dense execute path binds both templates alike.
+The graph adapter and direct kernel callers use one explicit pointer ABI.
+``compile()`` specializes only head dimensions, Stats presence/layout and the
+paged-pool layout; shapes and strides are bound at launch.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -132,9 +141,19 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_co
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline):
+# every masked call site below passes `form=MASK_FORM`, so the two forms of the
+# same mask -- "cells" (per-cell compare + select, 3-7 instructions per cell) and
+# "bits" (one keep-word per 32 columns, register-to-predicate R2P + one FSEL per
+# cell, 1.4-1.6 per cell) -- are an A/B by flipping this line.  Both produce the
+# same masked set with the same sentinel, so O / LSE are bitwise identical;
+# test_sm100_every_mask_site_takes_the_module_mask_form counts the sites.
+MASK_FORM: str = MASK_FORM_BITS
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 2:
@@ -149,16 +168,26 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
+    sdpa_operand_tensors,
     store_fp32_partial_tile as _store_fp32_partial_tile,
     make_classic_bars,
     row_max_for_exp2,
     make_sdpa_helpers,
+    _bshd as _bshd_view,
 )
 
 if CFG.CTA_MMA != 1 or CFG.TILES_Q != 1 or CFG.THD_VARLEN:
     # make_cfg_d128_decode already enforces this; the module-level check keeps
-    # the body's assumptions (no peer CTA, one sub-tile, dense) visible.
-    raise ValueError("decode_d128_f16_sm100: the decode tile is cga1, TILES_Q=1 and dense-only")
+    # the body's assumptions (no peer CTA, one sub-tile, no THD leg) visible.
+    raise ValueError("decode_d128_f16_sm100: the decode tile is cga1, TILES_Q=1 and carries no THD_VARLEN leg")
+
+# Ragged Q over paged K/V (see the module docstring): the Q row coordinate is
+# this batch's ragged offset (int32 elements / RAGGED_Q_DIV = tokens) over the
+# packed [1, T, H, D] view; the partials stay dense and the combine pass owns
+# the ragged O/Stats placement, so the split path is mandatory.
+RAGGED_Q = bool(getattr(CFG, "RAGGED_Q", 0))
+if RAGGED_Q and (CFG.SPLIT_KV < 2 or not CFG.PAGED_KV):
+    raise ValueError("decode_d128_f16_sm100: RAGGED_Q rides the split path over paged K/V (split_kv > 1, paged_kv)")
 
 CGA_SIZE = 1
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_1
@@ -284,9 +313,15 @@ def _kernel(
     # one for V. None (folded out of the ABI) unless CFG.PAGED_KV.
     block_table_tensor: Optional[cute.Tensor] = None,
     block_table_v_tensor: Optional[cute.Tensor] = None,
+    # Ragged Q (CFG.RAGGED_Q): (B+1,) Q ragged offsets in elements (int32, or
+    # int64 under ragged_q_i64) and the elements-per-token divisor
+    # (H_q * D / multiplier); reads fold out unless the flag is set.
+    ragged_q_addr: cutlass.Int64 = 0,
+    ragged_q_div: cutlass.Int32 = 1,
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
+    ragged_q_i64: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -492,6 +527,9 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            ragged_q_addr=ragged_q_addr,
+            ragged_q_div=ragged_q_div,
+            ragged_q_i64=ragged_q_i64,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -585,6 +623,9 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    ragged_q_addr: cutlass.Int64 = 0,
+    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_i64: cutlass.Constexpr[bool] = False,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
     q_empty_phase = cutlass.Int32(1)
@@ -668,9 +709,25 @@ def _tmaldg_warp_group(
             mb_q_reload[0].wait(q_empty_phase)
             bars.mb_qo_slab_free[0].arrive()
             bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=nvvm.elect_sync())
+            # Ragged Q: the batch's first token row is its ragged offset over
+            # the packed [1, T, H, D] view (batch coord 0); a sequence past the
+            # view's token extent zero-fills through TMA OOB.  Dense: the
+            # (B, H, S, D) descriptor's batch coord.
+            q_seq_off = cutlass.Int32(0)
+            q_tma_batch = batch_idx
+            if cutlass.const_expr(RAGGED_Q):
+                # Divide in 64 bits: an element offset can exceed 2^31 on a large packed buffer.
+                if cutlass.const_expr(ragged_q_i64):
+                    _rq = cute.make_tensor(cute.make_ptr(cutlass.Int64, ragged_q_addr, cute.AddressSpace.gmem, assumed_align=8), cute.make_layout(1 << 24))
+                    _q_off64 = cutlass.Int64(_rq[batch_idx])
+                else:
+                    _rq = cute.make_tensor(cute.make_ptr(cutlass.Int32, ragged_q_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
+                    _q_off64 = cutlass.Int64(cutlass.Int32(_rq[batch_idx]))
+                q_seq_off = cute.arch.make_warp_uniform(cutlass.Int32(_q_off64 // cutlass.Int64(ragged_q_div)))
+                q_tma_batch = cutlass.Int32(0)
             tma_load_tile(
                 sQ[0],
-                tma_q(cutlass.Int32(0), q_head_idx, q_row_base, batch_idx),
+                tma_q(cutlass.Int32(0), q_head_idx, q_row_base + q_seq_off, q_tma_batch),
                 bars.mb_q_full[0].smem_ptr,
                 cta_group=1,
                 mcast_mask=tma_mcast_mask,
@@ -1193,7 +1250,7 @@ def _softmax_kv_body(
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
-            apply_mask_chunk(
+            apply_mask_chunk_form(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * CHUNK),
@@ -1205,6 +1262,7 @@ def _softmax_kv_body(
                 causal_diag=causal_diag,
                 mask_value=float("-inf"),
                 window_right=CFG.WINDOW_RIGHT,
+                form=MASK_FORM,
             )
             for c in range(N_CHUNKS)
         ]
@@ -1772,7 +1830,7 @@ def _correction_warp_group(
 
 
 @cute.jit
-def _host(
+def _launch(
     q_tensor: cute.Tensor,
     k_tensor: cute.Tensor,
     v_tensor: cute.Tensor,
@@ -1783,31 +1841,22 @@ def _host(
     o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
-    n_thd_units: cutlass.Int32,
-    # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None
-    # (and absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.
-    seq_q_lens_addr: cutlass.Int64 = 0,
-    # THD-only slots of the shared dense ABI (the adapter passes them
-    # positionally as None on every dense build); this tile never reads them.
-    thd_q_lens_tensor: Optional[cute.Tensor] = None,
-    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
-    thd_lens_form: Optional[cutlass.Int32] = None,
-    o_partial_f32: Optional[cute.Tensor] = None,
-    # Paged KV: [B, max_pages] int32 block tables; None (folded out) unless
-    # CFG.PAGED_KV.  The page axis is a DYNAMIC extent and defines the static
-    # KV maximum the masks clamp against: seqlen_kv = max_pages * PAGE_SIZE.
-    block_table_tensor: Optional[cute.Tensor] = None,
-    block_table_v_tensor: Optional[cute.Tensor] = None,
+    seq_q_lens_addr: cutlass.Int64,
+    o_partial_f32: Optional[cute.Tensor],
+    block_table_tensor: Optional[cute.Tensor],
+    block_table_v_tensor: Optional[cute.Tensor],
+    paged_hnd: cutlass.Constexpr[bool],
+    ragged_q_addr: cutlass.Int64,
+    ragged_q_div: cutlass.Int32,
+    ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """TMA construction and launch for the explicit pointer host entry."""
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(PAGED_KV):
         SKV = block_table_tensor.shape[1] * cutlass.Int32(PAGE_SIZE)
 
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE
-    if cutlass.const_expr(CFG.PACK_GQA):
-        if cutlass.const_expr(q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
-            raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
     # Tensors are [B, S, H, D] with stride_order=(3, 2, 1, 0); D is fastest.
     # PackGQA: the Q box is TILE_M/G tokens x G heads (token-major rows).
     qk_box_q = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)
@@ -1823,9 +1872,6 @@ def _host(
     # descriptor lists dims innermost-first as (D, row, H_kv, page) and the
     # TMA-LDG warp swaps its (head, row) coords to match; NHD is the dense BSHD
     # order with batch -> page.
-    paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
-    if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
-        raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
     kv_stride_order = (3, 1, 2, 0) if paged_hnd else stride_order
 
     def _tma_swz(byte_w: int):
@@ -1894,7 +1940,10 @@ def _host(
         o_partial_f32,
         block_table_tensor,
         block_table_v_tensor,
+        ragged_q_addr,
+        ragged_q_div,
         paged_hnd,
+        ragged_q_i64,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -1903,140 +1952,201 @@ def _host(
     )
 
 
+@cute.jit
+def _host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int32,
+    scale_softmax_log2: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    o_partial_ptr: Optional[cute.Pointer],
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    n_pages: cutlass.Int32,
+    ragged_q_addr: cutlass.Int64,
+    ragged_q_div: cutlass.Int32,
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_kind: cutlass.Constexpr[str],
+    paged_hnd: cutlass.Constexpr[bool],
+    ragged_q_i64: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
+
+    The private raw entry assumes validated operands, including the compiled GQA
+    ratio. Graph/adapter calls bind through prepared.py; direct tests use launch_f16.
+
+    ``ragged_q_addr`` / ``ragged_q_div`` (CFG.RAGGED_Q only): the (B+1,) int32 Q
+    ragged offsets and the elements-per-token divisor; ``problem_size[5]`` then
+    carries the packed Q view's token capacity (0 and unused otherwise).
+    """
+    (
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        thd_q_lens_tensor,
+        thd_kv_lens_tensor,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+    ) = sdpa_operand_tensors(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        o_partial_ptr,
+        d_qk=d_qk,
+        d_v=d_v,
+        lse_kind=lse_kind,
+        thd=False,
+        split_kv=SPLIT_KV,
+        tensor_map_qwords=16,
+        paged=PAGED_KV,
+        page_size=PAGE_SIZE,
+        block_table_ptr=block_table_ptr,
+        block_table_v_ptr=block_table_v_ptr,
+        table_strides=table_strides,
+        n_pages=n_pages,
+    )
+    if cutlass.const_expr(RAGGED_Q):
+        # The packed [1, T, H, D] Q view (token capacity in problem_size[5]);
+        # the row coordinate is the batch's ragged offset (TMA-LDG warp).
+        q_tensor = _bshd_view(q_ptr, 1, problem_size[5], problem_size[1], d_qk, q_strides, True)
+
+    _launch(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        sinks_tensor,
+        seq_kv_lens_tensor,
+        o_desc_words,
+        problem_size,
+        scale_softmax_log2,
+        seq_q_lens_addr,
+        o_partial_f32,
+        block_table_tensor,
+        block_table_v_tensor,
+        paged_hnd,
+        ragged_q_addr,
+        ragged_q_div,
+        ragged_q_i64,
+        stream,
+    )
+
+
+EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
+# The decode tile's in-kernel Stats are always the dense (B[*split], H, S_q) form: on the
+# ragged-Q leg they are the split-major partial slab and the combine writes the ragged rows.
+LSE_KINDS = ("dense",)
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 1,
-    skv: int = 128,
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
     has_lse: bool = True,
-    q_stride: Optional[tuple] = None,
-    k_stride: Optional[tuple] = None,
-    v_stride: Optional[tuple] = None,
-    o_stride: Optional[tuple] = None,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-    block_table_stride: Optional[tuple[int, int]] = None,
-    block_table_v_stride: Optional[tuple[int, int]] = None,
+    lse_kind: str = "dense",
+    paged_hnd: bool = False,
+    ragged_i64: bool = False,
 ) -> Callable:
-    """Compile the decode tile with ALL dims concrete to pin TMA descriptor strides.
-
-    The dense subset of ``prefill_d128_f16.compile``'s contract (no THD, no
-    ``dynamic_bhk``): PAGED KV binds ``k_stride`` / ``v_stride`` (REQUIRED) as the
-    pools' strides in ``[num_pages, page_size, H_kv, D]`` order with ``skv``
-    IGNORED -- the page count and the table's page axis are runtime extents
-    (``cute.sym_int``), so one artifact serves every cache size (Rule 4);
-    ``has_lse=False`` compiles the LSE store out; ENVELOPE ``d_qk`` / ``d_v`` are
-    the ACTUAL head dims (multiples of 8) and the descriptors carry them while
-    the tile box stays 128; a split (``CFG.SPLIT_KV > 1``) writes fp32 partials
-    into ``(B*SPLIT_KV)``-batch slabs and REQUIRES ``has_lse``.
-    """
+    """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
+    are runtime arguments; head-dim envelopes, Stats presence, pool layout and the
+    ragged-Q offset width (``ragged_i64``: int64 offsets; int32 otherwise -- CFG.RAGGED_Q
+    only) are specializations. All stride fakes, including page tables, are Int64."""
     _cache_key = _template_key(globals(), locals(), "compile")
-    _b0, _qh0, _kh0 = b, qh, kh  # the problem_size fake: runtime scalars, values immaterial
+    if ragged_i64 and not RAGGED_Q:
+        raise ValueError("ragged_i64 is a RAGGED_Q specialization")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
-        raise ValueError(f"d128 decode envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+        raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
-        raise ValueError(f"d128 decode envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
+        raise ValueError(f"d128 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
     if SPLIT_KV > 1 and not has_lse:
-        raise ValueError("d128 decode: split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if lse_stride is not None and SPLIT_KV > 1:
-        raise ValueError("dense LSE strides are not valid for split-KV workspaces")
-    _o_batch = b * SPLIT_KV
-    _lse_batch = b * SPLIT_KV
+        raise ValueError("d128: split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_kind not in LSE_KINDS:
+        raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
+    if paged_hnd and not PAGED_KV:
+        raise ValueError("paged_hnd is a paged-KV specialization")
+    gmem = cute.AddressSpace.gmem
 
-    def _fake_bshd(shape, stride, dtype=STORAGE_DTYPE, bpe=CFG.BPE):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if stride[3] != 1:
-            raise ValueError(f"declared stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-        for axis in (1, 2):  # seq/head global strides feed TMA: 16-byte rule
-            if (stride[axis] * bpe) % 16 != 0:
-                raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
-        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
+    def P(dtype, align=16):
+        return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
-    fake_q = _fake_bshd((b, sq, qh, d_qk), q_stride)
-    if PAGED_KV:
-        if k_stride is None or v_stride is None:
-            raise ValueError("PAGED_KV: k_stride / v_stride (the pools' strides in [num_pages, page_size, H_kv, D] order) are required")
-        n_pages = cute.sym_int(divisibility=1)
-        fake_k = _fake_bshd((n_pages, PAGE_SIZE, kh, d_qk), k_stride)
-        fake_v = _fake_bshd((n_pages, PAGE_SIZE, kh, d_v), v_stride)
-        # K and V tables share one dynamic page-axis symbol: the kernel reads
-        # its KV maximum from the K table, so both must have the same extent.
-        _max_pages = cute.sym_int(divisibility=1)
-
-        def _fake_table(stride):
-            if stride is None:
-                return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b, _max_pages), stride_order=(1, 0), assumed_align=4)
-            return cute.runtime.make_fake_tensor(cutlass.Int32, (b, _max_pages), tuple(stride), assumed_align=4)
-
-        fake_block_table = _fake_table(block_table_stride)
-        fake_block_table_v = _fake_table(block_table_v_stride)
-    else:
-        fake_k = _fake_bshd((b, skv, kh, d_qk), k_stride)
-        fake_v = _fake_bshd((b, skv, kh, d_v), v_stride)
-        fake_block_table = None
-        fake_block_table_v = None
-    fake_o = _fake_bshd((_o_batch, sq, qh, d_v), o_stride, dtype=cutlass.Float32 if _FP32_PARTIALS else STORAGE_DTYPE)
-    if not has_lse:
-        fake_lse = None
-    else:
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (_lse_batch, qh, sq),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
-        )
-    # Sinks tensor always part of the ABI; read only when CFG.HAS_SINK == 1 (compile-time fold).
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (qh,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # seq_kv_lens always part of the ABI; read only when CFG.SEQ_KV_LENS_PRESENT == 1.
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    fake_seq_q_lens = cutlass.Int64(0)  # device address of the (B,) int32 Q lengths; 0 (unread) when the flag is off
-    # o_desc_words: THD-only per-batch descriptor array in the shared ABI; a
-    # dummy 1-element buffer here (never read).
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
+    i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
     return _compile_cached(
         _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_sinks,
-        fake_seq_kv_lens,
-        fake_o_desc,
-        (_b0, _qh0, _kh0, sq, skv, 0),
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(STORAGE_DTYPE),
+        P(cutlass.Float32 if _FP32_PARTIALS else STORAGE_DTYPE),
+        P(cutlass.Float32, 4) if has_lse else None,
+        P(cutlass.Float32),
+        P(cutlass.Int32),
+        P(cutlass.Int64),
+        (0, 0, 0, 0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i32,
         cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        fake_seq_q_lens,
+        i32,
+        cutlass.Int64(0),
         None,
         None,
         None,
-        # o_partial_f32 slot: the fp32 partial O under a split, else — only
-        # when the paged tables follow it positionally — an explicit None.
-        *((fake_o,) if _FP32_PARTIALS else ((None,) if PAGED_KV else ())),
-        *((fake_block_table, fake_block_table_v) if PAGED_KV else ()),
+        P(cutlass.Float32) if _FP32_PARTIALS else None,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        (cutlass.Int64(0), cutlass.Int64(0)),
+        i32,
+        cutlass.Int64(0),
+        i32,
+        d_qk,
+        d_v,
+        lse_kind,
+        paged_hnd,
+        bool(ragged_i64),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

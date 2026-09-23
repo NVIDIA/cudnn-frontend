@@ -51,6 +51,7 @@ from cutlass.utils.blackwell_helpers import (
     make_smem_layout_a as _make_smem_layout_a,
     make_smem_layout_b as _make_smem_layout_b,
 )
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import gemm_ptx_partial as _gemm_ptx_partial
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
@@ -248,7 +249,7 @@ class SparseScoreRecomputeSm100:
         mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[1, 2, 0]))
 
         cta_group = tcgen05.CtaGroup.ONE
-        self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
+        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
@@ -401,7 +402,7 @@ class SparseScoreRecomputeSm100:
                 self.buffer_align_bytes,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Extract all pointers/tensors from storage so no 'if' body references storage

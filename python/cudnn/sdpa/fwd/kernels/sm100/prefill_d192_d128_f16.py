@@ -20,6 +20,16 @@ SM100 resource layout:
      ``row_max_reduction`` (the masked path's pattern) instead of
      ``tmem_load_max_reduction_tile`` (LDTM.STAT).
   4. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``.
+  5. **exp2 split MUFU / FMA** (``_E2E_*``, **cc 10.0 only**): 32 of the 128 P
+     columns of every softmax row are evaluated on the FMA pipe by
+     ``exp2_emul_pair`` (blocks of 4, spread over both P chunks) on EVERY mask
+     arm, the alpha exp2 stays on MUFU -- 97 instead of 129 MUFU.EX2 per row
+     per KV step.  MEASURED on B200 (DSv3 layer, H=128/128 bf16, A/B/A x3):
+     +1.9 % at S=8K dense, +2.6 % at S=2K, +3.1 % at S=32K, +1.75 % causal.
+     ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out on
+     every other cc, where MUFU.EX2 runs at twice B200's rate and the same
+     split loses (``_E2E_ENABLED``); there the dense top-left causal arm keeps
+     its pre-existing tail emulation (``_exp2_mixed_late``).
 
 Supported: FP16 / BF16 (``DTYPE_QKV in {2, 3}``); masks none / causal / SWA /
 padded and all pairwise combos (causal+swa, causal+padded, swa+padded);
@@ -101,6 +111,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
     # row_max_reduction (see _softmax_kv_body), so tmem_load_max_reduction_tile
     # is not imported.
+    exp2_mixed,
     row_reduction_pair,
     row_max_reduction,
     vec_scale_pair,
@@ -111,17 +122,78 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_co
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
+# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
+MASK_FORM: str = MASK_FORM_BITS
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
+# Dense top-left causal MHA: BMM1/BMM2 issue tweaks (an opaque K descriptor, one BMM2 issue election per
+# sub-tile, chunk 1's row-sum after its publish) plus -- with the cc 10.0 exp2 split OFF -- the pre-existing
+# causal-only tail emulation ``_exp2_mixed_late`` (the last 34 columns of chunk 1 on ex2_emulation_2's
+# degree-2 polynomial, PR #841).  With the split ON (``_E2E_ENABLED`` below) the module-wide ``_E2E_*``
+# pattern replaces that tail emulation on EVERY mask arm -- the exact form MEASURED on B200.  The tail
+# emulation itself is untouched and still traces wherever the split is off; it runs ungated on cc 10.3
+# today and its own arch gate is a separate follow-up.
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
+
+# exp2 split between MUFU and the FMA pipe.  With 128 exps per row per KV step the MUFU pipe
+# (4 lanes/clk/SMSP) is the softmax warps' longest pipe on SM100 while the FP32 pipe has slack;
+# a compile-time subset of the P columns is evaluated by ``exp2_emul_pair`` (6 packed FP32/INT
+# instructions per pair) instead of ``ex2.approx``.  Same shape as the cuDNN backend fprop
+# kernel's pattern (of every _E2E_FREQ columns the LAST _E2E_RES are emulated, none at or past
+# _E2E_LIMIT); the distribution is the one the sm100 d128 MXFP8 prefill measured best on B200
+# (B=1 H=24/8 S=16K dense, A/B/A): 32 of 128 columns in blocks of 4 spread over BOTH 64-wide
+# chunks, +1.63 % over the backend's own (16, 8, 72) and +9.73 % over the all-MUFU kernel there;
+# 24/40/48/64 emulated columns and blocks of 2 or 8 all lost.  Per row per KV step MUFU.EX2
+# 129 -> 97 (the alpha exp2 stays on MUFU).  On THIS kernel MEASURED on B200 (DSv3 layer B=1
+# H=128/128 bf16, A/B/A x3, controls <= 0.76 %): +1.90 % at S=8K dense, +2.64 % at S=2K,
+# +3.07 % at S=32K, +1.75 % at S=8K causal (LPT_L2).  Derived per softmax chunk as pair indices
+# for ``exp2_mixed``; sign and pattern are per kernel -- re-measure before changing the constants.
+#
+# ARCH GATE.  The split trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's
+# MUFU rate -- MEASURED 16 elements/clk/SM on sm_100a (B200) and 32 on sm_107a (Rubin, where the same
+# split is -9..-10 %); cc 10.3 (GB300) DOCUMENTS the doubled rate too.  ``PARAMS.exp2_fma_split`` is
+# auto-set by the adapter from the BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the
+# kernels that measured a win) and folded here at trace time: off, ``_E2E_PAIRS`` are empty and both
+# exp2 sites trace the develop spelling.  Full rationale and the measured rates: the ``_E2E_*`` block
+# of ``prefill_d128_mxfp8.py``.
+_E2E_FREQ = 16
+_E2E_RES = 4
+_E2E_LIMIT = CFG.TILE_N
+_SOFTMAX_CHUNK = 64  # tcgen05_ld width of one softmax chunk (see _softmax_kv_body CHUNK)
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off): the MUFU.EX2 the softmax still
+# issues per row per KV step is the alpha exp2 plus the non-emulated columns (97 on, 129 off).
+_E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
+if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
+    raise ValueError(f"{__name__}: exp2 emulation pattern freq={_E2E_FREQ} res={_E2E_RES} limit={_E2E_LIMIT} must be even with 0 <= res <= freq | limit")
+if CFG.N_BMM2_CHUNKS * _SOFTMAX_CHUNK != CFG.TILE_N:
+    raise ValueError(f"{__name__}: N_BMM2_CHUNKS ({CFG.N_BMM2_CHUNKS}) x softmax chunk ({_SOFTMAX_CHUNK}) must equal TILE_N ({CFG.TILE_N})")
+
+
+def _e2e_pairs(chunk: int, chunk_elems: int = _SOFTMAX_CHUNK) -> frozenset:
+    """Pair indices (pair p = columns 2p, 2p+1 of the chunk) that ``exp2_mixed`` emulates."""
+    return frozenset(
+        p
+        for p in range(chunk_elems // 2)
+        if ((chunk * chunk_elems + 2 * p) % _E2E_FREQ) >= (_E2E_FREQ - _E2E_RES) and (chunk * chunk_elems + 2 * p) < _E2E_LIMIT
+    )
+
+
+_E2E_PAIRS = tuple(_e2e_pairs(c) if _E2E_ENABLED else frozenset() for c in range(CFG.N_BMM2_CHUNKS))
+if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
+    raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
 
 
 def _exp2_mixed_late(vec):
@@ -547,51 +619,11 @@ def _softmax_next_payload(
 
 
 @cute.jit
-def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        # Right-band widening: the causal upper limit sits BAND_RIGHT columns
-        # right of the diagonal (cuDNN diagonal_band_right_bound).
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
-
-
-@cute.jit
-def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs + causal_diag - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
-
-
-@cute.jit
 def _apply_padding_mask_if_needed(reg_S, kv_col_base, eff_seqlen_kv):
     """Apply the per-element padding predicate only to a partial KV chunk."""
     result = reg_S
     if kv_col_base + cutlass.Int32(int(reg_S.shape[0])) > eff_seqlen_kv:
-        result = apply_mask_chunk(
+        result = apply_mask_chunk_form(
             reg_S,
             cutlass.Int32(0),
             kv_col_base,
@@ -600,6 +632,7 @@ def _apply_padding_mask_if_needed(reg_S, kv_col_base, eff_seqlen_kv):
             MASK_PADDED,
             N=int(reg_S.shape[0]),
             mask_value=float("-inf"),
+            form=MASK_FORM,
         )
     return result
 
@@ -2007,7 +2040,7 @@ def _softmax_kv_body(
     Returns updated (total_max, total_max_safe, total_sum, bmm1_phase,
     stat_empty_phase).
     """
-    CHUNK = 64
+    CHUNK = _SOFTMAX_CHUNK
     # fp16/bf16 pack 2 probs per FP32 TMEM cell (CHUNK//2); TF32 is 1:1 (CHUNK).
     P_COLS_PER_CHUNK = CHUNK if IS_TF32 else CHUNK // 2
     N_CHUNKS = CFG.N_BMM2_CHUNKS
@@ -2040,40 +2073,64 @@ def _softmax_kv_body(
             if cutlass.const_expr(CFG.BOTTOM_RIGHT):
                 mask_q_abs = mask_q_abs + causal_diag
             mask_q_abs = cute.math.min(mask_q_abs, eff_seqlen_kv - cutlass.Int32(1))
+            # Causal + padded as ONE causal edge: kv > min(q (+ diag), seq_kv - 1) masks
+            # exactly the causal OR padded set, so the chunk sees a top-left causal mask
+            # anchored at mask_q_abs (WINDOW_RIGHT == 0 in this arm by _PADDED_CAUSAL).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk_form(
                     raw_chunks[c],
                     mask_q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
+                    form=MASK_FORM,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
+            # Top-left causal (+ the compile-time right band, cuDNN diagonal_band_right_bound).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk_form(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
+                    form=MASK_FORM,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
+            # Bottom-right causal: the diagonal sits causal_diag = S_kv - S_q columns right of top-left.
             chunks_S = [
-                _apply_bottom_right_causal_mask_chunk(
+                apply_mask_chunk_form(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
-                    causal_diag,
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    bottom_right=CFG.BOTTOM_RIGHT,
+                    causal_diag=causal_diag,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
+                    form=MASK_FORM,
                 )
                 for c in range(N_CHUNKS)
             ]
         else:
             chunk_mask_flags = body_mask_flags & ~MASK_PADDED if CFG.MASK_FLAGS & MASK_SWA else body_mask_flags
             chunks_S = [
-                apply_mask_chunk(
+                apply_mask_chunk_form(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
@@ -2085,6 +2142,7 @@ def _softmax_kv_body(
                     causal_diag=causal_diag,
                     mask_value=float("-inf"),
                     window_right=CFG.WINDOW_RIGHT,
+                    form=MASK_FORM,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -2175,7 +2233,12 @@ def _softmax_kv_body(
     # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Gated per arch
+    # at trace time (_E2E_ENABLED): off, this chunk is the plain MUFU exp2 -- the develop spelling.
+    if cutlass.const_expr(_E2E_ENABLED):
+        chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
+    else:
+        chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
     # Hoist chunk 0's sum before the cast to overlap with the cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
@@ -2192,10 +2255,15 @@ def _softmax_kv_body(
     p1_sum_pair = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
-            deferred_P_1 = _exp2_mixed_late(chunk_S_1)
+        # Split ON: the module-wide pattern on every mask arm.  Split OFF: develop's spelling -- the dense
+        # top-left causal arm's tail emulation (_exp2_mixed_late), the plain MUFU exp2 everywhere else.
+        if cutlass.const_expr(_E2E_ENABLED):
+            deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
-            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+            if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+                deferred_P_1 = _exp2_mixed_late(chunk_S_1)
+            else:
+                deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
         if cutlass.const_expr(not _DENSE_CAUSAL_PUBLIC_EXP2_MIX):
             p1_sum_pair = row_reduction_pair(deferred_P_1)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -2890,7 +2958,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -3173,7 +3241,7 @@ def compile(  # noqa: A001
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

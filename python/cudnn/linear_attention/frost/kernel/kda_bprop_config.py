@@ -20,7 +20,7 @@ compile-time constants).  The BT=16 backward mirrors the prefill's 16-warp
 (512-thread) specialization; the derived SMEM/TMEM sizes and offsets are
 stamped by ``build_cfg`` in ``kda_bprop_f16.py``.
 
-Target arch: Blackwell SM100 / SM103.
+Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass

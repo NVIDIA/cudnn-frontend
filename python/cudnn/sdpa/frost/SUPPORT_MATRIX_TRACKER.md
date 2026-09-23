@@ -22,8 +22,20 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-All FROST engines are `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`
-before `import cudnn` or the graph silently runs a cuDNN backend plan.
+`sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
+ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
+SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+`import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
+
+**Execute-time shape/stride overrides:** graphs created with
+`is_override_shape_enabled=True` retain compatible prepared SM100/SM107 f16/bf16
+plans: dense zero-copy layouts, split-KV with a non-overlapping final O layout,
+and supported unsplit THD. Each runtime override must remain inside that plan's
+compiled geometry, dtype, layout and workspace envelope. Tensor-only paths
+(including FP8/MXFP8, synthesized KV-tail padding, bias and SM120) decline;
+explicit opt-in does not bypass the contract. The same pure capability predicate
+filters candidate knobs and selects the prepared executor. Static-geometry graph
+eligibility is unchanged.
 
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
@@ -210,7 +222,7 @@ documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
 so S and dS go to a GMEM workspace and the gradients are three batched GEMMs
-over it (`do_dot` → `bprop_d512_f16_sm100` → `bprop_matmul_sm100`). Two
+over it (`do_dot` → `sm100/bprop_d512_f16` → `bprop_matmul_blackwell`). Two
 consequences a user can see: the workspace is `2·B·H_chunk·S_q·S_kv·2 B` (the
 host loops over head chunks to hold it under 4 GiB; under THD it is
 `2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ʰ), and everything in the band
@@ -224,6 +236,7 @@ MMA as d=512.
 | FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ✅ᵍ (E4M3 only, d=256) |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | ✅ᵍ (fp16/bf16 gradients) |
+| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107) | ❌ | ❌ | ❌ | ❌ |
 | Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
@@ -277,8 +290,10 @@ underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −
 off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA incl. partial
 packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head), KV split
 + combine, NATURAL
-/ LPT / LPT_L2. **Not on the decode tile: THD** (a ragged graph keeps `TILE_CGA_M=2`; a
-pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+/ LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
+ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
+at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
+and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 rides it through the d128 envelope. Measured on B200 (graph path,
@@ -287,6 +302,32 @@ prefill tile → 48.9 us on the decode tile (the cuDNN backend's decode engine: 
 64/4 MTP S_q=4 127.5 → 50.6 us; 64/8 S_q=1 234.6 → 96.4 us; 96/8 S_q=1 (G=12 packs 4,
 partial PackGQAᵐ on both tiles) 615 → 225 us (the same shape unpacked on the decode tile:
 875 us); d64 64/8 230.5 → 80.2 us. The kernel docstring carries the full table.
+
+ʳᵠ **Ragged Q over paged KV on the d128 decode tile (`TemplateParams.ragged_q`, nvbug
+6607857).** FlashInfer's prefill-style paged graph — ragged Q/O/Stats (ragged offsets +
+`seq_len_q`) over page pools + block tables — at `S_q(max) == 1` used to be THD to every
+FROST row and so kept the cga2 prefill tile unsplit and unpacked: on B200 (b=4, 64/8,
+d128, page 16, bf16) 206 us at `S_kv=2048` and 1641 us at 16384, 9–22× the dense decode
+graph of the same geometry (the cuDNN backend's `heur_mode.A` served it with the sm80
+WMMA engine, 66 / 517 us). It now rides the decode tile's **ragged-Q leg**: the dense
+grid over the declared batch is kept (one unit per packed head × batch × split), the
+TMA-LDG warp reads each batch's Q ragged offset on device and uses it as the row
+coordinate over the packed `[1, T, H, D]` Q view (no host read — Rule 3), PackGQA
+composes (the row base is token-unit), and the split path is **mandatory**: the fp32
+partials stay dense in the workspace and `split_combine_sm100` places the recombined O
+/ Stats rows at their ragged offsets, skipping every row of a zero-length sequence. No
+THD setup launch, no per-sequence O descriptors. Same shape after: 23.6 / 73.5 us
+(device time incl. the 6–7 us combine) — the dense decode graph's 22.7 / 73.3 us — with
+bit-clean Stats. Contract: the native (128, 128) f16/bf16 flavor on cc10.0/10.3 (Rubin
+has no decode tile), `S_q(max) == 1`, page pools (a ragged K/V needs the prefill THD
+leg's clamped descriptors), ragged Stats when Stats are requested (a per-batch padded
+Stats has no ragged base), int32 **or** int64 offsets of one width whose multiplier
+divides the row (`engines._thd_decode_leg`), per-batch `seq_len_kv` (not the cu form),
+no sink, no gate. Twins: `engines._thd_decode_leg` / `SdpaFwdDslSm100.thd_decode_leg` /
+`config_sm100._validate_params(ragged_q)` / `CfgD128Decode.RAGGED_Q`. **Not yet:**
+MTP-THD (`S_q(max) > 1` needs the per-sequence Q length in the bottom-right diagonal —
+the prefill THD leg keeps it), ragged K/V (non-paged THD decode), d192×d128 / d256 /
+d512 ragged decode (their decode graphs keep the prefill THD leg), fp8.
 
 ᵖ **Paged KV (issue #920), f16/bf16 only, d128 / d192×d128 / d256 flavors**
 (`Capabilities.paged_d_shapes = {(128, 128), (192, 128), (256, 256)}`). The head-dim
@@ -308,6 +349,9 @@ the tile), Stats out, and **THD queries**: ragged Q/O (ragged offsets + `seq_len
 over the same pools — chunked prefill — with the THD scheduler walking the Q units (no
 KV split there), including top-left causal + a left window (on d192x128 that band takes
 the plain decode path: the predecoded THD+SWA scheduler is folded off under `PAGED_KV`).
+At `S_q(max) == 1` a ragged d128 f16/bf16 graph with ragged Stats instead rides the
+d128 decode tile's ragged-Q legʳᵠ (PackGQA + KV split + combine, the offsets read on
+device) — FlashInfer's prefill-style paged graph at one token per sequence.
 KV split is proposed on dense-Q paged graphs by the same wave-cost
 model as on dense graphs (they are padded by construction: the per-batch lengths bound
 the walk on device and the split composes with them; it pays when `B * H_kv` leaves
@@ -639,6 +683,7 @@ red (2026-09-08).
 | FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | MXFP8 | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ❌ |
 | O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ✅ | ❌ | ❌ | ❌ | — |
 | Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |

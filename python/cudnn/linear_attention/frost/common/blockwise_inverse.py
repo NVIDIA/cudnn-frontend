@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Blockwise inverse of the beta-folded chunk factor ``I + strict_lower(M)`` (b_t = 64, f16 SMEM tiles in the 128B
-XOR-swizzled U GEMM layout): the diagonal 8x8 Gauss-Jordan step, then the off-diagonal corrections 8 -> 16 -> 32 -> 64
-(``C <- -D^-1 C A^-1`` on mma.sync fragments).  Every step reads the raw block from ``raw_base`` / ``in_base`` and writes
-the inverse on ``base`` / ``out_base``; a kernel that inverts in place passes the same pointer twice.
-"""
+"""Blockwise inverse of the beta-folded chunk matrix ``I + strict_lower(M)``."""
 
 import cutlass
 import cutlass.cute as cute

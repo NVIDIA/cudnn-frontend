@@ -156,12 +156,17 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_co
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk,
+    apply_mask_chunk_form,
+    MASK_FORM_BITS,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
+# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
+MASK_FORM: str = MASK_FORM_BITS
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 2:
@@ -1693,7 +1698,7 @@ def _softmax_kv_body(
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
-            apply_mask_chunk(
+            apply_mask_chunk_form(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * CHUNK),
@@ -1705,6 +1710,7 @@ def _softmax_kv_body(
                 causal_diag=causal_diag,
                 mask_value=float("-inf"),
                 window_right=CFG.WINDOW_RIGHT,
+                form=MASK_FORM,
             )
             for c in range(N_CHUNKS)
         ]
@@ -2414,7 +2420,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -2685,7 +2691,7 @@ def compile(  # noqa: A001
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

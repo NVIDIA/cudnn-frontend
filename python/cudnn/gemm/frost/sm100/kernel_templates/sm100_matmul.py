@@ -24,7 +24,7 @@ Warp layout (8 warps × 32 = 256 threads/CTA):
   warp  6   : CLC scheduler (leader CTA issues queries; every CTA waits + reads + arrives empty)  — setmaxnreg.dec 40
   warp  7   : unused donor — setmaxnreg.dec 40
 
-FORKED BY ``sdpa/bwd/kernels/bprop_matmul_sm100.py``
+FORKED BY ``sdpa/bwd/kernels/bprop_matmul_blackwell.py``
 ----------------------------------------------------
 The SDPA backward's stage-3 gradient GEMMs need a 2-D ``(batch, head)`` batch:
 their operands are BSHD ``[B, S, H, D]``, so the batch element is the PAIR

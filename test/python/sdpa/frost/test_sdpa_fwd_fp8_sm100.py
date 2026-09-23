@@ -27,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -47,6 +47,12 @@ _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
 _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
+
+# Block-scaled O (sdpa_fp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d,
+# "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d. sf_o is declared either as
+# per-(b,h) planes or as the token-major matrix a GEMM consumes (see
+# api_dsl.SdpaFwdDsl._sf_o_geometry).
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
 
 
 class _ReferenceWithStats(NamedTuple):
@@ -68,6 +74,31 @@ class _RunWithStatsResult(NamedTuple):
     reference_amax: float
     stats: torch.Tensor
     reference_stats: torch.Tensor
+
+
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in scale_o units
+    reference: torch.Tensor  # fp32 reference O * scale_o
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
+
+
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int, in_key: str):
+    """Kernel dequant vs fp32 reference: within the fp8 pipeline tolerance plus
+    three times the pure block-quantization floor of the reference itself."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(_half_atol(in_key) * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S_q must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
 
 
 def _quant(x, in_key):
@@ -175,6 +206,9 @@ def _run(
     poison_tmem_before_execute: bool = False,
     gate: Optional[torch.Tensor] = None,
     amax: bool = True,
+    block_scaled_o=None,
+    sf_o_layout="planes",
+    scale_o=1.0,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -196,7 +230,14 @@ def _run(
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("the packed FP4 dtype (torch.float4_e2m1fn_x2) needs torch >= 2.8")
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype.
+        Ob = torch.full((B, S_q, H_q, d_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    else:
+        Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -205,7 +246,7 @@ def _run(
 
     # Reciprocal S scales: this kernel casts P unscaled, which is exact for any
     # reciprocal pair. s_descale_gain breaks the reciprocity to test the guard.
-    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(s_descale_gain / s_scale), sc(s_scale), sc(1.0)
+    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(s_descale_gain / s_scale), sc(s_scale), sc(scale_o)
 
     g = cudnn.pygraph(
         io_data_type=getattr(cudnn.data_type, _CUDNN_ITYPE[in_key]), intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT
@@ -233,14 +274,42 @@ def _run(
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(d_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S_q, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+        else:
+            # token-major: one [B*S_q (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S_q are caller-owned (pre-zeroed here).
+            R = S_q
+            sf_o_buf = torch.full((round_up(B * S_q, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S_q :] = 0
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        if sf_o_layout == "planes":
+            sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=[H_q * R * C, R * C, C, 1], data_type=sf_dtype)
+        else:
+            sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=[R * H_q * C, C, H_q * C, 1], data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
+    if blk == 16:
+        o_cudnn_dtype = cudnn.data_type.FP4_E2M1
+        o_dim = [B, H_q, S_q, d_v]
+        o_stride = [S_q * H_q * d_v, d_v, H_q * d_v, 1]
+    else:
+        o_cudnn_dtype = getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt])
+        o_dim, o_stride = list(Ob.shape), list(Ob.stride())
     if gate is not None:
         # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
-        o.set_dim(list(Ob.shape)).set_stride(list(Ob.stride()))
+        assert not blk, "the epilogue gate and a block-scaled O are separate flavors"
+        o.set_dim(o_dim).set_stride(o_stride)
         gate_t = g.tensor_like(gate)
         vp[gate_t] = gate
         o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
+    o.set_output(True).set_dim(o_dim).set_stride(o_stride).set_data_type(o_cudnn_dtype)
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     if amax:
@@ -261,6 +330,8 @@ def _run(
     vp[o] = Ob
     if amax:
         vp[amx_o] = amax_o
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     if stats:
         vp[stats_t] = lse
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -287,6 +358,14 @@ def _run(
     ref_kw = _ref_kwargs(sdpa_kwargs)
     if sink is not None:
         ref_kw["sinks"] = sink.flatten()
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times scale_o (what the kernel quantizes).
+        o_ref = _ref(Q8, K8, V8, dq, dk, dv, in_key, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kw)
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S_q, d_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * scale_o, amax_o.item(), o_ref.abs().max().item(), sf_pad_ok, scale_o)
 
     def _gated(o_ref):
         return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
@@ -335,8 +414,9 @@ def _half_atol(in_key, d_v=None):
     return 7.5e-2 if d_v == 256 else 4e-2
 
 
-def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = _half_atol(in_key, out.shape[-1])
+def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref, atol=None):
+    if atol is None:
+        atol = _half_atol(in_key, out.shape[-1])
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -423,7 +503,45 @@ def test_fp8_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
-@_skip_on_rubin
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@pytest.mark.L0
+@torch_fork_set_rng(seed=71)
+def test_fp8_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o): FP4 O + E4M3/16 scales, or E4M3 O + UE8M0/32
+    scales, on the d128 flavor. S_q = 300 exercises a partially valid tail tile
+    (per-plane pad rows must come back zero), B > 1 the plane / token-major row
+    bookkeeping, GQA the head -> plane mapping. Runs on the whole SM100 line: the
+    Rubin d128 per-tensor FP8 kernel carries the same epilogue (_D128_ARCH picks it)."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300,
+        256,
+        "e4m3",
+        torch.float8_e4m3fn,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+        scale_o=3.0 if mode == "nvfp4" else 1.0,
+    )
+    _check_block_scaled(res, blk, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=72)
+def test_fp8_block_scaled_output_declines_wide_flavor():
+    """sf_o is a d128-only epilogue: a d256 graph requesting it has no engine."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="nvfp4")
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
@@ -1134,7 +1252,10 @@ def test_fp8_pack_gqa_d192_d128_e5m2_sink():
     out, o_ref, a_o, a_ref = _run(
         2, 8, 2, 40, 256, "e5m2", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink, d_qk=192, d_v=128, pack_gqa=True
     )
-    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
+    # This path's residual against the P-cast reference is 0.044 on B200 (DSL 4.7 and 4.8), unchanged since
+    # #709 (0.050 under the previous reference); the shared e5m2 bound #971 tightened to 0.04 was set
+    # without this L1 case.
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref, atol=5e-2)
 
 
 @pytest.mark.L0
@@ -2035,3 +2156,101 @@ def test_fp8_gate_tail_graph_api(out_key):
     assert (
         pos.amax == neg.amax == no_gate.amax
     ), f"Amax_O must be G-independent and equal the no-gate graph's: +1e4 {pos.amax:.6f}, -1e4 {neg.amax:.6f}, none {no_gate.amax:.6f}"
+
+
+# ============================================================================ sm100 d128 per-tensor FP8: the exp2 MUFU / FMA split, pinned on the SASS per arch
+# The split (`sm100/prefill_d128_fp8.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
+# the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
+# SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
+# (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record
+# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT and the kernel is
+# develop's -- the gate-off cubin is md5-identical to develop's on both archs).  Compiled here for the target arch
+# (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
+_SM100_D128_FP8_SASS_PROBE = sass_probe_source("""
+    # The PRODUCTION geometry of the llama chart layer the split was measured on (B200, B=1 H=64/8 S=8K, E4M3 in /
+    # E4M3 out, Stats + Amax_O, cga2 from the adapter's own table); the per-arch field (exp2_fma_split) and the causal
+    # specialization (window_right / sched_policy) come from the caller as the record api_dsl.template_params() builds.
+    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True)
+    params = TemplateParams(dtype_qkv=0, dtype_o=0, cta_mma=cta_mma, qh_per_kh=8, emit_amax_o=True, **params_kw)
+    mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=True, rubin=False)
+    # MUFU.EX2 the kernel must carry: per traced softmax body one alpha exp2 plus the non-emulated columns; the body is
+    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm -- derived from
+    # the module, so the pin follows the pattern (and the gate) rather than a literal.
+    n_bodies = (2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1) * (2 if mod.CFG.MASK_FLAGS else 1)
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
+    print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    print("E2E_ENABLED", int(mod._E2E_ENABLED))
+    mod.compile(b=1, qh=64, kh=8, sq=8192, skv=8192, has_lse=True)
+    """)
+# The two specializations the breadth measurement covered: dense (NATURAL) and top-left causal (LPT_L2, the heuristics'
+# pick on both trees), as extra TemplateParams fields on top of the per-arch record.
+_D128_FP8_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}}
+# MEASURED 2026-09-22 on the trace-compiled cubins that are md5-IDENTICAL to the ones A/B'd on B200 (+4.53 % S=8K dense,
+# +2.4 % S=2K, +1.50 % S=32K, causal +0.26 % = noise).  Gate ON (sm_100a): dense MUFU.EX2 258 -> 194 (2 x 97), FFMA2
+# 130 -> 226, FADD2 126 -> 222 (+3 each per emulated pair), STL / LDL 3 / 3 unchanged; causal (masked + unmasked arm x 2
+# warpgroups) MUFU.EX2 516 -> 388 (4 x 97), FFMA2 260 -> 452, FADD2 252 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a,
+# cubin md5-identical to develop's): develop's counts exactly.  The MUFU count is pinned EXACTLY (derived from the
+# module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches one emulated pair falling
+# back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries are the counts of THIS
+# toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins read 1 / 1 under the CI
+# lane's 4.7.0 + 13.3 ptxas on develop and on the branch alike (frost_test_utils.SPILL_TOLERANCE).
+_D128_FP8_SASS_SLACK = 16
+_D128_FP8_ON_PINS = {
+    "dense": {"MUFU_EX2": 194, "FFMA2": 226, "FADD2": 222, "STL": 3, "LDL": 3},
+    "causal": {"MUFU_EX2": 388, "FFMA2": 452, "FADD2": 444, "STL": 0, "LDL": 0},
+}
+_D128_FP8_OFF_PINS = {
+    "dense": {"MUFU_EX2": 258, "FFMA2": 130, "FADD2": 126, "STL": 3, "LDL": 3},
+    "causal": {"MUFU_EX2": 516, "FFMA2": 260, "FADD2": 252, "STL": 0, "LDL": 0},
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("spec", sorted(_D128_FP8_SPECS))
+def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
+    """cc 10.0 record (exp2_fma_split=True, what api_dsl.template_params() builds for a d128 per-tensor FP8 build on a
+    B200): 32 of the 128 softmax columns are evaluated on the FMA pipe -- MUFU.EX2 == 2 x 97 (dense) / 4 x 97 (causal)
+    exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured counts minus slack;
+    no new spill (STL / LDL within SPILL_TOLERANCE of this toolchain's count).  Compiled for sm_100a at the chart-layer geometry."""
+    from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
+
+    assert _exp2_fma_split_for((10, 0), kind="fp8", flavor=(128, 128)) is True, "the cc 10.0 record must switch the split ON for this kernel"
+    probe = run_sass_probe(
+        tmp_path, probe_src=_SM100_D128_FP8_SASS_PROBE, arch="sm_100a", params={"exp2_fma_split": True, **_D128_FP8_SPECS[spec]}, tag=f"d128_fp8_{spec}"
+    )
+    pins = _D128_FP8_ON_PINS[spec]
+    assert probe.expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
+    assert probe.expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {probe.expect['EMULATED_COLS']}"
+    assert (
+        probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
+    ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
+    for key in ("FFMA2", "FADD2"):
+        assert probe.stats[key] >= pins[key] - _D128_FP8_SASS_SLACK, f"{key} {probe.stats[key]} < {pins[key]} - {_D128_FP8_SASS_SLACK}: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("spec", sorted(_D128_FP8_SPECS))
+def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
+    """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
+    Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (2 x 129
+    dense / 4 x 129 causal, derived from `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at
+    or below develop's plus slack) and no spill beyond develop's plus SPILL_TOLERANCE.  Compiled for sm_103a; skips where this cutlass-dsl has
+    no sm_103a."""
+    from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
+
+    assert _exp2_fma_split_for((10, 3), kind="fp8", flavor=(128, 128)) is False, "the cc 10.3 record must fold the split OUT"
+    probe = run_sass_probe(
+        tmp_path, probe_src=_SM100_D128_FP8_SASS_PROBE, arch="sm_103a", params={"exp2_fma_split": False, **_D128_FP8_SPECS[spec]}, tag=f"d128_fp8_{spec}"
+    )
+    pins = _D128_FP8_OFF_PINS[spec]
+    assert probe.expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert probe.expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {probe.expect['EMULATED_COLS']}"
+    assert (
+        probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
+    ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
+    for key in ("FFMA2", "FADD2"):
+        assert (
+            probe.stats[key] <= pins[key] + _D128_FP8_SASS_SLACK
+        ), f"{key} {probe.stats[key]} > {pins[key]} + {_D128_FP8_SASS_SLACK}: emulation instructions with the gate off: {probe.stats}"
+    assert_no_new_spills(probe.stats, pins, f"[{spec}] ")

@@ -854,6 +854,23 @@ def _sm_count() -> int:
     return _DEFAULT_SM_COUNT
 
 
+def _mma_inst_k64(sm_count: int) -> bool:
+    """Whether the TARGET silicon issues the 64-byte-K dense-FP8/block-scale MMA
+    (``kernel_registry.MMA_INST_K64_ARCH_RANGES``). When a device is active the
+    answer is the arch itself, so the gate is exactly the parts that have the
+    instruction and nothing else. Only when no device is present (the sweep's
+    CPU-only replay, which must stay a pure function of the arguments the
+    caller supplies) does it fall back to an ``sm_count`` proxy: every k64 part
+    measured so far has >= 190 SMs, every part without it has <= 188."""
+    from . import compiler as C
+    from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = C._current_arch()
+    if arch is not None:
+        return any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES)
+    return sm_count >= 190
+
+
 # Cluster shapes worth considering. 2-D shapes are included but, with the operand-reuse
 # term switched off (see _cluster_score), the scorer has so far never selected one.
 _CLUSTERS_1D = ((1, 1), (1, 2), (1, 4), (2, 1), (4, 1), (8, 1))
@@ -960,6 +977,17 @@ def select_config(
                 choices = wide
         tiles += [(tm, c) for c in choices]
     cta_m, cta_n = max(tiles, key=lambda t: _tile_score(rep_m, N, K, t[0], t[1], sm))
+    # On k64 silicon the 256-tall CTA pair (mma_tile_m 128, one pair per 512 M
+    # rows) wins the machine-filling dense layers in the sweep; the wave scorer
+    # cannot see that (its rep_m/cta_m prior always favors the shorter tile), so
+    # upgrade the picked geometry when the taller grid still fills the machine.
+    if plain and not m_is_group_average and b_elem_bytes == 1 and _mma_inst_k64(sm) and cta_m == 128:
+        pairs = -(-M // 512)
+        # Fill the machine and keep the pair-row padding small: a ragged M
+        # (e.g. 1031 -> 1536 padded rows) hands the taller tile a third of its
+        # work back as waste, and the sweep shows those layers regressing.
+        if 2 * pairs * (-(-N // cta_n)) >= sm and pairs * 512 <= M + M // 16:
+            cta_m = 256
 
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
     # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
@@ -1020,11 +1048,20 @@ def select_config(
     def _launched(g: tuple[int, int]) -> int:
         return (-(-m_tiles // g[0])) * g[0] * (-(-n_tiles // g[1])) * g[1]
 
-    prefer = ((cta_group, 4),)
+    prefer = ((2, 1), (2, 4)) if cta_m == 256 else ((cta_group, 4),)
     rank = {g: len(prefer) - i for i, g in enumerate(prefer)}
     cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), -_launched(g), rank.get(g, 0)))
 
-    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
+    # The 64-byte-K MMA halves the mainloop instruction count and measures
+    # faster at the same DENSE-fp8 geometry on every part that issues it, so it
+    # is not scored -- it is taken whenever measured-safe: 1-byte
+    # operands, a 128-tall CTA in a pair (the swept k64 envelope). Block-scale
+    # keeps its width decision in kernel_registry.preferred_mma_tile_k_bytes --
+    # at the geometry picked here the sweep shows k64 HURTING a third of the
+    # block-scale layers, so nothing is forced from this side.
+    mma_kb = 64 if (not block_scale and b_elem_bytes == 1 and cta_m >= 128 and cta_group == 2 and _mma_inst_k64(sm)) else 32
+    mma_m = min(cta_m, 128)
+    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{mma_m}x{cta_n}x{mma_kb}_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
     return by_name(name)
 
 

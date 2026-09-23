@@ -16,6 +16,7 @@ channel, then combines their FP32 sums through shared memory.
 """
 
 from __future__ import annotations
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -307,7 +308,7 @@ def _reduce_dweight_vec4_partials_kernel(
         for tap in cutlass.range_constexpr(_WIDTH):
             accum[tap] = accum[tap] + values[tap]
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     split_partials = smem.allocate_tensor(
         cutlass.Float32,
         cute.make_layout(
