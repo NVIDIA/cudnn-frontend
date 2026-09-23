@@ -256,7 +256,7 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     TemplateParams template with no standalone entry point)."""
     try:
         from cudnn.sdpa.bwd import api_dsl as api_sm80
-        from cudnn.sdpa.bwd.kernels import bprop_d64_f16_sm80 as d64
+        from cudnn.sdpa.bwd.kernels.sm80 import bprop_d64_f16 as d64
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
