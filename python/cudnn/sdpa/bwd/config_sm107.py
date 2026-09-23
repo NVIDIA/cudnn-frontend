@@ -1173,6 +1173,14 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     dtype_ds = DTYPE_BF16 if is_fp8 else params.dtype_qkv
     mask_flags = _mask_flags_from(params)
     tile_k_hw = 64 if is_fp8 else 16
+    # Service-warp (MMA / TMA-LDG / TMA-STG / scheduler) register count.  The pre-port bodies ran at 40.
+    # f16: 48 -- at 40 the MMA warp is exactly at the allocation edge on sm_107a (2026-09-23: the bf16
+    # builds spill ONE 4-byte slot, the per-thread shared-storage base the sleeping wait-retry loops
+    # reload, 1 STL / 8-11 LDL; the fp16 build fits) and 48 clears it.  8 x 232 + 4 x 48 = 2048 is the
+    # whole register file (65536 / 32), which the budget predicate admits at equality; the entry
+    # allocation (168 / thread at .reqntid 384 = 64512) plus the four DEALLOCs frees exactly the
+    # 8 x 32 x 64 the softmax ALLOC needs.  fp8: keeps the pre-port 40 until its own port measures.
+    service_regs = 40 if is_fp8 else 48
     cfg = CfgBwdD256(
         TILE_M=128,
         TILE_N=128,
@@ -1214,11 +1222,11 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         CORRECTION_WARPS=0,
         SOFTMAX_REGS=232,
         CORRECTION_REGS=0,
-        MMA_REGS=40,
-        TMALDG_REGS=40,
-        TMASTG_REGS=40,
-        SCHEDULER_REGS=40,
-        OTHER_REGS=40,
+        MMA_REGS=service_regs,
+        TMALDG_REGS=service_regs,
+        TMASTG_REGS=service_regs,
+        SCHEDULER_REGS=service_regs,
+        OTHER_REGS=service_regs,
         MASK_FLAGS=mask_flags,
         SWA_WINDOW=params.window_left or 0,
         CAUSAL_BOTTOM_RIGHT=int(params.bottom_right),

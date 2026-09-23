@@ -179,11 +179,12 @@ def test_rejects_an_unknown_family():
 
 _SHARED_CFG_REJECTS = [
     # register split
-    (dict(MMA_REGS=48), r"MMA/TMALDG/TMASTG/SCHEDULER regs must be equal"),
-    (dict(SOFTMAX_REGS=240), r"register budget 2080 over 2048"),
+    # 56: distinct from BOTH families' service count (f16 48, fp8 40), so only the equality predicate fires
+    (dict(MMA_REGS=56), r"MMA/TMALDG/TMASTG/SCHEDULER regs must be equal"),
+    (dict(SOFTMAX_REGS=240), r"register budget (2112|2080) over 2048"),  # f16 8x240+4x48 / fp8 8x240+4x40
     (dict(SOFTMAX_REGS=228), r"multiple of 8"),
     (dict(MMA_REGS=16, TMALDG_REGS=16, TMASTG_REGS=16, SCHEDULER_REGS=16, OTHER_REGS=16), r"within 24\.\.256"),
-    (dict(OTHER_REGS=48), r"OTHER_REGS.*must equal MMA_REGS"),
+    (dict(OTHER_REGS=56), r"OTHER_REGS.*must equal MMA_REGS"),
     # warp population + scheduler ring
     (dict(SOFTMAX_WARPGROUPS=1), r"8 compute warps in 2 warpgroups of 4"),
     (dict(TOTAL_WARPS=16), r"TOTAL_WARPS must be compute \+ correction \+ 4"),
@@ -381,8 +382,11 @@ def test_scheduler_arrivers_and_warp_layout(family):
     assert cfg.READ_TILE_ARRIVERS_TOT == read_tile_arrivers_tot(cfg) == 21 == 2 * (8 + 2) + 1
     assert (cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA) == (12, 384)
     assert (cfg.SOFTMAX_WG0_BASE, cfg.SOFTMAX_WG1_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.TMASTG_WARP_ID, cfg.SCHED_WARP_ID) == (0, 4, 8, 9, 10, 11)
-    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.OTHER_REGS) == (232, 40, 40)
-    assert 8 * cfg.SOFTMAX_REGS + 4 * cfg.MMA_REGS == 2016 <= cfgmod.REG_BUDGET_PER_CTA
+    # Service warps: f16 48 (the 40-register MMA warp spilled one slot on the bf16 sm_107a builds; 48 fills the register
+    # file exactly), fp8 the pre-port 40 until its own port measures.
+    service = 48 if family == FAMILY_F16 else 40
+    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.OTHER_REGS) == (232, service, service)
+    assert 8 * cfg.SOFTMAX_REGS + 4 * cfg.MMA_REGS == 8 * 232 + 4 * service <= cfgmod.REG_BUDGET_PER_CTA
     assert (cfg.SOFTMAX_WG_LANES, cfg.SOFTMAX_LANES, cfg.SOFT_X_CTA_MMA, cfg.MMA_COMMIT_ARRIVES) == (128, 256, 512, 1)
 
 
