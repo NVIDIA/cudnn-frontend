@@ -64,6 +64,11 @@ CFG, _TMA = make_cfg_d192(PARAMS)
 # passes it, no other sm100 kernel passes the kwarg) and the module value per specialization.
 PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
 
+if PARAMS.paged_kv:
+    # config_sm100._PAGED_KV_FLAVORS names "d192" for the f16/bf16 kernel; this file has no PAGED_KV specialization.
+    raise ValueError(
+        "prefill_d192_d128_mxfp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d192_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 Cfg = type(CFG)
 # LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
 # cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software

@@ -223,6 +223,18 @@ def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
 
+# Paged compile key: the paged kernels IGNORE compile-time ``skv`` (the KV
+# maximum is ``block_table.shape[1] * page_size``, a dynamic extent the host
+# entry point reads off the bound table), yet the argument keys BOTH the
+# kernel module's compile() lru_cache and the persistent template key.  The
+# adapter hands the paged fp8 branch this one value instead of the plan's
+# logical ``paged_attention_max_seq_len_kv``, so otherwise identical plans
+# declaring different maxima (96, 128, ...) share one compiled artifact (Rule 4
+# across plans).  Dense keys keep the real S_kv: their K/V TMA extents are
+# compiled from it.  execute() still passes the plan's real maximum in the
+# runtime problem_size tuple, where the kernel overrides it for paged KV.
+_PAGED_COMPILE_SKV = 0
+
 # Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
 # family has a dedicated d512 flavor above the general template's head range.
 _SM120_KERNEL_FILES = {
@@ -1913,10 +1925,34 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
         )
         if self.paged:
-            # Paged KV rides the f16/bf16 kernels' PAGED_KV specialization on
-            # the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
-            # its _validate_params backstops, and engines' paged_d_shapes).
-            self._not_implemented_error_if(self._fp8, "paged KV is served by the f16/bf16 kernel only")
+            # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
+            # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
+            # its _validate_params backstops, and engines' paged_d_shapes) and of
+            # the d128 per-tensor FP8 kernel; every kernel file without it (MXFP8,
+            # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
+            # with a module-scope guard on paged_kv, and these declines keep that
+            # guard unreachable from here.
+            self._not_implemented_error_if(self._device_cc == (10, 7), "paged KV is not wired on the SM107 sibling kernels (SM100 line only)")
+            self._not_implemented_error_if(
+                self._fp8 and not self._pertensor,
+                "paged KV is not wired for MXFP8 (the F8_128x4 block-scale atoms bundle 128 rows of one head and cannot be assembled from sub-tile pages)",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and self.thd,
+                "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and self.has_sink,
+                "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and self.o_block_scale > 0,
+                "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and self.flavor != (128, 128),
+                f"paged KV for per-tensor FP8 is wired on the d128 flavor only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+            )
             self._not_implemented_error_if(
                 f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,  # config_sm100 tags flavors by d_qk (d192 = the d192x128 kernel)
                 f"paged KV is wired on the {sorted(_SM100_PAGED_KV_FLAVORS)} flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
@@ -2426,6 +2462,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # Both fp8 flavor kernels take these; MXFP8 is exact-native
                 # (gated in check_support) and takes no head-dim parameters.
                 fp8_kwargs.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
+                if self.paged:
+                    # Paged KV (d128 flavor): the pools are bound as declared —
+                    # their strides in the kernel's [num_pages, page_size, H_kv,
+                    # D] order (the container's head/row axes swapped); num_pages
+                    # / max_pages are dynamic extents of the artifact (Rule 4), and
+                    # the logical KV maximum leaves the key (_PAGED_COMPILE_SKV).  (The
+                    # f16/bf16 kernels bind their pools at run time through the pointer
+                    # ABI; this tensor-ABI kernel compiles the strides in.)
+                    fp8_kwargs.update(
+                        k_stride=self._paged_pool_stride(self.k_desc),
+                        v_stride=self._paged_pool_stride(self.v_desc),
+                        block_table_stride=self.paged_table_stride,
+                        block_table_v_stride=self.paged_table_v_stride,
+                        skv=_PAGED_COMPILE_SKV,
+                    )
             # Declared zero-copy strides (Rubin d256 only, see above), the
             # epilogue gate's declared strides and the amax fold-out -- each
             # only when the selected kernel's compile() carries the keyword.
@@ -2776,6 +2827,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 got = tuple(bt.stride())
                 if any(g != w for g, w, n in zip(got, want, bt.shape) if n != 1):
                     raise ValueError(f"paged KV: {name} strides {got} do not match the declared table strides {want}")
+            # The kernel compiles both tables on ONE dynamic page-axis extent and
+            # reads its KV maximum from block_table: decline a mismatch here, by
+            # name, rather than let the compiled callable's argument check raise
+            # (the graph path declines it in graph_analyzer).
+            if block_table_v.shape[1] != block_table.shape[1]:
+                raise ValueError(
+                    f"paged KV: block_table and block_table_v must have the same page-axis extent; got {block_table.shape[1]} vs {block_table_v.shape[1]}"
+                )
             for name, t, d in (("k_tensor", k_tensor, self.k_desc), ("v_tensor", v_tensor, self.v_desc)):
                 if tuple(t.shape) != tuple(d.shape) or tuple(t.stride()) != tuple(d.stride):
                     raise ValueError(
@@ -2883,6 +2942,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     workspace=workspace,
                     gate=gate,
                     sf_o=sf_o,
+                    block_table=block_table,
+                    block_table_v=block_table_v,
                 )
             return
 
@@ -3709,6 +3770,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         current_stream=None,
         workspace=None,
         gate=None,
+        block_table=None,
+        block_table_v=None,
         sf_o=None,
     ):
         """Per-tensor FP8 execute: scalar descales fold into scale_softmax_log2
@@ -3818,8 +3881,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # compact-view-or-copy behaviour), mirroring the dense half path.
         _decl = getattr(self, "_bshd_declared", (None, None, None, None))
         Q = self._to_bshd(q_tensor, _decl[0])
-        K = self._to_bshd(k_tensor, _decl[1])
-        V = self._to_bshd(v_tensor, _decl[2])
+        if self.paged:
+            # Page pools [num_pages, H_kv, page_size, D] -> the kernel's
+            # [num_pages, page_size, H_kv, D] view; the strides carry HND/NHD
+            # and were compiled in, so this is a view, never a copy (Rule 2:
+            # _to_bshd's .contiguous() fallback would gather the whole cache
+            # per execute on an HND pool).
+            K = k_tensor.permute(0, 2, 1, 3)
+            V = v_tensor.permute(0, 2, 1, 3)
+        else:
+            K = self._to_bshd(k_tensor, _decl[1])
+            V = self._to_bshd(v_tensor, _decl[2])
         o_decl = _decl[3]
         if self.o_block_scale == 16:
             # FP4 O arrives as its byte container ((B, H, S, d/2) in
@@ -3837,6 +3909,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Epilogue gate (bf16, O's shape): a view at the compiled strides, never a copy.
         G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
         sf_o_kwargs = self._sf_o_kernel_kwargs(sf_o, device) if self.o_block_scale else {}
+        # Trailing paged block tables: the two slots after o_partial_f32, ahead of
+        # the block-scaled O group; omitted entirely on dense builds (which
+        # None-specialize them or end before them).
+        paged_kwargs = {"block_table_tensor": block_table, "block_table_v_tensor": block_table_v} if self.paged else {}
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -3896,6 +3972,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # kernel's _host, after `stream`; absent on ungated builds.
             **({"gate_tensor": G} if G is not None else {}),
             **sf_o_kwargs,
+            **paged_kwargs,
             stream=current_stream,
         )
         if self.split_kv > 1:

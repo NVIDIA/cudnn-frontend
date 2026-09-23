@@ -73,6 +73,10 @@ CFG, _TMA = make_cfg_d128(PARAMS)
 # every site passes it), the module value per specialization, and the sm_100a BSSY / SYNCS.ARRIVE counts of both.
 PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
 
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d128_mxfp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
 Cfg = type(CFG)
