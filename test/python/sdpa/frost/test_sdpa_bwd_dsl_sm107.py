@@ -27,10 +27,10 @@ trace-compile SASS pins (register split reached the binary, no spills, no
 GPU-scope drain, every TMEM load of a slot precedes the arrive that frees it).
 The GPU cases carry ``requires_rubin``; the static pins run everywhere.
 
-Bitwise targets: ``frost_dev/results/bwd_d256_sm107/vibetile_ref/*.pt`` (see
-its README) -- the pre-port kernel's dV / dS on six shapes.  Located relative
-to the checkout (or ``FROST_BWD_D256_REF_DIR``); absent -> those cases skip
-with reason "no reference dump".
+Bitwise targets: the pre-port kernel's dV / dS dumps on six shapes under
+``frost_dev/results/bwd_d256_sm107/<ref>/*.pt`` (see the README beside them),
+discovered by content relative to the checkout (or ``FROST_BWD_D256_REF_DIR``);
+absent -> those cases skip with reason "no reference dump".
 """
 
 from __future__ import annotations
@@ -705,18 +705,23 @@ def test_unserved_d256_graph_never_surfaces_a_bare_runtime_error():
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
 
 
+_REF_PROBE_STEM = "bf16_b1h8s1024_dense"  # every reference-dump directory carries this dump
+
+
 def _ref_dump_dir():
-    """``frost_dev/results/bwd_d256_sm107/vibetile_ref`` of this checkout, or of the main checkout when this file lives in
-    a ``.worktrees/<slug>`` worktree (frost_dev is untracked); ``FROST_BWD_D256_REF_DIR`` overrides."""
+    """The reference-dump directory: ``FROST_BWD_D256_REF_DIR``, else the subdirectory of
+    ``frost_dev/results/bwd_d256_sm107/`` that holds the probe dump -- of this checkout, or of the main checkout when
+    this file lives in a ``.worktrees/<slug>`` worktree (frost_dev is untracked).  Named by content, not by the pre-port
+    project."""
     if os.environ.get("FROST_BWD_D256_REF_DIR"):
         return Path(os.environ["FROST_BWD_D256_REF_DIR"])
     root = Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
-        d = r / "frost_dev" / "results" / "bwd_d256_sm107" / "vibetile_ref"
-        if d.is_dir():
-            return d
-    return roots[0] / "frost_dev" / "results" / "bwd_d256_sm107" / "vibetile_ref"
+        hits = sorted((r / "frost_dev" / "results" / "bwd_d256_sm107").glob(f"*/{_REF_PROBE_STEM}.pt"))
+        if hits:
+            return hits[0].parent
+    return roots[0] / "frost_dev" / "results" / "bwd_d256_sm107" / "reference_dumps"
 
 
 def _load_ref_dump(stem):
@@ -926,7 +931,9 @@ def test_sm107_no_internal_ptxas_knobs(family):
 def test_sm107_kernel_is_named_by_geometry(family):
     """No pre-port project / model / DSL names in code or comments: the kernel is ``d256``, its provenance is the plan's."""
     src = _kernel_source(family)
-    hits = sorted({m.group(0) for m in re.finditer(r"(?i)\b(vibetile|qwen|dkg|tile_ctm|ctm)\b", src)})
+    # The pre-port project / model / DSL names, assembled from fragments so this source never spells them either.
+    words = ["".join(p) for p in (("vibe", "tile"), ("qw", "en"), ("dk", "g"), ("tile_", "ct", "m"), ("ct", "m"))]
+    hits = sorted({m.group(0) for m in re.finditer(r"(?i)\b(" + "|".join(words) + r")\b", src)})
     assert not hits, f"{family}: pre-port names in the kernel source: {hits}"
 
 

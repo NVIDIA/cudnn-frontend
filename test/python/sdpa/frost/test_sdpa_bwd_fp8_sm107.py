@@ -18,8 +18,9 @@ assert the decline through the row's own ``mismatch()`` on REAL graphs with a
 faked cc 10.7 device.  The two graph-admission cases of the bring-up
 placeholder are kept (Rubin only).  The host-only static and sm_107a SASS pins
 of this row's kernel body live in ``test_sdpa_bwd_dsl_sm107.py`` (both bodies,
-one machinery); the kernel-vs-kernel bitwise targets are the
-``frost_dev/results/bwd_d256_sm107/vibetile_ref/fp8_*.pt`` dumps.
+one machinery); the kernel-vs-kernel targets are the pre-port kernel's
+``fp8_*.pt`` dumps under ``frost_dev/results/bwd_d256_sm107/<ref>/`` (located by
+the half suite's ``_ref_dump_dir``).
 """
 
 from __future__ import annotations
