@@ -16,6 +16,8 @@ run them:
 
 - `configs/` - Benchmark configuration files
   - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
+  - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640; 2x / uncompressed pools, same per-query gather as V4), 2k..32k
+  - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
 - `runner.py` - Configuration-based benchmark runner (one subprocess per case)
 - `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
 - `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
@@ -86,6 +88,24 @@ gives logical `K = 640` / `1152` with `indexer_topk = 512` / `1024` (the
 indexer-selected prefix whose LSE the forward kernel also emits). Heads: 64
 (Flash) / 128 (Pro). Sequence lengths 2k, 4k, 8k, 16k, 32k with `s_q == s_kv`;
 every query gathers the full top-k, i.e. the per-token upper bound.
+
+`deepseek_v41` (`configs/deepseek_v41.py`): V4.1-Flash keeps the V4 sparse
+core — H=64, shared d=512 record, 512 indexer-selected entries plus the
+128-token window, sink — and changes the pool the indexer selects from:
+2x-compressed (layers 2-19) or uncompressed raw tokens (layers 20-39), with
+the KV record and index picks produced by a few source layers and reused by
+the layers after them. The per-query gather is unchanged, so the preset is
+`K = 640`, `indexer_topk = 512`. Only a Flash checkpoint is published.
+
+`glm53` (`configs/glm53.py`): GLM-5.3 (GLM-5.2's architecture) runs
+V3.2-style DSA on the MLA latent — the absorbed query attends a 576-wide
+shared record (512 KV latent + 64 RoPE) and reads the 512 latent channels
+back as V; token top-2048, no window fold, no sink, so `indexer_topk = 0`
+(the plain LSE is the indexer's teacher signal). `glm53_flash` is the hybrid
+sibling (11 of 45 layers are sparse, the rest KDA): NoPE MLA, so the record
+is 512 wide; its indexer scores 4-token pools and selects 512 of them =
+2048 raw tokens, always adding the incomplete tail pool (<= 3 tokens, left
+out of the round 2048).
 
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
