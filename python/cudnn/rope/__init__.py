@@ -6,6 +6,8 @@
 from importlib import import_module
 
 _EXPORT_MODULES = {
+    "TailRoPEForward": ".tail",
+    "tail_rope": ".tail",
     "VisionRoPEBackward": ".api",
     "vision_rope_backward_wrapper": ".api",
     "RopeQDQInplace": ".qdq",

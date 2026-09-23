@@ -413,6 +413,39 @@ def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
 
 
 @pytest.mark.L0
+def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
+    """sm100 d128 MXFP8, causal: the FIRST proposed policy is plain LPT and LPT_L2 stays in the ranking as the
+    autotune runner (MEASURED on B200, 2026-09-22: LPT over the L2-budget arm's LPT_L2 +4.3..+10.4 % on six shapes,
+    GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
+    an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
+    still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
+    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.heuristics import _sched_points
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    mx_name, fp8_name = engines.engine_name(mxfp8=True), engines.engine_name(fp8=True)
+    quant = dict(s_q=8192, h_q=24, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16)
+    for h_kv in (8, 24):  # GQA 3 and no GQA, both measured
+        mx = _facts(is_mxfp8=True, h_kv=h_kv, **quant)
+        assert engines.effective_sched_policies(caps[mx_name], mx) == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), "domain unchanged"
+        assert _sched_points(caps[mx_name], mx) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], h_kv
+        plans = recommend("A", mx, {mx_name: 20510})
+        assert (plans[0].knobs.split_kv, plans[0].knobs.sched_policy) == (1, SCHED_LPT), plans[0].knobs
+        assert SCHED_LPT_L2 in {p.knobs.sched_policy for p in plans}, "LPT_L2 must stay an autotune runner"
+        # The measured no-change: the per-tensor FP8 d128 row keeps the L2-budget arm (2 MiB per head here).
+        fp8 = _facts(is_fp8=True, h_kv=h_kv, **quant)
+        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
+        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT_L2
+    # Scope: d128 only, SM100 row only, causal only.
+    assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
+
+
+@pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler():
     name = engines.engine_name(mxfp8=True)
     offered = {name: 20510}
