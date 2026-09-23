@@ -2684,6 +2684,7 @@ def test_wrappers_normalise_layouts_the_plan_declines(monkeypatch):
     assert actual_grads["dk_tensor"].is_contiguous() and actual_grads["dv_tensor"].is_contiguous()
 
 
+@pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 def test_hstu_attention_forward_staging_outlives_the_released_original():
     """R1 staging: the wrapper clones a non-native q on an explicit side stream and records the
