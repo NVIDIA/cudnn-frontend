@@ -39,7 +39,7 @@ _DTYPE_IDS = ("bf16", "fp16")
 
 
 def test_stage3_compile_cache_is_arch_specific(monkeypatch):
-    import cudnn.sdpa.bwd.kernels.bprop_matmul_sm100 as stage3
+    import cudnn.sdpa.bwd.kernels.bprop_matmul_blackwell as stage3
 
     options = []
     capabilities = {

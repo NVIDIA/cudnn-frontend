@@ -19,7 +19,7 @@ import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 
 from cudnn.sdpa.bwd.config_sm120 import ROW_ROUND
-from cudnn.sdpa.bwd.kernels._common_sm120 import (
+from cudnn.sdpa.bwd.kernels.sm120._common import (
     _COPY_ELEMS,
     _LOG2E,
     ceil_div,
