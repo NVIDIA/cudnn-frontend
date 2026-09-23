@@ -658,13 +658,17 @@ def preferred_pipeline(chain: FusionChain) -> str:
 
 
 def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
-    """MMA-inst K width the auto path should build ``chain`` with. The 64-byte
-    block-scale MMA halves the instruction count at a wide tile, so take it
-    whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
-    asks the arch and not the config family. Everything else stays at 32."""
+    """MMA-inst K width the auto path should build ``chain`` with: 64 bytes for
+    DENSE fp8 x fp8 on the parts that issue the wide MMA (validated pick-by-pick
+    on silicon), 32 everywhere else. Block-scale no longer takes the 64-byte
+    re-target: at the heuristic's own tile geometries the swept 32B/64B pairs
+    measure MIXED (as many >2% regressions as wins, with a tail past +25%
+    runtime), and both production picks the re-target visibly changed in the
+    weekly sweep regressed, so the analytic pick keeps the 32B form it was
+    scored for."""
     mm = chain.matmul
     dense_fp8 = mm.a_dtype.startswith("fp8_") and mm.b_dtype.startswith("fp8_")
-    if not dense_fp8 and classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
+    if not dense_fp8:
         return 32
     from . import compiler as C
 
