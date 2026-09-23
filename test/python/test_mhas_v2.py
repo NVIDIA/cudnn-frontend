@@ -397,9 +397,18 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
     graph.select_plan(backend_plans[0])
     graph.check_support()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
-    # NVBug 6813175 (native ragged s_q == 1 decode codegen failed NVRTC on the Rubin-ranked plan, cuDNN 9.26 GA
-    # through 9.28.0.12): fixed in the 9.28.0.13 nightly, where the strict xfail that guarded it XPASSed on every
-    # SM107 id (pipeline 69411352), so the marker is retired and the plan must build everywhere.
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1 and cudnn.backend_version() < 92800:
+        # NVBug 6813175: the native ragged s_q == 1 decode codegen fails NVRTC on the Rubin-ranked plan on
+        # cuDNN 9.26 / 9.27. Fixed in the 9.28.0.13 nightly (the strict marker XPASSed on every SM107 id,
+        # pipeline 69411352): 9.28+ must build it -- backend_version() cannot tell .12 from .13, so the
+        # floor is the release line, not the build.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                raises=cudnn.cudnnGraphNotSupportedError,
+                reason="Rubin ranks the native ragged-decode plan first and it fails NVRTC on cuDNN 9.26/9.27 (NVBug 6813175)",
+            )
+        )
     graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
