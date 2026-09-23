@@ -74,7 +74,7 @@ documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
 so S and dS go to a GMEM workspace and the gradients are three batched GEMMs
-over it (`do_dot` → `bprop_d512_f16_sm100` → `bprop_matmul_sm100`). Two
+over it (`do_dot` → `sm100/bprop_d512_f16` → `bprop_matmul_blackwell`). Two
 consequences a user can see: the workspace is `2·B·H_chunk·S_q·S_kv·2 B` (the
 host loops over head chunks to hold it under 4 GiB; under THD it is
 `2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ʰ), and everything in the band

@@ -833,8 +833,8 @@ def _sm100_spec() -> EngineSpec:
     another 512, plus the S/dS accumulators -- against 512 per CTA.
 
         stage 1  do_dot = rowsum(dO * O)          (shared with the sm120 chain)
-        stage 2  S and dS workspaces              bprop_d512_f16_sm100.py
-        stage 3  dV = S^T.dO, dK = dS^T.Q, dQ = dS.K   bprop_matmul_sm100.py
+        stage 2  S and dS workspaces              sm100/bprop_d512_f16.py
+        stage 3  dV = S^T.dO, dK = dS^T.Q, dQ = dS.K   bprop_matmul_blackwell.py
 
     ``d`` is an ENVELOPE: the kernel's tiles are fixed at 512 and a smaller head
     dim rides the TMA descriptors' real extent, whose overshoot is HW
