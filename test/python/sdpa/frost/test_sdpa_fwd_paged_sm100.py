@@ -1787,7 +1787,8 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
     3 / 4 / 3 pages) -- share ONE compiled artifact: the second and third compile() add no
     miss to the template's compile cache and return the same callable. Eligible dense D128
     fp8-to-half plans use the prepared pointer entry: 96 / 128 / 96 share its artifact and
-    do not touch the legacy tensor-entry compile cache."""
+    do not touch the legacy tensor-entry compile cache. Each dense plan executes and
+    checks O/LSE against its own extent, including the extra KV tail at 128."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P = 3, 8, 2, 32
@@ -1826,12 +1827,27 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
         assert api._compiled_kernel is first._compiled_kernel, max_kv
 
     def dense_plan(s_kv):
-        kv = torch.zeros(B, s_kv, KH, D, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
+        generator = torch.Generator(device=dev).manual_seed(1847 + s_kv)
+        k = (torch.randn(B, s_kv, KH, D, device=dev, generator=generator) * 0.5).to(torch.float8_e4m3fn).transpose(1, 2)
+        v = torch.randn(B, s_kv, KH, D, device=dev, generator=generator) * 0.5
+        # A distinct final tile makes a stale 96-key binding visible at extent 128.
+        v[:, 96:] += 2.0
+        v = v.to(torch.float8_e4m3fn).transpose(1, 2)
         api = SdpaFwdDslSm100(
-            sample_q=q_gpu, sample_k=kv, sample_v=kv, sample_o=o_gpu, sample_lse=lse, seq_kv_lens_present=True, pertensor_fp8=True, dtype_o=torch.float16
+            sample_q=q_gpu, sample_k=k, sample_v=v, sample_o=o_gpu, sample_lse=lse, seq_kv_lens_present=True, pertensor_fp8=True, dtype_o=torch.float16
         )
         api.check_support()
         api.compile()
+        lens = torch.tensor([s_kv, s_kv - 17, s_kv - 32], device=dev, dtype=torch.int32)
+        workspace = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        o_gpu.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        api.execute(q_gpu, k, v, o_gpu, lse_tensor=lse, seq_kv_lens=lens, workspace=workspace)
+        scores = q_gpu.double() @ k.double().repeat_interleave(H // KH, 1).transpose(-1, -2) / math.sqrt(D)
+        scores.masked_fill_(torch.arange(s_kv, device=dev)[None, None, None, :] >= lens[:, None, None, None], float("-inf"))
+        ref_o = scores.softmax(-1) @ v.double().repeat_interleave(H // KH, 1)
+        _check_fp8_o(o_gpu.float(), ref_o.float(), torch.float16, in_key)
+        torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=5e-3, rtol=0)
         return api
 
     dense_96 = dense_plan(96)
