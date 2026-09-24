@@ -329,8 +329,9 @@ def _decline_reason(monkeypatch, engine=_ENGINE, cc=_RUBIN_CC, **kw):
         dict(hq=16, hkv=1),
         dict(sq=500, skv=500),
         dict(sq=768, skv=1280),
+        dict(sq=500, skv=1024, use_causal_mask_bottom_right=True),
     ],
-    ids=["dense-bf16", "dense-fp16", "default-scale", "causal", "bottom-right", "swa", "gqa-r4", "mqa-r16", "non-tile-S", "768x1280"],
+    ids=["dense-bf16", "dense-fp16", "default-scale", "causal", "bottom-right", "swa", "gqa-r4", "mqa-r16", "non-tile-S", "768x1280", "bottom-right-ragged-sq"],
 )
 def test_served_graph_passes_the_row_probe(monkeypatch, kw):
     """Sanity for the reject tests, and the host-side half of every accept claim: the row's probe admits each graph the
@@ -579,6 +580,16 @@ def test_causal_bottom_right_rectangular():
 
 
 @requires_rubin
+def test_causal_bottom_right_ragged_s_q():
+    """Bottom-right with S_q NOT a multiple of the q tile: the diagonal is ``S_kv - S_q`` in REAL rows (1024 - 500 = 524,
+    not 1024 - 512).  The f16 body takes ``sq_real`` (``SQ_REAL`` in its problem_size) and the adapter passes
+    ``self.s_q_max``, so this row serves it; the fp8 row DECLINES the same shape (its body has no ``seqlen_q_real`` --
+    ``test_sdpa_bwd_fp8_sm107.py::test_reject_bottom_right_with_ragged_s_q``).  This case is what keeps the two rows'
+    claims honest in opposite directions."""
+    _run(b=1, hq=2, sq=500, skv=1024, keep=_causal_keep(500, 1024, bottom_right=True), use_causal_mask_bottom_right=True).check()
+
+
+@requires_rubin
 def test_sliding_window():
     _run(keep=_causal_keep(512, 512, left=256), use_causal_mask=True, diagonal_band_left_bound=256).check()
 
@@ -783,9 +794,10 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
         dict(hq=8, hkv=2, sq=256, skv=256),
         dict(sq=500, skv=500, is_causal=True, window_size_left=256),
         dict(b=1, hq=4, hkv=2, sq=512, skv=1024, is_causal=True, causal_bottom_right=True),
+        dict(b=1, hq=2, sq=500, skv=1024, is_causal=True, causal_bottom_right=True),
         dict(sq=257, skv=129),
     ],
-    ids=["dense", "fp16", "gqa", "swa-padded", "br-rect", "257x129"],
+    ids=["dense", "fp16", "gqa", "swa-padded", "br-rect", "br-ragged-sq", "257x129"],
 )
 def test_half_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_build(kw):
     """The adapter's check_support admits every graph the row claims, and its workspace is a pure function of the

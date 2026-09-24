@@ -1196,7 +1196,8 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     # then spill ONE 4-byte slot in the 40-register MMA warp (the per-thread shared-storage base the sleeping
     # wait-retry loops reload: 1 STL / 8-11 LDL on sm_107a; the fp16 build fits).  f16 therefore moves 8 registers
     # from the softmax warps to the service warps: 8 x 224 + 4 x 56 = 2016, spill-free on both sides (SASS pin
-    # test_sm107_register_split_spills_and_drains_sass_pins).  fp8: the pre-port 232 / 40 until its own port measures.
+    # test_sm107_register_split_spills_and_drains_sass_pins).  fp8 keeps the pre-port 232 / 40: its dense AND causal
+    # sm_107a builds are spill-free (0 STL / 0 LDL, the same pin's fp8-dense / fp8-causal rows, 2026-09-24).
     softmax_regs = 232 if is_fp8 else 224
     service_regs = 40 if is_fp8 else 56
     cfg = CfgBwdD256(

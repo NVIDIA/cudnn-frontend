@@ -232,6 +232,15 @@ class Capabilities:
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
+    # Bottom-right causal is served only when S_q is a multiple of this (1 = any
+    # S_q, the default).  A body that derives the bottom-right diagonal S_kv - S_q
+    # (and the q-tile trim behind it) from its PADDED q extent is wrong by
+    # (pad - S_q) rows on a ragged S_q -- finite, no crash -- so its row declines
+    # the shape at eligibility instead of serving it.  Set to the body's q pad
+    # (sdpa_bwd_sm107_fp8: 128, no seqlen_q_real in its ABI); a body that
+    # threads the real length keeps 1.  Appended last: Capabilities is
+    # positional-append-only.
+    bottom_right_s_q_multiple: int = 1
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -394,6 +403,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
     if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
+    m = capabilities.bottom_right_s_q_multiple
+    if facts.bottom_right and m > 1 and facts.s_q % m != 0:
+        return (
+            f"bottom-right causal on this engine needs S_q % {m} == 0 (the body derives the diagonal S_kv - S_q "
+            f"from its padded S_q; follow-up: thread seqlen_q_real like the f16 body); graph has S_q={facts.s_q}"
+        )
 
     if facts.stats_t is not None:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
@@ -1301,7 +1316,13 @@ def _sm107_fp8_spec() -> EngineSpec:
 
     E4M3 payloads only (no E5M2 body); otherwise the half row's envelope and
     declines, plus: O must be an FP8 payload of Q's dtype and the gradient triple
-    must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``).
+    must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``),
+    and **bottom-right causal needs ``S_q % 128 == 0``** -- the fp8 body's ABI has
+    no ``seqlen_q_real`` (the f16 body's has), so it derives the bottom-right
+    diagonal and the q-tile trim from the PADDED q extent; a ragged S_q would be
+    served silently wrong by ``pad - S_q`` rows, so the row declines it
+    (``bottom_right_s_q_multiple=128``; the adapter backstops).  A ragged S_kv is
+    fine (the kernel's kv term is the runtime real length).
     """
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
@@ -1320,6 +1341,8 @@ def _sm107_fp8_spec() -> EngineSpec:
             swa=True,
             decode=False,
             layouts=frozenset({"bshd"}),
+            # == api_dsl_sm107._SM107_Q_PAD (the body's q tile); pinned equal by test_sdpa_bwd_fp8_sm107.py.
+            bottom_right_s_q_multiple=128,
         ),
         lower=partial(lower_dsl_bwd_fp8, api_type=_SM107_FP8),
     )

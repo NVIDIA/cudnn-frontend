@@ -35,6 +35,18 @@ caller's tensors directly; only a padded-kv GQA graph folds through a padded sta
 copy.  Everything the chain needs is carved from the caller's workspace in one fixed
 order (:meth:`_scratch_plan`), so ``scratch_workspace_bytes()`` is a build-time function.
 
+One exception, declined rather than served wrong: **bottom-right causal on the fp8 row
+needs ``S_q % 128 == 0``.**  The bottom-right diagonal is ``S_kv - S_q`` in REAL rows.
+The f16 body takes the real lengths (``sq_real`` / ``skv_real`` on its ``compile()``,
+``SQ_REAL`` in its problem_size); the fp8 body's ABI has no ``seqlen_q_real`` -- it
+derives the diagonal and the q-tile trim from the PADDED compile extent ``SQ`` (its kv
+term IS the real length, the runtime ``seqlen_kv_real``), so a ragged S_q would shift
+both by ``pad - S_q`` rows: finite, wrong dQ / dK / dV near the diagonal, no crash.  The
+row declines it at eligibility (``Capabilities.bottom_right_s_q_multiple``) and
+:meth:`SdpaBwdDslSm107Fp8._check_support_family` backstops.  A ragged S_kv is fine on
+both rows.  Follow-up: thread ``seqlen_q_real`` through the fp8 body like the f16 one
+and drop the decline.
+
 The dS workspace is the dominant allocation (``B * H * S_kv * S_q * 2`` bytes): heads
 (and, on the half row, batches -- the fp8 body has no ``batch_base``) are chunked to
 fit ``_SM107_WS_BUDGET_BYTES`` and the chain loops over chunks with runtime
@@ -76,6 +88,12 @@ from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE,
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
 _SM107_D = 256
+# The bodies' compile geometry: the q loop walks 128-row q tiles, a cga2 pair owns a 256-row kv block
+# (``config_sm107.q_pad_rows`` / ``kv_pad_rows``).  The adapter pads S_q / S_kv up to these and stages
+# the padded operands (module doc).  ``_SM107_Q_PAD`` is also the fp8 row's bottom-right alignment
+# claim (``engines.Capabilities.bottom_right_s_q_multiple``; pinned equal by the fp8 suite).
+_SM107_Q_PAD = 128
+_SM107_KV_PAD = 256
 _SM107_KERNEL_FILES = {_cfg.FAMILY_F16: "sm107/bprop_d256_f16.py", _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py"}
 _SM107_TEMPLATE_TAGS = {_cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16", _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8"}
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
@@ -167,8 +185,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape: the q loop walks 128-row q tiles, a cga2 pair owns a
         # 256-row kv block.  The padded operands are staged (zero-filled), see the module doc.
-        self._sq_pad = -(-self.s_q_max // 128) * 128
-        self._skv_pad = -(-self.s_k_max // 256) * 256
+        self._sq_pad = -(-self.s_q_max // _SM107_Q_PAD) * _SM107_Q_PAD
+        self._skv_pad = -(-self.s_k_max // _SM107_KV_PAD) * _SM107_KV_PAD
         self._q_padded = self._sq_pad != self.s_q_max
         self._kv_padded = self._skv_pad != self.s_k_max
         self._gqa_group = self.h_q // max(self.h_kv, 1)
@@ -559,6 +577,16 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         )
         for name, desc in (("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc)):
             self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
+        # The fp8 body derives the bottom-right diagonal (S_kv - S_q) and the q-tile trim from the PADDED
+        # S_q (no seqlen_q_real in its ABI; the f16 body threads it), so a ragged S_q would be served
+        # silently wrong by (pad - S_q) rows.  The row already declines this at eligibility
+        # (Capabilities.bottom_right_s_q_multiple); this is the backstop.  A ragged S_kv is fine: the
+        # kernel's kv term is the runtime real length.
+        self._value_error_if(
+            self.causal_bottom_right and self._q_padded,
+            f"{n}: bottom-right causal needs S_q % {_SM107_Q_PAD} == 0 (the fp8 body derives the diagonal from the padded S_q; "
+            f"its ABI has no seqlen_q_real); got S_q={self.s_q_max}; follow-up: thread seqlen_q_real like the f16 body",
+        )
 
     def _dtype_o_code(self) -> int:
         # Stage 2 publishes dV in bf16 (the pre-quantization value) for the fold + quantize pass.

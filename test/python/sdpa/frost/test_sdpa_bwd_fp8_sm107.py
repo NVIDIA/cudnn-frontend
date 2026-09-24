@@ -22,7 +22,11 @@ by its own rounding noise (measured on correct inputs: 0.56 % of dQ and
 backend suite's tolerance recipe and ``assert_close_fp8_grad``'s midpoint-flip
 budget (which now only P-side flips can spend); REJECT tests
 assert the decline through the row's own ``mismatch()`` on REAL graphs with a
-faked cc 10.7 device.  The two graph-admission cases of the bring-up
+faked cc 10.7 device -- including the one shape-conditioned decline this row
+carries and the half row does not: bottom-right causal with ``S_q % 128 != 0``
+(the fp8 body derives the diagonal from its PADDED S_q; ``api_dsl_sm107`` module
+doc), asserted host-side on the row probe AND the adapter backstop, and end to
+end on Rubin.  The two graph-admission cases of the bring-up
 placeholder are kept (Rubin only).  The host-only static and sm_107a SASS pins
 of this row's kernel body live in ``test_sdpa_bwd_dsl_sm107.py`` (both bodies,
 one machinery); the kernel-vs-kernel targets are the pre-port kernel's
@@ -253,6 +257,7 @@ def test_capabilities_match_what_is_implemented():
     assert c.out_dtypes <= frozenset({_FP8, _BF16, cudnn.data_type.HALF}), c.out_dtypes
     assert c.amax_dgrad, "amax_dQ / dK / dV / dP are produced in-kernel (the contract), so a graph may request them"
     assert c.causal and c.bottom_right and c.swa and c.gqa
+    assert c.bottom_right_s_q_multiple == 128, "bottom-right is claimed for S_q % 128 == 0 only (the fp8 body has no seqlen_q_real)"
     assert not c.right_band_widening
     assert not c.thd and not c.thd_declared_totals and not c.cu_seq_len
     assert not c.bias and not c.dbias
@@ -288,15 +293,32 @@ def _decline_reason(monkeypatch, engine=_ENGINE, cc=_RUBIN_CC, **kw):
         dict(causal=False),
         dict(causal=True),
         dict(causal=True, bottom_right=True),
+        dict(causal=True, bottom_right=True, s=512, skv=1024),
+        dict(causal=True, bottom_right=True, s=512, skv=1000),
         dict(causal=True, left_bound=256),
         dict(causal=False, hkv=1),
         dict(causal=False, h=8, hkv=2),
         dict(causal=False, s=500, skv=500),
+        dict(causal=True, s=500, skv=500),
         dict(causal=False, scale=None),
         dict(causal=False, request_amax=()),
         dict(causal=True, request_amax=("amax_dP",)),
     ],
-    ids=["dense", "causal", "bottom-right", "swa", "mqa", "gqa-r4", "non-tile-S", "default-scale", "no-amax", "amax-dP-only"],
+    ids=[
+        "dense",
+        "causal",
+        "bottom-right",
+        "bottom-right-rect",
+        "bottom-right-ragged-kv",
+        "swa",
+        "mqa",
+        "gqa-r4",
+        "non-tile-S",
+        "causal-non-tile-S",
+        "default-scale",
+        "no-amax",
+        "amax-dP-only",
+    ],
 )
 def test_served_graph_passes_the_row_probe(monkeypatch, kw):
     """Sanity for the rejects and the host half of every accept claim -- the amax outputs are served whether requested
@@ -357,6 +379,65 @@ def test_reject_decode_shaped(monkeypatch):
 
 def test_reject_non_bshd_layout(monkeypatch):
     assert _decline_reason(monkeypatch, stride_fn=_bhsd) is not None
+
+
+_BR_RAGGED_SQ_SHAPES = [(500, 1024), (300, 1000), (129, 256)]
+_BR_RAGGED_SQ_IDS = ["500x1024", "300x1000", "129x256"]
+
+
+@pytest.mark.parametrize("sq,skv", _BR_RAGGED_SQ_SHAPES, ids=_BR_RAGGED_SQ_IDS)
+def test_reject_bottom_right_with_ragged_s_q(monkeypatch, sq, skv):
+    """Bottom-right causal with ``S_q % 128 != 0`` is DECLINED on this row, not served: the fp8 body derives the diagonal
+    ``S_kv - S_q`` and the q-tile trim from its PADDED q extent (its ABI has no ``seqlen_q_real``; the f16 body threads
+    it), so S_q = 500 would run the diagonal of S_q = 512 -- finite, wrong near the diagonal, no crash.  The decline is
+    typed and at eligibility (``mismatch()``), so the graph falls through to a not-supported instead of a wrong answer.
+    The same graph on the HALF row is served (its adapter passes the real length).  Inverts when the fp8 ABI grows
+    ``seqlen_q_real`` (then ``bottom_right_s_q_multiple`` goes back to 1 and the accept case below takes over)."""
+    from test_sdpa_bwd_dsl_sm107 import _half_bwd_graph
+
+    reason = _decline_reason(monkeypatch, s=sq, skv=skv, causal=True, bottom_right=True)
+    if _spec().capabilities.bottom_right_s_q_multiple == 1:
+        assert reason is None, reason
+    else:
+        assert reason is not None and "S_q % 128 == 0" in reason, reason
+    # ... while top-left causal at the same ragged S_q, and bottom-right at a ragged S_KV, stay served.
+    assert _decline_reason(monkeypatch, s=sq, skv=skv, causal=True) is None
+    assert _decline_reason(monkeypatch, s=512, skv=1000, causal=True, bottom_right=True) is None
+    # The half row keeps the claim: its body consumes seqlen_q_real.
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.bwd.engines import mismatch
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
+    g, _t, _outs = _half_bwd_graph(b=1, hq=2, sq=sq, skv=skv, use_causal_mask_bottom_right=True)
+    facts = ga.analyze(g)
+    assert facts is not None and facts.bottom_right and facts.s_q == sq
+    assert mismatch(_spec(_HALF_ENGINE).capabilities, facts) is None
+
+
+def test_bottom_right_alignment_claim_mirrors_the_adapter_pad():
+    """``Capabilities.bottom_right_s_q_multiple`` MIRRORS the adapter's q pad (frost-engine-contract s8b': a row field that
+    mirrors adapter data is pinned per row): the fp8 row claims exactly the body's q tile, the half row claims any S_q."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_Q_PAD
+
+    assert _spec().capabilities.bottom_right_s_q_multiple == _SM107_Q_PAD == 128
+    assert _spec(_HALF_ENGINE).capabilities.bottom_right_s_q_multiple == 1
+
+
+@pytest.mark.parametrize("sq,skv", _BR_RAGGED_SQ_SHAPES, ids=_BR_RAGGED_SQ_IDS)
+def test_fp8_adapter_backstop_refuses_bottom_right_with_ragged_s_q(sq, skv):
+    """The adapter's own ``check_support`` refuses what the row declines (a ValueError naming the condition, never an
+    assert), and admits the aligned twin and the ragged-S_kv twin."""
+    from test_sdpa_bwd_dsl_sm107 import _adapter
+
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+
+    kw = dict(b=1, hq=2, dt=_T_E4M3, grad_dt=_T_E4M3, is_causal=True, causal_bottom_right=True)
+    with pytest.raises(ValueError, match="S_q % 128 == 0"):
+        _adapter(SdpaBwdDslSm107Fp8, sq=sq, skv=skv, **kw).check_support()
+    assert _adapter(SdpaBwdDslSm107Fp8, sq=512, skv=1024, **kw).check_support()
+    assert _adapter(SdpaBwdDslSm107Fp8, sq=512, skv=1000, **kw).check_support()
+    # Top-left causal at the ragged S_q is served (the diagonal is 0; the padded q rows read P = 0 through the +inf LSE).
+    assert _adapter(SdpaBwdDslSm107Fp8, sq=sq, skv=skv, b=1, hq=2, dt=_T_E4M3, grad_dt=_T_E4M3, is_causal=True).check_support()
 
 
 def test_padding_mask_follows_the_padded_claim(monkeypatch):
@@ -580,7 +661,16 @@ def test_causal():
 
 @requires_rubin
 def test_causal_bottom_right_rectangular():
+    """The ALIGNED bottom-right accept (S_q % 128 == 0, S_kv % 256 == 0): the shape the row claims."""
     _run_fp8(sq=512, skv=1024, causal=True, bottom_right=True).check()
+
+
+@requires_rubin
+def test_causal_bottom_right_ragged_kv():
+    """Bottom-right with a ragged S_KV is served: the kernel's kv term of the diagonal is the runtime REAL length
+    (``seqlen_kv_real``) and the padded kv rows ride the padded-mask arm.  Only a ragged S_Q is declined
+    (``test_reject_bottom_right_with_ragged_s_q``)."""
+    _run_fp8(sq=512, skv=1000, causal=True, bottom_right=True).check()
 
 
 @requires_rubin
@@ -652,6 +742,22 @@ def test_unserved_e5m2_graph_declines_as_not_supported():
     fails to finalize used to fold into (every SDPA harness skips on the typed error and FAILS on anything else)."""
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         g = _build_graph(fp8=_E5M2)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        g.check_support()
+        g.build_plans()
+
+
+@requires_rubin
+@pytest.mark.parametrize("sq,skv", _BR_RAGGED_SQ_SHAPES[:1], ids=_BR_RAGGED_SQ_IDS[:1])
+def test_unserved_bottom_right_ragged_s_q_graph_declines_as_not_supported(sq, skv):
+    """End to end on the device: the row's ``mismatch()`` drops it, no other engine serves a d256 fp8 backward, and the
+    typed ``cudnnGraphNotSupportedError`` surfaces (never a silently shifted diagonal, never a bare RuntimeError)."""
+    if _spec().capabilities.bottom_right_s_q_multiple == 1:
+        pytest.skip("the fp8 row serves a ragged S_q under bottom-right now; test_causal_bottom_right_* cover it")
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g = _build_graph(b=1, h=2, s=sq, skv=skv, causal=True, bottom_right=True)
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])

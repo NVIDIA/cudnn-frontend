@@ -129,6 +129,13 @@ likewise, and a padded S_kv selects the kernels' padded-mask specialization at
 the uniform real length, so every padded kv row's dS / dV is exactly zero. The
 GEMMs read real-extent slices and write the caller's tensors directly.
 
+One exception on the fp8 row: **bottom-right causal needs `S_q % 128 == 0`**
+(declined otherwise, at plan build, as not supported). The bottom-right
+diagonal is `S_kv − S_q` in real rows; the f16 kernel takes the real lengths,
+the fp8 kernel derives the diagonal from its padded q extent (its kv term is
+the real length), so a ragged S_q would shift it. A ragged S_kv under
+bottom-right is served on both rows.
+
 ### FP8 numerics (`sdpa_bwd_sm107_fp8`)
 
 Every scalar is a 1-element fp32 device tensor read in-kernel, never a host
@@ -152,7 +159,8 @@ applied (dS is not quantized to fp8 on this chain).
   `(B, H_q, S_q, 1)`
 - Layout: BSHD-physical Q/K/V/O/dO/dQ/dK/dV (stride order 3,1,2,0)
 - Masks: none, causal (top-left or bottom-right), sliding window (left,
-  with or without causal); any S_q / S_kv
+  with or without causal); any S_q / S_kv — except bottom-right on
+  `sdpa_bwd_sm107_fp8`, which needs `S_q % 128 == 0` (see above)
 - GQA/MQA: any `H_kv` dividing `H_q`
 - Declined (asserted by tests): dense padding masks (`seq_len_q/kv`), sink /
   dSink, bias / dBias, right-band widening, THD, `dense_flex` layouts, decode

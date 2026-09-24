@@ -546,7 +546,7 @@ red (2026-09-08).
 | `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | f16 ✅ · fp8 ✅ **`S_q % 128 == 0` only**ᵇ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -560,7 +560,7 @@ red (2026-09-08).
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv; padded to 128 / 256) |
+| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv; padded to 128 / 256 — except bottom-right on the fp8 row, which needs `S_q % 128 == 0`ᵇ) |
 | FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
@@ -578,7 +578,25 @@ skipped tile reads as zero) → the GQA fold of the per-Q-head partials
 sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
 128-row q tile / 256-row kv block is padded through zero-filled staging copies,
 `+inf` LSE rows, and the kernels' padded-mask arm at the uniform real S_kv), BSHD-
-physical io, contiguous fp32 Stats. The dS workspace is head-chunked (and, on the
+physical io, contiguous fp32 Stats. **One shape-conditioned decline, fp8 row only:
+bottom-right causal needs `S_q % 128 == 0`.** The bottom-right diagonal is
+`S_kv − S_q` in REAL rows; the f16 body takes the real lengths (`sq_real` /
+`skv_real` on its `compile()`, `SQ_REAL` in its problem_size, adapter passes
+`s_q_max`) while the fp8 body's ABI has no `seqlen_q_real` and derives the diagonal
+and the q-tile trim from the PADDED compile extent (its kv term IS the runtime real
+length), so a ragged S_q would shift both by `pad − S_q` rows — finite, wrong dQ/dK/dV
+near the diagonal, no crash. `mismatch()` declines it at eligibility
+(`Capabilities.bottom_right_s_q_multiple = 128`; the half row keeps 1) and the
+adapter backstops (`SdpaBwdDslSm107Fp8._check_support_family`); a ragged S_kv under
+bottom-right is served on both rows. Tests:
+`test_sdpa_bwd_fp8_sm107.py::test_reject_bottom_right_with_ragged_s_q` (host, +
+the half row admitting the same graph), `::test_fp8_adapter_backstop_refuses_bottom_right_with_ragged_s_q`,
+`::test_causal_bottom_right_{rectangular,ragged_kv}` (Rubin accept),
+`::test_unserved_bottom_right_ragged_s_q_graph_declines_as_not_supported` (Rubin,
+typed error end to end); `test_sdpa_bwd_dsl_sm107.py::test_causal_bottom_right_ragged_s_q`
+pins the f16 claim. Follow-up: thread `seqlen_q_real` through the fp8 body like the
+f16 one, then set the field back to 1 (the reject test inverts by itself). The dS
+workspace is head-chunked (and, on the
 f16 row, batch-chunked) to a 4 GiB budget; one compiled artifact serves every
 chunk. **FP8 row** = cuDNN's `sdpa_fp8_backward`: E4M3 Q/K/V/O/dO with the twelve
 scalar descales / scales as 1-element fp32 device tensors (read in-kernel, never
