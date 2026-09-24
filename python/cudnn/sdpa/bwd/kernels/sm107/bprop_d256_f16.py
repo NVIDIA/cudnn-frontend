@@ -85,21 +85,21 @@ BARRIER TABLE (lane ledger; L = leader CTA, F = follower; x N = per q tile, x T 
     mb_k_utccp_done[1]  MMA_COMMIT           1 / 1       MMA(L), inside `if elect_p:` with the UTCCP  1 x mcast          TMALDG L+F (same tile)    st(0)   x T
     mb_s_acc_full[1]    MMA_COMMIT           1 / 1       MMA(L), pred=elect_p                         1 x mcast          softmax L+F (256 lanes)   st(0)   x N
     mb_dp_full[1]       MMA_COMMIT           1 / 1       MMA(L), pred=elect_p                         1 x mcast          softmax L+F               st(0)   x N
-    mb_dp_empty[1]      LEADER / LEADER      512 / 1(-)  softmax, BARE, 8 warps x 2 CTAs              256 x 2 -> L       MMA(L); DRAIN x1          st(1)   x N
-    mb_p_ready[1]       LEADER / LEADER      512 / 1(-)  softmax, BARE, 8 warps x 2 CTAs              256 x 2 -> L       MMA(L)                    st(0)   x N
+    mb_dp_empty[1]      LEADER / LEADER      512 / 512(-) softmax, BARE, 8 warps x 2 CTAs             256 x 2 -> L       MMA(L); DRAIN x1          st(1)   x N
+    mb_p_ready[1]       LEADER / LEADER      512 / 512(-) softmax, BARE, 8 warps x 2 CTAs             256 x 2 -> L       MMA(L)                    st(0)   x N
     mb_stats_full[2]    THREAD               32 / 32     scheduler warp, BARE                         32 (local)         softmax (256 lanes)       st(0)   x N
     mb_stats_empty[2]   THREAD               256 / 256   softmax, BARE, 8 warps                       256 (local)        scheduler warp            st(1)   x N
     mb_ds_smem_full[1]  THREAD               256 / 256   softmax, BARE, 8 warps                       256 (local)        TMASTG                    st(0)   x N
     mb_ds_smem_empty[1] THREAD               1 / 1       TMASTG, `if elect_sync():`                   1 (local)          softmax                   st(1)   x N
     mb_dv_ready[1]      MMA_COMMIT           1 / 1       MMA(L), pred=elect_p                         1 x mcast          softmax L+F               st(0)   x T
-    mb_dv_acc_empty[1]  LEADER / LEADER      512 / 1(-)  softmax, BARE, 8 warps x 2 CTAs              256 x 2 -> L       MMA(L)                    st(0)   x T
+    mb_dv_acc_empty[1]  LEADER / LEADER      512 / 512(-) softmax, BARE, 8 warps x 2 CTAs             256 x 2 -> L       MMA(L)                    st(0)   x T
     mb_dv_stg_full[1]   THREAD               256 / 256   softmax, BARE, 8 warps                       256 (local)        TMASTG                    st(0)   x T
-    mb_dv_stg_empty[1]  THREAD               1 / 1       TMASTG, `if elect_sync():`                   1 (local)          TMALDG (pre-armed)        st(1)   x T
+    mb_dv_stg_empty[1]  THREAD               1 / 1       TMASTG, `if elect_sync():`                   1 (local)          TMALDG (pre-armed); DRAIN x1  st(1)  x T
     mb_tmem_dealloc[1]  THREAD (+peer)       512 / 512   softmax BARE local + BARE arrive_on_peer     256 + 256          MMA (each CTA)            0       x 1
     sched.mb_scheduler[2]     expect_tx 16 B  1 / 1     scheduler, CTA 0 elect arms EVERY CTA        1                  every persistent warp     st(0)   x T
     sched.mb_read_tile_id[2]  read_tile_id_arrive  21 / 21  8 softmax + TMALDG + TMASTG on both CTAs + MMA(L) = 21 calls, 1 arrive per CTA per call
 
-    SUM(issuing lanes) == init on every row and both CTAs; a "1(-)" follower init is a
+    SUM(issuing lanes) == init on every row and both CTAs; a "(-)" follower init is a
     copy that is never armed and never waited (cga2 tensor TMAs deliver both peers' bytes
     to the LEADER's mbar; LEADER-scope arrives all land on the leader).
 
@@ -486,7 +486,8 @@ def _make_bars(cfg) -> Bars:
         mb_s_acc_full=MBarrier(_alloc(cfg.STAGES_TMEM_S), stages=cfg.STAGES_TMEM_S, init_count=MMA_COMMIT_ARRIVES, producer=Producer.MMA_COMMIT),
         mb_dp_full=MBarrier(_alloc(cfg.STAGES_TMEM_S), stages=cfg.STAGES_TMEM_S, init_count=MMA_COMMIT_ARRIVES, producer=Producer.MMA_COMMIT),
         # dP slot freed by dSoftmax (after its tmem_load); every compute lane of BOTH CTAs
-        # arrives on the leader (bare LEADER arrive, 256 x 2 = 512); follower init = ONE_LANE (never waited).
+        # arrives on the leader (bare LEADER arrive, 256 x 2 = 512).  The LEADER-scope bars take this
+        # cluster-wide count on BOTH CTAs (the follower's copy is never armed or waited, P8).
         mb_dp_empty=MBarrier(_alloc(cfg.STAGES_TMEM_S), stages=cfg.STAGES_TMEM_S, init_count=SOFT_X_CTA_MMA, producer=Producer.LEADER, scope=Scope.LEADER),
         mb_p_ready=MBarrier(_alloc(cfg.STAGES_TMEM_P), stages=cfg.STAGES_TMEM_P, init_count=SOFT_X_CTA_MMA, producer=Producer.LEADER, scope=Scope.LEADER),
         # lse / do_dot prefetch ring: scheduler warp (32 lanes, bare) -> softmax; softmax (256 lanes, bare) -> scheduler.
@@ -738,23 +739,18 @@ def _kernel(
                 bars.mb_k_empty[s].init()
                 bars.mb_v_empty[s].init()
             bars.mb_k_utccp_done.init()
-            # P8: leader-waited fan-ins (dp_empty / p_ready / dv_acc_empty): the leader's copy
-            # takes every compute lane of BOTH CTAs, the follower's copy is never waited.
-            LEADER_INIT = cutlass.Int32(
-                arith.select(
-                    is_leader.ir_value(),
-                    cutlass.Int32(SOFT_X_CTA_MMA).ir_value(),
-                    cutlass.Int32(ONE_LANE).ir_value(),
-                )
-            )
+            # P8: the leader-waited fan-ins (dp_empty / p_ready / dv_acc_empty) take the cluster-wide
+            # count (every compute lane of BOTH CTAs) on BOTH CTAs: the follower's copy is never
+            # armed and never waited, so an unconditional constant beats a runtime select (and the
+            # fp8 body spells it the same way).
             for p in cutlass.range_constexpr(CFG.STAGES_TMEM_S):
                 bars.mb_s_acc_full[p].init()
                 bars.mb_dp_full[p].init()
-                bars.mb_dp_empty[p].init(override_count=LEADER_INIT)
+                bars.mb_dp_empty[p].init()
             for p in cutlass.range_constexpr(CFG.STAGES_TMEM_P):
-                bars.mb_p_ready[p].init(override_count=LEADER_INIT)
+                bars.mb_p_ready[p].init()
             bars.mb_dv_ready.init()
-            bars.mb_dv_acc_empty.init(override_count=LEADER_INIT)
+            bars.mb_dv_acc_empty.init()
             bars.mb_dv_stg_full.init()
             bars.mb_dv_stg_empty.init()
             bars.mb_tmem_dealloc.init()
@@ -1070,6 +1066,10 @@ def _tmaldg_warp(
             k_empty_state = advance(k_empty_state, CFG.STAGES_KV)
             bars.mb_v_empty[v_empty_state.idx].wait(v_empty_state.phase)
             v_empty_state = advance(v_empty_state, CFG.STAGES_KV)
+    # The LOCAL dV-staging ring: the last kv block's TMA-STG arrive is unconsumed (its wait guards the
+    # NEXT block's K load).  Harmless -- a THREAD arrive on this CTA's own SMEM -- but a symmetric 1-deep
+    # drain keeps an init-count imbalance a localizable hang (the fp8 body does the same).
+    bars.mb_dv_stg_empty.wait(dv_stg_empty_state.phase)
 
 
 @cute.jit

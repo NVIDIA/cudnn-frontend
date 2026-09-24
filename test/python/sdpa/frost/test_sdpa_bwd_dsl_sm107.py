@@ -1046,7 +1046,7 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(family):
 # handshakes) -- the pin records that classification as the (ring, idle) site COUNTS so a re-classified, re-literalled or
 # newly added site cannot drift in silently, and forbids the spin on the two waits every body parks in for a whole tile:
 # the scheduler payload and ``mb_tmem_dealloc``.  None = not yet pinned (the body is still moving): structural check only.
-_RING_WAIT_SITES = {"f16": None, "fp8": (17, 24)}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b
+_RING_WAIT_SITES = {"f16": (23, 15), "fp8": (17, 24)}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc",)
 
 
