@@ -46,10 +46,9 @@ import cuda.bindings.runtime as cudart
 def _cudart_call(fn, *args):
     err, *rest = fn(*args)
     if int(err) != 0:
-        raise RuntimeError(
-            f"{fn.__name__} failed: {cudart.cudaGetErrorString(err)[1].decode()}"
-        )
+        raise RuntimeError(f"{fn.__name__} failed: {cudart.cudaGetErrorString(err)[1].decode()}")
     return rest[0] if len(rest) == 1 else tuple(rest)
+
 
 # fmt: off
 
@@ -130,7 +129,11 @@ def _dead_cuda_context():
     # Probe only if this thread already holds a context; cudaDeviceSynchronize
     # would otherwise create one in a worker that never touched the GPU.
     err, ctx = cuda_driver.cuCtxGetCurrent()
-    if int(err) != 0 or int(ctx) == 0:
+    if err == cuda_driver.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+        return None
+    if err != cuda_driver.CUresult.CUDA_SUCCESS:
+        return cuda_driver.cuGetErrorString(err)[1].decode()
+    if int(ctx) == 0:
         return None
     (err,) = cudart.cudaDeviceSynchronize()
     if int(err) == 0:
