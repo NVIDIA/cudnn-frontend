@@ -65,6 +65,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   through CUDA graph replay. The detectors are in
   `test_prepared_backend_execution.py` (rebind, stale graph, replay after new
   geometry, and thread-local handles).
+- **Native owners of Python objects must expose their strong references to GC.**
+  A descriptor cached on its graph forms a cycle; retaining `py::object` members
+  without `tp_traverse`/`tp_clear` leaks both objects. Visit every held Python
+  reference and the heap type, and tolerate an instance whose C++ constructor
+  has not completed. Detectors: `test_prepared_cached_on_graph_is_collectible`,
+  `test_prepared_keeps_graph_alive_until_released`, and
+  `test_prepared_gc_handles_unconstructed_subclass`.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

@@ -6,6 +6,7 @@
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import weakref
 
 import cudnn
 import pytest
@@ -42,6 +43,10 @@ def test_prepare_resolves_ranked_index_and_declines_python_plans(monkeypatch):
 
 @pytest.fixture
 def backend_graph(cudnn_handle):
+    return _build_backend_graph(cudnn_handle)
+
+
+def _build_backend_graph(cudnn_handle):
     if cudnn.backend_version() < 92300:
         pytest.skip("Override workspace queries require cuDNN 9.23 or later")
     if torch.cuda.get_device_capability()[0] < 9:
@@ -105,6 +110,60 @@ def _assert_result(buffers, m=128, n=192, k=64):
     # Integer-valued BF16 inputs give an exact reference independent of TF32.
     expected = a[:, :m, :k].double() @ b[:, :n, :k].double().transpose(-1, -2)
     torch.testing.assert_close(out[:, :m, :n], expected.to(out.dtype), atol=0, rtol=0)
+
+
+def test_prepared_keeps_graph_alive_until_released(cudnn_handle):
+    # Build here: a fixture would retain the graph until this test returns.
+    graph = _build_backend_graph(cudnn_handle)
+    geometry = _geometry()
+    prepared = graph._prepare_backend_execution(*geometry)
+    workspace = _workspace(graph, cudnn_handle, geometry)
+    buffers = _buffers(39)
+    graph_ref, prepared_ref = weakref.ref(graph), weakref.ref(prepared)
+    del graph
+    gc.collect()
+    assert graph_ref() is not None
+    # The graph and its default handle remain usable through the descriptor.
+    prepared.execute(_frame(prepared, buffers), workspace.data_ptr())
+    _assert_result(buffers)
+    torch.cuda.synchronize()
+    del prepared
+    gc.collect()
+    assert prepared_ref() is None
+    assert graph_ref() is None
+
+
+def test_prepared_cached_on_graph_is_collectible(cudnn_handle):
+    graph = _build_backend_graph(cudnn_handle)
+    graph._prepared = graph._prepare_backend_execution(*_geometry())
+    graph_ref, prepared_ref = weakref.ref(graph), weakref.ref(graph._prepared)
+    del graph
+    gc.collect()
+    assert graph_ref() is None
+    assert prepared_ref() is None
+
+
+@pytest.mark.parametrize("failed_init", [False, True])
+def test_prepared_gc_handles_unconstructed_subclass(failed_init):
+    class Prepared(cudnn._pybind_module._PreparedBackendExecution):
+        pass
+
+    prepared = Prepared.__new__(Prepared)
+    if failed_init:
+        # Valid argument types enter the C++ constructor, where a non-graph
+        # backend owner fails its cast before the holder can be constructed.
+        with pytest.raises(RuntimeError, match="cast Python instance"):
+            Prepared.__init__(prepared, object(), object(), 0, [], [], [], object())
+    # GC can run between __new__ and __init__, or after a constructor fails.
+    # Cover both the subclass dictionary and the instance-to-type GC edge.
+    prepared.cached = prepared
+    Prepared.cached = prepared
+    prepared_ref, type_ref = weakref.ref(prepared), weakref.ref(Prepared)
+    gc.collect()
+    del prepared, Prepared
+    gc.collect()
+    assert prepared_ref() is None
+    assert type_ref() is None
 
 
 def test_prepared_rebinds_addresses_and_copies_override_geometry(backend_graph, cudnn_handle):

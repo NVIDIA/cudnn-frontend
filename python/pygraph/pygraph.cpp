@@ -860,6 +860,45 @@ class PreparedBackendExecution {
     }
 
    public:
+    // GC can visit a pybind instance between __new__ and __init__, including
+    // when the C++ constructor threw. Only a constructed holder owns a value.
+    static PreparedBackendExecution*
+    constructed_value(PyObject* object) {
+        auto* instance = reinterpret_cast<py::detail::instance*>(object);
+        auto* type     = py::detail::get_type_info(typeid(PreparedBackendExecution));
+        if (!type) return nullptr;
+        auto value = instance->get_value_and_holder(type, false);
+        return value.inst && value.holder_constructed() ? value.value_ptr<PreparedBackendExecution>() : nullptr;
+    }
+
+    static int
+    traverse(PyObject* object, visitproc visit, void* arg) {
+        // There is no GC-aware C++ base. Python subclasses traverse their own
+        // dictionary before delegating here; the heap type is our other edge.
+        Py_VISIT(Py_TYPE(object));
+        if (auto* self = constructed_value(object)) {
+            Py_VISIT(self->owner_.ptr());
+            Py_VISIT(self->backend_owner_.ptr());
+            Py_VISIT(self->handle_owner_.ptr());
+            Py_VISIT(self->uids_.ptr());
+        }
+        return 0;
+    }
+
+    static int
+    clear(PyObject* object) {
+        if (auto* self = constructed_value(object)) {
+            // Drop the extra native graph reference before its Python owner,
+            // whose destructor guards resource release during CUDA capture.
+            self->graph_.reset();
+            Py_CLEAR(self->owner_.ptr());
+            Py_CLEAR(self->backend_owner_.ptr());
+            Py_CLEAR(self->handle_owner_.ptr());
+            Py_CLEAR(self->uids_.ptr());
+        }
+        return 0;
+    }
+
     PreparedBackendExecution(py::object owner,
                              py::object backend_owner,
                              int64_t index,
@@ -911,11 +950,13 @@ class PreparedBackendExecution {
 
     py::tuple
     uids() const {
+        if (!uids_) throw std::runtime_error("Prepared backend execution has been cleared");
         return uids_;
     }
 
     void
     execute(py::buffer pointers, std::intptr_t workspace, std::intptr_t handle) const {
+        if (!graph_) throw std::runtime_error("Prepared backend execution has been cleared");
         auto const& backend = backend_owner_.cast<PyGraph&>();
         if (generation_ != backend.execution_generation || graph_ != backend.graph ||
             owner_.attr("_lowered_graph").ptr() != backend_owner_.ptr()) {
@@ -965,7 +1006,13 @@ class PreparedBackendExecution {
 
 void
 init_pygraph_submodule(py::module_& m) {
-    py::class_<PreparedBackendExecution>(m, "_PreparedBackendExecution")
+    py::class_<PreparedBackendExecution>(
+        m, "_PreparedBackendExecution", py::custom_type_setup([](PyHeapTypeObject* heap_type) {
+            auto* type = &heap_type->ht_type;
+            type->tp_flags |= Py_TPFLAGS_HAVE_GC;
+            type->tp_traverse = &PreparedBackendExecution::traverse;
+            type->tp_clear    = &PreparedBackendExecution::clear;
+        }))
         .def(py::init<py::object,
                       py::object,
                       int64_t,

@@ -911,8 +911,10 @@ their own thread-local handles and independent workspaces and outputs. The
 Python binding retains the GIL during submission.
 
 A prepared object owns the graph and its default handle owner, but **does not
-own input/output/workspace allocations**. Those allocations must remain alive
-through queued work and CUDA graph replay. Preparing different override geometry
+own input/output/workspace allocations**. These ownership references participate
+in Python garbage collection, so caching a prepared object on its graph does not
+prevent their collection once callers release both. The device allocations must
+remain alive through queued work and CUDA graph replay. Preparing different override geometry
 creates an independent object; this does not change an older descriptor or its
 captured bindings. Replacing/deserializing, rebuilding, checking native support,
 or changing native plan filters invalidates prepared objects; a stale execute
