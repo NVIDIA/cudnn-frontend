@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+import math
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -17,7 +21,9 @@ from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, align_up
+from ._workspace import validate_workspace_aliases
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -67,6 +73,11 @@ class GroupedGemmDgluBf16API(APIBase):
         act_func: str = "dswiglu",
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        geglu_alpha: float = 1.702,
+        glu_clamp_max: float = 7.0,
+        glu_clamp_min: float = -7.0,
+        round_dgrad_to_input_dtype: bool = False,
+        sample_activation: Optional[torch.Tensor] = None,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -96,6 +107,23 @@ class GroupedGemmDgluBf16API(APIBase):
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
         self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
         self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias", canonical=True)
+        self.activation_desc = self._make_tensor_desc(sample_activation, name="sample_activation", canonical=True)
+        if sample_activation is not None:
+            self._validate_activation_aliases(
+                sample_activation,
+                {
+                    "sample_a": sample_a,
+                    "sample_b": sample_b,
+                    "sample_c": sample_c,
+                    "sample_d_row": sample_d_row,
+                    "sample_padded_offsets": sample_padded_offsets,
+                    "sample_alpha": sample_alpha,
+                    "sample_beta": sample_beta,
+                    "sample_prob": sample_prob,
+                    "sample_dprob": sample_dprob,
+                    "sample_dbias": sample_dbias,
+                },
+            )
 
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
@@ -110,6 +138,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 ("sample_prob", sample_prob),
                 ("sample_dprob", sample_dprob),
                 ("sample_dbias", sample_dbias),
+                ("sample_activation", sample_activation),
             )
             if tensor is not None and not isinstance(tensor, TensorDesc)
         }
@@ -124,6 +153,10 @@ class GroupedGemmDgluBf16API(APIBase):
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.act_func = act_func
+        self.geglu_alpha = float(geglu_alpha)
+        self.glu_clamp_max = float(glu_clamp_max)
+        self.glu_clamp_min = float(glu_clamp_min)
+        self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
         self.b_major = b_major
         self.use_dynamic_sched = use_dynamic_sched
         self._has_dbias = self.dbias_desc is not None
@@ -131,6 +164,39 @@ class GroupedGemmDgluBf16API(APIBase):
         self._kernel_obj = None
         self._live_b_ptrs = None
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+
+    @staticmethod
+    def _validate_activation_aliases(activation, operands) -> None:
+        """Reject overlapping byte spans using host metadata only, including views."""
+        if isinstance(activation, TensorDesc):
+            # Plan-time declarations have no address; execute checks live aliases.
+            return
+        if not is_torch_tensor(activation):
+            raise ValueError("activation output currently requires torch tensors")
+
+        def span(tensor):
+            if not is_torch_tensor(tensor):
+                raise ValueError("activation output currently requires torch tensors")
+            begin = get_data_ptr(tensor)
+            elements = 1 + sum((extent - 1) * stride for extent, stride in zip(get_shape(tensor), get_strides(tensor))) if tensor.numel() else 0
+            return begin, begin + elements * tensor.element_size()
+
+        begin, end = span(activation)
+        if begin % 32:
+            raise ValueError("activation output must be 32-byte aligned")
+        for name, tensor in operands.items():
+            if tensor is not None and not isinstance(tensor, TensorDesc):
+                if name == "workspace":
+                    # Preserve the parent API's framework-neutral workspace contract.
+                    other_begin, shape, strides, dtype, _ = buffers.probe(tensor)
+                    elements = (
+                        math.prod(shape) if strides is None else (0 if 0 in shape else 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides)))
+                    )
+                    other_end = other_begin + elements * buffers.DTYPE_ITEMSIZE[dtype]
+                else:
+                    other_begin, other_end = span(tensor)
+                if begin < other_end and other_begin < end:
+                    raise ValueError(f"activation output must not overlap {name}")
 
     @staticmethod
     def _expect_shape(desc: TensorDesc, expected: Tuple[int, ...], name: str) -> None:
@@ -245,6 +311,14 @@ class GroupedGemmDgluBf16API(APIBase):
             self._check_dtype(self.dbias_desc, cutlass.BFloat16, "sample_dbias")
             self._expect_device(self.dbias_desc, device, "sample_dbias")
 
+        if self.activation_desc is not None:
+            if self.act_func != "dgeglu" or self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
+                raise ValueError("activation output requires BF16 C/D and dgeglu")
+            self._expect_shape(self.activation_desc, (tensor_m, n, 1), "sample_activation")
+            self._expect_stride(self.activation_desc, (n, 1, tensor_m * n), "sample_activation")
+            self._check_dtype(self.activation_desc, cutlass.BFloat16, "sample_activation")
+            self._expect_device(self.activation_desc, device, "sample_activation")
+
         for name, pointer in self._sample_data_ptrs.items():
             if pointer % 16 != 0:
                 raise ValueError(f"{name} data pointer must be 16-byte aligned")
@@ -257,6 +331,12 @@ class GroupedGemmDgluBf16API(APIBase):
             raise ValueError(f"sample_a M dimension must be 256-aligned, got {tensor_m}")
         if self.act_func not in ("dswiglu", "dgeglu"):
             raise ValueError(f"act_func must be 'dswiglu' or 'dgeglu', got {self.act_func}")
+        if self.act_func == "dgeglu" and (
+            not all(math.isfinite(value) for value in (self.geglu_alpha, self.glu_clamp_min, self.glu_clamp_max))
+            or self.geglu_alpha <= 0
+            or self.glu_clamp_min >= self.glu_clamp_max
+        ):
+            raise ValueError("dGeGLU requires finite positive alpha and ordered finite clamp bounds")
         if self.b_major not in ("k", "n"):
             raise ValueError(f"b_major must be 'k' or 'n', got {self.b_major}")
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
@@ -303,6 +383,10 @@ class GroupedGemmDgluBf16API(APIBase):
                 weight_mode=self.weight_mode,
                 use_dynamic_sched=self.use_dynamic_sched,
                 act_func=self.act_func,
+                geglu_alpha=self.geglu_alpha,
+                glu_clamp_max=self.glu_clamp_max,
+                glu_clamp_min=self.glu_clamp_min,
+                round_dgrad_to_input_dtype=self.round_dgrad_to_input_dtype,
             )
         return self._kernel_obj
 
@@ -310,7 +394,9 @@ class GroupedGemmDgluBf16API(APIBase):
         """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
         TMA-descriptor slots and the dynamic-scheduler counter, 128-byte aligned, never 0."""
         self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        if not hasattr(self, "_scratch_nbytes"):
+            self._scratch_nbytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return self._scratch_nbytes
 
     def compile(self) -> None:
         self._ensure_support_checked()
@@ -351,6 +437,13 @@ class GroupedGemmDgluBf16API(APIBase):
             divisibility=256,
         )
         valid_m = cute.sym_int(divisibility=256)
+        activation_fake = (
+            self._make_fake_cute_compact_tensor(
+                self.activation_desc.dtype, self.activation_desc.shape, self.activation_desc.stride_order, dynamic_mode=0, divisibility=256
+            )
+            if self.activation_desc is not None
+            else None
+        )
         prob_fake = self._make_fake_cute_tensor(self.prob_desc.dtype, (valid_m, 1, 1), self.prob_desc.stride)
         dprob_fake = self._make_fake_cute_tensor(self.dprob_desc.dtype, (valid_m, 1, 1), self.dprob_desc.stride)
 
@@ -388,6 +481,7 @@ class GroupedGemmDgluBf16API(APIBase):
             dbias_tensor=self._make_fake_cute_tensor_from_desc(self.dbias_desc),
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
+            activation=activation_fake,
             options="--enable-tvm-ffi",
         )
         cached_n, cached_k, cached_b_stride = n_value, k_value, b_stride
@@ -407,6 +501,7 @@ class GroupedGemmDgluBf16API(APIBase):
             workspace_ptr,
             stream,
             linear_offset,
+            activation_tensor=None,
         ) -> None:
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
             raw_compiled(
@@ -426,6 +521,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 cutlass.Float32(linear_offset),
                 dbias_tensor,
                 stream,
+                activation_tensor,
             )
 
         self._compiled_kernel = tensor_api
@@ -469,6 +565,7 @@ class GroupedGemmDgluBf16API(APIBase):
         dbias_tensor: Optional[torch.Tensor] = None,
         linear_offset: float = 0.0,
         current_stream: Optional[cuda.CUstream] = None,
+        activation_tensor: Optional[torch.Tensor] = None,
         *,
         workspace=None,
     ) -> None:
@@ -525,6 +622,31 @@ class GroupedGemmDgluBf16API(APIBase):
         elif dbias_tensor is not None:
             raise ValueError("dbias_tensor must be omitted because the API was compiled without sample_dbias")
 
+        if self.activation_desc is not None:
+            if activation_tensor is None:
+                raise ValueError("activation_tensor is required because the API was compiled with sample_activation")
+            activation_desc = self._validate_live_tensor(activation_tensor, self.activation_desc, "activation_tensor", dynamic_m=True)
+            self._expect_shape(activation_desc, (tensor_m, two_n // 2, 1), "activation_tensor")
+            self._expect_stride(activation_desc, (two_n // 2, 1, tensor_m * (two_n // 2)), "activation_tensor")
+            self._validate_activation_aliases(
+                activation_tensor,
+                {
+                    "a_tensor": a_tensor,
+                    "b_tensor": b_tensor,
+                    "c_tensor": c_tensor,
+                    "d_row_tensor": d_row_tensor,
+                    "padded_offsets": padded_offsets,
+                    "alpha_tensor": alpha_tensor,
+                    "beta_tensor": beta_tensor,
+                    "prob_tensor": prob_tensor,
+                    "dprob_tensor": dprob_tensor,
+                    "dbias_tensor": dbias_tensor,
+                    "b_ptrs": b_ptrs,
+                },
+            )
+        elif activation_tensor is not None:
+            raise ValueError("activation_tensor must be omitted because the API was compiled without sample_activation")
+
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or b_ptrs is not None:
                 raise ValueError("Dense execution requires b_tensor and forbids b_ptrs")
@@ -542,7 +664,23 @@ class GroupedGemmDgluBf16API(APIBase):
             self._record_pointer_stream(b_ptrs, current_stream)
 
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
+        validate_workspace_aliases(
+            ws_view.data_ptr(),
+            nbytes,
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            dbias_tensor=dbias_tensor,
+            activation_tensor=activation_tensor,
+        )
         retain_workspace(self, workspace, current_stream)
         self._compiled_kernel(
             a_tensor,
@@ -559,4 +697,5 @@ class GroupedGemmDgluBf16API(APIBase):
             ws_view.data_ptr(),
             current_stream,
             linear_offset,
+            activation_tensor,
         )

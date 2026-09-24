@@ -8,6 +8,8 @@ does not require PyTorch.
 """
 
 import importlib
+import sys
+from types import ModuleType
 from typing import Any
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
@@ -42,3 +44,22 @@ def __getattr__(name: str) -> Any:
 
 def __dir__():
     return sorted(set(globals()) | set(__all__))
+
+
+class _OpsModule(ModuleType):
+    """Keep callable exports stable after importing a same-named implementation."""
+
+    def __getattribute__(self, name: str) -> Any:
+        value = super().__getattribute__(name)
+        target = _LAZY_EXPORTS.get(name)
+        if target is not None and isinstance(value, ModuleType):
+            module_name, attr_name = target
+            if value.__name__ == __name__ + module_name:
+                value = getattr(value, attr_name)
+                super().__setattr__(name, value)
+        return value
+
+
+# Python binds submodules on their parent package, bypassing __getattr__. Resolve
+# those bindings on attribute access without importing any optional dependency.
+sys.modules[__name__].__class__ = _OpsModule
