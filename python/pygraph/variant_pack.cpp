@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -892,6 +893,19 @@ class VariantPackNative {
         return reinterpret_cast<int64_t>(pointers_.at(index));
     }
 
+    NativeOperandView
+    native_view(size_t index) const {
+        const auto &operand = operands_.at(index);
+        return {reinterpret_cast<int64_t>(operand.data),
+                operand.dtype,
+                operand.observed_bytes,
+                operand.observed_device_type,
+                operand.observed_device_id,
+                operand.filled,
+                operand.shape,
+                operand.stride};
+    }
+
     // The producer's guaranteed span in BYTES (-1 unknown) and DLPack (device_type, device_id) (-1, -1 unknown).
     int64_t
     observed_bytes(size_t index) const {
@@ -989,6 +1003,34 @@ class VariantPackNative {
     std::vector<Operand> operands_;
     std::vector<void *> pointers_;
 };
+
+std::vector<NativeOperandView>
+read_native_operand_views(py::handle object, const std::vector<int64_t> &indices) {
+    const auto &pack = object.cast<const VariantPackNative &>();
+    std::vector<NativeOperandView> views;
+    views.reserve(indices.size());
+    for (int64_t index : indices) {
+        if (index < -1 || index >= static_cast<int64_t>(pack.size())) {
+            throw py::index_error("native operand index out of range");
+        }
+        views.push_back(index == -1 ? NativeOperandView{} : pack.native_view(static_cast<size_t>(index)));
+    }
+    return views;
+}
+
+// Observe standalone operands through the SAME producer protocol as graph
+// normalization. A fresh pack owns the metadata for each invocation; only
+// producers without the exchange API take the existing Python observation path.
+py::tuple
+read_native_buffer_sequence(const py::sequence &buffers) {
+    auto pack = std::make_unique<VariantPackNative>(buffers.size());
+    std::vector<size_t> unread;
+    for (size_t i = 0; i < static_cast<size_t>(buffers.size()); ++i) {
+        auto buffer = buffers[i];
+        if (!buffer.is_none() && !pack->read_operand(i, buffer)) unread.push_back(i);
+    }
+    return py::make_tuple(py::cast(std::move(pack)), unread);
+}
 
 // A operand over memory that is not a caller operand: the regions a plan carves
 // out of the workspace. Same type, so a kernel is handed one kind of buffer
@@ -1155,6 +1197,8 @@ capsule built in python.
           py::arg("device_id"),
           "A DLPack producer over memory the caller did not supply -- a workspace carve.");
 
+    m.def("_read_buffer_sequence", &read_native_buffer_sequence, py::arg("buffers"));
+
     m.def("read_buffer_extent",
           &read_buffer_extent,
           py::arg("buffer"),
@@ -1260,6 +1304,7 @@ its parts.
             bool ok = self.all_dense_layout(offender);
             return py::make_tuple(ok, offender);
         });
+    init_sdpa_thd_binding(m);
 }
 
 }  // namespace python_bindings
