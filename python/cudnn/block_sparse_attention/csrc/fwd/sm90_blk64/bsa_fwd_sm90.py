@@ -18,6 +18,8 @@ from cudnn.block_sparse_attention.csrc.utils.batched_static_scheduler import (
 )
 
 SM90_FWD_BLOCK_SIZE = 64
+# |max * c| bound below which the softmax FFMA stays max-centered to 2^-14 (see inc_softmax_ffma).
+FFMA_MAX_SCALED_ABS = 2048.0
 
 
 @dataclass
@@ -198,24 +200,18 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 
         # Q does not depend on the list: issue it before the count and index loads resolve. The count is
         # loaded only after this branch in source order: loaded before it, ptxas hoisted its `> 0` compare
-        # above the branch, so the Q TMA (and the speculative index load below) waited for the count.
+        # above the branch, so the Q TMA waited for the count.
         if warp_idx == 0:
             Q_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["Q"])
             cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=Q_barrier[0].get_barrier(0))
 
-        # Candidate index first, actual count second, validation last — the candidate address no longer depends on count, so the two metadata loads can overlap.
-        list_capacity = cute.size(gIndices, mode=[0])
-        n_tile_idx_spec = cutlass.Int32(0)
-        if list_capacity > 0:
-            n_tile_idx_spec = gIndices[list_capacity - 1]
         num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
 
         # CTA-uniform guard: the prologue and the drain wait on loads that are only issued when the
         # list is non-empty. Empty rows fall through to the finalizer (O=0, LSE=-inf when empty-safe).
         if num_n_tiles > 0:
-            n_tile_idx_ = n_tile_idx_spec
-            if num_n_tiles != list_capacity:
-                n_tile_idx_ = gIndices[num_n_tiles - 1]
+            # First processed slot is the last active one; the inactive suffix is never read.
+            n_tile_idx_ = gIndices[num_n_tiles - 1]
 
             if warp_idx == 0:
                 K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
@@ -404,7 +400,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
             inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
 
-            # In current SASS ptxas hoists this wait above the softmax, so softmax[j] does not overlap PV[j-1].
+            # In current SASS ptxas places this wait right after the exponent FFMAs: mask, max, and the FFMAs overlap
+            # PV[j-1]'s tail. Forcing it above the softmax measured ~3% slower.
             cute.nvgpu.warpgroup.wait_group(0)  # PV[j-1] retired: O and P registers are free
             cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
             cute.autovec_copy(prev_ratio, alpha)
@@ -1135,17 +1132,33 @@ def inc_softmax_ffma(
     sum_m: cute.Tensor,
     softmax_scale_log2e: cutlass.Float32,
 ):
-    """inc_softmax with P = exp2(fma(s, c, -max * c)): one FFMA per element instead of FADD + FMUL (the compiler
-    does not contract (s - max) * c), and a pairwise-tree row sum (shorter FADD chain, lower LSE error)."""
+    """inc_softmax with P = exp2(fma(s, c, -max * c)): one FFMA per element instead of FADD + FMUL
+    (the compiler does not contract (s - max) * c), and a pairwise-tree row sum."""
     tSrS_mn = cute.make_tensor(tSrS.iterator, layout_acc_mn(tiled_mma_qk, tSrS.layout))
 
+    # At s == max the FFMA returns the rounding error of fl(max * c), not 0. The 16-bit P(max)
+    # still rounds to 1 while |max * c| < FFMA_MAX_SCALED_ABS; past that, the warp centers its
+    # rows first (s - max is exact at the max), and the vote keeps the branch warp-uniform.
+    row_max = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
+    neg_scaled_max = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
+    needs_centering = cutlass.Boolean(False)
     for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
         new_max = max_m[m]
         if new_max == -cutlass.Float32.inf:
             new_max = 0.0
-        neg_scaled_max = -(new_max * softmax_scale_log2e)
+        row_max[m] = new_max
+        neg_scaled_max[m] = -(new_max * softmax_scale_log2e)
+        needs_centering = needs_centering | (cute.math.absf(neg_scaled_max[m]) >= FFMA_MAX_SCALED_ABS)
+
+    if cute.arch.vote_any_sync(needs_centering):
+        for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
+            neg_scaled_max[m] = 0.0
+            for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
+                tSrS_mn[m, n] = tSrS_mn[m, n] - row_max[m]
+
+    for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
         for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
-            tSrS_mn[m, n] = cute.math.exp2(cute.math.fma(tSrS_mn[m, n], softmax_scale_log2e, neg_scaled_max), fastmath=True)
+            tSrS_mn[m, n] = cute.math.exp2(cute.math.fma(tSrS_mn[m, n], softmax_scale_log2e, neg_scaled_max[m]), fastmath=True)
 
     for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
         row = [tSrS_mn[m, n] for n in range(cute.size(tSrS_mn, mode=[1]))]
