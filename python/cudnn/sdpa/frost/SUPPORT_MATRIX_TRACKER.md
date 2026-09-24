@@ -530,7 +530,7 @@ from the layout **and** the version-1 SF path validated on Rubin — not free:
 putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
 red (2026-09-08).
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256 (Qwen)<br>BPROPᵇ |
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | **Data types** | | |  | | | |
 | FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |

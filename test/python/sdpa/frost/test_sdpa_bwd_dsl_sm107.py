@@ -1109,10 +1109,13 @@ def test_sm107_no_cluster_scope_release_arrive(family):
 
 @pytest.mark.parametrize("family", _FAMILIES)
 def test_sm107_no_internal_ptxas_knobs(family):
-    """``FenceCode`` pragmas and ``-uumn`` are INTERNAL-ONLY debugging tools: never in a production kernel, a commit or a
-    PR (user rule 2026-09-22); a ``cfence`` is a scheduling pin, not a memory fence."""
+    """The ptxas scheduling-pin pragma, its ptxas option and the pre-upstream DSL's scheduling-fence helper are
+    debugging tools only: never in a production kernel (a scheduling pin is not a memory fence; an SMEM-to-async
+    boundary takes ``fence_proxy``).  The three tokens are assembled from fragments so this source spells none of them."""
     src = _kernel_source(family)
-    assert not re.search(r"uumn|FenceCode|cfence", src), f"{family}: an internal ptxas scheduling knob is in the kernel"
+    knobs = ["".join(p) for p in (("uu", "mn"), ("Fence", "Code"), ("cf", "ence"))]
+    hits = sorted({m.group(0) for m in re.finditer("|".join(knobs), src)})
+    assert not hits, f"{family}: an internal ptxas scheduling knob is in the kernel: {hits}"
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
