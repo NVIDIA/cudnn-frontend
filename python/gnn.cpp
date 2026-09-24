@@ -17,9 +17,11 @@ namespace cudnn_frontend::python_bindings {
 
 namespace {
 
-// cuDNN GNN APIs are introduced in 9.26 and are not supported on Windows.
-#if CUDNN_VERSION >= 92600 && !defined(_WIN32)
-cudnnGnnCscGraph_t
+// cuDNN GNN APIs are not supported on Windows. Use frontend-owned ABI
+// structures so bindings built with older cuDNN headers remain available when
+// loaded with a newer backend.
+#if !defined(_WIN32)
+detail::gnn_csc_graph_t
 make_csc_graph(std::intptr_t csc_offsets,
                std::intptr_t csc_indices,
                std::intptr_t map_csc_to_coo,
@@ -29,22 +31,28 @@ make_csc_graph(std::intptr_t csc_offsets,
                int idx_type,
                std::intptr_t csc_rev_offsets = 0,
                std::intptr_t map_rev_to_coo  = 0) {
-    cudnnGnnCscGraph_t graph{};
-    graph.cscOffsets  = reinterpret_cast<const void *>(csc_offsets);
-    graph.cscIndices  = reinterpret_cast<const void *>(csc_indices);
-    graph.mapCscToCoo = reinterpret_cast<const void *>(map_csc_to_coo);
-#if CUDNN_VERSION >= 92700
-    graph.cscRevOffsets = reinterpret_cast<const void *>(csc_rev_offsets);
-    graph.mapRevToCoo   = reinterpret_cast<const void *>(map_rev_to_coo);
-#else
-    (void)csc_rev_offsets;
-    (void)map_rev_to_coo;
-#endif
-    graph.nSrcNodes = n_src_nodes;
-    graph.nDstNodes = n_dst_nodes;
-    graph.nIndices  = n_indices;
-    graph.idxType   = static_cast<cudnnDataType_t>(idx_type);
+    detail::gnn_csc_graph_t graph{};
+    graph.csc_offsets     = reinterpret_cast<const void *>(csc_offsets);
+    graph.csc_indices     = reinterpret_cast<const void *>(csc_indices);
+    graph.map_csc_to_coo  = reinterpret_cast<const void *>(map_csc_to_coo);
+    graph.map_rev_to_coo  = reinterpret_cast<const void *>(map_rev_to_coo);
+    graph.n_src_nodes     = n_src_nodes;
+    graph.n_dst_nodes     = n_dst_nodes;
+    graph.n_indices       = n_indices;
+    graph.idx_type        = static_cast<cudnnDataType_t>(idx_type);
+    graph.csc_rev_offsets = reinterpret_cast<const void *>(csc_rev_offsets);
     return graph;
+}
+
+void
+require_gnn_backend_version(size_t minimum_version, char const *operation) {
+    auto const backend_version = detail::get_backend_version();
+    if (backend_version < minimum_version) {
+        auto const message = std::string(operation) + " requires cuDNN " +
+                             detail::convert_version_to_str(minimum_version) + " or newer; loaded " +
+                             detail::convert_version_to_str(backend_version);
+        throw std::runtime_error(message);
+    }
 }
 
 void
@@ -56,7 +64,7 @@ throw_if_gnn_failed(cudnnStatus_t status, char const *operation) {
         throw std::invalid_argument(message);
     }
     if (status == CUDNN_STATUS_NOT_SUPPORTED || status == CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH) {
-        throw cudnnGraphNotSupportedException(message.c_str());
+        throw std::runtime_error(message);
     }
     throw std::runtime_error(message);
 }
@@ -78,10 +86,7 @@ ensure_cuda_runtime_context() {
 
 void
 init_gnn_submodule([[maybe_unused]] py::module_ &m) {
-    // maybe_unused: with pre-9.26 cuDNN headers (or on Windows) the #if body
-    // below compiles away entirely and -Werror=unused-parameter breaks the
-    // build (seen with the pip source build inside containers shipping older
-    // cuDNN headers).
+    // maybe_unused: on Windows the binding bodies compile away entirely.
 #if CUDNN_VERSION >= 92600 && !defined(_WIN32)
     py::enum_<cudnnGnnAggOp_t>(m, "gnn_agg_op")
         .value("SUM", CUDNN_GNN_AGG_SUM)
@@ -200,16 +205,17 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
         py::arg("concat_feat_dim"),
         py::arg("data_type"),
         py::arg("agg_op"));
+#endif
 
-#if CUDNN_VERSION >= 92800
-    py::enum_<cudnnGnnActivationOp_t>(m, "gnn_activation_op")
-        .value("LINEAR", CUDNN_GNN_ACT_LINEAR)
-        .value("RELU", CUDNN_GNN_ACT_RELU)
-        .value("SIGMOID", CUDNN_GNN_ACT_SIGMOID)
-        .value("TANH", CUDNN_GNN_ACT_TANH)
-        .value("ELU", CUDNN_GNN_ACT_ELU)
-        .value("SCALAR", CUDNN_GNN_ACT_SCALAR)
-        .value("LEAKY_RELU", CUDNN_GNN_ACT_LEAKY_RELU);
+#if !defined(_WIN32)
+    py::enum_<detail::gnn_activation_op_t>(m, "gnn_activation_op")
+        .value("LINEAR", detail::gnn_activation_op_t::LINEAR)
+        .value("RELU", detail::gnn_activation_op_t::RELU)
+        .value("SIGMOID", detail::gnn_activation_op_t::SIGMOID)
+        .value("TANH", detail::gnn_activation_op_t::TANH)
+        .value("ELU", detail::gnn_activation_op_t::ELU)
+        .value("SCALAR", detail::gnn_activation_op_t::SCALAR)
+        .value("LEAKY_RELU", detail::gnn_activation_op_t::LEAKY_RELU);
 
     m.def(
         "gnn_mha_gat_forward",
@@ -235,11 +241,14 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            int num_heads,
            bool concat_heads,
            int data_type) {
+            require_gnn_backend_version(92800, "cudnnGnnMhaGatForward");
             ensure_cuda_runtime_context();
             auto graph =
                 make_csc_graph(csc_offsets, csc_indices, map_csc_to_coo, n_src_nodes, n_dst_nodes, n_indices, idx_type);
-            cudnnGnnMhaParams_t params{
-                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            detail::gnn_mha_params_t params{static_cast<detail::gnn_activation_op_t>(activation),
+                                            activation_alpha,
+                                            num_heads,
+                                            concat_heads ? 1 : 0};
             auto status = detail::gnn_mha_gat_forward(reinterpret_cast<cudaStream_t>(stream),
                                                       &graph,
                                                       reinterpret_cast<const void *>(src_features),
@@ -314,6 +323,7 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            std::intptr_t grad_workspace_weights,
            int grad_data_type,
            int grad_weight_type) {
+            require_gnn_backend_version(92800, "cudnnGnnMhaGatBackward");
             ensure_cuda_runtime_context();
             auto graph = make_csc_graph(csc_offsets,
                                         csc_indices,
@@ -324,8 +334,10 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
                                         idx_type,
                                         csc_rev_offsets,
                                         map_rev_to_coo);
-            cudnnGnnMhaParams_t params{
-                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            detail::gnn_mha_params_t params{static_cast<detail::gnn_activation_op_t>(activation),
+                                            activation_alpha,
+                                            num_heads,
+                                            concat_heads ? 1 : 0};
             auto status = detail::gnn_mha_gat_backward(
                 reinterpret_cast<cudaStream_t>(stream),
                 &graph,
@@ -411,11 +423,14 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            int num_heads,
            bool concat_heads,
            int data_type) {
+            require_gnn_backend_version(92800, "cudnnGnnMhaGatV2Forward");
             ensure_cuda_runtime_context();
             auto graph =
                 make_csc_graph(csc_offsets, csc_indices, map_csc_to_coo, n_src_nodes, n_dst_nodes, n_indices, idx_type);
-            cudnnGnnMhaParams_t params{
-                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            detail::gnn_mha_params_t params{static_cast<detail::gnn_activation_op_t>(activation),
+                                            activation_alpha,
+                                            num_heads,
+                                            concat_heads ? 1 : 0};
             auto status = detail::gnn_mha_gat_v2_forward(reinterpret_cast<cudaStream_t>(stream),
                                                          &graph,
                                                          reinterpret_cast<const void *>(src_features),
@@ -489,6 +504,7 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
            std::intptr_t grad_workspace_features,
            std::intptr_t grad_workspace_weights,
            int grad_type) {
+            require_gnn_backend_version(92800, "cudnnGnnMhaGatV2Backward");
             ensure_cuda_runtime_context();
             auto graph = make_csc_graph(csc_offsets,
                                         csc_indices,
@@ -499,8 +515,10 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
                                         idx_type,
                                         csc_rev_offsets,
                                         map_rev_to_coo);
-            cudnnGnnMhaParams_t params{
-                static_cast<cudnnGnnActivationOp_t>(activation), activation_alpha, num_heads, concat_heads ? 1 : 0};
+            detail::gnn_mha_params_t params{static_cast<detail::gnn_activation_op_t>(activation),
+                                            activation_alpha,
+                                            num_heads,
+                                            concat_heads ? 1 : 0};
             auto status =
                 detail::gnn_mha_gat_v2_backward(reinterpret_cast<cudaStream_t>(stream),
                                                 &graph,
@@ -559,7 +577,6 @@ init_gnn_submodule([[maybe_unused]] py::module_ &m) {
         py::arg("grad_workspace_features"),
         py::arg("grad_workspace_weights"),
         py::arg("grad_type") = -1);
-#endif
 #endif
 }
 
