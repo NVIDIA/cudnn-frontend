@@ -113,7 +113,7 @@ output = mha_gat(
 
 ## Support and determinism
 
-The bindings are compiled with cuDNN 9.28 or newer headers on non-Windows platforms and resolve backend entry points when called. The backend requires SM 8.0 or newer.
+On non-Windows platforms, the bindings resolve the GAT backend entry points dynamically and require the loaded cuDNN backend to be 9.28 or newer; cuDNN 9.28 headers are not required at build time. The backend requires SM 8.0 or newer.
 
 By default, backward uses atomic accumulation for node-feature and attention-weight gradients. For deterministic backward, construct reverse-CSC metadata and request the deterministic path explicitly:
 
