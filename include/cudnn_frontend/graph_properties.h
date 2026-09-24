@@ -3082,6 +3082,96 @@ class Block_scale_quantize_attributes : public Attributes<Block_scale_quantize_a
     }
 };
 
+// Owns customer CUDA device source and compile-time metadata. Runtime weights
+// and scales are graph tensors, never embedded addresses or host callbacks.
+class Weight_dequantize_program {
+   public:
+    std::string source;
+    std::string entry;
+    int64_t abi_version             = 1;
+    std::vector<int64_t> tile_shape = {32, 64};
+    int64_t cta_smem_bytes          = 0;
+    int64_t stage_smem_bytes        = 0;
+    int64_t input_alignment         = 16;
+    std::vector<int64_t> constants;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Weight_dequantize_program,
+                                   source,
+                                   entry,
+                                   abi_version,
+                                   tile_shape,
+                                   cta_smem_bytes,
+                                   stage_smem_bytes,
+                                   input_alignment,
+                                   constants)
+    Weight_dequantize_program&
+    set_source(std::string const& value) {
+        source = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_entry(std::string const& value) {
+        entry = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_abi_version(int64_t value) {
+        abi_version = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_tile_shape(std::vector<int64_t> const& value) {
+        tile_shape = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_cta_smem_bytes(int64_t value) {
+        cta_smem_bytes = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_stage_smem_bytes(int64_t value) {
+        stage_smem_bytes = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_input_alignment(int64_t value) {
+        input_alignment = value;
+        return *this;
+    }
+    Weight_dequantize_program&
+    set_constants(std::vector<int64_t> const& value) {
+        constants = value;
+        return *this;
+    }
+};
+
+class Weight_dequantize_attributes : public Attributes<Weight_dequantize_attributes> {
+    friend class Attributes<Weight_dequantize_attributes>;
+    friend class WeightDequantizeNode;
+    friend class Graph;
+    Weight_dequantize_program program;
+    int64_t auxiliary_count = 0;
+
+   public:
+    // Fixed, ordered auxiliary ports preserve their order across JSON and UIDs.
+    enum class input_names { WEIGHTS, AUX_0, AUX_1, AUX_2, AUX_3, AUX_4, AUX_5, AUX_6, AUX_7 };
+    enum class output_names { Y };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Weight_dequantize_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   program,
+                                   auxiliary_count)
+    Weight_dequantize_attributes&
+    set_program(Weight_dequantize_program const& value) {
+        program = value;
+        return *this;
+    }
+};
+
 class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequantize_attributes> {
     friend class Attributes<Block_scale_dequantize_attributes>;
     friend class BlockScaleDequantizeNode;

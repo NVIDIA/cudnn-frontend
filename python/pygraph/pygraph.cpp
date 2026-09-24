@@ -283,6 +283,33 @@ PyGraph::conv_wgrad(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& i
 }
 
 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+PyGraph::weight_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& weights,
+                           std::string const& source,
+                           std::string const& entry,
+                           std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> const& auxiliaries,
+                           int64_t abi_version,
+                           std::vector<int64_t> const& tile_shape,
+                           int64_t cta_smem_bytes,
+                           int64_t stage_smem_bytes,
+                           int64_t input_alignment,
+                           std::vector<int64_t> const& constants,
+                           std::string const& name) {
+    auto program = cudnn_frontend::graph::Weight_dequantize_program{}
+                       .set_source(source)
+                       .set_entry(entry)
+                       .set_abi_version(abi_version)
+                       .set_tile_shape(tile_shape)
+                       .set_cta_smem_bytes(cta_smem_bytes)
+                       .set_stage_smem_bytes(stage_smem_bytes)
+                       .set_input_alignment(input_alignment)
+                       .set_constants(constants);
+    return graph->weight_dequantize(
+        weights,
+        auxiliaries,
+        cudnn_frontend::graph::Weight_dequantize_attributes{}.set_program(program).set_name(name));
+}
+
+std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 PyGraph::block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                                 std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
                                 std::vector<int32_t> const& block_size,
@@ -1087,6 +1114,26 @@ init_pygraph_submodule(py::module_& m) {
                 Returns:
                     cudnn_tensor: The result of reduction operation.
             )pbdoc")
+        .def("weight_dequantize",
+             &PyGraph::weight_dequantize,
+             py::arg("weights"),
+             py::arg("source"),
+             py::arg("entry"),
+             py::arg("auxiliaries")      = std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>{},
+             py::arg("abi_version")      = 1,
+             py::arg("tile_shape")       = std::vector<int64_t>{32, 64},
+             py::arg("cta_smem_bytes")   = 0,
+             py::arg("stage_smem_bytes") = 0,
+             py::arg("input_alignment")  = 16,
+             py::arg("constants")        = std::vector<int64_t>{},
+             py::arg("name")             = "",
+             R"pbdoc(Dequantize custom narrow numerical weights with customer CUDA device source.
+
+Weights are physical byte storage; auxiliaries are ordered runtime scale/metadata tensors.
+The source and entry implement device ABI 1 and become part of the compiled GEMM.
+Set the returned virtual tensor's logical [1,K,N] shape and FP16/BF16 dtype explicitly.
+Scratch declarations are bytes per CTA/per stage; zero is valid. Requires the experimental backend.
+)pbdoc")
         .def("block_scale_dequantize",
              &PyGraph::block_scale_dequantize,
              py::arg("input"),

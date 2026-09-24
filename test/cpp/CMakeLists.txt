@@ -30,6 +30,7 @@ add_executable(
     tensor.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
+    weight_dequantize.cpp
 )
 
 if (MSVC)

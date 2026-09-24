@@ -93,6 +93,9 @@ navigation:
           - page: FFT Causal Conv1d
             path: ../../operations/FFTCausalConv1d.md
             slug: FFTCausalConv1d
+          - page: Custom weight dequantization (experimental)
+            path: ../../operations/WeightDequantize.md
+            slug: WeightDequantize
           - page: Matmul
             path: ../../operations/Matmul.md
             slug: Matmul

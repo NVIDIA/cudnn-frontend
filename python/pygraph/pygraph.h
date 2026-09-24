@@ -324,6 +324,19 @@ class PyGraph {
                    std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
+    weight_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const& weights,
+                      std::string const& source,
+                      std::string const& entry,
+                      std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>> const& auxiliaries,
+                      int64_t abi_version,
+                      std::vector<int64_t> const& tile_shape,
+                      int64_t cta_smem_bytes,
+                      int64_t stage_smem_bytes,
+                      int64_t input_alignment,
+                      std::vector<int64_t> const& constants,
+                      std::string const& name);
+
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& descale,
                            std::vector<int32_t> const& block_size,
