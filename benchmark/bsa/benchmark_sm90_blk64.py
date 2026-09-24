@@ -50,6 +50,7 @@ def main():
         samples=7,
         results=[],
     )
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     for b, h, sq, sk, count in shapes:
         torch.manual_seed(20260917)
         q = torch.randn(b, h, sq, 128, device="cuda", dtype=torch.bfloat16)
