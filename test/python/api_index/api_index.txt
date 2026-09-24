@@ -385,6 +385,9 @@ cudnn.jax.call
 cudnn.jax.gemm_operand_spec
 cudnn.jax.grouped_gemm_dswiglu
 cudnn.jax.grouped_gemm_swiglu
+cudnn.jax.kimi_delta_attention
+cudnn.jax.kimi_delta_attention_bwd
+cudnn.jax.kimi_delta_attention_fwd
 cudnn.jax.neg_inf_init
 cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec

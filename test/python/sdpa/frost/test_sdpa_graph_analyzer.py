@@ -1703,6 +1703,117 @@ def test_paged_mixed_head_dims_are_served():
         assert engines.engine_name() in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
 
 
+def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False):
+    """The same paged contract on the per-tensor FP8 node (scalar descales, Amax_O
+    out); ``thd``: ragged Q/O (ragged offsets) over the pools."""
+    fp8 = cudnn.data_type.FP8_E4M3
+    g = cudnn.pygraph(io_data_type=fp8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    b, h, kh, s_q = B, H, 2, 4
+    q = g.tensor(dim=(b, h, s_q, d), stride=(s_q * h * d, d, h * d, 1), data_type=fp8, name="q")
+    if thd:
+        q.set_ragged_offset(g.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="q_ro"))
+    num_pages = b * max_pages
+    strides = (kh * page_size * d, page_size * d, d, 1) if hnd else (page_size * kh * d, d, kh * d, 1)
+    k = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=fp8, name="k")
+    v = g.tensor(dim=(num_pages, kh, page_size, d), stride=strides, data_type=fp8, name="v")
+    tk = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tk")
+    tv = g.tensor(dim=(b, 1, max_pages, 1), stride=(max_pages, max_pages, 1, 1), data_type=cudnn.data_type.INT32, name="tv")
+    slq = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slq")
+    slk = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="slk")
+
+    def _sc(name):
+        return g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name=name)
+
+    o, _stats, _amax_s, amax_o = g.sdpa_fp8(
+        name="s",
+        q=q,
+        k=k,
+        v=v,
+        descale_q=_sc("dq"),
+        descale_k=_sc("dk"),
+        descale_v=_sc("dv"),
+        descale_s=_sc("ds"),
+        scale_s=_sc("ss"),
+        scale_o=_sc("so"),
+        attn_scale=0.1,
+        generate_stats=False,
+        use_padding_mask=True,
+        seq_len_q=slq,
+        seq_len_kv=slk,
+        paged_attention_k_table=tk,
+        paged_attention_v_table=tv,
+    )
+    _finish_output(o, (b, h, s_q, d), (s_q * h * d, d, h * d, 1), dtype=cudnn.data_type.HALF)
+    if thd:
+        o.set_ragged_offset(g.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="o_ro"))
+    amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+def test_paged_fp8_probe_accepts_and_declines():
+    """Paged per-tensor FP8 is the d128 FP8 kernel's PAGED_KV specialization: the fp8
+    row admits d128 (and d64 on its envelope) pools in HND or NHD, dense Q only; it
+    declines the d256 flavor, THD queries over pools and off-contract page sizes.
+    The f16/bf16 row never serves an sdpa_fp8 graph."""
+    fp8_name = engines.engine_name(fp8=True)
+    for hnd in (True, False):
+        facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
+        assert facts.has_paged_kv and facts.is_fp8 and facts.padded and facts.page_size == 16
+        elig = _eligible(_mk_paged_graph_fp8(hnd=hnd))
+        assert fp8_name in elig and engines.engine_name() not in elig
+    assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
+    assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=256)), "paged per-tensor FP8 is wired on the d128 flavor only"
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=192)), "(192, 192) would select the d256 FP8 flavor"
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
+    assert fp8_name not in _eligible(_mk_paged_graph_fp8(thd=True)), "THD queries over FP8 pools clamp runtime K/V descriptors; declined"
+
+
+def test_paged_quantized_rows_mismatch_reasons():
+    """The row-level reasons, by field: the MXFP8 rows do not admit paged pools at all
+    (block-scale SF atoms are 128-row bundles), the Rubin per-tensor FP8 row does not
+    either (its sibling kernel has no PAGED_KV specialization), and the SM100 FP8 row's
+    paged sub-gates name THD and the d128 envelope."""
+
+    def paged_facts(**kw):
+        base = dict(
+            b=2,
+            h_q=8,
+            h_kv=2,
+            s_q=1,
+            s_kv=128,
+            d_qk=128,
+            d_v=128,
+            dtype=cudnn.data_type.FP8_E4M3,
+            dtype_o=cudnn.data_type.HALF,
+            has_paged_kv=True,
+            page_size=16,
+            padded=True,
+            device_cc=(10, 0),
+        )
+        base.update(kw)
+        return ga.SdpaGraphFacts(**base)
+
+    spec = {s.name: s for s in engines.ENGINE_SPECS}
+    fp8 = spec[engines.engine_name(fp8=True)].capabilities
+    mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
+    fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
+    assert fp8.paged_kv and not fp8_rubin.paged_kv and not mxfp8.paged_kv
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True)) is None
+    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
+    assert "paged attention" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
+    assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
+    assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
+    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(128, 128)} on the fp8 row).
+    assert "wired on the d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
+    assert "wired on the d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
+    # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
+    assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert "page_size" in engines.mismatch(fp8, paged_facts(is_fp8=True, page_size=48))
+    assert "use_padding_mask" in engines.mismatch(fp8, paged_facts(is_fp8=True, padded=False))
+
+
 def test_paged_split_kv_is_proposed_on_a_decode_launch(monkeypatch):
     """The padded exclusion on split-KV is lifted for paged graphs: a B=2, H_kv=2
     decode launch over 128k tokens must be offered a split plan."""
