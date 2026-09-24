@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -78,9 +77,14 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         assert num_splits >= 1, "num_splits must be >= 1"
         self.num_splits = num_splits
         self.use_tma_o = self.value_dim <= head_dim and self.num_splits == 1
+        # Non-split uses two V slots to overlap QK[j] with PV[j-1]. Split waits for each PV
+        # before reusing one slot; its TMA/PV views and barrier expect a single 2D V tile.
+        # Setting both paths to 2 would break split's view contract and add unused SMEM.
+        self.v_stages = 2 if self.num_splits == 1 else 1
+        self.min_blocks_per_mp = 3 if self.num_splits == 1 else 4
         self.has_block_sizes = has_block_sizes
         # Compile-time specialization: only the empty-enabled variant pays for the
-        # runtime num_n_tiles > 0 guard in the non-split kernel.
+        # empty-safe finalizer. The non-split kernel's num_n_tiles > 0 guard is unconditional.
         self.allow_empty_block_nums = allow_empty_block_nums
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
@@ -114,6 +118,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
+        # Single-stage Q/K, double-buffered V: overlap QK[j] with PV[j-1].
+        # Reuse K after wait_group(1); reuse V and update P/O after wait_group(0).
+        # Reuse Q storage for O only after the final drain.
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -134,10 +141,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         op = pipeline.PipelineOp.TmaLoad
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        # Initialize single stage barrier for Q/K/V
+        # Single-stage barriers for Q/K, two-stage ring for V
         Q_barrier = (pipeline.MbarrierArray(shared_storage.Q_barrier.data_ptr(), num_stages=1, agent=(op, cg)),)
         K_barrier = (pipeline.MbarrierArray(shared_storage.K_barrier.data_ptr(), num_stages=1, agent=(op, cg)),)
-        V_barrier = (pipeline.MbarrierArray(shared_storage.V_barrier.data_ptr(), num_stages=1, agent=(op, cg)),)
+        V_barrier = (pipeline.MbarrierArray(shared_storage.V_barrier.data_ptr(), num_stages=self.v_stages, agent=(op, cg)),)
 
         # partition tensors
         sQ = shared_storage.Q_smem.get_tensor(Q_smem_layout.outer, swizzle=Q_smem_layout.inner)
@@ -147,15 +154,19 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         mO_slice = mO[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
         mLSE_slice = mLSE[None, work_desc.qo_head_idx, work_desc.batch_idx]
         mQ_slice = mQ[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
-        mK_slice = mK[None, None, work_desc.kv_head_idx, work_desc.batch_idx]
-        mV_slice = mV[None, None, work_desc.kv_head_idx, work_desc.batch_idx]
+        # The K/V TMA coordinates are loop-invariant, but ptxas re-reads SR_CTAID (S2UR) for them inside
+        # every per-step TMA issue branch. Routed through a warp shuffle they stay in registers (seen in SASS, not guaranteed).
+        kv_head_u = cute.arch.make_warp_uniform(work_desc.kv_head_idx)
+        batch_u = cute.arch.make_warp_uniform(work_desc.batch_idx)
+        mK_slice = mK[None, None, kv_head_u, batch_u]
+        mV_slice = mV[None, None, kv_head_u, batch_u]
         gO = cute.local_tile(mO_slice, (self.tile_shape_pv[0], self.tile_shape_pv[1]), coord=(work_desc.qo_tile_idx, 0))
         gQ = cute.local_tile(mQ_slice, (self.tile_shape_qk[0], self.tile_shape_qk[2]), coord=(work_desc.qo_tile_idx, 0))
         gK = cute.local_tile(mK_slice, (self.tile_shape_qk[1], self.tile_shape_qk[2]), coord=(None, 0))
         gV = cute.local_tile(mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None))
 
         gIndices = blocksparse_indices_q2k[None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
-        num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+        gBSZ = None  # only read when has_block_sizes
         if cutlass.const_expr(self.has_block_sizes):
             gBSZ = blocksparse_varblk[None, work_desc.qo_head_idx, work_desc.batch_idx]
 
@@ -175,6 +186,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tOrV = tiled_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV))
         tOrO = cute.make_rmem_tensor(thr_mma_pv.partition_shape_C((self.tile_shape_pv[0], self.tile_shape_pv[1])), self.acc_dtype)
+        tOrP = cute.make_rmem_tensor_like(convert_c_layout_to_a_layout(tSrS.layout, tiled_mma_pv.tv_layout_A.shape[1]), self.K_dtype)
 
         max_m_layout = cute.make_layout(cute.size(layout_acc_mn(tiled_mma_pv, tOrO.layout), mode=[0]))
         max_m = cute.make_rmem_tensor_like(max_m_layout, cutlass.Float32)
@@ -184,70 +196,71 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         max_m.store(cute.full_like(max_m, float("-inf"), cutlass.Float32))
         sum_m.store(cute.full_like(sum_m, 0.0, cutlass.Float32))
 
-        if cutlass.const_expr(self.allow_empty_block_nums):
-            # Variable counts may contain empty rows. Keep the branch CTA-uniform
-            # and avoid reading gIndices[-1]. Empty rows fall through to the
-            # empty-safe finalizer and produce O=0, LSE=-inf.
-            process_tile = num_n_tiles > 0
-        else:
-            process_tile = True
-        if process_tile:
-            n_tile_ind_ = num_n_tiles - 1  # indirect tile index (logical), needs to be looked up
-            n_tile_idx_ = gIndices[n_tile_ind_]  # direct tile index (physical)
+        # Q does not depend on the list: issue it before the count and index loads resolve. The count is
+        # loaded only after this branch in source order: loaded before it, ptxas hoisted its `> 0` compare
+        # above the branch, so the Q TMA (and the speculative index load below) waited for the count.
+        if warp_idx == 0:
+            Q_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["Q"])
+            cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=Q_barrier[0].get_barrier(0))
+
+        # Candidate index first, actual count second, validation last — the candidate address no longer depends on count, so the two metadata loads can overlap.
+        list_capacity = cute.size(gIndices, mode=[0])
+        n_tile_idx_spec = cutlass.Int32(0)
+        if list_capacity > 0:
+            n_tile_idx_spec = gIndices[list_capacity - 1]
+        num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+
+        # CTA-uniform guard: the prologue and the drain wait on loads that are only issued when the
+        # list is non-empty. Empty rows fall through to the finalizer (O=0, LSE=-inf when empty-safe).
+        if num_n_tiles > 0:
+            n_tile_idx_ = n_tile_idx_spec
+            if num_n_tiles != list_capacity:
+                n_tile_idx_ = gIndices[num_n_tiles - 1]
 
             if warp_idx == 0:
-                Q_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.Q_dtype, Q_smem_layout))
-                cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=Q_barrier[0].get_barrier(0))
-
-                K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
+                K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
                 cute.copy(tma_atom_K, tKgK[None, n_tile_idx_], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+
+                V_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["V"])
+                cute.copy(tma_atom_V, tVgV[None, n_tile_idx_], tVsV[None, 0], tma_bar_ptr=V_barrier[0].get_barrier(0))
 
             cute.arch.sync_threads()
 
             Q_barrier[0].wait(index=0, phase=0)
-            n_tile_idx_next = n_tile_idx_
-            for n_tile_ind in cutlass.range(num_n_tiles - 1, -1, -1):
-                n_tile_idx = n_tile_idx_next
-                n_tile_idx_next = -1
-                if n_tile_ind > 0:
-                    n_tile_idx_next = gIndices[n_tile_ind - 1]
-                if cutlass.const_expr(self.has_block_sizes):
-                    varblk = gBSZ[n_tile_idx]
-                else:
-                    varblk = cutlass.Int32(self.tile_size)
-                    if n_tile_idx == num_compute_tiles - 1:
-                        varblk = seqlen - n_tile_idx * self.tile_size
-
-                # load this V block
-                if warp_idx == 0:
-                    V_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.V_dtype, V_smem_layout))
-                    cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV, tma_bar_ptr=V_barrier[0].get_barrier(0))
-
-                # compute Q@K
-                K_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
-                cute.nvgpu.warpgroup.fence()  # implicit sync WG
-                gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(0)
-
-                # load next K block
-                if warp_idx == 0 and n_tile_idx_next >= 0:
-                    K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
-                    cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
-
-                mask(tiled_mma_qk, tSrS, tScS, varblk)
-                prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
-                inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
-
-                # compute P@V
-                rescale_o_for_next_acc(tiled_mma_pv, tOrO, prev_ratio)
-                tOrP = make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype)
-                V_barrier[0].wait(index=0, phase=(num_n_tiles - n_tile_ind - 1) % 2)
-                cute.nvgpu.warpgroup.fence()  # implicit sync WG
-                tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV, tOrO)
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(0)
+            self.mainloop(
+                n_tile_idx_=n_tile_idx_,
+                num_n_tiles=num_n_tiles,
+                gIndices=gIndices,
+                gBSZ=gBSZ,
+                seqlen=seqlen,
+                num_compute_tiles=num_compute_tiles,
+                warp_idx=warp_idx,
+                tma_atom_K=tma_atom_K,
+                tma_atom_V=tma_atom_V,
+                tKgK=tKgK,
+                tKsK=tKsK,
+                tVgV=tVgV,
+                tVsV=tVsV,
+                K_barrier=K_barrier,
+                V_barrier=V_barrier,
+                tiled_mma_qk=tiled_mma_qk,
+                tiled_mma_pv=tiled_mma_pv,
+                tSrQ=tSrQ,
+                tSrK=tSrK,
+                tSrS=tSrS,
+                tScS=tScS,
+                tOrV=tOrV,
+                tOrO=tOrO,
+                tOrP=tOrP,
+                max_m=max_m,
+                sum_m=sum_m,
+                scale_softmax_log2e=scale_softmax_log2e,
+            )
+        else:
+            # Empty row: Q was still loaded. Let it land before its SMEM is reused for O staging or the
+            # CTA exits (the sync publishes the barrier initialization to every waiting thread).
+            cute.arch.sync_threads()
+            Q_barrier[0].wait(index=0, phase=0)
 
         if cutlass.const_expr(self.allow_empty_block_nums):
             final_ratio, lse = get_final_ratio_and_lse_empty_safe(max_m, sum_m, scale_softmax_log2e)
@@ -291,6 +304,130 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             tOrO_cv = tiled_copy_o_r2g.retile(tOrO_cvt)
             tOgO = tiled_copy_o_r2g.get_slice(tidx).partition_D(gO)
             cute.autovec_copy(tOrO_cv, tOgO)
+
+    @cute.jit
+    def mainloop(
+        self,
+        *,
+        n_tile_idx_: cutlass.Int32,
+        num_n_tiles: cutlass.Int32,
+        gIndices: cute.Tensor,
+        gBSZ: cute.Tensor,
+        seqlen: cutlass.Int32,
+        num_compute_tiles: cutlass.Int32,
+        warp_idx: cutlass.Int32,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        tKgK: cute.Tensor,
+        tKsK: cute.Tensor,
+        tVgV: cute.Tensor,
+        tVsV: cute.Tensor,
+        K_barrier,
+        V_barrier,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        tSrQ: cute.Tensor,
+        tSrK: cute.Tensor,
+        tSrS: cute.Tensor,
+        tScS: cute.Tensor,
+        tOrV: cute.Tensor,
+        tOrO: cute.Tensor,
+        tOrP: cute.Tensor,
+        max_m: cute.Tensor,
+        sum_m: cute.Tensor,
+        scale_softmax_log2e: cutlass.Float32,
+    ):
+        """QK[j] and PV[j-1] in flight together; wait_group(1) retires QK[j] before softmax[j]."""
+        # Every PV accumulates into O (zero-initialized): set once, so no MMA atom is loop-carried.
+        tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        # The list base address is loop-invariant, but ptxas rematerializes it every iteration (4 LDC.64 +
+        # CTAID reads + an IMAD chain). Routed through a warp shuffle it stays in registers (seen in SASS, not guaranteed).
+        gIdx = hoist_list_base(gIndices)
+        # ---- prologue: QK[0] and softmax[0]; O is still zero, so it needs no rescale ----
+        n_tile_idx = n_tile_idx_
+        n_tile_idx_next = -1
+        if num_n_tiles > 1:
+            n_tile_idx_next = gIndices[num_n_tiles - 2]
+        varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
+
+        K_barrier[0].wait(index=0, phase=0)
+        cute.nvgpu.warpgroup.fence()
+        gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(0)
+
+        if warp_idx == 0 and n_tile_idx_next >= 0:
+            K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
+            cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+
+        mask(tiled_mma_qk, tSrS, tScS, varblk)
+        get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+        inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+        cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
+
+        # alpha carries softmax[j-1]'s ratio to step j, which rescales O between the QK[j] and PV[j-1] issues so
+        # the FMULs overlap QK[j] (O is free: PV[j-2] retired at step j-1). O is 0 at first use, so start at 1.0.
+        alpha = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
+        alpha.fill(1.0)
+
+        # ---- steady state: step j = 1 .. N-1 walks list slot N-1-j ----
+        for n_tile_ind in cutlass.range(num_n_tiles - 2, -1, -1):
+            step = num_n_tiles - 1 - n_tile_ind
+            n_tile_idx = n_tile_idx_next
+            n_tile_idx_next = -1
+            if n_tile_ind > 0:
+                n_tile_idx_next = gIdx[n_tile_ind - 1]
+            varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
+
+            v_slot = step % 2  # V ring: V[j] fills slot j%2, whose barrier phase is (j//2)%2
+            if warp_idx == 0:
+                V_barrier[0].arrive_and_expect_tx(index=v_slot, tx_count=self.tma_copy_bytes["V"])
+                cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV[None, v_slot], tma_bar_ptr=V_barrier[0].get_barrier(v_slot))
+
+            K_barrier[0].wait(index=0, phase=step % 2)  # one K slot: its phase flips every step
+            cute.nvgpu.warpgroup.fence()
+            gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
+            cute.nvgpu.warpgroup.commit_group()
+
+            rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
+            V_barrier[0].wait(index=1 - v_slot, phase=((step - 1) // 2) % 2)
+            cute.nvgpu.warpgroup.fence()  # O was rescaled after the QK[j] fence
+            cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV[None, None, None, 1 - v_slot], tOrO)
+            cute.nvgpu.warpgroup.commit_group()
+            cute.nvgpu.warpgroup.wait_group(1)  # QK[j] retired, PV[j-1] may still run
+
+            if warp_idx == 0 and n_tile_idx_next >= 0:
+                K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
+                cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+
+            mask(tiled_mma_qk, tSrS, tScS, varblk)
+            prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+            inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
+
+            # In current SASS ptxas hoists this wait above the softmax, so softmax[j] does not overlap PV[j-1].
+            cute.nvgpu.warpgroup.wait_group(0)  # PV[j-1] retired: O and P registers are free
+            cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
+            cute.autovec_copy(prev_ratio, alpha)
+
+        # ---- drain: PV[N-1] ----
+        last = num_n_tiles - 1
+        rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
+        V_barrier[0].wait(index=last % 2, phase=(last // 2) % 2)
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV[None, None, None, last % 2], tOrO)
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(0)
+
+    @cute.jit
+    def block_len(self, n_tile_idx, gBSZ: cute.Tensor, seqlen, num_compute_tiles):
+        """Valid key count of physical KV block n_tile_idx."""
+        varblk = cutlass.Int32(self.tile_size)
+        if cutlass.const_expr(self.has_block_sizes):
+            varblk = gBSZ[n_tile_idx]
+        else:
+            if n_tile_idx == num_compute_tiles - 1:
+                varblk = seqlen - n_tile_idx * self.tile_size
+        return varblk
 
     @cute.kernel
     def kernel_split(
@@ -545,7 +682,18 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 
         self.Q_smem_layout = cute.tile_to_shape(Q_smem_layout_atom, (self.tile_shape_qk[0], self.tile_shape_qk[2]), order=(0, 1))
         self.K_smem_layout = cute.tile_to_shape(K_smem_layout_atom, (self.tile_shape_qk[1], self.tile_shape_qk[2]), order=(0, 1))
-        self.V_smem_layout = cute.tile_to_shape(V_smem_layout_atom, (self.tile_shape_pv[1], self.tile_shape_pv[2]), order=(1, 0))
+        if cutlass.const_expr(self.v_stages == 1):
+            self.V_smem_layout = cute.tile_to_shape(V_smem_layout_atom, (self.tile_shape_pv[1], self.tile_shape_pv[2]), order=(1, 0))
+            V_smem_layout_one = self.V_smem_layout
+        else:
+            self.V_smem_layout = cute.tile_to_shape(V_smem_layout_atom, (self.tile_shape_pv[1], self.tile_shape_pv[2], self.v_stages), order=(1, 0, 2))
+            V_smem_layout_one = cute.slice_(self.V_smem_layout, (None, None, 0))
+        # expect_tx bytes of one Q/K tile and one V ring slot (non-split kernel)
+        self.tma_copy_bytes = {
+            "Q": cute.size_in_bytes(self.Q_dtype, self.Q_smem_layout),
+            "K": cute.size_in_bytes(self.K_dtype, self.K_smem_layout),
+            "V": cute.size_in_bytes(self.V_dtype, V_smem_layout_one),
+        }
 
         self.O_smem_layout = self.Q_smem_layout  # dummy for non TMA O
         if cutlass.const_expr(self.num_splits == 1):
@@ -558,7 +706,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         class SharedStorage:
             Q_barrier: cute.struct.MemRange[cutlass.Int64, 1]
             K_barrier: cute.struct.MemRange[cutlass.Int64, 1]
-            V_barrier: cute.struct.MemRange[cutlass.Int64, 1]
+            V_barrier: cute.struct.MemRange[cutlass.Int64, self.v_stages]
 
             Q_smem: cute.struct.Align[cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128]
             K_smem: cute.struct.Align[cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128]
@@ -605,7 +753,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         tma_atom_V, tma_tensor_V = cute.nvgpu.cpasync.make_tiled_tma_atom(
             tma_copy_op,
             mV,
-            self.V_smem_layout,
+            V_smem_layout_one,
             (self.tile_shape_pv[1], self.tile_shape_pv[2]),
             num_multicast=1,
         )
@@ -654,7 +802,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 block=block_config,
                 smem=self.shared_storage_t.size_in_bytes(),
                 stream=stream,
-                min_blocks_per_mp=4,
+                min_blocks_per_mp=self.min_blocks_per_mp,
             )
         else:
             grid_config = self.get_split_grid_config(mQ.shape[0], mQ.shape[2], mQ.shape[3])
@@ -790,14 +938,23 @@ def gemm_zero_acc(tiled_mma, A, B, C):
         assert 0, "unreachable"
 
 
+def _tree(vals, op):
+    """Trace-time pairwise reduction: depth log2(n) instead of an n-deep dependent chain."""
+    if len(vals) == 1:
+        return vals[0]
+    half = len(vals) // 2
+    return op(_tree(vals[:half], op), _tree(vals[half:], op))
+
+
 @cute.jit
 def reduce_max(
     tSrS_mn: cute.Tensor,
     max_m: cute.Tensor,
 ):
-    for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
-        for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
-            max_m[m] = cute.arch.fmax(max_m[m], tSrS_mn[m, n])
+    # Per-row pairwise tree; max does not depend on evaluation order, so this is bitwise equal to a serial chain.
+    for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
+        row = [tSrS_mn[m, n] for n in range(cute.size(tSrS_mn, mode=[1]))]
+        max_m[m] = cute.arch.fmax(max_m[m], _tree(row, cute.arch.fmax))
 
     for m in cutlass.range_constexpr(cute.size(max_m, mode=[0])):
         max_m[m] = cute.arch.warp_reduction_max(max_m[m], threads_in_group=4)
@@ -968,3 +1125,39 @@ def layout_separate(thr, src, ref):
     if cutlass.const_expr(cute.rank(lt) == 1):
         return cute.append(lt, ge)
     return cute.append(cute.append(cute.make_layout(()), lt), ge)
+
+
+@cute.jit
+def inc_softmax_ffma(
+    tiled_mma_qk: cute.TiledMma,
+    tSrS: cute.Tensor,
+    max_m: cute.Tensor,
+    sum_m: cute.Tensor,
+    softmax_scale_log2e: cutlass.Float32,
+):
+    """inc_softmax with P = exp2(fma(s, c, -max * c)): one FFMA per element instead of FADD + FMUL (the compiler
+    does not contract (s - max) * c), and a pairwise-tree row sum (shorter FADD chain, lower LSE error)."""
+    tSrS_mn = cute.make_tensor(tSrS.iterator, layout_acc_mn(tiled_mma_qk, tSrS.layout))
+
+    for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
+        new_max = max_m[m]
+        if new_max == -cutlass.Float32.inf:
+            new_max = 0.0
+        neg_scaled_max = -(new_max * softmax_scale_log2e)
+        for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
+            tSrS_mn[m, n] = cute.math.exp2(cute.math.fma(tSrS_mn[m, n], softmax_scale_log2e, neg_scaled_max), fastmath=True)
+
+    for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
+        row = [tSrS_mn[m, n] for n in range(cute.size(tSrS_mn, mode=[1]))]
+        sum_m[m] += _tree(row, lambda a, b: a + b)
+
+
+@cute.jit
+def hoist_list_base(gIndices: cute.Tensor) -> cute.Tensor:
+    """gIndices re-based on a warp-uniform copy of its start address (same elements, same layout)."""
+    addr = gIndices.iterator.toint()
+    lo = cute.arch.make_warp_uniform(cutlass.Int32(addr & 0xFFFFFFFF))
+    hi = cute.arch.make_warp_uniform(cutlass.Int32(addr >> 32))
+    addr_u = (cutlass.Int64(hi) << 32) | (cutlass.Int64(lo) & 0xFFFFFFFF)
+    ptr = cute.make_ptr(gIndices.element_type, addr_u, cute.AddressSpace.gmem, assumed_align=4)
+    return cute.make_tensor(ptr, gIndices.layout)
