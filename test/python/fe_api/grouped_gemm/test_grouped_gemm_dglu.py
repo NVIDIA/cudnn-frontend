@@ -43,7 +43,7 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_dswiglu_utils import (
     allocate_discrete_dswiglu_output_tensors,
     check_ref_discrete_dswiglu,
 )
-from test_grouped_gemm_dglu_bf16_utils import (
+from fe_api.test_grouped_gemm_dglu_bf16_utils import (
     assert_grouped_gemm_dglu_close as assert_grouped_gemm_dglu_bf16_close,
     grouped_gemm_dglu_bf16_reference,
     make_grouped_gemm_dglu_bf16_problem,
@@ -96,6 +96,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     api._get_default_stream = lambda stream: stream
     api._runtime_error_if = lambda condition, message: None
     api._has_dbias = False
+    api.a_desc = Mock(device=torch.device("cuda:0"))
     api.weight_mode = None
     api._compiled_kernel = Mock()
     api.scratch_workspace_bytes = lambda: 128  # the workspace contract (R2) is stubbed: this test is about pointer streams
@@ -109,7 +110,8 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     )
     carved = Mock()
     carved.take.return_value.data_ptr.return_value = 0
-    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner: carved)
+    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner, *, device: carved)
+    monkeypatch.setattr(blockscaled_module, "validate_workspace_aliases", lambda *args, **kwargs: None)  # isolated pointer-stream test
     monkeypatch.setattr(blockscaled_module, "retain_workspace", lambda api, workspace, stream: None)  # part of the stubbed workspace contract
 
     b_ptrs = object()
@@ -2501,6 +2503,7 @@ def _execute_rubin_mxfp8_dglu(api, p):
         sfd_col_tensor=p["sfd_col"],
         amax_tensor=p["amax"],
         norm_const_tensor=p["norm"],
+        workspace=ws(api, p["a"].device),
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         **rubin_mxfp8_weight_arguments(p),
     )
