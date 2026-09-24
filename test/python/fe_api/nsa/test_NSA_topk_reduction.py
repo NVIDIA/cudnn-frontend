@@ -258,6 +258,9 @@ def test_nsa_topk_reduction_wrapper_lse_staging_outlives_the_released_original(r
     ref = NSA.topk_reduction_wrapper(**_wrapper_kwargs(kwargs, tensors))
     row_major = tensors["LSE"].contiguous()
     assert row_major.stride(0) != 1
+    # Warm the window's kernels first: under CUDA lazy loading a first launch waits for the device to drain (no race).
+    NSA.topk_reduction_wrapper(**dict(_wrapper_kwargs(kwargs, tensors), lse_tensor=row_major))
+    torch.empty(1, dtype=row_major.dtype, device="cuda").fill_(float("nan"))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
     side = torch.cuda.Stream()
