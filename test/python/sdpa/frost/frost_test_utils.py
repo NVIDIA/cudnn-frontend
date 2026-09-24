@@ -279,9 +279,9 @@ SASS_OPCODE_COUNTS = {
     "BSSY": ("BSSY",),
     "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
 }
-# The masked-softmax-arm pins (`tile_dsl/mask.py`, MASK_FORM): under the "bits" form every masked KV-tile body carries 4 R2P
-# per 32-column keep-word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and one ISETP per cell per mask term, and a
-# build that runs out of predicate registers spills them into GPRs through predicate-to-register moves.
+# The masked-softmax-arm pins (`tile_dsl.mask.apply_mask_chunk`, the bit-word form): every masked KV-tile body carries 4 R2P
+# per 32-column keep-word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced carried 0 R2P and one ISETP
+# per cell per mask term, and a build that ran out of predicate registers spilled them into GPRs through predicate-to-register moves.
 MASK_SASS_OPCODE_COUNTS = {
     **SASS_OPCODE_COUNTS,
     "R2P": (" R2P ",),

@@ -850,16 +850,27 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        # Served by the f16/bf16 kernels' PAGED_KV specialization on the
-        # flavors in paged_d_shapes (config_sm100._validate_params mirrors
-        # these as its backstop). The attention sink composes with it: the
-        # sink is a per-row epilogue fold and PAGED_KV only changes the K/V
-        # TMA-LDG warp (validated together in test_sdpa_fwd_paged_sm100,
-        # S_q 1..4, PackGQA on/off, HND/NHD, with a left window, on the d128,
-        # d192x128 and d256 flavors). Sink + split-KV stays declined above
-        # (the combine is not sink-aware), so sink decode runs unsplit.
-        if facts.is_fp8 or facts.is_mxfp8:
-            return "paged KV is served by the f16/bf16 kernel only"
+        # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
+        # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
+        # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
+        # as its backstop and each unwired kernel file backstops with a
+        # module-scope guard on paged_kv). The attention sink composes with it
+        # on the f16/bf16 kernels: the sink is a per-row epilogue fold and
+        # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
+        # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
+        # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
+        # stays declined above (the combine is not sink-aware), so sink decode
+        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
+        # epilogue (sf_o) over pools are not validated, so those two pairs stay
+        # declined on the fp8 row.
+        if facts.is_mxfp8:
+            return "paged KV is served by the f16/bf16 and per-tensor FP8 kernels only (MXFP8 block-scale atoms bundle 128 rows of one head)"
+        if facts.is_fp8 and facts.thd:
+            return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
+        if facts.is_fp8 and facts.has_sink:
+            return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
+        if facts.is_fp8 and facts.o_block_scale:
+            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if capabilities.paged_d_shapes is not None:
@@ -1352,6 +1363,22 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
+            # Paged KV caches (issue #920) on the SM100 line only: the d128
+            # per-tensor FP8 kernel carries the PAGED_KV specialization (block
+            # table indirection on the K/V TMA loads, HND/NHD pools, per-batch
+            # lengths on device, KV split + combine with the recombined amax);
+            # d64 rides its envelope. paged_d_shapes keeps the fp8 paged
+            # selection to the d128 flavor (d_qk, d_v <= 128: the d192x128 /
+            # d256 / d512 FP8 kernels carry no PAGED_KV specialization) and
+            # mismatch() keeps it to dense, sink-free, plain-O Q (the fp8 THD path
+            # clamps runtime K/V descriptors to a packed total a pool does not
+            # have; neither the sink fold nor the block-scaled O epilogue (sf_o)
+            # over pools is validated on this kernel).
+            # The Rubin sibling kernel has no PAGED_KV specialization, so that
+            # row stays off (a module-scope guard in the kernel file backstops
+            # it).
+            paged_kv=not rubin_row,
+            paged_d_shapes=None if rubin_row else frozenset({(128, 128)}),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
