@@ -10,7 +10,6 @@
 #include <array>
 #include <limits>
 #include <string>
-#include <unordered_map>
 
 #include <pybind11/stl.h>
 
@@ -92,6 +91,50 @@ struct Geometry {
     int64_t token, head, element, row;
 };
 
+// Host signatures may place these arguments at different positions. Resolve
+// their immutable names once; each invocation addresses the frame by slot.
+enum HostSlot : size_t {
+    QPtr,
+    KPtr,
+    VPtr,
+    OPtr,
+    QStrides,
+    KStrides,
+    VStrides,
+    OStrides,
+    QLensPtr,
+    KVLensPtr,
+    LSEPtr,
+    LSEExtent,
+    ProblemSize,
+    SinksPtr,
+    MetaPtr,
+    ODescPtr,
+    Stream,
+    ScaleSoftmaxLog2,
+    NumHostSlots
+};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
+                                                                    "k_ptr",
+                                                                    "v_ptr",
+                                                                    "o_ptr",
+                                                                    "q_strides",
+                                                                    "k_strides",
+                                                                    "v_strides",
+                                                                    "o_strides",
+                                                                    "thd_q_lens_ptr",
+                                                                    "thd_kv_lens_ptr",
+                                                                    "lse_ptr",
+                                                                    "lse_ext",
+                                                                    "problem_size",
+                                                                    "sinks_ptr",
+                                                                    "meta_ptr",
+                                                                    "o_desc_ptr",
+                                                                    "stream",
+                                                                    "scale_softmax_log2"};
+constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
+constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
+
 class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
@@ -128,26 +171,10 @@ class SdpaThdBinder {
         }
         auto order = spec.attr("order").cast<std::vector<std::string>>();
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
-        for (size_t i = 0; i < order.size(); ++i) index_[order[i]] = i;
-        for (const auto *name : {"q_ptr",
-                                 "k_ptr",
-                                 "v_ptr",
-                                 "o_ptr",
-                                 "q_strides",
-                                 "k_strides",
-                                 "v_strides",
-                                 "o_strides",
-                                 "thd_q_lens_ptr",
-                                 "thd_kv_lens_ptr",
-                                 "lse_ptr",
-                                 "lse_ext",
-                                 "problem_size",
-                                 "sinks_ptr",
-                                 "meta_ptr",
-                                 "o_desc_ptr",
-                                 "stream",
-                                 "scale_softmax_log2"}) {
-            if (!index_.count(name)) invalid(std::string("native THD host has no argument ") + name);
+        for (size_t slot = 0; slot < NumHostSlots; ++slot) {
+            auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+            if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
+            index_[slot] = static_cast<size_t>(found - order.begin());
         }
     }
 
@@ -218,31 +245,29 @@ class SdpaThdBinder {
         py::tuple frame(template_.size());
         for (size_t i = 0; i < template_.size(); ++i) frame[i] = template_[i];
         for (size_t i = Q; i <= O; ++i) {
-            put(frame, std::string(names[i]) + "_ptr", py::int_(facts[i].pointer));
-            put(frame,
-                std::string(names[i]) + "_strides",
-                py::make_tuple(geometry[i].token, geometry[i].token, geometry[i].head));
+            put(frame, pointer_slots[i], py::int_(facts[i].pointer));
+            put(frame, stride_slots[i], py::make_tuple(geometry[i].token, geometry[i].token, geometry[i].head));
         }
-        put(frame, "thd_q_lens_ptr", py::int_(q_lens.pointer));
-        put(frame, "thd_kv_lens_ptr", py::int_(kv_lens.pointer));
-        if (has_lse_) put(frame, "lse_ptr", py::int_(lse.pointer));
+        put(frame, QLensPtr, py::int_(q_lens.pointer));
+        put(frame, KVLensPtr, py::int_(kv_lens.pointer));
+        if (has_lse_) put(frame, LSEPtr, py::int_(lse.pointer));
         if (tkv == 0) {
             // Descriptor-only K/V dummy rows alias Q/O. Zero device KV lengths
             // make setup/kernel skip all reads, exactly as in the existing ABI.
             tkv = 1;
-            put(frame, "k_ptr", py::int_(facts[Q].pointer));
-            put(frame, "v_ptr", py::int_(facts[O].pointer));
+            put(frame, KPtr, py::int_(facts[Q].pointer));
+            put(frame, VPtr, py::int_(facts[O].pointer));
             const int64_t dk = declarations_[K][1], dv = declarations_[V][1];
-            put(frame, "k_strides", py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
-            put(frame, "v_strides", py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
+            put(frame, KStrides, py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
+            put(frame, VStrides, py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
         }
-        if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, "lse_ext", py::int_(tq));
-        put(frame, "problem_size", py::make_tuple(b, qh_, kh_, tq, tkv, 0));
-        put(frame, "sinks_ptr", py::int_(0));
-        put(frame, "meta_ptr", py::int_(workspace));
-        put(frame, "o_desc_ptr", py::int_(add(workspace, off_o_desc_)));
-        put(frame, "stream", std::move(stream));
-        if (!scale.is_none()) put(frame, "scale_softmax_log2", std::move(scale));
+        if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, LSEExtent, py::int_(tq));
+        put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
+        put(frame, SinksPtr, py::int_(0));
+        put(frame, MetaPtr, py::int_(workspace));
+        put(frame, ODescPtr, py::int_(add(workspace, off_o_desc_)));
+        put(frame, Stream, std::move(stream));
+        if (!scale.is_none()) put(frame, ScaleSoftmaxLog2, std::move(scale));
         return frame;
     }
 
@@ -359,13 +384,13 @@ class SdpaThdBinder {
         }
     }
     void
-    put(py::tuple &frame, const std::string &name, py::object value) const {
-        frame[index_.at(name)] = std::move(value);
+    put(py::tuple &frame, HostSlot slot, py::object value) const {
+        frame[index_[slot]] = std::move(value);
     }
 
     py::object fn_, owner_;
     py::tuple template_;
-    std::unordered_map<std::string, size_t> index_;
+    std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
