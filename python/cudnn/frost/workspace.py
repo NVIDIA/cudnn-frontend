@@ -85,17 +85,42 @@ class Workspace:
     """Execute-time view onto the caller's workspace buffer.
 
     Validates once — present, contiguous, large enough, aligned — then every
-    carve is a bounds-checked view. A buffer that fails any of these raises
+    carve is a bounds-checked view. When ``device`` is specified, also require
+    CUDA storage on that ordinal. A buffer that fails any of these raises
     with the required size in the message; it never silently corrupts memory."""
 
-    def __init__(self, buffer, required_bytes: int, owner: str, *, align: int = DEFAULT_ALIGN):
+    def __init__(self, buffer, required_bytes: int, owner: str, *, align: int = DEFAULT_ALIGN, device: int | None = None):
         required_bytes = int(required_bytes)
         if buffer is None:
             raise ValueError(
                 f"{owner} requires a {required_bytes}-byte workspace but execute() received "
                 f"none; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
             )
+        expected_device = device
         ptr, shape, strides, dtype, device = buffers.probe(buffer)
+        if expected_device is not None:
+            device_attr = getattr(buffer, "device", None)
+            device_kind = getattr(device_attr, "type", None)
+            dlpack_device = getattr(buffer, "__dlpack_device__", None)
+            if device_kind is not None and getattr(device_attr, "index", None) is not None:
+                # Tensor metadata is cheaper than invoking a framework's DLPack
+                # adapter again after probe; no framework import is needed.
+                if device_kind != "cuda":
+                    raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
+                device = device_attr.index
+            elif dlpack_device is not None:
+                device_type, device = dlpack_device()
+                if int(device_type) != 2:  # kDLCUDA; CPU/pinned-host storage is not scratch.
+                    raise ValueError(f"{owner}: workspace must be a CUDA device buffer")
+            else:
+                # CAI-only producers promise device storage but need not expose a
+                # device ordinal. Query pointer metadata; never read device contents.
+                from cuda.bindings import driver as cuda
+                from cudnn._device import _ck
+
+                device = _ck(*cuda.cuPointerGetAttribute(cuda.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, ptr))
+            if int(device) != int(expected_device):
+                raise ValueError(f"{owner}: workspace must be on cuda:{expected_device}, got cuda:{device}")
         if not buffers.is_contiguous(shape, strides):
             raise ValueError(f"{owner}: the workspace buffer must be contiguous")
         nbytes = buffers.DTYPE_ITEMSIZE[dtype]
