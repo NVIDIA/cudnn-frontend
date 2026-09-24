@@ -128,17 +128,12 @@ from cudnn.frost.tile_dsl.tma import (
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
-    apply_mask_chunk_form,
-    MASK_FORM_BITS,
+    apply_mask_chunk,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
     MASK_SWA,
 )
-
-# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked call site
-# below passes `form=MASK_FORM`; both forms mask the same set with the same sentinel, so O / LSE are bitwise identical.
-MASK_FORM: str = MASK_FORM_BITS
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
 _THD_HEAVY_ROWS_FIRST = CFG.THD_VARLEN and bool(CFG.MASK_FLAGS & MASK_CAUSAL)
@@ -217,7 +212,7 @@ def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv):
     """Apply the per-element padding predicate only to a partial KV chunk."""
     result = reg_s
     if kv_col_base + cutlass.Int32(int(reg_s.shape[0])) > eff_seqlen_kv:
-        result = apply_mask_chunk_form(
+        result = apply_mask_chunk(
             reg_s,
             cutlass.Int32(0),
             kv_col_base,
@@ -225,7 +220,6 @@ def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv):
             0,
             MASK_PADDED,
             N=int(reg_s.shape[0]),
-            form=MASK_FORM,
         )
     return result
 
@@ -2470,7 +2464,7 @@ def _softmax_kv_body(
             mask_causal_diag = None
         elif cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
             mask_flags = body_mask_flags & ~MASK_PADDED
-        reg_S_a = apply_mask_chunk_form(
+        reg_S_a = apply_mask_chunk(
             reg_S_a,
             mask_q_abs - kv_col_base_a,
             cutlass.Int32(0),
@@ -2481,12 +2475,11 @@ def _softmax_kv_body(
             bottom_right=mask_bottom_right,
             causal_diag=mask_causal_diag,
             window_right=CFG.WINDOW_RIGHT,
-            form=MASK_FORM,
         )
         if cutlass.const_expr(may_need_padding and (CFG.MASK_FLAGS & MASK_PADDED) and (CFG.MASK_FLAGS & MASK_SWA)):
             reg_S_a = _apply_padding_mask_if_needed(reg_S_a, kv_col_base_a, eff_seqlen_kv)
             reg_S_b = _apply_padding_mask_if_needed(reg_S_b, kv_col_base_b, eff_seqlen_kv)
-        reg_S_b = apply_mask_chunk_form(
+        reg_S_b = apply_mask_chunk(
             reg_S_b,
             mask_q_abs - kv_col_base_b,
             cutlass.Int32(0),
@@ -2497,7 +2490,6 @@ def _softmax_kv_body(
             bottom_right=mask_bottom_right,
             causal_diag=mask_causal_diag,
             window_right=CFG.WINDOW_RIGHT,
-            form=MASK_FORM,
         )
 
         max_a = row_max_reduction_64(reg_S_a)

@@ -1868,11 +1868,11 @@ def canonicalize_d192_lowering(
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time
         # `window_right` at the kernel's mask sites, so it must sit INSIDE the
-        # bits mask form's Int32 domain: `apply_mask_chunk_bits` raises at trace
+        # bit-word mask op's Int32 domain: `apply_mask_chunk` raises at trace
         # time from MASK_BOUND_LIMIT (1 << 30) on, and a trace-time raise is a
         # typed decline at engine.build_plan -- the former `1 << 30` dropped the
         # FROST fp8 row out of every dense per-tensor d192 graph once the kernels
-        # masked in that form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
+        # masked in the bit-word form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
         # sequence that fits in SM100 memory while leaving signed-int32 headroom
         # for q + R, and keeps the module key independent of S_kv.  Imported here,
         # not at module level: tile_dsl.mask imports cutlass, which stays off the
