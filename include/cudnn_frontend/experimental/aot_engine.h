@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -152,7 +153,14 @@ parse_arg(json const &j, Arg &a) {
         a.i    = j["int"].get<int64_t>();
     } else if (j.contains("float")) {
         a.kind = Arg::Kind::FLOAT;
-        a.f    = j["float"].get<double>();
+        if (j["float"].is_string()) {  // JSON has no spelling for the non-finite values
+            auto const v = j["float"].get<std::string>();
+            a.f          = v == "nan"    ? std::numeric_limits<double>::quiet_NaN()
+                           : v == "-inf" ? -std::numeric_limits<double>::infinity()
+                                         : std::numeric_limits<double>::infinity();
+        } else {
+            a.f = j["float"].get<double>();
+        }
     } else if (j.contains("bool")) {
         a.kind = Arg::Kind::BOOL;
         a.i    = j["bool"].get<bool>() ? 1 : 0;
@@ -231,42 +239,69 @@ struct Runtime {
     std::string error;                               // non-empty when the runtime is unusable
 };
 
+inline Runtime
+load_runtime() {
+    Runtime r;
+    // RTLD_GLOBAL: the exported kernels resolve their undefined symbols
+    // against these, and a library already loaded under the same SONAME
+    // (the Python package preloads both) is reused rather than loaded twice.
+    r.tvm_ffi = ::dlopen("libtvm_ffi.so", RTLD_NOW | RTLD_GLOBAL);
+    if (r.tvm_ffi == nullptr) {
+        char const *e = ::dlerror();
+        r.error       = std::string("cannot load libtvm_ffi.so (apache-tvm-ffi): ") + (e ? e : "unknown error");
+        return r;
+    }
+    r.cute_dsl_runtime = ::dlopen("libcute_dsl_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+    if (r.cute_dsl_runtime == nullptr) {
+        char const *e = ::dlerror();
+        r.error = std::string("cannot load libcute_dsl_runtime.so (nvidia-cutlass-dsl): ") + (e ? e : "unknown error");
+        return r;
+    }
+    r.get_global       = reinterpret_cast<ffi::GetGlobal>(::dlsym(r.tvm_ffi, "TVMFFIFunctionGetGlobal"));
+    r.call             = reinterpret_cast<ffi::FunctionCall>(::dlsym(r.tvm_ffi, "TVMFFIFunctionCall"));
+    r.dec_ref          = reinterpret_cast<ffi::DecRef>(::dlsym(r.tvm_ffi, "TVMFFIObjectDecRef"));
+    r.move_from_raised = reinterpret_cast<ffi::MoveFromRaised>(::dlsym(r.tvm_ffi, "TVMFFIErrorMoveFromRaised"));
+    if (!r.get_global || !r.call || !r.dec_ref || !r.move_from_raised) {
+        r.error = "libtvm_ffi.so does not export the tvm-ffi C API this build expects";
+        return r;
+    }
+    char const name[]  = "ffi.Array";
+    ffi::ByteArray key = {name, sizeof(name) - 1};
+    if (r.get_global(&key, &r.array_ctor) != 0 || r.array_ctor == nullptr) {
+        r.error = "libtvm_ffi.so has no global function ffi.Array";
+    }
+    return r;
+}
+
+inline Runtime &
+runtime_storage() {
+    static Runtime rt;
+    return rt;
+}
+
+// Loads the runtime once; a failure is reported and retried on the next call,
+// so a process that loads the libraries after a failed attempt recovers.
+inline std::string
+ensure_runtime() {
+    static std::mutex mu;
+    static bool ready = false;
+    std::lock_guard<std::mutex> lock(mu);
+    if (ready) {
+        return "";
+    }
+    Runtime r = load_runtime();
+    if (!r.error.empty()) {
+        return r.error;
+    }
+    runtime_storage() = r;
+    ready             = true;
+    return "";
+}
+
+// Valid once ensure_runtime() has succeeded, which every AotEngine did.
 inline Runtime const &
 runtime() {
-    static Runtime const rt = [] {
-        Runtime r;
-        // RTLD_GLOBAL: the exported kernels resolve their undefined symbols
-        // against these, and a library already loaded under the same SONAME
-        // (the Python package preloads both) is reused rather than loaded twice.
-        r.tvm_ffi = ::dlopen("libtvm_ffi.so", RTLD_NOW | RTLD_GLOBAL);
-        if (r.tvm_ffi == nullptr) {
-            char const *e = ::dlerror();
-            r.error       = std::string("cannot load libtvm_ffi.so (apache-tvm-ffi): ") + (e ? e : "unknown error");
-            return r;
-        }
-        r.cute_dsl_runtime = ::dlopen("libcute_dsl_runtime.so", RTLD_NOW | RTLD_GLOBAL);
-        if (r.cute_dsl_runtime == nullptr) {
-            char const *e = ::dlerror();
-            r.error =
-                std::string("cannot load libcute_dsl_runtime.so (nvidia-cutlass-dsl): ") + (e ? e : "unknown error");
-            return r;
-        }
-        r.get_global       = reinterpret_cast<ffi::GetGlobal>(::dlsym(r.tvm_ffi, "TVMFFIFunctionGetGlobal"));
-        r.call             = reinterpret_cast<ffi::FunctionCall>(::dlsym(r.tvm_ffi, "TVMFFIFunctionCall"));
-        r.dec_ref          = reinterpret_cast<ffi::DecRef>(::dlsym(r.tvm_ffi, "TVMFFIObjectDecRef"));
-        r.move_from_raised = reinterpret_cast<ffi::MoveFromRaised>(::dlsym(r.tvm_ffi, "TVMFFIErrorMoveFromRaised"));
-        if (!r.get_global || !r.call || !r.dec_ref || !r.move_from_raised) {
-            r.error = "libtvm_ffi.so does not export the tvm-ffi C API this build expects";
-            return r;
-        }
-        char const name[]  = "ffi.Array";
-        ffi::ByteArray key = {name, sizeof(name) - 1};
-        if (r.get_global(&key, &r.array_ctor) != 0 || r.array_ctor == nullptr) {
-            r.error = "libtvm_ffi.so has no global function ffi.Array";
-        }
-        return r;
-    }();
-    return rt;
+    return runtime_storage();
 }
 
 // The pending tvm-ffi error, as text, consumed.
@@ -600,10 +635,10 @@ class AotEngine {
             "AOT payload ABI '" + payload.value("abi", std::string()) + "'; this build calls tvm-ffi entry points.");
         CHECK_CUDNN_FRONTEND_ERROR(check_device(payload.at("target")));
 
-        auto const &rt = detail::runtime();
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!rt.error.empty(),
+        std::string const runtime_error = detail::ensure_runtime();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!runtime_error.empty(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "An AOT plan needs the CuTeDSL runtime libraries: " + rt.error +
+                                       "An AOT plan needs the CuTeDSL runtime libraries: " + runtime_error +
                                            ". Put their directories on LD_LIBRARY_PATH, or load them first.");
 
         workspace_size_ = payload.at("workspace_size").get<int64_t>();

@@ -30,8 +30,8 @@ share one kernel (and one load); execute-time shape overrides are refused.
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -39,6 +39,7 @@ import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .._aot_runtime import _dist_version
 from .base import ExecutionContext, Launch, VariantPack
 
 FORMAT_VERSION = 1  # experimental/aot_engine.h AOT_FORMAT_VERSION
@@ -109,7 +110,8 @@ def _lower_arg(a: Any, b: Any, order: Sequence[int], where: str) -> Dict[str, An
                 return {"tensor": order[k], "offset": offset} if k < len(order) else {"workspace": offset}
         raise NotImplementedError(f"cannot export: {where} depends on buffer addresses in a way the artifact cannot state")
     if type(a) is float and type(b) is float and (a == b or (a != a and b != b)):
-        return {"float": a}
+        # JSON cannot spell the non-finite values; the C++ reader maps these three strings.
+        return {"float": a if math.isfinite(a) else ("nan" if a != a else "inf" if a > 0 else "-inf")}
     if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
         if len(a) == len(b) and all(type(x) is int and x == y for x, y in zip(a, b)):
             return {"array": list(a)}
@@ -222,7 +224,8 @@ def export(graph, plan) -> List[int]:
     order = graph._variant_pack_uids()
     if order is None:
         raise NotImplementedError("cannot export: this graph's variant pack is not known")
-    device = _device.resolve_device(None)
+    # The device the plan was compiled for, which need not be the current one.
+    device = _device.resolve_device(getattr(plan, "device", None))
     first, second = _launches(graph, plan, order, 0, device), _launches(graph, plan, order, 1, device)
     if len(first) != len(second) or any(x.fn is not y.fn for x, y in zip(first, second)):
         raise NotImplementedError("cannot export: the plan's launch sequence depends on buffer addresses")
@@ -264,10 +267,3 @@ def export(graph, plan) -> List[int]:
         "steps": steps,
     }
     return lowered._serialize_aot(json.dumps(payload), modules, list(order))
-
-
-def _dist_version(name: str) -> str:
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"

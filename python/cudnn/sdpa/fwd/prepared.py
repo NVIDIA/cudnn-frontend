@@ -607,8 +607,7 @@ class PreparedThdLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
 
-    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
-        """What :meth:`execute` issues for ``pack``, in order, without issuing it."""
+    def _bind(self, pack, workspace_ptr: int, stream, stream_int: int, deferred: Optional[List[Any]]) -> Optional[List[Any]]:
         indices = self._indices
         if indices is None:
             try:
@@ -616,16 +615,21 @@ class PreparedThdLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        return bind_thd(self.spec, facts, workspace_ptr, stream, stream_int, deferred=deferred)
+
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it (the same binding)."""
         seeds: List[Any] = []
-        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int, deferred=seeds)
+        frame = self._bind(pack, workspace_ptr, stream, stream_int, seeds)
         out = [Launch(fn, args) for fn, args in seeds]
         if frame is not None:
             out.append(Launch(self.spec.fn, frame, self.spec.owner))
         return out
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        for fn, args, _ in self.launches(pack, workspace_ptr, stream, stream_int):
-            fn(*args)
+        frame = self._bind(pack, workspace_ptr, stream, stream_int, None)  # issues the padded-Stats seed itself
+        if frame is not None:
+            self.spec.fn(*frame)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1243,8 +1247,9 @@ class PreparedDenseLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
 
-    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
-        """What :meth:`execute` issues for ``pack``, in order, without issuing it."""
+    def _bind(self, pack, workspace_ptr: int, stream, stream_int: int):
+        """``(frame, combine_args)`` of this call: ``combine_args`` None without a split, ``frame``
+        None when nothing launches (the ragged-Q leg with no addressable token)."""
         indices = self._indices
         if indices is None:
             try:
@@ -1252,15 +1257,26 @@ class PreparedDenseLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        if self.spec.combine is not None:
+            bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
+            return (None, None) if bound is None else bound
+        return bind_dense(self.spec, facts, stream, stream_int), None
+
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it (the same binding)."""
         spec = self.spec
-        if spec.combine is not None:
-            bound = bind_dense_split(spec, facts, workspace_ptr, stream, stream_int)
-            if bound is None:
-                return []  # ragged-Q leg: no addressable token / empty producer -> no launch
-            frame, combine_args = bound
-            return [Launch(spec.fn, frame, spec.owner), Launch(spec.combine.fn, combine_args, spec.combine.owner)]
-        return [Launch(spec.fn, bind_dense(spec, facts, stream, stream_int), spec.owner)]
+        frame, combine_args = self._bind(pack, workspace_ptr, stream, stream_int)
+        if frame is None:
+            return []
+        out = [Launch(spec.fn, frame, spec.owner)]
+        if combine_args is not None:
+            out.append(Launch(spec.combine.fn, combine_args, spec.combine.owner))
+        return out
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        for fn, args, _ in self.launches(pack, workspace_ptr, stream, stream_int):
-            fn(*args)
+        frame, combine_args = self._bind(pack, workspace_ptr, stream, stream_int)
+        if frame is None:
+            return
+        self.spec.fn(*frame)
+        if combine_args is not None:
+            self.spec.combine.fn(*combine_args)

@@ -325,6 +325,37 @@ def test_overrides_are_refused():
 
 
 @requires_frost_sdpa
+def test_missing_workspace_and_native_cuda_graph_are_refused():
+    """A plan that carves scratch from the workspace refuses a null one (the kernel would fault);
+    and an AOT plan has no native cuDNN CUDA graph (capture execute() instead)."""
+    g, tensors, bufs, outputs = CASES["thd_padded_stats"]()
+    assert g.get_workspace_size() > 0
+    loaded = _loaded(g.serialize())
+    with pytest.raises(Exception, match="workspace"):
+        loaded.execute(_pack(tensors, bufs), None)
+    from cuda.bindings import runtime as cudart
+
+    err, cuda_graph = cudart.cudaGraphCreate(0)
+    assert int(err) == 0
+    try:
+        ptrs = {uid: buf.data_ptr() for uid, buf in _pack(tensors, bufs).items()}
+        with pytest.raises(Exception, match="not a cuDNN backend plan"):
+            loaded.populate_cuda_graph(cudnn.create_handle(), ptrs, _workspace(g).data_ptr(), int(cuda_graph))
+    finally:
+        cudart.cudaGraphDestroy(cuda_graph)
+
+
+def test_non_finite_constants_are_spelled_as_strings():
+    """JSON has no Infinity/NaN; the C++ reader maps these three strings."""
+    from cudnn.engines.aot import _lower_arg
+
+    assert _lower_arg(float("inf"), float("inf"), [], "x") == {"float": "inf"}
+    assert _lower_arg(float("-inf"), float("-inf"), [], "x") == {"float": "-inf"}
+    assert _lower_arg(float("nan"), float("nan"), [], "x") == {"float": "nan"}
+    assert _lower_arg(0.5, 0.5, [], "x") == {"float": 0.5}
+
+
+@requires_frost_sdpa
 def test_wrong_device_is_refused_at_load(monkeypatch):
     """An artifact for another SKU is an error at deserialize, before any kernel initializes."""
     from cudnn.frost import device as _device

@@ -706,6 +706,10 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
 
         int64_t candidate = plans.candidate;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(candidate < 0,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "This graph's plan is not a cuDNN backend plan and has no native CUDA graph; "
+                                       "capture execute() on a stream instead.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
         _CUDNN_CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
                                                            plans.execution_plans[candidate]->get_raw_desc(),
@@ -849,6 +853,10 @@ class Graph : public ICudnn, public INode {
         // Get the plan candidate. It only makes to sense to make cuda graph after execution plan has been built.
         // And in that case the candidate would have been set.
         int64_t candidate = plans.candidate;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(candidate < 0,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "This graph's plan is not a cuDNN backend plan and has no native CUDA graph; "
+                                       "capture execute() on a stream instead.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
 
         // Finally get the backend cuda graph.
@@ -1425,6 +1433,9 @@ class Graph : public ICudnn, public INode {
                 !override_uids.empty(),
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "An AOT plan runs the shapes it was exported for; it takes no execute-time overrides.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(workspace == nullptr && plans.get_aot_engine()->get_workspace_size() > 0,
+                                           error_code_t::INVALID_VALUE,
+                                           "This AOT plan needs a workspace of get_workspace_size() bytes; got none.");
             cudaStream_t stream = nullptr;
             if (handle != nullptr) {
                 _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
@@ -1579,6 +1590,13 @@ class Graph : public ICudnn, public INode {
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        // A deserialized AOT plan writes itself back unchanged.
+        if (plans.candidate == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE) {
+            std::vector<int64_t> uids(variant_pack_uids.begin(), variant_pack_uids.end());
+            std::sort(uids.begin(), uids.end());
+            return serialize_aot(data, aot_payload, uids, serialize_structure);
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         json j;
         j["json_version"] = GRAPH_JSON_VERSION;
@@ -1588,12 +1606,6 @@ class Graph : public ICudnn, public INode {
         }
 
         auto const candidate = plans.candidate;
-
-        // A deserialized AOT plan writes itself back unchanged.
-        if (candidate == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE) {
-            std::vector<int64_t> uids(variant_pack_uids.begin(), variant_pack_uids.end());
-            return serialize_aot(data, aot_payload, uids, serialize_structure);
-        }
 
         // OSS-sentinel candidates bypass the cuDNN backend and have no cudnnBackendExecutionPlan to write
         if (candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
@@ -1833,7 +1845,14 @@ class Graph : public ICudnn, public INode {
             std::shared_ptr<experimental::aot::AotEngine> engine;
             CHECK_CUDNN_FRONTEND_ERROR(experimental::aot::AotEngine::create(j["aot"], engine));
             plans.set_aot_engine(std::move(engine));
+            // Kept for serialize(). UBJSON hands the modules back as arrays of
+            // numbers (16 bytes per byte as json); store them as binary.
             aot_payload = j["aot"];
+            for (auto &m : aot_payload["modules"]) {
+                if (m.is_array()) {
+                    m = json::binary(m.get<std::vector<uint8_t>>());
+                }
+            }
         } else {
             auto serialized_plan = j["cudnn_backend_data"];
             if (device_prop != nullptr) {

@@ -447,13 +447,22 @@ def strided_fill_plan(shape, strides) -> "list | None":
     return [(base, pitch, width, height) for base in offsets]
 
 
+def fill_plan_steps(ptr: int, plan, word: int, stream) -> list:
+    """A plan from :func:`strided_fill_plan` as the ``(fn, args)`` calls that issue it."""
+    return [
+        (
+            (fill_word_async, (ptr + offset * 4, width, word, stream))
+            if height == 1
+            else (_fill_word_2d_async, (ptr + offset * 4, pitch, width, height, word, stream))
+        )
+        for offset, pitch, width, height in plan
+    ]
+
+
 def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
     """Issue a plan from :func:`strided_fill_plan`, stream-ordered."""
-    for offset, pitch, width, height in plan:
-        if height == 1:
-            fill_word_async(ptr + offset * 4, width, word, stream)
-        else:
-            _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
+    for fn, args in fill_plan_steps(ptr, plan, word, stream):
+        fn(*args)
 
 
 def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
@@ -482,14 +491,7 @@ def fill_steps(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> 
     plan = strided_fill_plan(shape, strides)
     if plan is None:
         raise ValueError(f"frost: a reduction output cannot write an element twice (shape {tuple(shape)} stride {tuple(strides)})")
-    return [
-        (
-            (fill_word_async, (ptr + offset * 4, width, word, stream))
-            if height == 1
-            else (_fill_word_2d_async, (ptr + offset * 4, pitch, width, height, word, stream))
-        )
-        for offset, pitch, width, height in plan
-    ]
+    return fill_plan_steps(ptr, plan, word, stream)
 
 
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs

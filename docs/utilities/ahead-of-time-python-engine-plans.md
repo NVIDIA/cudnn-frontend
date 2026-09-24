@@ -53,13 +53,14 @@ A plan that cannot be exported makes `serialize()` raise `cudnnGraphNotSupported
 - **The GPU it was built for.** Compute capability and SM count must match exactly. The cubins are architecture-specific SASS, and FROST kernels bake the SM count into their schedules. A mismatch is an error at `deserialize()`.
 - **Linux, with two runtime libraries.** The kernels link against `libtvm_ffi.so` (apache-tvm-ffi) and `libcute_dsl_runtime.so` (nvidia-cutlass-dsl), resolved by SONAME. The Python package preloads both from its installed wheels. A C++ process needs them on `LD_LIBRARY_PATH` or its rpath.
 - **Native code.** The blob contains shared objects that are loaded and run. Load only blobs you trust, as you would a shared library.
+- **The handle's stream.** Execute launches on the stream of the handle it is given, or the default stream with none, like any deserialized backend plan. Pass a handle whose stream is the one you are capturing or ordering against. `populate_cuda_graph()` is not available; capture `execute()` on a stream instead.
 - **Capture- and thread-safe.** Execute allocates nothing, never synchronizes, and may run from many threads. First calls of a kernel are serialized internally, because the CuTeDSL runtime's one-time module init can deadlock when two threads race it.
 
 ## How it works
 
 Exporting needs a C compiler driver (`$CC`, `cc`, `gcc` or `clang`) to link each kernel's exported object into a shared object.
 
-A plan is exportable when it implements `CompiledPlan.launches(graph, variant_pack, ctx)`. That method returns exactly what `execute()` issues, in order, without issuing it. `execute()` is implemented as running those launches, so the two cannot drift apart. A launch is either a compiled kernel's positional tvm-ffi entry with its arguments, or a stream-ordered 32-bit fill from `cudnn.frost.buffers`.
+A plan is exportable when it implements `CompiledPlan.launches(graph, variant_pack, ctx)`. That method returns exactly what `execute()` issues, in order, without issuing it. Both are built on one binding function, so the two cannot drift apart. A launch is either a compiled kernel's positional tvm-ffi entry with its arguments, or a stream-ordered 32-bit fill from `cudnn.frost.buffers`.
 
 Export calls `launches()` twice, over a variant pack describing every operand exactly as declared. Each operand and the workspace sit at a distinct placeholder address, and the addresses differ between the two calls. Export then classifies each argument:
 
@@ -80,4 +81,4 @@ workspace_size, modules [shared objects], steps [
 
 ## Adding an engine
 
-Implement `launches()` and route `execute()` through it (`cudnn/sdpa/fwd/prepared.py` is the reference). Arguments must be integers, floats, `None`, tuples of integers, buffer addresses, or the launch stream. Kernels must be compiled with `--enable-tvm-ffi` (through `compiled_cache.compile_cached` or in-process). Per-call host work the artifact must reproduce has to be a fill; anything else, such as a torch op, keeps the plan unexportable.
+Implement `launches()` on the same binding `execute()` uses (`cudnn/sdpa/fwd/prepared.py` is the reference). Arguments must be integers, floats, `None`, tuples of integers, buffer addresses, or the launch stream. Kernels must be compiled with `--enable-tvm-ffi` (through `compiled_cache.compile_cached` or in-process). Per-call host work the artifact must reproduce has to be a fill; anything else, such as a torch op, keeps the plan unexportable.

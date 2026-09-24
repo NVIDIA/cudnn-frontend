@@ -360,12 +360,17 @@ class CompiledPlan:
     def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
+    # The CUDA device the plan was compiled for (None: the current device). An
+    # exported plan records this device's target.
+    device: Any = None
+
     def launches(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> List[Launch]:
         """Exactly what ``execute(graph, variant_pack, ctx)`` would issue, in order, without issuing it.
 
         A plan that implements this can be exported by ``graph.serialize()`` and
-        run from the result with no Python (``cudnn.engines.aot``). Implement
-        ``execute`` as running these launches, so the two cannot disagree.
+        run from the result with no Python (``cudnn.engines.aot``). Build both
+        this and ``execute`` on one binding function, so the two cannot disagree;
+        ``execute`` may call the kernels directly rather than building the list.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot be compiled ahead of time")
 

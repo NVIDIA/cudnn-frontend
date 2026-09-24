@@ -61,6 +61,10 @@ class _FrostSdpaFwdPlan(CompiledPlan):
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
 
+    @property
+    def device(self):
+        return self._prepared.spec.device_index if self._prepared is not None else None
+
     def _prepared_call(self, pack, ctx: ExecutionContext):
         """``(workspace_ptr, stream, stream_int)`` the prepared launch binds for this call."""
         if pack is None:
