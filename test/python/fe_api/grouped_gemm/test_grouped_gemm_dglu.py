@@ -23,6 +23,7 @@ from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors as allocate_grouped_gemm_input_tensors_base,
 )
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_dswiglu_utils import (
     make_rubin_mxfp8_dglu_problem,
@@ -42,7 +43,7 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_dswiglu_utils import (
     allocate_discrete_dswiglu_output_tensors,
     check_ref_discrete_dswiglu,
 )
-from test_grouped_gemm_dglu_bf16_utils import (
+from fe_api.test_grouped_gemm_dglu_bf16_utils import (
     assert_grouped_gemm_dglu_close as assert_grouped_gemm_dglu_bf16_close,
     grouped_gemm_dglu_bf16_reference,
     make_grouped_gemm_dglu_bf16_problem,
@@ -88,13 +89,17 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypatch):
     from cudnn.gemm.cutedsl.grouped.dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
 
+    from cudnn.gemm.cutedsl.grouped.dglu import _blockscaled_api as blockscaled_module
+
     api = object.__new__(GroupedGemmDgluBlockScaledAPI)
     api._logger = Mock()
     api._get_default_stream = lambda stream: stream
     api._runtime_error_if = lambda condition, message: None
     api._has_dbias = False
+    api.a_desc = Mock(device=torch.device("cuda:0"))
     api.weight_mode = None
     api._compiled_kernel = Mock()
+    api.scratch_workspace_bytes = lambda: 128  # the workspace contract (R2) is stubbed: this test is about pointer streams
 
     recorded = []
     monkeypatch.setattr(
@@ -103,11 +108,16 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
         staticmethod(lambda pointers, stream: recorded.append((pointers, stream))),
         raising=False,
     )
+    carved = Mock()
+    carved.take.return_value.data_ptr.return_value = 0
+    monkeypatch.setattr(blockscaled_module, "Workspace", lambda buffer, nbytes, owner, *, device: carved)
+    monkeypatch.setattr(blockscaled_module, "validate_workspace_aliases", lambda *args, **kwargs: None)  # isolated pointer-stream test
 
     b_ptrs = object()
     sfb_ptrs = object()
     stream = object()
     api.execute(
+        workspace=object(),
         a_tensor=torch.ones(1),
         c_tensor=object(),
         d_row_tensor=object(),
@@ -728,6 +738,7 @@ def _test_grouped_gemm_dglu_dense_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     torch.cuda.synchronize()
@@ -975,6 +986,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_m_cache_behavior(request, monk
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "scratch_workspace_bytes", lambda self: 128)
 
     d_dtype = torch.float8_e4m3fn if ab_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else torch.bfloat16
     cfg = grouped_gemm_swiglu_init(
@@ -1073,6 +1085,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_nk_cache_behavior(request, mon
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(grouped_gemm_dglu_api.GroupedGemmDgluSm100, "scratch_workspace_bytes", lambda self: 128)
 
     cfg = grouped_gemm_swiglu_init(
         request=request,
@@ -1380,6 +1393,7 @@ def _test_grouped_gemm_dglu_discrete_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     torch.cuda.synchronize()
@@ -2488,6 +2502,7 @@ def _execute_rubin_mxfp8_dglu(api, p):
         sfd_col_tensor=p["sfd_col"],
         amax_tensor=p["amax"],
         norm_const_tensor=p["norm"],
+        workspace=ws(api, p["a"].device),
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         **rubin_mxfp8_weight_arguments(p),
     )

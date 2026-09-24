@@ -261,3 +261,26 @@ def test_support_check_pulls_no_framework(module):
     process that merely asks whether an engine applies.
     """
     _assert_absent(_imported_by(f"import cudnn\nimport {module}"), module)
+
+
+@pytest.mark.parametrize("symbol", ["causal_conv1d", "fft_causal_conv1d"])
+@pytest.mark.parametrize("import_order", ["submodule_first", "sibling_first", "symbol_first"])
+def test_ops_callable_exports_survive_import_order(symbol, import_order):
+    """A same-named implementation module must not replace the callable API."""
+    probe = f"""
+import importlib
+import cudnn.ops
+symbol = {symbol!r}
+order = {import_order!r}
+if order == "symbol_first":
+    first = getattr(cudnn.ops, symbol)
+elif order == "sibling_first" and symbol == "causal_conv1d":
+    assert callable(cudnn.ops.causal_conv1d_nwh)
+module = importlib.import_module("cudnn.ops." + symbol)
+export = getattr(cudnn.ops, symbol)
+assert callable(export), type(export)
+assert export is getattr(module, symbol)
+assert getattr(cudnn.ops, symbol) is export
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr

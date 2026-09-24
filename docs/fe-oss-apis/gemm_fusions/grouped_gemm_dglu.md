@@ -6,7 +6,7 @@
 
 Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
@@ -46,8 +46,11 @@ the backward wrapper's compiled-kernel cache key.
 
 Pass `sfa_tensor=None`, `sfb_tensor=None` (or `sfb_ptrs=None`), and
 `norm_const_tensor=None`; keep `sf_vec_size=16`, `discrete_col_sfd=False`, and
-`epilogue_op=None`. BF16 also uses the source GeGLU constants
-`geglu_alpha=1.702`, `glu_clamp_max=7`, and `glu_clamp_min=-7`.
+`epilogue_op=None`. BF16 supports finite positive `geglu_alpha` and finite
+ordered `glu_clamp_min < glu_clamp_max`; defaults are 1.702 and [-7,7].
+Use `geglu_alpha=1`, `glu_clamp_max=10`, `glu_clamp_min=-10`, and
+`linear_offset=0` for V4.1's clamped SwiGLU. The slope and bounds are compile
+constants and participate in plan caching; `linear_offset` is a runtime scalar.
 
 ### Tensors, layouts, and equation
 
@@ -64,6 +67,16 @@ For padded rows `M`, reduction dimension `K`, compact gradient width `N`, and
 - caller-zeroed `dprob`: `(M, 1, 1)`, stride `(1, 1, 1)`, FP32;
 - `D_row`: `(M, 2N, 1)`, stride `(2N, 1, 2M*N)`, BF16/FP16/FP32;
 - caller-zeroed optional `dbias`: `(L, 2N, 1)`, stride `(2N, 1, 1)`, BF16.
+
+`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
+reads them on device, and neither `check_support()` nor `execute()` copies them to
+the host (a blocking read would serialize the launch stream and is illegal under
+CUDA-graph capture). Malformed values (a decreasing or unaligned offset, a last
+offset outside `(0, M]`, a null or misaligned pointer) are
+undefined behaviour, as for any raw-pointer interface. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`; that mode raises
+`RuntimeError` when the launch stream is capturing instead of syncing.
 
 For expert `g`, the compact GEMM gradient and scaled forward activation are
 
@@ -83,16 +96,16 @@ d\mathrm{gate} = R\,\mathrm{prob}\,\mathrm{input}\,s
                   (1 + \mathrm{gate}(1-s)).
 $$
 
-For dGeGLU, distinguish raw values, clamped activation values, and the source's
-value-bearing filters:
+For dGeGLU, distinguish raw values, clamped activation values, and inclusive
+clamp derivative masks. With the default slope and bounds:
 
 ```text
 raw_gate = gate(X)
 raw_input = input(X)
 clamped_gate = min(raw_gate, 7)
 clamped_input = clamp(raw_input, -7, 7)
-gate_filter = raw_gate if raw_gate <= 7 else 0
-input_filter = raw_input if -7 <= raw_input <= 7 else 0
+gate_filter = 1 if raw_gate <= 7 else 0
+input_filter = 1 if -7 <= raw_input <= 7 else 0
 s = sigmoid(1.702 * clamped_gate)
 ```
 
@@ -110,16 +123,79 @@ d\mathrm{input} = R\,\mathrm{prob}\,\mathrm{clamped\_gate}\,s\,
                    \mathrm{input\_filter}.
 $$
 
+These masks correct the earlier BF16 implementation, which multiplied by
+the raw input values inside the clamp interval and therefore did not compute
+the derivative of the forward activation. Scalar and packed FP32x2 paths are
+checked against independent FP64 autograd, including values on the boundaries.
+
 `dprob` accumulates the row sum of the matching unscaled activation times `R`;
 `dbias` is the per-expert row reduction of interleaved `D_row`. The
 pointer-array tensor is stream-recorded, while every pointed allocation must
 remain alive and unchanged until that stream completes.
+
+Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(never 0); the API allocates nothing and the wrapper allocates it per call on the
+launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+The carved scratch byte range must not overlap any live operand. Direct buffer
+spans (including packed uint8 FP4 storage and pointer tables) are checked using
+host metadata before launch. Disjoint views of one allocation are allowed.
+For discrete weights, the caller must also keep the pointed-to weight and scale
+allocations disjoint from scratch; execute never reads device pointer tables
+back to the host.
+`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
 
 The wrapper return order is exactly `d_row_tensor`, `d_col_tensor`,
 `dprob_tensor`, `dbias_tensor`, `amax_tensor`, `sfd_row_tensor`,
 `sfd_col_tensor`. On BF16, `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and
 `sfd_col_tensor` are `None`; `dbias_tensor` is `None` unless
 `generate_dbias=True`.
+
+### Optional recomputed activation for training
+
+For torch BF16 `C` and `D_row` with `act_func="dgeglu"`, the class accepts
+`sample_activation` at construction and requires the corresponding
+`activation_tensor` on every execution. Both parameters default to `None`.
+An undeclared output is rejected at execution. The wrapper accepts the same
+caller-allocated `activation_tensor` and appends it as an eighth result only
+when supplied; calls without it retain the original seven-result order.
+
+The output is BF16 with shape `(M, N, 1)`, row-contiguous stride
+`(N, 1, M*N)` modulo unit dimensions, and a 32-byte-aligned data pointer.
+For each expert, using the clamped values of `beta[expert] * C`, it stores
+
+```text
+activation = BF16(((clamped_gate * sigmoid(geglu_alpha * clamped_gate))
+                   * (clamped_input + linear_offset)) * prob)
+```
+
+The primal does not depend on the down-projection gradient or `alpha`; it
+remains defined when either the gradient or probability is zero. It can feed
+the down-projection weight-gradient GEMM when the forward activation was
+discarded. The epilogue reuses its existing clamp and sigmoid calculation and
+writes the output directly; it introduces no separate activation kernel.
+It writes all addressed padded rows. Capacity after the final expert offset
+is unspecified and must not be consumed.
+
+The output must not overlap any input, gradient, metadata, or pointed expert
+weight allocation. The API rejects overlapping byte spans of visible tensor
+arguments, including views, using host metadata only. With discrete weights,
+the caller must also ensure that the allocations behind `b_ptrs` do not
+overlap the output. Output storage must remain alive until the launch stream
+finishes. This option currently rejects JAX, block-scaled operands, dSwiGLU,
+and non-BF16 `C` or `D_row`; their existing default paths are unchanged.
+
+```python
+activation = torch.empty((M, N, 1), device=a.device, dtype=torch.bfloat16)
+dprob.zero_()
+out = cudnn.grouped_gemm_dglu_wrapper_sm100(
+    a, c, None, padded_offsets, alpha, beta, prob, dprob,
+    b_tensor=b, act_func="dgeglu", geglu_alpha=1.0,
+    glu_clamp_min=-10.0, glu_clamp_max=10.0, linear_offset=0.0,
+    round_dgrad_to_input_dtype=True, activation_tensor=activation,
+)
+assert out["activation_tensor"] is activation
+```
 
 ## Block-scaled contract
 
@@ -287,6 +363,17 @@ $$
 
 ### BF16
 
+The class API and `grouped_gemm_dglu_wrapper_sm100` accept the optional
+`round_dgrad_to_input_dtype=False` compile-time flag. With `True`, the FP32
+GEMM accumulator, after the existing `alpha[group]**2` scaling, is rounded to
+A's BF16 dtype and converted back to FP32 before activation derivatives and
+`dprob` reduction. This preserves a materialized BF16 down-projection input
+gradient boundary in training. Both scalar and packed dSwiGLU/dGeGLU paths and
+dense/discrete weights support it. The default retains FP32 accumulator
+precision; `C`, output casts and accumulator reset requirements are unchanged.
+The block-scaled paths reject `True`. The jitted JAX entry point currently
+retains the default and does not expose this flag.
+
 #### High-level wrapper
 
 ```python
@@ -333,6 +420,7 @@ op = cudnn.GroupedGemmDgluSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 dprob.zero_()
 dbias.zero_()
 op.execute(
@@ -340,6 +428,7 @@ op.execute(
     sfa_tensor=None, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     dbias_tensor=dbias, b_tensor=b, sfb_tensor=None,
+    workspace=workspace,
 )
 ```
 
@@ -461,6 +550,7 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
@@ -469,6 +559,7 @@ api.execute(
     sfd_row_tensor=sfd_row, sfd_col_tensor=sfd_col,
     amax_tensor=amax, norm_const_tensor=norm_const,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 
@@ -499,12 +590,14 @@ api = GroupedGemmDgluSm100(
 )
 assert api.check_support()
 api.compile()
+workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=d_col,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
     beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
     b_ptrs=b_ptrs, sfb_ptrs=sfb_ptrs,
     current_stream=stream,
+    workspace=workspace,
 )
 ```
 
@@ -575,7 +668,7 @@ Providing both or neither raises `ValueError`.
 - `geglu_alpha`: dGeGLU sigmoid input scale. Default: `1.702`
 - `glu_clamp_max`: dGeGLU upper bound for gate and up. Default: `7.0`
 - `glu_clamp_min`: dGeGLU lower bound for up only. Default: `-7.0`
-- These activation parameters must match forward and specialize the block-scaled backward cache on Blackwell and Rubin; the BF16 backend retains its fixed alpha/clamp values
+- These activation parameters must match forward; on block-scaled Blackwell and Rubin, they specialize the backward cache. BF16 accepts finite positive `geglu_alpha` and finite ordered `glu_clamp_min < glu_clamp_max`.
 - `situ_beta1`: Positive finite gate tanh scale for dSiTU-GLU. Default: `4.0`
 - `situ_beta2`: Positive finite up-branch tanh scale for dSiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
@@ -652,3 +745,10 @@ For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grou
 Rubin MXFP8 activation-parameter coverage is in
 `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py`
 (`test_rubin_mxfp8_clamped_dgeglu_*`).
+
+The eager JAX wrapper allocates its internal scratch with the CUDA stream-ordered
+allocator and enqueues its release after the consumer on the same stream. This
+covers overlapping wrapper calls without storing mutable scratch on a cached
+plan. Input, pointer-table, weight, and output ownership still follows the eager
+JAX synchronization contract above. Direct API callers must pass a CUDA workspace
+on the same device as the operands and keep it alive through completion.
