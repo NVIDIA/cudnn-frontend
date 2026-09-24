@@ -235,6 +235,29 @@ def warmup_forward_host(
     )
 
 
+def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store_final_state, enable_checkpoints, tiles_per_head, prep, **flags):
+    prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
+    prefill_cfg = prefill_module.build_cfg(
+        io_dtype,
+        state_dtype,
+        gate_dtype,
+        use_initial_state=use_initial_state,
+        store_final_state=store_final_state,
+        enable_checkpoints=enable_checkpoints,
+        tiles_per_head=tiles_per_head,
+        **dict(flags, d_v=flags["d_v"] // tiles_per_head),
+    )
+    prep_cfg = None
+    if prep:
+        prep_cfg = kda_prep_f16.build_cfg(
+            io_dtype,
+            gate_dtype,
+            num_sm=flags["max_active_clusters"],
+            **{name: value for name, value in flags.items() if name not in ("max_active_clusters", "d_v")},
+        )
+    return prefill_cfg, prep_cfg
+
+
 def build_warmup_forward(
     *,
     q,
@@ -341,8 +364,7 @@ def build_warmup_forward(
         bool(prep),
     )
     if key not in warmup_forward_cache:
-        prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
-        prefill_cfg = prefill_module.build_cfg(
+        prefill_cfg, prep_cfg = build_configs(
             io_dtype,
             state_dtype,
             gate_dtype,
@@ -357,23 +379,10 @@ def build_warmup_forward(
             allow_neg_eigval=allow_neg_eigval,
             max_active_clusters=num_sm,
             d_k=DK,
-            d_v=DV // tiles_per_head,
+            d_v=DV,
             tiles_per_head=tiles_per_head,
+            prep=prep,
         )
-        prep_cfg = None
-        if prep:
-            prep_cfg = kda_prep_f16.build_cfg(
-                io_dtype,
-                gate_dtype,
-                num_sm=num_sm,
-                l2norm=use_qk_l2norm,
-                safe_gate=safe_gate,
-                gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
-                log_gate=log_gate,
-                beta_sigmoid=use_beta_sigmoid,
-                allow_neg_eigval=allow_neg_eigval,
-                d_k=DK,
-            )
         prep_placeholders = [None] * 8
         if prep:
             prep_placeholders = [from_dlpack(rec, assumed_align=128).mark_layout_dynamic(leading_dim=3) for rec in (prep_k_decay, prep_q_decay, prep_t)]
