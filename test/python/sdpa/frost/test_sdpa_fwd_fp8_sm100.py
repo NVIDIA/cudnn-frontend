@@ -1773,8 +1773,9 @@ def test_fp8_thd_sliding_window(d, in_key, bottom_right):
         stats=True,
         d=d,
     )
-    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+    # Stats first: it is independent of O, and the known-edge xfail inside _check must not skip it.
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
