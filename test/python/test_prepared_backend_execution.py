@@ -135,12 +135,36 @@ def test_prepared_keeps_graph_alive_until_released(cudnn_handle):
 
 def test_prepared_cached_on_graph_is_collectible(cudnn_handle):
     graph = _build_backend_graph(cudnn_handle)
-    graph._prepared = graph._prepare_backend_execution(*_geometry())
+    geometry = _geometry()
+    graph._prepared = graph._prepare_backend_execution(*geometry)
+    workspace = _workspace(graph, cudnn_handle, geometry)
+    buffers = _buffers(38)
+    pointers = _frame(graph._prepared, buffers)
     graph_ref, prepared_ref = weakref.ref(graph), weakref.ref(graph._prepared)
-    del graph
-    gc.collect()
-    assert graph_ref() is None
-    assert prepared_ref() is None
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+            graph._prepared.execute(pointers, workspace.data_ptr())
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured, stream=stream):
+                graph._prepared.execute(pointers, workspace.data_ptr())
+        stream.synchronize()
+        del graph
+        gc.collect()
+        assert graph_ref() is None
+        assert prepared_ref() is None
+        # Clearing the ownership cycle must leave a captured invocation valid.
+        # Its input/output/workspace allocations are still owned by the caller.
+        with torch.cuda.stream(stream):
+            buffers[_UIDS[0]].fill_(1)
+            buffers[_UIDS[2]].fill_(float("nan"))
+            captured.replay()
+            _assert_result(buffers)
+        stream.synchronize()
+    finally:
+        cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
 
 
 @pytest.mark.parametrize("failed_init", [False, True])
