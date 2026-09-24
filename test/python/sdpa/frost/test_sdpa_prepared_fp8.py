@@ -207,7 +207,7 @@ def test_prepared_fp8_bounded_batch_override(thd, monkeypatch):
     _check(bufs, thd=thd, b=1)
 
 
-@pytest.mark.parametrize("role,kind", [("descale_q", "span"), ("scale_o", "alignment"), ("amax_o", "alias")])
+@pytest.mark.parametrize("role,kind", [("descale_q", "span"), ("scale_o", "alignment"), ("amax_o", "alias"), ("amax_o", "bare_alias")])
 def test_prepared_fp8_invalid_scalars_do_not_launch(role, kind, monkeypatch):
     from cudnn.sdpa.fwd import prepared as prep
 
@@ -220,18 +220,24 @@ def test_prepared_fp8_invalid_scalars_do_not_launch(role, kind, monkeypatch):
         facts[role] = facts[role]._replace(ptr=facts[role].ptr + 1)
     else:
         facts[role] = facts[role]._replace(ptr=facts["scale_o"].ptr)
+        if kind == "bare_alias":
+            facts[role] = facts[role]._replace(span=-1)
+            facts["scale_o"] = facts["scale_o"]._replace(span=-1)
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("invalid scalar reached the kernel"))
     monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: pytest.fail("invalid scalar mutated output"))
     with pytest.raises(ValueError, match=role):
         prep.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
 
 
-def test_prepared_fp8_workspace_overlap_is_rejected(monkeypatch):
+@pytest.mark.parametrize("bare", [False, True])
+def test_prepared_fp8_workspace_overlap_is_rejected(bare, monkeypatch):
     from cudnn.sdpa.fwd import prepared as prep
 
     g, vp, ws, bufs, _ = _case()
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     facts = {name: prep.facts_of_tensor(t) for name, t in bufs.items()}
+    if bare:
+        facts["q"] = facts["q"]._replace(span=-1)
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("aliased workspace reached the kernel"))
     with pytest.raises(ValueError, match="workspace overlaps"):
         prep.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
@@ -263,3 +269,12 @@ def test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch):
     for i, name in enumerate(prepared.spec.order):
         if name != "stream":
             assert str(frames[0][i]) == str(frames[1][i]), name
+
+
+@pytest.mark.parametrize("thd", [False, True])
+def test_prepared_fp8_accepts_declared_bare_scalar_pointers(thd):
+    g, vp, ws, bufs, tensors = _case(thd=thd)
+    for name in ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o"):
+        vp[tensors[name]] = bufs[name].data_ptr()
+    g.execute(vp, ws)
+    _check(bufs, thd=thd)

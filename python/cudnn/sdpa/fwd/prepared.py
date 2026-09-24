@@ -121,8 +121,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
                 needs_identity = True
         else:
             _on_plan_device(spec, name, f)
-            if f.dtype != "float32" or f.numel != 1 or not f.contiguous or f.span < 1 or not f.ptr or f.ptr % 4:
-                raise ValueError(f"cudnn.sdpa: {name} must be one aligned float32 device element with observed storage")
+            if f.dtype != "float32" or f.numel != 1 or not f.contiguous or (f.span >= 0 and f.span < 1) or not f.ptr or f.ptr % 4:
+                raise ValueError(f"cudnn.sdpa: {name} must be one aligned float32 device element with sufficient storage when observed")
             if name == "amax_o" and not quant.has_amax:
                 raise ValueError("cudnn.sdpa: this specialization does not produce amax_o")
             ptr = f.ptr
@@ -133,13 +133,19 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
     if facts.get("amax_o") is not None and workspace_ptr < amax + 4 and amax < workspace_ptr + quant.scratch_offset + 8:
         raise ValueError("cudnn.sdpa: prepared FP8 workspace overlaps amax_o")
     for name, f in facts.items():
-        if f is None or name == "amax_o" or f.span <= 0:
+        if f is None or name == "amax_o":
+            continue
+        # A declared raw address carries no observed allocation span. Its
+        # declared footprint still detects aliases; capacity remains the
+        # caller's contract, as for the shared dense metadata bindings.
+        span = f.span if f.span >= 0 else (0 if f.numel == 0 else 1 + sum((n - 1) * st for n, st in zip(f.shape, f.strides)))
+        if span <= 0:
             continue
         width = _buffers.DTYPE_ITEMSIZE[f.dtype]
         scratch_end = workspace_ptr + quant.scratch_offset + 8
-        if workspace_ptr < f.ptr + f.span * width and f.ptr < scratch_end:
+        if workspace_ptr < f.ptr + span * width and f.ptr < scratch_end:
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace overlaps {name}")
-        if amax < f.ptr + f.span * width and f.ptr < amax + 4:
+        if amax < f.ptr + span * width and f.ptr < amax + 4:
             raise ValueError(f"cudnn.sdpa: amax_o overlaps {name}")
     if isinstance(spec, ThdLaunchSpec):
         frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
