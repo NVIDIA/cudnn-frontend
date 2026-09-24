@@ -51,6 +51,9 @@ class PyGraph {
     // This Graph class is the sole structure which implicitly makes PyGraph own all tensors, nodes, and cudnn
     // descriptors.
     Graph_t graph;
+    // Prepared bindings are snapshots of a built graph, not a mutable plan cache.
+    // Advance before a rebuild/deserialization, including an unsuccessful one.
+    uint64_t execution_generation                                       = 0;
     cudnnHandle_t handle                                                = nullptr;
     bool is_handle_owner                                                = false;
     std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties = nullptr;
@@ -800,36 +803,42 @@ class PyGraph {
 
     void
     select_numeric_notes(std::vector<NumericalNote_t> const& notes) {
+        ++execution_generation;
         graph->select_numeric_notes(notes);
         return;
     }
 
     void
     select_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
+        ++execution_generation;
         graph->select_behavior_notes(notes);
         return;
     }
 
     void
     deselect_engines(std::vector<std::string> const& engine_names) {
+        ++execution_generation;
         graph->deselect_engines(engine_names);
         return;
     }
 
     void
     deselect_numeric_notes(std::vector<NumericalNote_t> const& notes) {
+        ++execution_generation;
         graph->deselect_numeric_notes(notes);
         return;
     }
 
     void
     deselect_behavior_notes(std::vector<BehaviorNote_t> const& notes) {
+        ++execution_generation;
         graph->deselect_behavior_notes(notes);
         return;
     }
 
     void
     deselect_workspace_greater_than(int64_t const workspace) {
+        ++execution_generation;
         graph->deselect_workspace_greater_than(workspace);
         return;
     }

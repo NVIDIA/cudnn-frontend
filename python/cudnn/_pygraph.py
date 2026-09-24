@@ -34,7 +34,7 @@ from ._device import ensure_current_context
 from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
-from .engines.engine_ids import is_python_engine
+from .engines.engine_ids import is_backend_engine, is_python_engine
 from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor, storage_geometry, storage_slot_bytes
 from .nodes import Node, _row_major_stride
 
@@ -1932,6 +1932,51 @@ class pygraph:
             self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), *args, **kwargs)
             return
         self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, to_backend_handle(handle), *args, **kwargs)
+
+    def _prepare_backend_execution(self, override_uids=None, override_shapes=None, override_strides=None, index=None):
+        """Prepare immutable bindings for one already-built native backend plan.
+
+        This private low-level entry is for adapters that already validate tensor
+        dtype, device, storage and workspace capacity. ``prepared.uids`` is an
+        immutable tuple: pass a fresh contiguous native unsigned pointer-width
+        buffer in that order to ``prepared.execute(pointers, workspace, handle)``.
+        Workspace and handle are raw addresses; zero handle uses the graph's
+        retained default on the preparation thread. No tensor addresses are
+        cached. Callers own device buffers through asynchronous execution and
+        CUDA graph replay, just as with ``execute``.
+
+        ``index`` addresses the Python ranked list, not the backend list. The
+        result snapshots a concrete plan and the override geometry; selecting
+        another plan does not retarget it. Rebuilding or deserializing the native
+        graph invalidates it. Prepare a new object whenever geometry changes.
+        Python engines and delegating OSS entries are deliberately unsupported.
+        """
+        if not self._is_built:
+            raise RuntimeError("Build the graph before preparing backend execution")
+        if self._planning_done:
+            at = self._plan_index if index is None else self._check_plan_index(index)
+            self._reject_if_barred(at)
+            cfg = self._plans[at]
+            if not is_backend_engine(cfg.engine_id) or cfg.cpp_index is None:
+                raise NotImplementedError("Prepared backend execution requires a concrete native backend plan")
+            cpp_index = cfg.cpp_index
+        else:
+            # A deserialized graph owns one concrete native plan, at index zero.
+            cpp_index = 0 if index is None else index
+        if self._lowered_graph is None:
+            raise RuntimeError("Build a native backend graph before preparing execution")
+        supplied = (override_uids is not None, override_shapes is not None, override_strides is not None)
+        if any(supplied) and not all(supplied):
+            raise ValueError("Override uids, shapes and strides must be supplied together")
+        return _pybind_module._PreparedBackendExecution(
+            self,
+            self._lowered_graph,
+            cpp_index,
+            [] if override_uids is None else override_uids,
+            [] if override_shapes is None else override_shapes,
+            [] if override_strides is None else override_strides,
+            self._handle,
+        )
 
     def execute(
         self,

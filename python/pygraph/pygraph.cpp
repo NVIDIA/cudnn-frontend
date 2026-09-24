@@ -7,6 +7,7 @@
 #include <utility>
 #include <unordered_map>
 #include <vector>
+#include <unordered_set>
 
 #include "dlpack/dlpack.h"
 
@@ -456,6 +457,7 @@ PyGraph::moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_at
 
 void
 PyGraph::validate() {
+    ++execution_generation;
     auto status = graph->validate();
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
@@ -467,6 +469,7 @@ PyGraph::key() {
 
 void
 PyGraph::build_operation_graph() {
+    ++execution_generation;
     auto status = graph->build_operation_graph(handle);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
@@ -489,12 +492,14 @@ PyGraph::get_behavior_notes_for_plan_at_index(int64_t const index) {
 
 void
 PyGraph::create_execution_plans(std::vector<cudnn_frontend::HeurMode_t> const& modes) {
+    ++execution_generation;
     auto status = graph->create_execution_plans(modes);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
 void
 PyGraph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobType_t, int64_t> const& knobs) {
+    ++execution_generation;
     auto status = graph->create_execution_plan(engine_id, knobs);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
@@ -517,6 +522,7 @@ PyGraph::get_knobs_for_engine(int64_t const engine_id) {
 
 void
 PyGraph::build_plans(BuildPlanPolicy_t const policy) {
+    ++execution_generation;
     // TODO: Add multithreaded support in python
     auto status = graph->build_plans(policy, false);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
@@ -524,6 +530,7 @@ PyGraph::build_plans(BuildPlanPolicy_t const policy) {
 
 void
 PyGraph::build_plan_at_index(int64_t const index) {
+    ++execution_generation;
     auto status = graph->build_plan_at_index(index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
@@ -545,6 +552,7 @@ PyGraph::build() {
 
 void
 PyGraph::check_support() {
+    ++execution_generation;
     auto status = graph->check_support();
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
@@ -626,6 +634,7 @@ PyGraph::serialize() const {
 
 void
 PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
+    ++execution_generation;
     if (py::isinstance<py::str>(pyobj)) {
         json j = json::parse(pyobj.cast<std::string>());
 
@@ -828,8 +837,148 @@ default_vector(void) {
     return {};
 }
 
+// A low-level transport for callers that already validate tensor metadata. The
+// immutable geometry belongs to a concrete built plan; pointers belong to each
+// invocation. Keep the normal Graph executor as the only backend launch path.
+class PreparedBackendExecution {
+    py::object owner_;
+    py::object backend_owner_;
+    py::object handle_owner_;
+    PyGraph::Graph_t graph_;
+    uint64_t generation_;
+    unsigned long thread_;
+    cudnnHandle_t default_handle_;
+    int64_t index_;
+    py::tuple uids_;
+    std::vector<int64_t> override_uids_;
+    std::vector<std::vector<int64_t>> override_shapes_;
+    std::vector<std::vector<int64_t>> override_strides_;
+
+    static void
+    check(cudnn_frontend::error_t status) {
+        throw_if(status.is_bad(), status.get_code(), status.get_message());
+    }
+
+   public:
+    PreparedBackendExecution(py::object owner,
+                             py::object backend_owner,
+                             int64_t index,
+                             std::vector<int64_t> override_uids,
+                             std::vector<std::vector<int64_t>> override_shapes,
+                             std::vector<std::vector<int64_t>> override_strides,
+                             py::object handle_owner)
+        : owner_(std::move(owner)),
+          backend_owner_(std::move(backend_owner)),
+          handle_owner_(std::move(handle_owner)),
+          thread_(PyThread_get_thread_ident()),
+          index_(index),
+          override_uids_(std::move(override_uids)),
+          override_shapes_(std::move(override_shapes)),
+          override_strides_(std::move(override_strides)) {
+        auto& backend   = backend_owner_.cast<PyGraph&>();
+        graph_          = backend.graph;
+        generation_     = backend.execution_generation;
+        default_handle_ = backend.handle;
+        if (index_ < 0) throw py::value_error("A concrete built backend plan index is required");
+        // The workspace query also checks that this concrete plan was built.
+        int64_t workspace_size = 0;
+        check(graph_->get_workspace_size_plan_at_index(index_, workspace_size));
+        if (override_uids_.size() != override_shapes_.size() || override_uids_.size() != override_strides_.size()) {
+            throw py::value_error("Override uid/shape/stride lengths must agree");
+        }
+        std::unordered_set<int64_t> seen;
+        for (size_t i = 0; i < override_uids_.size(); ++i) {
+            if (!seen.insert(override_uids_[i]).second) throw py::value_error("Duplicate override uid");
+            graph::Tensor_attributes tensor;
+            check(graph_->query_tensor_attributes_of_uid(override_uids_[i], tensor));
+            auto const& shape  = override_shapes_[i];
+            auto const& stride = override_strides_[i];
+            if (shape.empty() || shape.size() != stride.size() || shape.size() != tensor.get_dim().size()) {
+                throw py::value_error("Override shape/stride ranks must match the declared tensor rank");
+            }
+            for (auto dim : shape) {
+                if (dim <= 0) throw py::value_error("Override extents must be positive");
+            }
+            for (auto value : stride) {
+                if (value < 0) throw py::value_error("Override strides must be nonnegative");
+            }
+        }
+        check(graph_->prepare_variant_pack_template());
+        auto const uids = graph_->get_variant_pack_uids_sorted();
+        uids_           = py::tuple(uids.size());
+        for (size_t i = 0; i < uids.size(); ++i) uids_[i] = py::int_(uids[i]);
+    }
+
+    py::tuple
+    uids() const {
+        return uids_;
+    }
+
+    void
+    execute(py::buffer pointers, std::intptr_t workspace, std::intptr_t handle) const {
+        auto const& backend = backend_owner_.cast<PyGraph&>();
+        if (generation_ != backend.execution_generation || graph_ != backend.graph ||
+            owner_.attr("_lowered_graph").ptr() != backend_owner_.ptr()) {
+            throw std::runtime_error(
+                "Prepared backend execution is stale; prepare again after rebuilding or deserializing the graph");
+        }
+        if (workspace < 0 || handle < 0) throw py::value_error("Workspace and handle addresses must be nonnegative");
+        auto const info = pointers.request();
+        // Do not accept floating point, foreign-endian, strided or unaligned
+        // storage and reinterpret it as a native pointer array. A host buffer
+        // export is held for the entire call; no tensor or pointer is retained.
+        auto format = info.format;
+        if (!format.empty() && (format[0] == '@' || format[0] == '=')) format.erase(0, 1);
+        if (info.ndim != 1 || info.itemsize != sizeof(void*) || info.strides[0] != sizeof(void*) ||
+            (format != "Q" && format != "L" && format != "N") ||
+            reinterpret_cast<std::uintptr_t>(info.ptr) % alignof(void*) != 0) {
+            throw py::value_error("Expected a contiguous native unsigned pointer-width 1D buffer");
+        }
+        if (info.size != static_cast<py::ssize_t>(py::len(uids_)))
+            throw py::value_error("Wrong number of user pointers");
+        auto h = handle ? reinterpret_cast<cudnnHandle_t>(handle) : default_handle_;
+        if (!handle) {
+            if (thread_ != PyThread_get_thread_ident()) {
+                throw py::value_error(
+                    "Supply a thread-local handle when executing a prepared graph from another thread");
+            }
+            if (!handle_owner_.is_none()) {
+                auto live_handle = handle_owner_.attr("backend_handle");
+                if (live_handle.is_none() || live_handle.cast<std::intptr_t>() != reinterpret_cast<std::intptr_t>(h)) {
+                    throw py::value_error("The prepared graph's default handle has been destroyed or replaced");
+                }
+            }
+        }
+        if (h == nullptr) throw py::value_error("Execution requires a live backend handle");
+        // Retain the GIL: Python owners and the exported buffer must remain
+        // stable, and each launch already uses Graph's own call-local frame.
+        check(graph_->execute_plan_at_index(h,
+                                            static_cast<void**>(info.ptr),
+                                            static_cast<int>(info.size),
+                                            reinterpret_cast<void*>(workspace),
+                                            index_,
+                                            override_uids_,
+                                            override_shapes_,
+                                            override_strides_));
+    }
+};
+
 void
 init_pygraph_submodule(py::module_& m) {
+    py::class_<PreparedBackendExecution>(m, "_PreparedBackendExecution")
+        .def(py::init<py::object,
+                      py::object,
+                      int64_t,
+                      std::vector<int64_t>,
+                      std::vector<std::vector<int64_t>>,
+                      std::vector<std::vector<int64_t>>,
+                      py::object>())
+        .def_property_readonly("uids", &PreparedBackendExecution::uids)
+        .def("execute",
+             &PreparedBackendExecution::execute,
+             py::arg("pointers"),
+             py::arg("workspace") = 0,
+             py::arg("handle")    = 0);
     py::class_<PyGraph> pygraph_(m, "backend_graph");
     pygraph_
         .def(py::init<std::string const&,

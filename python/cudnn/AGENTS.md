@@ -58,6 +58,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **Prepared native bindings cache geometry, never tensor addresses or streams.**
+  Resolve Python ranked indices to concrete backend indices at preparation;
+  rebuilding/deserializing or filtering the native graph invalidates the binding.
+  Raw-pointer adapters still own dtype/device/storage checks and buffer lifetimes
+  through CUDA graph replay. The detectors are in
+  `test_prepared_backend_execution.py` (rebind, stale graph, replay after new
+  geometry, and thread-local handles).
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

@@ -870,6 +870,56 @@ tensors' dtype, rank and dynamic marks; same hook once it does.
   lowers to (renamed from its pre-flip public name to avoid two things called
   `pygraph`).
 
+## Prepared native backend bindings (private adapter API)
+
+Adapters that already validate their tensor arguments can prepare the static
+part of a native backend invocation once:
+
+```python
+from array import array
+
+# The graph and the selected native backend plan have already been built.
+prepared = graph._prepare_backend_execution(override_uids, override_shapes, override_strides)
+
+# On every invocation, after the adapter's normal tensor/workspace checks:
+pointers = array("Q", (tensors_by_uid[uid].data_ptr() for uid in prepared.uids))
+prepared.execute(pointers, workspace.data_ptr(), handle.backend_handle)
+```
+
+`prepared.uids` is an immutable tuple of the graph's caller-filled UIDs in
+ascending order. The overrides are copied into native vectors at preparation;
+changing the source lists cannot modify them. Omitting all three override
+arguments prepares a fixed-shape invocation. The optional `index` argument
+addresses the **Python ranked plan list**, and is resolved to the concrete
+backend index once. Python engines and delegating OSS entries raise
+`NotImplementedError`; callers can retain their ordinary `graph.execute` path.
+
+This is pointer transport, not tensor validation. The adapter remains responsible
+for dtype, device, layout, pointer validity, storage span and workspace capacity;
+a raw pointer cannot establish those facts. The native entry validates descriptor
+structure and the pointer buffer's count, width, unsigned integer format, native
+byte order, alignment and contiguity. It then calls the existing C++ graph
+executor, retaining its plan checks, workspace-relative bindings, auxiliary
+kernels and backend execution. It allocates no device storage and performs no
+host synchronization.
+
+Each call supplies its own pointer buffer, workspace and handle. Nothing retains
+runtime tensor pointers or a mutable launch frame. The handle's stream is used
+on that invocation; there is no prepared stream. A zero handle uses the retained
+graph default, only on the preparation thread. Concurrent callers must supply
+their own thread-local handles and independent workspaces and outputs. The
+Python binding retains the GIL during submission.
+
+A prepared object owns the graph and its default handle owner, but **does not
+own input/output/workspace allocations**. Those allocations must remain alive
+through queued work and CUDA graph replay. Preparing different override geometry
+creates an independent object; this does not change an older descriptor or its
+captured bindings. Replacing/deserializing, rebuilding, checking native support,
+or changing native plan filters invalidates prepared objects; a stale execute
+raises before launching. Selecting another plan does not retarget an existing
+prepared object. This private API does not expand the native backend's supported
+shapes or layouts.
+
 ## Testing the backend path
 
 The `test_native_backend_lowering.py` suite builds graphs natively, lowers,
