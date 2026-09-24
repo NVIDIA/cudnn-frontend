@@ -283,6 +283,8 @@ if P_D_BLOCK != _SMX_CHUNK:
 # - log2(scale_s))).  attn_scale * log2e rides in the `attn_scale_log2e` scalar; the lse fold happens IN-KERNEL in the
 # scheduler-stats warp (the host passes natural-log lse).
 _LOG2E = 1.4426950408889634
+# CLC response payload the scheduler ring's expect_tx arms (tile_dsl/scheduler.py uses the same 16).
+_CLC_RESPONSE_BYTES = 16
 
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2  # CTA_MMA == 2 (validated by the config)
 
@@ -732,7 +734,7 @@ def _kernel(
                 bars.mb_ds_smem_full[p].init()
                 bars.mb_ds_smem_empty[p].init()
             # Scheduler rings: init on EVERY CTA (the try_cancel multicast targets all of them).
-            for s in range(CFG.SCHEDULER_STAGES):
+            for s in cutlass.range_constexpr(CFG.SCHEDULER_STAGES):
                 nvvm.mbarrier_init(sched.mb_scheduler.subview(s), ONE_LANE)
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOT)
 
@@ -1528,10 +1530,10 @@ def _scheduler_stats_warp(
         if nvvm.elect_sync() and is_cga_first_cta:
             for i in cutlass.range_constexpr(CGA_SIZE):
                 if cutlass.const_expr(i == 0):
-                    arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+                    arrive_expect_tx(sched.mb_scheduler.subview(state.idx), _CLC_RESPONSE_BYTES)
                 else:
                     peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(i))
-                    nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CTA)
+                    nvvm.mbarrier_arrive_expect_tx(peer_mb, _CLC_RESPONSE_BYTES, scope=nvvm.MemScope.CTA)
             nvvm.clusterlaunchcontrol_try_cancel(sched.tile_id_smem.subview(state.idx * cutlass.Int32(8)), sched.mb_scheduler.subview(state.idx), multicast=1)
         nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
