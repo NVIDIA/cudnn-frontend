@@ -5,6 +5,10 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 ## Import-time rules (the most common way to break this package)
 
 - `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` that names the missing framework module (torch, jax, cuda-python) alongside the base `pip install nvidia-cudnn-frontend` hint — or, for a CuTe DSL below `CUTEDSL_MIN_VERSION`, points at the DSL upgrade (Rule 7).
+- A function and its implementation module can share a name. Python installs an imported
+  submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
+  sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
+  `test_ops_callable_exports_survive_import_order` in `test/python/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
@@ -431,7 +435,16 @@ wrapper allocates per call on the caller's behalf, it allocates under
 `stream_context(<launch stream>)` (R1): the caching allocator orders a block's
 reuse only against the stream it was allocated on, so scratch allocated on
 torch's ambient stream for a handle re-streamed to a side stream is a
-use-after-free waiting for load.
+use-after-free waiting for load. For eager JAX wrappers, allocation readiness
+(`block_until_ready`) does not extend storage lifetime through a foreign CUDA
+consumer. Pair caller-layer stream-ordered allocation/free around the launch
+(`grouped.backend_utils.wrapper_workspace`), or use an XLA custom call that owns
+scratch. A cached plan's latest reference cannot cover overlapping calls. Test
+multiple pending consumers on independent streams with an intercepted bounded
+byte copy; never run a real kernel on an intentionally recycled scratch pointer.
+For direct API workspace, validate CUDA device type and the operand's ordinal
+before launch (`Workspace(..., device=...)`); byte size/alignment alone also
+accept host memory.
 An APIBase that
 wraps a cuDNN backend `pygraph` forwards `graph.get_workspace_size()` as
 `get_workspace_size()` and takes `workspace=` at execute, validated with
@@ -487,8 +500,12 @@ non-overlapping executions and carries no cross-launch state. The
 `*_wrapper_sm100` functions allocate via
 `backend_utils.allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(),
 device, current_stream)` exactly where they allocate outputs, memo and cold path
-alike; an eager-JAX workspace has no `record_stream`, so the API holds it until
-the next execute the way it holds `_live_ptrs`
+alike (the dGLU wrappers use `backend_utils.wrapper_workspace`, whose eager-JAX
+branch is the stream-ordered allocation/free above). The API calls
+`backend_utils.retain_workspace(self, workspace, current_stream)` right after the
+carve: a torch buffer is `record_stream`ed on the launch stream; an eager-JAX
+buffer (no `record_stream`) is held until an event recorded on its launch stream
+has completed, every pending one and never only the latest
 (`gemm/cutedsl/grouped/**`, `discrete_grouped/**`; detectors
 `fe_api/test_grouped_gemm_rule8.py`, `fe_api/grouped_gemm/test_grouped_gemm_rule8_fusions.py`).
 An APIBase whose kernel needs per-execute metadata built on device (HSTU
