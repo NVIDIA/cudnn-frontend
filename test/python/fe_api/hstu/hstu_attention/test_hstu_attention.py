@@ -2696,6 +2696,9 @@ def test_hstu_attention_forward_staging_outlives_the_released_original():
     storage[..., ::2] = q
     q_strided = storage[..., ::2]
     assert _api._needs_staging(q_strided, _api._input_layout_accepted(q_strided, False))
+    # Warm the window's kernels first: under CUDA lazy loading a first launch waits for the device to drain (no race).
+    hstu_attention_forward(q_strided, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128)
+    torch.empty(1, dtype=q.dtype, device=q.device).fill_(float("nan"))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
     side = torch.cuda.Stream()
