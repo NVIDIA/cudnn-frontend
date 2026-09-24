@@ -149,10 +149,9 @@ def grouped_gemm_dglu_bf16_reference(
         d_gate = ref * sigmoid * (1.0 + 1.702 * gate * (1.0 - sigmoid)) * (input_value + linear_offset) * prob
         d_input = ref * gate * sigmoid * prob
 
-        gate_filter = gate_unclipped.clone()
-        input_filter = input_unclipped.clone()
-        gate_filter[gate_unclipped > 7.0] = 0.0
-        input_filter[(input_unclipped > 7.0) | (input_unclipped < -7.0)] = 0.0
+        # Clamp's derivative is an inclusive0/1 mask, not the input value.
+        gate_filter = (gate_unclipped <= 7.0).float()
+        input_filter = ((input_unclipped >= -7.0) & (input_unclipped <= 7.0)).float()
         d_gate = d_gate * gate_filter
         d_input = d_input * input_filter
     else:
