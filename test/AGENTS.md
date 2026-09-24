@@ -132,3 +132,11 @@ Intercept the compiled consumer for negative tests so intentional aliasing never
 reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
+
+### Prepared quantized launch probes
+
+Rebind scale buffers with different values, not only cloned storage: identical
+values let a stale pointer pass. Poison and rebind amax too, then change scales
+in place after CUDA Graph capture and check outputs after replay.
+`test_prepared_fp8_rebind_scales_and_buffers` and
+`test_prepared_fp8_capture_replay_reads_current_scales` cover both lifecycles.

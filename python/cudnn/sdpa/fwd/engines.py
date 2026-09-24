@@ -516,8 +516,18 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     A complete assignment additionally checks the final O store's layout.
     Runtime geometry still has to fit the compiled binder's per-call contract.
     """
-    if capabilities.sm_lo not in (100, 107) or facts.is_fp8 or facts.is_mxfp8:
+    if capabilities.sm_lo not in (100, 107) or facts.is_mxfp8:
         return "this engine has no prepared shape/stride override executor"
+    if facts.is_fp8 and (
+        capabilities.sm_lo != 100
+        or (facts.d_qk, facts.d_v) != (128, 128)
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        or facts.has_paged_kv
+        or (split_kv or 1) > 1
+        or facts.o_block_scale
+        or facts.has_epilogue_gate
+    ):
+        return "prepared FP8 serves SM100 d128 unsplit, non-paged half outputs"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:
@@ -538,7 +548,11 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if split_kv is not None and split_kv <= 1:
         tensors.append(facts.o_t)
     for tensor in tensors:
-        if tensor is None or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 2) is None:
+        if (
+            tensor is None
+            or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 1 if facts.is_fp8 and tensor in (facts.q_t, facts.k_t, facts.v_t) else 2)
+            is None
+        ):
             return "prepared overrides require input and unsplit-output layouts that bind without a copy"
     if facts.o_t is None or not ga.dense_layout_ok(tuple(facts.o_t.get_dim()), tuple(facts.o_t.get_stride())):
         return "prepared overrides require a non-overlapping dense output layout"
