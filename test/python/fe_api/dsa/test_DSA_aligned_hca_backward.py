@@ -14,14 +14,14 @@ pytestmark = pytest.mark.gpu_exclusive
 
 
 @pytest.fixture(autouse=True)
-def require_gb300():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Aligned HCA requires GB300")
+def require_supported_device():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Aligned HCA requires GB300 or Rubin")
     pytest.importorskip("cutlass")
     pytest.importorskip("triton")
 
 
-def declarations():
+def declarations(sequence_length=65536, cp_size=16):
     from cudnn.api_base import TensorDesc
 
     def desc(shape, stride, dtype):
@@ -29,9 +29,11 @@ def declarations():
             dtype=dtype, shape=shape, stride=stride, stride_order=tuple(reversed(range(len(shape)))), device=torch.device("cuda", torch.cuda.current_device())
         )
 
-    q = desc((4096, 128, 512), (65536, 512, 1), torch.bfloat16)
-    kv = desc((4752, 512), (512, 1), torch.bfloat16)
-    lse = desc((4096, 128), (128, 1), torch.float32)
+    local_tokens = sequence_length // cp_size
+    kv_rows = local_tokens + 128 + sequence_length // 128 + cp_size
+    q = desc((local_tokens, 128, 512), (65536, 512, 1), torch.bfloat16)
+    kv = desc((kv_rows, 512), (512, 1), torch.bfloat16)
+    lse = desc((local_tokens, 128), (128, 1), torch.float32)
     sink = desc((128,), (1,), torch.float32)
     return [q, kv, q, q, lse, sink, q, kv, sink]
 
@@ -83,7 +85,13 @@ def test_workspace_has_no_paired_input_buffer():
         assert schedule[3][0] is (reduce_local_rows if layout.group_tokens == 32 else reduce_local_keys)
         assert schedule[3][1] == ((1056 if layout.group_tokens == 32 else 16896), 1, 1)
         assert schedule[3][2] == ("dk", "dv", "dkv")
-        assert schedule[3][3] == (layout.keys, layout.groups, 512, layout.group_tokens, *((2048,) if layout.group_tokens == 32 else (128,)))
+        assert schedule[3][3] == (
+            layout.keys,
+            layout.groups,
+            512,
+            layout.group_tokens,
+            *((layout.local_kv_rows, 2048) if layout.group_tokens == 32 else (128,)),
+        )
 
 
 @pytest.mark.L0
@@ -189,16 +197,26 @@ def test_execute_rejects_invalid_arguments():
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("rank", [0, 3, 15])
-def test_numerical_reference_and_wrapper_graph_replay(rank):
+@pytest.mark.parametrize(
+    "sequence_length,cp_size,rank",
+    [
+        (65536, 16, 0),
+        (65536, 16, 3),
+        (65536, 16, 15),
+        (8192, 4, 3),
+        (49152, 8, 7),
+        (10240, 16, 15),
+    ],
+)
+def test_numerical_reference_and_wrapper_graph_replay(sequence_length, cp_size, rank):
     from cudnn import aligned_hca_backward_wrapper
     from cudnn.deepseek_sparse_attention.aligned_hca_backward import api as api_module
     from triton.runtime.jit import JITFunction
     from fe_api.dsa.aligned_hca_test_utils import reference_case, assert_reference
 
-    inputs, expected = reference_case(rank, 751 + rank)
-    actual = aligned_hca_backward_wrapper(*inputs, cp_rank=rank)
-    assert_reference(actual, expected)
+    inputs, expected = reference_case(rank, 751 + rank, sequence_length, cp_size)
+    actual = aligned_hca_backward_wrapper(*inputs, cp_rank=rank, cp_size=cp_size)
+    assert_reference(actual, expected, cp_size)
     del actual
     torch.cuda.synchronize()
     graphs = []
@@ -209,19 +227,19 @@ def test_numerical_reference_and_wrapper_graph_replay(rank):
         for _ in range(2):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                outputs = aligned_hca_backward_wrapper(*inputs, cp_rank=rank)
+                outputs = aligned_hca_backward_wrapper(*inputs, cp_rank=rank, cp_size=cp_size)
             graphs.append((graph, outputs))
         gc.collect()
         torch.cuda.empty_cache()
         for seed in (1771, 8811):
-            fresh, expected = reference_case(rank, seed + rank)
+            fresh, expected = reference_case(rank, seed + rank, sequence_length, cp_size)
             for destination, source in zip(inputs, fresh):
                 destination.copy_(source)
             del fresh
             for graph, outputs in reversed(graphs):
                 graph.replay()
                 torch.cuda.synchronize()
-                assert_reference(outputs, expected)
+                assert_reference(outputs, expected, cp_size)
 
 
 @pytest.mark.L1
@@ -236,3 +254,23 @@ def test_wrapper_capture_requires_warmup():
         with torch.cuda.graph(graph):
             with pytest.raises(RuntimeError, match="Warm"):
                 aligned_hca_backward_wrapper(*tensors[:6], cp_rank=0, dq=tensors[6], dkv=tensors[7], d_sink=tensors[8])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sequence_length,cp_size", [(8192, 4), (49152, 8), (10240, 16), (131072, 4)])
+def test_generalized_declarations(sequence_length, cp_size):
+    from cudnn import AlignedHCABackward
+
+    before = torch.cuda.memory_allocated()
+    for rank in range(cp_size):
+        api = AlignedHCABackward(*declarations(sequence_length, cp_size), cp_rank=rank, cp_size=cp_size)
+        assert api.check_support()
+    assert torch.cuda.memory_allocated() == before
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("local_tokens,cp_size", [(2048, 2), (127, 16), (256, 16), (32769, 4), (65536, 4)])
+def test_unsupported_geometry(local_tokens, cp_size):
+    from cudnn import AlignedHCABackward
+
+    assert not AlignedHCABackward.supports_configuration(local_tokens, cp_size, "cuda")

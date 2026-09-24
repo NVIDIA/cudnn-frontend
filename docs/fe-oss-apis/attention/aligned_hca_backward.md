@@ -1,9 +1,10 @@
 # Aligned HCA Backward
 
 **Experimental.** This API computes HCA backward for the aligned, single-sequence
-DSV4 64K/CP16 case on GB300. It is separate from generic DSA backward: it does
-not accept arbitrary sparse indices, packed documents, rebalanced HCA layouts,
-or other sequence sizes. Unsupported declarations are rejected without a layout copy.
+DSV4 layout on GB300 and Rubin with CP4/8/16 and sequence lengths from 8K to 128K.
+Each CP chunk must be a multiple of 128 tokens. It is separate from generic DSA backward: it does
+not accept arbitrary sparse indices, multiple sequences per pack, rebalanced HCA layouts,
+or unaligned CP chunks. Unsupported declarations are rejected without a layout copy.
 
 ## Installation
 
@@ -16,16 +17,15 @@ python -m pip install -e '.[cutedsl,triton]' torch
 
 The implementation uses precompiled Triton kernels and cuDNN graph matmuls.
 It is Torch-only and requires Triton 3.7 or later. The implementation is
-validated with CUDA 13.2, cuDNN frontend 1.30, cuDNN 9.21 and GB300;
-other architectures are not enabled.
+validated with CUDA 13.2, cuDNN frontend 1.31, cuDNN 9.21 and GB300;
+Rubin validation uses CUDA 13.4 and cuDNN 9.26.
 Importing `cudnn` does not eagerly import this API or its optional dependencies.
 
 ## Computation
 
-Each CP rank owns 4096 queries with 128 heads and head dimension 512. A query
+Each CP rank owns `L = S / cp_size` queries with 128 heads and head dimension 512. A query
 at global position `t` attends to its causal 128-token window and compressed
-groups `0 .. floor((t + 1) / 128) - 1`. The sequence has exactly 65536 valid
-positions. K and V share one input tensor; their gradients are added into `dkv`.
+groups `0 .. floor((t + 1) / 128) - 1`. The sequence has exactly `S` positions in the declared padded layout. K and V share one input tensor; their gradients are added into `dkv`.
 
 `lse` is the natural-log normalization over ordinary KV keys **excluding** the
 attention sink. `out` already includes the sink in its softmax denominator.
@@ -51,41 +51,43 @@ the score kernel keeps two accumulators without materializing interleaved
 inputs. Gradient outputs `dq`/`dkv` are BF16 and
 `d_sink` is FP32. This is not bitwise equivalent to an all-FP32 reference.
 Normalization uses four warps. The score pipeline uses three or four stages
-selected from fixed CP-rank metadata at plan time, without runtime autotuning.
+selected from fixed shape and CP-rank metadata at plan time, without runtime autotuning.
 For 32-token query groups, local KV-gradient reduction streams four output
 rows per block. The 128-token groups retain the vector reduction. Both use
 FP32 accumulation, with different addition orders before the BF16 output cast.
 
 ## Tensor Contract
 
-All tensors are contiguous Torch CUDA tensors on one GB300 device. Input and
+All tensors are contiguous Torch CUDA tensors on one supported CUDA device. Input and
 output pointers must be 16-byte aligned. Outputs and workspace must not share
 storage with inputs or one another.
 
 | Argument | Shape | Dtype |
 |---|---|---|
-| `q`, `out`, `dout`, `dq` | `(4096, 128, 512)` | BF16 |
-| `kv`, `dkv` | `(4752, 512)` | BF16 |
-| `lse` | `(4096, 128)` | FP32 |
+| `q`, `out`, `dout`, `dq` | `(L, 128, 512)` | BF16 |
+| `kv`, `dkv` | `(L + 128 + S / 128 + cp_size, 512)` | BF16 |
+| `lse` | `(L, 128)` | FP32 |
 | `attn_sink`, `d_sink` | `(128,)` | FP32 |
 | `workspace` | At least `scratch_workspace_bytes()` bytes | uint8 |
 
-`cp_rank` is a plan-time integer from 0 to 15; the global query start is
-`4096 * cp_rank`. `softmax_scale` is a finite plan-time host scalar, default
+`cp_size` is 4, 8 or 16 (default 16). `cp_rank` is a plan-time integer in
+`[0, cp_size)`; the global query start is `L * cp_rank`. `softmax_scale` is a finite plan-time host scalar, default
 `1 / sqrt(512)`.
 
-KV rows 0-127 hold the preceding boundary, 128-4223 the local tokens, and
-4224-4751 the rank-major compressed storage. Each rank contributes 33 physical
-compressed slots for 32 canonical groups. For logical compressed group `c`:
+`AlignedHCABackward.supports_configuration(L, cp_size, device)` checks the
+architecture and sequence/CP geometry; `check_support()` validates the full tensor contract.
+
+KV rows 0-127 hold the preceding boundary, the next `L` rows hold local
+tokens, and the remaining rows hold rank-major compressed storage. Each rank
+contributes `G + 1` physical slots for `G = L / 128` canonical groups:
 
 ```text
-owner = c // 32
-physical_row = 4224 + owner * 33 + c % 32 + (owner > 0)
+owner = c // G
+physical_row = L + 128 + owner * (G + 1) + c % G + (owner > 0)
 ```
 
-Slot 32 of rank zero and slot zero of later ranks are not canonical compressed
-keys. They may contain duplicates but receive zero gradients. The API addresses
-this layout directly; canonical 4736-row KV is not accepted.
+Slot `G` of rank zero and slot zero of later ranks are not canonical compressed
+keys and receive zero gradients. The API addresses this layout directly.
 
 KV rows unreachable by this CP rank, including rank zero's preceding boundary,
 need not be initialized. Even nonfinite values in those rows do not affect
@@ -97,7 +99,7 @@ valid gradients, and their `dkv` entries are zero.
 from cudnn import aligned_hca_backward_wrapper
 
 result = aligned_hca_backward_wrapper(
-    q, kv, out, dout, lse, attn_sink, cp_rank=cp_rank,
+    q, kv, out, dout, lse, attn_sink, cp_rank=cp_rank, cp_size=cp_size,
 )
 dq, dkv, d_sink = result
 assert dq is result["dq"]
@@ -119,7 +121,7 @@ dq = torch.empty_like(q)
 dkv = torch.empty_like(kv)
 d_sink = torch.empty_like(attn_sink)
 op = AlignedHCABackward(
-    q, kv, out, dout, lse, attn_sink, dq, dkv, d_sink, cp_rank=cp_rank,
+    q, kv, out, dout, lse, attn_sink, dq, dkv, d_sink, cp_rank=cp_rank, cp_size=cp_size,
 )
 op.check_support()
 op.compile()
@@ -153,7 +155,7 @@ reuse the same scratch for overlapping calls on different streams.
 
 ## Testing
 
-From `test/python` in a GB300 environment:
+From `test/python` in a GB300 or Rubin environment:
 
 ```bash
 pytest fe_api/dsa/test_DSA_aligned_hca_backward.py \

@@ -10,9 +10,9 @@ pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive]
 
 
 @pytest.fixture(autouse=True)
-def require_gb300():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Aligned HCA requires GB300")
+def require_supported_device():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Aligned HCA requires GB300 or Rubin")
     pytest.importorskip("cutlass")
     pytest.importorskip("triton")
 

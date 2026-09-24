@@ -14,10 +14,10 @@ from ._workspace import workspace_layout
 
 
 class _HcaPlan:
-    """Fixed aligned S65536/CP16 BF16 HCA, physical KV shape (4752, 512)."""
+    """Compiled aligned BF16 HCA backward."""
 
-    def __init__(self, rank, softmax_scale, device):
-        self.layout = workspace_layout(rank)
+    def __init__(self, rank, softmax_scale, device, local_tokens=4096, cp_size=16):
+        self.layout = workspace_layout(rank, local_tokens, cp_size)
         self._gemms = None
         if type(softmax_scale) not in (int, float) or not math.isfinite(softmax_scale):
             raise ValueError("softmax_scale must be a finite host scalar")
@@ -26,8 +26,8 @@ class _HcaPlan:
         if device.type != "cuda":
             raise ValueError("A CUDA device is required")
         self.device = torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
-        if torch.cuda.get_device_capability(self.device) != (10, 3):
-            raise ValueError("This plan is validated only for GB300")
+        if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+            raise NotImplementedError("Aligned HCA requires GB300 or Rubin")
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self._launches = None
 
@@ -40,32 +40,53 @@ class _HcaPlan:
 
     def _schedule(self):
         w = self.layout
-        n, h, d = 4096 * 128, 128, 512
+        n, h, d = w.local_tokens * 128, 128, 512
         g, k, gt, nc = w.groups, w.keys, w.group_tokens, w.compressed_keys
         preparation = (normalize, (n // 16, 1, 1), ("out", "dout", "lse", "sink", "normalization", "sink_partial"), (n, h, d, 16), dict(num_warps=4))
+        stages = 3 if gt == 32 else 4
+        if (w.local_tokens, w.cp_size) == (4096, 16):
+            stages = 4 if w.rank in (0, 3, 4, 9, 11, 13, 14, 15) else 3
         scores = (
             separate_tma_scores,
             (self.sms, 1, 1),
             ("q_desc", "do_desc", "keys_desc", "normalization", "p_desc", "ds_desc"),
-            (n, k, h, d, w.rank * 4096, nc, self.scale, gt, 128, 128, 64, self.sms),
-            dict(num_warps=8, num_stages=4 if w.rank in (0, 3, 4, 9, 11, 13, 14, 15) else 3),
+            (n, k, h, d, w.rank * w.local_tokens, nc, self.scale, gt, 128, 128, 64, self.sms),
+            dict(num_warps=8, num_stages=stages),
         )
         if gt == 32:
-            local_reduction = (reduce_local_rows, (4224 * d // 2048, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 2048), dict(num_warps=4))
+            local_reduction = (
+                reduce_local_rows,
+                (w.local_kv_rows * d // 2048, 1, 1),
+                ("dk", "dv", "dkv"),
+                (k, g, d, gt, w.local_kv_rows, 2048),
+                dict(num_warps=4),
+            )
         else:
-            local_reduction = (reduce_local_keys, (4224 * 4, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 128), dict(num_warps=4))
+            local_reduction = (reduce_local_keys, (w.local_kv_rows * 4, 1, 1), ("dk", "dv", "dkv"), (k, g, d, gt, 128), dict(num_warps=4))
         return (
             preparation,
-            (pack_rank_major_keys, (k * d // 1024, g, 1), ("kv", "packed_keys"), (k, nc, gt, 1024, w.rank * 4096), {}),
+            (
+                pack_rank_major_keys,
+                (k * d // 1024, g, 1),
+                ("kv", "packed_keys"),
+                (k, nc, gt, 1024, w.rank * w.local_tokens, w.groups_per_rank, w.local_kv_rows),
+                {},
+            ),
             scores,
             local_reduction,
-            (reduce_rank_major_keys, (528 * 4, 1, 1), ("dk", "dv", "dkv"), (nc, k, g, gt, 128), dict(num_warps=8)),
-            (reduce_sink, (32, 1, 1), ("sink_partial", "d_sink"), (4096, h), dict(num_warps=8)),
+            (
+                reduce_rank_major_keys,
+                (w.compressed_rows * 4, 1, 1),
+                ("dk", "dv", "dkv"),
+                (nc, k, g, gt, 128, w.groups_per_rank, w.local_kv_rows),
+                dict(num_warps=8),
+            ),
+            (reduce_sink, (32, 1, 1), ("sink_partial", "d_sink"), (w.local_tokens, h), dict(num_warps=8)),
         )
 
     def _descriptors(self, tensors):
         w = self.layout
-        n = 4096 * 128
+        n = w.local_tokens * 128
         tensors.update(
             q_desc=TensorDescriptor(tensors["q"], [n, 512], [512, 1], [128, 64]),
             do_desc=TensorDescriptor(tensors["dout"], [n, 512], [512, 1], [128, 64]),
@@ -100,14 +121,15 @@ class _HcaPlan:
             raise RuntimeError("Compile the HCA plan before execute")
         if not isinstance(stream, torch.cuda.Stream) or stream.device != self.device:
             raise ValueError("An explicit Torch CUDA stream on the plan device is required")
+        w = self.layout
         shapes = dict(
-            q=(4096, 128, 512),
-            out=(4096, 128, 512),
-            dout=(4096, 128, 512),
-            dq=(4096, 128, 512),
-            kv=(4752, 512),
-            dkv=(4752, 512),
-            lse=(4096, 128),
+            q=(w.local_tokens, 128, 512),
+            out=(w.local_tokens, 128, 512),
+            dout=(w.local_tokens, 128, 512),
+            dq=(w.local_tokens, 128, 512),
+            kv=(w.kv_rows, 512),
+            dkv=(w.kv_rows, 512),
+            lse=(w.local_tokens, 128),
             sink=(128,),
             d_sink=(128,),
         )

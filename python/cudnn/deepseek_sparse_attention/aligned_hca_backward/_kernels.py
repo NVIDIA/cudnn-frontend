@@ -93,9 +93,13 @@ def separate_tma_scores(
 @triton.jit
 def reduce_sink(Partial, SinkGrad, TOKENS: tl.constexpr, H: tl.constexpr):
     heads = tl.program_id(0) * 4 + tl.arange(0, 4)
-    tokens = tl.arange(0, triton.next_power_of_2(TOKENS))
-    values = tl.load(Partial + tokens[:, None] * H + heads[None, :], tokens[:, None] < TOKENS, 0)
-    tl.store(SinkGrad + heads, tl.sum(values, axis=0))
+    tokens = tl.arange(0, min(triton.next_power_of_2(TOKENS), 4096))
+    result = tl.full((4,), 0, tl.float32)
+    for start in range(triton.cdiv(TOKENS, 4096)):
+        rows = start * 4096 + tokens
+        values = tl.load(Partial + rows[:, None] * H + heads[None, :], rows[:, None] < TOKENS, 0)
+        result += tl.sum(values, axis=0)
+    tl.store(SinkGrad + heads, result)
 
 
 @triton.jit
@@ -121,6 +125,7 @@ def reduce_local_rows(
     G: tl.constexpr,
     D: tl.constexpr,
     GROUP_TOKENS: tl.constexpr,
+    LOCAL_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -130,24 +135,34 @@ def reduce_local_rows(
     for previous in tl.static_range(128 // GROUP_TOKENS + 1):
         group = last - previous
         key = row - group * GROUP_TOKENS
-        valid = (row < 4224) & (group >= 0) & (key >= 0) & (key < 128 + GROUP_TOKENS)
+        valid = (row < LOCAL_ROWS) & (group >= 0) & (key >= 0) & (key < 128 + GROUP_TOKENS)
         ptr = (group * K + key) * D + dim
         dk = tl.load(Dk + ptr, valid, 0)
         dv = tl.load(Dv + ptr, valid, 0)
         result += dk + dv
-    tl.store(Dkv + x, result, row < 4224)
+    tl.store(Dkv + x, result, row < LOCAL_ROWS)
 
 
 @triton.jit
-def pack_rank_major_keys(KV, Packed, K: tl.constexpr, NCOMP: tl.constexpr, GROUP_TOKENS: tl.constexpr, BLOCK: tl.constexpr, START: tl.constexpr):
+def pack_rank_major_keys(
+    KV,
+    Packed,
+    K: tl.constexpr,
+    NCOMP: tl.constexpr,
+    GROUP_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    START: tl.constexpr,
+    GROUPS_PER_RANK: tl.constexpr,
+    LOCAL_ROWS: tl.constexpr,
+):
     group = tl.program_id(1)
     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     key, dim = x // 512, x % 512
     width: tl.constexpr = 128 + GROUP_TOKENS
     logical = tl.maximum(key - width, 0)
-    owner = logical // 32
-    physical = owner * 33 + logical % 32 + (owner > 0).to(tl.int32)
-    source = tl.where(key < width, group * GROUP_TOKENS + key, 4224 + physical)
+    owner = logical // GROUPS_PER_RANK
+    physical = owner * (GROUPS_PER_RANK + 1) + logical % GROUPS_PER_RANK + (owner > 0).to(tl.int32)
+    source = tl.where(key < width, group * GROUP_TOKENS + key, LOCAL_ROWS + physical)
     # Zero keys unreachable by every query in this group before any dot/GEMM.
     window = (key > 0) & (key < width) & (START + group * GROUP_TOKENS - 128 + key >= 0)
     compressed = (key >= width) & (key < width + NCOMP) & (logical < (START + (group + 1) * GROUP_TOKENS) // 128)
@@ -156,12 +171,23 @@ def pack_rank_major_keys(KV, Packed, K: tl.constexpr, NCOMP: tl.constexpr, GROUP
 
 
 @triton.jit
-def reduce_rank_major_keys(Dk, Dv, Dkv, NCOMP: tl.constexpr, K: tl.constexpr, G: tl.constexpr, GROUP_TOKENS: tl.constexpr, BLOCK: tl.constexpr):
+def reduce_rank_major_keys(
+    Dk,
+    Dv,
+    Dkv,
+    NCOMP: tl.constexpr,
+    K: tl.constexpr,
+    G: tl.constexpr,
+    GROUP_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUPS_PER_RANK: tl.constexpr,
+    LOCAL_ROWS: tl.constexpr,
+):
     physical = tl.program_id(0) // (512 // BLOCK)
     dims = tl.program_id(0) % (512 // BLOCK) * BLOCK + tl.arange(0, BLOCK)
-    owner, slot = physical // 33, physical % 33
-    logical = owner * 32 + slot - (owner > 0).to(tl.int32)
-    canonical = ((owner == 0) & (slot < 32)) | ((owner > 0) & (slot > 0))
+    owner, slot = physical // (GROUPS_PER_RANK + 1), physical % (GROUPS_PER_RANK + 1)
+    logical = owner * GROUPS_PER_RANK + slot - (owner > 0).to(tl.int32)
+    canonical = ((owner == 0) & (slot < GROUPS_PER_RANK)) | ((owner > 0) & (slot > 0))
     if canonical & (logical < NCOMP):
         group = tl.arange(0, triton.next_power_of_2(G))
         ptr = (group[:, None] * K + 128 + GROUP_TOKENS + logical) * 512 + dims[None, :]
@@ -170,4 +196,4 @@ def reduce_rank_major_keys(Dk, Dv, Dkv, NCOMP: tl.constexpr, K: tl.constexpr, G:
         result = tl.sum(dk + dv, axis=0)
     else:
         result = tl.full((BLOCK,), 0, tl.float32)
-    tl.store(Dkv + (4224 + physical) * 512 + dims, result)
+    tl.store(Dkv + (LOCAL_ROWS + physical) * 512 + dims, result)
