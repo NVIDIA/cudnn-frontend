@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Iterator, Optional, Sequence, Tuple
 
@@ -94,7 +94,12 @@ def debug_validate_offsets(offsets, *, expert_cnt: int, limit: int, mode: str, s
     if not DEBUG_VALIDATE_DEVICE_VALUES:
         return
     _check_not_capturing(stream, f"validating {name} values")
-    check_offsets_sequence(_host_int_values(offsets), expert_cnt=expert_cnt, limit=limit, mode=mode, alignment=alignment, name=name)
+    if is_torch_tensor(offsets):
+        with _torch_stream_context(stream, offsets.device):
+            values = _host_int_values(offsets)
+    else:
+        values = _host_int_values(offsets)
+    check_offsets_sequence(values, expert_cnt=expert_cnt, limit=limit, mode=mode, alignment=alignment, name=name)
 
 
 def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
@@ -103,7 +108,12 @@ def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
     if not DEBUG_VALIDATE_DEVICE_VALUES:
         return
     _check_not_capturing(stream, f"validating {name} entries")
-    if any(value == 0 or value % 16 != 0 for value in _host_pointer_values(ptrs)):
+    if is_torch_tensor(ptrs):
+        with _torch_stream_context(stream, ptrs.device):
+            values = _host_pointer_values(ptrs)
+    else:
+        values = _host_pointer_values(ptrs)
+    if any(value == 0 or value % 16 != 0 for value in values):
         raise ValueError(f"{name} entries must be non-null and 16-byte aligned")
 
 
@@ -186,10 +196,18 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     """
     if workspace is None:
         return
+    plan_device = getattr(getattr(api, "a_desc", None), "device", None)
+    from cudnn.frost.buffers import DeviceView
+
+    if isinstance(workspace, DeviceView):
+        # Owns no memory (a Workspace carve, or wrapper_workspace's stream-ordered allocation that is
+        # freed on the launch stream after the launch): check the device, retain nothing.
+        if plan_device is not None and plan_device.index is not None and workspace._device_id != plan_device.index:
+            raise ValueError(f"{type(api).__name__}: workspace must be on the plan's device {plan_device}, got cuda:{workspace._device_id}")
+        return
     device = get_device(workspace)
     if getattr(device, "type", None) != "cuda":
         raise ValueError(f"{type(api).__name__}: workspace must be a CUDA buffer, got {device}")
-    plan_device = getattr(getattr(api, "a_desc", None), "device", None)
     if plan_device is not None and plan_device.index is not None and device.index is not None and device.index != plan_device.index:
         raise ValueError(f"{type(api).__name__}: workspace must be on the plan's device {plan_device}, got {device}")
     if is_torch_tensor(workspace):
@@ -225,6 +243,35 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     kept.reverse()
     pending[:] = kept
     pending.append(_PendingWorkspace(workspace, stream))
+
+
+def wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
+    """Wrapper-owned scratch whose release follows the consumer on its launch stream.
+
+    JAX allocation readiness does not cover a foreign CUDA consumer. Use a driver
+    stream-ordered allocation for that caller layer, paired with a free after launch,
+    so overlapping calls have independent lifetimes without plan-owned storage.
+    The APIBase execute path still only receives and carves the supplied buffer.
+    """
+    if framework == "torch" or nbytes <= 0:
+        return nullcontext(allocate_wrapper_workspace(framework, nbytes, device, current_stream))
+    return _jax_wrapper_workspace(nbytes, device, current_stream)
+
+
+@contextmanager
+def _jax_wrapper_workspace(nbytes: int, device, current_stream: cuda.CUstream):
+    from cudnn._device import _ck, ensure_current_context
+    from cudnn.frost.buffers import DeviceView
+
+    device_id = int(device.local_hardware_id)
+    ensure_current_context(current_stream, device_id)
+    ptr = _ck(*cuda.cuMemAllocAsync(nbytes, current_stream))
+    try:
+        yield DeviceView(int(ptr), (nbytes,), "uint8", device_id)
+    finally:
+        # Free is enqueued even when validation/launch raises; no host wait or GC
+        # finalizer, and no mutable "latest workspace" on the cached plan.
+        _ck(*cuda.cuMemFreeAsync(ptr, current_stream))
 
 
 def wrapper_operand_meta(tensor):

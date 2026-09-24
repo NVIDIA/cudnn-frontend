@@ -36,6 +36,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 from cudnn.frost.workspace import Workspace, align_up
+from ._workspace import validate_workspace_aliases
 
 
 def _get_rubin_kernel():
@@ -341,7 +342,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
         self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        if not hasattr(self, "_scratch_nbytes"):
+            self._scratch_nbytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return self._scratch_nbytes
 
     @staticmethod
     def _fake_workspace_ptr():
@@ -1342,7 +1345,30 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 "dbias_tensor is required when GroupedGemmDgluSm100 is configured with sample_dbias",
             )
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
+        validate_workspace_aliases(
+            ws_view.data_ptr(),
+            nbytes,
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            d_col_tensor=d_col_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            dbias_tensor=dbias_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+            amax_tensor=amax_tensor,
+            norm_const_tensor=norm_const_tensor,
+        )
         retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:

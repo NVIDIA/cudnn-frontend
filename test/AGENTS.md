@@ -113,3 +113,22 @@ module's `__file__` after conftest setup, not only `cudnn.__file__`.
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
 the selected package/source setup into each child and verify its loaded path.
+
+### Pending-consumer lifetime probes
+
+A CUDA stream wait on an event that has never been recorded is a no-op; recording
+it later does not retroactively block the consumer. Do not use an unrecorded event
+as a host-released latch. A bounded delayed-consumer probe must assert that its
+completion event is still pending after the producer/churn work. If the delay
+expires, fail the setup instead of accepting a lifetime result without overlap.
+Use a bounded byte consumer for recycled-storage negative controls, never a real
+kernel on a deliberately invalidated workspace.
+
+### Caller workspace alias regressions
+
+Check the carved scratch byte range against operand byte spans, including packed
+uint8 FP4 storage, strided views, optional outputs, and device pointer tables.
+Intercept the compiled consumer for negative tests so intentional aliasing never
+reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
+allocation so rejecting shared ownership does not substitute for checking overlap.
+Device pointer-table contents remain a caller contract, not a reason for a D2H read.
