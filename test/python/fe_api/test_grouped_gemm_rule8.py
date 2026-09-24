@@ -502,6 +502,55 @@ def test_retain_workspace_guards_device_and_keeps_eager_buffers_until_their_laun
 
 
 @pytest.mark.L0
+def test_retain_workspace_checks_a_device_view_and_retains_nothing():
+    """A DeviceView owns no memory (a Workspace carve, or wrapper_workspace's stream-ordered driver
+    allocation that is freed on the launch stream): retain_workspace checks its device and keeps no
+    reference, instead of refusing it as a non-CUDA buffer."""
+    from cudnn.frost.buffers import DeviceView
+    from cudnn.gemm.cutedsl.grouped.backend_utils import retain_workspace
+
+    class _Desc:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    class _Api:
+        a_desc = _Desc()
+
+    api = _Api()
+    storage = torch.empty(256, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    retain_workspace(api, DeviceView(storage.data_ptr(), (256,), "uint8", storage.device.index), stream)
+    assert not hasattr(api, "_live_workspaces")
+    with pytest.raises(ValueError, match="plan's device"):  # metadata-only: the index need not exist
+        retain_workspace(api, DeviceView(storage.data_ptr(), (256,), "uint8", storage.device.index + 1), stream)
+
+
+@pytest.mark.L0
+def test_dglu_execute_accepts_the_jax_wrappers_device_view_workspace():
+    """The eager-JAX dGLU wrapper hands the plan a DeviceView over its stream-ordered scratch. The plan
+    carves it, validates aliases and passes it to retain_workspace; results match a torch workspace."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the FROST BF16 dGLU plan runs on SM100")
+    from cudnn.frost.buffers import DeviceView
+    from fe_api.grouped_gemm.test_grouped_gemm_dglu_activation import make_plan, problem
+
+    p = problem(True)
+    op = make_plan(p, True, None)
+    op.check_support()
+    op.compile()
+    nbytes = op.scratch_workspace_bytes()
+    storage = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    args = (p["a"], p["c"], p["d"], None, None, p["offsets"], p["alpha"], p["beta"], p["prob"], p["dp"])
+    p["d"].fill_(0)  # the kernel writes only the valid rows; the padded tail keeps whatever was there
+    op.execute(*args, **p["bind"], workspace=storage)
+    torch.cuda.synchronize()
+    expected = p["d"].clone()
+    p["d"].fill_(0)
+    op.execute(*args, **p["bind"], workspace=DeviceView(storage.data_ptr(), (nbytes,), "uint8", storage.device.index))
+    torch.cuda.synchronize()
+    assert torch.equal(p["d"], expected)
+
+
+@pytest.mark.L0
 def test_wgrad_expert_ptrs_rejects_overlapping_or_strided_slices():
     """The discrete kernels read each expert's slice through one contiguous (hidden, intermediate)
     descriptor: a view whose slices are strided or overlap is refused before a pointer table is built."""
