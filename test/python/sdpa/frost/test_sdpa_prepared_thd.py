@@ -1162,6 +1162,13 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
 
     with torch.cuda.stream(stream):
         g.execute(_pack(t, bufs), ws)
+    stream.synchronize()
+    verify()
+    with torch.cuda.stream(stream):
+        # Verify each route independently: otherwise a no-op standalone path
+        # could leave the preceding graph's correct outputs untouched.
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
         # The tensor/standalone route must share the same native evaluator.
         prepared = plan._prepared
         plan._prepared, plan.takes_variant_pack = None, False
@@ -1226,9 +1233,17 @@ def test_native_thd_concurrent_streams_use_independent_frames():
             g.execute(_pack(t, buffers[i]), workspaces[i], handle=handles[i])
         streams[i].synchronize()
 
-    with ThreadPoolExecutor(2) as pool:
-        list(pool.map(run, range(2)))
-    for bufs in buffers:
-        o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
-        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(run, range(2)))
+        for bufs in buffers:
+            o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
+            torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+    finally:
+        try:
+            for stream in streams:
+                stream.synchronize()
+        finally:
+            for handle in handles:
+                cudnn.destroy_handle(handle)
