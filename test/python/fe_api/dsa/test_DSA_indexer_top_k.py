@@ -331,6 +331,9 @@ def test_DSA_indexer_top_k_wrapper_staging_outlives_the_released_original():
     seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
     base = torch.randn(n_rows, 2 * num_cols, dtype=torch.float32, device="cuda")
     expected = DSA.indexer_top_k_wrapper(base[:, ::2].contiguous(), seq_lens, top_k)
+    # Warm the window's kernels first: under CUDA lazy loading a first launch waits for the device to drain (no race).
+    DSA.indexer_top_k_wrapper(base[:, ::2], seq_lens, top_k)
+    torch.empty(1, dtype=torch.float32, device="cuda").fill_(float("-inf"))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
     side = torch.cuda.Stream()
