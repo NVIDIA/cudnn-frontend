@@ -474,6 +474,95 @@ def test_bsa_attention_forward_gqa_without_block_sizes():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("q_value", "k_value"),
+    [
+        pytest.param(10000.0, 10008.0, id="fp16-p-underflow"),
+        pytest.param(30000.0, 30128.0, id="fp16-exp-overflow"),
+    ],
+)
+def test_bsa_attention_forward_sm90_blk64_large_equal_logits(q_value, k_value):
+    """Equal ~1e10 logits with V = 1 weight every key equally, so O is exactly 1.
+
+    P must stay max-centered through its 16-bit conversion: an exponent offset by the rounding residual of
+    max * softmax_scale overflows or underflows there (O = NaN or 0).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.full((1, 1, 64, 128), q_value, device="cuda", dtype=torch.float16)
+    k = torch.full((1, 1, 128, 128), k_value, device="cuda", dtype=torch.float16)
+    v = torch.ones_like(k)
+    q2k = torch.tensor([[[[0, 1]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    torch.testing.assert_close(result["o_tensor"], torch.ones_like(q), atol=0, rtol=0)
+    assert torch.isfinite(result["lse_tensor"]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("dtype", "q_value", "k_low", "k_high"),
+    [
+        pytest.param(torch.float16, 10000.0, 10000.0, 10048.0, id="fp16-p-overflow"),
+        pytest.param(torch.bfloat16, 30000.0, 30000.0, 30208.0, id="bf16-exp-overflow"),
+    ],
+)
+def test_bsa_attention_forward_sm90_blk64_large_logits_max_rises(dtype, q_value, k_low, k_high):
+    """The list is walked from its last slot: KV block 0 sets the running max, then KV block 1, larger by far more
+    than the softmax range, rescales it to zero. V is 1 on block 0 and 2 on block 1, so O is exactly 2."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.full((1, 1, 64, 128), q_value, device="cuda", dtype=dtype)
+    k = torch.full((1, 1, 128, 128), k_high, device="cuda", dtype=dtype)
+    k[:, :, :64] = k_low
+    v = torch.full_like(k, 2.0)
+    v[:, :, :64] = 1.0
+    q2k = torch.tensor([[[[1, 0]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    torch.testing.assert_close(result["o_tensor"], torch.full_like(q, 2.0), atol=0, rtol=0)
+    assert torch.isfinite(result["lse_tensor"]).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@torch_fork_set_rng(seed=5)
+def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype):
+    """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
+    holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    q = torch.zeros((1, 1, 64, 128), device="cuda", dtype=dtype)
+    q[..., 0::2, :64] = 10000.0
+    q[..., 1::2, 64:] = torch.randn((1, 1, 32, 64), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, 128, 128), device="cuda", dtype=dtype)
+    k[..., :64] = 10008.0
+    v = torch.randn_like(k)
+    q2k = torch.tensor([[[[0, 1]]]], device="cuda", dtype=torch.int32)
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, sparse_block_size=64)
+    mask = torch.zeros((64, 128), device="cuda", dtype=torch.float32)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=4)
 def test_bsa_attention_forward_sm100_blk64():
     if not torch.cuda.is_available():
