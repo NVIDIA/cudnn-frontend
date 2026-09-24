@@ -559,7 +559,9 @@ def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype):
     mask = torch.zeros((64, 128), device="cuda", dtype=torch.float32)
     o_ref, lse_ref = attention_reference(q, k, v, mask)
     torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+    # Even rows: LSE ~5.7e8, so bound it absolutely; the FP32 reference alone is off by a few hundred.
+    torch.testing.assert_close(result["lse_tensor"][..., 0::2], lse_ref[..., 0::2], atol=1e3, rtol=0)
+    torch.testing.assert_close(result["lse_tensor"][..., 1::2], lse_ref[..., 1::2], atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0
