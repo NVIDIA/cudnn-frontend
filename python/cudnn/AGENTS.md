@@ -403,7 +403,10 @@ Record whenever `stream` is given, even when it is torch's current stream (the c
 entered a side-stream context; the allocator orders reuse against the ALLOCATION stream);
 `stream=None` is the caller's own context and records nothing. Detector: `test/python/fe_api/test_torch_stream_staging.py` -- a long kernel on
 the side stream, the wrapper call, release the original, a same-size allocation filled with
-poison, synchronize, compare (the bare-`.contiguous()` control reads the poison).
+poison, synchronize, compare (the bare-`.contiguous()` control reads the poison). Launch every
+kernel of the window once before it: under CUDA lazy module loading a kernel's first launch waits
+for the device to drain, which serializes the poison behind the pending copy, so the control fails
+and the detector passes without any race having happened.
 
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-
