@@ -237,8 +237,8 @@ at its own KV length, rows left without a key write O := 0 / LSE := -inf) and a 
 sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests, pinned
 on the FROST plan, and the `test_mhas_v2.py` fp8 paged decode fuzz, which draws the same
 masks over the default walk and asserts the row served every draw). Not yet: packed (ragged-offset) block tables, the f16/bf16 and FP8 d512 flavors, the SM107 (Rubin)
-siblings, sink + KV split (a sink graph runs unsplit — see ˢ), sink and block-scaled O
-(`sf_o`) over FP8 pools.
+siblings, sink + KV split (a sink graph runs unsplit — see ˢ), sink over FP8 pools, block-scaled O
+(`sf_o`) over FP8 and MXFP8 pools.
 Served by the `PAGED_KV` specialization of
 `sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/prefill_d256_f16.py`
 and `sm100/prefill_d128_fp8.py`, and of the four `sm100/prefill_d*_mxfp8.py` kernels
@@ -293,7 +293,7 @@ descale tensors are page pools too and page with K/V through the same block tabl
 so `page_size % 128 == 0` (a page holds whole 128-row SF atoms and TMA loads one SF tile per KV tile).
 Q keeps the dense `[B, H_q, S_q_padded, D/32]` F8_128x4 descale. E4M3/E5M2 in, any O dtype, Stats,
 GQA (no PackGQA), KV split, sink; exact native head dims (d128 / d192×d128 / d256 / d512), dense Q only
-(no THD queries), SM100/SM103 only. The cuDNN backend declines these graphs (no paged load for block-scale
+(no THD queries), no block-scaled O (`sf_o`) over pools, SM100/SM103 only. The cuDNN backend declines these graphs (no paged load for block-scale
 pools), so a FROST engine is the only server.
 
 ˢ **Attention sink at `S_q == 1` (decode), incl. paged KV and sliding window.**
@@ -1030,7 +1030,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
-| Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries, the attention sink and a block-scaled O (`sf_o`) over FP8 pools |
+| Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |

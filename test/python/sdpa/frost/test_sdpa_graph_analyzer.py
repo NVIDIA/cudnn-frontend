@@ -1872,6 +1872,7 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert "block-scaled O" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True, page_size=128, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
     assert "page_size" in engines.mismatch(fp8, paged_facts(is_fp8=True, page_size=48))
     assert "use_padding_mask" in engines.mismatch(fp8, paged_facts(is_fp8=True, padded=False))
 

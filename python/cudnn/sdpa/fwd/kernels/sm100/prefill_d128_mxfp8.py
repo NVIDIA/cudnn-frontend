@@ -1342,7 +1342,7 @@ def _tmaldg_warp_group(
             if cutlass.const_expr(PAGED_KV):
                 n_pages_b = (eff_seqlen_kv + cutlass.Int32(PAGE_SIZE - 1)) // cutlass.Int32(PAGE_SIZE)
 
-    # cga2 drain — TMA warp cga2 drain at kernel exit.
+    # cga2 drain — TMA warp cga2 drain at kernel exit (cga2-mma.md).
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         for _qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_q_empty[_qs].wait(q_empty_phase)

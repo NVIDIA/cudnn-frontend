@@ -876,8 +876,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # TMA-LDG warp (validated together in test_sdpa_fwd_paged_sm100 /
         # test_sdpa_fwd_paged_mxfp8_sm100). Sink + split-KV stays declined above
         # (the combine is not sink-aware), so sink decode runs unsplit. The FP8
-        # kernel's sink fold and its block-scaled O epilogue (sf_o) over pools
-        # are not validated, so those two pairs stay declined on the fp8 row.
+        # kernel's sink fold over pools is not validated (declined on the fp8 row),
+        # and the block-scaled O epilogue (sf_o) over pools is not validated on
+        # either quantized row.
         if facts.is_mxfp8:
             if facts.page_size % 128 != 0:
                 # A page must hold whole 128-row F8_128x4 SF atoms.
@@ -888,8 +889,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
         if facts.is_fp8 and facts.has_sink:
             return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
-        if facts.is_fp8 and facts.o_block_scale:
-            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)"
+        if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
+            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if capabilities.paged_d_shapes is not None:
