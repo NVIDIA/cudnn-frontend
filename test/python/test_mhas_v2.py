@@ -2121,11 +2121,8 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 # # L0 MXFP8 paged KV cache on the FROST SM100 MXFP8 row
 # # ==================================
 #
-# sdpa_mxfp8 over E4M3/E5M2 page pools with block-scale descale POOLS (the SF pages with
-# K/V through the same block tables), per-batch lengths, decode / MTP / chunked-prefill
-# shapes. The FROST MXFP8 row serves d256 at page sizes that are multiples of 128; the
+# sdpa_mxfp8 over page pools whose F8_128x4 descales page with K/V (page_size % 128). The
 # cuDNN backend declines every MXFP8 paged graph, so each config asserts FROST routing.
-# The xfail cases spell the target contract the row does not serve yet.
 
 FROST_MXFP8_ENGINE = "sdpa_fwd_prefill_sm100_mxfp8"
 FROST_MXFP8_ENGINE_KEY = f"frost:{FROST_MXFP8_ENGINE}"

@@ -198,9 +198,8 @@ class TemplateParams:
 # other flavor must reject it rather than silently reading K/V as dense.
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
-# ``paged_d_shapes`` and the adapter's check_support name the same set;
-# the d512 MXFP8 kernel validates under the "d256" tag (make_cfg_d512_mxfp8
-# builds on _make_cfg_d256), so (512, 512) on the MXFP8 row needs no entry.
+# ``paged_d_shapes`` and the adapter's check_support name the same set
+# (the d512 MXFP8 kernel validates under the "d256" tag via make_cfg_d512_mxfp8).
 _PAGED_KV_FLAVORS = frozenset({"d128", "d192", "d256"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no

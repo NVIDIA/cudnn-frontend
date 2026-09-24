@@ -3409,7 +3409,6 @@ def _host(
         b_sf = B
         q_sf_num_tiles = (SQ + CFG.TILE_M - 1) // CFG.TILE_M
         kv_sf_num_tiles = (SKV + CFG.TILE_N - 1) // CFG.TILE_N
-    # The SF pools are indexed by page like K/V.
     kv_sf_batches = b_sf
     if cutlass.const_expr(PAGED_KV):
         kv_sf_batches = k_tensor.shape[0]

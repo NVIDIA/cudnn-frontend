@@ -977,9 +977,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
     q_fp8_d, sf_q_d_ref, sf_q_d_swizzle, q_fp8_s, sf_q_s_ref, sf_q_s_swizzle = quantize_to_mxfp8(q_f32, b, h_q, s_qo, d_qk, block_size, torch_itype, with_ref=not perf)
     if is_paged:
-        # Quantize the page POOLS (pool index p*b + batch, the harness's paging order), then fold
-        # them back into the dense [b, h, s_kv, d] operands the reference consumes. Page boundaries
-        # are 32-aligned, so the per-32 groups (hence the numerics) match a dense quantization.
+        # Quantize the pools (pool index p*b + batch, the harness's paging order) and fold back to the
+        # dense reference operands: page boundaries are 32-aligned, so the per-32 groups match dense.
         nblocks = ceil_div(s_kv, paged_block_size)
         num_pages = nblocks * b
 

@@ -3010,7 +3010,6 @@ def _host(
         _B_SF = B
         _q_sf_num_tiles = sq_sf_tiles
         _kv_sf_num_tiles = skv_sf_tiles
-    # The SF pools are indexed by page like K/V.
     _kv_sf_batches = _B_SF
     if cutlass.const_expr(PAGED_KV):
         _kv_sf_batches = k_tensor.shape[0]
@@ -3399,10 +3398,8 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
-        # o_partial_f32 is LAST of the fixed slots so the THD tensors keep theirs when
-        # the mode is off; the paged tables and then the block-scaled O group (the
-        # 1-element O scale, the SF_O buffer with a dynamic byte length, four geometry
-        # scalars) follow, each None-specialized when its mode is off.
+        # o_partial_f32 is LAST of the fixed slots so the THD tensors keep theirs when the
+        # mode is off; the paged tables, then the block-scaled O group, are None-specialized when off.
         *((fake_o,) if _FP32_PARTIALS else ((None,) if (PAGED_KV or CFG.O_BLOCK_SCALE) else ())),
         *((fake_block_table, fake_block_table_v) if PAGED_KV else ((None, None) if CFG.O_BLOCK_SCALE else ())),
         *(

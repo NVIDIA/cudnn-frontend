@@ -2485,9 +2485,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # exists (None-specialized identity fold otherwise; has_scale_o).
                 fp8_kwargs["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
             if self.paged:
-                # Pools bound as declared (the MXFP8 template pins pool / table strides at
-                # compile time, like the fp8 branch above); the logical KV maximum leaves
-                # the key (_PAGED_COMPILE_SKV).
+                # The MXFP8 template pins pool / table strides at compile time; the logical
+                # KV maximum leaves the key (_PAGED_COMPILE_SKV).
                 fp8_kwargs.update(
                     k_stride=self._paged_pool_stride(self.k_desc),
                     v_stride=self._paged_pool_stride(self.v_desc),
