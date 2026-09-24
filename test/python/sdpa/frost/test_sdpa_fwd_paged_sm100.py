@@ -1785,9 +1785,9 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
     the block table's dynamic page axis), so separately constructed paged fp8 plans that
     differ only in paged_attention_max_seq_len_kv -- 96, then 128, then 96 again (page 32:
     3 / 4 / 3 pages) -- share ONE compiled artifact: the second and third compile() add no
-    miss to the template's compile cache and return the same callable.  The dense fp8 plan
-    keeps its S_kv specialization (its K/V TMA extents are compiled from skv): 96 then 128
-    compile twice."""
+    miss to the template's compile cache and return the same callable. Eligible dense D128
+    fp8-to-half plans use the prepared pointer entry: 96 / 128 / 96 share its artifact and
+    do not touch the legacy tensor-entry compile cache."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P = 3, 8, 2, 32
@@ -1835,7 +1835,13 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
         return api
 
     dense_96 = dense_plan(96)
-    misses = dense_96._k_mod.compile.cache_info().misses
-    dense_128 = dense_plan(128)
-    assert dense_128._k_mod.compile.cache_info().misses == misses + 1, "a dense plan's S_kv still specializes the artifact"
-    assert dense_128._compiled_kernel is not dense_96._compiled_kernel
+    assert dense_96._prepared_fp8 and dense_96._dense_spec is not None
+    legacy_cache = dense_96._k_mod.compile.cache_info()
+    prepared_misses = dense_96._k_mod.compile_prepared.cache_info().misses
+    for max_kv in (128, 96):
+        api = dense_plan(max_kv)
+        assert api._prepared_fp8 and api._dense_spec is not None
+        assert api._k_mod is dense_96._k_mod
+        assert api._k_mod.compile.cache_info() == legacy_cache, "prepared dense plans must not call the legacy compiler"
+        assert api._k_mod.compile_prepared.cache_info().misses == prepared_misses, "runtime KV extents must not specialize the prepared artifact"
+        assert api._compiled_kernel is dense_96._compiled_kernel, max_kv

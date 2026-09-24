@@ -177,7 +177,7 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     assert engines.mismatch(spec.capabilities, fresh, split) is None
 
 
-@pytest.mark.parametrize("feature", ["fp8", "mxfp8", "bias", "synth_kv"])
+@pytest.mark.parametrize("feature", ["mxfp8", "bias", "synth_kv"])
 def test_prepared_override_capability_declines_legacy_features(feature):
     """The same pure predicate serves candidate filtering and runtime executor selection."""
     from dataclasses import replace
@@ -188,9 +188,41 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     _finish_output(o, dims, strides)
     facts = _facts(graph)
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
-    changed = dict(fp8=dict(is_fp8=True), mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
     assert engines._prepared_decline_reason(caps, facts, 1) is None
     assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
+
+
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "fp8_output", "paged", "split", "block_scaled_output", "gate", "sm107"])
+def test_prepared_fp8_override_capability_envelope(dtype_o, feature):
+    """D128 FP8-to-half is eligible; the other quantized routes retain their tensor entry."""
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    changed = dict(
+        supported={},
+        head_dim=dict(d_qk=256, d_v=256),
+        fp8_output=dict(dtype_o=cudnn.data_type.FP8_E4M3),
+        paged=dict(has_paged_kv=True),
+        split={},
+        block_scaled_output=dict(o_block_scale=32),
+        gate=dict(has_epilogue_gate=True),
+        sm107={},
+    )[feature]
+    if feature == "sm107":
+        caps = replace(caps, sm_lo=107, sm_hi=119)
+    reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
+    if feature == "supported":
+        assert reason is None
+    else:
+        assert reason is not None
+        assert "prepared FP8" in reason
 
 
 def test_probe_accepts_bf16():
