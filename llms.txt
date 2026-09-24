@@ -41,6 +41,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 
 - [CUDA graphs](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/cuda-graphs.md)
 - [Deviceless ahead-of-time compilation](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/deviceless-ahead-of-time-compilation.md)
+- [Ahead-of-time plans for Python engines (serialize a FROST plan, run it from C++ with no JIT)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/ahead-of-time-python-engine-plans.md)
 - [Dynamic kernel cache](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/dynamic-kernel-cache.md)
 - [Custom execution plans](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/custom-execution-plan.md)
 - [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/utilities/CompileTimeConstants.md)

@@ -467,12 +467,29 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
     cannot know whether the next region is refusable, so it would leave the
     earlier ones filled.
     """
+    for fn, args in fill_steps(ptr, shape, strides, elem_bytes, word, stream):
+        fn(*args)
+
+
+def fill_steps(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> list:
+    """:func:`fill_word_strided_async` as the ``(fn, args)`` calls it issues, not issued.
+
+    For a caller that records its launch sequence (a plan's ``launches()``)
+    rather than running it; running each ``fn(*args)`` in order is the fill.
+    """
     if elem_bytes != 4:
         raise NotImplementedError(f"frost: a reduction seed is a 32-bit pattern; this output stores {elem_bytes}-byte elements")
     plan = strided_fill_plan(shape, strides)
     if plan is None:
         raise ValueError(f"frost: a reduction output cannot write an element twice (shape {tuple(shape)} stride {tuple(strides)})")
-    apply_fill_plan(ptr, plan, word, stream)
+    return [
+        (
+            (fill_word_async, (ptr + offset * 4, width, word, stream))
+            if height == 1
+            else (_fill_word_2d_async, (ptr + offset * 4, pitch, width, height, word, stream))
+        )
+        for offset, pitch, width, height in plan
+    ]
 
 
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs

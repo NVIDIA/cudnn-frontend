@@ -837,6 +837,14 @@ class PyGraph {
     std::vector<uint8_t>
     serialize() const;
 
+    // The graph with an ahead-of-time plan (see experimental/aot_engine.h):
+    // payload_json is the payload with its "modules" left out, modules the
+    // exported shared objects in the order its steps name them.
+    std::vector<uint8_t>
+    serialize_aot(std::string const& payload_json,
+                  std::vector<py::bytes> const& modules,
+                  std::vector<int64_t> const& user_uids) const;
+
     void
     deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled = false);
 

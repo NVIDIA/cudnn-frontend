@@ -33,6 +33,7 @@ import math
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
+from cudnn.engines.base import Launch
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
 
@@ -438,10 +439,14 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     return t_kv
 
 
-def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
+def bind_thd(
+    spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int, deferred: Optional[List[Any]] = None
+) -> Optional[List[Any]]:
     """This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
-    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``."""
+    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``, or,
+    given a ``deferred`` list, appends it there as ``(fn, args)`` calls for the caller to issue
+    before the launch."""
     ix = spec.index
     frame = spec.frame()
 
@@ -516,9 +521,14 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     def seed_padded():
         shape = (spec.b, spec.qh, spec.s_q_max)
         if _buffers.is_contiguous(shape, spec.lse_stride):
-            _buffers.fill_word_async(lse.ptr, math.prod(shape), spec.neg_inf, stream_int)
+            calls = [(_buffers.fill_word_async, (lse.ptr, math.prod(shape), spec.neg_inf, stream_int))]
         else:
-            _buffers.fill_word_strided_async(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
+            calls = _buffers.fill_steps(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
+        if deferred is not None:
+            deferred.extend(calls)
+            return
+        for fn, args in calls:
+            fn(*args)
 
     t_q = min(_capacity(q, geo.roles["q"], "q"), _capacity(o, geo.roles["o"], "o"))
     if spec.total_q is not None:
@@ -597,7 +607,8 @@ class PreparedThdLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it."""
         indices = self._indices
         if indices is None:
             try:
@@ -605,9 +616,16 @@ class PreparedThdLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
-        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
+        seeds: List[Any] = []
+        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int, deferred=seeds)
+        out = [Launch(fn, args) for fn, args in seeds]
         if frame is not None:
-            self.spec.fn(*frame)
+            out.append(Launch(self.spec.fn, frame, self.spec.owner))
+        return out
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        for fn, args, _ in self.launches(pack, workspace_ptr, stream, stream_int):
+            fn(*args)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1225,7 +1243,8 @@ class PreparedDenseLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it."""
         indices = self._indices
         if indices is None:
             try:
@@ -1233,12 +1252,15 @@ class PreparedDenseLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
-        if self.spec.combine is not None:
-            bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
+        spec = self.spec
+        if spec.combine is not None:
+            bound = bind_dense_split(spec, facts, workspace_ptr, stream, stream_int)
             if bound is None:
-                return  # ragged-Q leg: no addressable token / empty producer -> no launch
+                return []  # ragged-Q leg: no addressable token / empty producer -> no launch
             frame, combine_args = bound
-            self.spec.fn(*frame)
-            self.spec.combine.fn(*combine_args)
-        else:
-            self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
+            return [Launch(spec.fn, frame, spec.owner), Launch(spec.combine.fn, combine_args, spec.combine.owner)]
+        return [Launch(spec.fn, bind_dense(spec, facts, stream, stream_int), spec.owner)]
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        for fn, args, _ in self.launches(pack, workspace_ptr, stream, stream_int):
+            fn(*args)

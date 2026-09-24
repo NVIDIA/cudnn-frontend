@@ -144,6 +144,9 @@ navigation:
           - page: Deviceless Ahead-of-time Compilation
             path: ../../utilities/deviceless-ahead-of-time-compilation.md
             slug: deviceless-ahead-of-time-compilation
+          - page: Ahead-of-time Plans for Python Engines
+            path: ../../utilities/ahead-of-time-python-engine-plans.md
+            slug: ahead-of-time-python-engine-plans
           - page: Dynamic Shapes and Kernel Cache
             path: ../../utilities/dynamic-kernel-cache.md
             slug: dynamic-kernel-cache

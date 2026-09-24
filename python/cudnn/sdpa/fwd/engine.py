@@ -19,7 +19,7 @@ only the engine contract around them.
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from cudnn import behavior_note
-from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, Launch, PlanConfig
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -61,39 +61,45 @@ class _FrostSdpaFwdPlan(CompiledPlan):
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
 
+    def _prepared_call(self, pack, ctx: ExecutionContext):
+        """``(workspace_ptr, stream, stream_int)`` the prepared launch binds for this call."""
+        if pack is None:
+            raise ValueError(f"{self._name}: the graph could not normalize the variant pack for this plan")
+        ws_ptr = 0
+        if self._workspace_bytes:
+            ws_ptr, nbytes = pack.workspace, pack.workspace_bytes
+            if not ws_ptr:
+                raise ValueError(
+                    f"{self._name} requires a {self._workspace_bytes}-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes"
+                )
+            if nbytes and nbytes < self._workspace_bytes:  # 0: a bare address, size unknown
+                raise ValueError(f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())")
+            device = getattr(ctx.workspace, "__dlpack_device__", None)
+            if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
+        raw_stream = ctx.stream
+        if raw_stream is None:
+            # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does
+            # (a legacy-stream launch would run eagerly inside a CUDA-graph capture and leave the graph empty).
+            cu_stream = self._default_stream() if self._default_stream is not None else None
+            stream_int = int(cu_stream) if cu_stream is not None else 0
+        else:
+            cu_stream = self._stream_handles.get(raw_stream)
+            if cu_stream is None:
+                from cuda.bindings import driver as _drv
+
+                cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
+            stream_int = int(raw_stream)
+        return ws_ptr, cu_stream, stream_int
+
+    def launches(self, graph: "pygraph", pack, ctx: ExecutionContext) -> List[Launch]:
+        if self._prepared is None:
+            raise NotImplementedError(f"{self._name}: only the prepared (positional-entry) launch can be compiled ahead of time; this plan binds tensors")
+        return self._prepared.launches(pack, *self._prepared_call(pack, ctx))
+
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
         if self._prepared is not None:
-            pack = uid_to_data  # a VariantPack (takes_variant_pack)
-            if pack is None:
-                raise ValueError(f"{self._name}: the graph could not normalize the variant pack for this plan")
-            ws_ptr = 0
-            if self._workspace_bytes:
-                ws_ptr, nbytes = pack.workspace, pack.workspace_bytes
-                if not ws_ptr:
-                    raise ValueError(
-                        f"{self._name} requires a {self._workspace_bytes}-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes"
-                    )
-                if nbytes and nbytes < self._workspace_bytes:  # 0: a bare address, size unknown
-                    raise ValueError(
-                        f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
-                    )
-                device = getattr(ctx.workspace, "__dlpack_device__", None)
-                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
-                    raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
-            raw_stream = ctx.stream
-            if raw_stream is None:
-                # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does
-                # (a legacy-stream launch would run eagerly inside a CUDA-graph capture and leave the graph empty).
-                cu_stream = self._default_stream() if self._default_stream is not None else None
-                stream_int = int(cu_stream) if cu_stream is not None else 0
-            else:
-                cu_stream = self._stream_handles.get(raw_stream)
-                if cu_stream is None:
-                    from cuda.bindings import driver as _drv
-
-                    cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
-                stream_int = int(raw_stream)
-            self._prepared.execute(pack, ws_ptr, cu_stream, stream_int)
+            self._prepared.execute(uid_to_data, *self._prepared_call(uid_to_data, ctx))
             return
         # The executor's operands out of the graph-wide variant pack, keyed by
         # IR tensor identity (the binding's own key).

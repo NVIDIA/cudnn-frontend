@@ -10,6 +10,7 @@ Usage examples for the C++ graph API and the Python API. Build commands: [../AGE
 | `legacy_samples/` | Frozen samples for the legacy flat API — binary `build/bin/legacy_samples`. Don't add here. |
 | `python/` | Numbered Jupyter notebooks (`00_introduction.ipynb` ...) — the Python tutorial sequence |
 | `frost/` | Standalone Python scripts for the FROST engines: `gemm/` and `linear_attention/`, numbered, each self-checking against a reference |
+| `aot/` | Ahead-of-time plans: `export_plan.py` serializes a FROST SDPA plan, `run_plan.cpp` runs it from C++ (see its README) |
 | `llama/`, `llm_coverage/` | End-to-end LLaMA tie-out scripts and per-op coverage scripts (plain `.py`, see their READMEs) |
 
 ## Running

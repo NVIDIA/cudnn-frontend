@@ -98,6 +98,14 @@ def _is_dense(dim, stride) -> bool:
     return True
 
 
+def _looks_aot(data) -> bool:
+    """Whether a serialized blob may carry an AOT plan (its "aot" key); a false
+    positive only preloads the CuTeDSL runtime libraries."""
+    if isinstance(data, list) and data and isinstance(data[0], int):
+        data = bytes(data)
+    return isinstance(data, (bytes, bytearray)) and b"\x03aot" in data
+
+
 def _observed_span(data) -> Optional[int]:
     """Element span of a caller's buffer as the CALLER describes it (``1 + sum((size-1)*stride)``,
     numel when compact); None for a bare address or a producer without shape/stride."""
@@ -2344,11 +2352,26 @@ class pygraph:
         return json.dumps(self.inspect(), default=str, indent=2)
 
     def serialize(self):
-        """Serialize the graph (classic passthrough).
+        """Serialize the graph with the plan it executes.
 
-        Returns the C++ binding's serialized form unchanged; C++
-        ``deserialize`` accepts exactly this form back.
+        A backend plan is the C++ binding's serialized form, unchanged. A Python
+        engine's plan is compiled ahead of time into the same form
+        (``cudnn.engines.aot``): its kernels and launch sequence travel in the
+        blob, and ``deserialize`` -- here or in C++ -- runs them with no Python
+        and no JIT. A plan that cannot be exported raises rather than writing a
+        different plan than the one that runs.
         """
+        eng = self.selected_engine if self._planning_done else None
+        if eng is not None:
+            plan = self._compiled_plans.get(self._plan_index)
+            if plan is None:
+                raise RuntimeError(f"serialize(): the selected plan ({eng.name}) is not built yet; call build_plans() first")
+            from .engines import aot
+
+            try:
+                return aot.export(self, plan)
+            except NotImplementedError as exc:
+                raise cudnn_graph_not_supported(f"serialize(): the selected plan ({eng.name}) cannot be compiled ahead of time: {exc}") from exc
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
             # demand (independent of which plan is selected for execution).
@@ -2376,6 +2399,10 @@ class pygraph:
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):
             kwargs["handle_"] = kwargs["handle_"].backend_handle
+        if any(_looks_aot(a) for a in list(args) + list(kwargs.values())):
+            from ._aot_runtime import preload_runtime
+
+            preload_runtime()  # the C++ loader resolves the CuTeDSL runtime by SONAME
         if self._lowered_graph is None:
             import cudnn
 

@@ -624,6 +624,22 @@ PyGraph::serialize() const {
     return data;
 }
 
+std::vector<uint8_t>
+PyGraph::serialize_aot(std::string const& payload_json,
+                       std::vector<py::bytes> const& modules,
+                       std::vector<int64_t> const& user_uids) const {
+    json payload       = json::parse(payload_json);
+    payload["modules"] = json::array();
+    for (auto const& m : modules) {
+        std::string_view const view = m;
+        payload["modules"].push_back(json::binary(std::vector<uint8_t>(view.begin(), view.end())));
+    }
+    std::vector<uint8_t> data;
+    auto status = graph->serialize_aot(data, payload, user_uids);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    return data;  // the same form serialize() returns, which deserialize() accepts
+}
+
 void
 PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
     if (py::isinstance<py::str>(pyobj)) {
@@ -634,7 +650,17 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
-        std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
+        // What serialize() returns (a list of ints), or the same bytes as read back from a file.
+        std::vector<uint8_t> data;
+        if (py::isinstance<py::bytes>(pyobj) || py::isinstance<py::bytearray>(pyobj)) {
+            std::string_view const view = py::isinstance<py::bytes>(pyobj)
+                                              ? std::string_view(pyobj.cast<py::bytes>())
+                                              : std::string_view(PyByteArray_AsString(pyobj.ptr()),
+                                                                 static_cast<size_t>(PyByteArray_Size(pyobj.ptr())));
+            data.assign(view.begin(), view.end());
+        } else {
+            data = pyobj.cast<std::vector<uint8_t>>();
+        }
 
         if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
             // Handle-less path: use the device properties set at construction.
@@ -1374,6 +1400,11 @@ init_pygraph_submodule(py::module_& m) {
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)
+        .def("_serialize_aot",
+             &PyGraph::serialize_aot,
+             py::arg("payload_json"),
+             py::arg("modules"),
+             py::arg("user_uids"))
         .def("deserialize",
              (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&, bool const))&PyGraph::deserialize,
              py::arg("handle_"),
