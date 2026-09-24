@@ -1119,9 +1119,11 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         stats_bwd = stats_ref
         o_cmp, stats_cmp = o_gpu, stats_gpu
         if is_paged:
-            # Padded (dead) query rows: compare live rows only (the engine writes O := 0 / LSE := -inf there).
+            # Padded (dead) query rows: the engine writes O := 0 / LSE := -inf there. Check that,
+            # then compare the live rows against the reference.
             dead_q = (torch.arange(s_qo, device="cuda")[None, :] >= padding[0][:, None]).view(b, 1, s_qo, 1)
-            o_cmp = o_gpu.float().masked_fill(dead_q, 0).to(o_gpu.dtype)
+            assert not o_gpu.float()[dead_q.expand(b, h_q, s_qo, d_vo)].any(), "padded query rows must write O := 0"
+            assert torch.isneginf(stats_gpu[dead_q.expand(b, h_q, s_qo, 1)]).all(), "padded query rows must write LSE := -inf"
             o_ref = o_ref.masked_fill(dead_q, 0)
             stats_cmp = stats_gpu.masked_fill(dead_q, 0)
             stats_ref = stats_ref.masked_fill(dead_q, 0)
@@ -1131,10 +1133,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         ):
             error = compare_tensors(actual, expected, atol, rtol, name)
             assert error == 0, f"{name} mismatch: {error} elements differ"
-        # E5M2 P rounding (2 mantissa bits) differs between the FROST kernel's exp2 emulation and
-        # the reference on individual probabilities; the FROST suites budget 7e-2 for it.
-        amax_rtol = 0.10 if (is_paged and torch_itype == torch.float8_e5m2) else 0.05
-        assert compare_amax(o_cmp, o_ref, rtol=amax_rtol, tag="amax"), "Amax mismatch: 1 element differs"
+        assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")

@@ -259,7 +259,7 @@ def _check_o(out, ref_o, out_dt, in_key):
     return atol
 
 
-def _run_graph(B, H, KH, P, max_pages, lens, hnd, **build_kw):
+def _run_graph(B, H, KH, P, max_pages, lens, hnd, *, want_split=None, **build_kw):
     import cudnn
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
@@ -270,6 +270,13 @@ def _run_graph(B, H, KH, P, max_pages, lens, hnd, **build_kw):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     plan = select_engine(g, name)
+    if want_split is not None:  # select a split plan explicitly: correctness does not ride the heuristic ranking
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        wanted = (lambda s: s > 1) if want_split is True else (lambda s: s == want_split)
+        idx = next((i for i, n in enumerate(names) if n.startswith(name) and wanted(g.plans[i].knobs.split_kv)), None)
+        assert idx is not None, f"no {name} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
+        g.select_plan(idx)
+        plan = g.plans[idx]
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
@@ -351,10 +358,10 @@ def test_paged_mxfp8_graph_prefill_shaped_s_q():
 
 
 @pytest.mark.L0
-def test_paged_mxfp8_graph_long_kv_heuristic_splits():
-    """A long KV at small B*H_kv makes the heuristic propose a split; the partials recombine through the shared combine."""
-    plan = _run_graph(1, 4, 1, 128, 64, [8000], False, stats=True)
-    assert plan.knobs.split_kv > 1, f"expected a KV split for 8k tokens at B*H_kv=1; got {plan.knobs}"
+def test_paged_mxfp8_graph_split_kv():
+    """A KV split over pools (8k tokens, one KV head), selected explicitly: the fp32 partials recombine through the shared combine."""
+    plan = _run_graph(1, 4, 1, 128, 64, [8000], False, stats=True, want_split=True)
+    assert plan.knobs.split_kv > 1
 
 
 # --- direct adapter: CUDA-graph replay ---------------------------------------
