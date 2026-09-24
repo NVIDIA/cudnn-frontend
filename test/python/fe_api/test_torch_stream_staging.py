@@ -11,6 +11,15 @@ from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, recor
 _ROWS, _COLS = 1024, 2048  # 8 MiB fp32: one large-pool block, handed back whole to the next same-size request
 
 
+def _warm(window):
+    """Launch every kernel of the timed window once, outside it. Under CUDA lazy module loading a
+    kernel's first launch in the process waits for the device to drain, which serializes the poison
+    fill behind the pending copy: the controls then fail and the detectors pass without a race."""
+    window()
+    torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda").fill_(-1.0)
+    torch.cuda.synchronize()
+
+
 def _delayed_copy_then_release(stage):
     """Queue a long kernel on a side stream, stage ``base.t()`` through ``stage(view, side)``, release
     ``base``, and fill the released block through a same-size allocation on the current stream.
@@ -18,6 +27,7 @@ def _delayed_copy_then_release(stage):
     allocator normally defers the block's reuse until the copy has run (``reused`` False), or waits for
     it before handing the block out; either way the copy is intact."""
     side = torch.cuda.Stream()
+    _warm(lambda: stage(torch.zeros(_ROWS, _COLS, device="cuda").t(), side))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
     base = torch.arange(_ROWS * _COLS, dtype=torch.float32, device="cuda").view(_ROWS, _COLS)
@@ -85,6 +95,7 @@ def _delayed_copy_back_then_release(copy_back):
     allocate and fill a same-size ``other`` on the current stream, synchronize. Returns ``(other, reused)``:
     with ``dst`` recorded, the pending write can never land in ``other``'s block."""
     side = torch.cuda.Stream()
+    _warm(lambda: copy_back(torch.empty(_ROWS, _COLS, device="cuda"), torch.zeros(_ROWS, _COLS, device="cuda"), side))
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     src = torch.arange(_ROWS * _COLS, dtype=torch.float32, device="cuda").view(_ROWS, _COLS)
