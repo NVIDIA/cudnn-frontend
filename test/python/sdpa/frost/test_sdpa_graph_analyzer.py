@@ -2286,17 +2286,24 @@ def test_fp8_bwd_dtype_facts():
 
 
 @pytest.mark.parametrize("cc", [(10, 7), (10, 0), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm120", "sm80"])
-def test_fp8_bwd_every_row_declines_by_message(monkeypatch, cc):
-    """No row serves sdpa_fp8_backward yet: every backward row (and every forward
-    row) declines it with a REASON on every arch.  A row in the device's SM
-    range must fall through to the quantization-family gate, not raise."""
+def test_fp8_bwd_every_other_row_declines_by_message(monkeypatch, cc):
+    """Exactly ONE backward row serves sdpa_fp8_backward -- ``sdpa_bwd_sm107_fp8``
+    (d = 256 E4M3) on the Rubin line -- and every OTHER backward row (and every
+    forward row) declines it with a REASON on every arch.  A row in the device's
+    SM range must fall through to the quantization-family gate, not raise.
+    (Written as "no row serves it yet" in 3a816a02; the sm107 arm inverted when
+    the row registered in 54ad0710.)"""
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
     facts = _facts(g)
-    assert not _bwd_eligible(g) and not _eligible(g)
+    served = {"sdpa_bwd_sm107_fp8"} if cc == (10, 7) else set()
+    assert _bwd_eligible(g) == served and not _eligible(g)
     sm = cc[0] * 10 + cc[1]
     for spec in bwd_engines.ENGINE_SPECS:
         reason = bwd_engines.mismatch(spec.capabilities, facts)
+        if spec.name in served:
+            assert reason is None, (spec.name, reason)
+            continue
         assert isinstance(reason, str) and reason, spec.name
         if spec.capabilities.sm_lo <= sm <= spec.capabilities.sm_hi and not spec.capabilities.is_fp8:
             assert "serves only" in reason, (spec.name, reason)
