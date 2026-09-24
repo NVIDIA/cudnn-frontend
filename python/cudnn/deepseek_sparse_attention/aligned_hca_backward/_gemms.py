@@ -6,7 +6,7 @@
 import cudnn
 
 
-class _HcaGemms:
+class _HcaGroupedGemms:
     """Two compiled graph shapes, three launches, one shared caller workspace.
 
     The plan and its handle must not be executed concurrently from host threads.

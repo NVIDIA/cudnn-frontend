@@ -89,9 +89,9 @@ class _HcaPlan:
             for kernel, grid, names, constants, options in self._schedule():
                 compiled = kernel.warmup(*(tensors[name] for name in names), *constants, grid=grid, **options)
                 launches.append((compiled[grid], names, constants))
-            from ._gemms import _HcaGemms
+            from ._gemms import _HcaGroupedGemms
 
-            self._gemms = _HcaGemms(self.layout)
+            self._gemms = _HcaGroupedGemms(self.layout)
         self._launches = tuple(launches)
         return self
 
