@@ -168,9 +168,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         gV = cute.local_tile(mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None))
 
         gIndices = blocksparse_indices_q2k[None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
-        gBSZ = None  # only read when has_block_sizes
-        if cutlass.const_expr(self.has_block_sizes):
-            gBSZ = blocksparse_varblk[None, work_desc.qo_head_idx, work_desc.batch_idx]
+        # Without block sizes this views the wrapper's placeholder, which block_len never reads.
+        gBSZ = blocksparse_varblk[None, work_desc.qo_head_idx, work_desc.batch_idx]
 
         cta_coord_layout = (0, cute.make_layout(1))  # CTA coord layout for TMA multicasting, effectively no multicast
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(tma_atom_Q, *cta_coord_layout, cute.group_modes(sQ, 0, 2), cute.group_modes(gQ, 0, 2))
