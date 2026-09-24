@@ -492,6 +492,56 @@ def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
         _api().check_support()
 
 
+@pytest.mark.L0
+def test_paged_mxfp8_adapter_rejects_unequal_table_extents():
+    """Direct API: K and V block tables of different page-axis extents are declined by name in
+    execute() (the kernel compiles both tables on one dynamic extent and reads its KV maximum
+    from the K table); equal extents execute. The graph path declines the same mismatch in
+    graph_analyzer."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, P, max_pages = 2, 8, 2, 128, 4
+    dev = "cuda"
+    fp8 = _FP8["e4m3"]
+    pools = _pools(B, KH, P, max_pages, False, fp8, seed=1)
+    Q8, sfq, _, sfq_dims = _quantize(torch.randn(B, H, 1, D, device=dev) * 0.5, B, H, 1, D, fp8, columnwise=False)
+    Qb = Q8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
+    Ob = torch.empty(B, 1, H, D, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
+    amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
+    bt = pools["bt_k"].view(B, max_pages)
+    api = SdpaFwdDslSm100(
+        sample_q=Qb,
+        sample_k=pools["k_c"],
+        sample_v=pools["v_c"],
+        sample_o=Ob,
+        sample_lse=lse,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        dtype_o=torch.bfloat16,
+        paged_page_size=P,
+        paged_max_seq_len_kv=max_pages * P,
+    )
+    api.check_support()
+    api.compile()
+    ex = dict(
+        lse_tensor=lse,
+        seq_kv_lens=torch.full((B,), 300, dtype=torch.int32, device=dev),
+        seq_q_lens=torch.ones(B, dtype=torch.int32, device=dev),
+        sf_q=sfq.view(torch.uint8).reshape(sfq_dims),
+        sf_k=pools["sfk_g"],
+        sf_v=pools["sfv_g"],
+        amax_o=amax,
+        workspace=torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8),
+    )
+    wider = torch.cat([bt, bt[:, :2]], dim=1).contiguous()  # a V table two pages wider, otherwise valid
+    with pytest.raises(ValueError, match="same page-axis extent"):
+        api.execute(Qb, pools["k_c"], pools["v_c"], Ob, block_table=bt, block_table_v=wider, **ex)
+    api.execute(Qb, pools["k_c"], pools["v_c"], Ob, block_table=bt, block_table_v=bt.clone(), **ex)
+    torch.cuda.synchronize()
+    assert not torch.isnan(Ob.float()).any()
+
+
 # --- declines -----------------------------------------------------------------
 
 
