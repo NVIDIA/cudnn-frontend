@@ -1199,6 +1199,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("SASS USYNCS_PHASECHK", cnt("USYNCS.PHASECHK"))
     print("SASS NANOSLEEP", cnt("NANOSLEEP"))
     print("SASS LINES", len(sass))
+    print("SASS R2P", cnt(" R2P"))
     # TMEM-load / publish-arrive order (frost-kernels.md s3): in every innermost loop body that carries an exp2 burst (the
     # softmax recompute), the LDTMs of ONE accumulator slot -- same base register, same 128-column window -- must not
     # have an ARRIVE scheduled between their first and their last.
@@ -1259,7 +1260,10 @@ _SASS_PIN_ROWS = [
     pytest.param("f16", "dense", id="f16-dense"),
     pytest.param("f16", "causal", id="f16-causal"),
     pytest.param("fp8", "dense", id="fp8-dense"),
+    pytest.param("fp8", "causal", id="fp8-causal"),
 ]
+# The masked rows of the above: the mask form pin (rules/frost-tile-dsl.md s10d) applies to them only.
+_MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
 # Spill bounds: the counts MEASURED on the branch's own toolchain (cutlass-dsl 4.8.0 + the internal CUDA toolkit's ptxas,
 # 2026-09-23, B=1 H=8 S=1024): 0 / 0 STL / LDL on all three rows -- the plan's target (s10.9) -- plus the DSL / ptxas
 # jitter frost_test_utils.SPILL_TOLERANCE allows.  Never loosen a row to turn it green; a real spill adds tens.
@@ -1267,10 +1271,16 @@ _SPILL_PINS = {
     ("f16", "dense"): {"STL": 0, "LDL": 0},
     ("f16", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
+    ("fp8", "causal"): {"STL": 0, "LDL": 0},
 }
+# One trace-compile per (family, mask) per session: every pin below reads the same SASS, so the probe runs once and
+# the tests share its counts (a compile is 20-60 s; the dump dir of the FIRST caller holds the cubin).
+_SASS_CACHE = {}
 
 
 def _sass_probe(tmp_path, family, mask):
+    if (family, mask) in _SASS_CACHE:
+        return _SASS_CACHE[(family, mask)]
     if not arch_known_to_the_dsl("sm_107a"):
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
     cands = nvdisasm_candidates()
@@ -1288,6 +1298,7 @@ def _sass_probe(tmp_path, family, mask):
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
     order = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("LDTM_ORDER_") and len(ln.split()) == 2}
     print(f"\nsm107 bwd {family} {mask} sm_107a SASS: {stats}; {order}; {[ln for ln in out if ln.startswith('LDTM_ORDER_VIOLATION ')]}")
+    _SASS_CACHE[(family, mask)] = (stats, order)
     return stats, order
 
 
@@ -1317,3 +1328,15 @@ def test_sm107_every_tmem_load_precedes_the_arrive_that_frees_its_slot(tmp_path,
     assert (
         order["LDTM_ORDER_VIOLATIONS"] == 0
     ), "an ARRIVE is scheduled between two LDTMs of one accumulator slot (missing tcgen05_wait(LOAD) before the publish)"
+
+
+@pytest.mark.parametrize("family, mask", _MASKED_SASS_PIN_ROWS)
+def test_sm107_masked_arm_lowers_to_the_bit_word_form(tmp_path, family, mask):
+    """A masked softmax arm must be the bit-word form -- one keep-word per 32 columns, ``R2P`` + one ``FSEL`` per cell --
+    never the per-cell compare + select (rules/frost-tile-dsl.md s10d: 2-3x the dense tile's instruction count; the f16
+    body's causal build read ISETP 94 / FSEL 64 / R2P 0 before it took the fp8 body's ``band_mask_words`` arm, 54 / 64 / 8
+    after).  ``R2P == 0`` on a masked build is the detector the rule names; both bodies spell the form as ``MASK_FORM``."""
+    stats, _order = _sass_probe(tmp_path, family, mask)
+    assert stats["R2P"] > 0, f"{family} {mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
+    mod = _load_kernel(family)
+    assert mod.MASK_FORM == "bits", f"{mod.__name__}: MASK_FORM must be the bit-word form"

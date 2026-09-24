@@ -118,8 +118,10 @@ q range is FORCED to one fully-masked q tile (P = 0 -> dV = 0 written with
 and every per-tile ring stays balanced (sdpa-invariants S1-2).  SWA under
 bottom-right alignment anchors the window to the bottom-right diagonal
 (kv >= q + (S_kv - S_q) - W), the same anchor ``tile_dsl.mask.apply_mask_chunk`` uses.
-TODO(plan s13 PR-4): a transposed ``apply_mask_chunk_bits`` arm; this port keeps the
-validated per-cell select form (``_mask_p_chunk``).
+The per-cell mask (``_mask_p_chunk``) lowers to the bit-word form (``MASK_FORM = MASK_FORM_BITS``:
+one keep-word per 32 q columns, R2P + 1 FSEL per cell, rules/frost-tile-dsl.md S10d) built on
+``tile_dsl.mask.band_mask_words`` / ``apply_mask_words``; TODO(plan s13 PR-4): hoist the
+transposed (kv-major) arm into tile_dsl.mask beside ``apply_mask_chunk_bits``.
 
 ## Launch ABI
 
@@ -183,7 +185,17 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_PADDED, MASK_SWA, compute_q_loop_bounds
+from cudnn.frost.tile_dsl.mask import (
+    MASK_CAUSAL,
+    MASK_FORM_BITS,
+    MASK_FORMS,
+    MASK_NONE,
+    MASK_PADDED,
+    MASK_SWA,
+    apply_mask_words,
+    band_mask_words,
+    compute_q_loop_bounds,
+)
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 from cudnn.frost.tile_dsl.scheduler import SCHED_NATURAL, Sched, read_clc_payload, read_tile_id_arrive
@@ -214,6 +226,14 @@ DESC_VERSION: int = desc_version(CFG)
 # end-of-kernel drains keep the default sleeping form.  The sign is a MEASURED per-kernel
 # fact (rules/frost-tile-dsl.md S8b); unmeasured on this body -> the default.
 SPIN_RING_WAITS: bool = False
+
+# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked
+# site passes form=MASK_FORM.  "bits" = one keep-word per 32 q columns + register-to-predicate
+# select (R2P + 1 FSEL per cell, rules/frost-tile-dsl.md S10d); "cells" = the per-cell compare +
+# select the pre-port body carried.  Same masked set, same zero -> bitwise identical dS / dV.
+MASK_FORM: str = MASK_FORM_BITS
+if MASK_FORM not in MASK_FORMS:
+    raise ValueError(f"{__name__}: MASK_FORM must be one of {MASK_FORMS}, got {MASK_FORM!r}")
 
 # --- dtype dispatch (tile_dsl DTYPE_* codes) -------------------------------------------
 if CFG.DTYPE_QKV == DTYPE_BF16:
@@ -364,18 +384,33 @@ def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv):
 
 
 def _mask_p_chunk(reg_P, kv_abs, q_col_base, eff_seqlen_kv, causal_diag, N: int):
-    """Zero P on masked (kv = lane, q = col) cells; MASK_NONE returns reg_P unchanged (no IR).
+    """Zero P on masked (kv = lane, q = col) cells of an ``N``-wide q chunk starting at absolute q ``q_col_base``.
 
-    kv_abs = this lane's absolute kv row; q_col_base = absolute q of column 0; N columns.
-      causal : kv_abs >  q_abs + diag       (key past the query; diag = S_kv - S_q under bottom-right)
+    The TRANSPOSE of ``tile_dsl.mask.apply_mask_chunk`` (row = kv, col = q), with ZERO as the masked value:
+      causal : kv_abs >  q_abs + diag       (key past the query; diag = S_kv - S_q under bottom-right, else 0)
       SWA    : kv_abs <  q_abs + diag - W   (key left of the window, bottom-right-anchored like the forward)
       padded : kv_abs >= seq_kv_len         (per-lane pad row; the whole row goes to 0)
-    Per-cell compare + select (the validated form).  TODO(plan s13 PR-4): the transposed
-    keep-word / register-to-predicate arm (tile_dsl.mask.band_mask_words) -- per lane the
-    band is [kv_abs - diag, kv_abs + diag' + W] in q, so it maps onto band_mask_words directly.
+    ``form=MASK_FORM``: "cells" is the per-cell compare + select; "bits" maps the terms onto ONE q band [lo, hi)
+    per lane -- causal lo = kv_abs - diag, SWA hi = kv_abs - diag + W + 1, padded hi = q_col_base (all masked) --
+    and reuses the library's ``band_mask_words`` / ``apply_mask_words`` (keep-word + R2P + 1 FSEL per cell).  Same
+    masked set, same zero, so the two forms are bitwise identical.  MASK_NONE returns reg_P unchanged (no IR).
+    TODO(plan s13 PR-4): hoist this transposed arm into tile_dsl.mask as the kv-major twin of apply_mask_chunk_bits.
     """
     if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
         return reg_P
+    if cutlass.const_expr(MASK_FORM == MASK_FORM_BITS):
+        lo = None
+        hi = None
+        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+            lo = kv_abs - causal_diag
+        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+            hi = kv_abs - causal_diag + cutlass.Int32(CFG.SWA_WINDOW + 1)
+        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
+            row_dead = kv_abs >= eff_seqlen_kv
+            hi_pad = cutlass.Int32(arith.select(row_dead.ir_value(), q_col_base.ir_value(), (q_col_base + cutlass.Int32(N)).ir_value()))
+            hi = hi_pad if hi is None else cute.math.min(hi, hi_pad)
+        words = band_mask_words(lo, hi, q_col_base, N)
+        return apply_mask_words(reg_P, words, mask_value=0.0, n_cols=N)
     zero = cutlass.Float32(0.0)
     elems = []
     for i in range(N):
