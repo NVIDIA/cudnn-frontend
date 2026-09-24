@@ -354,8 +354,8 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "MXFP8 SDPA is only supported on Blackwell Data Center architectures.");
 
-            // No backend engine loads block-scale pools through a block table; a frontend
-            // engine serves these graphs or nothing does.
+            // No backend engine loads block-scale pools through a block table.
+            // Only a frontend (FROST) engine can serve these graphs.
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_paged_k() || is_paged_v(),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend.");

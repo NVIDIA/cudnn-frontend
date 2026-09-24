@@ -291,7 +291,7 @@ descale tensors are page pools too and page with K/V through the same block tabl
 `descale_k` is `[num_pages, H_kv, page_size, D/32]` (scaled along D) and
 `descale_v` is `[num_pages, H_kv, page_size/32, D]` (scaled along the page's rows), both F8_128x4-reordered,
 so `page_size % 128 == 0` (a page holds whole 128-row SF atoms and TMA loads one SF tile per KV tile).
-Q keeps the dense `[B, H_q, S_q_padded, D/32]` F8_128x4 descale. E4M3/E5M2 in, any O dtype, Stats,
+Q keeps the dense `[B, H_q, S_q_padded, D/32]` F8_128x4 descale. E4M3/E5M2 in, O in FP16 / BF16 / E4M3 / E5M2, Stats,
 GQA (no PackGQA), KV split, sink; exact native head dims (d128 / d192×d128 / d256 / d512), dense Q only
 (no THD queries), no block-scaled O (`sf_o`) over pools, SM100/SM103 only. The cuDNN backend declines these graphs (no paged load for block-scale
 pools), so a FROST engine is the only server.
@@ -526,8 +526,8 @@ attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
 none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`.
 ⁹ `thd_d_shapes` is an **exact** membership test, not an envelope: the
-quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
-(MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
+SM100 quantized rows list the four native shapes `{(128,128), (192,128), (256,256), (512,512)}`,
+so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
 envelope (`thd_d_shapes=None`) and works.
 ¹⁰ The per-tensor FP8 d192×d128 and d256 flavors are **floored to their exact
 shapes** (`d_envelope_floors` `((192,128),128), ((256,256),255)`, mirrored in

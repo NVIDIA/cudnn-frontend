@@ -198,8 +198,7 @@ class TemplateParams:
 # other flavor must reject it rather than silently reading K/V as dense.
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
-# ``paged_d_shapes`` and the adapter's check_support name the same set
-# (the d512 MXFP8 kernel validates under the "d256" tag via make_cfg_d512_mxfp8).
+# ``paged_d_shapes`` and the adapter's check_support name the same set.
 _PAGED_KV_FLAVORS = frozenset({"d128", "d192", "d256"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
@@ -319,10 +318,11 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
         # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
-        # (wired on every native flavor), so the dtype family is NOT gated here:
-        # every kernel file WITHOUT the PAGED_KV specialization raises at module
-        # scope on paged_kv=True (next to its softmax_f16 guard), which is the
-        # backstop that cannot silently read a page pool as dense K/V.
+        # (wired on every native flavor), so
+        # the dtype family is NOT gated here: every kernel file WITHOUT the
+        # PAGED_KV specialization raises at module scope on paged_kv=True
+        # (next to its softmax_f16 guard), which is the backstop that cannot
+        # silently read a page pool as dense K/V.
         # A K/V tile is loaded as a stack of page-sized row boxes (or one box
         # inside a page when the page is taller than the tile). Either way a
         # box must never straddle a page, and the 128 B swizzle atom is 8 rows.

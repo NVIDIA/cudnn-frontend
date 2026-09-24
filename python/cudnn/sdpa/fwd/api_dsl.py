@@ -1918,9 +1918,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d128 per-tensor FP8 kernel and of every MXFP8 flavor; every kernel
-            # file without it (the f16/bf16 and FP8 d512, the SM107 siblings, the
-            # d192x128 / d256 FP8 flavors) backstops
+            # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
+            # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
             self._not_implemented_error_if(self._device_cc == (10, 7), "paged KV is not wired on the SM107 sibling kernels (SM100 line only)")
@@ -2485,7 +2484,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # exists (None-specialized identity fold otherwise; has_scale_o).
                 fp8_kwargs["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
             if self.paged:
-                # The MXFP8 template pins pool / table strides at compile time; the logical
+                # The MXFP8 template pins pool and table strides at compile time. The logical
                 # KV maximum leaves the key (_PAGED_COMPILE_SKV).
                 fp8_kwargs.update(
                     k_stride=self._paged_pool_stride(self.k_desc),

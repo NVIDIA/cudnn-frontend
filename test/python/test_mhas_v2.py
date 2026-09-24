@@ -2142,33 +2142,6 @@ def _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle):
     assert after == before + 1, f"expected {FROST_MXFP8_ENGINE_KEY} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
-def _mxfp8_paged_randomization(rng, data_seed, geom_seed, *, block_sizes):
-    with RandomizationContext(
-        batches=RandomBatchSize(min=1, max=16, with_high_probability=[4, 16]),
-        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=256, d_qk_max=256, d_v_min=256, d_v_max=256, head_dim_distribution={"d_qk=d_v": 1}),
-        head_count=RandomHeadGenerator(min=2, max=32, head_group_options=(1, 8, 2)),
-        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice({torch.float16: 1, torch.bfloat16: 1}),
-        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=5, causal=3, left_window_only=2),
-        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
-        with_sink_token=RandomChoice({True: 1, False: 3}),
-        block_size=RandomBlockSize(min=min(block_sizes), max=max(block_sizes), with_high_probability=list(block_sizes)),
-    ) as randomization_ctx:
-        cfg = randomization_ctx(rng, data_seed, geom_seed)
-    cfg.is_mxfp8 = True
-    cfg.is_paged = True
-    # A decode / MTP step has at least one query token per request; KV lengths stay free.
-    cfg.seq_len_q = [max(1, n) for n in cfg.seq_len_q]
-    # Bottom-right alignment needs a causal upper bound.
-    if cfg.right_bound is None:
-        cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
-    # The FROST MXFP8 kernels bake the 4-binade lazy-rescale threshold.
-    cfg.rescale_threshold = 4.0
-    return cfg
-
-
 def _run_mxfp8_paged(test, test_no, request, cudnn_handle):
     test.showConfig(test_no, request)
     if request.node.name in test.blocked_tests:
@@ -2181,13 +2154,44 @@ def _run_mxfp8_paged(test, test_no, request, cudnn_handle):
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=32, rng_seed=2006), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2006), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
-    """Decode / MTP-shaped (s_q <= 8) MXFP8 paged graphs at page sizes 128 / 256, d256."""
+    """Decode / MTP-shaped (s_q <= 8) MXFP8 paged graphs at page sizes 128 / 256, d256, over the
+    default plan walk, each asserting the FROST MXFP8 row served it."""
     _require_frost_sm100(FROST_MXFP8_ENGINE)
+
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
-    test.cfg = _mxfp8_paged_randomization(random.Random(abs(hash(test_no))), test_no[2], abs(hash(test_no)), block_sizes=(128, 256))
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[4, 16]),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=256, d_qk_max=256, d_v_min=256, d_v_max=256, head_dim_distribution={"d_qk=d_v": 1}),
+        head_count=RandomHeadGenerator(min=2, max=32, head_group_options=(1, 8, 2)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float16: 1, torch.bfloat16: 1}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=5, causal=3, left_window_only=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
+        with_sink_token=RandomChoice({True: 1, False: 3}),
+        block_size=RandomBlockSize(min=128, max=256, with_high_probability=[128, 256]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_mxfp8 = True
+    test.cfg.is_paged = True
+    # A decode / MTP step has at least one query token per request. KV lengths stay free.
+    test.cfg.seq_len_q = [max(1, n) for n in test.cfg.seq_len_q]
+    # Bottom-right alignment needs a causal upper bound.
+    if test.cfg.right_bound is None:
+        test.cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    # The FROST MXFP8 kernels bake the 4-binade lazy-rescale threshold.
+    test.cfg.rescale_threshold = 4.0
     _run_mxfp8_paged(test, test_no, request, cudnn_handle)
 
 
