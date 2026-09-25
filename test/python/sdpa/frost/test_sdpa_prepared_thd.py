@@ -1125,3 +1125,35 @@ def test_override_enabled_dense_plan_honors_bounded_kv(d, split):
     torch.cuda.synchronize()
     torch.testing.assert_close(bufs["o"], torch.ones_like(bufs["o"]), atol=0, rtol=0)
     torch.testing.assert_close(bufs["lse"], torch.full_like(bufs["lse"], math.log(1024)), atol=2e-6, rtol=0)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("d", [128, 256, 512])
+def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
+    """B=2 must step the wide stride; a singleton ABI-only probe misses truncation in setup."""
+    b, ql, kl, hq, hk = 2, 1, 64, 4, 2
+    row_stride = 2**32 + hq * d
+    if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
+        pytest.skip("wide physical row-stride regression needs 9 GiB free")
+    g, t = _thd_graph(b, ql, kl, hq, hk, d, causal=False, override_enabled=True)
+    bufs = _buffers(b, ql, kl, hq, hk, d)
+    bufs["o"] = torch.empty_strided((b * ql, hq, d), (row_stride, d, 1), device=DEV, dtype=torch.bfloat16)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    overrides = dict(override_uids=[t["o"].get_uid()], override_shapes=[[b, hq, ql, d]], override_strides=[[hq * d, d, row_stride, 1]])
+    for replay in (False, True):
+        if replay:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                g.execute(_pack(t, bufs), ws, **overrides)
+            bufs["v"].mul_(0.5)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        if replay:
+            graph.replay()
+        else:
+            g.execute(_pack(t, bufs), ws, **overrides)
+        o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d, causal=False)
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
