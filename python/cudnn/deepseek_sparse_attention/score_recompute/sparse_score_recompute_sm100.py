@@ -582,8 +582,7 @@ class SparseScoreRecomputeSm100:
                 cute.arch.alloc_tmem(tmem_alloc_cols, tmem_holding_buf)
                 cute.arch.sync_warp()
 
-                s_empty_phase = Int32(1)  # unblock first round's s_empty barriers
-                NUM_SLOTS_MASK = Int32(self.num_tmem_slots - 1)
+                s_empty_phase_bits = Int32((1 << self.num_tmem_slots) - 1)
                 K_mma_state = make_pipeline_state(PipelineUserType.Consumer, self.kv_stage)
                 while work_tile.is_valid_tile:
                     m_block = work_tile.tile_idx[0]
@@ -606,16 +605,20 @@ class SparseScoreRecomputeSm100:
                         topK_mma = mTopkLength[q_token_idx, batch_idx]
                         n_block_max = (topK_mma + self.n_block_size - 1) // self.n_block_size
                         while n_block >= n_block_max:
-                            slot = n_block & NUM_SLOTS_MASK
+                            slot = n_block % Int32(self.num_tmem_slots)
+                            s_empty_phase = self._phase_for_slot(s_empty_phase_bits, slot)
                             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * slot + 1, s_empty_phase)
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * slot)
-                            if slot == Int32(0):
-                                s_empty_phase ^= 1
+                            s_empty_phase_bits = self._toggle_phase_for_slot(
+                                s_empty_phase_bits,
+                                slot,
+                            )
                             n_block = n_block - 1
 
                     while n_block >= Int32(0):
-                        slot = n_block & NUM_SLOTS_MASK
+                        slot = n_block % Int32(self.num_tmem_slots)
+                        s_empty_phase = self._phase_for_slot(s_empty_phase_bits, slot)
                         cute.arch.mbarrier_wait(S_mbar_ptr + 2 * slot + 1, s_empty_phase)
 
                         for _kc in cutlass.range_constexpr(self.num_k_chunks):
@@ -641,8 +644,10 @@ class SparseScoreRecomputeSm100:
                         with cute.arch.elect_one():
                             tcgen05.commit(S_mbar_ptr + 2 * slot)
 
-                        if slot == Int32(0):
-                            s_empty_phase ^= 1
+                        s_empty_phase_bits = self._toggle_phase_for_slot(
+                            s_empty_phase_bits,
+                            slot,
+                        )
                         n_block = n_block - 1
 
                     handle_Q.release()
@@ -682,7 +687,7 @@ class SparseScoreRecomputeSm100:
         # =====================================================================
         if warp_group_idx == 1:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
-            s_full_phase = Int32(0)
+            s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             tile_count = Int32(0)
             while work_tile.is_valid_tile:
@@ -692,7 +697,7 @@ class SparseScoreRecomputeSm100:
                 topk_idx_offset = (tile_count % 2) * self.topk
                 if cutlass.const_expr(self.score_type == "attention"):
                     if cutlass.const_expr(self.n_block_size >= 128):
-                        s_full_phase, reduce_phase = self._epilogue_attention_n128(
+                        s_full_phase_bits, reduce_phase = self._epilogue_attention_n128(
                             tiled_mma_qk,
                             tStS_ref,
                             sPerHead,
@@ -706,14 +711,14 @@ class SparseScoreRecomputeSm100:
                             m_block,
                             batch_idx,
                             tidx,
-                            s_full_phase,
+                            s_full_phase_bits,
                             reduce_phase,
                             softmax_scale,
                             per_head_offset=per_head_offset,
                             topk_idx_offset=topk_idx_offset,
                         )
                     else:
-                        s_full_phase, reduce_phase = self._epilogue_attention(
+                        s_full_phase_bits, reduce_phase = self._epilogue_attention(
                             tiled_mma_qk,
                             tStS_ref,
                             sPerHead,
@@ -727,14 +732,14 @@ class SparseScoreRecomputeSm100:
                             m_block,
                             batch_idx,
                             tidx,
-                            s_full_phase,
+                            s_full_phase_bits,
                             reduce_phase,
                             softmax_scale,
                             per_head_offset=per_head_offset,
                             topk_idx_offset=topk_idx_offset,
                         )
                 else:
-                    s_full_phase, reduce_phase = self._epilogue_indexer(
+                    s_full_phase_bits, reduce_phase = self._epilogue_indexer(
                         tiled_mma_qk,
                         tStS_ref,
                         mPerHead,
@@ -749,7 +754,7 @@ class SparseScoreRecomputeSm100:
                         m_block,
                         batch_idx,
                         tidx,
-                        s_full_phase,
+                        s_full_phase_bits,
                         reduce_phase,
                         softmax_scale,
                         per_head_offset=per_head_offset,
@@ -1054,6 +1059,14 @@ class SparseScoreRecomputeSm100:
             chunk_idx = tile * 8 + idx_in_group
             sK_chunks[None, chunk_idx].fill(0)
 
+    @cute.jit
+    def _phase_for_slot(self, phase_bits, slot):
+        return (phase_bits >> slot) & Int32(1)
+
+    @cute.jit
+    def _toggle_phase_for_slot(self, phase_bits, slot):
+        return phase_bits ^ (Int32(1) << slot)
+
     # =========================================================================
     # Cross-warp reduce helpers (epilogue warpgroup)
     # =========================================================================
@@ -1149,7 +1162,7 @@ class SparseScoreRecomputeSm100:
         m_block,
         batch_idx,
         tidx,
-        s_full_phase,
+        s_full_phase_bits,
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
@@ -1219,6 +1232,7 @@ class SparseScoreRecomputeSm100:
         for _ri in cutlass.range_constexpr(self.num_n_blocks):
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
+            s_full_phase = self._phase_for_slot(s_full_phase_bits, _slot)
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(W_src_f32, rW_all_f32)
@@ -1234,8 +1248,10 @@ class SparseScoreRecomputeSm100:
             cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
             cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
-            if const_expr(_slot == 0):
-                s_full_phase ^= 1
+            s_full_phase_bits = self._toggle_phase_for_slot(
+                s_full_phase_bits,
+                _slot,
+            )
             local_sum = (Float32(0.0), Float32(0.0))
             for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
                 for ci in cutlass.range_constexpr(W_ILP):
@@ -1313,7 +1329,7 @@ class SparseScoreRecomputeSm100:
             cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_phase)
             reduce_phase = reduce_phase ^ 1
 
-        return s_full_phase, reduce_phase
+        return s_full_phase_bits, reduce_phase
 
     # =========================================================================
     # Epilogue: attention mode, n_block_size>=128 — Ld32x32bOp path
@@ -1334,7 +1350,7 @@ class SparseScoreRecomputeSm100:
         m_block,
         batch_idx,
         tidx,
-        s_full_phase,
+        s_full_phase_bits,
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
@@ -1398,6 +1414,7 @@ class SparseScoreRecomputeSm100:
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
 
+            s_full_phase = self._phase_for_slot(s_full_phase_bits, _slot)
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
@@ -1416,8 +1433,10 @@ class SparseScoreRecomputeSm100:
             cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
             cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
-            if const_expr(_slot == 0):
-                s_full_phase ^= 1
+            s_full_phase_bits = self._toggle_phase_for_slot(
+                s_full_phase_bits,
+                _slot,
+            )
             should_accumulate_score = const_expr(True)
             if const_expr(self.have_topk_length):
                 should_accumulate_score = n_blk < n_block_max_epi
@@ -1476,7 +1495,7 @@ class SparseScoreRecomputeSm100:
                 pos = kv_offset + ei * self.n_block_size
                 mOut[q_token_idx, pos, batch_idx] = Float32(0.0)
 
-        return s_full_phase, reduce_phase
+        return s_full_phase_bits, reduce_phase
 
     # =========================================================================
     # Epilogue: attention mode, n_block_size<128 — Ld16x64bOp path
@@ -1497,7 +1516,7 @@ class SparseScoreRecomputeSm100:
         m_block,
         batch_idx,
         tidx,
-        s_full_phase,
+        s_full_phase_bits,
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
@@ -1575,6 +1594,7 @@ class SparseScoreRecomputeSm100:
             n_blk = self.num_n_blocks - 1 - _ri
             _slot = const_expr(n_blk % self.num_tmem_slots)
 
+            s_full_phase = self._phase_for_slot(s_full_phase_bits, _slot)
             cute.arch.mbarrier_wait(S_mbar_ptr + 2 * _slot, s_full_phase)
             if const_expr(_ri == 0):
                 cute.autovec_copy(tSsLSE, tSrLSE)
@@ -1593,8 +1613,10 @@ class SparseScoreRecomputeSm100:
             cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
             cute.arch.fence_view_async_tmem_load()
             cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * _slot + 1)
-            if const_expr(_slot == 0):
-                s_full_phase ^= 1
+            s_full_phase_bits = self._toggle_phase_for_slot(
+                s_full_phase_bits,
+                _slot,
+            )
             should_accumulate_score = const_expr(True)
             if const_expr(self.have_topk_length):
                 should_accumulate_score = n_blk < n_block_max_epi
@@ -1664,4 +1686,4 @@ class SparseScoreRecomputeSm100:
                     pos = kv_offset + ei * self.n_block_size
                     mOut[q_token_idx, pos, batch_idx] = Float32(0.0)
 
-        return s_full_phase, reduce_phase
+        return s_full_phase_bits, reduce_phase

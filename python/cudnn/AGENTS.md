@@ -11,6 +11,12 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
   `test_ops_callable_exports_survive_import_order` in `test/python/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
+- A lazy public function and a same-named subpackage can collide: importing the
+  subpackage writes a module onto the parent, bypassing its `__getattr__` on the
+  next access. When both APIs coexist, preserve the public function and test
+  both public access orders in fresh subprocesses, checking identity as well
+  as callability. See `test_native_and_semantic_forward_exports_survive_import_order`
+  for the native/semantic DSA forward collision.
 
 ## Hard rules
 
