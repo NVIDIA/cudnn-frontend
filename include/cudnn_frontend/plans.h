@@ -19,6 +19,7 @@
 #include "backend/execution_helpers.h"
 #include "backend/plan_helpers.h"
 #include "experimental/sm100_rms_norm_silu_engine.h"
+#include "experimental/aot_engine.h"
 
 namespace cudnn_frontend {
 
@@ -822,6 +823,12 @@ class Execution_plan_list {
 
     error_t
     is_plan_index_executable(int64_t const index) const {
+        if (index == AOT_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                aot_engine_ == nullptr, error_code_t::GRAPH_EXECUTION_FAILED, "No AOT plan was deserialized.");
+            return {error_code_t::OK, ""};
+        }
+
         // OSS RmsNorm+SiLU engine path
         if (index == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -990,7 +997,27 @@ class Execution_plan_list {
                                                   extra);
     }
 
+    // ================================================================
+    // AOT plans: kernels a Python engine compiled and exported through
+    // serialize(). Only ever set by deserialize(); the artifact is the plan.
+    // ================================================================
+
+    static constexpr int64_t AOT_ENGINE_CANDIDATE = -4;
+
+    void
+    set_aot_engine(std::shared_ptr<experimental::aot::AotEngine> engine) {
+        aot_engine_ = std::move(engine);
+        candidate   = AOT_ENGINE_CANDIDATE;
+    }
+
+    std::shared_ptr<experimental::aot::AotEngine> const&
+    get_aot_engine() const {
+        return aot_engine_;
+    }
+
    private:
+    std::shared_ptr<experimental::aot::AotEngine> aot_engine_;
+
     std::shared_ptr<experimental::IOssNormEngine> oss_rms_norm_silu_engine_;
     bool oss_rms_norm_silu_supported_ = false;
     bool oss_rms_norm_silu_built_     = false;

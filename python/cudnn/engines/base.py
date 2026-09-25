@@ -332,6 +332,19 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
     return {node: NodeBuffers(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
 
 
+class Launch(NamedTuple):
+    """One operation a plan issues on the launch stream: ``fn(*args)``.
+
+    ``fn`` is a compiled kernel's positional tvm-ffi entry (``owner`` is the
+    compiled object it came from) or one of the stream-ordered fills in
+    ``cudnn.frost.buffers`` (``owner`` None). Addresses are plain integers.
+    """
+
+    fn: Any
+    args: Any
+    owner: Any = None
+
+
 class CompiledPlan:
     """A compiled (graph, plan) artifact. Subclass for real JIT engines."""
 
@@ -346,6 +359,20 @@ class CompiledPlan:
 
     def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
+
+    # The CUDA device the plan was compiled for (None: the current device). An
+    # exported plan records this device's target.
+    device: Any = None
+
+    def launches(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> List[Launch]:
+        """Exactly what ``execute(graph, variant_pack, ctx)`` would issue, in order, without issuing it.
+
+        A plan that implements this can be exported by ``graph.serialize()`` and
+        run from the result with no Python (``cudnn.engines.aot``). Build both
+        this and ``execute`` on one binding function, so the two cannot disagree;
+        ``execute`` may call the kernels directly rather than building the list.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot be compiled ahead of time")
 
 
 class _EagerPlan(CompiledPlan):

@@ -463,13 +463,22 @@ def strided_fill_plan(shape, strides) -> "list | None":
     return [(base, pitch, width, height) for base in offsets]
 
 
+def fill_plan_steps(ptr: int, plan, word: int, stream) -> list:
+    """A plan from :func:`strided_fill_plan` as the ``(fn, args)`` calls that issue it."""
+    return [
+        (
+            (fill_word_async, (ptr + offset * 4, width, word, stream))
+            if height == 1
+            else (_fill_word_2d_async, (ptr + offset * 4, pitch, width, height, word, stream))
+        )
+        for offset, pitch, width, height in plan
+    ]
+
+
 def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
     """Issue a plan from :func:`strided_fill_plan`, stream-ordered."""
-    for offset, pitch, width, height in plan:
-        if height == 1:
-            fill_word_async(ptr + offset * 4, width, word, stream)
-        else:
-            _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
+    for fn, args in fill_plan_steps(ptr, plan, word, stream):
+        fn(*args)
 
 
 def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
@@ -483,12 +492,22 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
     cannot know whether the next region is refusable, so it would leave the
     earlier ones filled.
     """
+    for fn, args in fill_steps(ptr, shape, strides, elem_bytes, word, stream):
+        fn(*args)
+
+
+def fill_steps(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> list:
+    """:func:`fill_word_strided_async` as the ``(fn, args)`` calls it issues, not issued.
+
+    For a caller that records its launch sequence (a plan's ``launches()``)
+    rather than running it; running each ``fn(*args)`` in order is the fill.
+    """
     if elem_bytes != 4:
         raise NotImplementedError(f"frost: a reduction seed is a 32-bit pattern; this output stores {elem_bytes}-byte elements")
     plan = strided_fill_plan(shape, strides)
     if plan is None:
         raise ValueError(f"frost: a reduction output cannot write an element twice (shape {tuple(shape)} stride {tuple(strides)})")
-    apply_fill_plan(ptr, plan, word, stream)
+    return fill_plan_steps(ptr, plan, word, stream)
 
 
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs

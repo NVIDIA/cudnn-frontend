@@ -67,6 +67,11 @@ class Graph : public ICudnn, public INode {
 
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_inputs;
     int64_t fe_workspace_size = 0;
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    // The payload a deserialized AOT plan came from, so serialize() can write it back.
+    json aot_payload;
+#endif
     uint64_t gid;
 
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
@@ -701,6 +706,10 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
 
         int64_t candidate = plans.candidate;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(candidate < 0,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "This graph's plan is not a cuDNN backend plan and has no native CUDA graph; "
+                                       "capture execute() on a stream instead.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
         _CUDNN_CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
                                                            plans.execution_plans[candidate]->get_raw_desc(),
@@ -844,6 +853,10 @@ class Graph : public ICudnn, public INode {
         // Get the plan candidate. It only makes to sense to make cuda graph after execution plan has been built.
         // And in that case the candidate would have been set.
         int64_t candidate = plans.candidate;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(candidate < 0,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "This graph's plan is not a cuDNN backend plan and has no native CUDA graph; "
+                                       "capture execute() on a stream instead.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
 
         // Finally get the backend cuda graph.
@@ -1011,6 +1024,12 @@ class Graph : public ICudnn, public INode {
 
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
+        if (plan_index == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE) {
+            CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
+            cudnn_workspace_size = fe_workspace_size + plans.get_aot_engine()->get_workspace_size();
+            return {error_code_t::OK, ""};
+        }
+
         // OSS RmsNorm+SiLU engine workspace
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudnn_workspace_size = fe_workspace_size + plans.get_oss_rms_norm_silu_workspace_size();
@@ -1051,6 +1070,9 @@ class Graph : public ICudnn, public INode {
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
         }
+        RETURN_CUDNN_FRONTEND_ERROR_IF(plan_index == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "An AOT plan runs the shapes it was exported for; it takes no overrides.");
 
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
                                        "Runtime workspace query with override shapes requires cuDNN v9.23.0"};
@@ -1353,7 +1375,9 @@ class Graph : public ICudnn, public INode {
         // context actually has to be established.
         if (!detail::has_current_context()) {
             cudaStream_t stream = nullptr;
-            detail::get_stream(handle, &stream);
+            if (handle != nullptr) {
+                detail::get_stream(handle, &stream);
+            }
             detail::ensure_current_context(stream);
         }
 
@@ -1400,6 +1424,23 @@ class Graph : public ICudnn, public INode {
         // 3. Re-apply replacements (currently only Slice nodes)
         for (auto const &[dst_slot, src_info] : varpack_template.replacement_slots) {
             ptrs[dst_slot] = static_cast<char *>(ptrs[src_info.first]) + src_info.second;
+        }
+
+        // An AOT plan carries its whole launch sequence, auxiliary work included,
+        // and needs no cuDNN handle: the stream is the handle's when there is one.
+        if (plan_index == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !override_uids.empty(),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "An AOT plan runs the shapes it was exported for; it takes no execute-time overrides.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(workspace == nullptr && plans.get_aot_engine()->get_workspace_size() > 0,
+                                           error_code_t::INVALID_VALUE,
+                                           "This AOT plan needs a workspace of get_workspace_size() bytes; got none.");
+            cudaStream_t stream = nullptr;
+            if (handle != nullptr) {
+                _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            }
+            return plans.get_aot_engine()->execute(ptrs, static_cast<char *>(workspace) + fe_workspace_size, stream);
         }
 
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
@@ -1549,6 +1590,13 @@ class Graph : public ICudnn, public INode {
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        // A deserialized AOT plan writes itself back unchanged.
+        if (plans.candidate == graph::Execution_plan_list::AOT_ENGINE_CANDIDATE) {
+            std::vector<int64_t> uids(variant_pack_uids.begin(), variant_pack_uids.end());
+            std::sort(uids.begin(), uids.end());
+            return serialize_aot(data, aot_payload, uids, serialize_structure);
+        }
+
         CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         json j;
         j["json_version"] = GRAPH_JSON_VERSION;
@@ -1635,6 +1683,42 @@ class Graph : public ICudnn, public INode {
 #endif
     }
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    /**
+     * @brief Serialize this graph with an ahead-of-time plan in place of a backend plan.
+     *
+     * The Python graph API calls this for a graph whose selected plan is a
+     * CuTeDSL engine: @p payload carries the exported kernels and the launch
+     * sequence (see experimental/aot_engine.h), @p user_uids the variant pack the
+     * plan binds, ascending. deserialize() accepts the result and executes it with
+     * no Python and no JIT.
+     */
+    error_t
+    serialize_aot(std::vector<uint8_t> &data,
+                  json const &payload,
+                  std::vector<int64_t> const &user_uids,
+                  bool serialize_structure = true) const {
+        json j;
+        j["json_version"] = GRAPH_JSON_VERSION;
+        if (serialize_structure) {
+            CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
+            serialize(j);
+        }
+        j["aot"]                       = payload;
+        j["variant_pack_uids"]         = user_uids;
+        j["behavior_notes"]            = std::vector<std::vector<BehaviorNote_t>>{{}};
+        j["pass_by_values"]            = json::object();
+        j["workspace_modifications"]   = json::object();
+        j["variant_pack_replacements"] = json::array();
+        j["fe_workspace_size"]         = 0;
+        j["tensors_to_dump"]           = json::array();
+        // Typed, sized containers: the kernel modules are byte arrays, which the
+        // default UBJSON encoding would spend two bytes per byte on.
+        data = json::to_ubjson(j, true, true);
+        return {error_code_t::OK, ""};
+    }
+#endif
+
     /**
      * @brief Deserialize an execution plan from a serialized byte blob.
      *
@@ -1687,12 +1771,14 @@ class Graph : public ICudnn, public INode {
     deserialize(std::vector<uint8_t> const &data, bool const enforce_precompiled = false) {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITHOUT HANDLE ");
-        if (device_properties == nullptr) {
+        json const j = json::from_ubjson(data);
+        // An AOT plan builds nothing through cuDNN, so it needs neither a handle nor device properties.
+        if (device_properties == nullptr && !j.contains("aot")) {
             return {error_code_t::ATTRIBUTE_NOT_SET,
                     "device_properties is not set; call set_device_properties() before deserialize(), "
                     "or use deserialize(handle, data) to supply a cuDNN handle"};
         }
-        return deserialize_plan_impl(nullptr, device_properties, json::from_ubjson(data), enforce_precompiled, false);
+        return deserialize_plan_impl(nullptr, device_properties, j, enforce_precompiled, false);
 #else
         CUDNN_FRONTEND_UNUSED(data);
         CUDNN_FRONTEND_UNUSED(enforce_precompiled);
@@ -1749,16 +1835,31 @@ class Graph : public ICudnn, public INode {
             }
         }
 
+        bool const is_aot = j.contains("aot");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            enforce_precompiled && !j.contains("cudnn_backend_data"),
+            enforce_precompiled && !is_aot && !j.contains("cudnn_backend_data"),
             error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
-        auto serialized_plan = j["cudnn_backend_data"];
-        if (device_prop != nullptr) {
-            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
+        if (is_aot) {
+            std::shared_ptr<experimental::aot::AotEngine> engine;
+            CHECK_CUDNN_FRONTEND_ERROR(experimental::aot::AotEngine::create(j["aot"], engine));
+            plans.set_aot_engine(std::move(engine));
+            // Kept for serialize(). UBJSON hands the modules back as arrays of
+            // numbers (16 bytes per byte as json); store them as binary.
+            aot_payload = j["aot"];
+            for (auto &m : aot_payload["modules"]) {
+                if (m.is_array()) {
+                    m = json::binary(m.get<std::vector<uint8_t>>());
+                }
+            }
         } else {
-            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+            auto serialized_plan = j["cudnn_backend_data"];
+            if (device_prop != nullptr) {
+                CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
+            } else {
+                CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+            }
         }
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
@@ -1804,6 +1905,14 @@ class Graph : public ICudnn, public INode {
         // Eager prep, matching what build_plans() does for fresh-build graphs.
         CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
 
+        if (is_aot) {
+            auto const &uids = varpack_template.all_uids;
+            CHECK_CUDNN_FRONTEND_ERROR(plans.get_aot_engine()->bind_slots([&uids](int64_t uid) {
+                auto it = std::find(uids.begin(), uids.end(), uid);
+                return it == uids.end() ? -1 : static_cast<int>(it - uids.begin());
+            }));
+        }
+
         if (j.contains("tensors_to_dump")) {
             auto dump_uids = j["tensors_to_dump"].get<std::vector<std::pair<uid_t, char>>>();
             for (auto const &[uid, fmt] : dump_uids) {
@@ -1816,7 +1925,7 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        if (run_warmup && handle != nullptr) {
+        if (run_warmup && handle != nullptr && !is_aot) {
             CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
         }
 
