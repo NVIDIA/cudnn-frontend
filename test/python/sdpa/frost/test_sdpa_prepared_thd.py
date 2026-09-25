@@ -1260,6 +1260,7 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
     g, t = _thd_graph(b, ql, kl, hq, hk, d, causal=False, override_enabled=True)
+    assert _plan(g)._prepared.spec.native is not None
     bufs = _buffers(b, ql, kl, hq, hk, d)
     bufs["o"] = torch.empty_strided((b * ql, hq, d), (row_stride, d, 1), device=DEV, dtype=torch.bfloat16)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
