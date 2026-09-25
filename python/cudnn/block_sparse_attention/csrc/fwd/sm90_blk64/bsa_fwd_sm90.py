@@ -355,7 +355,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
             cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
-        mask(tiled_mma_qk, tSrS, tScS, varblk)
+        # Full KV tiles need no mask; the CTA-uniform branch skips per-element selects.
+        if varblk < self.tile_size:
+            mask(tiled_mma_qk, tSrS, tScS, varblk)
         get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
         inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
         cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
@@ -395,12 +397,12 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
                 cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
-            mask(tiled_mma_qk, tSrS, tScS, varblk)
+            if varblk < self.tile_size:
+                mask(tiled_mma_qk, tSrS, tScS, varblk)
             prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
             inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
 
-            # In current SASS ptxas places this wait right after the exponent FFMAs: mask, max, and the FFMAs overlap
-            # PV[j-1]'s tail. Forcing it above the softmax measured ~3% slower.
+            # ptxas overlaps softmax with PV[j-1]'s tail
             cute.nvgpu.warpgroup.wait_group(0)  # PV[j-1] retired: O and P registers are free
             cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
             cute.autovec_copy(prev_ratio, alpha)
@@ -574,7 +576,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                     K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
                     cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
-                mask(tiled_mma_qk, tSrS, tScS, varblk)
+                if varblk < self.tile_size:
+                    mask(tiled_mma_qk, tSrS, tScS, varblk)
                 prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
                 inc_softmax(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
 
