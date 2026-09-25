@@ -278,3 +278,32 @@ def test_prepared_fp8_accepts_declared_bare_scalar_pointers(thd):
         vp[tensors[name]] = bufs[name].data_ptr()
     g.execute(vp, ws)
     _check(bufs, thd=thd)
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_prepared_fp8_thd_output_row_stride_above_int32(dtype):
+    """The Int64 host ABI must not narrow again in device-side descriptor setup."""
+    row_stride = 2**32 + 4 * 128
+    if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
+        pytest.skip("wide physical row-stride regression needs 9 GiB free")
+    g, vp, ws, bufs, tensors = _case(thd=True, override=True, dtype=dtype, sq=1, skv=64)
+    plan = g._compiled_plans[g._plan_index]
+    assert plan._prepared is not None
+    owner = plan._prepared.spec.owner
+    bufs["o"] = torch.empty_strided((2, 4, 128), (row_stride, 128, 1), device="cuda", dtype=torch.bfloat16)
+    vp[tensors["o"]] = bufs["o"]
+    overrides = dict(override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, 128]], override_strides=[[512, 128, row_stride, 1]])
+    bufs["o"].fill_(float("nan"))
+    g.execute(vp, ws, **overrides)
+    _check(bufs, thd=True, sq=1, skv=64)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g.execute(vp, ws, **overrides)
+    bufs["descale_v"].fill_(0.3)
+    bufs["o"].fill_(float("nan"))
+    bufs["lse"].fill_(float("nan"))
+    bufs["amax_o"].fill_(999)
+    graph.replay()
+    _check(bufs, thd=True, sq=1, skv=64)
+    assert plan._prepared.spec.owner is owner
