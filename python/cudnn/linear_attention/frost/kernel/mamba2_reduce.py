@@ -16,9 +16,10 @@ class Mamba2BackwardReduce:
         self.batch, self.nchunks = batch, (length + 31) // 32
 
     @cute.jit
-    def __call__(self, dbp, dcp, dap, ddp, dbiasp, db, dc, da, dd, dbias, stream: cuda.CUstream):
+    def __call__(self, dbp, dcp, dap, ddp, dbiasp, db, dc, da, dd, dbias, dxp, ddtp, dx, ddt, stream: cuda.CUstream):
         if cutlass.const_expr(self.mode & 1):
-            self.bc(dbp, dcp, db, dc).launch(grid=(self.tokens * self.groups, 1, 1), block=(128, 1, 1), stream=stream)
+            self.bc(dbp, dcp, db, dc).launch(grid=((self.tokens * self.groups + 3) // 4, 1, 1), block=(128, 1, 1), stream=stream)
+        self.partials(dxp, ddtp, dx, ddt).launch(grid=((self.tokens * self.heads * 64 + 1023) // 1024, 1, 1), block=(128, 1, 1), stream=stream)
         if cutlass.const_expr(self.mode & 2):
             self.params(dap, ddp, dbiasp, da, dd, dbias).launch(grid=(self.heads, 1, 1), block=(128, 1, 1), stream=stream)
 
@@ -26,23 +27,23 @@ class Mamba2BackwardReduce:
     def bc(self, dbp, dcp, db, dc):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
-        token, group = block // self.groups, block % self.groups
-        dim, part = tid % 64, tid // 64
-        hs = self.heads // self.groups
-        vb, vc = cutlass.Float32(0), cutlass.Float32(0)
-        for i in cutlass.range_constexpr((hs + 1) // 2):
-            h = i * 2 + part
-            if h < hs:
-                idx = (token * self.heads + group * hs + h) * 64 + dim
-                vb += dbp[idx].to(cutlass.Float32)
-                vc += dcp[idx].to(cutlass.Float32)
-        sb = cutlass.Array(cutlass.Float32, 128, space=cutlass.AddressSpace.smem, alignment=128)
-        sc = cutlass.Array(cutlass.Float32, 128, space=cutlass.AddressSpace.smem, alignment=128)
-        sb[tid], sc[tid] = vb, vc
-        nvvm.barrier_cta_sync_aligned()
-        if tid < 64:
-            db[block * 64 + tid] = (sb[tid] + sb[tid + 64]).to(cutlass.BFloat16)
-            dc[block * 64 + tid] = (sc[tid] + sc[tid + 64]).to(cutlass.BFloat16)
+        # Four (token, group) rows per CTA, four adjacent state columns per
+        # thread. Each thread owns the full head reduction, so no SMEM handoff
+        # or separate state-tile CTA is needed.
+        logical = block * 4 + tid // 32
+        dim = (tid % 32) * 4
+        token, group = logical // self.groups, logical % self.groups
+        if token < self.tokens:
+            hs = self.heads // self.groups
+            vb = cutlass.Vector.from_elements(tuple(cutlass.Float32(0) for _ in range(4)), cutlass.Float32)
+            vc = vb
+            for h in cutlass.range_constexpr(hs):
+                idx = (token * self.heads + group * hs + h) * 128 + dim
+                vb += (dbp.iterator.raw_ptr() + idx).load(count=4, alignment=8).to(cutlass.Float32)
+                vc += (dcp.iterator.raw_ptr() + idx).load(count=4, alignment=8).to(cutlass.Float32)
+            offset = logical * 128 + dim
+            (db.iterator.raw_ptr() + offset).store(vb.to(cutlass.BFloat16), alignment=8)
+            (dc.iterator.raw_ptr() + offset).store(vc.to(cutlass.BFloat16), alignment=8)
 
     bc.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -56,9 +57,9 @@ class Mamba2BackwardReduce:
             if partial < self.batch * self.nchunks:
                 batch, chunk = partial // self.nchunks, partial % self.nchunks
                 idx = (batch * self.heads + h) * self.nchunks + chunk
-                va += dap[idx]
+                va += dap[idx * 2] + dap[idx * 2 + 1]
                 vd += ddp[idx]
-                vb += dbiasp[idx]
+                vb += dbiasp[idx * 2] + dbiasp[idx * 2 + 1]
         for off in [16, 8, 4, 2, 1]:
             va += nvvm.shfl_sync(0xFFFFFFFF, va, off, 31, kind=nvvm.Shfl.BFLY)
             vb += nvvm.shfl_sync(0xFFFFFFFF, vb, off, 31, kind=nvvm.Shfl.BFLY)
@@ -78,3 +79,19 @@ class Mamba2BackwardReduce:
             da[h], dd[h], dbias[h] = va, vd, vb
 
     params.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.kernel
+    def partials(self, dxp, ddtp, dx, ddt):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        idx = (block * 128 + tid) * 8
+        if idx < self.tokens * self.heads * 64:
+            row, col = idx // 64, idx % 64
+            offset = row * 128 + col
+            high = (dxp.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+            low = (dxp.iterator.raw_ptr() + offset + 64).load(count=8, alignment=16)
+            (dx.iterator.raw_ptr() + idx).store((high + low).to(cutlass.BFloat16), alignment=16)
+            if col == 0:
+                ddt[row] = (ddtp[row * 2] + ddtp[row * 2 + 1]).to(cutlass.BFloat16)
+
+    partials.set_name_prefix("cudnn", remove_cutlass_symbol=True)

@@ -6,6 +6,9 @@
 Four compute warps form causal scores, four update state/output, four load
 three input stages, and one issues asynchronous tensor-core work. The delta
 rule's residual, triangular inverse and inverse-times-value GEMM are absent.
+The N=128 state is partitioned into two native 64-column tiles. Each CTA
+reads its columns directly from the declared B/C/state layout and writes an
+FP32 output partial; the output epilogue sums them before BF16 rounding.
 The state conversion and transposed output layouts follow gdn_prefill_f16.
 """
 
@@ -24,24 +27,26 @@ from cudnn.frost.tile_dsl.tma import cp_async_commit, cp_async_wait
 
 
 class Mamba2Prefill:
-    def __init__(self, batch, length, heads, groups, chunk=32, warps=13, parallel_scores=False, gate_in_loader=False):
+    def __init__(self, batch, length, heads, groups, chunk=32, warps=13, parallel_scores=False, gate_in_loader=False, early_tmem_release=False):
         if chunk != 32:
             raise ValueError("GDN-derived SSD specializes logical chunk=32")
         self.batch, self.length, self.heads, self.groups = batch, length, heads, groups
         self.nchunks = (length + 31) // 32
         self.parallel_scores = parallel_scores
         self.gate_in_loader = gate_in_loader
+        self.early_tmem_release = early_tmem_release
 
     @cute.jit
     def __call__(self, x, dt, a, b, c, d, bias, z, initial, out, final, ungated_out, checkpoints, stream: cuda.CUstream):
         self.kernel(x, dt, a, b, c, d, bias, z, initial, out, final, ungated_out, checkpoints).launch(
-            grid=(self.batch * self.heads, 1, 1), block=(416, 1, 1), stream=stream
+            grid=(self.batch * self.heads * 2, 1, 1), block=(416, 1, 1), stream=stream
         )
 
     @cute.kernel
     def kernel(self, x, dt, a, b, c, d, bias, z, initial, out, final, ungated_out, checkpoints):
         tid, _, _ = cute.arch.thread_idx()
-        bh, _, _ = cute.arch.block_idx()
+        work, _, _ = cute.arch.block_idx()
+        bh, state_tile = work // 2, work % 2
         batch, h = bh // self.heads, bh % self.heads
         group = h // (self.heads // self.groups)
         warp, lane = tid // 32, tid % 32
@@ -96,6 +101,8 @@ class Mamba2Prefill:
             nvvm.fence_mbarrier_init()
         if warp == 12:
             nvvm.tcgen05_alloc(slot, cutlass.Int32(256), group=nvvm.CTAGroup.CTA_1)
+            if cutlass.const_expr(self.early_tmem_release):
+                nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         nvvm.barrier_cta_sync_aligned()
         base = slot.load()
         # TMEM: state fp32 [0,64), bf16 state [64,96), output [96,128),
@@ -111,7 +118,7 @@ class Mamba2Prefill:
                     idx = lt * 8 + pack * 1024
                     row, col = idx // 64, idx % 64
                     token = chunk * 32 + row
-                    bcidx = ((batch * self.length + token) * self.groups + group) * 64 + col
+                    bcidx = ((batch * self.length + token) * self.groups + group) * 128 + state_tile * 64 + col
                     xidx = ((batch * self.length + token) * self.heads + h) * 64 + col
                     valid = cutlass.Int32(token < self.length) * 16
                     ki = stage * 4096 + row * 64 + swizzle_xor_128b(row, col)
@@ -214,7 +221,7 @@ class Mamba2Prefill:
                 col = lane % 4 * 2 + j // 4 * 8 + j % 2
                 value = cutlass.Float32(0)
                 if cutlass.const_expr(initial is not None):
-                    value = initial[bh * 4096 + r0 * 64 + col]
+                    value = initial[bh * 8192 + r0 * 128 + state_tile * 64 + col]
                 seed.append(value)
             nvvm.tcgen05_st("16x256b", nvvm.make_tmem_ptr(base, cutlass.Float32), cutlass.Vector.from_elements(tuple(seed), cutlass.Float32))
             nvvm.tcgen05_wait("store")
@@ -231,7 +238,7 @@ class Mamba2Prefill:
                     for j in cutlass.range_constexpr(16):
                         r0 = (warp - 4) * 16 + lane // 4 + (j % 2) * 8
                         col = lane % 4 * 2 + j // 2 * 8
-                        idx = (bh * self.nchunks + chunk) * 4096 + r0 * 64 + col
+                        idx = (bh * self.nchunks + chunk) * 8192 + r0 * 128 + state_tile * 64 + col
                         pair = cutlass.Vector.from_elements((statev[2 * j], statev[2 * j + 1]), cutlass.Float32).to(checkpoints.element_type)
                         (checkpoints.iterator.raw_ptr() + idx).store(pair, alignment=checkpoints.element_type.width // 4)
                 packs = [fp32_to_fp16(statev[2 * j], statev[2 * j + 1], dtype=cutlass.BFloat16) for j in range(16)]
@@ -287,8 +294,9 @@ class Mamba2Prefill:
                     x0, x1 = f16x2_to_f32(xv[j], dtype=cutlass.BFloat16)
                     y0, y1 = ov[2 * j], ov[2 * j + 1]
                     if cutlass.const_expr(d is not None):
-                        y0 += d[h] * x0
-                        y1 += d[h] * x1
+                        if state_tile == 0:
+                            y0 += d[h] * x0
+                            y1 += d[h] * x1
                     if cutlass.const_expr(z is not None):
                         if cutlass.const_expr(ungated_out is not None):
                             pre_gate.append(fp32_to_fp16(y0, y1, dtype=cutlass.BFloat16))
@@ -323,7 +331,7 @@ class Mamba2Prefill:
                     if tok < self.length:
                         yi = r * 64 + swizzle_xor_128b(r, col)
                         yy = (yo.data_ptr() + yi).load(count=8, alignment=16)
-                        oi = ((batch * self.length + tok) * self.heads + h) * 64 + col
+                        oi = ((batch * self.length + tok) * self.heads + h) * 128 + state_tile * 64 + col
                         (out.iterator.raw_ptr() + oi).store(yy, alignment=16)
                         if cutlass.const_expr(ungated_out is not None):
                             ungated_values = (yu.data_ptr() + yi).load(count=8, alignment=16)
@@ -338,7 +346,7 @@ class Mamba2Prefill:
                 r0 = (warp - 4) * 16 + lane // 4 + (j % 2) * 8
                 col = lane % 4 * 2 + j // 2 * 8
                 pair = cutlass.Vector.from_elements((sv[2 * j], sv[2 * j + 1]), cutlass.Float32)
-                (final.iterator.raw_ptr() + bh * 4096 + r0 * 64 + col).store(pair, alignment=8)
+                (final.iterator.raw_ptr() + bh * 8192 + r0 * 128 + state_tile * 64 + col).store(pair, alignment=8)
         else:
             qk_desc = MmaDesc(
                 M=64,
@@ -408,7 +416,8 @@ class Mamba2Prefill:
                     state_done.arrive(cta_group=1)
         nvvm.barrier_cta_sync_aligned()
         if warp == 12:
-            nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
+            if cutlass.const_expr(not self.early_tmem_release):
+                nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
             nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(base, cutlass.Float32), cutlass.Int32(256), group=nvvm.CTAGroup.CTA_1)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

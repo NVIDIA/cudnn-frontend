@@ -71,14 +71,15 @@ class Mamba2BackwardChunks:
     @cute.jit
     def __call__(self, x, dy, dt, a, b, c, d, bias, seeds, adjoints, dx, db, dc, ddt, da, dd, dbias, stream: cuda.CUstream):
         self.kernel(x, dy, dt, a, b, c, d, bias, seeds, adjoints, dx, db, dc, ddt, da, dd, dbias).launch(
-            grid=(self.batch * self.heads * self.chunk_groups, 1, 1), block=(128, 1, 1), stream=stream
+            grid=(2 * self.batch * self.heads * self.chunk_groups, 1, 1), block=(128, 1, 1), stream=stream
         )
 
     @cute.kernel
     def kernel(self, x, dy, dt, a, b, c, d, bias, seeds, adjoints, dx, db, dc, ddt, da, dd, dbias):
         tid, _, _ = cute.arch.thread_idx()
         work, _, _ = cute.arch.block_idx()
-        bh, chunk_group = work // self.chunk_groups, work % self.chunk_groups
+        tiled_bh, chunk_group = work // self.chunk_groups, work % self.chunk_groups
+        bh, state_tile = tiled_bh // 2, tiled_bh % 2
         batch, h = bh // self.heads, bh % self.heads
         group = h // (self.heads // self.groups)
         warp, lane = tid // 32, tid % 32
@@ -86,6 +87,8 @@ class Mamba2BackwardChunks:
         sm = cutlass.AddressSpace.smem
         sx = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
         sz = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
+        if cutlass.const_expr(dy.element_type == cutlass.Float32):
+            sz_low = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
         sb = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
         sc = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
         ss = cutlass.Array(cutlass.BFloat16, 4096, space=sm, alignment=1024)
@@ -116,6 +119,7 @@ class Mamba2BackwardChunks:
                 nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         nvvm.barrier_cta_sync_aligned()
         base = slot.load()
+        phase = cutlass.Int32(0)
         for step in cutlass.range(self.chunks_per_cta, unroll=1):
             chunk = chunk_group * self.chunks_per_cta + step
             block = bh * self.nchunks + chunk
@@ -144,16 +148,21 @@ class Mamba2BackwardChunks:
                     tok = chunk * 32 + r
                     xv = cutlass.Vector.from_elements(tuple(cutlass.BFloat16(0) for _ in range(8)), cutlass.BFloat16)
                     zv, bv, cv = xv, xv, xv
+                    raw_grad = xv.to(cutlass.Float32)
                     if r < 32 and tok < self.length:
                         oi = ((batch * self.length + tok) * self.heads + h) * 64 + col
-                        bi = ((batch * self.length + tok) * self.groups + group) * 64 + col
+                        bi = ((batch * self.length + tok) * self.groups + group) * 128 + state_tile * 64 + col
                         xv = (x.iterator.raw_ptr() + oi).load(count=8, alignment=16)
-                        zv = (dy.iterator.raw_ptr() + oi).load(count=8, alignment=16)
+                        raw_grad = (dy.iterator.raw_ptr() + oi).load(count=8, alignment=16).to(cutlass.Float32)
+                        zv = raw_grad.to(cutlass.BFloat16)
                         bv = (b.iterator.raw_ptr() + bi).load(count=8, alignment=16)
                         cv = (c.iterator.raw_ptr() + bi).load(count=8, alignment=16)
                     si = r * 64 + swizzle_xor_128b(r, col)
                     (sx.data_ptr() + si).store(xv, alignment=16)
                     (sz.data_ptr() + si).store(zv, alignment=16)
+                    if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                        residual_grad = (raw_grad - zv.to(cutlass.Float32)).to(cutlass.BFloat16)
+                        (sz_low.data_ptr() + si).store(residual_grad, alignment=16)
                     (sb.data_ptr() + si).store(bv, alignment=16)
                     (sc.data_ptr() + si).store(cv, alignment=16)
                     zero = cutlass.Vector.from_elements(tuple(cutlass.BFloat16(0) for _ in range(8)), cutlass.BFloat16)
@@ -161,8 +170,8 @@ class Mamba2BackwardChunks:
                     if cutlass.const_expr(not self.reuse_j_storage):
                         (sjt.data_ptr() + si).store(zero, alignment=16)
                     (swt.data_ptr() + si).store(zero, alignment=16)
-                    sv = (seeds.iterator.raw_ptr() + block * 4096 + idx).load(count=8, alignment=16).to(cutlass.Float32)
-                    gv = (adjoints.iterator.raw_ptr() + block * 4096 + idx).load(count=8, alignment=16).to(cutlass.Float32)
+                    sv = (seeds.iterator.raw_ptr() + block * 8192 + r * 128 + state_tile * 64 + col).load(count=8, alignment=16).to(cutlass.Float32)
+                    gv = (adjoints.iterator.raw_ptr() + block * 8192 + r * 128 + state_tile * 64 + col).load(count=8, alignment=16).to(cutlass.Float32)
                     (ss.data_ptr() + si).store(sv.to(cutlass.BFloat16), alignment=16)
                     (sg.data_ptr() + si).store(gv.to(cutlass.BFloat16), alignment=16)
                     for j in cutlass.range_constexpr(8):
@@ -173,11 +182,17 @@ class Mamba2BackwardChunks:
                     dotparts[warp] = dot_sg
                 nvvm.fence_proxy("async.shared", space="cta")
                 nvvm.barrier_cta_sync_aligned()
-                gemm(sc, sb, base, bar, 0, n=32)
+                gemm(sc, sb, base, bar, phase, n=32)
+                phase ^= 1
                 # All consumers must observe this phase before the MMA warp
                 # can complete the next phase on the same single barrier.
                 nvvm.barrier_cta_sync_aligned()
-                gemm(sz, sx, base + 32, bar, 1, n=32)
+                gemm(sz, sx, base + 32, bar, phase, n=32)
+                phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(sz_low, sx, base + 32, bar, phase, n=32, accumulate=True)
+                    phase ^= 1
                 cb = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(base, cutlass.Float32), num=4)
                 zx = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(base + 32, cutlass.Float32), num=4)
                 nvvm.tcgen05_wait("load")
@@ -219,7 +234,24 @@ class Mamba2BackwardChunks:
                 nvvm.barrier_cta_sync_aligned()
 
                 # dC = exp(p) * dY @ S + J @ B.
-                gemm(sz, ss, base + 64, bar, 0, transpose=True)
+                gemm(sz, ss, base + 64, bar, phase, transpose=True)
+                phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(sz_low, ss, base + 64, bar, phase, transpose=True, accumulate=True)
+                    phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    for pack in cutlass.range_constexpr(4):
+                        idx = tid * 8 + pack * 1024
+                        r, col = idx // 64, idx % 64
+                        fp32_tile = (seeds.iterator.raw_ptr() + block * 8192 + r * 128 + state_tile * 64 + col).load(count=8, alignment=16)
+                        residual_tile = fp32_tile - fp32_tile.to(cutlass.BFloat16).to(cutlass.Float32)
+                        (ss.data_ptr() + r * 64 + swizzle_xor_128b(r, col)).store(residual_tile.to(cutlass.BFloat16), alignment=16)
+                    nvvm.fence_proxy("async.shared", space="cta")
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(sz, ss, base + 64, bar, phase, transpose=True, accumulate=True)
+                    phase ^= 1
                 cv = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 factor = cutlass.Float32(0)
@@ -235,11 +267,12 @@ class Mamba2BackwardChunks:
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), cv * factor)
                 nvvm.tcgen05_wait("store")
                 nvvm.barrier_cta_sync_aligned()
-                gemm(sj, sb, base + 64, bar, 1, k=32, transpose=True, accumulate=True)
+                gemm(sj, sb, base + 64, bar, phase, k=32, transpose=True, accumulate=True)
+                phase ^= 1
                 cvout = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 if row < 32 and lane < 16 and chunk * 32 + row < self.length:
-                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 64
+                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 128 + state_tile * 64
                     (dc.iterator.raw_ptr() + oi).store(cvout.to(dc.element_type), alignment=16)
                 # Join TMEM readers before reusing both its output buffer and
                 # the shared MMA completion barrier in the next operation.
@@ -256,7 +289,20 @@ class Mamba2BackwardChunks:
                         sjt[(jc + j) * 64 + swizzle_xor_128b(jc + j, jr)] = jvalues[j]
                     nvvm.fence_proxy("async.shared", space="cta")
                     nvvm.barrier_cta_sync_aligned()
-                gemm(sx, sg, base + 64, bar, 0, transpose=True)
+                gemm(sx, sg, base + 64, bar, phase, transpose=True)
+                phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    for pack in cutlass.range_constexpr(4):
+                        idx = tid * 8 + pack * 1024
+                        r, col = idx // 64, idx % 64
+                        fp32_tile = (adjoints.iterator.raw_ptr() + block * 8192 + r * 128 + state_tile * 64 + col).load(count=8, alignment=16)
+                        residual_tile = fp32_tile - fp32_tile.to(cutlass.BFloat16).to(cutlass.Float32)
+                        (ss.data_ptr() + r * 64 + swizzle_xor_128b(r, col)).store(residual_tile.to(cutlass.BFloat16), alignment=16)
+                    nvvm.fence_proxy("async.shared", space="cta")
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(sx, ss, base + 64, bar, phase, transpose=True, accumulate=True)
+                    phase ^= 1
                 bv = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 factor = cutlass.Float32(0)
@@ -274,26 +320,37 @@ class Mamba2BackwardChunks:
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), bv * factor)
                 nvvm.tcgen05_wait("store")
                 nvvm.barrier_cta_sync_aligned()
-                gemm(sjt, sc, base + 64, bar, 1, k=32, transpose=True, accumulate=True)
+                gemm(sjt, sc, base + 64, bar, phase, k=32, transpose=True, accumulate=True)
+                phase ^= 1
                 bvout = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 if row < 32 and lane < 16 and chunk * 32 + row < self.length:
-                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 64
+                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 128 + state_tile * 64
                     (db.iterator.raw_ptr() + oi).store(bvout.to(db.element_type), alignment=16)
                 nvvm.barrier_cta_sync_aligned()
 
                 # dX = delta*exp(p_end-p) * B @ G^T + W^T @ dY + D*dY.
-                gemm(sb, sg, base + 64, bar, 0)
+                gemm(sb, sg, base + 64, bar, phase)
+                phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(sb, ss, base + 64, bar, phase, accumulate=True)
+                    phase ^= 1
                 xv = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), xv * factor)
                 nvvm.tcgen05_wait("store")
                 nvvm.barrier_cta_sync_aligned()
-                gemm(swt, sz, base + 64, bar, 1, k=32, transpose=True, accumulate=True)
+                gemm(swt, sz, base + 64, bar, phase, k=32, transpose=True, accumulate=True)
+                phase ^= 1
+                if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                    nvvm.barrier_cta_sync_aligned()
+                    gemm(swt, sz_low, base + 64, bar, phase, k=32, transpose=True, accumulate=True)
+                    phase ^= 1
                 xvout = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(base + 64, cutlass.Float32), num=64)
                 nvvm.tcgen05_wait("load")
                 if row < 32 and lane < 16 and chunk * 32 + row < self.length:
-                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 64
+                    oi = ((batch * self.length + chunk * 32 + row) * self.heads + h) * 128 + state_tile * 64
                     dterms = []
                     for pack in cutlass.range_constexpr(8):
                         packvals = []
@@ -306,11 +363,12 @@ class Mamba2BackwardChunks:
                             yz = yvalues[j].to(cutlass.Float32)
                             value = xvout[col]
                             if cutlass.const_expr(d is not None):
-                                value += d[h] * yz
-                            packvals.append(value.to(cutlass.BFloat16))
+                                if state_tile == 0:
+                                    value += d[h] * yz
+                            packvals.append(value.to(dx.element_type))
                             if cutlass.const_expr(dd is not None):
                                 dterms.append(yz * xvalues[j].to(cutlass.Float32))
-                        (dx.iterator.raw_ptr() + oi + pack * 8).store(cutlass.Vector.from_elements(tuple(packvals), cutlass.BFloat16), alignment=16)
+                        (dx.iterator.raw_ptr() + oi + pack * 8).store(cutlass.Vector.from_elements(tuple(packvals), dx.element_type), alignment=16)
                     if cutlass.const_expr(dd is not None):
                         ddparts[row] = sum64(dterms)
                 nvvm.barrier_cta_sync_aligned()
@@ -333,7 +391,7 @@ class Mamba2BackwardChunks:
                         gd += a[h] * gl
                         sigmoid = 1.0 / (1.0 + cute.math.exp(-rawdt, fastmath=True))
                         gd_bias = gd * sigmoid
-                        ddt[oi] = gd_bias.to(ddt.element_type)
+                        ddt[oi * 2 + state_tile] = gd_bias.to(ddt.element_type)
                         ga = gl * delta[lane]
                         if cutlass.const_expr(dd is not None):
                             gd_skip = ddparts[lane]
@@ -343,9 +401,10 @@ class Mamba2BackwardChunks:
                         if cutlass.const_expr(dd is not None):
                             gd_skip += nvvm.shfl_sync(0xFFFFFFFF, gd_skip, off, 31, kind=nvvm.Shfl.BFLY)
                     if lane == 0:
-                        da[block], dbias[block] = ga, gd_bias
+                        da[block * 2 + state_tile], dbias[block * 2 + state_tile] = ga, gd_bias
                         if cutlass.const_expr(dd is not None):
-                            dd[block] = gd_skip
+                            if state_tile == 0:
+                                dd[block] = gd_skip
                 nvvm.barrier_cta_sync_aligned()
         if warp == 0:
             if cutlass.const_expr(not self.early_tmem_release):

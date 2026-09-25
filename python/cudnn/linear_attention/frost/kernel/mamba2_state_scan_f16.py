@@ -28,18 +28,18 @@ class Mamba2StateScan:
     def __call__(self, x, dy, dt, a, b, c, bias, initial, dfinal, seeds, adjoints, dinitial, stream: cuda.CUstream):
         if cutlass.const_expr(self.reverse_only):
             self.kernel(x, dy, dt, a, b, c, bias, initial, dfinal, seeds, adjoints, dinitial, 1).launch(
-                grid=(self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
+                grid=(2 * self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
             )
         elif cutlass.const_expr(self.split_directions):
             # Compile-time directions avoid excessive live registers when both
             # optional initial-state tensors are present in the boundary case.
             for direction in cutlass.range_constexpr(2):
                 self.kernel(x, dy, dt, a, b, c, bias, initial, dfinal, seeds, adjoints, dinitial, direction).launch(
-                    grid=(self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
+                    grid=(2 * self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
                 )
         else:
             self.kernel(x, dy, dt, a, b, c, bias, initial, dfinal, seeds, adjoints, dinitial, -1).launch(
-                grid=(2 * self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
+                grid=(4 * self.batch * self.heads, 1, 1), block=(288, 1, 1), stream=stream
             )
 
     @cute.kernel
@@ -48,16 +48,17 @@ class Mamba2StateScan:
         block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(direction >= 0):
             reverse = direction == 1
-            bh = block
+            tiled_bh = block
         else:
-            reverse = block >= self.batch * self.heads
-            bh = block % (self.batch * self.heads)
+            reverse = block >= 2 * self.batch * self.heads
+            tiled_bh = block % (2 * self.batch * self.heads)
+        bh, state_tile = tiled_bh // 2, tiled_bh % 2
         batch, h = bh // self.heads, bh % self.heads
         group = h // (self.heads // self.groups)
         warp, lane = tid // 32, tid % 32
         sm = cutlass.AddressSpace.smem
         keys = cutlass.Array(cutlass.BFloat16, 3 * 2048, space=sm, alignment=1024)
-        values = cutlass.Array(cutlass.BFloat16, 3 * 2048, space=sm, alignment=1024)
+        values = cutlass.Array(dy.element_type, 3 * 2048, space=sm, alignment=1024)
         weight = cutlass.Array(cutlass.Float32, 3 * 32, space=sm, alignment=128)
         decay = cutlass.Array(cutlass.Float32, 3, space=sm, alignment=16)
         slot = cutlass.Array(cutlass.Int32, 1, space=sm, alignment=16)
@@ -91,15 +92,26 @@ class Mamba2StateScan:
                     row, col = idx // 64, idx % 64
                     token = chunk * 32 + row
                     valid = cutlass.Int32(token < self.length) * 16
-                    ki = ((batch * self.length + token) * self.groups + group) * 64 + col
+                    ki = ((batch * self.length + token) * self.groups + group) * 128 + state_tile * 64 + col
                     vi = ((batch * self.length + token) * self.heads + h) * 64 + col
                     dst = stage * 2048 + row * 64 + swizzle_xor_128b(row, col)
                     if reverse:
                         nvvm.cp_async_shared_global(keys.data_ptr() + dst, c.iterator.raw_ptr() + ki, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
-                        nvvm.cp_async_shared_global(values.data_ptr() + dst, dy.iterator.raw_ptr() + vi, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
                     else:
                         nvvm.cp_async_shared_global(keys.data_ptr() + dst, b.iterator.raw_ptr() + ki, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
-                        nvvm.cp_async_shared_global(values.data_ptr() + dst, x.iterator.raw_ptr() + vi, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
+                    if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                        value_pack = cutlass.Vector.from_elements(tuple(cutlass.Float32(0) for _ in range(8)), cutlass.Float32)
+                        if token < self.length:
+                            if reverse:
+                                value_pack = (dy.iterator.raw_ptr() + vi).load(count=8, alignment=16)
+                            else:
+                                value_pack = (x.iterator.raw_ptr() + vi).load(count=8, alignment=16).to(cutlass.Float32)
+                        (values.data_ptr() + dst).store(value_pack, alignment=16)
+                    else:
+                        if reverse:
+                            nvvm.cp_async_shared_global(values.data_ptr() + dst, dy.iterator.raw_ptr() + vi, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
+                        else:
+                            nvvm.cp_async_shared_global(values.data_ptr() + dst, x.iterator.raw_ptr() + vi, 16, nvvm.LoadCacheModifier.CA, cp_size=valid)
                 cp_async_commit()
                 if warp == 4:
                     token = chunk * 32 + lane
@@ -132,10 +144,10 @@ class Mamba2StateScan:
                     value = cutlass.Float32(0)
                     if reverse:
                         if cutlass.const_expr(dfinal is not None):
-                            value = dfinal[bh * 4096 + r0 * 64 + col]
+                            value = dfinal[bh * 8192 + r0 * 128 + state_tile * 64 + col]
                     else:
                         if cutlass.const_expr(initial is not None):
-                            value = initial[bh * 4096 + r0 * 64 + col]
+                            value = initial[bh * 8192 + r0 * 128 + state_tile * 64 + col]
                     initial_values.append(value)
                 nvvm.tcgen05_st(
                     "16x256b", nvvm.make_tmem_ptr(base + part * 32, cutlass.Float32), cutlass.Vector.from_elements(tuple(initial_values), cutlass.Float32)
@@ -154,7 +166,7 @@ class Mamba2StateScan:
                 for j in cutlass.range_constexpr(16):
                     r = warp * 16 + lane // 4 + 8 * (j % 2)
                     col = (lane % 4) * 2 + (j // 2) * 8
-                    ci = (bh * self.nchunks + chunk) * 4096 + r * 64 + col
+                    ci = (bh * self.nchunks + chunk) * 8192 + r * 128 + state_tile * 64 + col
                     pair = cutlass.Vector.from_elements((state[2 * j], state[2 * j + 1]), cutlass.Float32).to(seeds.element_type)
                     if reverse:
                         (adjoints.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
@@ -162,16 +174,22 @@ class Mamba2StateScan:
                         (seeds.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
                 nvvm.tcgen05_st("16x256b", nvvm.make_tmem_ptr(base, cutlass.Float32), state * decay[stage])
                 xwords = []
-                for part in cutlass.range_constexpr(2):
-                    words = nvvm.ldmatrix(
-                        values.data_ptr() + stage * 2048 + (vr + part * 16) * 64 + swizzle_xor_128b(vr + part * 16, vc), 4, nvvm.MMALayout.COL
-                    )
-                    for j in cutlass.range_constexpr(4):
-                        xwords.append(words[j])
+                if cutlass.const_expr(dy.element_type != cutlass.Float32):
+                    for part in cutlass.range_constexpr(2):
+                        words = nvvm.ldmatrix(
+                            values.data_ptr() + stage * 2048 + (vr + part * 16) * 64 + swizzle_xor_128b(vr + part * 16, vc), 4, nvvm.MMALayout.COL
+                        )
+                        for j in cutlass.range_constexpr(4):
+                            xwords.append(words[j])
                 weighted = []
                 for j in cutlass.range_constexpr(8):
-                    v0, v1 = f16x2_to_f32(xwords[j], dtype=cutlass.BFloat16)
                     col = (lane % 4) * 2 + (j // 2) * 8
+                    if cutlass.const_expr(dy.element_type == cutlass.Float32):
+                        value_row = warp * 16 + lane // 4 + (j % 2) * 8
+                        v0 = values[stage * 2048 + col * 64 + swizzle_xor_128b(col, value_row)]
+                        v1 = values[stage * 2048 + (col + 1) * 64 + swizzle_xor_128b((col + 1), value_row)]
+                    else:
+                        v0, v1 = f16x2_to_f32(xwords[j], dtype=cutlass.BFloat16)
                     weighted.append(fp32_to_fp16(v0 * weight[stage * 32 + col], v1 * weight[stage * 32 + col + 1], dtype=cutlass.BFloat16))
                 nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(base + 64, cutlass.Int32), cutlass.Vector.from_elements(tuple(weighted), cutlass.Int32))
                 nvvm.tcgen05_wait("store")
@@ -186,7 +204,7 @@ class Mamba2StateScan:
                         r0 = warp * 16 + lane // 4 + (j % 2) * 8
                         col = part * 32 + lane % 4 * 2 + j // 2 * 8
                         pair = cutlass.Vector.from_elements((final_vec[2 * j], final_vec[2 * j + 1]), cutlass.Float32)
-                        (dinitial.iterator.raw_ptr() + bh * 4096 + r0 * 64 + col).store(pair, alignment=8)
+                        (dinitial.iterator.raw_ptr() + bh * 8192 + r0 * 128 + state_tile * 64 + col).store(pair, alignment=8)
         else:
             desc = MmaDesc(
                 M=64,

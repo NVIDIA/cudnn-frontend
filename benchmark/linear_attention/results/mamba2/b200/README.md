@@ -1,4 +1,11 @@
-# Mamba-2 SSD integration measurement, 2026-09-17
+# Historical N=64 Mamba-2 SSD measurement, 2026-09-17
+
+This archived snapshot predates the N=128-only Nemotron specialization. It
+does not describe the current support envelope or predict N=128 performance.
+Its Triton baseline also used chunk size 32; current Nemotron comparisons use
+the model default of 128. Keep the raw evidence for provenance. Reproducing
+these numbers requires the historical source hashes recorded below; the
+current benchmark driver exercises a different state size and baseline.
 
 B200 (148 SMs), B=2, L=2048, H=64, P=N=64, G=1, logical chunk=32,
 BF16 I/O, FP32 A/D/dt_bias/final state. Forward checkpoints are recomputed in
@@ -53,7 +60,7 @@ by the reference peak < 1.5%, with denominator floor 1e-10. These are finite
 tensor comparisons, not a claim about training convergence. Only SM100 was
 validated; the engine declines other architectures.
 
-Reproduce from the repository root:
+Historical reproduction commands (with the matching pre-N=128 sources):
 
 ```bash
 python benchmark/linear_attention/benchmark_mamba2.py \

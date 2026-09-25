@@ -23,6 +23,14 @@ and optional SiLU gate. It does not include input/output projections, causal
 convolution, or GatedRMSNorm. In a Mamba-2 block with a separate GatedRMSNorm,
 leave `z=None` here and apply the block's normalization/gating afterward.
 
+This specialization targets the N=128 SSD geometry in
+[Nemotron 3 Nano](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/config.json)
+and [Nemotron 3 Super](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16/blob/main/config.json):
+head dimension 64, state size 128, and 8 B/C groups (64 or 128 heads).
+It accepts only state size 128; this is not support for every Mamba-2 or
+Nemotron-family configuration. The two native 64-column state tiles are an
+internal decomposition of N=128 and do not expose an N=64 mode.
+
 ## Operation and supported tensors
 
 For head `h`, group `g = h // (H // G)`, and token `t`:
@@ -43,9 +51,9 @@ outside this operation remain differentiable through ordinary PyTorch.
 |---|---|---|
 | `x`, optional `z`, `out` | `[B, L, H, 64]` | BF16 |
 | `dt` | `[B, L, H]` | BF16 |
-| `B`, `C` | `[B, L, G, 64]` | BF16 |
+| `B`, `C` | `[B, L, G, 128]` | BF16 |
 | `A`, optional `D`, optional `dt_bias` | `[H]` | FP32 |
-| optional `initial_state`, `final_state` | `[B, H, 64, 64]` (value, state axes) | FP32 |
+| optional `initial_state`, `final_state` | `[B, H, 64, 128]` (value, state axes) | FP32 |
 
 Requirements: SM100 (B200), CuTeDSL >= 4.7.0, positive dimensions, `H % G == 0`,
 contiguous buffers with 16-byte aligned addresses, and `chunk_size=32`. The last
@@ -64,19 +72,25 @@ Higher-order gradients are not supported.
 `intermediate_dtype` is a numerical operation attribute, not an autotuning knob:
 
 - `"float32"` (default): FP32 chunk checkpoints, adjoints and per-head B/C
-  gradient partials.
+  gradient partials. Gated backward also retains its cotangent in FP32.
 - `"bfloat16"`: BF16 storage for those intermediates, with FP32 state
   accumulation and reductions. This reduces traffic and changes rounding.
+  This mode requires z=None: BF16 state rounding with the optional SSD SiLU
+  gate can amplify cancellation in parameter gradients. Use FP32 intermediates
+  when supplying z; the engine rejects that combination with BF16 intermediates.
 
 Both paths use BF16 tensor-core operands. Neither is an all-FP32 implementation.
 The native gated forward keeps the raw output in FP32 until applying SiLU, and
 saves a BF16 ungated output for backward, following the baseline's saved-output
-contract. The gate backward accumulates the skip-weight gradient before rounding
-the gated cotangent to BF16.
+contract. The gate backward accumulates the skip-weight gradient in FP32. With FP32
+intermediates, the scan scales the unrounded gated cotangent and backward uses
+high/low BF16 operands for the cotangent and state contractions. This avoids
+losing the gate gradient in cancellation-sensitive parameter reductions. The
+BF16 mode is supported only without this optional gate.
 
 By default backward recomputes chunk-entry states. With
-`reuse_forward_states=True`, forward saves `[B,H,ceil(L/32),64,64]` states instead.
-At `B=2,L=2048,H=64` this retains 128 MiB in FP32 or 64 MiB in BF16. The choice
+`reuse_forward_states=True`, forward saves `[B,H,ceil(L/32),64,128]` states instead.
+At `B=2,L=2048,H=64` this retains 256 MiB in FP32 or 128 MiB in BF16. The choice
 does not change the logical chunk size. Compare numerics for your training
 distribution before selecting BF16 intermediates.
 
@@ -103,7 +117,7 @@ o, final, ungated, checkpoints = graph.mamba2(
 graph.build()  # selects mamba2_frost and compiles kernels from declarations
 workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 out = torch.empty_like(inputs["x"])
-state = torch.empty(o.dim[0], o.dim[2], 64, 64, device="cuda", dtype=torch.float32)
+state = torch.empty(o.dim[0], o.dim[2], 64, 128, device="cuda", dtype=torch.float32)
 pack = {ports[name]: t for name, t in inputs.items()}
 pack.update({o: out, final: state})
 if ungated is not None:
@@ -146,8 +160,13 @@ python benchmark/linear_attention/benchmark_mamba2.py \
   --intermediate-dtype bfloat16 --output mamba2_b200.json
 ```
 
-The default shape is `B=2,L=2048,H=64,P=N=64,G=1,chunk_size=32`, BF16 I/O.
-The script checks all gradients and final states against Triton before timing.
+The default shape is `B=2,L=2048,H=64,P=64,N=128,G=8`, BF16 I/O.
+The native engine uses chunk size 32; Triton uses the Nemotron default of 128
+(`--triton-chunk-size` can select another baseline). The script checks all
+gradients and final states before timing and again from the captured buffers
+after CUDA Graph replay. `--reuse-forward-states` measures the checkpointed
+native route and records the choice. BF16-intermediate benchmarks cover the
+supported ungated route; FP32-intermediate benchmarks also cover SiLU gating.
 It measures CUDA Graph device time for complete forward, complete backward and
 an actual forward-plus-backward pair, including timestep preprocessing and all
 recomputations/reductions. Compilation, Python dispatch and allocation costs

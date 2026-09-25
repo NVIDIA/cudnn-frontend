@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SiLU gate backward with FP32 dD partials before rounding the SSD gradient."""
+"""SiLU backward with FP32 dD partials and configurable cotangent storage."""
 
 import cutlass
 import cutlass.cute as cute
@@ -38,10 +38,10 @@ class Mamba2GateBackward:
                 for j in cutlass.range_constexpr(8):
                     sigmoid = 1.0 / (1.0 + cute.math.exp(-zv[j], fastmath=True))
                     gated_grad = grad[j] * zv[j] * sigmoid
-                    dxs.append(gated_grad.to(cutlass.BFloat16))
+                    dxs.append(gated_grad.to(dx.element_type))
                     dzs.append((grad[j] * outputs[j] * sigmoid * (1.0 + zv[j] * (1.0 - sigmoid))).to(cutlass.BFloat16))
                     partial += gated_grad * values[j]
-                (dx.iterator.raw_ptr() + idx).store(cutlass.Vector.from_elements(tuple(dxs), cutlass.BFloat16), alignment=16)
+                (dx.iterator.raw_ptr() + idx).store(cutlass.Vector.from_elements(tuple(dxs), dx.element_type), alignment=16)
                 (dz.iterator.raw_ptr() + idx).store(cutlass.Vector.from_elements(tuple(dzs), cutlass.BFloat16), alignment=16)
         for off in [16, 8, 4, 2, 1]:
             partial += nvvm.shfl_sync(0xFFFFFFFF, partial, off, 31, kind=nvvm.Shfl.BFLY)

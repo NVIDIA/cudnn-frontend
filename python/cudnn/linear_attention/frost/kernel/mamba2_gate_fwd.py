@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Apply SiLU to an FP32 pre-gate SSD result without intermediate rounding."""
+"""Combine N=128 state-tile outputs and optionally apply SiLU before BF16 rounding."""
 
 import cutlass
 import cutlass.cute as cute
@@ -25,11 +25,17 @@ class Mamba2GateForward:
         block, _, _ = cute.arch.block_idx()
         idx = (block * self.threads + tid) * 8
         if idx < self.elements:
-            values = (raw.iterator.raw_ptr() + idx).load(count=8, alignment=16)
-            gates = (z.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
+            row, col = idx // 64, idx % 64
+            offset = row * 128 + col
+            values = (raw.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+            values += (raw.iterator.raw_ptr() + offset + 64).load(count=8, alignment=16)
+            if cutlass.const_expr(z is not None):
+                gates = (z.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
             outputs = []
             for j in cutlass.range_constexpr(8):
-                activation = gates[j] / (1.0 + cute.math.exp(-gates[j], fastmath=True))
+                activation = cutlass.Float32(1.0)
+                if cutlass.const_expr(z is not None):
+                    activation = gates[j] / (1.0 + cute.math.exp(-gates[j], fastmath=True))
                 outputs.append((values[j] * activation).to(cutlass.BFloat16))
             (out.iterator.raw_ptr() + idx).store(cutlass.Vector.from_elements(tuple(outputs), cutlass.BFloat16), alignment=16)
             if cutlass.const_expr(saved is not None):

@@ -27,7 +27,7 @@ def require_sm100():
         pytest.skip("Mamba2FrostEngine requires CuTeDSL >= 4.7.0")
 
 
-def inputs(length=33, heads=4, groups=2, mode="full", batch=1):
+def inputs(length=33, heads=4, groups=2, mode="full", batch=1, state_size=128):
     torch.manual_seed(1729)
 
     def rand(shape, dtype=torch.bfloat16):
@@ -37,15 +37,15 @@ def inputs(length=33, heads=4, groups=2, mode="full", batch=1):
         x=rand((batch, length, heads, 64)),
         dt=rand((batch, length, heads)) - 2,
         A=-torch.rand(heads, device="cuda") - 0.1,
-        B=rand((batch, length, groups, 64)),
-        C=rand((batch, length, groups, 64)),
+        B=rand((batch, length, groups, state_size)),
+        C=rand((batch, length, groups, state_size)),
     )
     if mode != "bare":
         values.update(D=rand((heads,), torch.float32), dt_bias=rand((heads,), torch.float32) - 1)
     if mode in ("gated", "full"):
         values["z"] = rand(values["x"].shape)
-    if mode == "full":
-        values["initial_state"] = rand((batch, heads, 64, 64), torch.float32)
+    if mode in ("full", "state"):
+        values["initial_state"] = rand((batch, heads, 64, state_size), torch.float32)
     return {name: t.requires_grad_() for name, t in values.items()}
 
 
@@ -86,11 +86,12 @@ def assert_error(actual, expected):
         (31, "gated", "float32", False),
         (32, "full", "float32", True),
         (33, "full", "float32", False),
-        (33, "full", "bfloat16", True),
-        (65, "gated", "bfloat16", False),
+        (33, "state", "bfloat16", True),
+        (65, "skip", "bfloat16", False),
         (128, "bare", "bfloat16", False),
         (128, "gated", "float32", True),
-        (129, "full", "bfloat16", False),
+        (128, "gated", "float32", False),
+        (129, "state", "bfloat16", False),
     ],
 )
 def test_numerics(length, mode, precision, reuse):
@@ -214,7 +215,7 @@ def test_torch_compile_training():
     values = inputs(33)
 
     def model(x, dt, A, B, C, D, dt_bias, z, initial_state):
-        o, s = mamba2(x, dt, A, B, C, D, dt_bias, z, initial_state, return_final_state=True, intermediate_dtype="bfloat16")
+        o, s = mamba2(x, dt, A, B, C, D, dt_bias, z, initial_state, return_final_state=True, intermediate_dtype="float32")
         return o.float().square().mean() + s.square().mean()
 
     eager = model(**values)
@@ -262,3 +263,55 @@ def test_public_training_capture():
     stream.synchronize()
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e)
+
+
+@pytest.mark.parametrize("state_size", [64, 96, 256])
+def test_declines_non_nemotron_state_size(state_size):
+    from cudnn.linear_attention.frost.mamba2_engine import Mamba2FrostEngine
+
+    values = inputs(33, mode="bare", state_size=state_size)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=ops.torch_dtype_to_cudnn(t.dtype), name=name) for name, t in values.items()}
+    graph.mamba2(**ports)
+    with pytest.raises(NotImplementedError, match="state_dim=128"):
+        Mamba2FrostEngine().check_support(graph)
+
+
+@pytest.mark.parametrize("heads", [64, 128], ids=["nemotron_nano", "nemotron_super"])
+@pytest.mark.parametrize("precision", ["float32", "bfloat16"])
+def test_nemotron_ssd_geometry(heads, precision):
+    # Nemotron uses a separate GatedRMSNorm after SSD, so z stays absent here.
+    # Match its P=64/N=128/G=8 geometry and timestep initialization range.
+    values = inputs(65, heads=heads, groups=8, mode="skip")
+    values["A"] = (-torch.empty(heads, device="cuda").uniform_(1, 16)).requires_grad_()
+    delta = torch.exp(torch.empty(heads, device="cuda").uniform_(-6.9, -2.3))
+    values["dt_bias"] = (delta + torch.log(-torch.expm1(-delta))).requires_grad_()
+    refs = {name: t.detach().double().requires_grad_() for name, t in values.items()}
+    actual = mamba2(**values, return_final_state=True, intermediate_dtype=precision, reuse_forward_states=True)
+    expected = reference(refs)
+    for a, e in zip(actual, expected):
+        assert_error(a, e)
+    cotangents = tuple(torch.randn_like(t) for t in actual)
+    actual_grads = torch.autograd.grad(actual, tuple(values.values()), cotangents)
+    expected_grads = torch.autograd.grad(expected, tuple(refs.values()), tuple(t.double() for t in cotangents))
+    for name, a, e in zip(values, actual_grads, expected_grads):
+        try:
+            assert_error(a, e)
+        except AssertionError as exc:
+            raise AssertionError(f"{name}: {exc}") from exc
+
+
+@pytest.mark.parametrize("surface", ["graph", "torch"])
+def test_declines_bf16_intermediates_with_ssd_gate(surface):
+    values = inputs(128, mode="gated")
+    if surface == "torch":
+        with pytest.raises(ValueError, match="SiLU gate requires intermediate_dtype=float32"):
+            mamba2(**values, intermediate_dtype="bfloat16")
+    else:
+        graph = cudnn.pygraph()
+        ports = {name: graph.tensor(list(t.shape), data_type=ops.torch_dtype_to_cudnn(t.dtype), name=name) for name, t in values.items()}
+        graph.mamba2(**ports, intermediate_dtype="bfloat16")
+        from cudnn.linear_attention.frost.mamba2_engine import Mamba2FrostEngine
+
+        with pytest.raises(NotImplementedError, match="SiLU gate requires intermediate_dtype=float32"):
+            Mamba2FrostEngine().check_support(graph)

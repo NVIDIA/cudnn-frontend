@@ -249,14 +249,14 @@ def mamba2(
     """Mamba-2 SSD forward and first-order backward on SM100.
 
     ``x,z``: BF16 [batch,length,heads,64]; ``dt``: BF16 [batch,length,heads];
-    ``B,C``: BF16 [batch,length,groups,64]; ``A,D,dt_bias``: FP32 [heads].
-    State is FP32 [batch,heads,64,64], with value then state axes. All inputs
+    ``B,C``: BF16 [batch,length,groups,128]; ``A,D,dt_bias``: FP32 [heads].
+    State is FP32 [batch,heads,64,128], with value then state axes. All inputs
     must be contiguous. Uses softplus(dt + dt_bias), exp(A * dt), D*x skip,
     and optional SiLU(z) gate. Pass A directly, not log(-A).
 
     ``chunk_size`` must be 32. ``intermediate_dtype`` controls checkpoints and
     partial gradients: float32 (default) or bfloat16 (less memory, different
-    rounding). ``reuse_forward_states`` saves chunk-entry states for backward
+    rounding, only without the optional SiLU gate). ``reuse_forward_states`` saves chunk-entry states for backward
     instead of recomputing them. Outputs are O or (O, FP32 final_state).
     Warm forward and backward before CUDA graph capture. Only first-order
     gradients are supported. Autograd materializes noncontiguous cotangents;
@@ -266,6 +266,8 @@ def mamba2(
         raise ValueError("mamba2 currently requires chunk_size=32")
     if intermediate_dtype not in ("float32", "bfloat16"):
         raise ValueError("mamba2: intermediate_dtype must be float32 or bfloat16")
+    if z is not None and intermediate_dtype != "float32":
+        raise ValueError("mamba2: SiLU gate requires intermediate_dtype=float32")
     out, final, _, _ = mamba2_fwd(
         x, dt, A, B, C, D, dt_bias, z, initial_state, return_final_state, chunk_size, intermediate_dtype, reuse_forward_states, plan_name
     )

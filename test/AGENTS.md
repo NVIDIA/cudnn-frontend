@@ -149,3 +149,18 @@ padding-dependent tail rule. A shared binder must preserve that distinction.
 `test_sm120_prepared_bounded_geometry_override` shrinks an unpadded plan to
 S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
 dimensions as compile-time constants: the same binder fixes those per plan.
+
+
+### Mamba-2 state-size and gated-gradient regressions
+
+Check N=128 with both 64 and 128 heads and 8 B/C groups, not just the small
+four-head fixture; reject unsupported state sizes explicitly. Keep the
+length-128 gated FP32 case in `linear_attention/test_mamba2_frost.py`: rounding
+the gate cotangent to BF16 before the scan and state contractions amplifies
+cancellation in `dt_bias`. Its independent FP64 gradient check must pass
+without relaxing the shared RMS/peak thresholds. The explicit BF16-intermediate
+mode declines the optional SSD gate because BF16 state rounding itself can
+amplify this cancellation; test the decline at both graph and torch entry points.
+Component benchmarks should
+use the model's Triton chunk size (128 for these Nemotron configurations) and
+validate captured output/gradient buffers after replay, as well as before it.
