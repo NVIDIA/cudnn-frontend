@@ -11,8 +11,6 @@ import torch
 
 from cudnn.engines.engine_ids import is_backend_engine
 
-pytestmark = pytest.mark.L1
-
 _B, _HQ, _HK, _D = 2, 4, 2, 128
 _Q, _KV = 32, 64
 
@@ -161,6 +159,7 @@ def attention_case(request, cudnn_handle):
     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
 
 
+@pytest.mark.L0
 def test_ordered_matches_mapping_with_fresh_buffers_and_uid_order(attention_case):
     graph, tensors, handle, _ = attention_case
     workspace = _workspace(graph, handle)
@@ -180,6 +179,7 @@ def test_ordered_matches_mapping_with_fresh_buffers_and_uid_order(attention_case
         _assert_result(buffers)
 
 
+@pytest.mark.L1
 def test_ordered_at_index_uses_the_same_provider_contract(attention_case):
     graph, tensors, handle, _ = attention_case
     buffers = _buffers(seed=9)
@@ -199,6 +199,7 @@ def test_ordered_at_index_uses_the_same_provider_contract(attention_case):
     assert graph._plan_index == selected
 
 
+@pytest.mark.L1
 def test_ordered_deserialized_backend_replaces_the_binding_layout(cudnn_handle):
     restored = cudnn.pygraph(handle=cudnn_handle)
     for uid_offset in (0, 1000):
@@ -224,6 +225,7 @@ def test_ordered_deserialized_backend_replaces_the_binding_layout(cudnn_handle):
             torch.testing.assert_close(buffers["lse"], expected[1], atol=0, rtol=0)
 
 
+@pytest.mark.L1
 def test_ordered_autobound_inputs_caller_precedence_and_unused_uids(attention_case):
     graph, tensors, handle, _ = attention_case
     buffers = _buffers(seed=10)
@@ -252,6 +254,7 @@ def test_ordered_autobound_inputs_caller_precedence_and_unused_uids(attention_ca
         graph._data_bindings.update(previous)
 
 
+@pytest.mark.L1
 def test_ordered_mixes_current_native_and_python_buffer_observation(attention_case):
     class PythonBuffer:
         # A torch-like producer without the native DLPack exchange vtable.
@@ -281,6 +284,7 @@ def test_ordered_mixes_current_native_and_python_buffer_observation(attention_ca
         _assert_result(buffers)
 
 
+@pytest.mark.L0
 def test_ordered_overrides_follow_mutable_values(attention_case):
     graph, tensors, handle, _ = attention_case
     geometry = None
@@ -316,6 +320,7 @@ def test_ordered_overrides_follow_mutable_values(attention_case):
         _assert_result(buffers, q_len, kv_len)
 
 
+@pytest.mark.L1
 def test_ordered_frost_strided_override_matches_mapping(cudnn_handle):
     # FROST permits token-stride changes on this compiled plan. Exercise that
     # provider capability without assuming every backend plan supports it.
@@ -337,6 +342,7 @@ def test_ordered_frost_strided_override_matches_mapping(cudnn_handle):
     _assert_result(buffers, 16, 32)
 
 
+@pytest.mark.L1
 def test_ordered_capture_replay_survives_new_bindings_and_workspace(attention_case):
     graph, tensors, handle, _ = attention_case
     buffers = _buffers(seed=12)
@@ -375,6 +381,7 @@ def test_ordered_capture_replay_survives_new_bindings_and_workspace(attention_ca
         cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
 
 
+@pytest.mark.L1
 def test_ordered_rebuild_and_selected_plan_do_not_reuse_old_bindings(attention_case):
     graph, tensors, handle, provider = attention_case
     for seed in (20, 21):
@@ -391,6 +398,7 @@ def test_ordered_rebuild_and_selected_plan_do_not_reuse_old_bindings(attention_c
         assert (graph.selected_engine is None) == (provider == "backend")
 
 
+@pytest.mark.L1
 def test_ordered_provider_selection_changes_on_the_same_graph(cudnn_handle):
     graph, tensors = _graph(cudnn_handle, "frost")
     for seed, provider in enumerate(("frost", "backend", "frost")):
@@ -402,6 +410,7 @@ def test_ordered_provider_selection_changes_on_the_same_graph(cudnn_handle):
         _assert_result(buffers)
 
 
+@pytest.mark.L1
 def test_ordered_handle_and_stream_are_invocation_local(attention_case):
     graph, tensors, _, _ = attention_case
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -428,6 +437,7 @@ def test_ordered_handle_and_stream_are_invocation_local(attention_case):
 
 
 @pytest.mark.parametrize("invalid", ["duplicate", "duplicate_unused", "missing", "count"])
+@pytest.mark.L1
 def test_ordered_rejects_invalid_uid_bindings_before_launch(attention_case, invalid):
     graph, tensors, handle, _ = attention_case
     buffers = _buffers(seed=25)
@@ -449,6 +459,7 @@ def test_ordered_rejects_invalid_uid_bindings_before_launch(attention_case, inva
 
 
 @pytest.mark.parametrize("invalid", ["length_storage", "cpu_input", "output_inner_stride"])
+@pytest.mark.L1
 def test_ordered_preserves_frost_observed_metadata_checks(cudnn_handle, invalid):
     graph, tensors = _graph(cudnn_handle, "frost")
     buffers = _buffers(seed=30)
@@ -476,6 +487,7 @@ def _schema():
     return native._OrderedBindingSchema([1], layout, False)
 
 
+@pytest.mark.L0
 def test_ordered_schema_reentry_keeps_the_original_snapshot():
     schema = _schema()
     # Retain the old pack even in the buggy version: the regression should
@@ -491,6 +503,7 @@ def test_ordered_schema_reentry_keeps_the_original_snapshot():
     assert len(previous[0]) == len(current[0]) == 1
 
 
+@pytest.mark.L0
 def test_ordered_schema_metadata_validation_does_not_depend_on_cache_state():
     schema = _schema()
     for warm in (False, True):
@@ -508,6 +521,7 @@ def test_ordered_schema_metadata_validation_does_not_depend_on_cache_state():
             schema.read([None], [1], {}, None, [1], [range(1, 2)], [[1]])
 
 
+@pytest.mark.L0
 def test_ordered_override_uids_remain_strict():
     schema = _schema()
     for override_uids, shapes, strides in (([999], [[1]], [[1]]), ([1, 1], [[1], [1]], [[1], [1]])):

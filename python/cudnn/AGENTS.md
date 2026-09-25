@@ -475,7 +475,7 @@ window, then replay and a native launch). For R1, monkeypatch
 (`test_torch_stream.py`).
 
 
-**Rule 8 — backend and FROST share one FE Python graph contract; no special
+**Rule 9 — backend and FROST share one FE Python graph contract; no special
 treatment at the caller boundary.**
 
 - **Same API and semantics.** For workloads supported by both engines, graph
