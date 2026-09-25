@@ -1026,6 +1026,9 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         q_fp8_d = q_fp8_d.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
         o_gpu = torch.empty(b, s_qo, h_q, d_vo, dtype=torch_otype, device="cuda").permute(0, 2, 1, 3)
     stats_gpu = torch.empty(b, h_q, s_qo, 1, dtype=torch.float32, device="cuda")
+    if is_paged:  # NaN, so a padded row the kernel skips cannot pass the O := 0 / LSE := -inf checks
+        o_gpu.fill_(float("nan"))
+        stats_gpu.fill_(float("nan"))
     amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
 
     sf_o_gpu = scale_o_gpu = None
@@ -1132,7 +1135,12 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         ):
             error = compare_tensors(actual, expected, atol, rtol, name)
             assert error == 0, f"{name} mismatch: {error} elements differ"
-        assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
+        if is_paged:
+            # A split plan rounds P against each split's own max, not the reference's single running max, so max|O|
+            # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
+            assert compare_amax(amax_o_gpu, o_cmp, rtol=torch.finfo(torch_otype).eps, tag="amax(graph output)"), "Amax_O mismatch"
+        else:
+            assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")
