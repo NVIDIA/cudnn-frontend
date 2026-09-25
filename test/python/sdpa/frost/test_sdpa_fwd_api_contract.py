@@ -22,7 +22,9 @@ def test_new_constructor_parameters_follow_the_legacy_positional_prefix():
         "thd_stats_padded",
     ]
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
-    assert params[-2:] == ["sample_amax_o", "pv_bf16"]
+    extension_start = params.index("sample_amax_o")
+    assert params[extension_start : extension_start + 3] == ["sample_amax_o", "pv_bf16", "stats_log2"]
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
 
 
 @pytest.mark.L0
@@ -66,3 +68,75 @@ def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
 
     assert "sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous()" not in source
     assert 'f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}"' in source
+
+
+@pytest.mark.L0
+def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy():
+    """sdpa_mxfp8's scale_o is optional. A graph that declares none must get the
+    kernel's None-specialized identity fold (constructor ``sample_scale_o=None``
+    -> ``compile(has_scale_o=False)``), NEVER a cached ``torch.ones`` created on
+    the first execute: when that first execute is under CUDA-graph capture the
+    dummy is allocated but its fill is only captured, so an eager execute before
+    the first replay reads garbage (review on #1180; Rule 8)."""
+    source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
+    assert "self._scale_view(None" not in source
+    assert "self.has_scale_o" in source
+    # Append-only public signature: sample_scale_o closes the block-scale tail; the
+    # ragged-Q decode leg's plan-time facts (defaulted) follow it.
+    params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
+    assert params[-3:] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64"], params[-4:]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("api_cls", [SdpaFwdDslSm100, SdpaFwdDslSm120], ids=["sm100", "sm120"])
+def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cls):
+    """The lowering hands ``sf_o`` to ``execute()`` for every graph whose engine
+    row advertises a block-scaled O (the SM100-line and SM120-line FP8 rows).
+    A class that lowers such a graph but whose ``execute()`` lacks the keyword
+    passes check_support and compile, then fails every block-scaled draw at
+    execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
+    SM120 CI lane caught exactly that, invisible from an SM100 box."""
+    # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
+    fns = (api_cls.execute, api_cls._execute_fp8) + ((api_cls._execute_mxfp8,) if hasattr(api_cls, "_execute_mxfp8") else ())
+    for fn in fns:
+        params = inspect.signature(fn).parameters
+        assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
+        assert params["sf_o"].default is None
+    # Append-only public signature: sf_o closes the block-scale tail; the ragged-Q
+    # decode leg's offset operands (defaulted None) follow it.
+    exec_params = list(inspect.signature(api_cls.execute).parameters)
+    tail = exec_params[exec_params.index("sf_o") :]
+    assert tail in (["sf_o"], ["sf_o", "ragged_q", "ragged_o", "ragged_lse"]), tail  # SM100 carries the leg; SM120 does not
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("api_cls", "device_cc"),
+    [
+        (SdpaFwdDslSm80, (8, 0)),
+        (SdpaFwdDslSm100, (10, 0)),
+        (SdpaFwdDslSm120, (12, 0)),
+    ],
+    ids=["sm80", "sm100", "sm120"],
+)
+def test_ordinary_paths_do_not_need_the_packed_fp4_dtype(monkeypatch, api_cls, device_cc):
+    """``torch.float4_e2m1fn_x2`` arrived in torch 2.8 and the torch dependency group
+    is unversioned: an ordinary BF16 forward must get through check_support on a
+    build WITHOUT the symbol -- only a caller handing over an FP4 O may need it.
+    (Review on PR #1088: eager comparisons raised AttributeError on every
+    architecture, and build_plan's decline handler does not catch that.)"""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: device_cc)
+    monkeypatch.delattr(torch, "float4_e2m1fn_x2", raising=False)
+    q = torch.empty((1, 4, 128, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty((1, 2, 128, 128), dtype=torch.bfloat16, device="cuda")
+    v = torch.empty((1, 2, 128, 128), dtype=torch.bfloat16, device="cuda")
+    o = torch.empty((1, 4, 128, 128), dtype=torch.bfloat16, device="cuda")
+    api = api_cls(q, k, v, o)
+    try:
+        supported = api.check_support()
+    except AttributeError as e:  # the one failure mode this test is about
+        pytest.fail(f"{api_cls.__name__}.check_support reads torch.float4_e2m1fn_x2 eagerly: {e}")
+    except (NotImplementedError, ValueError):
+        return  # an arch-specific decline of this shape on this box is fine; only the eager lookup is not
+    if api_cls is SdpaFwdDslSm100:
+        assert supported

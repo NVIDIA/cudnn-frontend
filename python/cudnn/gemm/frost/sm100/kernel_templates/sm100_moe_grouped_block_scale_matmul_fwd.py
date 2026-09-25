@@ -30,6 +30,9 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
+    dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
+)
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -324,24 +327,23 @@ def _kernel(
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
-    smem_a_list = [
-        cutlass.Array(
-            a_smem_dtype,
-            sA_elems * ab_stages,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
-        )
-        for _ in range(num_a_operands)
-    ]
-    smem_b_list = [
-        cutlass.Array(
-            b_smem_dtype,
-            sB_elems * ab_stages,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
-        )
-        for _ in range(num_b_operands)
-    ]
+    # Declaration order IS the SMEM layout, and here it is load-bearing.  Every
+    # ring ROOT feeds `Tcgen05SmemDesc.build(start_address=...)`, whose lowering
+    # (cutlass-dsl experimental/primitives/descriptors.py:513-522, the
+    # non-versioned `_tcgen05_mma_smem_desc` intrinsic) keeps only 14 bits of
+    # `addr >> 4`: a root at or above 262144 B wraps to the bottom of SMEM with
+    # no error, and the SF UTCCP then copies A-operand bytes into the SF TMEM
+    # columns -> NaN/inf on every output.  Reachable on sm107 only, whose 327 KiB
+    # carveout lets the AB ring run past 256 KiB.  `advance_start_address`
+    # (descriptors.py:413-425) is a plain encoded add and carries the per-stage
+    # and per-k-step offsets past the line correctly (the d512 SDPA kernels
+    # already rely on it), so the SMALL scale-factor rings are declared FIRST and
+    # the big A/B rings -- whose roots then stay far below the line -- follow.
+    # The compiler models these roots (`_block_scale_smem_desc_roots`), trims
+    # `ab_stages` when a deeper ring would still put one past the line (the
+    # MoE template at sm107 512x128), and refuses a layout a single stage cannot
+    # fit; the CPU test test_block_scale_smem_layout_sm107.py pins this order.
+    # Do not reorder.
     smem_sfa_list = [
         cutlass.Array(
             cutlass.Uint8,
@@ -359,6 +361,24 @@ def _kernel(
             alignment=1024,
         )
         for _ in range(num_sfb_operands)
+    ]
+    smem_a_list = [
+        cutlass.Array(
+            a_smem_dtype,
+            sA_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_b_list = [
+        cutlass.Array(
+            b_smem_dtype,
+            sB_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
     ]
 
     if cutlass.const_expr(cta_group == 2):
@@ -521,6 +541,8 @@ def _kernel(
             ):
                 pass
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+            # Finish every lane's slot reads before the elected release.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
@@ -800,6 +822,8 @@ def _kernel(
             group_begin = (slot.subview(4)).load()
             group_end = (slot.subview(5)).load()
             start_sf_block_m = (slot.subview(6)).load()
+            # Finish every lane's slot reads before the elected release.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1123,6 +1147,8 @@ def _kernel(
                 ):
                     pass
                 is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                # Finish every lane's slot reads before the elected release.
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                 sched_stage += 1
@@ -1403,6 +1429,8 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    # Finish every lane's slot reads before the elected release.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1580,6 +1608,8 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    # Finish every lane's slot reads before the elected release.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1685,6 +1715,8 @@ def _kernel(
                 group_end = (slot.subview(5)).load()
                 start_sf_block_m = (slot.subview(6)).load()
                 group_idx = (slot.subview(7)).load()
+            nvvm.bar_warp_sync(0xFFFFFFFF)
+            sched_stage = cute.arch.make_warp_uniform(sched_stage)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1986,6 +2018,8 @@ def _host(
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
     grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+    counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
+    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

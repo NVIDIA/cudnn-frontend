@@ -37,6 +37,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_mxfp8
 # it is not a supported standalone execution configuration for this kernel.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256_mxfp8(PARAMS)
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d256_mxfp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -77,6 +81,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_PADDED,
     MASK_SWA,
 )
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 if CFG.DTYPE_QKV == 0:
@@ -3017,6 +3022,10 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
             inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
+
+        # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+        if cutlass.const_expr(CFG.STATS_LOG2):
+            lse_val = lse_val * cutlass.Float32(1.4426950408889634)
 
         if cutlass.const_expr(CFG.THD_VARLEN):
             cu = cutlass.make_array_view(seq_kv_lens_tensor)

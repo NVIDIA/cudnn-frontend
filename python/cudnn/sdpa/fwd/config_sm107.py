@@ -62,7 +62,7 @@ from cudnn.frost.tile_dsl.constants import (
 
 # The engine-contract record is deliberately SHARED: one lowering builds it, and
 # an arch-specific copy would let the two drift in ways the loader cannot see.
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, bshd_compact, bshd_zero_copy_stride
 
 __all__ = [
     "TemplateParams",
@@ -83,6 +83,11 @@ __all__ = [
     "SMEM_CAP_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_F16_THD_SHAPES",
+    "SM107_EPILOGUE_GATE_SHAPES",
+    "epilogue_gate_layout_declarable",
+    "TCGEN05_V0_ADDR_LIMIT",
+    "d256_mxfp8_sf_smem_bytes",
+    "d256_mxfp8_last_sf_tile_start",
 ]
 
 
@@ -111,6 +116,10 @@ _SMEM_FIXED_OVERHEAD = 2 * 1024  # barriers + scheduler + tmem-ptr slack
 TMEM_TOTAL_COLS = 576
 
 _DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16 = 0, 1, 2, 3
+# Output-only block-scaled codes (per-tensor FP8 d128 epilogue; see config_sm100):
+# 4 = E2M1 data + E4M3 scale per 16 d, 5 = E4M3 data + UE8M0 scale per 32 d.
+_DTYPE_O_NVFP4, _DTYPE_O_MXFP8 = 4, 5
+_O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 
 # Head-dim shapes whose Rubin PER-TENSOR FP8 kernel carries the THD/varlen leg.
 #
@@ -148,6 +157,49 @@ _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm
 # with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
 SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
+# Head-dim shapes whose Rubin kernels carry the FUSED EPILOGUE GATE
+# (O := O * sigmoid(G), TemplateParams.epilogue_gate).  ONE named constant with
+# three consumers -- the engine rows' ``epilogue_gate_d_shapes``, the standalone
+# adapter's rule-8b twin in ``api_dsl.SdpaFwdDslSm100.check_support`` and the
+# gated-attention block's geometry pin -- so the three cannot drift (rule 8b').
+# EXACT dims: the envelope flavor that pads d=200 up to (256, 256) is NOT
+# claimed (the gate tile is TMA'd at the kernel's TILE_O, and nothing has
+# validated a padded G).  Membership rule: the flavor's f16/bf16, per-tensor
+# FP8 AND block-scale MXFP8 bodies all carry the gate seams (sGate SmemTile,
+# mb_gate_full/empty, the TMA-LDG issue after the KV loop, the packed tanh
+# epilogue).  The MXFP8 kernel stages a bf16 G like the FP8 one and writes a
+# gated e4m3 O UNSCALED (it has no per-tensor scale_o: block scales dequantize
+# in-MMA), and its gate tile is declared AFTER the scale-factor slabs so the
+# version-0 SF descriptors stay under 256 KiB (see d256_mxfp8_last_sf_tile_start).
+SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
+
+# The same fact keyed by the config-flavor string `_validate_params` receives
+# (`make_cfg_d256` and `make_cfg_d256_mxfp8`).  Must stay in step with
+# SM107_EPILOGUE_GATE_SHAPES: every dtype family of a listed shape carries the
+# seams, and only those flavors may load with epilogue_gate=True.
+_EPILOGUE_GATE_FLAVORS = frozenset({"sm107 d256", "sm107 d256 mxfp8"})
+
+
+def epilogue_gate_layout_declarable(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int = 2) -> bool:
+    """Whether a logical BHSD gate ``G`` binds ZERO-COPY on the Rubin d256 gated
+    kernels: BSHD-compact, or a token-major declaration TMA can express
+    (``config_sm100.bshd_zero_copy_stride``: D innermost-contiguous, then heads,
+    then tokens; seq/head strides 16-byte multiples; covering).
+
+    The gate has NO normalisation-copy fallback (a hidden per-execute repack is
+    what the engine contract forbids), so this predicate is STRICTER than
+    ``graph_analyzer.dense_layout_ok`` -- which admits any B/H/S stride order
+    and any 16-byte-unaligned stride because the Q/K/V/O path copies those.  It
+    is the ONE rule both sides of rule 8b consume: ``engines.mismatch`` applies
+    it to G before admitting a gated graph, and
+    ``api_dsl.SdpaFwdDslSm100.check_support`` raises on exactly the layouts it
+    rejects, so a plan that entered the ranked list can never die on G's layout
+    in the lowering.  ``elem_bytes`` defaults to the 2 B every Rubin gate kernel
+    stores (``_CfgSm107.GATE_BPE``: Q-dtype on the half kernels, bf16 on the
+    quantized one).
+    """
+    return bshd_compact(shape_bhsd, stride_bhsd) or bshd_zero_copy_stride(shape_bhsd, stride_bhsd, elem_bytes) is not None
+
 
 # ---------------------------------------------------------------------------
 # Derivation helpers (Rubin values — several differ from the SM100 twins)
@@ -155,8 +207,14 @@ SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per element. FP8/MXFP8 = 1, BF16/FP16 = 2."""
-    return 1 if dtype <= _DTYPE_E5M2 else 2
+    """Bytes per STORAGE element. FP8/MXFP8 = 1 (the block-scaled O codes are
+    byte containers too), BF16/FP16 = 2."""
+    return 1 if (dtype <= _DTYPE_E5M2 or dtype in (_DTYPE_O_NVFP4, _DTYPE_O_MXFP8)) else 2
+
+
+def o_pack_div(dtype_o: int) -> int:
+    """Logical O elements per storage byte: 2 for E2M1, else 1."""
+    return 2 if dtype_o == _DTYPE_O_NVFP4 else 1
 
 
 def resolve_dtype_o(params: TemplateParams) -> int:
@@ -199,8 +257,8 @@ def v_swz_bytes(tile_o: int, cta_mma: int, bpe_val: int) -> int:
     raise ValueError(f"V inner bytes {inner} is not a multiple of 32/64/128")
 
 
-def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
-    return 128 if (tile_o * bpe_o) % 128 == 0 else 64
+def o_swz_bytes(tile_o: int, bpe_o: int, pack_div: int = 1) -> int:
+    return 128 if (tile_o * bpe_o // pack_div) % 128 == 0 else 64
 
 
 def rescale_threshold(dtype_qkv: int) -> float:
@@ -220,17 +278,93 @@ def sdpa_smem_bytes(
     bpe_qkv: int,
     bpe_o: int,
     qo_alias: bool = False,
+    gate_bpe: int = 0,
+    sf_bytes: int = 0,
 ) -> int:
-    """Q/K/V/O SMEM footprint for the classic prefill pipeline.
+    """Q/K/V/O (+ GATE) (+ MXFP8 scale-factor slabs) SMEM footprint for the
+    classic prefill pipeline.
 
     K (seq rows) and V (d_v cols) shrink by CTA_MMA; Q/O are per-CTA full.
     ``qo_alias`` = O reuses Q's slab in the epilogue (max instead of sum).
+    ``gate_bpe`` = bytes per element of the fused epilogue gate's staging tile
+    (0 = no gate).  The gate tile is one O-shaped slab per CTA -- full TILE_O
+    width and NOT divided by CTA_MMA, because under cga2 each CTA of the pair
+    owns a distinct 128-row Q block and gates its own full-width O rows.
+    ``sf_bytes`` = the block-scale kernels' scale-factor slabs (Q, K ring, P,
+    V ring; ``d256_mxfp8_sf_smem_bytes``), 0 on the f16 / per-tensor kernels.
     """
     s_q = tiles_q * (tile_m * tile_k) * bpe_qkv
     s_o = tiles_q * (tile_m * tile_o) * bpe_o
     s_k = stages_kv * (tile_n * tile_k // cta_mma) * bpe_qkv
     s_v = stages_kv * (tile_o * tile_n // cta_mma) * bpe_qkv
-    return (max(s_q, s_o) if qo_alias else s_q + s_o) + s_k + s_v
+    s_gate = tiles_q * (tile_m * tile_o) * gate_bpe
+    return (max(s_q, s_o) if qo_alias else s_q + s_o) + s_k + s_v + s_gate + sf_bytes
+
+
+# 14-bit ``start_address`` of a version-0 tcgen05 SMEM descriptor: every
+# descriptor-fed slab (MMA operand or UTCCP scale-factor source) of a module
+# that pins DESC_VERSION=0 must START under this, or it wraps to offset 0 and
+# the MMA/UTCCP reads the bottom of SMEM (rules/mma-tma-matrix.md S6).
+TCGEN05_V0_ADDR_LIMIT = 256 * 1024
+
+_SMEM_SLAB_ALIGN = 1024  # every kernel slab is a 1024-B-aligned cutlass.Array
+_MX_BLOCK = 32  # MXFP8: 32 elements share one E8M0 scale byte
+
+
+def _align_slab(nbytes: int) -> int:
+    return -(-nbytes // _SMEM_SLAB_ALIGN) * _SMEM_SLAB_ALIGN
+
+
+def _d256_mxfp8_sf_sizes(tile_m: int, tile_n: int, tile_k: int, tile_o: int) -> Tuple[int, int, int, int]:
+    """(Q, K-per-stage, P, V-per-stage) scale-factor slab sizes in bytes, the
+    kernel's own formulas (``sm107/prefill_d256_mxfp8.py`` SF_SMEM_SIZE_*): a
+    128-row tile x ceil(D/128)*128 / 32 for the rowwise operands, TILE_N/32 x
+    the 128-padded non-K extent for the BMM2 pair.  Full-size regardless of
+    CTA_MMA (the cga2 peers multicast halves into the same slab)."""
+    k128 = -(-tile_k // 128) * 128
+    return (
+        tile_m * k128 // _MX_BLOCK,
+        tile_n * k128 // _MX_BLOCK,
+        (-(-tile_m // 128) * 128) * tile_n // _MX_BLOCK,
+        (-(-tile_o // 128) * 128) * tile_n // _MX_BLOCK,
+    )
+
+
+def d256_mxfp8_sf_smem_bytes(tile_m: int, tile_n: int, tile_k: int, tile_o: int, stages_kv: int) -> int:
+    """SMEM the d256 MXFP8 kernel spends on its four scale-factor slabs, as the
+    allocator lays them out (declaration order sQ_SF | sK_SF[stages] | sP_SF |
+    sV_SF[stages], each slab 1024-B aligned -- the 512 B P slab is padded to the
+    next KiB).  At d256, STAGES_KV=2: 1 + 2 + 1 + 2 = 6 KiB."""
+    sf_q, sf_k, sf_p, sf_v = _d256_mxfp8_sf_sizes(tile_m, tile_n, tile_k, tile_o)
+    return _align_slab(sf_q) + _align_slab(stages_kv * sf_k) + _align_slab(sf_p) + _align_slab(stages_kv * sf_v)
+
+
+def d256_mxfp8_last_sf_tile_start(cfg) -> int:
+    """Byte offset of the LAST scale-factor stage (sV_SF[STAGES_KV-1]) of the
+    d256 MXFP8 kernel for ``cfg`` -- the highest address any of its version-0
+    UTCCP descriptors names.  Config-side twin of the kernel's own
+    ``_last_sf_tile_start`` (a test pins that the two agree), so a depth or an
+    O dtype that pushes the scale factors past the 256 KiB window is a typed
+    ``ValueError`` at config build rather than LSE = +inf / O = NaN at run time.
+
+    Layout (declaration order in ``_kernel``, each slab 1024-B aligned):
+    sQO alias (byte-max of Q@BPE and O@BPE_O -- a bf16 O doubles it) | sK ring |
+    sV ring | sQ_SF | sK_SF ring | sP_SF | sV_SF ring.  The epilogue gate tile
+    is declared AFTER sV_SF and is not in this sum; declared before it, a bf16 O
+    at STAGES_KV=2 would put sQ_SF at exactly 262144.
+    """
+    sf_q, sf_k, sf_p, sf_v = _d256_mxfp8_sf_sizes(cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.TILE_O)
+    off = 0
+    for nbytes in (
+        max(cfg.TILE_M * cfg.TILE_K * cfg.BPE, cfg.TILE_M * cfg.TILE_O * cfg.BPE_O),  # sQO alias
+        cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K // cfg.CTA_MMA) * cfg.BPE,  # sK ring
+        cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N // cfg.CTA_MMA) * cfg.BPE,  # sV ring
+        sf_q,  # sQ_SF
+        cfg.STAGES_KV * sf_k,  # sK_SF ring
+        sf_p,  # sP_SF
+    ):
+        off = _align_slab(off + nbytes)
+    return off + (cfg.STAGES_KV - 1) * sf_v
 
 
 @dataclass(frozen=True)
@@ -272,7 +406,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
     return flags
 
 
-def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = False) -> None:
+def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = False, block_scaled_o_wired: bool = False) -> None:
     """Guard the TemplateParams a Rubin flavor can express. Every rejection here
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
@@ -282,12 +416,40 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     other nine siblings existed. Rejecting the split for that one contradicted
     the engine row, which advertises split_d_shapes={(128, 128)} — so a long-KV
     Rubin graph could be handed an automatically proposed split plan and then
-    fail here at compile."""
+    fail here at compile.
+
+    ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
+    block-scaled O epilogue (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output). The two d128
+    kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
+    config family but accept DTYPE_O 0..3 only, so a flavor-name test
+    ("d128" in flavor) would let them through to a specialization error."""
+    # Fused epilogue gate FIRST, so an interaction decline names the feature the
+    # caller asked for (`TemplateParams(epilogue_gate=True, split_kv=2)` reads
+    # "epilogue_gate is dense, unsplit ...", not the generic Rubin split
+    # message below).  Only the flavors whose BODIES carry the gate seams may
+    # load with it -- an unlisted flavor would trace an ungated epilogue and
+    # silently return O instead of O * sigmoid(G).  The feature interactions
+    # are declined here as well as in the rows/adapter twin: THD has no gate
+    # descriptor, a KV split would gate the partials the combine then
+    # re-normalizes, paged KV and PackGQA are simply not wired through the gate
+    # TMA coordinates.
+    if k.epilogue_gate:
+        if flavor not in _EPILOGUE_GATE_FLAVORS:
+            raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
+        if k.thd_varlen or (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: epilogue_gate is dense, unsplit, unpaged, non-PackGQA only")
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be 0=E4M3/1=E5M2/2=BF16/3=FP16 (got {k.dtype_qkv}); Rubin has no TF32 prefill kernel")
     dtype_o = resolve_dtype_o(k)
-    if dtype_o not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
-        raise ValueError(f"{flavor}: dtype_o must be 0..3 (got {k.dtype_o})")
+    if dtype_o not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16, _DTYPE_O_NVFP4, _DTYPE_O_MXFP8):
+        raise ValueError(f"{flavor}: dtype_o must be 0..5 (got {k.dtype_o})")
+    if dtype_o in (_DTYPE_O_NVFP4, _DTYPE_O_MXFP8):
+        if k.dtype_qkv > _DTYPE_E5M2:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) requires FP8 inputs")
+        if not block_scaled_o_wired:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) is wired in the d128 kernels (per-tensor FP8, MXFP8) only")
+        if k.thd_varlen or k.seq_q_lens_present or (k.split_kv or 1) > 1 or k.pack_gqa:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked graphs only")
     if k.dtype_qkv > _DTYPE_E5M2 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
     if k.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
@@ -355,6 +517,10 @@ class _CfgSm107:
     DTYPE_O: int = _DTYPE_FP16
     BPE: int = 2
     BPE_O: int = 2
+    # Block-scaled O (per-tensor FP8 d128 only): scale block along d (0 = plain
+    # O) and logical O elements per storage byte (2 for E2M1).
+    O_BLOCK_SCALE: int = 0
+    O_PACK_DIV: int = 1
 
     # --- cluster
     CGA_M: int = 2
@@ -396,6 +562,7 @@ class _CfgSm107:
     WINDOW_RIGHT: int = 0
     BOTTOM_RIGHT: int = 0
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0
     PACK_GQA: int = 0
     QH_PER_KH: int = 1
     SPLIT_KV: int = 1
@@ -431,6 +598,18 @@ class _CfgSm107:
     CORR_LANES: int = 128
     SOFTMAX_PLUS_CORR: int = 256
     READ_TILE_ARRIVERS: int = 15
+
+    # --- fused epilogue gate (O := O * sigmoid(G)); every seam in the kernel
+    # bodies folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the
+    # pre-gate instruction stream byte-for-byte.  Only the d256 factory ever
+    # sets it (config_sm107._EPILOGUE_GATE_FLAVORS); d128/d192/d512 inherit 0.
+    EPILOGUE_GATE: int = 0
+    # Bytes per gate element: the gate is Q-dtype on the half kernels and bf16
+    # on the quantized one -- both 2 B.  Every gate constant in a kernel (TMA
+    # box, swizzle, subtile walk) derives from THIS, never from BPE_O: with an
+    # e4m3 O the two geometries differ, and a gate walk borrowed from O's
+    # passes every bf16-O test and fails only e4m3-O.
+    GATE_BPE: int = 2
 
 
 @dataclass(frozen=True)
@@ -534,15 +713,37 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
     )
 
 
-def _validate_smem(cfg, flavor: str, *, qo_alias: bool) -> None:
+def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0) -> None:
+    """``sf_bytes``: the block-scale kernel's scale-factor slabs (0 on the f16 /
+    per-tensor flavors); named in the message so a reader sees every term."""
+    gate_bpe = cfg.GATE_BPE if cfg.EPILOGUE_GATE else 0
+    gate_kib = (cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * gate_bpe) // 1024
     used = (
-        sdpa_smem_bytes(cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.TILES_Q, cfg.STAGES_KV, cfg.CTA_MMA, cfg.BPE, cfg.BPE_O, qo_alias=qo_alias)
+        sdpa_smem_bytes(
+            cfg.TILE_M,
+            cfg.TILE_N,
+            cfg.TILE_K,
+            cfg.TILE_O,
+            cfg.TILES_Q,
+            cfg.STAGES_KV,
+            cfg.CTA_MMA,
+            cfg.BPE,
+            cfg.BPE_O,
+            qo_alias=qo_alias,
+            gate_bpe=gate_bpe,
+            sf_bytes=sf_bytes,
+        )
         + _SMEM_FIXED_OVERHEAD
     )
     if used > SMEM_USABLE_BYTES:
+        gate_term = f" + {gate_kib} KiB GATE staging tile" if gate_bpe else ""
+        sf_term = (
+            f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
+        )
         raise ValueError(
-            f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed) exceeds the "
-            f"{SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout at STAGES_KV={cfg.STAGES_KV}, CTA_MMA={cfg.CTA_MMA}. "
+            f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed{gate_term}{sf_term}) exceeds the "
+            f"{SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout at STAGES_KV={cfg.STAGES_KV}, CTA_MMA={cfg.CTA_MMA}"
+            f"{', EPILOGUE_GATE=1' if gate_bpe else ''}. "
             f"Overflowing it does NOT fail the launch -- it clobbers the last buffer allocated (measured: O came back "
             f"50 % zeros with an exact LSE), so this must raise here"
         )
@@ -627,10 +828,14 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # (at tile_k=192) the d192 one -- hence the dtype and tile checks rather than
     # keying on the flavor string.
     split_wired = not mxfp8 and tile_k == 128 and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
-    _validate_params(flavor, params, split_wired=split_wired)
+    # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
+    # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
+    block_scaled_o_wired = tile_k == 128 and tile_o == 128
+    _validate_params(flavor, params, split_wired=split_wired, block_scaled_o_wired=block_scaled_o_wired)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
+    o_div = o_pack_div(dtype_o)
     tile_n = 128
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
@@ -653,7 +858,9 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         Q_SWZ_BYTES=q_swz_bytes(tile_k, b),
         K_SWZ_BYTES=q_swz_bytes(tile_k, b),
         V_SWZ_BYTES=v_swz_bytes(tile_o, cta_mma, b),
-        O_SWZ_BYTES=o_swz_bytes(tile_o, b_o),
+        O_SWZ_BYTES=o_swz_bytes(tile_o, b_o, o_div),
+        O_BLOCK_SCALE=_O_BLOCK_SCALE_BY_DTYPE.get(dtype_o, 0),
+        O_PACK_DIV=o_div,
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
         TILES_Q=2,
@@ -669,6 +876,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,
@@ -784,6 +992,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
     # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
     # depth that fits SMEM is correct by construction. Do not re-literal it.
+    # (The per-tensor FP8 sibling `prefill_d256_fp8.py` carried a literal 0
+    # until the epilogue-gate PR ported the same `_needs_desc_v1` derivation;
+    # at e4m3-O depth 4 its last V stage starts at exactly 262144, so the
+    # literal was one depth away from the same wrap.)
     # `is not None`, NOT a truth test: a truthiness check maps an explicit
     # stages_kv=0 onto the default 2, which is a knob SUBSTITUTION -- the one
     # thing the engine contract forbids (honored or ineligible). Out-of-domain
@@ -791,6 +1003,19 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     stages_kv = params.stages_kv if getattr(params, "stages_kv", None) is not None else 2
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     arrivers = _d256_read_tile_arrivers(cta_mma)
+    # The four single-warp roles (MMA / TMA-LDG / TMA-STG / scheduler; the HW
+    # equality constraint keeps them one number) run at 40 on every d256
+    # module.  MEASURED DEAD END (2026-09-15, gated MXFP8): its sm_107a SASS
+    # carries 25 STL/LDL against the ungated 6 (the SR_CTAID.{x,y,z} tile
+    # coordinates, spilled at kernel entry and refilled in the TMA-LDG /
+    # TMA-STG / scheduler regions), and raising these four roles to 48 left the
+    # count at 25.  The refill sites carry MOV.SPILL UR -> R (5 vs 0 ungated):
+    # the pressure starts in the UNIFORM register file, which setmaxnreg does
+    # not govern, so this vector budget is not the lever.  The split itself IS
+    # applied (USETMAXREG.TRY_ALLOC / DEALLOC present in the sm_107a SASS).  Do
+    # not retry the bump; see the REGISTER NOTE in
+    # sm107/prefill_d256_mxfp8.py's TMA-LDG warp for the levers not yet tried.
+    other_regs = 40
 
     cfg = CfgD256(
         TILE_M=128,
@@ -820,12 +1045,18 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         CORRECTION_WARPS=4,
         SOFTMAX_REGS=240,
         CORRECTION_REGS=96,
+        MMA_REGS=other_regs,
+        TMALDG_REGS=other_regs,
+        TMASTG_REGS=other_regs,
+        SCHEDULER_REGS=other_regs,
+        OTHER_REGS=other_regs,
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=win_l,
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,
@@ -845,6 +1076,10 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         TMASTG_WARP_ID=10,
         SCHED_WARP_ID=11,
         READ_TILE_ARRIVERS=arrivers,
+        # Fused epilogue gate (validated per flavor in _validate_params). The gate
+        # is 2 B/elem on BOTH the half kernel (Q dtype) and the FP8 kernel (bf16).
+        EPILOGUE_GATE=int(params.epilogue_gate),
+        GATE_BPE=2,
     )
 
     _validate_regs(cfg, flavor)
@@ -852,20 +1087,74 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_dtype_k_step(cfg, flavor)
     _validate_swizzles(cfg, flavor)
     _validate_masks(cfg, flavor)
+    # The STAGES_KV upper bound differs per dtype family, and the message says
+    # which: the f16 and per-tensor FP8 bodies DERIVE their tcgen05 descriptor
+    # version from the layout (`_needs_desc_v1`), so for them every depth that
+    # fits SMEM is correct; the MXFP8 body PINS DESC_VERSION=0 (version 1
+    # regressed 21 green d128/d256 MXFP8 tests, rules/mma-tma-matrix.md S6), so
+    # for it the bound is the 256 KiB version-0 window on the LAST scale-factor
+    # slab -- checked below with its own diagnostic.
+    _depth_bound = (
+        f"the {SMEM_USABLE_BYTES // 1024} KiB Rubin carveout, and the kernel derives its tcgen05 descriptor version from the resulting "
+        f"layout so every depth in range is correct"
+        if not mxfp8
+        else f"the {SMEM_USABLE_BYTES // 1024} KiB Rubin carveout AND the {TCGEN05_V0_ADDR_LIMIT // 1024} KiB version-0 tcgen05 descriptor "
+        f"window on the last scale-factor slab (this kernel pins DESC_VERSION=0; see d256_mxfp8_last_sf_tile_start)"
+    )
     _check(
         [
             (cfg.TILES_Q == 1, f"{flavor}: the d256 pipeline mandates TILES_Q == 1"),
             (cfg.SOFTMAX_WARPGROUPS == 1, f"{flavor}: the d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
             (
                 2 <= cfg.STAGES_KV <= 4,
-                f"{flavor}: STAGES_KV must be in 2..4 (got {cfg.STAGES_KV}); the upper bound is the "
-                f"{SMEM_USABLE_BYTES // 1024} KiB Rubin carveout, and the kernel derives its tcgen05 "
-                f"descriptor version from the resulting layout so every depth in range is correct",
+                f"{flavor}: STAGES_KV must be in 2..4 (got {cfg.STAGES_KV}); the upper bound is {_depth_bound}",
             ),
         ]
     )
-    # d256 always Q-union-O aliases.
-    _validate_smem(cfg, flavor, qo_alias=True)
+    sf_bytes = 0
+    if mxfp8:
+        # MXFP8: the four scale-factor slabs are declared after sQO | sK | sV
+        # and read through VERSION-0 UTCCP descriptors, so their START must sit
+        # under the 14-bit window.  A bf16 O at STAGES_KV=3 (or an e4m3 O at 4)
+        # puts sQ_SF at or past 262144: the descriptor wraps to offset 0 and the
+        # UTCCP copies Q DATA bytes into the SF TMEM columns -- LSE = +inf and
+        # O = NaN on 100 % of cells at every shape, the SF values provably
+        # irrelevant (the d512 MXFP8 failure).  Latent until 2026-09-15 (depth 3
+        # fit the SMEM check); raised HERE, before the kernel's own backstop.
+        # The epilogue gate tile is declared AFTER the SF slabs (PR-B D7) and is
+        # not in this sum.
+        last_sf = d256_mxfp8_last_sf_tile_start(cfg)
+        _check(
+            [
+                (
+                    # The gated MXFP8 module was traced and launched at CTA_MMA=1 ONLY
+                    # (the row pins cga1 for the quantized d256 flavors and so does the
+                    # adapter, supported_cgas_for((256, 256), fp8=True) == (1,)).  A
+                    # cga2 gated MXFP8 module (K/V rings halved, SF slabs full-size,
+                    # gate per CTA) fits the tallies below but was never validated;
+                    # a future widening of the row surfaces HERE, as a config raise,
+                    # not as an inherited unvalidated arm.
+                    not (cfg.EPILOGUE_GATE and cfg.CTA_MMA == 2),
+                    f"{flavor}: the epilogue gate is validated at CTA_MMA=1 only (got CTA_MMA={cfg.CTA_MMA}); a cga2 gated "
+                    f"MXFP8 module has never been traced or launched -- validate on Rubin before widening the row (engine-contract rule 9)",
+                ),
+                (
+                    last_sf < TCGEN05_V0_ADDR_LIMIT,
+                    f"{flavor}: the last scale-factor slab starts at {last_sf} B, at or past the {TCGEN05_V0_ADDR_LIMIT} B version-0 tcgen05 "
+                    f"descriptor window (STAGES_KV={cfg.STAGES_KV}, BPE_O={cfg.BPE_O}, CTA_MMA={cfg.CTA_MMA}); a version-0 SF descriptor there "
+                    f"wraps to offset 0 and the UTCCP copies Q data as scale factors (LSE = +inf, O = NaN on every cell).  Reduce STAGES_KV or "
+                    f"write an e4m3 O -- the kernel pins DESC_VERSION=0 (version 1 is not a transparent widening, rules/mma-tma-matrix.md S6)",
+                ),
+            ]
+        )
+        sf_bytes = d256_mxfp8_sf_smem_bytes(cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.STAGES_KV)
+    # d256 always Q-union-O aliases.  With the epilogue gate on, the 64 KiB
+    # staging tile is added here: depth 2 fits at both CTA_MMA widths (258 KiB
+    # f16 cga2 / 226 KiB fp8 e4m3-O / 258 KiB fp8 bf16-O; MXFP8 adds its 6 KiB of
+    # scale-factor slabs: 232 KiB e4m3-O / 264 KiB bf16-O), depth 3 does not
+    # (322 KiB) -- the raise names every term so the reader sees why a depth
+    # that fits ungated no longer does.
+    _validate_smem(cfg, flavor, qo_alias=True, sf_bytes=sf_bytes)
     return cfg, _tma_iters(cfg)
 
 
@@ -950,6 +1239,7 @@ def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,
         HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=params.qh_per_kh,
         SPLIT_KV=params.split_kv or 1,

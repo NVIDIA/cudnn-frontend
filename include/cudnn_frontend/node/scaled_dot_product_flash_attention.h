@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
@@ -281,7 +282,26 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
+
+        // O is not a caller tensor: the graph factory creates it with output_tensor(), so its
+        // dim/stride are unset unless the caller declares them, and infer_properties_node()
+        // materializes a packed BHSD layout for an undeclared one (the same contract Stats, Max
+        // and Sum_exp follow). Only a caller-declared layout can be judged in pre -- running the
+        // rank/stride check on "not yet derived" properties would report a legal omission as an
+        // invalid O. The materialized layout is re-checked in post_validate_node().
+        {
+            auto const& o_tensor    = attributes.outputs.at(output_names::O);
+            bool const o_dim_set    = !o_tensor->get_dim().empty();
+            bool const o_stride_set = !o_tensor->get_stride().empty();
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(o_dim_set != o_stride_set,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "The dim and stride for output_names::O must be declared together, or "
+                                           "both left unset to have them inferred.");
+            if (o_dim_set) {
+                CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
+            }
+        }
 
         if (attributes.has_bias()) {
             CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
@@ -441,6 +461,24 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         // [n, 1, 1, 1] (contiguous) form the cuDNN backend requires.
         promote_index_tensors_to_4d();
 
+        // O is created by the graph factory with output_tensor(); when the caller leaves both dim
+        // and stride unset, materialize the packed BHSD layout here -- the same way the Stats, Max
+        // and Sum_exp outputs below are materialized. The composite node's bmm2 (built in
+        // expand_node()) then honours this declaration instead of inferring its own, and validate()
+        // -- which never expands the composite -- still sees a complete output tensor.
+        {
+            auto const& o_tensor = attributes.outputs.at(output_names::O);
+            if (o_tensor->get_dim().empty() && o_tensor->get_stride().empty()) {
+                auto const& q_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
+                auto const b      = q_dim[0];
+                auto const h_q    = q_dim[1];
+                auto const s_q    = q_dim[2];
+                auto const d_v    = v_dim[3];
+                o_tensor->set_dim({b, h_q, s_q, d_v}).set_stride({h_q * s_q * d_v, s_q * d_v, d_v, 1});
+            }
+        }
+
         if (attributes.generate_stats.value_or(false)) {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
@@ -492,17 +530,22 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     error_t
     post_validate_node() const override final {
-#define CUDNN_FE_VALIDATE_STRIDE(port, port_map)                                                                \
-    {                                                                                                           \
-        auto const& t = port_map.find(port);                                                                    \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            t->second->get_stride().back() != 1,                                                                \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
-                std::string(#port));                                                                            \
-    }
-
-        CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
+        // Runs after infer_properties_node(), so O now carries either the layout the caller
+        // declared or the packed BHSD layout inference materialized for an undeclared one. That
+        // is why the rank/last-stride check for this derived output lives here and not in
+        // pre_validate_node(): an unset O is derived, not invalid. Codes and messages are the ones
+        // the pre-validation check used to emit for a caller-declared O.
+        {
+            auto const& o_tensor = attributes.outputs.at(output_names::O);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(o_tensor->get_dim().size() != 4 || o_tensor->get_stride().size() != 4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "The dim and stride for output_names::O must have rank 4");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                o_tensor->get_stride()[3] != 1,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "The stride for the last dimension corresponding to the embedding size per head should be 1 for "
+                "output_names::O");
+        }
 
         auto const& stats_out = attributes.outputs.find(output_names::Stats);
         bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
@@ -549,8 +592,6 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
         }
-
-#undef CUDNN_FE_VALIDATE_STRIDE
 
         return {error_code_t::OK, ""};
     }
@@ -951,6 +992,9 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
+        // Base-2 Stats: on cuDNN 9.21+ this softmax lowers to the unified softmax operation, whose
+        // descriptor carries the log-base attribute (cuDNN 9.27+); the composite engine honors it.
+        softmax_attributes.set_stats_use_log2(attributes.stats_use_log2);
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output,
                 softmax_attributes,
@@ -2548,6 +2592,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
             if (has_output(output_names::Stats)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Stats] =
                     attributes.outputs[output_names::Stats];
+                softmax_attrs.set_stats_use_log2(attributes.stats_use_log2);
             }
             if (has_output(output_names::Max)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Max] = attributes.outputs[output_names::Max];
@@ -2637,6 +2682,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         } else {
             auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
             if (stats_it != attributes.outputs.end() && stats_it->second) {
+                // stats_use_log2 cannot reach this pre-9.21 path: the support surface rejects it below 9.27.
                 auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
                 _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
                                                                CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,

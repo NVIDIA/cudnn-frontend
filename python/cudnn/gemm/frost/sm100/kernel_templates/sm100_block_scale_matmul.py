@@ -377,24 +377,23 @@ def _kernel(
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
-    smem_a_list = [
-        cutlass.Array(
-            a_smem_dtype,
-            sA_elems * ab_stages,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
-        )
-        for _ in range(num_a_operands)
-    ]
-    smem_b_list = [
-        cutlass.Array(
-            b_smem_dtype,
-            sB_elems * ab_stages,
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
-        )
-        for _ in range(num_b_operands)
-    ]
+    # Declaration order IS the SMEM layout, and here it is load-bearing.  Every
+    # ring ROOT feeds `Tcgen05SmemDesc.build(start_address=...)`, whose lowering
+    # (cutlass-dsl experimental/primitives/descriptors.py:513-522, the
+    # non-versioned `_tcgen05_mma_smem_desc` intrinsic) keeps only 14 bits of
+    # `addr >> 4`: a root at or above 262144 B wraps to the bottom of SMEM with
+    # no error, and the SF UTCCP then copies A-operand bytes into the SF TMEM
+    # columns -> NaN/inf on every output.  Reachable on sm107 only, whose 327 KiB
+    # carveout lets the AB ring run past 256 KiB.  `advance_start_address`
+    # (descriptors.py:413-425) is a plain encoded add and carries the per-stage
+    # and per-k-step offsets past the line correctly (the d512 SDPA kernels
+    # already rely on it), so the SMALL scale-factor rings are declared FIRST and
+    # the big A/B rings -- whose roots then stay far below the line -- follow.
+    # The compiler models these roots (`_block_scale_smem_desc_roots`), trims
+    # `ab_stages` when a deeper ring would still put one past the line (the
+    # MoE template at sm107 512x128), and refuses a layout a single stage cannot
+    # fit; the CPU test test_block_scale_smem_layout_sm107.py pins this order.
+    # Do not reorder.
     smem_sfa_list = [
         cutlass.Array(
             cutlass.Uint8,
@@ -412,6 +411,24 @@ def _kernel(
             alignment=1024,
         )
         for _ in range(num_sfb_operands)
+    ]
+    smem_a_list = [
+        cutlass.Array(
+            a_smem_dtype,
+            sA_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_b_list = [
+        cutlass.Array(
+            b_smem_dtype,
+            sB_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -1531,13 +1548,13 @@ def _host(
     problem_size: tuple,
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    splitk_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_HOST_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    splitk_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
     # @@INJECT_HOST_AB_LISTS@@

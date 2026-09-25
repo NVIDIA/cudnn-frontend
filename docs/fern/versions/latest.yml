@@ -156,6 +156,9 @@ navigation:
           - page: Python-native `cudnn.pygraph` and pluggable execution backends
             path: ../../utilities/python_graph_and_execution_backends.md
             slug: python_graph_and_execution_backends
+          - page: Composing multi-kernel blocks in Python
+            path: ../../utilities/composing_kernel_blocks.md
+            slug: composing_kernel_blocks
       - section: Frontend OSS APIs
         slug: fe-oss-apis
         contents:
@@ -174,12 +177,24 @@ navigation:
           - page: CSA Fused Compressor
             path: ../../fe-oss-apis/csa.md
             slug: csa
+          - page: Tail RoPE + Microscaled QDQ
+            path: ../../fe-oss-apis/rope_qdq.md
+            slug: rope-qdq
+          - page: Prepared BF16 Tail RoPE
+            path: ../../fe-oss-apis/rope_tail.md
+            slug: rope-tail
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../fe-oss-apis/dsa.md
             slug: dsa
+          - page: Engram Saved-State Gate
+            path: ../../fe-oss-apis/engram_saved_gate.md
+            slug: engram_saved_gate
           - page: FLA Integration Shims
             path: ../../fe-oss-apis/fla.md
             slug: fla
+          - page: Gated Attention Block (SM107)
+            path: ../../fe-oss-apis/gated_attention_block.md
+            slug: gated_attention_block
           - page: Native Sparse Attention (NSA)
             path: ../../fe-oss-apis/nsa.md
             slug: nsa
@@ -264,6 +279,9 @@ navigation:
               - page: Grouped GEMM + WGrad (Unified)
                 path: ../../fe-oss-apis/gemm_fusions/grouped_gemm_wgrad.md
                 slug: grouped_gemm_wgrad
+              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
+                path: ../../fe-oss-apis/gemm_fusions/mhc_projection_bwd.md
+                slug: mhc_projection_bwd
           - section: HSTU
             slug: hstu
             contents:

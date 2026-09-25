@@ -53,6 +53,10 @@ _MOE_BS_1 = [
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
 ]
+_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1)]
+_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2)]
+_MOE_SWAP_1 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1)]
+_MOE_SWAP_2 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2)]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
@@ -77,10 +81,10 @@ _SM120 = [
 # mma_inst_m % 128 != 0), so its two modes never differed here.
 _SETUP_GROUPS = {
     "plain": _PLAIN_1 + _PLAIN_2,
-    "moe_1ctamma": _MOE_PLAIN_1,
-    "moe_2ctamma": _MOE_PLAIN_2,
-    "block_scale_1ctamma": _BS_1 + _MOE_BS_1,
-    "block_scale_2ctamma": _BS_2 + _MOE_BS_2,
+    "moe_1ctamma": _MOE_PLAIN_1 + _MOE_PLAIN_SWAP_1,
+    "moe_2ctamma": _MOE_PLAIN_2 + _MOE_PLAIN_SWAP_2,
+    "block_scale_1ctamma": _BS_1 + _MOE_BS_1 + _MOE_SWAP_1,
+    "block_scale_2ctamma": _BS_2 + _MOE_BS_2 + _MOE_SWAP_2,
     "sm120": _SM120,
 }
 
@@ -94,10 +98,12 @@ _DRAIN_GROUPS = {
     "moe_2ctamma": _MOE_PLAIN_2,
     "moe_block_scale_1ctamma": _MOE_BS_1,
     "moe_block_scale_2ctamma": _MOE_BS_2,
+    "moe_plain_swap_ab": _MOE_PLAIN_SWAP_1 + _MOE_PLAIN_SWAP_2,
+    "moe_block_scale_swap_ab": _MOE_SWAP_1 + _MOE_SWAP_2,
     "sm120": _SM120,
 }
 
-_BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2}
+_BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2 + _MOE_SWAP_1 + _MOE_SWAP_2}
 
 
 def _templates():
@@ -258,7 +264,7 @@ def test_the_markers_do_not_break_the_template_parse():
 
 
 _MIXED_CGA = {f for f, _ in _PLAIN_1 + _PLAIN_2 + _BS_1 + _BS_2}
-_MOE = {f for f, _ in _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2}
+_MOE = {f for f, _ in _MOE_PLAIN_SWAP_1 + _MOE_PLAIN_SWAP_2 + _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2 + _MOE_SWAP_1 + _MOE_SWAP_2}
 _STANDALONE = {f for f, _ in _SM120}
 
 
@@ -673,3 +679,26 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
                 offenders.append(f"{path.name}:{operation.lineno}: runtime cluster divisor in {ast.unparse(operation)!r}")
 
     assert not offenders, "mixed-CGA host-constant mask/shift fast path is incomplete:\n  " + "\n  ".join(offenders)
+
+
+@pytest.mark.parametrize("stem", ["sm100_moe_grouped_matmul_fwd", "sm100_moe_grouped_block_scale_matmul_fwd"])
+def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
+    def pipeline(file):
+        tree = ast.parse(template_path(file).read_text())
+        kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+        warp_regions = [
+            ast.dump(node, include_attributes=False)
+            for node in kernel.body
+            if isinstance(node, ast.If) and ast.unparse(node.test) in ("warp_idx == 0", "warp_idx == mma_warp_id")
+        ]
+        assert len(warp_regions) == 3
+        producer = next(node for node in kernel.body if isinstance(node, ast.If) and ast.unparse(node.test) == "warp_idx == tma_warp_id")
+        barriers = [
+            ast.dump(node, include_attributes=False)
+            for node in ast.walk(producer)
+            if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("nvvm.mbarrier_")
+        ]
+        assert barriers
+        return warp_regions, barriers
+
+    assert pipeline(f"{stem}_swap_ab.py") == pipeline(f"{stem}.py")

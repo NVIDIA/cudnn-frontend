@@ -20,7 +20,87 @@ from fe_api.dsa.dsa_reference import (
     _batched_ratio_causal_mask,
     _ratio_causal_mask,
     check_ref_dense_score_recompute,
+    ref_dense_attn_score_recompute,
+    ref_indexer_forward,
 )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+@pytest.mark.parametrize("heads", [16, 32, 64])
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("singleton_first", [True, False])
+def test_DSA_dense_indexer_sm90_singleton_and_mask_cache(heads, ratio, singleton_first, monkeypatch):
+    from cudnn import DSA
+
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This regression exercises the SM90 dense score kernel")
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
+
+    # Exercise both compile orders: singleton layouts must also work on a cache hit.
+    monkeypatch.setattr(_interface_sm90._dense_score_recompute, "compile_cache", {})
+    lengths = [(1, 1), (3, 7), (7, 67)]
+    if not singleton_first:
+        lengths.reverse()
+    for seqlen_q, seqlen_k in lengths:
+        q = torch.randn(1, seqlen_q, heads, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(1, seqlen_k, 1, 128, dtype=torch.bfloat16, device="cuda")
+        weights = torch.randn(1, seqlen_q, heads, dtype=torch.bfloat16, device="cuda")
+        offsets = torch.zeros(1, dtype=torch.int32, device="cuda")
+        result = DSA.dense_indexer_score_recompute_wrapper(q, k, weights, ratio=ratio, qhead_per_kv_head=heads, q_causal_offsets=offsets)
+        expected = ref_indexer_forward(q, k, weights, ratio, q_causal_offsets=offsets)
+        torch.testing.assert_close(result["out"], expected, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(result["denom"], torch.logsumexp(expected, dim=-1), atol=5e-3, rtol=5e-3)
+    assert len(_interface_sm90._dense_score_recompute.compile_cache) == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+@pytest.mark.parametrize("heads", [32, 128])
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("is_thd", [False, True])
+def test_DSA_dense_attn_sm90_masked_output(heads, ratio, is_thd):
+    """Masked scores stay -inf across KV tiles while contributing zero to L1."""
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This regression exercises the SM90 dense score kernel")
+    from cudnn import DSA
+
+    q_lengths, k_lengths = ([1, 8], [1, 128]) if is_thd else ([8, 8], [128, 128])
+    q_shape = (sum(q_lengths), heads, 128) if is_thd else (2, 8, heads, 128)
+    k_shape = (sum(k_lengths), 1, 128) if is_thd else (2, 128, 1, 128)
+    q = torch.randn(q_shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(k_shape, dtype=torch.bfloat16, device="cuda")
+    lse = torch.randn(q_shape[:-1], dtype=torch.float32, device="cuda")
+    out_shape = (sum(q_lengths), 128) if is_thd else (2, 8, 128)
+    out = torch.full(out_shape, 123.0, dtype=torch.float32, device="cuda")
+    offsets = torch.tensor([0, 0 if is_thd else 64 * ratio - 1], dtype=torch.int32, device="cuda")
+    options = {}
+    if is_thd:
+        options = dict(
+            cu_seqlens_q=torch.tensor([0, 1, 9], dtype=torch.int32, device="cuda"),
+            cu_seqlens_k=torch.tensor([0, 1, 129], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=8,
+            max_seqlen_k=128,
+        )
+    scale = 128**-0.5
+    result = DSA.dense_attn_score_recompute_wrapper(q, k, lse, scale, qhead_per_kv_head=heads, out=out, ratio=ratio, q_causal_offsets=offsets, **options)
+    assert result["out"].data_ptr() == out.data_ptr()
+    q0, k0 = 0, 0
+    for b, (sq, sk) in enumerate(zip(q_lengths, k_lengths)):
+        q_b = q[q0 : q0 + sq].unsqueeze(0) if is_thd else q[b : b + 1]
+        k_b = k[k0 : k0 + sk].unsqueeze(0) if is_thd else k[b : b + 1]
+        lse_b = lse[q0 : q0 + sq].unsqueeze(0) if is_thd else lse[b : b + 1]
+        expected, denom = ref_dense_attn_score_recompute(q_b, k_b, lse_b, scale, ratio, offsets[b : b + 1])
+        valid = _batched_ratio_causal_mask(sq, sk, ratio, q.device, 1, offsets[b : b + 1])
+        expected = expected.masked_fill(~valid, float("-inf"))
+        actual = result["out"][q0 : q0 + sq, :sk].unsqueeze(0) if is_thd else result["out"][b : b + 1]
+        actual_denom = result["denom"][q0 : q0 + sq].unsqueeze(0) if is_thd else result["denom"][b : b + 1]
+        torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(actual_denom, denom, atol=5e-3, rtol=5e-3)
+        if is_thd:
+            assert torch.isneginf(result["out"][q0 : q0 + sq, sk:]).all()
+        q0 += sq
+        k0 += sk
 
 
 @pytest.mark.L0

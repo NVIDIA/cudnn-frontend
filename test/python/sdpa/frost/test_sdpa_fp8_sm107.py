@@ -539,6 +539,31 @@ def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
         assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
 
 
+def test_sm107_block_scaled_o_is_wired_only_for_the_d128_kernels():
+    """config_sm107 admits a block-scaled O (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output)
+    for the two Rubin kernels that carry the epilogue, prefill_d128_fp8 and
+    prefill_d128_mxfp8, and refuses it for every sibling: the d192xd128 flavors
+    share the d128 config FAMILY (and "sm107 d192xd128" contains "d128"), so the
+    gate must key on the kernel the family builds, not on the flavor name."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    unwired = [
+        ("d192xd128", cfg.make_cfg_d192),
+        ("d192xd128 mxfp8", cfg.make_cfg_d192_mxfp8),
+        ("d256", cfg.make_cfg_d256),
+        ("d512", cfg.make_cfg_d512),
+    ]
+    for dtype_o in (4, 5):
+        assert cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o)) is not None
+        assert cfg.make_cfg_d128_mxfp8(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o)) is not None
+        for name, make in unwired:
+            with pytest.raises(ValueError, match="wired in the d128 kernels"):
+                make(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o))
+        # Half inputs never carry a block-scaled O, whichever kernel.
+        with pytest.raises(ValueError, match="requires FP8 inputs"):
+            cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_BF16_OUT, dtype_o=dtype_o))
+
+
 def test_sm107_split_matches_unsplit_on_rubin():
     """End-to-end split numerics on cc10.7 silicon.
 
@@ -751,3 +776,318 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
     assert (
         err.max().item() <= 1e-4
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"
+
+
+# ============================================================================
+# Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
+#
+# ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
+# ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
+# ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
+# |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
+# normalised O -- the sdpa node's output, which precedes the gate, so G cannot
+# move it (the kernel folds |h| = |u/2| and doubles once per tile, exact).  The
+# quantized O itself is the gated value.  The row-level claims are pinned in
+# test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
+# declines (CPU) and the Rubin e2e behind them.
+# ============================================================================
+
+_D256 = (256, 256)
+# The d256 O bound of the shared fp8 suite (test_sdpa_fwd_fp8_sm100._half_atol at
+# d_v=256): the d256 cell computes exp2 with the degree-1/2 emulation on part of
+# every tile, ~40 % of its P values sit one fp8 step off an exact-exp2 cast.
+_D256_O_ATOL = 7.5e-2
+# Amax_O is an in-kernel atomicMax over the fp32 pre-cast values (same bound as _check).
+_AMAX_ATOL = 0.03
+# "O is zero" bound for a G that drives sigmoid(G) to exactly 0: the kernel's
+# h*tanh(g/2) + h saturates to 0 (tanh.approx returns -1 for |x| >> 9).  Amax_O is
+# NOT bounded by it -- it is the UNGATED O's amax (~0.09 on the probe's data).
+_AMAX_ZERO = 1e-3
+
+
+def _load_d256(**params):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    # cta_mma=1 is what the adapter pins for FP8 d256 (supported_cgas_for((256, 256), fp8=True) == (1,)); dtype_o overridable.
+    tp = dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    tp.update(params)
+    return _load_sm100_kernel_module(_D256, TemplateParams(**tp), fp8=True, pertensor=True, rubin=True)
+
+
+def test_fp8_d256_gate_module_is_a_separate_specialization():
+    """The gate is a module-cache key on the FP8 d256 kernel too: gate-on is a
+    DIFFERENT module (digest included) with CFG.EPILOGUE_GATE == 1 and the bf16
+    gate storage the row's ``epilogue_gate_dtypes`` promises; gate-off is the
+    module every pre-gate caller loads.  ``has_amax`` is a compile() kwarg, not
+    a module knob: both specializations expose it."""
+    import inspect
+
+    off, on = _load_d256(), _load_d256(epilogue_gate=True)
+    assert off is not on and off.FROST_SOURCE_DIGEST != on.FROST_SOURCE_DIGEST
+    assert (off.CFG.EPILOGUE_GATE, on.CFG.EPILOGUE_GATE) == (0, 1)
+    assert on.CFG.GATE_BPE == 2
+    import cutlass
+
+    assert on.GATE_STORAGE_DTYPE is cutlass.BFloat16, "the FP8 kernel stages a bf16 G (row: epilogue_gate_dtypes={BFLOAT16})"
+    for mod in (off, on):
+        params = inspect.signature(mod.compile).parameters
+        assert "has_amax" in params and params["has_amax"].default is True
+        assert "gate_stride" in params and params["gate_stride"].default is None
+        assert not hasattr(mod, "AMAX_O"), "Amax_O is a compile-time fact (has_amax), not a module knob"
+    # The e4m3-O geometry must NOT leak into the gate's: with a 1-byte O the two
+    # TMA walks differ (O: 2 subtiles of 128; bf16 G: 4 of 64).
+    e4m3_out = _load_d256(epilogue_gate=True, dtype_o=_E4M3)
+    assert e4m3_out.CFG.BPE_O == 1 and e4m3_out.CFG.GATE_BPE == 2
+    assert e4m3_out._GG.tma_iters == 4 and e4m3_out._GG.tma_granu_elems == 64 and e4m3_out._GG.tx_bytes == 64 * 1024
+    assert e4m3_out._GG == on._GG, "the gate geometry derives from GATE_BPE, never from O's byte width"
+
+
+def _fp8_gate_api(*, dtype_o, gate_dtype, pertensor=True, **kw):
+    """A d256 per-tensor-FP8 SdpaFwdDslSm100 built from descriptors only."""
+    import torch
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def desc(shape, dtype, name):
+        b, h, s, d = shape
+        stride = (s * h * d, d, h * d, 1)
+        return TensorDesc(dtype=dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name)
+
+    shape = (1, 8, 512, 256)
+    q = desc(shape, torch.float8_e4m3fn, "q")
+    api = SdpaFwdDslSm100(
+        q,
+        desc(shape, torch.float8_e4m3fn, "k"),
+        desc(shape, torch.float8_e4m3fn, "v"),
+        desc(shape, dtype_o, "o"),
+        None,
+        pertensor_fp8=pertensor,
+        dtype_o=dtype_o,
+        sample_gate=desc(shape, gate_dtype, "gate") if gate_dtype is not None else None,
+        **kw,
+    )
+    return api
+
+
+def test_fp8_gate_check_support_declines_typed(monkeypatch):
+    """Standalone twin of the FP8 row's gate claims (rule 8b'): a bf16 G is
+    accepted with every O dtype the row lists; a half-precision G and the Amax_O
+    fold-out on the wrong path are typed declines; the MXFP8 path is admitted at
+    d256 with a bf16 G (PR-B) and declines a half G like the per-tensor path."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    for dto in (torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        api = _fp8_gate_api(dtype_o=dto, gate_dtype=torch.bfloat16)
+        assert api.check_support(), dto
+        assert api.template_params().epilogue_gate is True
+        assert api.template_params().dtype_o == {torch.float16: 3, torch.bfloat16: 2, torch.float8_e4m3fn: 0, torch.float8_e5m2: 1}[dto]
+    api = _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, has_amax_o=False)
+    assert api.check_support() and api.has_amax_o is False
+    assert _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None, has_amax_o=False).check_support(), "has_amax_o=False needs no gate"
+    with pytest.raises(ValueError, match="GATE"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16).check_support()
+    # MXFP8 (PR-B): the Rubin d256 block-scale kernel carries the same gate seams, so the
+    # block-scale path is ADMITTED on the FP8 row's terms (cc 10.7, exactly (256, 256), bf16 G)
+    # -- the mxfp8 row claims it (engines._sm107_mxfp8_spec epilogue_gate=True); a half G is
+    # still the typed dtype decline, gate or no gate.
+    api = _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, pertensor=False)
+    assert api.check_support() and api.template_params().epilogue_gate is True
+    with pytest.raises(ValueError, match="GATE"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16, pertensor=False).check_support()
+    # The cga knob domain at (256, 256) FP8 is {1} and the gate does not widen it.
+    with pytest.raises(ValueError, match="cga"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, cga=2).check_support()
+
+
+# --- Rubin e2e ------------------------------------------------------------------
+
+
+def _rubin_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the gated per-tensor FP8 d256 kernel serves cc10.7 only")
+
+
+def _quant_e4m3(x, dev):
+    import torch
+
+    fmax = 448.0
+    dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+    return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+
+def _fp8_gate_problem(b, hq, hkv, s, d, *, seed=0):
+    """Quantized BSHD-physical Q/K/V (+ descales), a bf16 gate, and the fp32 dequantized operands."""
+    import torch
+
+    torch.manual_seed(seed)
+    dev = "cuda"
+    q8, dq = _quant_e4m3(torch.randn(b, s, hq, d, device=dev) * 0.5, dev)
+    k8, dk = _quant_e4m3(torch.randn(b, s, hkv, d, device=dev) * 0.5, dev)
+    v8, dv = _quant_e4m3(torch.randn(b, s, hkv, d, device=dev) * 0.5, dev)
+    gate = (torch.randn(b, s, hq, d, device=dev) * 2.0).to(torch.bfloat16).transpose(1, 2)
+    q8, k8, v8 = q8.transpose(1, 2), k8.transpose(1, 2), v8.transpose(1, 2)
+    deq = (q8.float() * dq, k8.float() * dk, v8.float() * dv)
+    return q8, k8, v8, (dq, dk, dv), gate, deq
+
+
+def _fp8_gate_reference(deq, gate, *, causal, scale):
+    """softmax(QK^T)V on the dequantized operands, times sigmoid(gate) when a gate is given (None = ungated)."""
+    import torch
+
+    qf, kf, vf = deq
+    rep = qf.shape[1] // kf.shape[1]
+    logits = qf @ kf.repeat_interleave(rep, 1).transpose(-1, -2) * scale
+    if causal:
+        s = qf.shape[2]
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=qf.device)), float("-inf"))
+    o = torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)
+    return o * torch.sigmoid(gate.float()) if gate is not None else o
+
+
+def _run_fp8_gated(q8, k8, v8, descales, gate, *, dtype_o, causal, sched_policy=None, has_amax_o=True, amax_o=None, gate_on=True):
+    """Build, compile, launch TWICE (two-launch trick), sentinel-check; return (api, O)."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s, d = q8.shape
+    # Sentinel: e4m3 SATURATES 1.5e30 to 448 (its max finite), bf16 holds ~1.4954e30 -- neither is NaN,
+    # so an unwritten cell is caught by comparing against the CAST value, not by isfinite.
+    out = torch.full((b, s, hq, d), 1.5e30, device=q8.device, dtype=torch.float32).to(dtype_o).transpose(1, 2)
+    sentinel = out[0, 0, 0, 0].float().item()
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        None,
+        is_causal=causal,
+        scale_softmax=d**-0.5,
+        pertensor_fp8=True,
+        dtype_o=dtype_o,
+        sched_policy=sched_policy,
+        has_amax_o=has_amax_o,
+        **({"sample_gate": gate} if gate_on else {}),
+    )
+    assert api.check_support()
+    api.compile()
+    dq, dk, dv = descales
+    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv)
+    if gate_on:
+        kw["gate"] = gate
+    if amax_o is not None:
+        kw["amax_o"] = amax_o
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    first = out.clone()
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first), "two-launch delta on O: a first-launch race"
+    assert torch.isfinite(out.float()).all() and not (out.float() == sentinel).any(), "unwritten (sentinel) or non-finite O cells"
+    return api, out
+
+
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+def test_fp8_d256_gate_matches_the_e4m3_oracle(out_key):
+    """Rubin e2e for the FP8 row's gate claim: e4m3 in, bf16 AND e4m3 out, a
+    bf16 G; O == softmax(QK^T)V * sigmoid(G) on the DEQUANTIZED operands within
+    the shared d256 bound (plus the O-quantization floor for an fp8 O), and
+    NATURAL / LPT -- both claimed at (256, 256) -- are BITWISE identical."""
+    import torch
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+
+    _rubin_only()
+    dtype_o = {"bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn}[out_key]
+    b, hq, hkv, s, d = 2, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    _, out_nat = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=dtype_o, causal=True, sched_policy=SCHED_NATURAL)
+    _, out_lpt = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=dtype_o, causal=True, sched_policy=SCHED_LPT)
+    assert torch.equal(out_lpt, out_nat), "LPT must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+    ref = _fp8_gate_reference(deq, gate, causal=True, scale=d**-0.5)
+    atol = _D256_O_ATOL
+    if dtype_o == torch.float8_e4m3fn:
+        atol = max(atol, 3.0 * (ref - ref.to(dtype_o).float()).abs().max().item())
+    diff = (out_nat.float() - ref).abs().max().item()
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f}"
+
+
+def test_fp8_d256_has_amax_false_is_bitwise_and_writes_nothing():
+    """``has_amax_o=False`` folds the |o| tree and the atomic OUT of the kernel
+    (+4-7 % on this row): O is BITWISE the has_amax=True O, the specialization
+    accepts no ``amax_o`` at execute (typed), and the legacy specialization's
+    slot is written -- so a caller can tell the two apart by contract, never by
+    a silently unwritten buffer."""
+    import torch
+
+    _rubin_only()
+    b, hq, hkv, s, d = 1, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    slot = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    api_on, out_on = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=torch.bfloat16, causal=True, has_amax_o=True, amax_o=slot)
+    assert api_on.has_amax_o is True and slot.item() >= 0.0, "the legacy specialization writes the requested Amax_O"
+    api_off, out_off = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=torch.bfloat16, causal=True, has_amax_o=False)
+    assert api_off.has_amax_o is False
+    assert torch.equal(out_on, out_off), "folding Amax_O out must not touch O"
+    untouched = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    dq, dk, dv = descales
+    with pytest.raises(ValueError, match="has_amax_o"):
+        api_off.execute(q8, k8, v8, out_off, descale_q=dq, descale_k=dk, descale_v=dv, gate=gate, amax_o=untouched)
+    assert untouched.item() == -1.0
+    # The two are different kernel specializations (has_amax is a compile() kwarg), not a runtime branch.
+    import inspect
+
+    assert "has_amax" in inspect.signature(api_off._k_mod.compile).parameters
+
+
+def test_fp8_d256_amax_is_the_pre_gate_value():
+    """``Amax_O`` is an output of the sdpa NODE, which on the graph PRECEDES the
+    sigmoid/mul tail: it must be the amax of the UNGATED, dead-row-selected fp32
+    O in scale_o units (scale_o = 1 here) and independent of G, while the
+    quantized O itself IS the gated value.  A random G cannot tell the two
+    apart (the top |O| cells carry sigmoid(G) ~ 1, so the gated and un-gated
+    amax differ by ~0.005 -- inside the 0.03 bound), so the discrimination is
+    STRUCTURAL: G = -1e4 (sigmoid == 0) zeroes O yet must leave Amax_O at the
+    un-gated ~0.09 (a gated-value reduction reports ~0); G = +1e4 (sigmoid == 1)
+    reproduces it; and all three gated runs equal the UNGATED specialization's
+    Amax_O bit-for-bit (the kernel folds |h| = |u/2| and doubles once per tile,
+    exact in fp32).  The random-G run also pins O against the gated reference."""
+    import torch
+
+    _rubin_only()
+    b, hq, hkv, s, d = 2, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    ungated_ref = _fp8_gate_reference(deq, None, causal=False, scale=d**-0.5)
+    ungated_amax = ungated_ref.abs().max().item()
+    assert ungated_amax > 2 * _AMAX_ATOL, f"un-gated amax {ungated_amax:.4f} too small to be told from zero -- reshape the probe"
+
+    def _amax(g, *, gate_on=True):
+        slot = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)  # -1 so "written" is visible even when the amax is 0
+        _, out = _run_fp8_gated(q8, k8, v8, descales, g, dtype_o=torch.bfloat16, causal=False, amax_o=slot, gate_on=gate_on)
+        return slot.item(), out
+
+    # sigmoid(G) == 0: every gated O cell is 0, yet Amax_O is the UN-gated amax (a gated-value reduction would report ~0).
+    amax_neg, out_neg = _amax(torch.full_like(gate, -1e4))
+    assert out_neg.float().abs().max().item() <= _AMAX_ZERO, "O itself must be the gated (zero) value"
+    assert (
+        abs(amax_neg - ungated_amax) <= _AMAX_ATOL
+    ), f"Amax_O {amax_neg:.4f} with sigmoid(G) == 0 vs un-gated ref {ungated_amax:.4f}: the kernel reduced the GATED O"
+    # sigmoid(G) == 1: the gated value IS the un-gated one, and so is Amax_O.
+    amax_pos, out_pos = _amax(torch.full_like(gate, 1e4))
+    assert abs(amax_pos - ungated_amax) <= _AMAX_ATOL, f"Amax_O {amax_pos:.4f} with sigmoid(G) == 1 vs un-gated ref {ungated_amax:.4f}"
+    assert (out_pos.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    # An ordinary G: O is the gated value within the shared bound; Amax_O is unchanged.
+    amax_rand, out = _amax(gate)
+    assert (out.float() - _fp8_gate_reference(deq, gate, causal=False, scale=d**-0.5)).abs().max().item() <= _D256_O_ATOL
+    # G-independence and agreement with the UNGATED specialization are bit-exact, not tolerance-bound.
+    amax_ungated_kernel, out_ungated = _amax(gate, gate_on=False)
+    assert (out_ungated.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    assert amax_neg == amax_pos == amax_rand == amax_ungated_kernel, (
+        f"Amax_O must be G-independent and equal the ungated kernel's: -1e4 {amax_neg:.6f}, +1e4 {amax_pos:.6f}, "
+        f"random {amax_rand:.6f}, ungated {amax_ungated_kernel:.6f}"
+    )

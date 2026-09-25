@@ -50,6 +50,11 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d192(PARAMS)
+if PARAMS.paged_kv:
+    # config_sm100._PAGED_KV_FLAVORS names "d192" for the f16/bf16 kernel; this file has no PAGED_KV specialization.
+    raise ValueError(
+        "prefill_d192_d128_fp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d192_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -99,6 +104,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_SWA,
 )
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
@@ -571,7 +577,11 @@ def _scheduler_warp_loop_predecode(
                         arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
                     else:
                         peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(cta_rank))
-                        nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CLUSTER)
+                        # Local copy of tile_dsl/scheduler.py's leader arm: it only has to be program-ordered before the
+                        # multicast try_cancel issued below by the SAME thread, and a complete-tx that lands before the
+                        # arm leaves the tx-count transiently negative, which the mbarrier permits.  A cluster-scope
+                        # release here is a GPU-scope drain (MEMBAR.ALL.GPU + ERRBAR + CGAERRBAR) per tile; CTA scope is not.
+                        nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CTA)
                 nvvm.clusterlaunchcontrol_try_cancel(
                     sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
                     sched.mb_scheduler.subview(state.idx),
@@ -2539,6 +2549,10 @@ def _correction_warp_group(
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
                 beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
                 row_dead = row_dead | row_trim
+
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
 
             # cga2 OOB-row guard: cluster Q rows can exceed the live sequence.
             if cutlass.const_expr(CFG.THD_VARLEN):

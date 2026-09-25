@@ -22,6 +22,9 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
+    dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
+)
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
@@ -453,6 +456,8 @@ def _kernel(
             ):
                 pass
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+            # Finish every lane's slot reads before the elected release.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
@@ -619,6 +624,8 @@ def _kernel(
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
             group_end = (slot.subview(5)).load()
+            # Finish every lane's slot reads before the elected release.
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -811,6 +818,8 @@ def _kernel(
                 ):
                     pass
                 is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                # Finish every lane's slot reads before the elected release.
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                 sched_stage += 1
@@ -962,6 +971,8 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    # Finish every lane's slot reads before the elected release.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1090,6 +1101,8 @@ def _kernel(
                     ):
                         pass
                     is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
+                    # Finish every lane's slot reads before the elected release.
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
                     if elect_one:
                         nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
                     sched_stage += 1
@@ -1173,6 +1186,8 @@ def _kernel(
         group_begin = (_slot.subview(4)).load()
         group_end = (_slot.subview(5)).load()
         group_idx = (_slot.subview(7)).load()
+        nvvm.bar_warp_sync(0xFFFFFFFF)
+        sched_stage = cute.arch.make_warp_uniform(sched_stage)
         if elect_one:
             nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
         sched_stage += 1
@@ -1308,6 +1323,8 @@ def _kernel(
             group_begin = (_slot.subview(4)).load()
             group_end = (_slot.subview(5)).load()
             group_idx = (_slot.subview(7)).load()
+            nvvm.bar_warp_sync(0xFFFFFFFF)
+            sched_stage = cute.arch.make_warp_uniform(sched_stage)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
@@ -1422,6 +1439,8 @@ def _host(
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
     grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+    counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
+    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],

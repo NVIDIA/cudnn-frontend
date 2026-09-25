@@ -23,10 +23,37 @@ python engine's ``check_support()`` gives its own, and the backend gives its
 own when it is lowered (declines recorded by ``backend_plan_entries()``, and
 surfaced by ``plan()`` only if no engine proposes a plan).
 
+Also absent, for the same reason: the C++ surface's unconditional "decode only
+mode, i.e. s_q == 1, not supported with sink_token" (``sdpa_support_surface.h``).
+A sink at s_q == 1 is a well-formed graph; whether it is SERVED is an engine
+answer — the FROST SM100 f16/bf16 row folds the sink logit into its epilogue
+independent of S_q (dense and paged), while the backend engines decline it.
+The C++ rule is left in place on purpose so the backend-only configuration (no
+python candidate, classic eager lowering) keeps rejecting at validate(); with a
+python candidate a graph no engine can serve fails at
+``create_execution_plans()`` with "no engine — python or backend — proposed a
+plan for this graph (the backend declined: decode only mode ...)".
+
 Error-type parity with the pybind ``throw_if`` mapping:
 ``GRAPH_NOT_SUPPORTED`` -> ``cudnn.cudnnGraphNotSupportedError`` (callers catch
 it to skip a config); ``ATTRIBUTE_NOT_SET`` / ``INVALID_VALUE`` ->
 ``std::invalid_argument`` -> ``ValueError``.
+
+One composite is covered beyond the single-node graphs: the SDPA
+**epilogue-gate tail** ``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)``
+(``cudnn._sdpa_tail.match_gate_tail``), which the Rubin d256 kernels fuse.  It
+is validated natively for a reason beyond version-coupling: the classic C++
+``pre_validate_node`` needs a rank-4 dim + stride on the sdpa node's O, and the
+lowering pushes op-output dim/stride only when USER-assigned, so an undeclared
+virtual O_v would surface as a bare ``ValueError`` out of planning
+(``create_execution_plans`` catches only the typed declines).  The native
+validator turns that into the typed not-supported with the fix in the message.
+Scope: the family's validator runs whenever a python SDPA engine is OFFERED
+(the SM100/SM120 f16 forward rows by default, the others with
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
+-- not only where a row serves the tail -- so the tail validates natively there
+and the backend's own verdict on it is deferred to planning, as for every
+python-validated graph.  With the engines disabled nothing changes (classic path).
 
 Import-light on purpose: only the IR types. Never import ``cudnn.sdpa`` (that
 pulls torch/cutlass) or the compiled binding at module scope.
@@ -36,6 +63,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ._sdpa_tail import GateTail, match_gate_tail
 from .graph_types import NodeType
 
 _FWD_TYPES = (NodeType.SDPA, NodeType.SDPA_FP8, NodeType.SDPA_MXFP8)
@@ -119,15 +147,57 @@ def _has(node, port: str) -> bool:
 
 def validate_graph(graph) -> bool:
     """The frost_sdpa families' native validator (engines.manifest.EngineFamily.validator):
-    validate every node when all of them are SDPA-family; return False without
-    raising when the graph holds a node this module does not cover, so the caller
-    falls back to the classic eager C++ lowering."""
+    validate every node when all of them are SDPA-family, or the whole graph when
+    it is exactly the epilogue-gate tail; return False without raising when the
+    graph holds any other node this module does not cover, so the caller falls
+    back to the classic eager C++ lowering."""
     nodes = list(graph._nodes)
-    if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
+    if not nodes:
         return False
-    for node in nodes:
-        validate_node(node)
+    if all(n.node_type in COVERED_NODE_TYPES for n in nodes):
+        for node in nodes:
+            validate_node(node)
+        return True
+    tail = match_gate_tail(nodes)
+    if tail is None:
+        return False
+    _validate_gate_tail(tail)
     return True
+
+
+def _validate_gate_tail(tail: GateTail) -> None:
+    """The three-node ``sdpa -> sigmoid(G) -> mul`` graph, with classic error semantics.
+
+    The sdpa node is validated as usual (its own virtual O carries the inferred or
+    declared dim/stride).  Then the tail's own contract:
+
+    * G and the final O (the mul output) are rank-4 with a unit stride on the
+      head dim -- ``_check_dim_stride`` parity, as if they were sdpa ports;
+    * dims(G) == dims(O): the pointwise mul would broadcast a smaller G, the
+      fused epilogue does not (GRAPH_NOT_SUPPORTED parity: a legal graph the
+      python engines decline, and one the C++ frontend accepts unfused);
+    * the sdpa node's virtual O_v must carry USER-assigned dim AND stride
+      (``set_dim`` / ``set_stride``).  Required, not stylistic: the C++
+      ``pre_validate_node`` needs both on the sdpa node's O and the lowering
+      pushes op-output attributes only when user-assigned, so an undeclared
+      O_v would fail planning with ``ATTRIBUTE_NOT_SET`` -> a bare ValueError
+      that ``create_execution_plans`` does not treat as a decline.  FROST binds
+      the mul output as the kernel's O and never materialises O_v.
+    """
+    node = tail.sdpa
+    validate_node(node)
+    _check_dim_stride(node, "G", tail.gate)
+    _check_dim_stride(node, "O", tail.o_final)
+    if list(tail.gate.get_dim()) != list(tail.o_final.get_dim()):
+        raise _not_supported(
+            f"The gate G of the fused sdpa epilogue (O * sigmoid(G)) must have exactly O's shape (B, H_q, S_q, D_v); "
+            f"got G {list(tail.gate.get_dim())} vs O {list(tail.o_final.get_dim())}"
+        )
+    if not (getattr(tail.o_virtual, "dim_assigned", False) and getattr(tail.o_virtual, "stride_assigned", False)):
+        raise _not_supported(
+            "The sdpa node's virtual O feeding O * sigmoid(G) must declare dim AND stride (set_dim / set_stride): "
+            "the classic frontend requires them on the sdpa output and the fused lowering binds the mul output as O"
+        )
 
 
 def validate_node(node) -> None:
@@ -246,8 +316,7 @@ def _validate_forward(node) -> None:
     if node.node_type == NodeType.SDPA:
         if (d_qk % 8 != 0) or (d_v % 8 != 0):
             raise _not_supported("hidden_dim should be multiple of 8")
-        if s_q == 1 and _has(node, "sink_token"):
-            raise _not_supported("decode only mode, i.e. s_q == 1, not supported with sink_token")
+        # No sink_token x (s_q == 1) rule here: see the module docstring.
 
         has_any_q = _has(node, "seq_len_q") or _has(node, "cu_seq_len_q")
         has_any_kv = _has(node, "seq_len_kv") or _has(node, "cu_seq_len_kv")
@@ -271,6 +340,38 @@ def _validate_forward(node) -> None:
             raise _not_supported("SDPA FP8 does not support bias")
         if (d_qk % 16 != 0) or (d_v % 16 != 0):
             raise _not_supported("hidden_dim should be multiple of 16")
+
+    if node.node_type in (NodeType.SDPA_FP8, NodeType.SDPA_MXFP8):
+        # Block-scaled O (both quantized forwards): FP4_E2M1 O carries one E4M3
+        # scale per 16 d elements in sf_o; an FP8_E4M3 O with sf_o carries one
+        # UE8M0 scale per 32 (MXFP8 output).
+        sf_o = node.outputs.get("sf_o")
+        o_dtype = _dtype_name(o)
+        if o_dtype == "FP4_E2M1":
+            if sf_o is None:
+                raise _not_supported("An FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements).")
+            if _dtype_name(sf_o) not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o must be FP8_E4M3 for an FP4_E2M1 O.")
+        elif sf_o is not None:
+            if o_dtype not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output).")
+            if _dtype_name(sf_o) not in (None, "FP8_E8M0"):
+                raise _not_supported("sf_o must be FP8_E8M0 for an FP8_E4M3 O (MXFP8 output).")
+            if d_v % 32 != 0:
+                raise _not_supported("MXFP8 output needs d_v to be a multiple of 32.")
+        if sf_o is not None:
+            _check_dim_stride(node, "sf_o", sf_o)
+        if node.node_type == NodeType.SDPA_MXFP8:
+            # sdpa_mxfp8 has no per-tensor O scale: ``scale_o`` exists only as the
+            # block-scaled epilogue's global scale (an FP4 O cannot span its range
+            # through the E4M3 block scale alone, so it is REQUIRED there).
+            scale_o = node.inputs.get("scale_o")
+            if scale_o is not None and sf_o is None:
+                raise _not_supported("sdpa_mxfp8: scale_o is accepted only together with the sf_o output (block-scaled O).")
+            if o_dtype == "FP4_E2M1" and scale_o is None:
+                raise _not_supported("sdpa_mxfp8: an FP4_E2M1 O requires scale_o (the FP4 global scale; a 1-element FLOAT tensor).")
+            if scale_o is not None and _dtype_name(scale_o) not in (None, "FLOAT"):
+                raise _not_supported("sdpa_mxfp8: scale_o must be a FLOAT tensor.")
 
     if node.node_type == NodeType.SDPA_MXFP8:
         _validate_mxfp8_descales(node, q, k, v, s_kv if s_kv is not None else k.get_dim()[2])

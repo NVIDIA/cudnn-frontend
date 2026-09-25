@@ -57,6 +57,7 @@ class GraphFwdUid(IntEnum):
     sink_token = 22
     cu_seq_len_q = 23
     cu_seq_len_kv = 24
+    sf_o = 25
 
 class GraphBwdUid(IntEnum):
     q = 100
@@ -95,7 +96,14 @@ class GraphBwdUid(IntEnum):
     sink_token = 133
     dSink_token = 134
 
-def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None):
+def block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale):
+    """sf_o declared as per-(b, h) planes: [b, h_q, s padded to 128, d/block padded to 4], F8_128x4 atom order."""
+    rows = -(-s_qo // 128) * 128
+    cols = max(4, -(-(d_vo // o_block_scale) // 4) * 4)
+    return (b, h_q, rows, cols)
+
+
+def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None, o_block_scale=0):
     graph_fwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     use_padding_mask = None
@@ -182,6 +190,14 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
     if diag_align is not None:
         sdpa_kwargs['diagonal_alignment'] = diag_align
+    if o_block_scale:
+        # Block-scaled O: the sf_o output (per-(b,h) planes) rides sdpa_fp8 like
+        # rng_dump; FP4 O carries E4M3 scales, E4M3 O carries UE8M0 scales.
+        sf_dims = block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale)
+        sf_stride = (sf_dims[1] * sf_dims[2] * sf_dims[3], sf_dims[2] * sf_dims[3], sf_dims[3], 1)
+        sf_dtype = cudnn.data_type.FP8_E4M3 if o_block_scale == 16 else cudnn.data_type.FP8_E8M0
+        sdpa_kwargs['sf_o'] = graph_fwd.tensor(uid=GraphFwdUid.sf_o, dim=sf_dims, stride=sf_stride, data_type=sf_dtype)
+        cudnn_otype = cudnn.data_type.FP4_E2M1 if o_block_scale == 16 else cudnn.data_type.FP8_E4M3
     # Amax_S is not requested: nothing downstream consumes it, and the FROST
     # engines no longer produce it (they decline graphs that declare it).
     o, stats, _amax_s_unused, amax_o = graph_fwd.sdpa_fp8(**sdpa_kwargs)
@@ -658,7 +674,20 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     return fits
 
 
-def create_paged_container_and_block_table(tensor, block_size):
+def create_paged_container_and_block_table(tensor, block_size, seq_lens=None):
+    """Page a dense [B, H, S, D] tensor: container [B*blocks, H, block_size, D] (page p of
+    batch b at pool index p*B + b) + a row-major (B, 1, blocks, 1) int32 table.
+
+    ``seq_lens`` (per-batch lengths, the padding-mask values bound alongside) is OPT-IN
+    poison: when given, every page at or past ``ceil(seq_lens[b] / block_size)`` -- a page
+    no length reaches -- is NaN-filled, so an engine that dereferences a dead table slot
+    poisons its O through 0 * NaN and fails the compare. Only engines that promise to
+    skip dead slots may be tested this way: the FROST paged kernels issue a TMA-OOB page
+    -1 there, while the backend engine loads whole tile-rounded page ranges through the
+    table and masks the scores, so it needs finite data in every table slot (its default
+    ``exec_sdpa_fp8`` path passes ``seq_lens=None``; see ``ExecConfig.paged_nan_dead_pages``).
+    Rows INSIDE the last live page but past the length keep their finite data either way:
+    the paged-attention contract lets a kernel load and mask them."""
     B, H, S, D = tensor.shape
     blocks_per_batch = math.ceil(S / block_size)
 
@@ -670,6 +699,11 @@ def create_paged_container_and_block_table(tensor, block_size):
         cat_tensor = tensor
 
     container = torch.cat(cat_tensor.chunk(blocks_per_batch, dim=2), dim=0)
+    if seq_lens is not None:
+        for b, length in enumerate(seq_lens):
+            live_pages = math.ceil(int(length) / block_size)
+            for p in range(live_pages, blocks_per_batch):
+                container[p * B + b] = float("nan")
 
     table_size = math.ceil(S / block_size)
     block_table_temp = torch.linspace(0, B * table_size - 1, B * table_size, device="cuda", dtype=torch.int32).reshape(table_size, 1, B, 1)
@@ -716,6 +750,22 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     s_qo, s_kv = cfg.s_q, cfg.s_kv
     d_qk, d_vo = cfg.d_qk, cfg.d_v
     block_size = cfg.block_size if cfg.is_paged else 0
+    # Block-scaled O (sf_o): the FROST d128 epilogue (SM100 and newer) serves
+    # dense, unpaged, non-ragged d_qk = d_v = 128 forward graphs; fold the knob
+    # to 0 elsewhere so the drawn config still runs as a plain fp8 forward
+    # instead of skipping on "unsupported forward graph".
+    o_block_scale = int(getattr(cfg, 'o_block_scale', 0) or 0)
+    block_scaled_o_arch = torch.cuda.get_device_capability()[0] >= 10
+    if o_block_scale and not (
+        block_scaled_o_arch and cfg.is_infer and not cfg.is_paged and not getattr(cfg, 'is_ragged', False) and d_qk == 128 and d_vo == 128
+    ):
+        o_block_scale = 0
+    if o_block_scale == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        o_block_scale = 0  # the packed FP4 dtype arrived in torch 2.8; older builds run the draw as plain fp8
+    if o_block_scale:
+        # The quantized O container is E4M3 (mxfp8) or the E2M1 byte container (nvfp4);
+        # the reference stays fp32 and is compared after dequantization.
+        torch_otype = torch.float8_e4m3fn
     deterministic = cfg.is_determin if hasattr(cfg, 'is_determin') else False
     is_ragged = cfg.is_ragged if hasattr(cfg, 'is_ragged') else False
     left_bound = cfg.left_bound if hasattr(cfg, 'left_bound') else None
@@ -761,7 +811,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     try:
         graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None)
+                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
+                                       o_block_scale=o_block_scale)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -806,10 +857,20 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if with_sink_token:
         sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float, device="cuda", generator=rng_data) * 0.5
 
+    # Paged: the per-batch lengths the padding mask binds. A "padded" config draws them
+    # (partial last pages, zero-length sequences, dead pages past each length); a full
+    # config binds every batch at its maximum, as before.
+    paged_seq_len_q = list(seq_len_q_list) if (is_paged and seq_len_q_list) else [s_qo] * b
+    paged_seq_len_kv = list(seq_len_kv_list) if (is_paged and seq_len_kv_list) else [s_kv] * b
+
     # Compute forward reference (also computes o_amax internally)
     if is_ragged:
         seq_len_q_ref = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda")
         seq_len_kv_ref = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda")
+        padding = (seq_len_q_ref, seq_len_kv_ref)
+    elif is_paged:
+        seq_len_q_ref = torch.tensor(paged_seq_len_q, dtype=torch.int32, device="cuda")
+        seq_len_kv_ref = torch.tensor(paged_seq_len_kv, dtype=torch.int32, device="cuda")
         padding = (seq_len_q_ref, seq_len_kv_ref)
     else:
         padding = None
@@ -828,7 +889,15 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                                return_intermediates=return_intermediates)
         o_ref, stats_ref, o_amax = ref_fwd()
 
-    o_scale_gpu = torch.tensor([get_fp8_scale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
+    if o_block_scale == 16:
+        # NVFP4 global scale: put the tensor amax at the top of the E4M3 x E2M1
+        # range (block scale <= 448 when the block amax / 6 is scaled by it).
+        o_scale_val = (448.0 * 6.0) / max(o_amax, 1e-6) * 0.5
+    elif o_block_scale == 32:
+        o_scale_val = 1.0  # UE8M0 block scales absorb the range; no global scale needed
+    else:
+        o_scale_val = get_fp8_scale_factor(o_amax, torch_otype)
+    o_scale_gpu = torch.tensor([o_scale_val], dtype=torch.float, device="cuda")
 
     # Prepare GPU input tensors (pack for ragged, page for paged)
     q_gpu = q_fp8
@@ -843,16 +912,26 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         k_gpu_bhsd = torch.einsum('bshd->bhsd', k_fp8).contiguous()
         v_gpu_bhsd = torch.einsum('bshd->bhsd', v_fp8).contiguous()
-        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size)
-        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size)
+        # Dead-page NaN poison is opt-in (cfg.paged_nan_dead_pages): the FROST-pinned
+        # paged tests set it; the default path serves the backend engine, whose
+        # contract lets it read (and mask) every page the table names.
+        poison_lens = paged_seq_len_kv if getattr(cfg, "paged_nan_dead_pages", False) else None
+        container_k_gpu, k_block_table_gpu = create_paged_container_and_block_table(k_gpu_bhsd, block_size, seq_lens=poison_lens)
+        container_v_gpu, v_block_table_gpu = create_paged_container_and_block_table(v_gpu_bhsd, block_size, seq_lens=poison_lens)
 
     # Allocate forward output tensors
     if is_ragged:
         o_gpu = torch.full((max_t_q, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda")
         stats_gpu = torch.full((max_t_q, h_q, 1), float('nan'), dtype=torch.float, device="cuda")
+    elif o_block_scale == 16:
+        o_gpu = torch.full((b, s_qo, h_q, d_vo // 2), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        stats_gpu = torch.full((b, h_q, s_qo, 1), float('nan'), dtype=torch.float, device="cuda")
     else:
         o_gpu = torch.full((b, s_qo, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda")
         stats_gpu = torch.full((b, h_q, s_qo, 1), float('nan'), dtype=torch.float, device="cuda")
+    sf_o_gpu = None
+    if o_block_scale:
+        sf_o_gpu = torch.full(block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale), 0xAA, dtype=torch.uint8, device="cuda")
 
     o_amax_gpu = torch.tensor([float('nan')], dtype=torch.float, device="cuda")
 
@@ -874,8 +953,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.full((b,), s_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.full((b,), s_qo, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
@@ -894,6 +973,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     if with_sink_token:
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
+    if o_block_scale:
+        variant_pack[int(GraphFwdUid.sf_o)] = sf_o_gpu
 
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
     if perf:
@@ -904,7 +985,33 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     torch.cuda.synchronize()
 
     # Compare forward output
-    if not perf:
+    if not perf and o_block_scale:
+        from .block_scale_o_ref import dequantize_e2m1, quantize_o_mxfp8, quantize_o_nvfp4, unpack_e2m1, unswizzle_128x4
+
+        # o_ref came back quantized to the per-tensor container; rebuild the fp32
+        # O (times the kernel's global scale) from the un-quantized reference.
+        o_ref32, _, _ = compute_ref(q_fp8, k_fp8, v_fp8, attn_scale=attn_scale,
+                                     q_descale=q_descale_gpu, k_descale=k_descale_gpu, v_descale=v_descale_gpu,
+                                     s_scale=s_scale_gpu, s_descale=s_descale_gpu, torch_itype=torch_itype,
+                                     torch_otype=torch.float32, padding=padding,
+                                     left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
+                                     sink_token=sink_token_gpu, rescale_threshold=rescale_threshold, quantize_o=False)
+        o_ref_scaled = o_ref32.float() * o_scale_val  # (b, s, h, d)
+        c_used = d_vo // o_block_scale
+        sf_log = unswizzle_128x4(sf_o_gpu)[:, :, :s_qo, :c_used].permute(0, 2, 1, 3)  # (b, s, h, c)
+        if o_block_scale == 16:
+            codes = unpack_e2m1(o_gpu.view(torch.uint8)).reshape(b, s_qo, h_q, d_vo)
+            o_deq = (dequantize_e2m1(codes).reshape(b, s_qo, h_q, c_used, 16) * sf_log.view(torch.float8_e4m3fn).float()[..., None]).reshape(b, s_qo, h_q, d_vo)
+            _, _, ref_q = quantize_o_nvfp4(o_ref_scaled)
+        else:
+            o_deq = (o_gpu.float().reshape(b, s_qo, h_q, c_used, 32) * torch.pow(2.0, sf_log.float() - 127.0)[..., None]).reshape(b, s_qo, h_q, d_vo)
+            _, _, ref_q = quantize_o_mxfp8(o_ref_scaled)
+        assert not torch.isnan(o_deq).any(), "NaN in dequantized block-scaled O"
+        assert bool((unswizzle_128x4(sf_o_gpu)[:, :, s_qo:, :] == 0).all().item()), "sf_o pad rows past s_q must be zero"
+        floor = (ref_q - o_ref_scaled).abs().max().item()
+        atol = max((0.125 if torch_itype == torch.float8_e5m2 else 0.08) * o_scale_val, 3.0 * floor)
+        assert_close_fp8_grad(o_deq, o_ref_scaled, atol, 0.2, tag="O(block-scaled)", keys=s_kv)
+    elif not perf:
         if is_ragged:
             o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q)
         else:
@@ -917,6 +1024,13 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             t_idx = sum(seq_len_q_list)
             o_gpu_float[t_idx:] = 0
             o_ref_float[t_idx:] = 0
+        elif is_paged:
+            # Padded (dead) query rows: the reference holds 0 there and the engines
+            # write O := 0 (the FROST dense padded-Q trim) or leave the buffer; compare
+            # the live rows only.  O is [b, s_qo, h_q, d_vo].
+            dead_q = torch.arange(s_qo, device="cuda")[None, :] >= seq_len_q_ref[:, None]
+            o_gpu_float[dead_q] = 0
+            o_ref_float[dead_q] = 0
 
         # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
         atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2

@@ -194,6 +194,20 @@ def chain_forward_host(
     )
 
 
+def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, **flags):
+    summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags)
+    prefill_cfg = kda_prefill_f16.build_cfg(
+        io_dtype,
+        state_dtype,
+        gate_dtype,
+        use_initial_state=True,
+        store_final_state=store_final_state,
+        enable_checkpoints=enable_checkpoints,
+        **flags,
+    )
+    return summary_cfg, prefill_cfg
+
+
 def build_chain_forward(
     *,
     q,
@@ -248,9 +262,9 @@ def build_chain_forward(
     seed dtype, chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and
     ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel
     compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
     HO = gate.shape[1]
     if not safe_gate:
         a_log = None
@@ -292,25 +306,10 @@ def build_chain_forward(
         int(chain_rows),
     )
     if key not in chain_forward_cache:
-        summary_cfg = kda_summary_f16.build_cfg(
-            io_dtype,
-            gate_dtype,
-            use_initial_state=False,
-            l2norm=use_qk_l2norm,
-            safe_gate=safe_gate,
-            gate_scale_log2=gate_scale_log2,
-            log_gate=log_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            max_active_clusters=num_sm,
-            d_k=DK,
-            d_v=DV,
-        )
-        prefill_cfg = kda_prefill_f16.build_cfg(
+        summary_cfg, prefill_cfg = build_configs(
             io_dtype,
             state_dtype,
             gate_dtype,
-            use_initial_state=True,
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             l2norm=use_qk_l2norm,

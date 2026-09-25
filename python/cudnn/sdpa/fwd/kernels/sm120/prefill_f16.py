@@ -84,8 +84,14 @@ from cudnn.sdpa.fwd.config_sm120 import (
     validate_params,
 )
 
+from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_host as _compile_prepared_host
+
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
+
+# Every template masks the rightmost KV tile, independently of padding flags.
+PREPARED_KV_TAIL_NATIVE = True
+
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 validate_params(PARAMS)
 
@@ -175,6 +181,7 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile: int = SEQ_Q_TILES[0],
         pack_gqa: bool = False,
         qh_per_kh: int = 1,
+        stats_log2: bool = False,
     ):
         """Initialize the FMHA prefill kernel configuration.
 
@@ -245,6 +252,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
+        self.stats_log2 = stats_log2
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
         self.thd_lse_head_major = thd_lse_head_major
@@ -1202,6 +1210,9 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + (_lse_row_in_cta if cutlass.const_expr(not self.pack_gqa) else _lse_row_in_cta // self.qh_per_kh)
                         _lse_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + _lse_row_in_cta % self.qh_per_kh
                         lse_out = cutlass.Float32(row_lse[row_half])
+                        # Split partials stay natural-log; the combine owns final base conversion.
+                        if cutlass.const_expr(self.stats_log2 and self.split_kv == 1):
+                            lse_out = lse_out * cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.thd_varlen):
                             # Packed ragged-Stats LSE, written directly in the
                             # caller's declared layout: token-major (T, H) or
@@ -1514,6 +1525,7 @@ class SM120FusedMultiHeadAttentionForward:
         thd_lens_form: Optional[cutlass.Int32],
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
+        prepared: cutlass.Constexpr[bool] = False,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
 
@@ -1553,66 +1565,69 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
             raise ValueError("head dimensions must be multiples of 8 (TMA 16-byte global-stride rule at 2 B/elem)")
 
-        # THD compiles the token extents DYNAMIC (mode 1 is a symbol, not an
-        # int), so only statically-known modes can be compared at trace time;
-        # the adapter builds the ragged views from shared totals, so the
-        # dynamic seq extents match by construction.
-        def _static_neq(a, b):
-            return isinstance(a, int) and isinstance(b, int) and a != b
+        # The pointer entry is validated by prepared.bind_dense; tensor callers
+        # retain the original trace-time geometry and layout checks.
+        if cutlass.const_expr(not prepared):
+            # THD compiles the token extents DYNAMIC (mode 1 is a symbol, not an
+            # int), so only statically-known modes can be compared at trace time;
+            # the adapter builds the ragged views from shared totals, so the
+            # dynamic seq extents match by construction.
+            def _static_neq(a, b):
+                return isinstance(a, int) and isinstance(b, int) and a != b
 
-        # Under KV split, O is the split-major PARTIAL workspace: its batch mode
-        # is B*SPLIT_KV while Q/K/V keep the real batch, so O's batch is checked
-        # against that multiple rather than against Q's.
-        if cutlass.const_expr(
-            _static_neq(q.shape[0], k.shape[0])
-            or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
-            or _static_neq(q.shape[0] * self.split_kv, o.shape[0])
-            or _static_neq(q.shape[1], o.shape[1])
-            or _static_neq(q.shape[2], o.shape[2])
-            or q.shape[2] % k.shape[2] != 0
-            or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
-        ):
-            raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
-        for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
-            if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
-                raise ValueError(
-                    f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
-                    f"and non-overlapping seq/head strides that are multiples of 8 elements "
-                    f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
-                )
-        if cutlass.const_expr(lse is not None):
-            if cutlass.const_expr(self.thd_varlen):
-                # The packed token total (q.shape[1]) is DYNAMIC under THD, so
-                # only the static modes are trace-checkable; head_stride >= T
-                # and the (T, H) extent are validated by the adapter at
-                # execute, which builds both views from the same total.
-                if cutlass.const_expr(self.thd_lse_padded):
-                    if cutlass.const_expr(len(lse.shape) != 3):
-                        raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
-                elif cutlass.const_expr(self.thd_lse_head_major):
-                    if cutlass.const_expr(lse.shape[0] != q.shape[2]):
-                        raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
-                    if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
-                        raise ValueError("head-major THD LSE must be compact row-major")
+            # Under KV split, O is the split-major PARTIAL workspace: its batch mode
+            # is B*SPLIT_KV while Q/K/V keep the real batch, so O's batch is checked
+            # against that multiple rather than against Q's.
+            if cutlass.const_expr(
+                _static_neq(q.shape[0], k.shape[0])
+                or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
+                or _static_neq(q.shape[0] * self.split_kv, o.shape[0])
+                or _static_neq(q.shape[1], o.shape[1])
+                or _static_neq(q.shape[2], o.shape[2])
+                or q.shape[2] % k.shape[2] != 0
+                or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
+            ):
+                raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
+            for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
+                if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
+                    raise ValueError(
+                        f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
+                        f"and non-overlapping seq/head strides that are multiples of 8 elements "
+                        f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
+                    )
+            if cutlass.const_expr(lse is not None):
+                if cutlass.const_expr(self.thd_varlen):
+                    # The packed token total (q.shape[1]) is DYNAMIC under THD, so
+                    # only the static modes are trace-checkable; head_stride >= T
+                    # and the (T, H) extent are validated by the adapter at
+                    # execute, which builds both views from the same total.
+                    if cutlass.const_expr(self.thd_lse_padded):
+                        if cutlass.const_expr(len(lse.shape) != 3):
+                            raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
+                    elif cutlass.const_expr(self.thd_lse_head_major):
+                        if cutlass.const_expr(lse.shape[0] != q.shape[2]):
+                            raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
+                        if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
+                            raise ValueError("head-major THD LSE must be compact row-major")
+                    else:
+                        if cutlass.const_expr(lse.shape[1] != q.shape[2]):
+                            raise ValueError("THD LSE must have shape (T, H)")
+                        if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
+                            raise ValueError("THD LSE must be compact token-major")
                 else:
-                    if cutlass.const_expr(lse.shape[1] != q.shape[2]):
-                        raise ValueError("THD LSE must have shape (T, H)")
-                    if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
-                        raise ValueError("THD LSE must be compact token-major")
-            else:
-                # Under KV split the LSE is the split-major partial workspace,
-                # batch mode B*SPLIT_KV (same as O).
-                if cutlass.const_expr(lse.shape != (q.shape[0] * self.split_kv, q.shape[2], q.shape[1])):
-                    raise ValueError("LSE must have shape (B * split_kv, H, Sq)")
-        if cutlass.const_expr(self.has_sink != (sinks is not None)):
-            raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
-        if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
-            raise ValueError("sinks must have shape (H,)")
-        if cutlass.const_expr(self.thd_varlen):
-            if cutlass.const_expr(q.shape[0] != 1):
-                raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-            if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
-                raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
+                    # Under KV split the LSE is the split-major partial workspace,
+                    # batch mode B*SPLIT_KV (same as O).
+                    if cutlass.const_expr(lse.shape != (q.shape[0] * self.split_kv, q.shape[2], q.shape[1])):
+                        raise ValueError("LSE must have shape (B * split_kv, H, Sq)")
+            if cutlass.const_expr(self.has_sink != (sinks is not None)):
+                raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
+            if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
+                raise ValueError("sinks must have shape (H,)")
+            if cutlass.const_expr(self.thd_varlen):
+                if cutlass.const_expr(q.shape[0] != 1):
+                    raise ValueError("THD Q/K/V/O must be packed batch-1 views")
+                if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
+                    raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
@@ -1737,6 +1752,8 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple[int, int, int, int]] = None,
     o_stride: Optional[tuple[int, int, int, int]] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
+    prepared: bool = False,
+    persistent_ctas: int = 0,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1776,6 +1793,7 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
+        stats_log2=PARAMS.stats_log2,
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
@@ -1788,6 +1806,8 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
+    if prepared:
+        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key)
     if PARAMS.split_kv > 1 and not has_lse:
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
     if lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):

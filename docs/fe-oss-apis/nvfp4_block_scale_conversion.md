@@ -3,7 +3,7 @@
 `cudnn.ops.nvfp4_block_scale_quantize` and
 `cudnn.ops.nvfp4_block_scale_dequantize` are explicit conversion operations for
 the NVFP4 tensor representation consumed by block-scaled GEMMs. They are
-experimental frontend-only APIs and require the `cutedsl` optional dependency.
+experimental frontend-only APIs and require CuTeDSL >= 4.7.0.
 
 The conversion is intentionally separate from GEMM. Quantized activations can
 be reused by multiple projections, and callers can see and manage the packed
@@ -70,3 +70,6 @@ allocates, converts, or copies its tensor arguments.
 Both kernels in this package were authored for cuDNN Frontend from the public
 NVFP4 arithmetic and `F8_128x4` layout contract; they do not embed code copied
 from another framework's quantizer.
+
+Requires CuTeDSL >= 4.7.0. Older installed versions are rejected before the
+kernel module is imported; the package-wide dependency floor remains 4.6.2.
