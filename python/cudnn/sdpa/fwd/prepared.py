@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""SM100/SM107 f16 forward launches, prepared once and bound per call.
+"""SM100/SM107 and SM120 f16 forward launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
@@ -752,6 +752,7 @@ class DenseLaunchSpec:
         "fp32_partial",
         "combine",
         "tile_n",
+        "kv_tail_native",
         "causal",
         "causal_bottom_right",
         "window_right",
@@ -775,8 +776,8 @@ class DenseLaunchSpec:
         """The compiled artifact's KV-tail contract (the adapter's check_support rule, applied to the
         RUNTIME extents): a partial last KV tile is zero-filled by TMA but only MASKED on the padded /
         causal paths, so S_kv must be a tile multiple unless per-batch KV lengths carry the real lengths
-        or the causal diagonal provably covers the tail."""
-        if self.paged or s_kv % self.tile_n == 0 or self.seq_kv_present:
+        or the causal diagonal provably covers the tail. SM120 always masks its rightmost tile."""
+        if getattr(self, "kv_tail_native", False) or self.paged or s_kv % self.tile_n == 0 or self.seq_kv_present:
             return True
         if not self.causal:
             return False
@@ -788,13 +789,14 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     template with every constant filled, the fixed specialization the binder checks each call against,
     with no owned device allocations."""
     km = api._k_mod
+    cfg = getattr(km, "CFG", None)
     raw, compiled, order = _positional_order(api)
     s = DenseLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
-    if getattr(km.CFG, "PACK_GQA", False) and s.qh != s.kh * km.CFG.QH_PER_KH:
+    if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
         raise ValueError("cudnn.sdpa: runtime head counts must match the compiled PackGQA ratio")
     if hasattr(km, "N_Q") and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
         raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
@@ -810,16 +812,17 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.has_sink = bool(api.has_sink)
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
-    s.tile_n = int(getattr(km.CFG, "TILE_N", 128))
+    s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
+    s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False))
     # the COMPILED mask kind: the d192 lowering may have rewritten a square bottom-right mask as top-left
     s.causal = bool(api.is_causal)
-    s.causal_bottom_right = bool(getattr(km.CFG, "BOTTOM_RIGHT", getattr(api, "causal_bottom_right", False)))
+    s.causal_bottom_right = bool(getattr(cfg, "BOTTOM_RIGHT", getattr(api, "causal_bottom_right", False)))
     s.window_right = int(api.window_size_right or 0)
     # Lowering canonicalizations that read the DECLARED (S_q, S_kv) pin the runtime extents to them: the square
     # bottom-right -> top-left rewrite (equal only for S_q == S_kv) and the 8K LPT-L2 head grouping of the d192 flavor.
     requested_br = bool(getattr(api, "causal_bottom_right", False))
     s.shape_fixed = (s.causal and requested_br and not s.causal_bottom_right) or (  # compiled top-left for a requested bottom-right: square only
-        tuple(getattr(api, "flavor", ())) == (192, 128) and s.s_q_max == s.s_k_max == 8192  # the 8K LPT-L2 head grouping
+        tuple(getattr(api, "flavor", ()) or ()) == (192, 128) and s.s_q_max == s.s_k_max == 8192  # the 8K LPT-L2 head grouping
     )
     # A grouped-LPT schedule decodes tile coordinates from a COMPILED Q-tile count and head group (derived from the
     # declared S_q and batch x heads): such an artifact serves exactly the declared (batch, S_q). The f16 kernels
@@ -832,7 +835,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.ragged_divs = tuple(int(d) for d in getattr(api, "ragged_divisors", (1, 1, 1))) if s.ragged else (1, 1, 1)
     s.ragged_i64 = bool(getattr(api, "ragged_offsets_int64", False)) if s.ragged else False
     s.total_q = getattr(api, "max_total_seq_len_q", None) if s.ragged else None
-    if s.ragged and (s.split < 2 or not s.paged or not getattr(km.CFG, "RAGGED_Q", 0)):
+    if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
     s.combine = None
     if s.split > 1:
@@ -1120,7 +1123,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
             raise ValueError("cudnn.sdpa: sinks is required by this compiled specialization")
         _on_plan_device(spec, "sinks", sinks)
         if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
-            raise ValueError(f"cudnn.sdpa: sinks must be a contiguous ({spec.qh},) float32 tensor")
+            raise ValueError(f"cudnn.sdpa: sinks must be float32 and contiguous with {spec.qh} elements")
         if sinks.ptr % _ALIGN_F32:
             raise ValueError("cudnn.sdpa: sinks must be 4-byte aligned")
         if sinks.span >= 0 and sinks.span < spec.qh:
