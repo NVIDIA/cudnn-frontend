@@ -2301,6 +2301,14 @@ def test_paged_mxfp8_graph_e5m2_sink_swa():
 
 
 @pytest.mark.L0
+def test_paged_mxfp8_graph_sink_persistent_tiles_repeat():
+    """More clusters than the device holds resident, so CTAs walk several tiles. The next tile's
+    prologue parks SF_Q/K in O_0's TMEM head, which the epilogue (slower with a sink) must read first."""
+    for _ in range(8):
+        _run_graph_mxfp8(10, 32, 8, 128, 8, [400, 1, 1024, 17, 3] * 2, True, stats=True, s_q=512, causal_br=True, sink=True, d_qk=128, d_v=128)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "dims",
     [

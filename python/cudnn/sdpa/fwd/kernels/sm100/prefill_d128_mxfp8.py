@@ -2558,11 +2558,6 @@ def _correction_warp_group(
             total_sum = stats_vec[1]
 
             bars.mb_stat_empty[qs].arrive()
-            # Release MMA's NEXT-tile prologue BMM1 into this S_acc slot: the
-            # final stats ride the slot HEAD and are now safely in registers
-            # (tcgen05_wait LOAD above).  Cross-CTA arrive on the leader under
-            # cga2 — the collective BMM1 writes both peers' TMEM.
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             # Pre-declare inv_sum/lse_val — without it MLIR cf.if NameErrors the tracer post-branch.
             inv_sum = cutlass.Float32(0.0)
@@ -2846,6 +2841,8 @@ def _correction_warp_group(
                 # fence_proxy needed before TMA reads SMEM written by tcgen05_st.
                 nvvm.fence_proxy("async.shared", space="cta")
 
+            # The next tile's prologue also parks SF_Q/K in O_0's head, so release it only after O is read.
+            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             bars.mb_o_full[qs].arrive()
 
         stat_full_phase = stat_full_phase ^ 1
