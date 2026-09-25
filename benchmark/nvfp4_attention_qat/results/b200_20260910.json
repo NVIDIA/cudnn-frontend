@@ -1,0 +1,193 @@
+{
+  "status": "pass",
+  "scope": "complete QAT backward component, not model E2E",
+  "cases": [
+    {
+      "sequence": 8192,
+      "heads": 3,
+      "head_chunk": 0,
+      "status": "pass",
+      "eager_comparisons": [
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003184582805261016,
+          "exact": false
+        },
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003159746527671814,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "graph_comparisons": [
+        {
+          "max_abs": 0.0009765625,
+          "relative_l2": 0.0031812372617423534,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0009765625,
+          "relative_l2": 0.0031662590336054564,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "workspace_bytes": {
+        "triton": 18972672,
+        "cutedsl": 421625856
+      },
+      "samples_ms": {
+        "triton": [
+          1.0345173676808674,
+          1.021066665649414,
+          1.0223573048909504,
+          1.022879997889201,
+          1.0231253306070964,
+          1.0210560162862141,
+          1.02237868309021,
+          1.024351994196574,
+          1.0217173099517822,
+          1.021877368291219
+        ],
+        "cutedsl": [
+          0.42456531524658203,
+          0.4221760034561157,
+          0.4240106741587321,
+          0.4242560068766276,
+          0.42481064796447754,
+          0.4230719804763794,
+          0.42390398184458417,
+          0.42391467094421387,
+          0.4230399926503499,
+          0.42395734786987305
+        ]
+      },
+      "median_ms": {
+        "triton": 1.02236799399058,
+        "cutedsl": 0.42393600940704346
+      },
+      "speedup": 2.411609231828548
+    },
+    {
+      "sequence": 32768,
+      "heads": 3,
+      "head_chunk": 0,
+      "status": "pass",
+      "eager_comparisons": [
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003184756962582469,
+          "exact": false
+        },
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.0031609106808900833,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "graph_comparisons": [
+        {
+          "max_abs": 0.000244140625,
+          "relative_l2": 0.003182522486895323,
+          "exact": false
+        },
+        {
+          "max_abs": 0.000244140625,
+          "relative_l2": 0.003159986576065421,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "workspace_bytes": {
+        "triton": 75890688,
+        "cutedsl": 6518341632
+      },
+      "samples_ms": {
+        "triton": [
+          13.806592305501303,
+          15.219093322753906,
+          13.929300944010416,
+          13.797643025716146,
+          13.79922103881836,
+          14.32101313273112,
+          13.949323018391928,
+          13.789866129557291,
+          13.784533182779947,
+          14.809781392415365
+        ],
+        "cutedsl": [
+          5.09390926361084,
+          5.086197217305501,
+          5.190442721048991,
+          5.088917414347331,
+          5.098538716634114,
+          5.12498124440511,
+          5.142250696818034,
+          5.088864008585612,
+          5.093941370646159,
+          5.0785706837972
+        ]
+      },
+      "median_ms": {
+        "triton": 13.86794662475586,
+        "cutedsl": 5.0939253171285
+      },
+      "speedup": 2.722447967213891
+    }
+  ],
+  "device": "NVIDIA B200",
+  "sm_count": 148,
+  "capability": [
+    10,
+    0
+  ],
+  "torch": "2.13.0+cu130",
+  "triton": "3.7.1",
+  "cutedsl": "4.7.0",
+  "cudnn_frontend": "1.29.0",
+  "cuda": "13.0",
+  "seed": 20260910,
+  "source_sha256": {
+    "benchmark_backends.py": "7f6b61c4d97491e455ade87b1c835608a81878903f79d201a1022e0db4fc9b46",
+    "sdpa/bwd/qat/__init__.py": "58aebbc07e5b596d87b061fbde03f01e29eaee444c4ea23c866e44215ca06716",
+    "sdpa/bwd/qat/_interface.py": "44e30cc0d060a0f014aa692b4dd1fa7adc237fe9c8ecdeef2b7f35a582869576",
+    "sdpa/bwd/qat/_kernels.py": "afdfd39a2e48a5a637f9217c845e79ec5f09810d20d7b98fcff3eaba1e37e919",
+    "sdpa/bwd/qat/_nvfp4.py": "f63ad360cc6433f285fbc71e7e8848f9015599d0368c4a3d07ad96fa420c8f6d",
+    "sdpa/bwd/qat/_workspace.py": "47e26cab8b73afe59918b97c4f0b7163624a1c6e19cb694eda41acf5030ceb5b",
+    "sdpa/bwd/qat/api.py": "22a8d604fba6ac525da0649f3b5919a5617fceb8abfa41718f76997adeec24b3",
+    "sdpa/bwd/qat/_cutedsl_kernel.py": "ab1a1a868f4f3b21e5ebca1f832fd3f8c590a1e9fba174669dbc6b12adf591bb",
+    "sdpa/bwd/qat/_cutedsl.py": "1aee5443879ef20c3dc7a5876250e1c60d104464f733becbaf3d365d94ba4622",
+    "frost/tile_dsl/__init__.py": "ca5aa1a8c37c4fad19938dbd57f084b2540a084260b0ada94cd161341884c887",
+    "frost/tile_dsl/barrier.py": "3f137ebc9ee3721a4a301e561a78524e5f24b56741ccad286d4001dfdb960ce5",
+    "frost/tile_dsl/constants.py": "c73aa87b957b16e580da7781b392d2ae90b98dc09c6f243b6a0ebb8a40b9e3f1",
+    "frost/tile_dsl/handles.py": "5e694d248da07b535b8d98df7003518cc61565c3fcb89eec93ff93a75c08eca7",
+    "frost/tile_dsl/mask.py": "c84a65520caf9fa41a3768ea904291c039ba25ff7ecde01d4bf88943d9506455",
+    "frost/tile_dsl/mma.py": "e917f81937aa20b685d5ff9716b8fe79e74208a7acdf91202fb917ee5f459a63",
+    "frost/tile_dsl/pointwise.py": "7b47a60371c7cdc9fd5fc7a3bc1e2086405e5ecb9bdb060167343beb7cd829e8",
+    "frost/tile_dsl/regtile.py": "4138a3641d5841c94e4b0ed6eeb4b219382e76723a12b41953e27717457098dc",
+    "frost/tile_dsl/rope.py": "e88097028ef835ef40f2dd7f546c89a9b78fcffd84a4730107d73065689891b0",
+    "frost/tile_dsl/scheduler.py": "8e39c52254c9acaa5a4bd91c932c1c614daba969d87284a8bf8f78ea9025fc83",
+    "frost/tile_dsl/swizzle.py": "826acae44e34f87d46510272762db864f007777306175fe411c570fade354f4c",
+    "frost/tile_dsl/thd.py": "dd2251de74c4dd74836b51a0086b834c9aea4354f95c9b34e7f3730572d87bf1",
+    "frost/tile_dsl/tma.py": "ca4eca60930c0bd3878ecff535614feae4ec24f1ceeba376b21d40ce7f38da3d",
+    "frost/tile_dsl/tmem.py": "7eaedce61960ab4d8a59b9b4b5172d9f8e1b9301b6dac10978216dc528377160"
+  }
+}

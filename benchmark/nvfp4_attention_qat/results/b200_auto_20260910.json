@@ -1,0 +1,163 @@
+{
+  "status": "pass",
+  "scope": "complete QAT backward component, not model E2E",
+  "cases": [
+    {
+      "sequence": 8192,
+      "heads": 3,
+      "head_chunk": 0,
+      "status": "pass",
+      "routes": {
+        "triton": {
+          "requested": "triton",
+          "selected": "triton",
+          "head_chunk": 0,
+          "fallback_reason": null,
+          "workspace_limit_bytes": null
+        },
+        "frost": {
+          "requested": "auto",
+          "selected": "frost",
+          "head_chunk": 3,
+          "fallback_reason": null,
+          "workspace_limit_bytes": null
+        }
+      },
+      "eager_comparisons": [
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003184582805261016,
+          "exact": false
+        },
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003159746527671814,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "graph_comparisons": [
+        {
+          "max_abs": 0.0009765625,
+          "relative_l2": 0.0031812372617423534,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0009765625,
+          "relative_l2": 0.0031662590336054564,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "workspace_bytes": {
+        "triton": 18972672,
+        "frost": 421625856
+      }
+    },
+    {
+      "sequence": 32768,
+      "heads": 3,
+      "head_chunk": 0,
+      "status": "pass",
+      "routes": {
+        "triton": {
+          "requested": "triton",
+          "selected": "triton",
+          "head_chunk": 0,
+          "fallback_reason": null,
+          "workspace_limit_bytes": null
+        },
+        "frost": {
+          "requested": "auto",
+          "selected": "frost",
+          "head_chunk": 3,
+          "fallback_reason": null,
+          "workspace_limit_bytes": null
+        }
+      },
+      "eager_comparisons": [
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.003184756962582469,
+          "exact": false
+        },
+        {
+          "max_abs": 0.00048828125,
+          "relative_l2": 0.0031609106808900833,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "graph_comparisons": [
+        {
+          "max_abs": 0.000244140625,
+          "relative_l2": 0.003182522486895323,
+          "exact": false
+        },
+        {
+          "max_abs": 0.000244140625,
+          "relative_l2": 0.003159986576065421,
+          "exact": false
+        },
+        {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "exact": true
+        }
+      ],
+      "workspace_bytes": {
+        "triton": 75890688,
+        "frost": 6518341632
+      }
+    }
+  ],
+  "device": "NVIDIA B200",
+  "sm_count": 148,
+  "capability": [
+    10,
+    0
+  ],
+  "torch": "2.13.0+cu130",
+  "triton": "3.7.1",
+  "cutedsl": "4.7.0",
+  "cudnn_frontend": "1.29.0",
+  "cuda": "13.0",
+  "seed": 20260910,
+  "source_sha256": {
+    "benchmark_backends.py": "99307463f3f91baf5f5a5c124a1426fc01efe1b95bcf7de18cc03b248186bdd7",
+    "sdpa/bwd/qat/__init__.py": "58aebbc07e5b596d87b061fbde03f01e29eaee444c4ea23c866e44215ca06716",
+    "sdpa/bwd/qat/_interface.py": "44e30cc0d060a0f014aa692b4dd1fa7adc237fe9c8ecdeef2b7f35a582869576",
+    "sdpa/bwd/qat/_kernels.py": "afdfd39a2e48a5a637f9217c845e79ec5f09810d20d7b98fcff3eaba1e37e919",
+    "sdpa/bwd/qat/_nvfp4.py": "f63ad360cc6433f285fbc71e7e8848f9015599d0368c4a3d07ad96fa420c8f6d",
+    "sdpa/bwd/qat/_workspace.py": "47e26cab8b73afe59918b97c4f0b7163624a1c6e19cb694eda41acf5030ceb5b",
+    "sdpa/bwd/qat/api.py": "71ded3b53cba67f492747ab487dd48c3139ba206f34e87c026bf8edcd880b766",
+    "sdpa/bwd/qat/_frost_kernel.py": "6c17524184d6e00312181441a5745112d977b5fd6d568e6014394dab48d72275",
+    "sdpa/bwd/qat/_frost.py": "d7775fee76ef6a43cffecc8a70167fc6e06805a06bd09a1cfbbd2424abedbd0d",
+    "frost/tile_dsl/__init__.py": "ca5aa1a8c37c4fad19938dbd57f084b2540a084260b0ada94cd161341884c887",
+    "frost/tile_dsl/barrier.py": "3f137ebc9ee3721a4a301e561a78524e5f24b56741ccad286d4001dfdb960ce5",
+    "frost/tile_dsl/constants.py": "c73aa87b957b16e580da7781b392d2ae90b98dc09c6f243b6a0ebb8a40b9e3f1",
+    "frost/tile_dsl/handles.py": "5e694d248da07b535b8d98df7003518cc61565c3fcb89eec93ff93a75c08eca7",
+    "frost/tile_dsl/mask.py": "c84a65520caf9fa41a3768ea904291c039ba25ff7ecde01d4bf88943d9506455",
+    "frost/tile_dsl/mma.py": "e917f81937aa20b685d5ff9716b8fe79e74208a7acdf91202fb917ee5f459a63",
+    "frost/tile_dsl/pointwise.py": "7b47a60371c7cdc9fd5fc7a3bc1e2086405e5ecb9bdb060167343beb7cd829e8",
+    "frost/tile_dsl/regtile.py": "4138a3641d5841c94e4b0ed6eeb4b219382e76723a12b41953e27717457098dc",
+    "frost/tile_dsl/rope.py": "e88097028ef835ef40f2dd7f546c89a9b78fcffd84a4730107d73065689891b0",
+    "frost/tile_dsl/scheduler.py": "8e39c52254c9acaa5a4bd91c932c1c614daba969d87284a8bf8f78ea9025fc83",
+    "frost/tile_dsl/swizzle.py": "826acae44e34f87d46510272762db864f007777306175fe411c570fade354f4c",
+    "frost/tile_dsl/thd.py": "dd2251de74c4dd74836b51a0086b834c9aea4354f95c9b34e7f3730572d87bf1",
+    "frost/tile_dsl/tma.py": "ca4eca60930c0bd3878ecff535614feae4ec24f1ceeba376b21d40ce7f38da3d",
+    "frost/tile_dsl/tmem.py": "7eaedce61960ab4d8a59b9b4b5172d9f8e1b9301b6dac10978216dc528377160"
+  }
+}
