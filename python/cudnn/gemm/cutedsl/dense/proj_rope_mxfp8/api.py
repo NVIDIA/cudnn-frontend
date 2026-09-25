@@ -13,6 +13,8 @@ kernels that differ only in the GEMM *input* precision, exposed as sibling APIBa
 match), allocates outputs, drives the class lifecycle, and returns a ``TupleDict``.
 """
 
+from __future__ import annotations
+
 from .gemm_proj_rope_mxfp8_bf16in import (
     gemm_proj_rope_mxfp8_host as _bf16in_host,
     HEAD_DIM,
@@ -27,14 +29,30 @@ from .gemm_proj_rope_mxfp8_mxfp8in import (
 
 from cuda.bindings import driver as cuda
 import logging
-import torch
 from typing import Optional
 
+import cutlass
 import cutlass.utils
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_device,
+    get_shape,
+    is_torch_tensor,
+)
+
+
+def _maybe_detach(tensor):
+    """Detach torch autograd-tracked tensors before DLPack export; no-op for other frameworks."""
+    return tensor.detach() if is_torch_tensor(tensor) else tensor
 
 
 # ======================================================================================
@@ -59,16 +77,23 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
-        self.x_desc = self._make_tensor_desc(sample_x, name="sample_x")
-        self.w_desc = self._make_tensor_desc(sample_w, name="sample_w")
-        self.cos_desc = self._make_tensor_desc(sample_cos, name="sample_cos")
-        self.sin_desc = self._make_tensor_desc(sample_sin, name="sample_sin")
-        self.out_fp8_row_desc = self._make_tensor_desc(sample_out_fp8_row, name="sample_out_fp8_row")
-        self.out_scales_row_desc = self._make_tensor_desc(sample_out_scales_row, name="sample_out_scales_row")
-        self.out_fp8_col_desc = self._make_tensor_desc(sample_out_fp8_col, name="sample_out_fp8_col")
-        self.out_scales_col_desc = self._make_tensor_desc(sample_out_scales_col, name="sample_out_scales_col")
+        self._framework = detect_framework(sample_x)
+        self.x_desc = self._make_tensor_desc(sample_x, name="sample_x", canonical=True)
+        self.w_desc = self._make_tensor_desc(sample_w, name="sample_w", canonical=True)
+        self.cos_desc = self._make_tensor_desc(sample_cos, name="sample_cos", canonical=True)
+        self.sin_desc = self._make_tensor_desc(sample_sin, name="sample_sin", canonical=True)
+        self.out_fp8_row_desc = self._make_tensor_desc(sample_out_fp8_row, name="sample_out_fp8_row", canonical=True)
+        self.out_scales_row_desc = self._make_tensor_desc(sample_out_scales_row, name="sample_out_scales_row", canonical=True)
+        self.out_fp8_col_desc = self._make_tensor_desc(sample_out_fp8_col, name="sample_out_fp8_col", canonical=True)
+        self.out_scales_col_desc = self._make_tensor_desc(sample_out_scales_col, name="sample_out_scales_col", canonical=True)
 
         self.w_out_in = bool(w_out_in)
+        if self._framework == "jax" and not self.w_out_in:
+            raise ValueError(
+                "w_out_in=False is not expressible as JAX arrays for GemmProjRopeMxfp8Bf16InSm100 "
+                "(the [in, out] weight is presented to the kernel through a transposed strided view); "
+                "pass the weight as [out, in] with w_out_in=True"
+            )
         self.tokens = int(sample_x.shape[0])
         proj_dim = int(sample_w.shape[0] if self.w_out_in else sample_w.shape[1])
         self.num_heads = proj_dim // HEAD_DIM
@@ -88,14 +113,14 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
-        self._check_dtype(self.x_desc, dtype=torch.bfloat16, name="x")
-        self._check_dtype(self.w_desc, dtype=torch.bfloat16, name="w")
-        self._check_dtype(self.cos_desc, dtype=torch.bfloat16, name="cos")
-        self._check_dtype(self.sin_desc, dtype=torch.bfloat16, name="sin")
-        self._check_dtype(self.out_fp8_row_desc, dtype=torch.float8_e4m3fn, name="out_fp8_row")
-        self._check_dtype(self.out_fp8_col_desc, dtype=torch.float8_e4m3fn, name="out_fp8_col")
-        self._check_dtype(self.out_scales_row_desc, dtype=torch.uint8, name="out_scales_row")
-        self._check_dtype(self.out_scales_col_desc, dtype=torch.uint8, name="out_scales_col")
+        self._check_dtype(self.x_desc, dtype=cutlass.BFloat16, name="x")
+        self._check_dtype(self.w_desc, dtype=cutlass.BFloat16, name="w")
+        self._check_dtype(self.cos_desc, dtype=cutlass.BFloat16, name="cos")
+        self._check_dtype(self.sin_desc, dtype=cutlass.BFloat16, name="sin")
+        self._check_dtype(self.out_fp8_row_desc, dtype=cutlass.Float8E4M3FN, name="out_fp8_row")
+        self._check_dtype(self.out_fp8_col_desc, dtype=cutlass.Float8E4M3FN, name="out_fp8_col")
+        self._check_dtype(self.out_scales_row_desc, dtype=cutlass.Uint8, name="out_scales_row")
+        self._check_dtype(self.out_scales_col_desc, dtype=cutlass.Uint8, name="out_scales_col")
 
         self._value_error_if(
             self.tokens % TILE_M != 0,
@@ -164,14 +189,15 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         return True
 
     def _to_cute_tensors(self, x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col):
-        """``w`` may be [in, out] (default) or TE-native [out, in] (``w_out_in``); both present as [out, in]."""
-        mA = from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        """Compile-time sample conversion. ``w`` may be [in, out] (default) or TE-native
+        [out, in] (``w_out_in``); both present as [out, in]."""
+        mA = from_dlpack(_maybe_detach(x), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         if self.w_out_in:
-            mB = from_dlpack(w.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            mB = from_dlpack(_maybe_detach(w), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         else:
-            mB = from_dlpack(w.detach().transpose(0, 1), assumed_align=16).mark_layout_dynamic(leading_dim=0)
-        mCos = from_dlpack(cos.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        mSin = from_dlpack(sin.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            mB = from_dlpack(_maybe_detach(w).transpose(0, 1), assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        mCos = from_dlpack(_maybe_detach(cos), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mSin = from_dlpack(_maybe_detach(sin), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mQrow = from_dlpack(out_fp8_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mSrow = from_dlpack(out_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mQcol = from_dlpack(out_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
@@ -187,7 +213,7 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         grid_m = self.tokens // TILE_M
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         swizzle_size = 8
-        compile_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         self._compiled_kernel = cute.compile(
             _bf16in_host,
             *cute_tensors,
@@ -195,7 +221,8 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
             self.num_heads,
             max_active_clusters,
             swizzle_size,
-            compile_stream,
+            fake_stream,
+            options="--enable-tvm-ffi",
         )
         self._samples = None
         self._logger.debug("Kernel compiled successfully")
@@ -212,13 +239,31 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         out_scales_col,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(x))
         self._runtime_error_if(
             self._compiled_kernel is None,
             "GemmProjRopeMxfp8Bf16InSm100 kernel not compiled; call compile() first",
         )
-        cute_tensors = self._to_cute_tensors(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)
-        self._compiled_kernel(*cute_tensors, current_stream)
+        # TVM-FFI entry point: raw DLPack-capable tensors go straight to the compiled
+        # kernel (no per-call from_dlpack). torch inputs are detached views so autograd-
+        # tracked tensors stay exportable; w in [in, out] layout is a transposed view.
+        w_arg = _maybe_detach(w)
+        if not self.w_out_in:
+            w_arg = w_arg.transpose(0, 1)
+        self._compiled_kernel(
+            _maybe_detach(x),
+            w_arg,
+            _maybe_detach(cos),
+            _maybe_detach(sin),
+            out_fp8_row,
+            out_scales_row,
+            out_fp8_col,
+            out_scales_col,
+            current_stream,
+        )
 
 
 # ======================================================================================
@@ -249,16 +294,17 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
-        self.x_code_desc = self._make_tensor_desc(sample_x_code, name="sample_x_code")
-        self.x_scale_desc = self._make_tensor_desc(sample_x_scale, name="sample_x_scale")
-        self.w_code_desc = self._make_tensor_desc(sample_w_code, name="sample_w_code")
-        self.w_scale_desc = self._make_tensor_desc(sample_w_scale, name="sample_w_scale")
-        self.cos_desc = self._make_tensor_desc(sample_cos, name="sample_cos")
-        self.sin_desc = self._make_tensor_desc(sample_sin, name="sample_sin")
-        self.out_fp8_row_desc = self._make_tensor_desc(sample_out_fp8_row, name="sample_out_fp8_row")
-        self.out_scales_row_desc = self._make_tensor_desc(sample_out_scales_row, name="sample_out_scales_row")
-        self.out_fp8_col_desc = self._make_tensor_desc(sample_out_fp8_col, name="sample_out_fp8_col")
-        self.out_scales_col_desc = self._make_tensor_desc(sample_out_scales_col, name="sample_out_scales_col")
+        self._framework = detect_framework(sample_x_code)
+        self.x_code_desc = self._make_tensor_desc(sample_x_code, name="sample_x_code", canonical=True)
+        self.x_scale_desc = self._make_tensor_desc(sample_x_scale, name="sample_x_scale", canonical=True)
+        self.w_code_desc = self._make_tensor_desc(sample_w_code, name="sample_w_code", canonical=True)
+        self.w_scale_desc = self._make_tensor_desc(sample_w_scale, name="sample_w_scale", canonical=True)
+        self.cos_desc = self._make_tensor_desc(sample_cos, name="sample_cos", canonical=True)
+        self.sin_desc = self._make_tensor_desc(sample_sin, name="sample_sin", canonical=True)
+        self.out_fp8_row_desc = self._make_tensor_desc(sample_out_fp8_row, name="sample_out_fp8_row", canonical=True)
+        self.out_scales_row_desc = self._make_tensor_desc(sample_out_scales_row, name="sample_out_scales_row", canonical=True)
+        self.out_fp8_col_desc = self._make_tensor_desc(sample_out_fp8_col, name="sample_out_fp8_col", canonical=True)
+        self.out_scales_col_desc = self._make_tensor_desc(sample_out_scales_col, name="sample_out_scales_col", canonical=True)
 
         self.tokens = int(sample_x_code.shape[0])
         proj_dim = int(sample_w_code.shape[0])  # weight is [N, K]
@@ -282,16 +328,16 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
-        self._check_dtype(self.x_code_desc, dtype=torch.float8_e4m3fn, name="x_code")
-        self._check_dtype(self.w_code_desc, dtype=torch.float8_e4m3fn, name="w_code")
-        self._check_dtype(self.x_scale_desc, dtype=torch.uint8, name="x_scale")
-        self._check_dtype(self.w_scale_desc, dtype=torch.uint8, name="w_scale")
-        self._check_dtype(self.cos_desc, dtype=torch.bfloat16, name="cos")
-        self._check_dtype(self.sin_desc, dtype=torch.bfloat16, name="sin")
-        self._check_dtype(self.out_fp8_row_desc, dtype=torch.float8_e4m3fn, name="out_fp8_row")
-        self._check_dtype(self.out_fp8_col_desc, dtype=torch.float8_e4m3fn, name="out_fp8_col")
-        self._check_dtype(self.out_scales_row_desc, dtype=torch.uint8, name="out_scales_row")
-        self._check_dtype(self.out_scales_col_desc, dtype=torch.uint8, name="out_scales_col")
+        self._check_dtype(self.x_code_desc, dtype=cutlass.Float8E4M3FN, name="x_code")
+        self._check_dtype(self.w_code_desc, dtype=cutlass.Float8E4M3FN, name="w_code")
+        self._check_dtype(self.x_scale_desc, dtype=cutlass.Uint8, name="x_scale")
+        self._check_dtype(self.w_scale_desc, dtype=cutlass.Uint8, name="w_scale")
+        self._check_dtype(self.cos_desc, dtype=cutlass.BFloat16, name="cos")
+        self._check_dtype(self.sin_desc, dtype=cutlass.BFloat16, name="sin")
+        self._check_dtype(self.out_fp8_row_desc, dtype=cutlass.Float8E4M3FN, name="out_fp8_row")
+        self._check_dtype(self.out_fp8_col_desc, dtype=cutlass.Float8E4M3FN, name="out_fp8_col")
+        self._check_dtype(self.out_scales_row_desc, dtype=cutlass.Uint8, name="out_scales_row")
+        self._check_dtype(self.out_scales_col_desc, dtype=cutlass.Uint8, name="out_scales_col")
 
         self._value_error_if(
             self.tokens % TILE_M != 0,
@@ -386,12 +432,13 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         return grid_m, t2r_x8, swizzle_size
 
     def _to_cute_tensors(self, x_code, x_scale, w_code, w_scale, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col):
-        mA = from_dlpack(x_code.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        """Compile-time sample conversion."""
+        mA = from_dlpack(_maybe_detach(x_code), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mSFA = _mxfp8_as_e8m0(x_scale)
-        mB = from_dlpack(w_code.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(_maybe_detach(w_code), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mSFB = _mxfp8_as_e8m0(w_scale)
-        mCos = from_dlpack(cos.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        mSin = from_dlpack(sin.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mCos = from_dlpack(_maybe_detach(cos), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mSin = from_dlpack(_maybe_detach(sin), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mQrow = from_dlpack(out_fp8_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mSrow = from_dlpack(out_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mQcol = from_dlpack(out_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
@@ -407,7 +454,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         grid_m, t2r_x8, swizzle_size = self._grid_params()
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         k_scale_words = self.k_dim // 128  # compact-scale uint32 words per row = K // 128 (deduced, not hardcoded)
-        compile_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
         self._compiled_kernel = cute.compile(
             _mxfp8in_host,
             *cute_tensors,
@@ -417,7 +464,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             swizzle_size,
             t2r_x8,
             k_scale_words,
-            compile_stream,
+            fake_stream,
+            options="--enable-tvm-ffi",
         )
         self._samples = None
         self._logger.debug("Kernel compiled successfully")
@@ -436,24 +484,30 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         out_scales_col,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(x_code))
         self._runtime_error_if(
             self._compiled_kernel is None,
             "GemmProjRopeMxfp8Mxfp8InSm100 kernel not compiled; call compile() first",
         )
-        cute_tensors = self._to_cute_tensors(
-            x_code,
-            x_scale,
-            w_code,
-            w_scale,
-            cos,
-            sin,
+        # TVM-FFI entry point: raw DLPack-capable tensors go straight to the compiled
+        # kernel. The uint8 scale tensors keep the per-call e8m0 element-type reinterpret
+        # (the ABI validates the compiled e8m0 dtype).
+        self._compiled_kernel(
+            _maybe_detach(x_code),
+            _mxfp8_as_e8m0(x_scale),
+            _maybe_detach(w_code),
+            _mxfp8_as_e8m0(w_scale),
+            _maybe_detach(cos),
+            _maybe_detach(sin),
             out_fp8_row,
             out_scales_row,
             out_fp8_col,
             out_scales_col,
+            current_stream,
         )
-        self._compiled_kernel(*cute_tensors, current_stream)
 
 
 # ======================================================================================
@@ -479,13 +533,12 @@ def _check_contiguous(api, **named_descs):
 
 
 def _check_sm100(api):
-    api._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
+    api._runtime_error_if(not cuda_is_available(), "CUDA is not available")
+    major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
     api._runtime_error_if(
         compute_capability < 100,
-        f"GemmProjRopeMxfp8 requires SM100+ compute capability, but found SM{compute_capability} on device {device}",
+        f"GemmProjRopeMxfp8 requires SM100+ compute capability, but found SM{compute_capability} on the current device",
     )
 
 
@@ -522,21 +575,50 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
     Returns:
         ``TupleDict(out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)``.
     """
-    assert x.dtype == w.dtype, f"x and w must share a dtype (both bfloat16 or both float8_e4m3fn); got x {x.dtype}, w {w.dtype}"
+    framework = detect_framework(x)
+    if framework not in ("torch", "jax"):
+        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_proj_rope_mxfp8_wrapper_sm100; pass torch tensors or JAX arrays")
 
-    tokens = x.shape[0]
+    x_cutlass_dtype = _convert_to_cutlass_data_type(x.dtype)
+    assert x_cutlass_dtype == _convert_to_cutlass_data_type(
+        w.dtype
+    ), f"x and w must share a dtype (both bfloat16 or both float8_e4m3fn); got x {x.dtype}, w {w.dtype}"
+
+    tokens = get_shape(x)[0]
     device = x.device
-    proj_dim = w.shape[0] if w_out_in else w.shape[1]
+    proj_dim = get_shape(w)[0] if w_out_in else get_shape(w)[1]
     num_heads = proj_dim // HEAD_DIM
 
-    out_fp8_row = torch.empty(tokens, num_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    out_scales_row = torch.empty(tokens, num_heads, HEAD_DIM // BLOCK, dtype=torch.uint8, device=device)
-    out_fp8_col = torch.empty(tokens, num_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    out_scales_col = torch.empty(tokens // BLOCK, num_heads, HEAD_DIM, dtype=torch.uint8, device=device)
+    if framework == "torch":
+        import torch
 
-    if x.dtype == torch.bfloat16:
+        out_fp8_row = torch.empty(tokens, num_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
+        out_scales_row = torch.empty(tokens, num_heads, HEAD_DIM // BLOCK, dtype=torch.uint8, device=device)
+        out_fp8_col = torch.empty(tokens, num_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
+        out_scales_col = torch.empty(tokens // BLOCK, num_heads, HEAD_DIM, dtype=torch.uint8, device=device)
+    else:
+        import jax
+        import jax.numpy as jnp
+
+        if not w_out_in:
+            raise ValueError(
+                "w_out_in=False is not expressible as JAX arrays for gemm_proj_rope_mxfp8_wrapper_sm100 "
+                "(the [in, out] weight is presented to the kernel through a transposed strided view); "
+                "pass the weight as [out, in] with w_out_in=True"
+            )
+        fp8 = framework_dtype(cutlass.Float8E4M3FN, "jax")
+        u8 = framework_dtype(cutlass.Uint8, "jax")
+        out_fp8_row = jnp.empty((tokens, num_heads, HEAD_DIM), dtype=fp8, device=device)
+        out_scales_row = jnp.empty((tokens, num_heads, HEAD_DIM // BLOCK), dtype=u8, device=device)
+        out_fp8_col = jnp.empty((tokens, num_heads, HEAD_DIM), dtype=fp8, device=device)
+        out_scales_col = jnp.empty((tokens // BLOCK, num_heads, HEAD_DIM), dtype=u8, device=device)
+        # The kernel writes into these buffers on the launch stream; make sure XLA has
+        # finished materializing them before the kernel runs.
+        jax.block_until_ready((out_fp8_row, out_scales_row, out_fp8_col, out_scales_col))
+
+    if x_cutlass_dtype is cutlass.BFloat16:
         assert x_scale is None and w_scale is None, "bf16 inputs must not be given MXFP8 scales (x_scale/w_scale); those are for the float8_e4m3fn path"
-        key = (tuple(x.shape), tuple(w.shape), bool(w_out_in), device)
+        key = (get_shape(x), get_shape(w), bool(w_out_in), get_device(x))
         obj = _bf16in_obj_cache.get(key)
         if obj is None:
             obj = GemmProjRopeMxfp8Bf16InSm100(
@@ -555,14 +637,14 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
             _bf16in_obj_cache[key] = obj
         obj.execute(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, current_stream=stream)
 
-    elif x.dtype == torch.float8_e4m3fn:
+    elif x_cutlass_dtype is cutlass.Float8E4M3FN:
         assert x_scale is not None and w_scale is not None, "MXFP8 (float8_e4m3fn) inputs require x_scale and w_scale (E8M0 rowwise block scales)"
         # the mxfp8in kernel expects the weight as [out, in]; transpose code + scale for [in, out].
         if w_out_in:
             wc, ws = w, w_scale
         else:
             wc, ws = w.T.contiguous(), w_scale.T.contiguous()
-        key = (tuple(x.shape), tuple(wc.shape), device)
+        key = (get_shape(x), get_shape(wc), get_device(x))
         obj = _mxfp8in_obj_cache.get(key)
         if obj is None:
             obj = GemmProjRopeMxfp8Mxfp8InSm100(

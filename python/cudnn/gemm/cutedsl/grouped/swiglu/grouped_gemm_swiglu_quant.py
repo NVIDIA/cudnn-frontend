@@ -13,6 +13,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -20,6 +21,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..utils import (
     PersistentTileSchedulerParams,
     StaticPersistentTileScheduler,
@@ -295,7 +297,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -562,16 +564,24 @@ class BlockScaledContiguousGroupedGemmKernel:
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
+        # Canonical-rank operands (grouped/canonical.py) normalize to the kernel-facing views.
+        a = kernel_facing_mx(a)
+        b = kernel_facing_b(b)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         # Compute grid size
         m, n, l = cute.shape(d)
@@ -1297,7 +1307,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1342,7 +1352,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2311,7 +2321,7 @@ class BlockScaledContiguousGroupedGemmKernel:
                 #
                 if cutlass.const_expr(prob is not None):
                     mPosition = tile_info[0] * self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape) + tidx
-                    mProb = prob[mPosition, 0, 0]
+                    mProb = prob[mPosition, 0, 0].to(cutlass.Float32)
                 else:
                     mProb = cutlass.Float32(1.0)
 
@@ -2616,6 +2626,8 @@ class BlockScaledContiguousGroupedGemmKernel:
             c_pipeline.producer_tail()
             d_pipeline.producer_tail()
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     def epilog_tmem_copy_and_partition(
         self,
         tidx: cutlass.Int32,
@@ -2769,9 +2781,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         epi_tile: cute.Tile,
         epi_tile_c: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         num_smem_capacity: int,
@@ -2793,7 +2805,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param d_layout: Layout of operand D.
-        :type d_layout: utils.LayoutEnum
+        :type d_layout: LayoutEnum
         :param sf_dtype: Data type of scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Vector size of scale factor.

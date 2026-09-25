@@ -86,6 +86,22 @@ kernel_cache_from_json_helper(std::shared_ptr<cudnn_frontend::KernelCache> kerne
     throw_if(err.is_bad(), err.code, err.get_message());
 }
 
+int64_t
+kernel_cache_revision_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
+    int64_t value = 0;
+    auto err      = kernel_cache->revision(value);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return value;
+}
+
+int64_t
+kernel_cache_size_helper(std::shared_ptr<cudnn_frontend::KernelCache> const& kernel_cache) {
+    int64_t value = 0;
+    auto err      = kernel_cache->size(value);
+    throw_if(err.is_bad(), err.code, err.get_message());
+    return value;
+}
+
 std::shared_ptr<cudnn_frontend::DeviceProperties>
 create_device_properties_helper(int32_t device_id) {
     auto device_properties = std::make_shared<cudnn_frontend::DeviceProperties>();
@@ -143,6 +159,7 @@ init_properties(py::module_& m) {
         .value("FP8_E5M2", cudnn_frontend::DataType_t::FP8_E5M2)
         .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
         .value("FP8_E8M0", cudnn_frontend::DataType_t::FP8_E8M0)
+        .value("FP8_E5M3", cudnn_frontend::DataType_t::FP8_E5M3)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("INT4", cudnn_frontend::DataType_t::INT4)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
@@ -243,7 +260,25 @@ init_properties(py::module_& m) {
         .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG)
         .value("SWAP_AB", cudnn_frontend::KnobType_t::SWAP_AB)
         .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
-        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE);
+        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE)
+        .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA)
+        // frontend-only band (knobs.h): never handed to the backend
+        .value("SCHED_POLICY", cudnn_frontend::KnobType_t::SCHED_POLICY)
+        .value("PACK_GQA", cudnn_frontend::KnobType_t::PACK_GQA)
+        .value("SPLIT_KV", cudnn_frontend::KnobType_t::SPLIT_KV)
+        .value("PIPELINE_ARCH", cudnn_frontend::KnobType_t::PIPELINE_ARCH)
+        .value("MMA_TILE_M", cudnn_frontend::KnobType_t::MMA_TILE_M)
+        .value("MMA_TILE_N", cudnn_frontend::KnobType_t::MMA_TILE_N)
+        .value("MMA_TILE_K", cudnn_frontend::KnobType_t::MMA_TILE_K)
+        .value("CTA_GROUP", cudnn_frontend::KnobType_t::CTA_GROUP)
+        .value("WARPS_M", cudnn_frontend::KnobType_t::WARPS_M)
+        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N);
+    m.attr("FRONTEND_KNOB_TYPE_BASE") = py::int_(cudnn_frontend::FRONTEND_KNOB_TYPE_BASE);
+    m.def(
+        "is_frontend_knob_type",
+        [](cudnn_frontend::KnobType_t const knob_type) { return cudnn_frontend::is_frontend_knob_type(knob_type); },
+        py::arg("knob_type"),
+        "True for knobs in the frontend-only band (>= FRONTEND_KNOB_TYPE_BASE); they have no backend counterpart.");
 
     py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),
@@ -270,7 +305,34 @@ init_properties(py::module_& m) {
 
     py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache")
         .def("serialize", &kernel_cache_to_json_helper)
-        .def("deserialize", &kernel_cache_from_json_helper);
+        .def("deserialize", &kernel_cache_from_json_helper)
+        .def("revision",
+             &kernel_cache_revision_helper,
+             R"pbdoc(
+                Get a counter that shows if the contents of the kernel cache changed.
+
+                An insertion, a replacement, a removal, or an eviction each add one to the counter.
+                A lookup does not change the counter. Use this function, and not size(), to find if
+                the cache changed. cuDNN can replace data that is already in the cache, so size()
+                is not a reliable measure.
+
+                The counter is local to the process. serialize() does not put the counter in its
+                data, and deserialize() starts a new count.
+
+                Returns:
+                    int: The revision counter.
+             )pbdoc")
+        .def("size",
+             &kernel_cache_size_helper,
+             R"pbdoc(
+                Get the number of entries in the kernel cache.
+
+                Two different shapes can use the same entry, so this count does not track the
+                number of shapes that were built.
+
+                Returns:
+                    int: The number of entries.
+             )pbdoc");
     m.def("create_kernel_cache", &create_kernel_cache_helper);
 
     py::class_<cudnn_frontend::DeviceProperties, std::shared_ptr<cudnn_frontend::DeviceProperties>>(m,
@@ -284,9 +346,12 @@ init_properties(py::module_& m) {
               &create_device_properties_helper));
 
     m.def("create_handle", &HandleManagement::create_handle);
-    m.def("destroy_handle", &HandleManagement::destroy_handle);
+    // destroy_handle / set_stream are exposed under a raw name and wrapped in Python
+    // (cudnn/__init__.py) to skip a redundant cudnnSetStream when the stream is unchanged,
+    // matching how the graph execute binding (_execute) is wrapped as the public execute().
+    m.def("_raw_destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
-    m.def("set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
+    m.def("_raw_set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
 
     py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)

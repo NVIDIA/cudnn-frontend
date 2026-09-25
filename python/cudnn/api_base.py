@@ -14,14 +14,51 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Tuple, Optional
 import logging
+import sys
 import threading
 import cuda.bindings.driver as cuda
 import cutlass
-import torch
 
 import cutlass.cute as cute
 from cudnn._experimental_warnings import warn_experimental_api_once
-from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.datatypes import _convert_to_cutlass_data_type, _convert_to_cutlass_data_type_or_none
+from cudnn.tensor_adapter import (
+    Device,
+    canonicalize_unit_dim_strides,
+    cuda_is_available,
+    get_compute_capability,
+    get_device,
+    get_shape,
+    get_strides,
+)
+
+# torch stays a lazy dependency: a torch tensor/dtype can only reach these APIs if torch
+# is already imported, so probing sys.modules never imports torch on behalf of other
+# frameworks (e.g. JAX).
+
+
+def _torch():
+    return sys.modules.get("torch")
+
+
+_RAW_STREAM = None
+
+
+def _raw_stream(torch):
+    """``device_index -> raw CUstream int``, resolved once.
+
+    ``torch._C._cuda_getCurrentRawStream`` is private, so fall back to the
+    documented accessor if a torch build ever drops it.
+    """
+    global _RAW_STREAM
+    if _RAW_STREAM is None:
+        _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (lambda _dev: torch.cuda.current_stream().cuda_stream)
+    return _RAW_STREAM
+
+
+def _is_framework_tensor(obj: Any) -> bool:
+    """True for framework tensors (torch/jax/numpy/...) as opposed to dtypes or shape/stride tuples."""
+    return hasattr(obj, "__dlpack__")
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -35,7 +72,7 @@ def is_power_of_2(n: int) -> bool:
 
 def is_sm107_device() -> bool:
     """Return True when the current CUDA device is Rubin (SM107)."""
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 7)
+    return cuda_is_available() and get_compute_capability() == (10, 7)
 
 
 def get_device_type() -> str:
@@ -67,11 +104,11 @@ def _reset_experimental_api_warning_registry() -> None:
 class TensorDesc:
     """Metadata needed to validate/compile tensor signatures without storage."""
 
-    dtype: torch.dtype
+    dtype: Any
     shape: Tuple[int, ...]
     stride: Tuple[int, ...]
     stride_order: Tuple[int, ...]
-    device: torch.device
+    device: Any
     interpret_uint8_as_fp4x2: bool = False
     ndim: int = field(init=False)
     name: str = ""
@@ -81,7 +118,8 @@ class TensorDesc:
         stride = tuple(self.stride)
         stride_order = tuple(self.stride_order)
         device = self.device
-        if not isinstance(device, torch.device):
+        torch = _torch()
+        if torch is not None and not isinstance(device, (torch.device, Device)):
             try:
                 device = torch.device(device)
             except (TypeError, ValueError, RuntimeError) as exc:
@@ -198,9 +236,10 @@ class TensorDesc:
             raise TypeError("len() of a 0-d tensor")
         return self.shape[0]
 
-    def size(self, dim: Optional[int] = None) -> torch.Size | int:
+    def size(self, dim: Optional[int] = None) -> Tuple[int, ...] | int:
         if dim is None:
-            return torch.Size(self.shape)
+            torch = _torch()
+            return torch.Size(self.shape) if torch is not None else self.shape
         dim = self._normalize_dim(int(dim), self.ndim)
         return self.shape[dim]
 
@@ -260,16 +299,18 @@ class TensorDesc:
         new_stride = self.stride[:dim] + (inserted_stride,) + self.stride[dim:]
         return self._with_layout(new_shape, new_stride)
 
-    def is_contiguous(self, memory_format: torch.memory_format = torch.contiguous_format) -> bool:
-        if memory_format in {torch.contiguous_format, torch.preserve_format}:
+    def is_contiguous(self, memory_format: Any = None) -> bool:
+        """Row-major contiguity check; ``memory_format=None`` means torch.contiguous_format semantics."""
+        torch = _torch()
+        if memory_format is None or (torch is not None and memory_format in {torch.contiguous_format, torch.preserve_format}):
             if self._numel(self.shape) == 0:
                 return True
             return self._is_contiguous_with_order(self.shape, self.stride, tuple(range(self.ndim - 1, -1, -1)))
-        if memory_format == torch.channels_last:
+        if torch is not None and memory_format == torch.channels_last:
             if self.ndim != 4:
                 return False
             return self._is_contiguous_with_order(self.shape, self.stride, (1, 3, 2, 0))
-        if memory_format == torch.channels_last_3d:
+        if torch is not None and memory_format == torch.channels_last_3d:
             if self.ndim != 5:
                 return False
             return self._is_contiguous_with_order(self.shape, self.stride, (1, 4, 3, 2, 0))
@@ -540,10 +581,15 @@ class APIBase(ABC):
             ...     current_stream = self._get_default_stream(current_stream)
             ...     # Now current_stream is guaranteed to be a valid stream
         """
-        if stream is None:
-            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using torch current stream")
-            return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        return stream
+        if stream is not None:
+            return stream
+        torch = _torch()
+        if torch is None:
+            return cuda.CUstream(0)
+        # _cuda_getCurrentRawStream is the same value torch.cuda.current_stream()
+        # reports, without building the Stream wrapper: 0.1 us against 4.3 us,
+        # and execute() calls this once per launch.
+        return cuda.CUstream(_raw_stream(torch)(torch.cuda.current_device()))
 
     def _pad_tensor_to_ndim(
         self,
@@ -567,8 +613,12 @@ class APIBase(ABC):
 
         if tensor.ndim < ndim:
             self._logger.info(f"Padding {name} to {ndim}D from {tensor.shape}")
-            for _ in range(ndim - tensor.ndim):
-                tensor = tensor.unsqueeze(-1)
+            if hasattr(tensor, "unsqueeze"):
+                for _ in range(ndim - tensor.ndim):
+                    tensor = tensor.unsqueeze(-1)
+            else:
+                # e.g. JAX arrays have no unsqueeze; appending unit dims via reshape is equivalent
+                tensor = tensor.reshape(tuple(tensor.shape) + (1,) * (ndim - tensor.ndim))
         return tensor
 
     def _unpad_tensor_to_ndim(
@@ -616,13 +666,16 @@ class APIBase(ABC):
         if isinstance(tensor_or_dtype, TensorDesc):
             dtype = tensor_or_dtype.dtype
             interpret_uint8_as_fp4x2 = tensor_or_dtype.interpret_uint8_as_fp4x2
-        elif isinstance(tensor_or_dtype, torch.Tensor):
+        elif _is_framework_tensor(tensor_or_dtype):
             dtype = tensor_or_dtype.dtype
             interpret_uint8_as_fp4x2 = self._interpret_uint8_as_fp4x2
         else:
             dtype = tensor_or_dtype
             interpret_uint8_as_fp4x2 = self._interpret_uint8_as_fp4x2
-        return (dtype == torch.float4_e2m1fn_x2) or (interpret_uint8_as_fp4x2 and dtype == torch.uint8)
+        # Compare in canonical (cutlass) dtype space so torch/jax/numpy dtypes all resolve;
+        # dtypes with no cutlass mapping compare False, as before.
+        dtype = _convert_to_cutlass_data_type_or_none(dtype)
+        return (dtype is cutlass.Float4E2M1FN) or (interpret_uint8_as_fp4x2 and dtype is cutlass.Uint8)
 
     def _is_fp8(self, tensor_or_dtype: torch.Tensor | torch.dtype | TensorDesc) -> bool:
         """Check if tensor or dtype is an FP8 datatype.
@@ -634,8 +687,8 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
-        return dtype in {torch.float8_e5m2, torch.float8_e4m3fn}
+        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, TensorDesc) or _is_framework_tensor(tensor_or_dtype) else tensor_or_dtype
+        return _convert_to_cutlass_data_type_or_none(dtype) in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
 
     def _is_f16(self, tensor_or_dtype: torch.Tensor | torch.dtype | TensorDesc) -> bool:
         """Check if tensor or dtype is an fp16 or bf16 datatype.
@@ -647,20 +700,19 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
-        return dtype in {torch.float16, torch.bfloat16}
+        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, TensorDesc) or _is_framework_tensor(tensor_or_dtype) else tensor_or_dtype
+        return _convert_to_cutlass_data_type_or_none(dtype) in {cutlass.Float16, cutlass.BFloat16}
 
     def _get_innermost_stride_dim(self, tensor: torch.Tensor, name: str = "") -> int:
         """Return index of innermost contiguous dimension (stride == 1).
 
         :raises RuntimeError: If no dimension with stride 1 is found.
         """
-        idx = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
+        tensor_stride = get_strides(tensor)
+        idx = next((i for i, s in enumerate(tensor_stride) if s == 1), None)
         if idx is None:
-            self._logger.critical(
-                f"tensor {name} has shape: {tensor.shape} stride {tensor.stride()} – innermost contiguous (stride == 1) dimension not found. "
-            )
-            raise RuntimeError(f"tensor {name} has shape: {tensor.shape} stride {tensor.stride()} – innermost contiguous (stride == 1) dimension not found. ")
+            self._logger.critical(f"tensor {name} has shape: {tensor.shape} stride {tensor_stride} – innermost contiguous (stride == 1) dimension not found. ")
+            raise RuntimeError(f"tensor {name} has shape: {tensor.shape} stride {tensor_stride} – innermost contiguous (stride == 1) dimension not found. ")
         return idx
 
     def _tensor_shape(
@@ -688,11 +740,11 @@ class APIBase(ABC):
 
         if self._is_fp4x2(tensor):
             innermost_dim_index = self._get_innermost_stride_dim(tensor, name=name)
-            shape = tuple(dim * 2 if i == innermost_dim_index else dim for i, dim in enumerate(tensor.shape))
+            shape = tuple(dim * 2 if i == innermost_dim_index else dim for i, dim in enumerate(get_shape(tensor)))
             self._logger.debug(f"FP4x2 tensor {name}: physical shape {tensor.shape} -> logical shape {shape}")
             return shape
         else:
-            return tensor.shape
+            return get_shape(tensor)
 
     def _tensor_stride(
         self,
@@ -719,11 +771,12 @@ class APIBase(ABC):
 
         if self._is_fp4x2(tensor):
             innermost_dim_index = self._get_innermost_stride_dim(tensor, name=name)
-            strides = tuple(s * 2 if i != innermost_dim_index else s for i, s in enumerate(tensor.stride()))
-            self._logger.debug(f"FP4x2 tensor {name}: physical stride {tensor.stride()} -> logical stride {strides}")
+            tensor_stride = get_strides(tensor)
+            strides = tuple(s * 2 if i != innermost_dim_index else s for i, s in enumerate(tensor_stride))
+            self._logger.debug(f"FP4x2 tensor {name}: physical stride {tensor_stride} -> logical stride {strides}")
             return strides
         else:
-            return tensor.stride()
+            return get_strides(tensor)
 
     def _check_tensor_shape(
         self,
@@ -745,7 +798,11 @@ class APIBase(ABC):
         """
         if tensor_or_shape is None:
             return None
-        tensor_shape = self._tensor_shape(tensor_or_shape, name=name) if isinstance(tensor_or_shape, (torch.Tensor, TensorDesc)) else tensor_or_shape
+        tensor_shape = (
+            self._tensor_shape(tensor_or_shape, name=name)
+            if isinstance(tensor_or_shape, TensorDesc) or _is_framework_tensor(tensor_or_shape)
+            else tensor_or_shape
+        )
         if isinstance(shape, tuple):
             if tensor_shape != shape:
                 raise ValueError(f"{name} tensor shape mismatch: expected {shape}, got {tensor_shape}")
@@ -785,7 +842,7 @@ class APIBase(ABC):
         if isinstance(tensor_or_stride, TensorDesc):
             tensor_stride = tensor_or_stride.stride
             tensor_stride_order = tensor_or_stride.stride_order
-        elif isinstance(tensor_or_stride, torch.Tensor):
+        elif _is_framework_tensor(tensor_or_stride):
             tensor_stride = self._tensor_stride(tensor_or_stride, name=name)
             tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1]))
         else:
@@ -851,8 +908,10 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return None
-        tensor_dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
-        if isinstance(dtype, torch.dtype):
+        tensor_dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, TensorDesc) or _is_framework_tensor(tensor_or_dtype) else tensor_or_dtype
+        torch = _torch()
+        is_scalar_dtype = (torch is not None and isinstance(dtype, torch.dtype)) or (isinstance(dtype, type) and issubclass(dtype, cutlass.Numeric))
+        if is_scalar_dtype:
             if tensor_dtype != dtype:
                 error_msg = f"{name} dtype mismatch: expected {dtype}, got {tensor_dtype}"
                 if extra_error_msg:
@@ -927,11 +986,18 @@ class APIBase(ABC):
 
     def _make_tensor_desc(
         self,
-        tensor: Optional[torch.Tensor],
+        tensor: Optional[Any],
         name: str = "",
         interpret_uint8_as_fp4x2: Optional[bool] = None,
+        canonical: bool = False,
     ) -> Optional[TensorDesc]:
-        """Capture logical tensor metadata that is sufficient for validation/compile."""
+        """Capture logical tensor metadata that is sufficient for validation/compile.
+
+        With ``canonical=True`` the descriptor is framework-neutral: the dtype is converted
+        to its cutlass type, the device is read via the tensor adapter (torch tensors keep
+        torch.device), and extent-1 dims get canonicalized strides so layouts that differ
+        only in unit-dim strides -- unobservable by the kernels -- compare and compile equal.
+        """
         if tensor is None:
             return None
         if interpret_uint8_as_fp4x2 is None:
@@ -943,13 +1009,20 @@ class APIBase(ABC):
             tensor_stride = self._tensor_stride(tensor, name=name)
         finally:
             self._interpret_uint8_as_fp4x2 = prev_interpret
+        if canonical:
+            dtype = _convert_to_cutlass_data_type(tensor.dtype)
+            device = get_device(tensor)
+            tensor_stride = canonicalize_unit_dim_strides(tensor_shape, tensor_stride)
+        else:
+            dtype = tensor.dtype
+            device = tensor.device
         tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: (x[1], tensor_shape[x[0]])))
         return TensorDesc(
-            dtype=tensor.dtype,
+            dtype=dtype,
             shape=tensor_shape,
             stride=tensor_stride,
             stride_order=tensor_stride_order,
-            device=tensor.device,
+            device=device,
             interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2,
             name=name,
         )

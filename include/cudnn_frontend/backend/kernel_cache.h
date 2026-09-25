@@ -9,6 +9,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -23,7 +24,7 @@ class Graph;
 /// KernelCache Class
 /// Wraps the kernel_cache backend descriptor
 /// Wraps backend utility functions for user's convenience
-/// Backend accessor functions: size()
+/// Backend accessor functions: revision(), size()
 /// Contains internal utilities for kernel cache finalization and operation graph attributes
 ///
 class KernelCache : public detail::backend_descriptor {
@@ -40,8 +41,18 @@ class KernelCache : public detail::backend_descriptor {
     }
 
     bool
-    is_finalized() {
-        return finalized;
+    is_finalized() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return finalized_unlocked();
+    }
+
+    // Returns the underlying descriptor pointer by VALUE under the lock.
+    // Use this instead of get_ptr() when the cache may still be under concurrent build().
+    // IMPORTANT: do not call from any method that already holds mutex_ (non-recursive).
+    cudnnBackendDescriptor_t
+    get_ptr_locked() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return get_ptr();
     }
 
     // Used to check kernel cache status (particularly after initialization)
@@ -56,11 +67,17 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     to_json(std::string &str_json) const {
+        std::lock_guard<std::mutex> lk(mutex_);
         str_json.clear();
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
                                        "CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION is only available starting 9.10.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            get_ptr() == nullptr,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            "KernelCache::to_json: descriptor not initialized; call build() or from_json() first.");
 
         int64_t serializationSize;
         std::vector<char> serialization_buf;
@@ -86,6 +103,7 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     from_json(const std::string &json_cache) {
+        std::lock_guard<std::mutex> lk(mutex_);
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
@@ -113,14 +131,68 @@ class KernelCache : public detail::backend_descriptor {
 #endif
     }
 
-    // Responsible for initializing, setting operation graph attribute, and finalizing kernel cache
-    // Check for both compile-time and runtime cuDNN version
+    /// Gets a counter that shows if the contents of the kernel cache changed.
+    ///
+    /// An insertion, a replacement, a removal, or an eviction each add one to the counter. A
+    /// lookup does not change the counter.
+    ///
+    /// Use this function, and not size(), to find if the cache changed. cuDNN can replace data
+    /// that is already in the cache, so size() is not a reliable measure. A change in the counter
+    /// shows, for example, that a new serialization is worth the cost.
+    ///
+    /// The counter is local to the process. to_json() does not put the counter in its data, and
+    /// from_json() starts a new count. Two kernel caches have no common count.
+    ///
+    /// The kernel cache must be finalized.
+    error_t
+    revision(int64_t &value) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        value = 0;
+#if (CUDNN_VERSION >= 92700)
+        return get_int64_attribute_unlocked(
+            CUDNN_ATTR_KERNEL_CACHE_REVISION, "CUDNN_ATTR_KERNEL_CACHE_REVISION", "KernelCache::revision", value);
+#else
+        return {error_code_t::CUDNN_BACKEND_API_FAILED, too_old_message("CUDNN_ATTR_KERNEL_CACHE_REVISION")};
+#endif
+    }
+
+    /// Gets the number of entries in the kernel cache.
+    ///
+    /// Two different shapes can use the same entry, so this count does not track the number of
+    /// shapes that were built.
+    ///
+    /// A replacement changes the data of an entry but keeps the number of entries. Thus use
+    /// revision(), and not this function, to find if the data changed.
+    ///
+    /// The kernel cache must be finalized.
+    error_t
+    size(int64_t &value) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        value = 0;
+#if (CUDNN_VERSION >= 92700)
+        return get_int64_attribute_unlocked(
+            CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT, "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT", "KernelCache::size", value);
+#else
+        return {error_code_t::CUDNN_BACKEND_API_FAILED, too_old_message("CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT")};
+#endif
+    }
+
+    // Responsible for initializing, setting operation graph attribute, and finalizing kernel cache.
+    // Check for both compile-time and runtime cuDNN version.
+    // Thread-safe: the entire body is locked so concurrent callers serialize. Idempotent: a second
+    // call after finalization returns OK immediately without re-initializing the descriptor.
+    // NOTE: build() uses get_ptr() (inherited, unlocked) — it MUST NOT call get_ptr_locked() as
+    // mutex_ is non-recursive and is already held for the duration of this call.
     error_t
     build(cudnnBackendDescriptor_t op_graph) {
+        std::lock_guard<std::mutex> lk(mutex_);
 #if (CUDNN_VERSION >= 90400)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90400,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR is only available starting 9.4.");
+        if (finalized_unlocked()) {
+            return {};
+        }
         if (get_ptr() == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(initialize(CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR));
         }
@@ -147,5 +219,45 @@ class KernelCache : public detail::backend_descriptor {
 
    private:
     bool finalized = false;
+    // Protects finalized, and the desc/status members inherited from backend_descriptor.
+    // KernelCache is always heap-allocated via shared_ptr and never moved after construction.
+    mutable std::mutex mutex_;
+
+    // Must only be called with mutex_ already held (by build(), is_finalized(), etc.).
+    bool
+    finalized_unlocked() const {
+        return finalized;
+    }
+
+    // The message that both revision() and size() give when the attribute is not available. The
+    // runtime check and the compile-time check use it, so the text exists once.
+    static std::string
+    too_old_message(const char *attribute_name) {
+        return std::string(attribute_name) + " is only available starting 9.27.";
+    }
+
+    // Reads one CUDNN_TYPE_INT64 attribute that cuDNN 9.27 adds. revision() and size() differ only
+    // in the attribute that they read, so the version check, the descriptor check and the read live
+    // here. The caller keeps the compile-time guard, because it must name the attribute.
+    // Must only be called with mutex_ already held (mutex_ is not recursive).
+    error_t
+    get_int64_attribute_unlocked(cudnnBackendAttributeName_t attribute,
+                                 const char *attribute_name,
+                                 const char *method_name,
+                                 int64_t &value) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       too_old_message(attribute_name));
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            get_ptr() == nullptr,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            std::string(method_name) + ": descriptor not initialized; call build() or from_json() first.");
+
+        int64_t element_count = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(
+            detail::get_attribute(get_ptr(), attribute, CUDNN_TYPE_INT64, 1, &element_count, &value));
+        return {};
+    }
 };
 }  // namespace cudnn_frontend

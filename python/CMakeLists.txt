@@ -13,11 +13,16 @@ set(BUILD_MOCK OFF)
 option(CUDNN_FRONTEND_USE_SYSTEM_DLPACK "Whether dlpack should use the system version or fetched." OFF)
 
 IF(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
-  find_package(dlpack REQUIRED)
+  # 1.3 is where DLPackExchangeAPI is declared, which pygraph/variant_pack.cpp
+  # needs. The wire structs are byte-identical to 1.1 -- sizeof and every
+  # offsetof of DLTensor and DLManagedTensor match -- so this is a
+  # compile-time requirement only; capsules exchanged with a consumer built
+  # against 1.1 are unaffected.
+  find_package(dlpack 1.3 REQUIRED)
   if(dlpack_FOUND)
-    message(STATUS "Found system dlpack")
+    message(STATUS "Found system dlpack ${dlpack_VERSION}")
   else()
-    message(FATAL_ERROR "dlpack not found")
+    message(FATAL_ERROR "dlpack >= 1.3 not found (needed for DLPackExchangeAPI); unset CUDNN_FRONTEND_USE_SYSTEM_DLPACK to fetch it")
   endif()
 else()
 
@@ -62,12 +67,14 @@ python_add_library(
     
     MODULE
     pycudnn.cpp
+    gnn.cpp
     properties.cpp
 
     pygraph/pygraph.cpp
     pygraph/norm.cpp
     pygraph/sdpa.cpp
     pygraph/pointwise.cpp
+    pygraph/variant_pack.cpp
 
     WITH_SOABI
 )

@@ -1,0 +1,2 @@
+# Benchmark-only dependency; not part of cudnn-frontend's runtime package.
+diffusers @ git+https://github.com/huggingface/diffusers.git@2f7e0154a9db246e95c9ede43edba7db5b130805

@@ -7,6 +7,7 @@ Unnecessary once the engine ships in the built frontend package."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -33,3 +34,58 @@ def _frost_opt_in(monkeypatch):
     the same pytest process, quietly turning a default-path run into an opt-in
     one."""
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+
+
+@pytest.fixture(autouse=True)
+def _moe_plan_workspace(request, monkeypatch):
+    """A compiled MoE plan owns no workspace (Rule 8): called without one it raises
+    the contract error. This suite calls the direct ``jit_from_cudnn_graph`` plans
+    in 180+ places, so the HARNESS supplies ``workspace_bytes`` here -- per test,
+    through monkeypatch, so the plan classes themselves stay strict. Opt out with
+    ``@pytest.mark.no_workspace_shim`` to test the contract error itself."""
+    if request.node.get_closest_marker("no_workspace_shim"):
+        yield
+        return
+    import torch
+    from cudnn._torch_stream import stream_context
+    from cudnn.gemm.frost.sm100 import compiler as _sm100
+    from cudnn.gemm.frost.sm120 import compiler as _sm120
+
+    for cls in (_sm100.CompiledMoeGemm, _sm100.CompiledMoeBlockScaleGemm, _sm120.CompiledMoeGemm, _sm120.CompiledMoeBlockScaleGemm):
+        real = cls.__call__
+
+        def shim(self, variant_pack, workspace=None, stream=None, _real=real):
+            if workspace is None and self.workspace_bytes:
+                # Allocated on the launch stream (R1) so the allocator's reuse ordering covers the plan.
+                with stream_context(stream, self.device):
+                    workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=torch.device("cuda", self.device))
+            return _real(self, variant_pack, workspace=workspace, stream=stream)
+
+        monkeypatch.setattr(cls, "__call__", shim)
+    yield
+
+
+# A template family that does not run on the active GPU -- or that this
+# process's arch tree does not render -- is a capability gap, not a defect.
+# Every frost jit path declines it with one of two messages:
+# kernel_registry.KernelTemplate.arch_active_reject (the SM range) and the
+# compiler's _check_own_family (an sm120 config on a process running the sm100
+# tree, or the reverse), so a test that pins a config of another family reports
+# that message and nothing else. Report it as skipped, the way the arch markers
+# do for the families a test knows to gate on, so a run on a part the config
+# was never meant for reads as what it is.
+_ARCH_DECLINE = re.compile(
+    r"runs only on \d+ <= SM < \d+.* but the active GPU is sm_\d+" r"|is served by the sm\d+ arch tree, but this process runs the sm\d+ tree"
+)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when != "call" or not rep.failed or call.excinfo is None:
+        return
+    exc = call.excinfo.value
+    if isinstance(exc, NotImplementedError) and _ARCH_DECLINE.search(str(exc)):
+        rep.outcome = "skipped"
+        rep.longrepr = (str(item.path), item.location[1], f"SKIPPED: {exc}")

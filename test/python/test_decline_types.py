@@ -23,14 +23,16 @@ from cudnn.engines.base import decline_types
 
 @pytest.mark.L0
 def test_device_probes_decline_when_no_driver(monkeypatch):
+    from cudnn import _device
     from cudnn.frost import device
 
+    monkeypatch.setattr(_device, "_driver", lambda: None)
     monkeypatch.setattr(device, "_driver", lambda: None)
 
     with pytest.raises(decline_types()):
         device.current_device()
     with pytest.raises(decline_types()):
-        device._device_handle(0)
+        _device._device_handle(0)
     with pytest.raises(decline_types()):
         with device.device_context(0):
             pass

@@ -184,8 +184,8 @@ def test_grouped_gemm_quant_has_rubin_compile_branches():
 @pytest.mark.parametrize(
     "kernel_path",
     [
-        "grouped_gemm_quant/grouped_gemm_quant.py",
-        "grouped_gemm_quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
+        "quant/grouped_gemm_quant.py",
+        "quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
     ],
 )
 def test_grouped_gemm_quant_kernels_support_optional_prob(kernel_path):
@@ -215,8 +215,9 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
     sf_vec_size,
     expected,
 ):
+    import torch
+
     api_mod = _import_api_module("cudnn.gemm.cutedsl.grouped.wgrad.api")
-    torch = api_mod.torch
 
     assert (
         api_mod._is_supported_rubin_quantization(

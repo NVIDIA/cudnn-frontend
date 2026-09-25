@@ -634,14 +634,19 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
-        // If handle is provided, use it (AoT compilation).
-        cudnnHandle_t handle =
-            handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
-
         std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
-        auto status               = graph->deserialize(handle, data, enforce_precompiled);
 
-        throw_if(status.is_bad(), status.get_code(), status.get_message());
+        if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
+            // Handle-less path: use the device properties set at construction.
+            auto status = graph->deserialize(data, enforce_precompiled);
+            throw_if(status.is_bad(), status.get_code(), status.get_message());
+        } else {
+            // Uses explicit handle if provided, otherwise falls back to the construction-time handle.
+            cudnnHandle_t handle =
+                handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
+            auto status = graph->deserialize(handle, data, enforce_precompiled);
+            throw_if(status.is_bad(), status.get_code(), status.get_message());
+        }
     }
 }
 
@@ -737,30 +742,21 @@ PyGraph::prepare_variant_pack_template() {
 }
 
 void
-PyGraph::execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs,
-                           std::intptr_t workspace,
-                           std::intptr_t exec_handle) {
-    std::vector<void*> ptrs(user_ptrs.size());
-    for (size_t i = 0; i < user_ptrs.size(); i++) {
-        ptrs[i] = (void*)user_ptrs[i];
-    }
-    cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
-    auto status     = graph->execute(h, ptrs.data(), (int)ptrs.size(), (void*)workspace);
-    throw_if(status.is_bad(), status.get_code(), status.get_message());
-}
-
-void
 PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
                                int64_t n_user,
                                std::intptr_t workspace,
-                               std::intptr_t exec_handle) {
+                               std::intptr_t exec_handle,
+                               int64_t plan_index) {
     static_assert(sizeof(std::intptr_t) == sizeof(void*), "intptr_t and void* must be the same size");
     throw_if(n_user < 0, error_code_t::INVALID_VALUE, "n_user must be non-negative");
     throw_if(n_user > 0 && user_ptrs_array == 0, error_code_t::INVALID_VALUE, "user_ptrs_array is null");
     // user_ptrs_array points to a contiguous intptr_t[] of device pointers — zero copy
     void** ptrs     = reinterpret_cast<void**>(user_ptrs_array);
     cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
-    auto status     = graph->execute(h, ptrs, (int)n_user, (void*)workspace);
+    // Address the plan the python walk built, which stops being the graph's own
+    // candidate once the walk has skipped an entry. -1 defers to the candidate.
+    auto status = plan_index < 0 ? graph->execute(h, ptrs, (int)n_user, (void*)workspace)
+                                 : graph->execute_plan_at_index(h, ptrs, (int)n_user, (void*)workspace, plan_index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
@@ -1368,17 +1364,13 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("override_strides") = py::none())
         .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
         .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
-        .def("_execute_with_ptrs",
-             &PyGraph::execute_with_ptrs,
-             py::arg("user_ptrs"),
-             py::arg("workspace"),
-             py::arg("handle"))
         .def("_execute_with_raw_ptrs",
              &PyGraph::execute_with_raw_ptrs,
              py::arg("user_ptrs_array"),
              py::arg("n_user"),
              py::arg("workspace"),
-             py::arg("handle"))
+             py::arg("handle"),
+             py::arg("plan_index") = -1)
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)

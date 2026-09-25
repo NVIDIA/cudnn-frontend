@@ -41,7 +41,7 @@ def _B(g, K, N, name="B"):
     return g.tensor(name=name, dim=[1, K, N], stride=[K * N, 1, K])
 
 
-_N128_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
+_N128_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
 
 
 # --- Analyzer + codegen (no GPU) ---
@@ -169,9 +169,7 @@ def test_heterogeneous_gemms_rejected() -> None:
         analyze(g)
 
 
-_N256_C2_CFG = next(
-    c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 2 and c.cgrp_size_n == 1
-)
+_N256_C2_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 2 and c.cga_size_n == 1)
 
 
 @requires_sm100
@@ -202,7 +200,7 @@ def test_multi_gemm_mainloop_template_rejected() -> None:
     Y = g.add(a=C0, b=C1, name="a")
     Y.set_output(True)
     chain = analyze(g)
-    mainloop_tmpl = next(t for t in TEMPLATES if t.mainloop)
+    mainloop_tmpl = next(t for t in TEMPLATES if t.supports_mainloop_fusion)
     assert not mainloop_tmpl.supports_multi_gemm
     assert mainloop_tmpl.accepts(chain, _N256_C2_CFG) is not None
 
@@ -300,8 +298,27 @@ def _assert_red_close(actual, expected, mode, *, exact=False):
     torch.testing.assert_close(actual, expected, **tol)
 
 
+# A split CTA tile competes with multi-GEMM for the SAME 512 TMEM columns: one
+# acc stage holds num_gemms x mma_size_m x cols_per_mma_m.
+_SPLIT_CFG = by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1")
+
+
 @_GPU
-def test_dual_silu_mul_end_to_end() -> None:
+def test_multi_gemm_times_split_tile_over_tmem_budget_is_rejected() -> None:
+    M, N, K = 256, 256, 128
+    g = _graph()
+    A = _A(g, M, K)
+    B0, B1 = _B(g, K, N, "B0"), _B(g, K, N, "B1")
+    Y = g.mul(a=g.swish(input=g.matmul(A=A, B=B0, name="mm0")), b=g.matmul(A=A, B=B1, name="mm1"))
+    Y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    with pytest.raises(NotImplementedError, match="TMEM columns"):
+        # 2 GEMMs x 2 M blocks x 256 cols = 1024
+        _plan(g, by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1"), cta_group=1)
+
+
+@_GPU
+@pytest.mark.parametrize("config", [DEFAULT_CONFIG, _SPLIT_CFG], ids=["single_mma", "num_mma_m2"])
+def test_dual_silu_mul_end_to_end(config) -> None:
     M, N, K = 256, 256, 128
     g = _graph()
     A = _A(g, M, K)
@@ -313,7 +330,7 @@ def test_dual_silu_mul_end_to_end() -> None:
     MU = g.mul(a=S0, b=C1, name="m")
     DQ = g.mul(a=MU, b=sc, name="d")
     DQ.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    compiled = _plan(g, DEFAULT_CONFIG, cta_group=1)
+    compiled = _plan(g, config, cta_group=1)
 
     torch.manual_seed(0)
     a, b0 = _rand(M, N, K, 0.4)

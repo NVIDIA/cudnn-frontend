@@ -18,7 +18,7 @@
 """Gated DeltaNet (GDN) Cutlass-primitives prefill kernel config (fixed compile-time
 constants; the per-compile attributes live on ``GdnCfg`` in the kernel file).
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass
@@ -28,22 +28,15 @@ from typing import Tuple
 @dataclass(frozen=True)
 class Cfg:
     # --- tile shape ---
-    B_T: int = 64  # chunk size / token tile (the mma N or K of every GEMM)
-    D_K: int = 128  # query/key head dim (contraction of GEMMs 1-4, M of GEMM 7)
-    D_V: int = 128  # value head dim (M of GEMMs 3-6, N of GEMM 7)
-
-    # --- TMA descriptor pool ---
-    BYTES_PER_TENSORMAP: int = 128
+    B_T: int = 64
 
     # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # kv_decay_v / v-k*state / epi ops
-    MMA_WARP_ID: int = 8  # CG0 issuer: KK/QK per pair
+    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
+    LOAD_GATE_WARP_ID: int = 8
     TMA_QKV_WARP_ID: int = 9
-    MMA_CG1_WARP_ID: int = 10  # CG1 issuer: KS/QS/NV/QKV/KV per chunk
-    # The lightly loaded O/H epilogue warp also loads gate/beta.
+    TCGEN05_MMA_WARP_ID: int = 10
     EPILOGUE_WARP_ID: int = 11
-    LOAD_GATE_BETA_WARP_ID: int = 11
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 224
@@ -55,15 +48,13 @@ class Cfg:
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
 
     # --- SMEM stage counts ---
-    SMEM_SCHED_STAGES: int = 2
-    SMEM_Q_STAGES: int = 3
-    SMEM_K_STAGES: int = 4
-    SMEM_V_STAGES: int = 3
-    SMEM_AINV_STAGES: int = 2
-    SMEM_QK_STAGES: int = 2
-    SMEM_O_STAGES: int = 2
+    SMEM_SCHEDULER_STAGES: int = 2
+    SMEM_KQ_STAGES: int = 4
+    SMEM_V_STAGES: int = 2
+    SMEM_T_INV_STAGES: int = 3
+    SMEM_A_STAGES: int = 3
+    SMEM_O_STAGES: int = 1
     SMEM_GATE_STAGES: int = 3
-    SMEM_BETA_STAGES: int = 3
 
     # --- TMEM stage counts ---
     TMEM_KV_ACC_STAGES: int = 1

@@ -18,6 +18,7 @@
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend/backend/kernel_cache.h"
 #include "cudnn_frontend/backend/device_properties.h"
+#include "cudnn_frontend/utils/cuda_graph_retention.h"
 
 namespace cudnn_frontend {
 ///
@@ -140,7 +141,30 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     ExecutionPlan_v8 &
     operator=(ExecutionPlan_v8 const &) = default;
 
+    //! Make `graph` keep this plan's backend descriptor alive for as long as the graph, its
+    //! clones and graphExecs exist. A graph recorded from this plan keeps launching its kernels,
+    //! and cuDNN releases runtime-compiled kernel code with the plan.
+    cudaError_t
+    retain_on_cuda_graph(cudaGraph_t graph) const {
+        return cuda_graph_retention.retain_on_graph(graph, [this] { return make_graph_retention_payload(); });
+    }
+
+    //! Same as retain_on_cuda_graph() for the graph `stream` is capturing into, if any.
+    cudaError_t
+    retain_on_capturing_stream(cudaStream_t stream) const {
+        return cuda_graph_retention.retain_on_capturing_stream(stream,
+                                                               [this] { return make_graph_retention_payload(); });
+    }
+
    private:
+    // What a recorded CUDA graph has to keep alive is the plan's backend descriptor: it owns
+    // the engine and the loaded kernel code. The kernel cache the plan was built with is only
+    // consulted while the plan is finalized, so it is deliberately not retained.
+    std::shared_ptr<void>
+    make_graph_retention_payload() const {
+        return pointer;
+    }
+
     void
     fetchNotes(ManagedOpaqueDescriptor &extractedEngine) {
         auto status                               = CUDNN_STATUS_SUCCESS;
@@ -308,6 +332,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
     float execution_time_ms                   = 0.0f;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
+    // Lends references to `pointer` to the CUDA graphs recorded from this plan.
+    mutable detail::CudaGraphRetainedResource cuda_graph_retention;
 };
 
 ///
@@ -323,6 +349,20 @@ class ExecutionPlanBuilder_v8 {
     auto
     setHandle(cudnnHandle_t handle_) -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.handle = handle_;
+        return *this;
+    }
+
+    /**
+     * @brief Set device properties for handle-less plan deserialization.
+     *
+     * When device properties are set and a handle is not, loadFromJson() will use
+     * CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP instead of CUDNN_ATTR_EXECUTION_PLAN_HANDLE.
+     * Device properties are used only when a handle is not set. Requires cuDNN >= 9.8
+     * at both compile and runtime.
+     */
+    auto
+    setDeviceProperties(std::shared_ptr<const DeviceProperties> device_properties_) -> ExecutionPlanBuilder_v8 & {
+        device_properties = std::move(device_properties_);
         return *this;
     }
     //! Set engine Config for the Plan
@@ -393,11 +433,14 @@ class ExecutionPlanBuilder_v8 {
 
 #if (CUDNN_VERSION >= 90400)
         if (m_execution_plan.kernel_cache) {
-            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+            // Copy the descriptor pointer by value under the KernelCache lock. This ensures that the right pointer is
+            // passed to the backend, bypassing lazy materialization thread-safety hazards.
+            cudnnBackendDescriptor_t kc_desc = m_execution_plan.kernel_cache->get_ptr_locked();
+            status                           = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE,
                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                            1,
-                                           &m_execution_plan.kernel_cache->get_ptr());
+                                           &kc_desc);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&m_execution_plan,
                                               status,
@@ -453,11 +496,12 @@ class ExecutionPlanBuilder_v8 {
         CUDNN_FRONTEND_UNUSED(json_plan);
         auto status = CUDNN_STATUS_SUCCESS;
 
-        if (m_execution_plan.handle == nullptr) {
+        if (m_execution_plan.handle == nullptr && device_properties == nullptr) {
             set_error_and_throw_exception(
                 &m_execution_plan,
                 CUDNN_STATUS_BAD_PARAM,
-                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Check and Set the CUDNN_ATTR_EXECUTION_PLAN_HANDLE");
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Set either CUDNN_ATTR_EXECUTION_PLAN_HANDLE "
+                "via setHandle() or CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP via setDeviceProperties()");
             return std::move(m_execution_plan);
         };
 
@@ -484,17 +528,55 @@ class ExecutionPlanBuilder_v8 {
             return std::move(m_execution_plan);
         }
 
-        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                       CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
-                                       CUDNN_TYPE_HANDLE,
-                                       1,
-                                       &m_execution_plan.handle);
-        if (status != CUDNN_STATUS_SUCCESS) {
+#if (CUDNN_VERSION >= 90800)
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
+            if (detail::get_backend_version() < 90800) {
+                set_error_and_throw_exception(
+                    &m_execution_plan,
+                    CUDNN_STATUS_NOT_SUPPORTED,
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP "
+                    "requires cuDNN runtime >= 9.8");
+                return std::move(m_execution_plan);
+            }
+            {
+                cudnnBackendDescriptor_t local = device_properties->get_ptr();
+                status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               1,
+                                               &local);
+            }
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_execution_plan,
+                                              status,
+                                              "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP Failed");
+                return std::move(m_execution_plan);
+            }
+        } else {
+#else
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
             set_error_and_throw_exception(
                 &m_execution_plan,
-                status,
-                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
+                CUDNN_STATUS_NOT_SUPPORTED,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP "
+                "requires cuDNN headers >= 9.8; rebuild against cuDNN 9.8+");
             return std::move(m_execution_plan);
+        }
+        {
+#endif
+            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
+                                           CUDNN_TYPE_HANDLE,
+                                           1,
+                                           &m_execution_plan.handle);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_execution_plan,
+                    status,
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
+                return std::move(m_execution_plan);
+            }
         }
 
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
@@ -574,6 +656,7 @@ class ExecutionPlanBuilder_v8 {
 
    private:
     ExecutionPlan_v8 m_execution_plan;
+    std::shared_ptr<const DeviceProperties> device_properties = nullptr;
 };
 
 using ExecutionPlan        = ExecutionPlan_v8;

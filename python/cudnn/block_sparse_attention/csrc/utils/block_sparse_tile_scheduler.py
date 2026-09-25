@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 from typing import Tuple, Protocol, runtime_checkable
 from dataclasses import dataclass
@@ -7,7 +10,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 from .tile_scheduler import (
     SchedulingMode,
@@ -33,10 +36,14 @@ class BlockSparsePersistentTileScheduler:
     class Params(ParamsBase):
         num_block_divmod: FastDivmodDivisor
         num_head_divmod: FastDivmodDivisor
+        num_splits_divmod: FastDivmodDivisor
+        total_base_blocks: Int32
         total_blocks: Int32
         num_block: Int32
         num_head: Int32
         num_batch: Int32
+        num_splits: Int32
+        is_split_kv: cutlass.Constexpr[bool] = False
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
 
         @staticmethod
@@ -47,14 +54,19 @@ class BlockSparsePersistentTileScheduler:
             loc=None,
             ip=None,
         ) -> "BlockSparsePersistentTileScheduler.Params":
-            total_blocks = args.num_block * args.num_head * args.num_batch
+            total_base_blocks = args.num_block * args.num_head * args.num_batch
+            total_blocks = total_base_blocks if scheduling_mode == SchedulingMode.CLC else total_base_blocks * (args.num_splits if args.is_split_kv else 1)
             return BlockSparsePersistentTileScheduler.Params(
                 FastDivmodDivisor(args.num_block),
                 FastDivmodDivisor(args.num_head),
+                FastDivmodDivisor(args.num_splits),
+                total_base_blocks,
                 total_blocks,
                 args.num_block,
                 args.num_head,
                 args.num_batch,
+                args.num_splits,
+                is_split_kv=args.is_split_kv,
                 scheduling_mode=scheduling_mode,
             )
 
@@ -96,12 +108,21 @@ class BlockSparsePersistentTileScheduler:
                 ClcDynamicPersistentTileSchedulerParams,
             )
 
-            cutlass_params = ClcDynamicPersistentTileSchedulerParams(
-                problem_shape_ntile_mnl=(
+            problem_shape_ntile_mnl = (
+                (
+                    params.total_base_blocks,
+                    params.num_splits,
+                    Int32(1),
+                )
+                if const_expr(params.is_split_kv)
+                else (
                     params.num_block,
                     params.num_head,
                     params.num_batch,
-                ),
+                )
+            )
+            cutlass_params = ClcDynamicPersistentTileSchedulerParams(
+                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 cluster_shape_mnk=(1, 1, 1),
             )
             block_idx = cute.arch.block_idx()
@@ -125,6 +146,12 @@ class BlockSparsePersistentTileScheduler:
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
+            if const_expr(params.is_split_kv):
+                return (
+                    params.total_base_blocks,
+                    params.num_splits,
+                    Int32(1),
+                )
             return (
                 params.num_block,
                 params.num_head,
@@ -137,10 +164,23 @@ class BlockSparsePersistentTileScheduler:
 
     @cute.jit
     def _clc_work_to_coords(self, work) -> WorkTileInfo:
-        """Convert CLC response (block, head, batch) to WorkTileInfo."""
-        batch_idx = work.tile_idx[2]
+        """Convert a CLC response to block-sparse attention work coordinates."""
+        if const_expr(self.params.is_split_kv):
+            hn_idx, block_idx = divmod(Int32(work.tile_idx[0]), self.params.num_block_divmod)
+            batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
+            split_idx = Int32(work.tile_idx[1])
+        else:
+            block_idx = Int32(work.tile_idx[0])
+            head_idx = Int32(work.tile_idx[1])
+            batch_idx = Int32(work.tile_idx[2])
+            split_idx = Int32(0)
         return WorkTileInfo(
-            (Int32(work.tile_idx[0]), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(0)),
+            (
+                Int32(block_idx),
+                Int32(head_idx),
+                Int32(batch_idx),
+                Int32(split_idx),
+            ),
             work.is_valid_tile,
         )
 
@@ -150,10 +190,23 @@ class BlockSparsePersistentTileScheduler:
             work = self._clc_scheduler.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self._clc_work_to_coords(work)
-        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_divmod)
+        if const_expr(self.params.is_split_kv):
+            base_idx, split_idx = divmod(self._tile_idx, self.params.num_splits_divmod)
+        else:
+            base_idx = self._tile_idx
+            split_idx = Int32(0)
+        hn_idx, block_idx = divmod(base_idx, self.params.num_block_divmod)
         batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
         is_valid = self._tile_idx < self.params.total_blocks
-        return WorkTileInfo((Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
+        return WorkTileInfo(
+            (
+                Int32(block_idx),
+                Int32(head_idx),
+                Int32(batch_idx),
+                Int32(split_idx),
+            ),
+            is_valid,
+        )
 
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -176,9 +229,6 @@ class BlockSparsePersistentTileScheduler:
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
-            # Match blk64 C++ ClcPersistentTileScheduler::consumer_advance:
-            # all warps must converge before consuming the next CLC response.
-            cute.arch.sync_threads()
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)

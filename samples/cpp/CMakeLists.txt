@@ -30,7 +30,6 @@ add_executable(
     sdpa/fp16_bwd_with_sink_token.cpp
     sdpa/fp16_fwd_with_max_and_sum_exp.cpp
     sdpa/fp16_fwd_with_block_mask.cpp
-    sdpa/prefill_oss_engine.cpp
 
     convolution/fprop.cpp
     convolution/fp8_fprop.cpp
@@ -79,6 +78,7 @@ add_executable(
     causal_conv1d/causal_conv1d.cpp
     causal_conv1d/causal_conv1d_nwh.cpp
     causal_conv1d/b2b_causal_conv1d.cpp
+    causal_conv1d/fft_causal_conv1d.cpp
 )
 
 # target flags

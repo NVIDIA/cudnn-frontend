@@ -45,24 +45,25 @@ class _FrostSdpaBwdPlan(CompiledPlan):
         # graph API hands us covers every IO tensor of the graph, so key the
         # kernel's own operands out of it by uid (uids are eager and unique).
         self._tensors = list(compiled.binding.bound_tensors())
+        # A bound tensor's uid is fixed once the graph is frozen, so read them
+        # here rather than re-walking the list on every execute.
+        self._uids = [t.get_uid() for t in self._tensors]
+        self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0) or 0)
 
     def get_workspace_size(self) -> int:
-        return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
+        return self._workspace_bytes
 
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
         # Keyed by IR tensor object: that is the binding's own identity, and the
         # only key resolve_variant_pack() accepts for an auto-assigned uid.
         pack = {}
-        missing = []
-        for t in self._tensors:
-            buf = uid_to_data.get(t.get_uid())
+        for t, uid in zip(self._tensors, self._uids):
+            buf = uid_to_data.get(uid)
             if buf is None:
-                missing.append(t.get_name() or t.get_uid())
-            else:
-                pack[t] = buf
-        if missing:
-            raise ValueError(f"{self._name}: the variant pack is missing buffers for {missing}")
-        required = self.get_workspace_size()
+                missing = [t.get_name() or uid for t, uid in zip(self._tensors, self._uids) if uid_to_data.get(uid) is None]
+                raise ValueError(f"{self._name}: the variant pack is missing buffers for {missing}")
+            pack[t] = buf
+        required = self._workspace_bytes
         if required:
             _check_workspace(ctx.workspace, required, self._name)
             self._compiled(pack, ctx.workspace, stream=ctx.stream)
@@ -100,10 +101,30 @@ class FrostSdpaBwdEngine(BaseEngine):
         if reason is not None:
             raise NotImplementedError(f"{self.name}: {reason}")
 
+    # Public knob vocabulary (BaseEngine contract): the native SdpaBwdKnobs
+    # travels inside PlanConfig; callers see {cudnn.knob_type: int}.
+    def knobs_to_public(self, knobs) -> dict:
+        from .engines import SdpaBwdKnobs
+
+        if knobs is None:
+            return {}
+        if isinstance(knobs, dict):
+            return dict(knobs)
+        if isinstance(knobs, SdpaBwdKnobs):
+            return knobs.to_public()
+        return super().knobs_to_public(knobs)
+
+    def knobs_from_public(self, public: dict):
+        from .engines import SdpaBwdKnobs
+
+        return SdpaBwdKnobs.from_public(public) if public else None
+
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build
 
         knobs = plan.knobs if plan is not None else None
+        if isinstance(knobs, dict):  # a replayed public record, not yet converted
+            knobs = self.knobs_from_public(knobs)
         try:
             return _FrostSdpaBwdPlan(self.name, build(self._spec, graph, knobs))
         except (NotImplementedError, ValueError, ImportError) as exc:

@@ -18,6 +18,14 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import logging
+import re as _re
+import struct
+import sys
+
+from cudnn import _pybind_module
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
@@ -58,15 +66,6 @@ _DLManagedTensor._fields_ = [
 ]
 
 
-@_DELETER_T
-def _noop_deleter(_ptr):
-    # views own no memory: the workspace (or caller buffer) outlives them
-    pass
-
-
-_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
-_PyCapsule_New.restype = ctypes.py_object
-_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 _PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 _PyCapsule_GetPointer.restype = ctypes.c_void_p
 _PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
@@ -75,6 +74,10 @@ _PyCapsule_SetName.restype = ctypes.c_int
 _PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
 # name -> (DLPack type code, bits); typestr -> name for the CAI path
+# name -> (DLPack type code, bits). Names match how torch spells them, so one
+# table serves both a dtype read off a buffer and one named in a graph.
+# Sub-byte types are deliberately absent: DTYPE_ITEMSIZE below is bits // 8, so
+# fp4 would land on 0 and take every byte/element conversion with it.
 DTYPES = {
     "float32": (2, 32),
     "float16": (2, 16),
@@ -85,6 +88,9 @@ DTYPES = {
     "int8": (0, 8),
     "uint8": (1, 8),
     "bool": (6, 8),
+    "float8_e4m3fn": (10, 8),
+    "float8_e5m2": (12, 8),
+    "float8_e8m0fnu": (14, 8),
 }
 _TYPESTR = {"<f4": "float32", "<f2": "float16", "<f8": "float64", "<i8": "int64", "<i4": "int32", "|i1": "int8", "|u1": "uint8", "|b1": "bool"}
 _CODE_BITS = {v: k for k, v in DTYPES.items()}
@@ -98,18 +104,30 @@ def dtype_name(buf) -> str:
     return str(buf.dtype).split(".")[-1]
 
 
+def data_ptr(buf) -> int:
+    """Device address of a tensor-like (``data_ptr()`` or the CUDA array interface)."""
+    fn = getattr(buf, "data_ptr", None)
+    if fn is not None:
+        return fn()
+    return buf.__cuda_array_interface__["data"][0]
+
+
 class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 
     The view owns no memory — the underlying allocation (workspace or caller
-    buffer) must outlive it. Row-major contiguous."""
+    buffer) must outlive it. Row-major contiguous.
+
+    Not a concept an engine has to learn: it is what a variant-pack slot or a
+    workspace region turns into on the way to a kernel, because CuTe needs an
+    object exposing ``__dlpack__`` and neither a pointer nor a Tensor record
+    is one."""
 
     def __init__(self, ptr: int, shape, dtype: str, device_id: int):
         self._ptr = int(ptr)
         self.shape = tuple(int(s) for s in shape)
         self.dtype = dtype
         self._device_id = int(device_id)
-        self._keepalive = []
 
     def data_ptr(self) -> int:
         return self._ptr
@@ -143,6 +161,14 @@ class DeviceView:
     def view_as(self, other):
         return self.reshape(tuple(other.shape))
 
+    def stride(self):
+        st = []
+        acc = 1
+        for s in reversed(self.shape):
+            st.append(acc)
+            acc *= s
+        return tuple(reversed(st))
+
     def contiguous(self):
         return self  # row-major contiguous by construction
 
@@ -166,29 +192,25 @@ class DeviceView:
         return (_KDL_CUDA, self._device_id)
 
     def __dlpack__(self, *, stream=None, **_kwargs):
-        # a fresh managed struct per call; shape array + struct stay alive on
-        # the view (the no-op deleter frees nothing)
-        ndim = len(self.shape)
-        shape_arr = (ctypes.c_int64 * max(ndim, 1))(*self.shape)
+        """Delegate to a slot, which owns the struct it hands out.
+
+        A view has nowhere to put a struct that must outlive the capsule: it
+        cannot know when the consumer is done with it, and cute's from_dlpack
+        keeps the pointer rather than copying the DLTensor. Holding the struct
+        on the view and shipping a no-op deleter -- which is what this did --
+        is a use-after-free the moment a consumer outlives the view.
+        """
         code, bits = DTYPES[self.dtype]
-        mt = _DLManagedTensor()
-        mt.dl_tensor.data = ctypes.c_void_p(self._ptr)
-        mt.dl_tensor.device = _DLDevice(_KDL_CUDA, self._device_id)
-        mt.dl_tensor.ndim = ndim
-        mt.dl_tensor.dtype = _DLDataType(code, bits, 1)
-        mt.dl_tensor.shape = shape_arr
-        mt.dl_tensor.strides = None  # None = compact row-major
-        mt.dl_tensor.byte_offset = 0
-        mt.manager_ctx = None
-        mt.deleter = _noop_deleter
-        self._keepalive.append((mt, shape_arr))
-        return _PyCapsule_New(ctypes.addressof(mt), b"dltensor", None)
+        return _pybind_module.make_operand_buffer(self._ptr, list(self.shape), code, bits, self._device_id).__dlpack__()
 
 
 class DeviceBuffer(DeviceView):
-    """A uint8 device allocation this process owns, for the paths where no
-    caller buffer exists. Allocated on the CURRENT context, so the caller owns
-    the context this memory belongs to."""
+    """A uint8 device allocation this process owns. Allocated on the CURRENT
+    context, so the caller owns the context this memory belongs to.
+
+    No production path may own one (Rule 8: plans and engines carve scratch from
+    the caller's workspace). Kept for tests that need a driver-owned allocation
+    whose GC-timed release must not invalidate a stream capture."""
 
     def __init__(self, nbytes: int, device_id: int):
         from cuda.bindings import driver as _drv
@@ -199,20 +221,73 @@ class DeviceBuffer(DeviceView):
         super().__init__(int(ptr), (int(nbytes),), "uint8", device_id)
 
     def __del__(self):
-        # At interpreter teardown the context can already be gone, which makes
-        # the free fail on memory the driver has reclaimed anyway.
+        # Cyclic GC can run during someone else's CUDA graph capture. This
+        # allocation is no longer live; releasing it must not invalidate that
+        # capture. Relax only this thread's safety check, and always restore it.
         try:
             from cuda.bindings import driver as _drv
 
-            _drv.cuMemFree(self.data_ptr())
+            ptr = getattr(self, "_ptr", 0)
+            if not ptr:
+                return
+            err, previous = _drv.cuThreadExchangeStreamCaptureMode(_drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+            if int(err) != 0:
+                _LOG.warning("cudnn.frost: cannot release DeviceBuffer: capture-mode exchange failed: %s", err)
+                return
+            try:
+                (err,) = _drv.cuMemFree(ptr)
+                if int(err) == 0:
+                    self._ptr = 0
+                elif err not in (_drv.CUresult.CUDA_ERROR_DEINITIALIZED, _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED):
+                    _LOG.warning("cudnn.frost: cuMemFree failed: %s", err)
+            finally:
+                err, _ = _drv.cuThreadExchangeStreamCaptureMode(previous)
+                if int(err) != 0:
+                    _LOG.warning("cudnn.frost: restoring capture mode failed: %s", err)
         except Exception:  # noqa: BLE001
-            pass
+            pass  # Interpreter teardown may already have unloaded CUDA / logging.
 
 
 def probe(buf):
     """(ptr, shape, strides_in_elements_or_None, dtype_name, device_id) of a
     device buffer, via ``__cuda_array_interface__`` when available (torch,
-    CuPy, numba) else the ``__dlpack__`` protocol."""
+    CuPy, numba) else the ``__dlpack__`` protocol.
+
+    Raises for a buffer it cannot read. Callers that would rather have the
+    geometry of a buffer whose DTYPE has no name here — fp8, fp4, anything
+    sub-byte — want :func:`_dlpack_geometry`, which separates the two
+    failures."""
+    geometry = _dlpack_geometry(buf)
+    if geometry is None:
+        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+    if geometry[3] is None:
+        raise TypeError(f"unsupported buffer dtype for {type(buf).__name__}")
+    return geometry
+
+
+def _dlpack_geometry(buf):
+    """``probe``'s reading, with its two declines made distinguishable.
+
+    Returns None when the buffer exposes neither protocol — nothing but a
+    pointer will ever come out of it. Returns the 5-tuple with ``dtype_name``
+    set to None when the buffer IS readable but its dtype has no name in
+    ``DTYPES``; dim and stride are real in that case and worth keeping.
+    """
+    # The common scratch buffer is a plain CUDA uint8 Tensor. Its public
+    # metadata already contains the CAI facts, without constructing/parsing an
+    # interface dictionary. Do not import torch or bypass a subclass's protocol.
+    torch = sys.modules.get("torch")
+    if (
+        torch is not None
+        and type(buf) is torch.Tensor
+        and not torch.overrides.has_torch_function_unary(buf)
+        and buf.dtype is torch.uint8
+        and buf.is_cuda
+        and buf.layout is torch.strided
+    ):
+        ptr = buf.data_ptr() if buf.numel() else 0  # CAI's empty-buffer convention
+        strides = None if buf.is_contiguous() else tuple(buf.stride())
+        return ptr, tuple(buf.shape), strides, "uint8", buf.device.index
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
@@ -234,11 +309,11 @@ def probe(buf):
 
     dl = getattr(buf, "__dlpack__", None)
     if dl is None:
-        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+        return None
     # stream=-1 is DLPack's "the caller handles synchronisation; do no
-    # bookkeeping". probe() only reads metadata, so it never needed any --
-    # and the default makes torch call record_stream, which is illegal inside
-    # a CUDA graph capture.
+    # bookkeeping". This only reads metadata, so it never needed any -- and the
+    # default makes torch call record_stream, which is illegal inside a CUDA
+    # graph capture.
     try:
         capsule = dl(stream=-1)
     except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
@@ -248,9 +323,7 @@ def probe(buf):
     t = mt.dl_tensor
     shape = tuple(t.shape[i] for i in range(t.ndim))
     strides = tuple(t.strides[i] for i in range(t.ndim)) if t.strides else None
-    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits))
-    if dtype is None or t.dtype.lanes != 1:
-        raise TypeError(f"unsupported buffer dtype (code={t.dtype.code}, bits={t.dtype.bits}, lanes={t.dtype.lanes})")
+    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits)) if t.dtype.lanes == 1 else None
     ptr = (t.data or 0) + t.byte_offset
     device_id = t.device.device_id
     # release: mark the capsule consumed and run its deleter
@@ -281,10 +354,149 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
 
 
+_WORD_FORMAT = {"fp32": "<f", "int32": "<i"}
+
+
+def init_word(dtype: str, value) -> int:
+    """The 32-bit pattern that writes ``value`` to a buffer of ``dtype``.
+
+    A memset moves bits, not numbers, so the value has to be packed as the dtype
+    the kernel will read it back as. int32's reduction identities are the ends
+    of its range and are exactly where that bites: -2**31 packed as float is
+    0xcf000000 where the kernel wants 0x80000000.
+    """
+    fmt = _WORD_FORMAT.get(dtype)
+    if fmt is None:
+        raise NotImplementedError(f"no 32-bit fill pattern for dtype {dtype!r}")
+    return int.from_bytes(struct.pack(fmt, value), "little")
+
+
+def fill_word_async(ptr: int, count: int, word: int, stream) -> None:
+    """Stream-ordered fill of ``count`` CONTIGUOUS 32-bit words with ``word``.
+
+    An engine that seeds a caller's buffer owns that operation itself: reaching
+    for ``tensor.fill_()`` works only while the buffer happens to be a torch
+    tensor, and queues on torch's current stream rather than the one the kernel
+    will run on. Every seed a reduction uses is a 32-bit pattern, so the
+    driver's D32 memset covers them without a kernel -- see ``init_word`` for
+    turning a value into one.
+
+    :func:`fill_word_strided_async` is the same fill for a buffer that is not
+    one dense run.
+    """
+    from cuda.bindings import driver as _drv
+
+    res = _drv.cuMemsetD32Async(int(ptr), int(word), int(count), int(stream) if stream is not None else 0)
+    err = res[0] if isinstance(res, tuple) else res
+    if int(err) != 0:
+        raise RuntimeError(f"cuMemsetD32Async failed: {err}")
+
+
+def _fill_word_2d_async(ptr: int, pitch_words: int, width: int, height: int, word: int, stream) -> None:
+    from cuda.bindings import driver as _drv
+
+    res = _drv.cuMemsetD2D32Async(int(ptr), int(pitch_words) * 4, int(word), int(width), int(height), int(stream) if stream is not None else 0)
+    err = res[0] if isinstance(res, tuple) else res
+    if int(err) != 0:
+        raise RuntimeError(f"cuMemsetD2D32Async failed: {err}")
+
+
+def collapse_layout(shape, strides) -> list:
+    """``(extent, stride)`` outermost first, with unit axes dropped and adjacent
+    axes merged where one exactly fills the other's gap.
+
+    A padded output is usually dense underneath its declared rank -- a rank-3
+    ``(1, M, 1)`` tap is one strided run, and a contiguous one is a single dense
+    run whatever rank it was declared at. Merging first is what keeps the fill
+    below down to one memset in both cases.
+    """
+    axes = sorted(((int(d), int(s)) for d, s in zip(shape, strides) if int(d) != 1), key=lambda ds: -ds[1])
+    out: list = []
+    for extent, stride in axes:
+        if out and out[-1][1] == extent * stride:
+            out[-1] = (out[-1][0] * extent, stride)
+        else:
+            out.append((extent, stride))
+    return out
+
+
+def strided_fill_plan(shape, strides) -> "list | None":
+    """The 2D memsets that cover a strided region exactly once, or None.
+
+    None means the region writes some element twice -- a stride of 0 over a real
+    extent, or an outer stride that does not clear the axis below it. That is a
+    write race whichever buffer it is, so it is refused rather than issued; the
+    caller decides how to say so.
+
+    Returned before anything is written, which is the point: the seed's
+    preconditions have to be settled while the caller's buffer is still
+    untouched, and a plan is what lets several outputs all be checked before the
+    first of them is filled.
+
+    Each entry is ``(offset, pitch, width, height)`` in ELEMENTS. The driver's
+    2D memset takes a pitch, so a per-row scalar tap is one entry rather than one
+    per row (the reading that made this look expensive: 572 us at one memset per
+    row); what remains is one entry per point of whatever axis is left outside
+    the 2D region, which for a rank-3 output is the batch and is usually 1.
+    """
+    if any(int(s) == 0 and int(d) != 1 for d, s in zip(shape, strides)):
+        return None
+    axes = collapse_layout(shape, strides)
+    # Non-overlapping iff each axis clears the whole span of the one below it.
+    # `pitch >= width` is this rule at the innermost pair and misses the rest:
+    # shape (2, 2) stride (2, 2) has width 1 and passes it, and lands both axes
+    # on the same element.
+    for (_outer_extent, outer_stride), (inner_extent, inner_stride) in zip(axes, axes[1:]):
+        if outer_stride < inner_extent * inner_stride:
+            return None
+    if not axes:
+        return [(0, 1, 1, 1)]
+    # The innermost run is the memset's width when it is dense; otherwise every
+    # element stands alone and the width is one.
+    width, rest = (axes[-1][0], axes[:-1]) if axes[-1][1] == 1 else (1, axes)
+    if not rest:
+        return [(0, width, width, 1)]
+    height, pitch = rest[-1]
+    offsets = [0]
+    for extent, stride in reversed(rest[:-1]):
+        offsets = [base + i * stride for base in offsets for i in range(extent)]
+    return [(base, pitch, width, height) for base in offsets]
+
+
+def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
+    """Issue a plan from :func:`strided_fill_plan`, stream-ordered."""
+    for offset, pitch, width, height in plan:
+        if height == 1:
+            fill_word_async(ptr + offset * 4, width, word, stream)
+        else:
+            _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
+
+
+def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
+    """Plan and issue in one call, for a caller with a single region to seed.
+
+    The engine owns seeding a reduction output, and a padded one is the case
+    that used to send it back to the caller's ``fill_()`` -- the last place
+    anything here wrote through a buffer it does not own, and the reason a
+    perfectly legal call had to fall off the fast path. A caller with SEVERAL
+    regions wants :func:`strided_fill_plan` for all of them first: this one
+    cannot know whether the next region is refusable, so it would leave the
+    earlier ones filled.
+    """
+    if elem_bytes != 4:
+        raise NotImplementedError(f"frost: a reduction seed is a 32-bit pattern; this output stores {elem_bytes}-byte elements")
+    plan = strided_fill_plan(shape, strides)
+    if plan is None:
+        raise ValueError(f"frost: a reduction output cannot write an element twice (shape {tuple(shape)} stride {tuple(strides)})")
+    apply_fill_plan(ptr, plan, word, stream)
+
+
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs
 # fail during codegen with errors that name a missing attribute rather than the
 # version, so the check belongs where an engine can still decline.
 CUTEDSL_MIN_VERSION = (4, 7, 0)
+
+_RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 
 _DSL_STATE = None
 
@@ -336,11 +548,37 @@ def cutedsl_too_old(version):
     dist, ver = version
     if dist != "nvidia-cutlass-dsl":
         return False
-    try:
-        parts = tuple(int(x) for x in ver.split("+", 1)[0].split(".")[:3])
-    except ValueError:
+    # PEP 440 public versions: keep the leading integer of each release component
+    # so a prerelease of X ("4.6.2a0", "4.6.2rc1") compares as X -- below the
+    # floor it is too old, at/above it is not. Local labels ("+...") are dropped,
+    # and a dotted post/dev segment ("4.6.post1", "4.6.2.dev0") ends the release
+    # segment: what precedes it is the version being compared.
+    parts = []
+    for component in ver.split("+", 1)[0].split(".")[:3]:
+        m = _RELEASE_INT.match(component)
+        if m is None:
+            break
+        parts.append(int(m.group(1)))
+    if not parts:
         return False
-    return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+    # A short public version ("4.6") means the omitted components are zero
+    # ("4.6.0"), so it compares against the floor instead of slipping past it.
+    parts += [0] * (3 - len(parts))
+    return tuple(parts) < CUTEDSL_MIN_VERSION
+
+
+def cutedsl_requirement_error(what):
+    """Message naming the installed DSL version when it is below the floor, else None.
+
+    Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
+    version problem, not as a missing dependency: pyproject's floor is the
+    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    """
+    installed, version = cutedsl_state()
+    if not installed or not cutedsl_too_old(version):
+        return None
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
 
 
 def current_device_id():

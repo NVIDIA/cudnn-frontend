@@ -1,0 +1,876 @@
+---
+title: "Installing cuDNN Backend on Linux"
+---
+## Installing the CUDA Toolkit for Linux
+
+Refer to the following instructions for installing CUDA on Linux, including the CUDA driver and toolkit: [NVIDIA CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html).
+
+## Installing Zlib
+
+For Ubuntu users, to install the zlib package, run:
+
+```
+sudo apt-get install zlib1g
+```
+
+For RHEL users, to install the zlib package, run:
+
+```
+sudo yum install zlib
+```
+
+## Installing the cuDNN Backend Packages on Linux
+
+cuDNN can be installed using either distribution-specific packages (RPM and Debian packages), or a distribution-independent package (Tarballs).
+
+The distribution-independent package has the advantage of working across a wider set of Linux distributions, but does not update the distribution's native package management system. The distribution-specific packages interface with the distribution’s native package management system. It is recommended to use the distribution-specific packages, where possible.
+
+### Package Manager Installation
+
+Installation using RPM or Debian packages interfaces with your system's package management system. If the online network repository is enabled, RPM or Debian packages will be automatically downloaded at installation time using the package manager: `apt-get` or `dnf`. When using RPM or Debian local repo installers, the downloaded package contains a repository snapshot stored on the local filesystem in `/var/`. Such a package only informs the package manager where to find the actual installation packages, but will not install them.
+
+#### Package Manager Network Installation
+
+##### Ubuntu and Debian Network Installation
+
+1. Enable the network repository. Perform the steps described in the [NVIDIA CUDA Installation Guide for Ubuntu](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#network-repo-installation-for-ubuntu) or the [NVIDIA CUDA Installation Guide for Debian](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#network-repo-installation-for-debian).
+
+    For the `$distro/$arch` noted in the above links, refer to the [cuDNN Support Matrix](/reference/support-matrix) for the `$distro/$arch` supported versions, as cuDNN's Support Matrix might differ from CUDA.
+
+    Where `$distro/$arch` should be replaced by one of the following:
+
+   - `ubuntu2204/x86_64`
+   - `ubuntu2204/sbsa`
+   - `ubuntu2204/cross-linux-sbsa`
+   - `ubuntu2204/arm64`
+   - `ubuntu2204/cross-linux-aarch64`
+   - `ubuntu2404/x86_64`
+   - `ubuntu2404/sbsa`
+   - `ubuntu2404/cross-linux-sbsa`
+   - `ubuntu2404/arm64`
+   - `ubuntu2404/cross-linux-aarch64`
+   - `ubuntu2604/x86_64`
+   - `ubuntu2604/sbsa`
+   - `debian12/x86_64`
+   - `debian12/sbsa`
+   - `debian12/cross-linux-sbsa`
+   - `debian13/x86_64`
+   - `debian13/sbsa`
+   - `debian13/cross-linux-sbsa`
+
+    For `arm64-sbsa` repos:
+
+   - Native: `$distro/sbsa`
+   - Cross: `$distro/cross-linux-sbsa`
+
+    For `aarch64-jetson` repos:
+
+   - Native: `$distro/arm64`
+   - Cross: `$distro/cross-linux-aarch64`
+
+2. Refresh the repository metadata.
+
+   ```
+   sudo apt-get update
+   ```
+
+3. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo apt-get -y install cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo apt-get -y install cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo apt-get -y install cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo apt-get -y install cudnn9-jit-cuda-13
+   ```
+
+<Note>
+- Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+- cuDNN 9 JIT is supported only on x86_64 and SBSA (`arm64-sbsa`).
+- On supported platforms, the `cudnn9-cross-sbsa` and `cudnn9-cross-aarch64` meta-packages install all the packages required for cross-platform development to SBSA (`arm64-sbsa`) and ARMv8 (`aarch64-jetson`), respectively.
+
+  - Cross `arm64-sbsa` for CUDA 12:
+
+    ```
+    sudo apt-get -y install libcudnn9-cross-sbsa-cuda-12
+    ```
+
+  - Cross `arm64-sbsa` for CUDA 13:
+
+    ```
+    sudo apt-get -y install cudnn9-cross-sbsa
+    ```
+
+  - Cross `aarch64-jetson` for CUDA 12:
+
+    ```
+    sudo apt-get -y install libcudnn9-cross-aarch64-cuda-12
+    ```
+
+  - Cross `aarch64-jetson` for CUDA 13:
+
+    ```
+    sudo apt-get -y install cudnn9-cross-aarch64
+    ```
+
+- On supported platforms, the `cudnn9-jit-cross-sbsa` meta-package installs all the packages required for cuDNN JIT cross-platform development to SBSA (`arm64-sbsa`).
+
+  - Cross `arm64-sbsa` for CUDA 12:
+
+    ```
+    sudo apt-get -y install libcudnn9-jit-cross-sbsa-cuda-12
+    ```
+
+  - Cross `arm64-sbsa` for CUDA 13:
+
+    ```
+    sudo apt-get -y install cudnn9-jit-cross-sbsa
+    ```
+
+</Note>
+
+##### RHEL, Rocky, and Amazon Linux Network Installation
+
+1. Enable the repository.
+
+   ```
+   sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/$distro/$arch/cuda-$distro.repo
+   sudo dnf clean all
+   ```
+
+    Where `$distro/$arch` should be replaced by one of the following:
+
+   - `rhel8/x86_64`
+   - `rhel8/sbsa`
+   - `rhel9/x86_64`
+   - `rhel9/sbsa`
+   - `rhel10/x86_64`
+   - `rhel10/sbsa`
+   - `amzn2023/x86_64`
+   - `amzn2023/aarch64`
+
+<Note>
+For Rocky users, only the following are supported.
+
+- For Rocky 8, `rhel8/x86_64`.
+- For Rocky 9, `rhel9/x86_64`.
+- For Rocky 10, `rhel10/x86_64`.
+
+For Amazon Linux 2023, use `$distro=amzn2023` and `$arch` of `x86_64` or `aarch64`.
+</Note>
+
+2. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-jit-cuda-13
+   ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+##### SUSE Linux Enterprise Server and OpenSUSE Network Installation
+
+1. Enable the repository.
+
+   ```
+   sudo zypper addrepo https://developer.download.nvidia.com/compute/cuda/repos/$distro/$arch/cuda-$distro.repo
+   sudo zypper refresh
+   ```
+
+    Where `$distro/$`arch`` should be replaced by one of the following:
+
+   - `sles15/x86_64`
+   - `opensuse15/x86_64`
+
+2.  Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+    ```
+    sudo zypper -y install --allowerasing cudnn9-cuda-12
+    ```
+
+    To install for CUDA 13, run:
+
+    ```
+    sudo zypper -y install --allowerasing cudnn9-cuda-13
+    ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+    ```
+    sudo zypper -y install --allowerasing cudnn9-jit-cuda-12
+    ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+    ```
+    sudo zypper -y install --allowerasing cudnn9-jit-cuda-13
+    ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+#### Package Manager Local Installation
+
+##### Ubuntu and Debian Local Installation
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y`, `$distro`, and `$architecture` with your respective cuDNN version, OS distribution, and platform architecture.
+
+Where `$distro` is one of the following:
+
+- `ubuntu2204`
+- `ubuntu2404`
+- `ubuntu2604`
+- `debian12`
+- `debian13`
+
+And `$architecture` is one of the following:
+
+- For Ubuntu 26.04/24.04/22.04:
+
+- `amd64`
+- `arm64`
+
+- For Debian 13/12:
+
+- `amd64`
+- `arm64`
+</Note>
+
+<Note>
+Debian 13 and Debian 12 are not supported on the ARMv8 (`aarch64-jetson`) platform.
+</Note>
+
+1. Download the Debian package either from the developer website or through `wget`.
+
+   2. The local Debian package is available at [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn). Click on the green buttons that describe your target platform and choose Deb (local) as the installer type.
+   3. Or, run:
+
+      ```
+      wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y_1.0-1_$architecture.deb
+      ```
+
+<Note>
+The following commands are specific to the SBSA (`arm64-sbsa`) and ARMv8 (`aarch64-jetson`) platforms.
+
+- Native `arm64-sbsa`:
+
+```
+wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y_1.0-1_arm64.deb
+```
+
+- Cross `arm64-sbsa`:
+
+```
+wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-cross-sbsa-$distro-9.x.y_1.0-1_all.deb
+```
+
+- Native `aarch64-jetson`:
+
+```
+wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-tegra-repo-$distro-9.x.y_1.0-1_arm64.deb
+```
+
+- Cross `aarch64-jetson`:
+
+```
+wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-cross-aarch64-$distro-9.x.y_1.0-1_all.deb
+```
+
+</Note>
+
+4. Navigate to your `downloads` directory containing the cuDNN Debian local installer file.
+5. Enable the local repository.
+
+   ```
+   sudo dpkg -i cudnn-local-repo-$distro-9.x.y_1.0-1_$architecture.deb
+   ```
+
+<Note>
+The following commands are specific to the SBSA (`arm64-sbsa`) and ARMv8 (`aarch64-jetson`) platforms.
+
+- Native `arm64-sbsa`:
+
+```
+sudo dpkg -i cudnn-local-repo-$distro-9.x.y_1.0-1_arm64.deb
+```
+
+- Cross `arm64-sbsa`:
+
+```
+sudo dpkg -i cudnn-local-repo-cross-sbsa-$distro-9.x.y_1.0-1_all.deb
+```
+
+- Native `aarch64-jetson`:
+
+```
+sudo dpkg -i cudnn-local-tegra-repo-$distro-9.x.y_1.0-1_arm64.deb
+```
+
+- Cross `aarch64-jetson`:
+
+```
+sudo dpkg -i cudnn-local-repo-cross-aarch64-$distro-9.x.y_1.0-1_all.deb
+```
+
+</Note>
+
+6. Import the CUDA GPG key.
+
+   ```
+   sudo cp /var/cudnn-local-*/cudnn-*-keyring.gpg /usr/share/keyrings/
+   ```
+
+7. Refresh the repository metadata.
+
+   ```
+   sudo apt-get update
+   ```
+
+8. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo apt-get -y install cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo apt-get -y install cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo apt-get -y install cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo apt-get -y install cudnn9-jit-cuda-13
+   ```
+
+<Note>
+- Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+- cuDNN 9 JIT is supported only on x86_64 and SBSA (`arm64-sbsa`
+- The following commands are specific to the SBSA (`arm64-sbsa`) and ARMv8 (`aarch64-jetson`) platforms.
+
+  - Cross `arm64-sbsa` for CUDA 12:
+
+    ```
+    sudo apt-get -y install libcudnn9-cross-sbsa-cuda-12
+    ```
+
+  - Cross `arm64-sbsa` for CUDA 13:
+
+    ```
+    sudo apt-get -y install cudnn9-cross-sbsa
+    ```
+
+  - Cross `arm64-jetson` for CUDA 12:
+
+    ```
+    sudo apt-get -y install libcudnn9-cross-aarch64-cuda-12
+    ```
+
+  - Cross `aarch64-jetson` for CUDA 13:
+
+    ```
+    sudo apt-get -y install cudnn9-cross-aarch64
+    ```
+
+</Note>
+
+   - The following commands are specific to cuDNN JIT on the SBSA (`arm64-sbsa`) platform.
+
+     - Cross `arm64-sbsa` for CUDA 12:
+
+       ```
+       sudo apt-get -y install libcudnn9-jit-cross-sbsa-cuda-12
+       ```
+
+     - Cross `arm64-sbsa` for CUDA 13:
+
+       ```
+       sudo apt-get -y install cudnn9-jit-cross-sbsa
+       ```
+
+##### RHEL, Rocky, and Amazon Linux Local Installation
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y`, `$distro`, and `$architecture` with your respective cuDNN version, OS distribution, and platform architecture.
+
+Where `$distro` is one of the following:
+
+For RHEL 10/Rocky 10:
+
+- `rhel10`
+
+- For RHEL 9/Rocky 9:
+
+- `rhel9`
+
+- For RHEL 8/Rocky 8:
+
+- `rhel8`
+
+- For Amazon Linux 2023:
+
+- `amzn2023`
+
+And `$architecture` is one of the following:
+
+- For RHEL 10:
+
+- `x86_64`
+- `aarch64`
+
+- For Rocky 10:
+
+- `x86_64`
+
+- For RHEL 9:
+
+- `x86_64`
+- `aarch64`
+
+- For Rocky 9:
+
+- `x86_64`
+
+- For RHEL 8:
+
+- `x86_64`
+- `aarch64`
+
+- For Rocky 8:
+
+- `x86_64`
+
+- For Amazon Linux 2023:
+
+- `x86_64`
+- `aarch64`
+</Note>
+
+1. Download the RPM package either from the developer website or through `wget`.
+
+   2. The local RPM package is available at [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn). Click on the green buttons that describe your target platform and choose RPM (local) as the installer type.
+   3. Or, run:
+
+      ```
+      wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+      ```
+
+<Note>
+For RHEL users, the following command is specific to the SBSA (`arm64-sbsa`) platform.
+
+- Native `arm64-sbsa`:
+
+```
+wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y-1.0-1.aarch64.rpm
+```
+
+</Note>
+
+4. Navigate to your `downloads` directory containing the cuDNN RPM local installer file.
+5. Enable the local repository.
+
+   ```
+   sudo rpm -i cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+   ```
+
+<Note>
+For RHEL users, the following command is specific to the SBSA (`arm64-sbsa`) platform.
+
+- Native `arm64-sbsa`:
+
+```
+sudo rpm -i cudnn-local-repo-$distro-9.x.y-1.0-1.aarch64.rpm
+```
+
+</Note>
+
+6. Refresh the repository metadata.
+
+   ```
+   sudo dnf clean all
+   ```
+
+7. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo dnf -y install --allowerasing cudnn9-jit-cuda-13
+   ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+##### SUSE Linux Enterprise Server and OpenSUSE Local Installation
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y`, `$distro`, and `$architecture` with your respective cuDNN version, OS distribution, and platform architecture.
+
+Where `$distro` is one of the following:
+
+- `sles15`
+- `opensuse15`
+
+And `$architecture` is one of the following:
+
+- `x86_64`
+</Note>
+
+1. Download the RPM package either from the developer website or through `wget`.
+
+   2. The local RPM package is available at [https://developer.nvidia.com/cudnn](https://developer.nvidia.com/cudnn). Click on the green buttons that describe your target platform and choose RPM (local) as the installer type.
+   3. Or, run:
+
+      ```
+      wget https://developer.download.nvidia.com/compute/cudnn/9.x.y/local_installers/cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+      ```
+
+4. Navigate to your `downloads` directory containing the cuDNN RPM local installer file.
+5. Enable the local repository.
+
+   ```
+   sudo rpm -i cudnn-local-repo-$distro-9.x.y-1.0-1.$architecture.rpm
+   ```
+
+6. Refresh the repository metadata.
+
+   ```
+   sudo zypper refresh
+   ```
+
+7. Install the per-CUDA meta-packages.
+
+    To install for CUDA 12, run:
+
+   ```
+   sudo zypper -y install --allowerasing cudnn9-cuda-12
+   ```
+
+    To install for CUDA 13, run:
+
+   ```
+   sudo zypper -y install --allowerasing cudnn9-cuda-13
+   ```
+
+    To install cuDNN JIT for CUDA 12, run:
+
+   ```
+   sudo zypper -y install --allowerasing cudnn9-jit-cuda-12
+   ```
+
+    To install cuDNN JIT for CUDA 13, run:
+
+   ```
+   sudo zypper -y install --allowerasing cudnn9-jit-cuda-13
+   ```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+#### Additional Package Manager Capabilities
+
+##### Meta-Packages
+
+Meta-packages are RPM and Debian packages that contain no (or few) files but have multiple dependencies. They are used to install many cuDNN packages when you may not know the details of the packages you want.
+
+| Meta-Package Name | Intended Use Case |
+| --- | --- |
+| `cudnn` | Installs the latest available cuDNN for the latest available CUDA version. |
+| `cudnn-jit` | Installs the latest available cuDNN JIT for the latest available CUDA version. |
+| `cudnn9` | Installs the latest available cuDNN 9 for the latest available CUDA version. |
+| `cudnn9-jit` | Installs the latest available cuDNN 9 JIT for the latest available CUDA version. |
+| `cudnn-cuda-13` | Installs the latest available cuDNN for the latest available CUDA 13 version. |
+| `cudnn9-cuda-13` | Installs the latest available cuDNN 9 for the latest available CUDA 13 version. |
+| `cudnn9-jit-cuda-13` | Installs the latest available cuDNN 9 JIT for the latest available CUDA 13 version. |
+| `cudnn-cuda-12` | Installs the latest available cuDNN for the latest available CUDA 12 version. |
+| `cudnn9-cuda-12` | Installs the latest available cuDNN 9 for the latest available CUDA 12 version. |
+| `cudnn9-jit-cuda-12` | Installs the latest available cuDNN 9 JIT for the latest available CUDA 12 version. |
+| `cudnn-cross-sbsa` | Installs the latest available cuDNN for the latest available CUDA version meant for cross-platform development to SBSA. |
+| `cudnn-jit-cross-sbsa` | Installs the latest available cuDNN JIT for the latest available CUDA version meant for cross-platform development to SBSA. |
+| `cudnn9-cross-sbsa` | Installs the latest available cuDNN 9 for the latest available CUDA version meant for cross-platform development to SBSA. |
+| `cudnn9-jit-cross-sbsa` | Installs the latest available cuDNN 9 JIT for the latest available CUDA version meant for cross-platform development to SBSA. |
+| `cudnn-cross-aarch64` | Installs the latest available cuDNN for the latest available CUDA version meant for cross-platform development to ARMv8. |
+| `cudnn9-cross-aarch64` | Installs the latest available cuDNN 9 for the latest available CUDA version meant for cross-platform development to ARMv8. |
+
+<Note>
+The above packages install the latest major and minor patch version of cuDNN 9.x. To install a specific cuDNN 9.x.y version, pin the cudnn9* package version to 9.x.y.
+</Note>
+
+##### Base Packages
+
+Base packages are RPM and Debian packages that contain actual cuDNN deliverables, such as binaries and headers. They can give you fine-grained control over what parts of cuDNN you want to install.
+
+| Base Package Name (Ubuntu/Debian) | Base Package Name (RHEL/Rocky) | Intended Use Case |
+| --- | --- | --- |
+| `libcudnn9-cuda-13` | `libcudnn9-cuda-13` | Installs the *runtime* package which contains the latest available cuDNN 9 dynamic libraries for the latest available CUDA 13 version. |
+| `libcudnn9-jit-cuda-13` | `libcudnn9-jit-cuda-13` | Installs the *runtime* package which contains the latest available cuDNN 9 JIT dynamic libraries for the latest available CUDA 13 version. |
+| `libcudnn9-headers-cuda-13` | `libcudnn9-headers-cuda-13` | Installs the *headers* package which contains the latest available cuDNN 9 headers for the latest available CUDA 13 version. |
+| `libcudnn9-dev-cuda-13` | `libcudnn9-devel-cuda-13` | Installs the *dev* package which contains the latest available cuDNN 9 dynamic library symlinks for the latest available CUDA 13 version. (The *runtime* and *headers* packages are dependencies.) |
+| `libcudnn9-jit-dev-cuda-13` | `libcudnn9-jit-devel-cuda-13` | Installs the *dev* package which contains the latest available cuDNN 9 JIT dynamic library symlinks for the latest available CUDA 13 version. (The *runtime* and *headers* packages are dependencies.) |
+| `libcudnn9-static-cuda-13` | `libcudnn9-static-cuda-13` | Installs the *static* package which contains the latest available cuDNN 9 static libraries for the latest available CUDA 13 version. (The *dev* and *runtime* packages are dependencies.) |
+| `libcudnn9-cuda-12` | `libcudnn9-cuda-12` | Installs the *runtime* package which contains the latest available cuDNN 9 dynamic libraries for the latest available CUDA 12 version. |
+| `libcudnn9-jit-cuda-12` | `libcudnn9-jit-cuda-12` | Installs the *runtime* package which contains the latest available cuDNN 9 JIT dynamic libraries for the latest available CUDA 12 version. |
+| `libcudnn9-headers-cuda-12` | `libcudnn9-headers-cuda-12` | Installs the *headers* package which contains the latest available cuDNN 9 headers for the latest available CUDA 12 version. |
+| `libcudnn9-dev-cuda-12` | `libcudnn9-devel-cuda-12` | Installs the *dev* package which contains the latest available cuDNN 9 dynamic library symlinks for the latest available CUDA 12 version. (The *runtime* and *headers* packages are dependencies.) |
+| `libcudnn9-jit-dev-cuda-12` | `libcudnn9-jit-devel-cuda-12` | Installs the *dev* package which contains the latest available cuDNN 9 JIT dynamic library symlinks for the latest available CUDA 12 version. (The *runtime* and *headers* packages are dependencies.) |
+| `libcudnn9-static-cuda-12` | `libcudnn9-static-cuda-12` | Installs the *static* package which contains the latest available cuDNN 9 static libraries for the latest available CUDA 12 version. (The *dev* and *runtime* packages are dependencies.) |
+| `libcudnn9-samples` | `libcudnn9-samples` | Installs the latest available cuDNN samples source code. |
+
+<Note>
+The above packages install the latest major and minor patch version of cuDNN 9.x. To install a specific cuDNN 9.x.y version, pin the `libcudnn9*` package version to 9.x.y.
+</Note>
+
+### Tarball Installation
+
+In an effort to meet the needs of a growing customer base requiring alternative installer packaging formats, as well as a means of input into community CI/CD systems, Tarballs are available for download.
+
+#### Redist Archive
+
+Tarballs are provided at [https://developer.download.nvidia.com/compute/cudnn/redist/](https://developer.download.nvidia.com/compute/cudnn/redist/).
+
+These `.tar.xz` archives do not replace existing packages such as `.deb`, `.rpm`, and are not meant for general consumption, as they are not installers.
+
+For each release, a JSON manifest is provided such as **redistrib_9.x.y.z.json**, which corresponds to the cuDNN 9.x.y.z release label which includes the release date, the name of each component, license name, relative URL for each platform, and checksums.
+
+Details on parsing these JSON files are described in [Parsing Redistrib JSON](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#parsing-redistrib-json).
+
+### Conda Installation
+
+Starting with cuDNN 9.23.0, cuDNN and cuDNN JIT packages are published **only** on the [conda-forge](https://anaconda.org/conda-forge/cudnn) channel and are no longer published on the `nvidia` channel.
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y` with your respective cuDNN version and `<cuda-major-version>` with your respective CUDA major version (12 or 13). Only `x86_64` and `arm64-sbsa` Conda packages are available.
+</Note>
+
+#### Installing cuDNN using Conda
+
+To install cuDNN using Conda, run:
+
+```
+conda install cudnn cuda-version=<cuda-major-version> -c conda-forge
+```
+
+To install cuDNN JIT using Conda, run:
+
+```
+conda install cudnn-jit cuda-version=<cuda-major-version> -c conda-forge
+```
+
+#### Installing a Specific Release Version of cuDNN using Conda
+
+To install a specific cuDNN release, pin the package version in the `install` command.
+
+For example, for cuDNN:
+
+```
+conda install cudnn=9.x.y cuda-version=<cuda-major-version> -c conda-forge
+```
+
+For cuDNN JIT:
+
+```
+conda install cudnn-jit=9.x.y cuda-version=<cuda-major-version> -c conda-forge
+```
+
+#### Uninstalling cuDNN using Conda
+
+To uninstall cuDNN using Conda, run:
+
+```
+conda remove cudnn
+```
+
+To uninstall cuDNN JIT using Conda, run:
+
+```
+conda remove cudnn-jit
+```
+
+### Python Wheels - Linux Installation
+
+NVIDIA provides Python Wheels for installing cuDNN through `pip`, primarily for the use of cuDNN with Python. With this installation method, the cuDNN installation environment is managed via `pip`. Additional care must be taken to set up your host environment to use cuDNN outside the `pip` environment.
+
+<Note>
+Before issuing the following commands, you must replace `9.x.y.z` with your respective cuDNN version. On Linux, only `x86_64` and `aarch64`  (`arm64-sbsa`) architectures are supported.
+</Note>
+
+#### Prerequisites
+
+If your `pip` and `wheel` Python modules are not up-to-date, then use the following command to upgrade these Python modules. If these Python modules are out-of-date, then the commands which follow later in this section may fail.
+
+```
+python3 -m pip install --upgrade pip wheel
+```
+
+#### Installing cuDNN with Pip
+
+To install cuDNN for CUDA 13, run:
+
+```
+python3 -m pip install nvidia-cudnn-cu13
+```
+
+To install cuDNN for CUDA 12, run:
+
+```
+python3 -m pip install nvidia-cudnn-cu12
+```
+
+To install cuDNN JIT for CUDA 13, run:
+
+```
+python3 -m pip install nvidia-cudnn-jit-cu13
+```
+
+To install cuDNN JIT for CUDA 12, run:
+
+```
+python3 -m pip install nvidia-cudnn-jit-cu12
+```
+
+To install cuDNN for a specific release version, include the release version in the command. For example, to install cuDNN 9.x.y.z for CUDA 13, run:
+
+```
+python3 -m pip install nvidia-cudnn-cu13==9.x.y.z
+```
+
+To install cuDNN 9.x.y.z for CUDA 12, run:
+
+```
+python3 -m pip install nvidia-cudnn-cu12==9.x.y.z
+```
+
+To install cuDNN 9.x.y.z JIT for CUDA 13, run:
+
+```
+python3 -m pip install nvidia-cudnn-jit-cu13==9.x.y.z
+```
+
+To install cuDNN 9.x.y.z JIT for CUDA 12, run:
+
+```
+python3 -m pip install nvidia-cudnn-jit-cu12==9.x.y.z
+```
+
+<Note>
+Only one CUDA toolkit version of cuDNN 9 can be installed at a time.
+</Note>
+
+### Verifying the Install on Linux
+
+To verify that cuDNN is installed and is running properly, compile the `mnistCUDNN` sample located in the `/usr/src/cudnn_samples_v9` directory in the Debian file.
+
+1. Install the cuDNN samples.
+
+   ```
+   sudo apt-get -y install libcudnn9-samples
+   ```
+
+    or
+
+   ```
+   sudo dnf -y install libcudnn9-samples
+   ```
+
+2. Go to the writable path.
+
+   ```
+   cd $HOME/cudnn_samples_v9/mnistCUDNN
+   ```
+
+3. Compile the `mnistCUDNN` sample.
+
+   ```
+   make clean && make
+   ```
+
+4. Run the `mnistCUDNN` sample.
+
+   ```
+   ./mnistCUDNN
+   ```
+
+If cuDNN is properly installed and running on your Linux system, you will see a message similar to the following:
+
+```
+Test passed!
+```
+
+### Upgrading From Older Versions of cuDNN to cuDNN 9.x.y
+
+To upgrade from an older cuDNN version to 9, refer to the [Package Manager Installation](/installation/backend/linux#package-manager-installation) section and follow the steps for your target platform.
+
+Starting with cuDNN Backend 9.10.0, side-by-side installation with previous versions of cuDNN Backend is no longer supported. If a previous version of cuDNN Backend is installed on your system, the package manager handles the uninstallation of the previous version as follows:
+
+- The Debian package manager automatically uninstalls the previous version.
+- The RPM package manager prompts you to pass a flag to uninstall the previous version.

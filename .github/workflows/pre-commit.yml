@@ -1,0 +1,43 @@
+name: Style check
+
+# Enforces the formatting contract in CONTRIBUTING.md: clang-format for
+# C++/CUDA and black (line length 160) for Python/notebooks, exactly as
+# pinned in .pre-commit-config.yaml — CI runs the same hooks contributors
+# run locally.
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  push:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    # Draft PRs are skipped; marking one ready for review runs the check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit on all files
+        run: |
+          pip install pre-commit
+          pre-commit run --all-files --show-diff-on-failure --color always

@@ -84,6 +84,7 @@ This file intentionally does not touch the ratio=4 path; launch machinery mirror
 """
 
 from __future__ import annotations
+from cudnn._cutlass_compat import SmemAllocator
 
 import threading
 
@@ -130,7 +131,7 @@ _L2E_LO = 1.925963033500011e-08  # fp32(log2(e) - _L2E_HI); residual ~4e-16
 
 
 # ``cute.math.exp2``'s ``approx``/``ftz`` keywords are newer than the
-# ``nvidia-cutlass-dsl>=4.5.0`` floor this project's dependency spec resolves to, so the
+# ``nvidia-cutlass-dsl>=4.6.2`` floor this project's dependency spec resolves to, so the
 # same instruction is requested through ``fastmath=True``, which both versions accept.
 # Both spellings lower to ``ex2.approx.ftz.f32`` -- the form the tolerance contract is
 # calibrated on: on 4.6.1 the 16-kernel ``reg_probe_csa_compressor_r128.py`` PTX is
@@ -180,7 +181,7 @@ def _compressor_fwd_r128_kernel(
     col = bidy * threads_x + tidx
     bb = bidx  # one output row per CTA
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     # Partial-merge buffer, [tchunks][threads_x][vec] per quantity; unused (0 B) when
     # tchunks == 1 (the allocation below is skipped at trace time).
     if cutlass.const_expr(tchunks > 1):
@@ -724,7 +725,7 @@ def _compressor_bwd_r128_kernel(
     cvec = col * vec
     ZERO_BF16 = cutlass.BFloat16(0.0)
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     # [win][cols_pc] fp32 tile: holds s_k after stage, e_k after the e-pass (``p_k``
     # is formed at store time as ``e_k * (1/den)``). [win][cols_pc] bf16 tile: staged
     # kv. Small buffers for the chunk maxes and the published per-column den / S.

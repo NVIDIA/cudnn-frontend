@@ -28,6 +28,9 @@ TEST_CASE("B2B causal conv1d forward", "[b2b_causal_conv1d][forward]") {
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
     }
+    if (get_compute_capability() == 107 && cudnnGetVersion() < 92600) {
+        SKIP("B2B causal conv1d kernels on SM107 require cuDNN 9.26.0 or newer");
+    }
 
     int batch             = 2;
     int dim               = 64;
@@ -72,6 +75,9 @@ TEST_CASE("B2B causal conv1d backward", "[b2b_causal_conv1d][backward]") {
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
+    }
+    if (get_compute_capability() == 107 && cudnnGetVersion() < 92600) {
+        SKIP("B2B causal conv1d kernels on SM107 require cuDNN 9.26.0 or newer");
     }
 
     int batch             = 2;

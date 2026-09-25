@@ -8,6 +8,8 @@ import torch
 
 import cudnn
 
+pytestmark = pytest.mark.skipif(cudnn.backend_version() < 91200, reason="fluent Graph requires cuDNN >= 9.12")
+
 
 def _matmul_graph(**kwargs):
     """A 64x64 half matmul through the fluent wrapper."""

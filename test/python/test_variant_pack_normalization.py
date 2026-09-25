@@ -1,0 +1,478 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""graph.execute() normalizes the variant pack once, and both paths see the same thing.
+
+The property under test is that a caller never has to know whether the
+heuristics landed the graph on the cuDNN backend or on a python engine. Before
+normalization the backend accepted a bare device address (its `_ptr` had
+`if type(d) is int: return d`) while a python engine did not — `resolve_node_buffers`
+handed the engine the caller's object untouched and `frost.buffers.probe` then
+raised "buffer of type int exposes neither __cuda_array_interface__ nor
+__dlpack__". Same call, two answers, and the caller does not pick the plan.
+"""
+
+import threading
+
+import pytest
+import torch
+
+import cudnn
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="execute() needs a device to run a plan on")
+
+M = N = K = 64
+
+
+def _matmul_graph():
+    """A graph the cuDNN backend serves."""
+    a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, K, N, dtype=torch.bfloat16, device="cuda")
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
+    A, B = g.tensor_like(a), g.tensor_like(b)
+    C = g.matmul(A=A, B=B)
+    C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    g.build_plans()
+    return g, {A: a, B: b, C: c}, (a, b, c)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "form",
+    ["tensor_keys", "uid_keys", "int_values", "int_values_and_workspace"],
+)
+def test_every_variant_pack_form_still_works(form):
+    """The four shapes a variant pack has always been allowed to take."""
+    g, vp, (a, b, c) = _matmul_graph()
+    handle = cudnn.create_handle()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    ws_arg = ws
+
+    if form == "uid_keys":
+        vp = {t.get_uid(): v for t, v in vp.items()}
+    elif form == "int_values":
+        vp = {t: v.data_ptr() for t, v in vp.items()}
+    elif form == "int_values_and_workspace":
+        vp = {t.get_uid(): v.data_ptr() for t, v in vp.items()}
+        ws_arg = ws.data_ptr()
+
+    g.execute(vp, ws_arg, handle=handle)
+    torch.cuda.synchronize()
+    ref = (a.float() @ b.float()).to(torch.bfloat16)
+    torch.testing.assert_close(c, ref, atol=0.2, rtol=0.05)
+
+
+@pytest.mark.L0
+def test_missing_operand_names_the_tensor():
+    g, vp, _ = _matmul_graph()
+    handle = cudnn.create_handle()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    partial = dict(list(vp.items())[:-1])
+    with pytest.raises(ValueError, match="missing a buffer for tensor uid"):
+        g.execute(partial, ws, handle=handle)
+
+
+@pytest.mark.L0
+def test_operand_order_is_the_backend_order():
+    """The layout is the backend's own, ascending by uid — not a python guess.
+
+    A walk over node ports cannot produce it: a tensor's ragged_offset is a
+    user operand but hangs off the Tensor rather than off a port, and the slots
+    the graph fills itself (pass-by-value scalars, slice replacement
+    destinations, workspace modifications) must be excluded.
+    """
+    g, _, _ = _matmul_graph()
+    order = g._variant_pack_uids()
+    assert order == sorted(order), f"not ascending: {order}"
+    assert order == list(g._lowered_graph._get_variant_pack_uids_sorted())
+
+
+@pytest.mark.L0
+def test_execute_is_reentrant():
+    """One built graph, many threads, each with its own buffers.
+
+    The pointer array is per call for this reason. Sharing one across calls
+    hands each thread the other's pointers — silently, because every pointer in
+    it is individually valid, so the failure is a wrong number and not a raise.
+    """
+    g, _, _ = _matmul_graph()
+    handle = cudnn.create_handle()
+    uids = g._variant_pack_uids()
+    wrong = [0] * 8
+
+    def worker(i):
+        a = torch.full((1, M, K), float(i + 1), dtype=torch.bfloat16, device="cuda")
+        b = torch.eye(K, N, dtype=torch.bfloat16, device="cuda").unsqueeze(0)
+        c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+        # one workspace per thread: it is scratch the plan writes, so sharing
+        # it would be the very crossing this test is looking for
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        want = float(i + 1)
+        for _ in range(200):
+            g.execute({uids[0]: a, uids[1]: b, uids[2]: c}, ws, handle=handle)
+            torch.cuda.synchronize()
+            if c[0, 0, 0].item() != want:
+                wrong[i] += 1
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(wrong) == 0, f"crossed buffers between threads: {wrong}"
+
+
+@pytest.mark.L0
+def test_describing_tensor_matches_the_dataclass():
+    """``describing_tensor`` skips ``Tensor.__init__``, so every field it does
+    not set has to resolve to the same default the dataclass would have given
+    it. A new field with a ``default_factory`` gets no class attribute and
+    would raise here rather than reach an engine as a missing attribute."""
+    import dataclasses
+
+    from cudnn.graph_types import Tensor, describing_tensor
+
+    fast = describing_tensor(7, (4, 3), (6, 1), cudnn.data_type.FLOAT)
+    slow = Tensor(uid=7, dim=(4, 3), stride=(6, 1), data_type=cudnn.data_type.FLOAT)
+    for f in dataclasses.fields(Tensor):
+        assert getattr(fast, f.name) == getattr(slow, f.name), f.name
+
+
+@pytest.mark.L0
+def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
+    """Overrides do not change what a python plan is handed.
+
+    They exist so the backend can re-describe a tensor it lowered at another
+    shape. A python engine reads the shape off the buffer, which is what the
+    pack already carries. Branching on them used to send a migrated plan the
+    raw uid map, which it cannot read.
+    """
+    total, h, d, nseq = 256, 4, 128, 2
+    dt = cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph()
+    q = g.tensor([total, h, d], data_type=dt, name="q")
+    k = g.tensor([total, h, d], data_type=dt, name="k")
+    v = g.tensor([total, h, d], data_type=dt, name="v")
+    gate = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="g")
+    beta = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="beta")
+    cu = g.tensor([nseq + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
+    out, _fs, _h = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
+    out.set_output(True).set_data_type(dt)
+    try:
+        g.build()
+    except Exception as exc:  # no python engine on this arch -- nothing to assert
+        pytest.skip(f"no GDN engine here: {exc}")
+    if not g._compiled_plans[g._plan_index].takes_variant_pack:
+        pytest.skip("the selected plan has not migrated to the variant pack")
+
+    per = total // nseq
+    data = {
+        q: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        k: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        v: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        gate: torch.rand(total, h, device="cuda").log(),
+        beta: torch.rand(total, h, device="cuda"),
+        cu: torch.tensor([0, per, 2 * per], dtype=torch.int32, device="cuda"),
+        out: torch.empty(total, h, d, dtype=torch.bfloat16, device="cuda"),
+    }
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute(data, ws)
+    torch.cuda.synchronize()
+    plain = data[out].clone()
+
+    data[out].zero_()
+    g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]], override_strides=[[h * d, d, 1]])
+    torch.cuda.synchronize()
+    torch.testing.assert_close(data[out], plain)
+
+
+# ---------------------------------------------------------------------------
+# The declaration is the contract: a caller buffer whose own geometry disagrees
+# with the graph's but covers its bytes is described AS the declaration, the
+# way a bare address is. This is how the backend has always read a buffer
+# (pointer only), and it is what lets a 2-D matrix serve a [1, m, k] tensor or
+# a flat blob serve a reordered scale tensor on a python plan too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+def test_a_buffer_that_disagrees_with_the_declaration_is_described_from_it():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    two_d = {A: a.view(M, K), B: b.view(K, N), C: c}  # what FlashInfer binds
+    pack = g._normalize(g._uid_to_data(two_d), ws)
+    for t, buf in ((A, a), (B, b)):
+        i = pack.index_of(t)
+        assert list(pack.native.shape(i)) == list(t.get_dim()) and list(pack.native.stride(i)) == list(t.get_stride())
+        assert i in pack.graph_described  # an engine reads it in the graph's axis order
+        assert pack.native.pointer(i) == buf.data_ptr()
+    assert pack.index_of(C) not in pack.graph_described  # bound as declared: its own description stands
+    # ... and the backend plan runs the 2-D binding bit-identically to the 3-D one.
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    ref = c.clone()
+    c.zero_()
+    g.execute(two_d, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, ref)
+
+
+@pytest.mark.L0
+def test_the_declared_layout_is_built_once_and_the_rule_runs_natively():
+    """The rule is on every execute's critical path (backend plans included),
+    so the declaration side is computed once per graph and the comparison is
+    one crossing per pack: the second execute reuses the first's layout."""
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    assert g._declared_layout_native is None
+    first = g._normalize(g._uid_to_data({A: a.view(M, K), B: b.view(K, N), C: c}), ws)
+    layout = g._declared_layout_native
+    assert layout is not None and len(layout) == len(first)
+    second = g._normalize(g._uid_to_data({A: a, B: b, C: c}), ws)
+    assert g._declared_layout_native is layout
+    assert set(first.graph_described) == {first.index_of(A), first.index_of(B)} and second.graph_described == ()
+
+
+@pytest.mark.L0
+def test_the_declared_extents_under_the_callers_own_strides_are_kept():
+    """A padded / transposed view of the declared tensor: the strides carry
+    information and the engine honours them (the linear-attention engines
+    serve strided inputs this way), so the slot is NOT re-described."""
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    padded = torch.empty(1, M, 2 * K, dtype=torch.bfloat16, device="cuda")[:, :, :K]  # declared extents, row stride 2K
+    pack = g._normalize(g._uid_to_data({A: padded, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [1, M, K] and list(pack.native.stride(i)) == [2 * M * K, 2 * K, 1]
+    assert i not in pack.graph_described
+    strided_other = torch.empty(2 * M, K, dtype=torch.bfloat16, device="cuda")[::2]  # other extents AND strided: left alone too
+    pack = g._normalize(g._uid_to_data({A: strided_other, B: b, C: c}), ws)
+    assert pack.index_of(A) not in pack.graph_described
+
+
+@pytest.mark.L0
+def test_a_buffer_too_small_for_the_declaration_keeps_its_own_description():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    half = a[:, : M // 2, :]  # a strided view spanning fewer slots than [1, M, K]
+    pack = g._normalize(g._uid_to_data({A: half, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [1, M // 2, K] and i not in pack.graph_described
+
+
+@pytest.mark.L0
+def test_a_narrower_buffer_covering_the_slot_count_but_not_the_bytes_is_not_re_described():
+    g, vp, (a, b, c) = _matmul_graph()
+    A, B, C = vp.keys()
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    as_bytes = torch.empty(a.numel(), dtype=torch.uint8, device="cuda")  # as many SLOTS as [1, M, K] bf16, half the bytes
+    pack = g._normalize(g._uid_to_data({A: as_bytes, B: b, C: c}), ws)
+    i = pack.index_of(A)
+    assert list(pack.native.shape(i)) == [a.numel()] and i not in pack.graph_described
+
+
+@pytest.mark.L0
+@pytest.mark.L0
+def test_a_buffer_of_the_declared_width_is_read_as_the_declared_dtype():
+    """FlashInfer binds packed fp4 as uint8 and the e4m3 scale blob as uint8:
+    the declaration names the dtype, the buffer only has to be as wide. A
+    byte blob covering a bf16 output is re-described as that output, dtype
+    included; a too-small buffer keeps its own dtype and description. Exercised
+    at the native level, where the rule lives; the FlashInfer-shaped GEMM suite
+    runs the whole graph with these bindings."""
+    from cudnn import _pybind_module as native_mod
+    from cudnn.datatypes import _dlpack_code_bits, _dlpack_lanes
+
+    fp4, bf16 = cudnn.data_type.FP4_E2M1, cudnn.data_type.BFLOAT16
+    assert (_dlpack_code_bits(fp4), _dlpack_lanes(fp4)) == ((17, 4), 2)  # spelled as torch exports float4_e2m1fn_x2
+    bf16_dl = (*_dlpack_code_bits(bf16), _dlpack_lanes(bf16))
+    layout = native_mod.DeclaredLayout(4)
+    layout.set(0, [1, M, K // 2], [M * K // 2, K // 2, 1], 1, 17, 4, 2)  # fp4 [1, M, K] declared, in storage slots
+    layout.set(1, [1, M, K // 2], [M * K // 2, K // 2, 1], 1, 17, 4, 2)
+    layout.set(2, [1, M, N], [M * N, N, 1], 2, *bf16_dl)  # bf16 [1, M, N]
+    layout.set(3, [1, M, N], [M * N, N, 1], 2, *bf16_dl)
+    a_u8 = torch.zeros(M, K // 2, device="cuda", dtype=torch.uint8)  # what FlashInfer binds: other extents, same width
+    a_u8_declared = torch.zeros(1, M, K // 2, device="cuda", dtype=torch.uint8)  # the declared storage extents already
+    c_bytes = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16).view(torch.uint8)  # a byte blob covering the output
+    c_small = torch.empty(1, M, N, device="cuda", dtype=torch.uint8)  # the declared extents at half the width: too small
+    pack = native_mod.VariantPackNative(4)
+    assert pack.read_from({1: a_u8, 2: a_u8_declared, 3: c_bytes, 4: c_small}, [1, 2, 3, 4]) == []
+    assert pack.describe_from(layout, []) == [0, 2]  # extents re-described: the 2-D fp4 buffer and the byte blob
+    assert list(pack.shape(0)) == [1, M, K // 2] and pack.dtype(0) == (17, 4)
+    assert list(pack.shape(1)) == [1, M, K // 2] and pack.dtype(1) == (17, 4)  # dtype reinterpreted even when the extents already matched
+    assert list(pack.shape(2)) == [1, M, N] and pack.dtype(2) == bf16_dl[:2]  # the blob became the declared output
+    slot = pack.operand(0, 0)  # what an engine is handed: one byte per fp4 x2 slot, spelled as torch spells it
+    assert slot.dtype == "float4_e2m1fn_x2" and slot.element_size() == 1 and slot.nbytes == M * K // 2
+    assert list(pack.shape(3)) == [1, M, N] and pack.dtype(3) == (1, 8)  # too small: its own dtype and description stand
+    x2 = getattr(torch, "float4_e2m1fn_x2", None)
+    if x2 is not None:  # torch's own spelling arrives as the same dtype and is left alone
+        pack = native_mod.VariantPackNative(4)
+        pack.read_from({1: a_u8.view(x2)}, [1])
+        assert pack.describe_from(layout, []) == [0] and pack.dtype(0) == (17, 4)
+    # override_shapes: a buffer SMALLER than the declaration (a cache-M graph run
+    # at a smaller M) is too small to re-describe, but the override names the
+    # declared tensor at this call's size -- dtype included, when as wide
+    pack = native_mod.VariantPackNative(4)
+    pack.read_from({1: torch.zeros(M // 2, K // 2, device="cuda", dtype=torch.uint8)}, [1])
+    assert pack.describe_from(layout, []) == [] and pack.dtype(0) == (1, 8)
+    pack.override_operand(0, [1, M // 2, K // 2], [M * K // 4, K // 2, 1], 17, 4, 2)
+    assert list(pack.shape(0)) == [1, M // 2, K // 2] and pack.dtype(0) == (17, 4)
+    pack.override_operand(0, [1, M // 2, K // 2], [M * K // 4, K // 2, 1], *bf16_dl)  # a wider dtype: the buffer's stands
+    assert pack.dtype(0) == (17, 4)
+
+
+def test_storage_geometry_packs_fp4_two_per_slot():
+    from cudnn.graph_types import storage_geometry as _storage_geometry
+
+    bf16, fp4 = cudnn.data_type.BFLOAT16, cudnn.data_type.FP4_E2M1
+    assert _storage_geometry([1, 256, 256], [65536, 256, 1], bf16) == ((1, 256, 256), (65536, 256, 1))
+    # row-major A [1, M, K]: K halves, the outer strides halve with it
+    assert _storage_geometry([1, 256, 256], [65536, 256, 1], fp4) == ((1, 256, 128), (32768, 128, 1))
+    # column-major B [1, K, N] (stride 1 on K): K halves, N's stride halves
+    assert _storage_geometry([1, 256, 512], [131072, 1, 256], fp4) == ((1, 128, 512), (65536, 1, 128))
+    assert _storage_geometry([1, 256, 255], [65280, 255, 1], fp4) is None  # no slot geometry spells an odd extent
+    # a singleton axis may carry stride 1 too; the packed axis is the one with the even extent above one
+    assert _storage_geometry([1, 256, 256], [1, 256, 1], fp4) == ((1, 256, 128), (1, 128, 1))
+
+
+@pytest.mark.L0
+def test_a_bare_address_for_an_fp4_tensor_is_lent_the_storage_geometry():
+    """A bare address borrows the declaration; for fp4 that is the x2 SLOT
+    geometry, so an engine's per-slot packing factor applies to it like to any
+    typed buffer (the caller guarantees the allocation covers the bytes)."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="a", dim=[1, 256, 256], stride=[65536, 256, 1], data_type=cudnn.data_type.FP4_E2M1)
+    b = g.tensor(name="b", dim=[1, 256, 512], stride=[131072, 1, 256], data_type=cudnn.data_type.FP4_E2M1)
+    _, ta = g._describe(0x1000, a.get_uid())
+    _, tb = g._describe(0x2000, b.get_uid())
+    assert (tuple(ta.dim), tuple(ta.stride)) == ((1, 256, 128), (32768, 128, 1))
+    assert (tuple(tb.dim), tuple(tb.stride)) == ((1, 128, 512), (65536, 1, 128))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [512, 2560])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_reordered_scale_blob_keeps_physical_capacity(capacity, rank):
+    from cudnn.datatypes import _dlpack_code_bits
+
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    token = g.tensor(name="token", dim=[1, 137, 128], stride=[137 * 128, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    scale = g.tensor(
+        name="scale",
+        dim=[1, 256, 4],
+        stride=[1024, 4, 1],
+        data_type=cudnn.data_type.FP8_E8M0,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    shape = (capacity,) if rank == 1 else (1, capacity // 4, 4)
+    blob = torch.empty(shape, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert operand.numel() * operand.element_size() == capacity
+    assert tuple(operand.shape) == ((1, capacity, 1) if rank == 1 else shape)
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()
+    assert pack.native.dtype(slot) == _dlpack_code_bits(cudnn.data_type.FP8_E8M0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [4096, 4097])
+def test_reordered_batched_flat_scale_blob_preserves_batch_count(capacity):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[4, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[4, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(capacity, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    operand = pack.operand(pack.index_of(scale))
+    assert list(operand.shape) == ([4, capacity // 4, 1] if capacity % 4 == 0 else [capacity])
+    assert list(operand.stride()) == ([capacity // 4, 1, 1] if capacity % 4 == 0 else [1])
+    assert operand.numel() == capacity
+    assert operand.data_ptr() == blob.data_ptr()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stride", [(1023, 0), (1024, 1), (1, 2)])
+def test_reordered_scale_blob_keeps_noncontiguous_view(stride):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[1, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[1, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(2048, dtype=torch.uint8, device="cuda").as_strided((2, 512), stride)
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert tuple(operand.shape) == tuple(blob.shape)
+    assert tuple(operand.stride()) == stride
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()
+
+
+@pytest.mark.L0
+def test_override_many_matches_the_per_operand_path():
+    """The single-crossing override (``VariantPackNative.override_many``) must land exactly where the
+    per-operand Python path did: storage-slot geometry (fp4 packing), the axis-order permutation against
+    the buffer's EFFECTIVE strides (an omitted stride vector is compact row-major, not "no strides"),
+    and the declared dtype when the slots are as wide. Differential over producers with and without
+    strides, a column-major declaration, fp4 packing, singleton axes and a dtype-only declaration."""
+    from cudnn import _pybind_module as native_mod
+    from cudnn._pygraph import _in_axis_order_of
+    from cudnn.datatypes import _dlpack_code_bits, _dlpack_lanes
+    from cudnn.graph_types import storage_geometry
+
+    bf16, fp4 = cudnn.data_type.BFLOAT16, cudnn.data_type.FP4_E2M1
+    bf16_dl = (*_dlpack_code_bits(bf16), _dlpack_lanes(bf16))
+    fp4_dl = (*_dlpack_code_bits(fp4), _dlpack_lanes(fp4))
+    ptr = 0x10000
+    # (declared geometry or None, declared dtype, producer shape, producer stride or () for omitted, override shape, override stride)
+    cases = [
+        (([1, 8, 8], [64, 1, 8]), bf16, (1, 8, 8), (), [1, 4, 8], [64, 1, 8]),  # omitted strides, column-major declaration
+        (([1, 8, 8], [64, 1, 8]), bf16, (1, 8, 8), (64, 8, 1), [1, 4, 8], [64, 1, 8]),  # the same, strides spelled out
+        (([1, 8, 8], [64, 8, 1]), bf16, (1, 8, 8), (), [1, 4, 8], [32, 8, 1]),  # row-major: identity permutation
+        (([1, 8, 8], [64, 8, 1]), fp4, (1, 8, 4), (), [1, 4, 8], [32, 8, 1]),  # fp4: unit-stride extent halves, other strides halve
+        (([2, 1, 8], [8, 8, 1]), bf16, (2, 1, 8), (8, 8, 1), [1, 1, 8], [8, 8, 1]),  # singleton / tied-stride axis
+        (None, bf16, (8, 8), (8, 1), [4, 8], [8, 1]),  # dtype-only declaration (no storage geometry)
+    ]
+    for decl, dtype, pshape, pstride, oshape, ostride in cases:
+        dl = (*_dlpack_code_bits(dtype), _dlpack_lanes(dtype))
+        layout = native_mod.DeclaredLayout(1)
+        if decl is not None:
+            st = storage_geometry(decl[0], decl[1], dtype)
+            layout.set(0, list(st[0]), list(st[1]), 1 if dtype == fp4 else 2, *dl)
+        else:
+            layout.set_dtype(0, *dl)
+        # a producer whose own dtype is a byte (FlashInfer-style blob) so the declared dtype applies when as wide
+        own = (1, 8, 1) if dtype == fp4 else dl
+        old, new = native_mod.VariantPackNative(1), native_mod.VariantPackNative(1)
+        for pk in (old, new):
+            pk.set_operand(0, ptr, tuple(pshape), tuple(pstride), *own, -1, 2, 0)
+        # the per-operand path as _normalize wrote it before
+        storage = storage_geometry(oshape, ostride, dtype)
+        old.override_operand(0, *_in_axis_order_of(storage[0], storage[1], old.stride(0)), *dl)
+        new.override_many(layout, [0], [list(oshape)], [list(ostride)])
+        assert (list(new.shape(0)), list(new.stride(0)), new.dtype(0)) == (list(old.shape(0)), list(old.stride(0)), old.dtype(0)), (
+            decl,
+            dtype,
+            pshape,
+            pstride,
+            (list(new.shape(0)), list(new.stride(0))),
+            (list(old.shape(0)), list(old.stride(0))),
+        )
+    # an odd fp4 extent has no storage geometry: both paths refuse it
+    layout = native_mod.DeclaredLayout(1)
+    layout.set(0, [1, 8, 4], [32, 4, 1], 1, *fp4_dl)
+    pk = native_mod.VariantPackNative(1)
+    pk.set_operand(0, ptr, (1, 8, 4), (), 1, 8, 1, -1, 2, 0)
+    assert storage_geometry([1, 8, 7], [56, 7, 1], fp4) is None
+    with pytest.raises(ValueError, match="fp4"):
+        pk.override_many(layout, [0], [[1, 8, 7]], [[56, 7, 1]])

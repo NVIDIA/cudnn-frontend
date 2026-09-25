@@ -298,3 +298,38 @@ def _test_gemm_amax_wrapper(
         pytest.skip(f"Unsupported testcase: {e}")
 
     check_ref_gemm_amax(a_ref, b_ref, sfa_ref, sfb_ref, c_torch, amax_torch, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+def test_gemm_amax_rejects_noncontiguous_scale_factors():
+    """SF tensors are consumed by base pointer only (the kernel rebuilds the layout from
+    the GEMM shapes), so a shape-matching but differently-strided tensor must be rejected
+    rather than silently producing wrong results."""
+    try:
+        from cudnn import gemm_amax_wrapper_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires SM100+")
+
+    m, n, k, sf_vec_size = 512, 256, 256, 32
+    a = torch.randn(m, k, 1, device="cuda").to(torch.float8_e5m2)
+    b = torch.randn(n, k, 1, device="cuda").to(torch.float8_e5m2)
+    sf_dtype = torch.float8_e8m0fnu
+    sfa = torch.ones(1, m // 128, k // (4 * sf_vec_size), 32, 4, 4, device="cuda", dtype=torch.uint8).view(sf_dtype)
+    sfb = torch.ones(1, n // 128, k // (4 * sf_vec_size), 32, 4, 4, device="cuda", dtype=torch.uint8).view(sf_dtype)
+
+    # Valid: the physical form and its (3, 4, 1, 5, 2, 0)-permuted atom view
+    gemm_amax_wrapper_sm100(a, b, sfa, sfb, sf_vec_size=sf_vec_size)
+    gemm_amax_wrapper_sm100(a, b, sfa.permute(3, 4, 1, 5, 2, 0), sfb.permute(3, 4, 1, 5, 2, 0), sf_vec_size=sf_vec_size)
+
+    # Non-contiguous tensor whose shape matches the physical form
+    bad_physical = torch.ones(1, k // (4 * sf_vec_size), m // 128, 32, 4, 4, device="cuda", dtype=torch.uint8).view(sf_dtype).permute(0, 2, 1, 3, 4, 5)
+    assert tuple(bad_physical.shape) == tuple(sfa.shape) and not bad_physical.is_contiguous()
+    with pytest.raises(ValueError, match="stride"):
+        gemm_amax_wrapper_sm100(a, b, bad_physical, sfb, sf_vec_size=sf_vec_size)
+
+    # C-contiguous allocation in the atom-view shape (not a permutation of the physical form)
+    bad_atom = torch.ones(32, 4, m // 128, 4, k // (4 * sf_vec_size), 1, device="cuda", dtype=torch.uint8).view(sf_dtype)
+    with pytest.raises(ValueError, match="stride"):
+        gemm_amax_wrapper_sm100(a, b, bad_atom, sfb, sf_vec_size=sf_vec_size)

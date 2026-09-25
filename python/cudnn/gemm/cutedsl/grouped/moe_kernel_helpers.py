@@ -12,12 +12,13 @@ This module contains:
 - Kernel helper functions that don't depend on kernel instance state
 """
 
-from typing import Type, Tuple, Union
+from __future__ import annotations
 
-import torch
+from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -131,6 +132,32 @@ def fmax(a: Union[float, Float32], b: Union[float, Float32], *, nan=True, loc=No
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             f"{ptx_instr}",
             f"=f,f,f",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def tanh_clamp_unit(u: Float32, *, loc=None, ip=None) -> Float32:
+    """``t = sat(tanh(u))`` for ``u = x/s``: the soft-clamp unit of the srelu/dsrelu epilogues.
+
+    One MUFU.TANH plus one FMUL.SAT (``mul.rn.sat.f32`` by 1.0 clamps to [0, 1]; NaN -> +0).
+    The saturate does two jobs. It is the relu: tanh is monotone with tanh(0) = 0, so u < 0
+    lands on t = 0, and NaN lands on 0 exactly like ``where(NaN > 0, NaN, 0)`` did. And it is
+    the defensive t <= 1 cap the backward needs for t - t^3 >= 0, since tanh.approx.f32's
+    range is not assumed.
+
+    Both kernels must go through this one function: with C stored in fp32 the backward's
+    d_srelu regen has to reproduce the forward bit for bit.
+    """
+    t = cute.math.tanh(u, fastmath=True)
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(t).ir_value(loc=loc, ip=ip)],
+            "mul.rn.sat.f32 $0, $1, 0f3F800000;",
+            "=f,f",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -401,6 +428,8 @@ def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> U
 
 def sigmoid(x):
     """PyTorch reference sigmoid using exp2 for numerical consistency."""
+    import torch
+
     LOG2_E = 1.4426950408889634
     exp_x = torch.exp2(x * (-LOG2_E))
     ret = 1.0 / (exp_x + 1.0)
@@ -417,6 +446,8 @@ def compute_reference_amax(output_tensor: torch.Tensor) -> float:
     Returns:
         float: reference amax value
     """
+    import torch
+
     if output_tensor.dtype != torch.float32:
         output_fp32 = output_tensor.float()
     else:
@@ -446,6 +477,8 @@ def compare_and_report_mismatches(
         rtol: Relative tolerance
         max_mismatches: Maximum number of mismatches to report
     """
+    import torch
+
     if gpu_tensor.is_cuda:
         gpu_data = gpu_tensor.cpu()
     else:
@@ -873,9 +906,9 @@ def compute_stages(
     epi_tile: cute.Tile,
     epi_tile_c: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     d_dtype: Type[cutlass.Numeric],
-    d_layout: utils.LayoutEnum,
+    d_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -994,7 +1027,7 @@ def compute_stages_wgrad(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -1034,7 +1067,7 @@ def compute_stages_wgrad_bf16(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     num_smem_capacity: int,
     occupancy: int,
 ) -> Tuple[int, int, int]:

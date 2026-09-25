@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** in FP8 configurations: b_ptrs/sfb_ptrs as packed-uint8 (or x64 int64) pointer arrays, SFA in the physical C-contiguous atom shape `(1, MN', K', 32, 4, 4)`, SFD outputs allocated the same way (the kernel rebuilds all SF layouts from the GEMM shapes and reads only base pointers). Column-major bias and packed-fp4 inputs are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `discrete_grouped_gemm_swiglu_jax_sm100` (built on `cudnn.jax.call`; k-major weights only): all outputs (c/d/d_col, SFD tensors, amax) are XLA-managed donated buffers — no manual synchronization. Under tracing the offsets *values* cannot be host-validated, and the weight/scale buffers behind the pointer arrays must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Discrete Grouped GEMM + SwiGLU fusion**: A block-scaled grouped GEMM fused with a SwiGLU/GeGLU epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE workloads where each expert weight lives in a separate allocation.
@@ -292,7 +298,7 @@ api.execute(
 
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread block cluster shape `(CLUSTER_M, CLUSTER_N)`
-  - Constraints: positive powers of 2, both <= 4, `CLUSTER_M * CLUSTER_N <= 16`
+  - Constraints: positive powers of 2, both &lt;= 4, `CLUSTER_M * CLUSTER_N <= 16`
   - Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 
 - `sf_vec_size: int`
@@ -376,7 +382,7 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 | Format | ab_dtype | sf_dtype | sf_vec_size | d_dtype |
 |--------|----------|----------|-------------|---------|
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` |
-| **NVF4** | `float4_e2m1fn_x2` or `uint8` | {`float8_e8m0fnu`, `float8_e4m3fn`} | {16, 32} | `{float16, bfloat16, float32}` |
+| **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e8m0fnu`, `float8_e4m3fn`\} | \{16, 32\} | `{float16, bfloat16, float32}` |
 
 #### Additional Type Constraints
 

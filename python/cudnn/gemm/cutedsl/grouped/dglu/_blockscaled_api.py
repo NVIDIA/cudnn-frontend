@@ -5,7 +5,7 @@ Unified API for Grouped GEMM dGLU Backward Kernel (SM100+)
 
 This module provides a single API class that supports both contiguous (dense)
 and discrete weight modes for block-scaled grouped GEMM with dGLU activation
-gradient (dSwiGLU / dGeGLU) in MoE (Mixture of Experts) workloads.
+gradient (dSwiGLU / dGeGLU / dSiTU-GLU) in MoE (Mixture of Experts) workloads.
 
 Dense mode
     All expert weights are packed contiguously in a 3-D tensor (N, K, L).
@@ -17,21 +17,26 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from cuda.bindings import driver as cuda
+import math
 import os
-import torch
-from typing import Tuple, Optional
+from typing import Literal, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
+from cudnn.frost.workspace import Workspace, align_up
+from ._workspace import validate_workspace_aliases
 
 
 def _get_rubin_kernel():
@@ -40,21 +45,6 @@ def _get_rubin_kernel():
     )
 
     return RubinBlockScaledMoEGroupedGemmDgluKernel
-
-
-_GEGGLU_ALPHA_DEFAULT = 1.702
-_GLU_CLAMP_MAX_DEFAULT = 7.0
-_GLU_CLAMP_MIN_DEFAULT = -7.0
-
-
-def _reject_unsupported_rubin_glu_tune_params(
-    is_rubin_kernel: bool,
-    geglu_alpha: float,
-    glu_clamp_max: float,
-    glu_clamp_min: float,
-) -> None:
-    if is_rubin_kernel and (geglu_alpha != _GEGGLU_ALPHA_DEFAULT or glu_clamp_max != _GLU_CLAMP_MAX_DEFAULT or glu_clamp_min != _GLU_CLAMP_MIN_DEFAULT):
-        raise NotImplementedError("Rubin grouped GEMM dGLU does not support geglu_alpha, glu_clamp_max, or glu_clamp_min tuning")
 
 
 class GroupedGemmDgluBlockScaledAPI(APIBase):
@@ -123,10 +113,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
@@ -139,6 +130,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -166,10 +159,18 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
-        :param vector_f32: Use vectorized f32 operations
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
+        :param vector_f32: Use vectorized f32 operations for dSwiGLU and dGeGLU.
+            K3-default dSiTU-GLU (``situ_beta1=4.0``) always uses its packed
+            FP32x2 specialization; non-default dSiTU-GLU uses scalar FP32.
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
-        :param act_func: Activation function, one of "dswiglu" or "dgeglu"
+        :param act_func: Activation function, one of "dswiglu", "dgeglu", or "dsituglu"
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param epilogue_op: Optional epilogue operation. Valid: None, "none", "identity", "relu", "srelu"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
@@ -182,7 +183,20 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             ``act_func == "dswiglu"``.
         :param glu_clamp_min: Compile-time dGeGLU lower clamp. Ignored when
             ``act_func == "dswiglu"``.
+        :param situ_beta1: Compile-time gate tanh scale for dSiTU-GLU.
+        :param situ_beta2: Compile-time up-branch tanh scale for dSiTU-GLU.
         """
+        from cudnn.tensor_adapter import detect_framework
+
+        if sample_a is not None and detect_framework(sample_a) != "torch":
+            raise ValueError(
+                "GroupedGemmDgluBlockScaledAPI supports torch tensors only: the block-scaled "
+                "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
+            )
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -247,6 +261,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         else:
             self.cluster_shape_mn = cluster_shape_mn
         self.sf_vec_size = sf_vec_size
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
@@ -277,12 +292,17 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.geglu_alpha = geglu_alpha
         self.glu_clamp_max = glu_clamp_max
         self.glu_clamp_min = glu_clamp_min
-        _reject_unsupported_rubin_glu_tune_params(
-            self._is_rubin_kernel,
-            self.geglu_alpha,
-            self.glu_clamp_max,
-            self.glu_clamp_min,
-        )
+        self.situ_beta1 = float(situ_beta1)
+        self.situ_beta2 = float(situ_beta2)
+        if self.act_func == "dsituglu":
+            self._value_error_if(
+                not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
+                f"situ_beta1 must be finite and positive, got {self.situ_beta1}",
+            )
+            self._value_error_if(
+                not math.isfinite(self.situ_beta2) or self.situ_beta2 <= 0.0,
+                f"situ_beta2 must be finite and positive, got {self.situ_beta2}",
+            )
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
@@ -291,21 +311,55 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
-        self._workspace = None
+        self._kernel_obj = None
 
         self._logger.debug("__init__ completed")
 
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                discrete_col_sfd=self.discrete_col_sfd,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                act_func=self.act_func,
+                use_dynamic_sched=self.use_dynamic_sched,
+                **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+                **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
+                # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
+                # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
+                # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
+                # that internal-only type is never named outside the Rubin module.
+                **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
+        self._ensure_support_checked()
+        if not hasattr(self, "_scratch_nbytes"):
+            self._scratch_nbytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return self._scratch_nbytes
+
+    @staticmethod
+    def _fake_workspace_ptr():
+        # Compile-time placeholder: type and alignment only; execute() passes the caller's address.
+        return cute.runtime.make_ptr(cutlass.Uint8, 128, cute.AddressSpace.gmem, assumed_align=128)
+
+    @staticmethod
+    def _fake_pointer_table():
+        return cute.runtime.make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
+
     @staticmethod
     def _record_pointer_stream(pointers: torch.Tensor, current_stream: cuda.CUstream) -> None:
-        handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(pointers.device)
-        torch_default = torch.cuda.default_stream(pointers.device)
-        if handle == torch_current.cuda_stream:
-            launch_stream = torch_current
-        elif handle == torch_default.cuda_stream:
-            launch_stream = torch_default
-        else:
-            launch_stream = torch.cuda.ExternalStream(handle, device=pointers.device)
+        import torch
+
+        launch_stream = as_torch_stream(int(current_stream), pointers.device)
         pointers.record_stream(launch_stream)
 
     # --------------------------------------------------------------------- #
@@ -317,6 +371,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -479,6 +535,30 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
 
+        # torch has no e5m3 dtype and TVM-FFI cannot marshal FloatNV8E5M3FNU, so e5m3
+        # scale factors arrive as e4m3 storage of the same width and the Rubin kernel
+        # reinterprets them. That reinterpretation is the only real override; every
+        # other format the kernel reads straight off sfa.element_type.
+
+        # e5m3 is the only override currently supported
+        self._value_error_if(
+            self.sf_fp8_dtype_override not in (None, "e5m3"),
+            f"sf_fp8_dtype_override must be None or 'e5m3', got {self.sf_fp8_dtype_override!r}",
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            # Only allow e5m3 to pretend to be e4m3fn
+            self._value_error_if(
+                self.sf_dtype != torch.float8_e4m3fn,
+                f"sf_fp8_dtype_override='e5m3' requires the NVFP4 recipe -- FP4 A/B with "
+                f"torch.float8_e4m3fn scale factors at sf_vec_size 16 -- but got "
+                f"ab_dtype={self.ab_dtype}, sf_dtype={self.sf_dtype}, sf_vec_size={self.sf_vec_size}",
+            )
+            # Only allow e5m3 for rubin kernels
+            self._value_error_if(
+                not self._is_rubin_kernel,
+                f"sf_fp8_dtype_override='e5m3' requires Rubin (SM107), got device type {self._device_type!r}",
+            )
+
         self._check_dtype(
             self.acc_dtype,
             dtype=torch.float32,
@@ -554,8 +634,12 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Activation function validation ----
         self._value_error_if(
-            self.act_func not in ["dswiglu", "dgeglu"],
-            f"act_func must be 'dswiglu' or 'dgeglu', got {self.act_func}",
+            self.act_func not in ["dswiglu", "dgeglu", "dsituglu"],
+            f"act_func must be 'dswiglu', 'dgeglu', or 'dsituglu', got {self.act_func}",
+        )
+        self._not_implemented_error_if(
+            self._is_rubin_kernel and self.act_func == "dsituglu",
+            "Rubin grouped GEMM dGLU does not support dsituglu",
         )
 
         # ---- Discrete-mode-specific validation ----
@@ -679,21 +763,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             self._logger.debug("sample valid_m is zero, skipping kernel compilation")
             return
 
-        # ---- Instantiate the unified kernel ----
-        gemm_dglu = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            discrete_col_sfd=self.discrete_col_sfd,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            act_func=self.act_func,
-            use_dynamic_sched=self.use_dynamic_sched,
-            **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
-        )
+        gemm_dglu = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -703,10 +773,6 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        # ---- Allocate workspace ----
-        workspace_bytes = gemm_dglu.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_dglu, max_active_clusters, fake_stream)
@@ -721,10 +787,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         """Compile for dense (contiguous) weight mode."""
         use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
-        fake_workspace_ptr = cute.runtime.nullptr(
-            dtype=cutlass.Uint8,
-            assumed_align=128,
-        )
+        fake_workspace_ptr = self._fake_workspace_ptr()
 
         if not use_full_dynamic:
             valid_m = cute.sym_int(divisibility=256)
@@ -934,20 +997,19 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
             linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": self.geglu_alpha,
-                    "glu_clamp_max": self.glu_clamp_max,
-                    "glu_clamp_min": self.glu_clamp_min,
+                    "situ_beta1": self.situ_beta1,
+                    "situ_beta2": self.situ_beta2,
                 }
             )
         _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
-
-        # Cache workspace pointer for the tensor_api closure
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
         def tensor_api(
             a_tensor: torch.Tensor,
@@ -967,6 +1029,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             prob_tensor: Optional[torch.Tensor],
             dprob_tensor: Optional[torch.Tensor],
             dbias_tensor: Optional[torch.Tensor],
+            workspace_ptr: int,
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
@@ -977,7 +1040,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 cutlass.Int32(0),
                 cutlass.Int32(0),
                 cutlass.Int64(0),
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_row_tensor,
                 d_col_tensor,
@@ -1095,13 +1158,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             )
         dbias_tensor = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
-        # Compile-time pointer placeholders
-        b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        b_ptrs_cute = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
-        sfb_ptrs_cute = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
-
-        workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
+        b_ptrs_cute = self._fake_pointer_table()
+        sfb_ptrs_cute = self._fake_pointer_table()
+        workspace_ptr_cute = self._fake_workspace_ptr()
 
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         compile_kwargs = dict(
@@ -1131,14 +1190,16 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
             linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": self.geglu_alpha,
-                    "glu_clamp_max": self.glu_clamp_max,
-                    "glu_clamp_min": self.glu_clamp_min,
+                    "situ_beta1": self.situ_beta1,
+                    "situ_beta2": self.situ_beta2,
                 }
             )
         _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
@@ -1148,7 +1209,6 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self._b_stride_size = b_stride_size
 
         # Cache constant values for execute() closure
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
         cached_n = cutlass.Int32(self._n)
         cached_k = cutlass.Int32(self._k)
         cached_b_stride = cutlass.Int64(self._b_stride_size)
@@ -1171,6 +1231,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             prob_tensor: Optional[torch.Tensor],
             dprob_tensor: Optional[torch.Tensor],
             dbias_tensor: Optional[torch.Tensor],
+            workspace_ptr: int,
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
@@ -1184,7 +1245,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 cached_n,
                 cached_k,
                 cached_b_stride,
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_row_tensor,
                 d_col_tensor,
@@ -1235,6 +1296,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1261,6 +1324,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param amax_tensor: Optional amax tensor
         :param norm_const_tensor: Optional normalization constant
         :param current_stream: CUDA stream
+        :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
+            128-byte aligned, that the launch carves (recipe R2). Required.
         """
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
@@ -1279,6 +1344,31 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dbias_tensor is None,
                 "dbias_tensor is required when GroupedGemmDgluSm100 is configured with sample_dbias",
             )
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
+        validate_workspace_aliases(
+            ws_view.data_ptr(),
+            nbytes,
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            d_col_tensor=d_col_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            dbias_tensor=dbias_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+            amax_tensor=amax_tensor,
+            norm_const_tensor=norm_const_tensor,
+        )
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(
@@ -1299,6 +1389,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 prob_tensor=prob_tensor,
                 dprob_tensor=dprob_tensor,
                 dbias_tensor=dbias_tensor,
+                workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
             )
         else:
@@ -1322,6 +1413,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 prob_tensor=prob_tensor,
                 dprob_tensor=dprob_tensor,
                 dbias_tensor=dbias_tensor,
+                workspace_ptr=ws_view.data_ptr(),
                 stream=current_stream,
             )
 

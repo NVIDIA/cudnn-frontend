@@ -12,9 +12,20 @@ os.environ.setdefault(
     "expandable_segments:True,garbage_collection_threshold:0.6",
 )
 
+# The JAX interop tests (fe_api/**/test_*_jax.py) initialize XLA in the same pytest
+# process as the torch suites; XLA's default 75%-of-GPU preallocation starves later
+# torch tests of memory (CUDA_ERROR_OUT_OF_MEMORY at kernel-compile time). Must be set
+# before jax initializes its backend.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+# Transformer Engine is used only for PyTorch quantization references. JAX
+# interop tests do not need its optional JAX extension, even when JAX is installed.
+os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
+
+import faulthandler
+import subprocess
 import sys
 import time
-import traceback
 import pytest
 
 # Import TransformerEngine BEFORE cudnn to avoid library loading conflicts
@@ -25,25 +36,227 @@ except (ImportError, OSError):
     pass
 
 import cudnn
-import torch
+
+# cudart via cuda-python instead of torch: torch is optional, and startup must
+# not create a CUDA context so per-worker CUDA_VISIBLE_DEVICES routing works.
+import cuda.bindings.driver as cuda_driver
+import cuda.bindings.runtime as cudart
+
+
+def _cudart_call(fn, *args):
+    err, *rest = fn(*args)
+    if int(err) != 0:
+        raise RuntimeError(f"{fn.__name__} failed: {cudart.cudaGetErrorString(err)[1].decode()}")
+    return rest[0] if len(rest) == 1 else tuple(rest)
+
 
 # fmt: off
 
-# =================== CUDA Synchronize Guard =====================
-torch.cuda.synchronize_unsafe = torch.cuda.synchronize
+# =================== Crash isolation =====================
+# Three failure modes are unrecoverable in-process and make every later test lie:
+#   - a segfault or abort kills the interpreter;
+#   - a faulting kernel (illegal memory access, device-side assert, ...) poisons
+#     the CUDA context, so every later CUDA call -- fixture setup included --
+#     returns the same sticky error;
+#   - a hung test, CPU or GPU, blocks the session forever.
+# So the tests run inside a pytest-xdist worker (one is injected below when the
+# caller did not ask for -n), and the worker is killed as soon as its context is
+# dead or a test overruns its deadline. The controller reports the offending
+# test, replaces the worker, and the rest of the session runs in a fresh process
+# with fresh fixtures. Escape hatches: -s / --pdb / -n<N> / CUDNN_TEST_NO_ISOLATION=1.
+#
+# Caveat for GPU hangs: killing the process does not stop a kernel that is still
+# running; the driver keeps that context alive until the kernel finishes, and
+# the next worker can block behind it. Nothing short of a GPU reset fixes that.
 
-def cuda_synchronize_safe(*args, **kwargs):
+_TEST_TIMEOUT_S = float(os.environ.get("CUDNN_TEST_TIMEOUT", "1500"))
+_xdist_controller = False
+_stderr_fd = None  # dup of the real stderr, taken while pytest's capture is suspended
+
+# Per-worker journal of started/finished tests, off unless CUDNN_TEST_TRACE_DIR
+# names a writable directory. See _trace() for what it is for.
+_TRACE_DIR = os.environ.get("CUDNN_TEST_TRACE_DIR")
+_TRACE_PATH = (
+    os.path.join(_TRACE_DIR, f"worker-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}.trace")
+    if _TRACE_DIR
+    else None
+)
+
+
+def _is_xdist_worker():
+    return os.environ.get("PYTEST_XDIST_WORKER") is not None
+
+
+def _log_to_real_stderr(msg):
+    # print(..., file=sys.__stderr__) does NOT reach the CI log from an xdist
+    # worker: pytest's global capture replaces fd 2 for the whole worker
+    # process, so sys.__stderr__ writes land in a capture buffer that is thrown
+    # away when the worker dies -- which is exactly when these messages matter.
+    # _stderr_fd is the pre-capture dup, the same channel pytest's own
+    # faulthandler plugin writes tracebacks to for this very reason. Verified
+    # both ways against a worker that prints on both channels and then _exits:
+    # only the duped fd survives.
+    fd = _stderr_fd if _stderr_fd is not None else 2
     try:
-        torch.cuda.synchronize_unsafe(*args, **kwargs)
-    except Exception as e:
-        entries = traceback.extract_stack(sys._getframe(1))
-        test_entries = [f for f in entries if "/test/python/" in f.filename]
-        print("Traceback (most recent call last):", flush=True)
-        print(*traceback.format_list(test_entries), end="", flush=True)
-        print(e, flush=True)
-        os._exit(os.EX_SOFTWARE)
+        os.write(fd, (msg + "\n").encode("utf-8", errors="replace"))
+    except OSError:
+        pass  # a diagnostic must never be what breaks the run
 
-torch.cuda.synchronize = cuda_synchronize_safe
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    # Runs before xdist's own tryfirst hook, which expands numprocesses into tx
+    # specs. Workers re-enter this hook with numprocesses reset to None; skip
+    # there, or a worker spawns workers of its own.
+    opt = config.option
+    if _is_xdist_worker() or os.environ.get("CUDNN_TEST_NO_ISOLATION"):
+        return
+    if not hasattr(opt, "numprocesses"):
+        return  # pytest-xdist not installed
+    if opt.maxworkerrestart is None:
+        opt.maxworkerrestart = 100000  # xdist's default is 4x the worker count; every crashing test costs one
+    if opt.numprocesses is not None or opt.tx or opt.collectonly:
+        return
+    if opt.capture == "no" or opt.usepdb:
+        return  # interactive run: keep the tests in this process
+    opt.numprocesses = 1
+
+
+def _dead_cuda_context():
+    # A sticky context error is returned by every later CUDA call, so one
+    # synchronize is both the cheapest and the most complete probe; it also
+    # surfaces async faults the test itself swallowed.
+    # Probe only if this thread already holds a context; cudaDeviceSynchronize
+    # would otherwise create one in a worker that never touched the GPU.
+    err, ctx = cuda_driver.cuCtxGetCurrent()
+    if err == cuda_driver.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+        return None
+    if err != cuda_driver.CUresult.CUDA_SUCCESS:
+        return cuda_driver.cuGetErrorString(err)[1].decode()
+    if int(ctx) == 0:
+        return None
+    (err,) = cudart.cudaDeviceSynchronize()
+    if int(err) == 0:
+        return None
+    return cudart.cudaGetErrorString(err)[1].decode()
+
+
+def _trace(event, nodeid):
+    # Opt-in per-worker journal of what each worker started and finished.
+    #
+    # When a worker dies, all the log says is "node down"; the journal survives
+    # it and distinguishes the two deaths that otherwise look identical:
+    #   - last line is a START, so the worker died *inside* that test (signal);
+    #   - last line is DEAD-CONTEXT, so the crash guard below killed it after
+    #     the test, and the line carries the CUDA error that condemned it.
+    # It also pins down which test is at fault independently of xdist's own
+    # attribution, which is worth having precisely because that attribution is
+    # easy to reason about wrongly.
+    # The controller replays every worker's reports, so logstart fires there
+    # too, while logfinish returns early -- its journal would be nothing but
+    # START lines and would read as a worker that died on every test.
+    if _TRACE_PATH is None or _xdist_controller:
+        return
+    try:
+        with open(_TRACE_PATH, "a") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')} {event} {nodeid}\n")
+    except OSError:
+        pass  # a diagnostic must never be what breaks the run
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _trace("START ", nodeid)
+    # faulthandler's watchdog is a C thread that needs no GIL, so it fires even
+    # while the main thread sits in a CUDA driver call; a Python thread or
+    # SIGALRM handler would never get to run there. exit=True dumps every
+    # thread's stack to the real stderr and then _exit()s the worker.
+    if _TEST_TIMEOUT_S > 0 and not _xdist_controller:
+        faulthandler.dump_traceback_later(_TEST_TIMEOUT_S, exit=True, file=_stderr_fd)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logfinish(nodeid, location):
+    if _xdist_controller:
+        return  # only replays worker reports; ran no CUDA work of its own
+    # The probe blocks on any kernel the test left running, so it runs with the
+    # watchdog still armed; disarm only once it has returned.
+    error = _dead_cuda_context()
+    faulthandler.cancel_dump_traceback_later()
+    if error is None:
+        _trace("ok    ", nodeid)
+        return
+    msg = f"[crash-guard] {nodeid}: CUDA context is unusable ({error})"
+    _trace(f"DEAD-CONTEXT ({error}) ", nodeid)
+    if not _is_xdist_worker():
+        pytest.exit(msg, returncode=1)  # no supervisor to restart us: stop cleanly instead of cascading
+    _log_to_real_stderr(f"{msg}; killing the worker")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.5)  # let this test's report drain to the xdist controller first
+    os._exit(os.EX_SOFTWARE)
+
+# =================== JAX/XLA target gate =====================
+# XLA cannot compile for every GPU these tests run on, and when it cannot it
+# does not raise -- it prints
+#
+#   LLVM Fatal Error ... PTX version 9.0 does not support target 'sm_107a'.
+#   Minimum required PTX version is 9.4.
+#
+# and calls exit(1) from C. On Rubin (sm_107a) that happens on the very first
+# XLA compilation, so every test_*_jax.py test takes the interpreter down with
+# it: jaxlib 0.11.1 -- the newest release -- emits PTX 9.0 from its embedded
+# LLVM, and no local CUDA or ptxas can change that.
+#
+# Under pytest-xdist the death is completely silent. The fatal text goes to
+# fd 2, which pytest's capture has replaced, so the buffer dies with the worker
+# and all the controller reports is "node down: Not properly terminated"
+# against an arbitrary JAX test. That cost a long hunt through OOM and
+# CUDA-context theories; skipping loudly is the point of this gate.
+#
+# There is no way to ask XLA whether it can target this device short of
+# compiling something, and a failed attempt is unrecoverable in-process, so the
+# probe runs once in a subprocess. It is a capability check rather than an
+# arch/version blocklist so that the tests start running again by themselves on
+# the first jaxlib that can emit PTX 9.4.
+
+_JAX_PROBE = "import jax, jax.numpy as jnp; jax.jit(lambda x: x + 1)(jnp.ones(1)).block_until_ready()"
+_jax_can_compile = None
+
+
+def _jax_compiles_for_this_device():
+    global _jax_can_compile
+    if _jax_can_compile is not None:
+        return _jax_can_compile
+    try:
+        import jax  # noqa: F401
+    except ImportError:
+        _jax_can_compile = True  # nothing to gate; the tests importorskip themselves
+        return _jax_can_compile
+    try:
+        done = subprocess.run([sys.executable, "-c", _JAX_PROBE], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError):
+        _jax_can_compile = True  # cannot tell -- let the tests run and report for themselves
+        return _jax_can_compile
+    _jax_can_compile = done.returncode == 0
+    if not _jax_can_compile:
+        reason = next(
+            (ln.strip() for ln in reversed((done.stderr or "").splitlines()) if "PTX" in ln or "Fatal" in ln),
+            f"probe exited {done.returncode}",
+        )
+        _log_to_real_stderr(f"[jax-gate] XLA cannot compile for this GPU, skipping every *_jax.py test: {reason}")
+    return _jax_can_compile
+
+
+def pytest_collection_modifyitems(config, items):
+    if not any(item.fspath.basename.endswith("_jax.py") for item in items):
+        return  # do not pay for the probe on runs with no JAX tests
+    if _jax_compiles_for_this_device():
+        return
+    skip = pytest.mark.skip(reason="XLA cannot compile for this GPU (jaxlib emits PTX 9.0; sm_107a needs >= 9.4)")
+    for item in items:
+        if item.fspath.basename.endswith("_jax.py"):
+            item.add_marker(skip)
+
 
 # =================== GPU memory gate (pytest-xdist) =====================
 # Several xdist workers share one GPU. A memory-hungry test in one worker (a
@@ -66,36 +279,41 @@ def _under_xdist():
     return int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1")) > 1
 
 
+def _torch_empty_cache():
+    # No-op unless torch (and thus its caching allocator) is loaded.
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.cuda.empty_cache()
+
+
 def _wait_for_free_gpu_memory(context):
     # Best effort: proceed after the timeout even if the floor was not reached,
     # so a worker can never deadlock the run; the allocation itself then either
     # succeeds or fails with the usual OOM.
-    free, total = torch.cuda.mem_get_info()
+    free, total = _cudart_call(cudart.cudaMemGetInfo)
     floor = _MEM_GATE_FRACTION * total
     if free >= floor:
         return
-    torch.cuda.empty_cache()
+    _torch_empty_cache()
     deadline = time.monotonic() + _MEM_GATE_TIMEOUT_S
     waited = False
     while time.monotonic() < deadline:
-        free, _ = torch.cuda.mem_get_info()
+        free, _ = _cudart_call(cudart.cudaMemGetInfo)
         if free >= floor:
             break
         waited = True
         time.sleep(2)
     if waited:
-        # sys.__stderr__ bypasses pytest capture so the message reaches the CI log.
-        print(
+        _log_to_real_stderr(
             f"[mem-gate] {context}: waited for GPU memory "
-            f"(free {free / 2**30:.2f} GiB, floor {floor / 2**30:.2f} GiB)",
-            file=sys.__stderr__,
-            flush=True,
+            f"(free {free / 2**30:.2f} GiB, floor {floor / 2**30:.2f} GiB)"
         )
 
 
 def _is_cuda_oom(exc):
     # torch.OutOfMemoryError only exists on newer torch; the cuda alias is old.
-    return isinstance(exc, torch.cuda.OutOfMemoryError)
+    torch = sys.modules.get("torch")
+    return torch is not None and isinstance(exc, torch.cuda.OutOfMemoryError)
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +322,7 @@ def _gpu_memory_gate(request):
         _wait_for_free_gpu_memory(request.node.name)
     yield
     if _under_xdist():
-        torch.cuda.empty_cache()
+        _torch_empty_cache()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -114,8 +332,8 @@ def pytest_runtest_call(item):
         return
     # OOM under xdist is usually transient sibling-worker pressure, not a
     # property of this test: release our cache, wait for the device, retry once.
-    print(f"[mem-gate] {item.nodeid}: OOM under xdist, retrying once", file=sys.__stderr__, flush=True)
-    torch.cuda.empty_cache()
+    _log_to_real_stderr(f"[mem-gate] {item.nodeid}: OOM under xdist, retrying once")
+    _torch_empty_cache()
     _wait_for_free_gpu_memory(item.nodeid)
     try:
         item.runtest()
@@ -135,23 +353,22 @@ def cudnn_handle():
         return
     
     # Create CUDA stream and graph objects
-    stream = torch.cuda.Stream()
+    stream = _cudart_call(cudart.cudaStreamCreateWithFlags, cudart.cudaStreamNonBlocking)
     cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(handle=cudnn_handle, stream=stream.cuda_stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=int(stream))
     yield cudnn_handle
     cudnn.destroy_handle(cudnn_handle)
+    _cudart_call(cudart.cudaStreamDestroy, stream)
 
 
 # =================== PyTest Hooks =====================
-def pytest_load_initial_conftests(args, early_config, parser):
-    if not any(arg.startswith("--tb=") for arg in args):
-        args.insert(0, "--tb=short")
-    if "--no-header" not in args:
-        args.insert(0, "--no-header")
-
 
 def pytest_configure(config):
-    assert torch.cuda.is_available()
+    global _xdist_controller, _stderr_fd
+    _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
+    _stderr_fd = os.dup(sys.__stderr__.fileno())
+
+    assert _cudart_call(cudart.cudaGetDeviceCount) > 0
 
     print("===== cudnn-frontend conftest.py ====")
     print(f"cuDNN Frontend Version: {cudnn.__version__}")
@@ -160,12 +377,18 @@ def pytest_configure(config):
         print(f"cuDNN Backend Version: {cudnn.backend_version()}")
     except Exception as e:
         print(f"cuDNN Backend not available: {e}")
-    print(f"PyTorch Version: {torch.__version__}")
-    print(f"PyTorch Path: {torch.__file__}")
-    print(f"PyTorch GPU Name: {torch.cuda.get_device_name()}")
-    print(f"PyTorch SM Arch Version: {torch.cuda.get_device_capability()}")
-    print(f"PyTorch CUDA Version: {torch.version.cuda}")
-    print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    prop = _cudart_call(cudart.cudaGetDeviceProperties, 0)
+    print(f"GPU Name: {prop.name.decode().rstrip(chr(0))}")
+    print(f"SM Arch Version: {(prop.major, prop.minor)}")
+    try:
+        import torch
+    except ImportError:
+        print("PyTorch: not installed")
+    else:
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"PyTorch Path: {torch.__file__}")
+        print(f"PyTorch CUDA Version: {torch.version.cuda}")
+        print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
 
 # fmt: off
 def pytest_addoption(parser):
@@ -179,18 +402,18 @@ def pytest_addoption(parser):
     parser.addoption("--timing_method", action="store", type=str, default="cupti", choices=["events", "cupti"], help="timing method: 'cupti' (torch.profiler device_time, default) or 'events' (CUDA events)")
 
     # MHA command line options to overwrite specific test dimensions in test_mhas.py and test_mhas_v2.py.
-    parser.addoption("--b", default=None, type=int, help="[test_mhas.py] batch dimension")
-    parser.addoption("--s_q", default=None, type=int, help="[test_mhas.py] query sequence length")
-    parser.addoption("--s_kv", default=None, type=int, help="[test_mhas.py] key/value sequence length")
-    parser.addoption("--d_qk", default=None, type=int, help="[test_mhas.py] query/key embedding dimension per head")
-    parser.addoption("--d_v", default=None, type=int, help="[test_mhas.py] value embedding dimension per head")
-    parser.addoption("--h_q", default=None, type=int, help="[test_mhas.py] query number of heads")
-    parser.addoption("--h_k", default=None, type=int, help="[test_mhas.py] key number of heads")
-    parser.addoption("--h_v", default=None, type=int, help="[test_mhas.py] value number of heads")
-    parser.addoption("--deterministic", default=None, type=int, choices=[0, 1], help="[test_mhas.py] force deterministic algorithm")
-    parser.addoption("--block_size", default=None, type=int, help="[test_mhas.py] block size for paged attention")
-    parser.addoption("--left_bound", default=None, type=int, help="[test_mhas.py] size of the window to the left of the diagonal")
-    parser.addoption("--right_bound", default=None, type=int, help="[test_mhas.py] size of the window to the right of the diagonal")
+    parser.addoption("--b", default=None, type=int, help="[sdpa tests] batch dimension")
+    parser.addoption("--s_q", default=None, type=int, help="[sdpa tests] query sequence length")
+    parser.addoption("--s_kv", default=None, type=int, help="[sdpa tests] key/value sequence length")
+    parser.addoption("--d_qk", default=None, type=int, help="[sdpa tests] query/key embedding dimension per head")
+    parser.addoption("--d_v", default=None, type=int, help="[sdpa tests] value embedding dimension per head")
+    parser.addoption("--h_q", default=None, type=int, help="[sdpa tests] query number of heads")
+    parser.addoption("--h_k", default=None, type=int, help="[sdpa tests] key number of heads")
+    parser.addoption("--h_v", default=None, type=int, help="[sdpa tests] value number of heads")
+    parser.addoption("--deterministic", default=None, type=int, choices=[0, 1], help="[sdpa tests] force deterministic algorithm")
+    parser.addoption("--block_size", default=None, type=int, help="[sdpa tests] block size for paged attention")
+    parser.addoption("--left_bound", default=None, type=int, help="[sdpa tests] size of the window to the left of the diagonal")
+    parser.addoption("--right_bound", default=None, type=int, help="[sdpa tests] size of the window to the right of the diagonal")
 
     parser.addoption("--implementation", action="store", default=None, type=str, choices=["AUTO", "COMPOSITE", "UNIFIED"], help="[test_mhas_v2.py], overwrites implementation")
 

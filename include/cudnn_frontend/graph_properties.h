@@ -131,7 +131,7 @@ class Tensor_attributes {
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
     int64_t ragged_offset_multiplier = 1;
-    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t alignment                = default_alignment;
     int64_t vector_count             = 1;   // Default to 1 (no vectorization)
     int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
@@ -412,6 +412,9 @@ class Tensor_attributes {
         reordering_type = value;
         return *this;
     }
+
+    // Pointer alignment assumed by the backend when selecting engines, in bytes.
+    static constexpr int64_t default_alignment = 16;
 
     int64_t
     get_alignment() const {
@@ -1993,14 +1996,25 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::function<Tensor_t(std::shared_ptr<Graph>, std::shared_ptr<Tensor_attributes>)>;
 
     std::optional<bool> generate_stats;
-    bool alibi_mask   = false;
-    bool padding_mask = false;
+    bool stats_use_log2 = false;
+    bool alibi_mask     = false;
+    bool padding_mask   = false;
     std::optional<int64_t> left_bound;
     std::optional<int64_t> right_bound;
     DiagonalAlignment_t diagonal_alignment = DiagonalAlignment_t::TOP_LEFT;
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
     std::optional<int> max_seq_len_kv;
+
+    // Packed (ragged) token totals, mirroring SDPA_backward_attributes. A
+    // frontend-side hint only: never lowered to a backend attribute. Ragged
+    // layouts describe extents as (B, H, S_max, D) plus a device ragged-offset
+    // tensor, so the packed total is not otherwise expressible -- consumers
+    // that must bound the token axis have to infer it from buffer geometry
+    // instead. See docs/operations/Attention.md.
+    std::optional<int64_t> max_total_seq_len_q;
+    std::optional<int64_t> max_total_seq_len_kv;
+
     AttentionScoreModifier_t attention_score_modifier = nullptr;
     DataType_t mma_core_mode                          = DataType_t::NOT_SET;
 
@@ -2075,11 +2089,14 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    inputs,
                                    outputs,
                                    generate_stats,
+                                   stats_use_log2,
                                    alibi_mask,
                                    padding_mask,
                                    dropout_probability,
                                    attn_scale_value,
                                    max_seq_len_kv,
+                                   max_total_seq_len_q,
+                                   max_total_seq_len_kv,
                                    mma_core_mode,
                                    left_bound,
                                    right_bound,
@@ -2089,6 +2106,16 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_generate_stats(bool const value) {
         generate_stats = value;
+        return *this;
+    }
+
+    /// Convert the "Stats" (LSE) output from cuDNN's natural-log convention to base-2
+    /// ((max + ln(sum_exp)) * log2(e)), matching attention kernels
+    /// that fold log2(e) into their softmax scale. Only affects Stats; Max and Sum_exp (if
+    /// requested instead) remain in their natural units.
+    SDPA_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 
@@ -2118,6 +2145,21 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_attn_scale(float const value) {
         attn_scale_value = value;
+        return *this;
+    }
+
+    // Packed token total of the ragged Q (and O/Stats, which share its token
+    // axis). Only meaningful on a ragged/packed layout; ignored otherwise.
+    SDPA_attributes&
+    set_max_total_seq_len_q(int64_t const value) {
+        max_total_seq_len_q = value;
+        return *this;
+    }
+
+    // Packed token total of the ragged K/V.
+    SDPA_attributes&
+    set_max_total_seq_len_kv(int64_t const value) {
+        max_total_seq_len_kv = value;
         return *this;
     }
 
@@ -2359,6 +2401,11 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
         return right_bound.has_value() && diagonal_alignment == DiagonalAlignment_t::BOTTOM_RIGHT;
     }
 
+    bool
+    has_bias() const {
+        return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
+
    public:
     enum class input_names {
         Q,
@@ -2577,6 +2624,11 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
 
+    bool
+    has_bias() const {
+        return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
+    }
+
    public:
     enum class input_names {
         Q,
@@ -2782,11 +2834,19 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { S, Stats, Max, Sum_exp };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs)
+    // Emit Stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp). Only affects Stats.
+    bool stats_use_log2 = false;
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs, stats_use_log2)
 
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
         inputs[Softmax_attributes::input_names::SINK] = value;
+        return *this;
+    }
+
+    Softmax_attributes&
+    set_stats_use_log2(bool const value) {
+        stats_use_log2 = value;
         return *this;
     }
 };

@@ -18,7 +18,12 @@ which is the supported entry point for users.
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "MhcProjectionBackward": ("cudnn.gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "mhc_projection_backward": ("cudnn.gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),
+    "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),
+    "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),
+    "swiglu_moe": ("cudnn.gemm.ops", "swiglu_moe"),
 }
 
 

@@ -5,14 +5,16 @@
 
 from __future__ import annotations
 
-import re
-
 import cudnn
+from dataclasses import replace
+
 import pytest
 import torch
 
-from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-from cudnn.gemm.frost.tile_config import by_name
+from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, jit_from_cudnn_graph
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
+from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG, by_name
 
 # --- GPU / arch gate -------------------------------------------------------
 
@@ -26,12 +28,81 @@ def _active_sm() -> int | None:
 
 _SM = _active_sm()
 
+
+def _int8_mma_arch_ranges() -> tuple[tuple[int, int], ...]:
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES
+
+    return MMA_GPU_ARCH_SPECIAL_CASES[("sm100", ("int8", "int8", "int32"))]
+
+
 # Every e2e test in this suite JITs sm100-family templates, valid only on
 # 100 <= SM < 120 (see kernel_registry.PIPELINE_ARCH_RANGES) — gate on arch, not just
 # GPU presence, so wrong-arch machines skip instead of failing in the JIT.
 requires_sm100 = pytest.mark.skipif(
     _SM is None or not (100 <= _SM < 120),
     reason="needs a Blackwell-family GPU (100 <= SM < 120), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+
+def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
+    """Copy live scales into deterministic, analyzer-sized segmented storage."""
+    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
+    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
+    return result
+
+
+def skip_unless_pipeline_active(cfg) -> None:
+    """Skip when ``cfg``'s template family does not run on the active GPU.
+
+    For a test that pins a config of one family to probe a REJECTION: the family
+    gate (kernel_registry.KernelTemplate.arch_active_reject) fires before the rule
+    under test, so on another part the test would meet the arch message instead
+    of the one it asserts. (A test that merely fails with that message is turned
+    into a skip by the frost conftest; one that catches it inside pytest.raises
+    needs this gate.)"""
+    from cudnn.gemm.frost.arch_family import active_family
+    from cudnn.gemm.frost.compiler import _current_arch
+    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
+
+    arch = _current_arch()
+    if arch is not None and not any(lo <= arch < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
+        pytest.skip(f"the {cfg.pipeline} pipeline does not run on sm_{arch}")
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        pytest.skip(f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree")
+
+
+# The sm120 (consumer Blackwell, warp-scoped MMA) family's own e2e tests: its
+# templates JIT only on 12.0 <= SM < 13.0 GPUs.
+requires_sm120 = pytest.mark.skipif(
+    _SM is None or not (120 <= _SM < 130),
+    reason="needs a consumer-Blackwell GPU (120 <= SM < 130), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+# test_matmul.py sweeps every matmul family (sm100 tcgen05 + sm120 warp-MMA), so
+# its module gate is the union of their arch ranges; a config whose own family
+# does not cover the active part is skipped per-case by `_compatible`.
+requires_matmul_gpu = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM < 130),
+    reason="needs a Blackwell-family GPU (100 <= SM < 130), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+# The int8 tcgen05 MMA is narrower than its family — SM 10.7 has no such
+# instruction, and NVVM fails to lower it rather than the JIT rejecting it.
+# Read the ranges off the registry so the suite never holds a second copy.
+INT8_SM_RANGES = _int8_mma_arch_ranges()
+requires_int8_mma = pytest.mark.skipif(
+    _SM is None or not any(lo <= _SM < hi for lo, hi in INT8_SM_RANGES),
+    reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+# Dense FP8 and block-scale K64 tests share the engine's active-arch ranges.
+requires_mma_k64 = pytest.mark.skipif(
+    _SM is None or not any(lo <= _SM < hi for lo, hi in MMA_INST_K64_ARCH_RANGES),
+    reason="the 64-byte MMA requires "
+    + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+    + ", have "
+    + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -43,44 +114,58 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False):
         self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+        kw = {}
+        if swap_ab:
+            config = replace(config or DEFAULT_CONFIG, swap_ab=True)
         if config is not None:
+            if cta_group is not None and "cta_group" in type(config).__dataclass_fields__ and cta_group != config.cta_group:
+                config = replace(config, cta_group=cta_group)
             kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        with _force_stg_epi(force_stg_epi):
+            self._compiled = jit_from_cudnn_graph(graph, **kw)
         self.chain = self._compiled.chain
         self.binding = self._compiled.binding
         self.block_scale = self.chain.has_block_scale
         self.aux_names = [t.name for t in self.chain.aux_tensors]
+        self.generated_path = self._compiled.generated_path
+        self.workspace_bytes = getattr(self._compiled, "workspace_bytes", 0)
 
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
+    def __call__(self, variant_pack, workspace=None):
+        if workspace is None and self.workspace_bytes:
+            # The plan owns no workspace (Rule 8); the test harness supplies it.
+            import torch
 
-
-LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
-
-def resolve(legacy_name):
-    """Legacy config-name (with _Nctamma/_static, kept as readable test IDs) ->
-    (pure-geometry config, cta_group, scheduler)."""
-    m = LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return by_name(m.group(1)), int(m.group(2)), "static" if m.group(3) else "clc"
+            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device="cuda")
+        return self._compiled(variant_pack, workspace=workspace)
 
 
-def kw(legacy_name):
+def resolve(name):
+    """Config-name -> config. The ``_Nctamma`` token is part of the canonical
+    name now (``cta_group`` is geometry), so this is just ``by_name`` — kept as
+    the one place the suite spells the lookup."""
+    return by_name(name)
+
+
+def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
-    config, cta_group, scheduler = resolve(legacy_name)
-    return dict(config=config, cta_group=cta_group, scheduler=scheduler)
+    return dict(config=by_name(name))
 
 
 # --- variant packs ----------------------------------------------------------
 
 
+def graph_binding(compiled):
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+
+    return swap_ab_binding(compiled.binding) if isinstance(compiled.chain.moe, MoeSwapAbSpec) else compiled.binding
+
+
 def vp(compiled, a, b, outs, *aux):
     """Variant-pack dict {cuDNN tensor: buffer}: A/B operands, outputs, then aux."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     d = {bd.a_operands[0]: a, bd.b_operands[0]: b}
     d.update({o: buf for o, buf in zip(bd.outputs, outs)})
@@ -91,7 +176,7 @@ def vp(compiled, a, b, outs, *aux):
 def vp_bs(compiled, a, b, outs, sfa, sfb, *aux, fto=None):
     """Block-scale variant-pack (A/B + SFA/SFB + outputs + aux); pass ``fto``
     for the MoE grouped variant's first_token_offset."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     d = {
         bd.a_operands[0]: a,
@@ -110,7 +195,7 @@ def vp_mg(compiled, gemm_pairs, outs, *aux, fto=None):
     """Multi-GEMM variant-pack: dedup per-GEMM (a, b) pairs by identity into
     the binding's distinct A/B slots (first-appearance order); + outputs + aux.
     Pass ``fto`` for the MoE grouped variant's first_token_offset."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
         if not any(ag is x for x in a_seen):
@@ -158,12 +243,60 @@ def rand_e8m0(shape, dev):
     return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
 
 
+def e5m3_to_float(b: torch.Tensor) -> torch.Tensor:
+    """Decode E5M3 bytes: unsigned, 5-bit exponent (bias 15), 3-bit mantissa.
+
+    Exact over the whole 8-bit domain, matching the epilogue's decode:
+    ``E >= 1`` is the normal ``2^(E-15) * (1 + M/8)``; ``E == 0`` is subnormal
+    ``2^-14 * M/8 == M * 2^-17`` (so byte 0 is 0.0). ``E == 31`` is NOT inf/NaN —
+    the format is canonical-NaN-only, so only byte 255 is NaN and 248..254 are
+    finite (up to 114688); byte 255's value here is unused, since the hardware's
+    satfinite cvt never emits it."""
+    E = (b >> 3).to(torch.float32)
+    M = (b & 7).to(torch.float32)
+    normal = torch.pow(2.0, E - 15.0) * (1.0 + M / 8.0)
+    return torch.where(E >= 1, normal, M * (2.0**-17))
+
+
+def e5m3_finite_values(dev="cpu") -> torch.Tensor:
+    """The 255 finite E5M3 values, indexed by byte. Monotonically increasing
+    (the format is unsigned), so byte 254 = 114688 is the max finite and 255 is
+    the canonical NaN the hardware's satfinite cvt never emits."""
+    b = torch.arange(255, dtype=torch.float32, device=dev)
+    return e5m3_to_float(b.to(torch.int32))
+
+
+def e5m3_quant_ref(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> E5M3 byte, rounding UP, saturating to max finite — the reference
+    for what the epilogue's `cvt.rp.satfinite.ue5m3x2.f32` emits. Negative
+    inputs cannot occur (a scale is |amax| / output_max)."""
+    vals = e5m3_finite_values(x.device)
+    return torch.searchsorted(vals, x.clamp(min=0.0).contiguous(), right=False).clamp(max=254).to(torch.uint8)
+
+
+def rand_e5m3(shape, dev):
+    """Random E5M3 scale factors as raw bytes (torch has no E5M3 dtype, and the
+    kernel takes the SF blob as a base pointer anyway). Exponent field 13..17
+    keeps a scale PAIR inside FP32 while every value stays exactly
+    representable, so the torch reference is exact."""
+    return torch.randint(13 * 8, 18 * 8, shape, dtype=torch.uint8, device=dev)
+
+
 def block_quant_ref(x, block_size, out_dtype, scale_dtype):
-    """Torch reference for the block-quant epilogue: per-block amax scale
-    (E8M0 scales round toward +inf) + quantized output."""
+    """Torch reference for the block-quant epilogue: per-block amax scale +
+    quantized output. ``scale_dtype`` is a torch dtype, or the string
+    ``"e5m3"`` — torch has no E5M3, so that scale comes back as raw BYTES
+    (which is also what the kernel writes and what the test compares).
+
+    E8M0 and E5M3 scales round toward +inf; E4M3 scales round to nearest."""
     blocks = x.view(1, x.shape[0], x.shape[1] // block_size, block_size)
     output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
     scale_f = blocks.abs().amax(dim=-1) / output_max
+    if scale_dtype == "e5m3":
+        scale = e5m3_quant_ref(scale_f)
+        inv = torch.where(e5m3_to_float(scale.to(torch.int32)) > 0, e5m3_to_float(scale.to(torch.int32)).reciprocal(), 0.0)
+        q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
+        return q.to(out_dtype).view(1, x.shape[0], x.shape[1]), scale
     if scale_dtype is torch.float8_e8m0fnu:
         safe = torch.where(scale_f > 0, scale_f, 1.0)
         scale_f = torch.where(scale_f > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
@@ -175,12 +308,23 @@ def block_quant_ref(x, block_size, out_dtype, scale_dtype):
 
 
 def reduction_ref(x: torch.Tensor, mode, dims: tuple[int, ...]) -> torch.Tensor:
+    if mode == cudnn.reduction_mode.AVG:
+        return x.mean(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.AMAX:
         return x.abs().amax(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.MAX:
         return x.amax(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.MIN:
         return x.amin(dim=dims, keepdim=True)
+    if mode == cudnn.reduction_mode.NORM1:
+        return x.abs().sum(dim=dims, keepdim=True)
+    if mode in (cudnn.reduction_mode.MUL, cudnn.reduction_mode.MUL_NO_ZEROS):
+        product = x.cpu()
+        if mode == cudnn.reduction_mode.MUL_NO_ZEROS:
+            product = torch.where(product == 0, 1, product)
+        for dim in dims:
+            product = product.prod(dim=dim, keepdim=True)
+        return product.to(x.device)
     return x.sum(dim=dims, keepdim=True)
 
 
@@ -236,3 +380,7 @@ FULL_EXPERT_REDUCE_OFFSETS = [
     1800,
     1900,
 ]
+
+
+# Retired name; the gate is about the MMA-inst K width, not a pipeline family.
+requires_sm107 = requires_mma_k64

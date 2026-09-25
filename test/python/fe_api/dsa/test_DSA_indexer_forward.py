@@ -304,16 +304,22 @@ def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=14)
-def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
+@pytest.mark.parametrize("h_q", [16, 32, 64])
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_sm90()
+    if h_q == 16:
+        _require_sm90()
+    elif torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("Requires Hopper or Blackwell")
     device = torch.device("cuda")
-    shapes = [(7, 67), (11, 70)]
-    ratio, h_q, h_kv, d = 4, 16, 1, 128
+    shapes = [(1, 1), (3, 7), (7, 67), (11, 70)]
+    h_kv, d = 1, 128
     q_lengths = [s_q for s_q, _ in shapes]
     k_lengths = [s_k for _, s_k in shapes]
     cu_seqlens_q = torch.tensor(
@@ -331,12 +337,15 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
     k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device)
     q_causal_offsets = torch.tensor(
-        [s_k * ratio - s_q for s_q, s_k in shapes],
+        [0, 0, *[s_k * ratio - s_q for s_q, s_k in shapes[2:]]],
         dtype=torch.int32,
         device=device,
     )
 
-    result = DSA.indexer_forward_wrapper(
+    wrapper = DSA.dense_indexer_score_recompute_wrapper if recompute else DSA.indexer_forward_wrapper
+    forward_lse = not recompute and torch.cuda.get_device_capability()[0] == 9
+    options = {} if recompute else {"return_lse": forward_lse}
+    result = wrapper(
         q,
         k,
         w,
@@ -347,9 +356,10 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
         max_seqlen_q=max(q_lengths),
         max_seqlen_k=max(k_lengths),
         q_causal_offsets=q_causal_offsets,
-        return_lse=True,
+        **options,
     )
-    scores = result["scores"]
+    scores = result["out"] if recompute else result["scores"]
+    lse = result["denom"] if recompute else result.get("lse")
     torch.cuda.synchronize()
 
     cu_q_host = cu_seqlens_q.tolist()
@@ -373,12 +383,13 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
             ratio,
             q_causal_offsets=q_causal_offsets[batch : batch + 1],
         ).squeeze(0)
-        torch.testing.assert_close(
-            result["lse"][q0:q1],
-            torch.logsumexp(scores_ref, dim=-1),
-            atol=5e-3,
-            rtol=5e-3,
-        )
+        if lse is not None:
+            torch.testing.assert_close(
+                lse[q0:q1],
+                torch.logsumexp(scores_ref, dim=-1),
+                atol=5e-3,
+                rtol=5e-3,
+            )
         if s_k < max_seqlen_k:
             assert bool(torch.isneginf(scores[q0:q1, s_k:]).all())
 

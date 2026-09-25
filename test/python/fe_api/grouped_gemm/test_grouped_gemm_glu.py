@@ -12,8 +12,19 @@ import torch
 import pytest
 import cudnn
 from test_utils import torch_fork_set_rng
-from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
+from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
+    RUBIN_MXFP8_CUSTOM,
+    RUBIN_MXFP8_DEFAULTS,
+    RUBIN_MXFP8_DSV4,
+    rubin_mxfp8_weight_arguments,
+    make_rubin_mxfp8_glu_problem,
+    rubin_mxfp8_glu_reference,
+    check_rubin_mxfp8_glu_unquantized,
+    check_rubin_mxfp8_glu_quantized,
+    GROUPED_GEMM_SWIGLU_COMMON_MARKS,
+    GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS,
     grouped_gemm_swiglu_init,
     with_grouped_gemm_swiglu_params_fp4,
     with_grouped_gemm_swiglu_params_fp8,
@@ -210,8 +221,9 @@ def test_grouped_gemm_glu_dense_compile_execute_fp8(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_scheduler_modes
-@with_grouped_gemm_swiglu_params_fp4
+@with_grouped_gemm_swiglu_params_fp4(with_e5m3=True)
 def test_grouped_gemm_glu_dense_wrapper_fp4(
+    sf_fp8_dtype_override,
     ab_dtype,
     c_dtype,
     d_dtype,
@@ -239,6 +251,7 @@ def test_grouped_gemm_glu_dense_wrapper_fp4(
         vector_f32=vector_f32,
         discrete_col_sfd=discrete_col_sfd,
         use_dynamic_sched=use_dynamic_sched,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         request=request,
     )
 
@@ -676,6 +689,11 @@ def _test_grouped_gemm_glu_dense_wrapper(
     use_dynamic_sched=False,
     omit_prob=False,
     use_single_group_runtime_offsets=False,
+    sf_fp8_dtype_override=None,
+    act_func="swiglu",
+    situ_beta1=4.0,
+    situ_beta2=25.0,
+    skip_reference=False,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -699,6 +717,9 @@ def _test_grouped_gemm_glu_dense_wrapper(
         enable_bias=enable_bias,
     )
     cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
+    cfg["act_func"] = act_func
+    cfg["situ_beta1"] = situ_beta1
+    cfg["situ_beta2"] = situ_beta2
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -716,6 +737,13 @@ def _test_grouped_gemm_glu_dense_wrapper(
 
     if input_mutator is not None:
         input_mutator(inputs, cfg)
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Re-encode the scale factors in place. The generator emits values that are
+        # exact in both e4m3 and ue5m3, so sfa_ref/sfb_ref stay valid and the shared
+        # reference check below is reused unchanged -- only the bytes differ.
+        inputs["sfa_tensor"] = reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        inputs["sfb_tensor"] = reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
 
     try:
         for _ in range(2):  # Run twice to test caching path
@@ -738,10 +766,13 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 mma_tiler_mn=cfg["mma_tiler_mn"],
                 cluster_shape_mn=cfg["cluster_shape_mn"],
                 sf_vec_size=cfg["sf_vec_size"],
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=cfg["vector_f32"],
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
-                act_func="swiglu",
+                act_func=act_func,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
@@ -749,8 +780,32 @@ def _test_grouped_gemm_glu_dense_wrapper(
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
-    check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+    if not skip_reference:
+        check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
     return inputs, outputs, cfg
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_dense_wrapper_situglu_mxfp8(request):
+    """Smoke-test the dense MXFP8 compile and execute path for SiTU-GLU."""
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        act_func="situglu",
+        skip_reference=True,
+    )
 
 
 @pytest.mark.L0
@@ -799,8 +854,9 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_m_cache_behavior(request, monke
     if use_full_dynamic:
         monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
     else:
-        monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "0")
 
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -881,6 +937,7 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_nk_cache_behavior(request, monk
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -960,7 +1017,16 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_nk_cache_behavior(request, monk
 @torch_fork_set_rng(seed=0)
 @with_scheduler_modes
 @pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
-def test_grouped_gemm_glu_discrete_compile_execute_fp4(act_func, use_dynamic_sched, request):
+@pytest.mark.parametrize(
+    "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
+    [
+        (32, torch.float8_e8m0fnu, None),
+        (16, torch.float8_e4m3fn, None),
+        (16, torch.float8_e4m3fn, "e5m3"),
+    ],
+    ids=["mxfp4", "nvfp4_e4m3", "nvfp4_e5m3"],
+)
+def test_grouped_gemm_glu_discrete_compile_execute_fp4(sf_vec_size, sf_dtype, sf_fp8_dtype_override, act_func, use_dynamic_sched, request):
     _test_grouped_gemm_glu_discrete_compile_execute(
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
@@ -969,8 +1035,9 @@ def test_grouped_gemm_glu_discrete_compile_execute_fp4(act_func, use_dynamic_sch
         acc_dtype=torch.float32,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
-        sf_vec_size=32,
-        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=False,
         discrete_col_sfd=False,
         act_func=act_func,
@@ -1074,6 +1141,7 @@ def _test_grouped_gemm_glu_discrete_compile_execute(
     b_major="k",
     enable_bias=False,
     use_dynamic_sched=False,
+    sf_fp8_dtype_override=None,
 ):
     try:
         from cudnn import GroupedGemmGluSm100
@@ -1113,6 +1181,14 @@ def _test_grouped_gemm_glu_discrete_compile_execute(
         enable_bias=enable_bias,
     )
 
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place. The generator emits values exact
+        # in both E4M3 and UE5M3, so the reference stays valid; in place is required
+        # because sfb_ptrs already holds the per-expert device addresses.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        for sfb in inputs["sfb_list"]:
+            reencode_sf_tensor_as_ue5m3(sfb)
+
     outputs = allocate_discrete_output_tensors(
         tensor_m=inputs["tensor_m"],
         n=cfg["n"],
@@ -1146,6 +1222,7 @@ def _test_grouped_gemm_glu_discrete_compile_execute(
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=cfg["vector_f32"],
         m_aligned=cfg["m_aligned"],
         discrete_col_sfd=cfg["discrete_col_sfd"],
@@ -1199,6 +1276,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     b_major="k",
     enable_bias=False,
     use_dynamic_sched=False,
+    situ_beta1=4.0,
+    situ_beta2=25.0,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -1222,6 +1301,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
         act_func,
         b_major=b_major,
     )
+    cfg["situ_beta1"] = situ_beta1
+    cfg["situ_beta2"] = situ_beta2
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1264,6 +1345,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
                 act_func=cfg["act_func"],
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
@@ -1271,6 +1354,41 @@ def _test_grouped_gemm_glu_discrete_wrapper(
         pytest.skip(f"Unsupported testcase: {e}")
 
     check_ref_discrete_grouped_gemm(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("ab_dtype", "d_dtype", "sf_dtype", "sf_vec_size"),
+    [
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e8m0fnu, 32),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e8m0fnu, 32),
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e4m3fn, 16),
+    ],
+    ids=["mxfp4", "mxfp8", "nvfp4"],
+)
+@pytest.mark.parametrize(("situ_beta1", "situ_beta2"), [(4.0, 25.0), (2.0, 8.0)])
+def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, sf_dtype, sf_vec_size, situ_beta1, situ_beta2, request):
+    """Exercise SiTU-GLU with the inherited MXFP4, MXFP8, and NVFP4 layouts."""
+
+    _test_grouped_gemm_glu_discrete_wrapper(
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="situglu",
+        request=request,
+        b_major="k",
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
+    )
 
 
 @pytest.mark.L0
@@ -1335,6 +1453,7 @@ def _test_grouped_gemm_glu_discrete_wrapper_dynamic_m_cache_behavior(request, mo
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
+    monkeypatch.setattr(grouped_gemm_glu_api, "_glu_wrapper_memo", {})
     grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -1950,3 +2069,333 @@ def test_grouped_gemm_glu_single_group_runtime_offsets(request):
         input_mutator=invalidate_runtime_offset,
         use_single_group_runtime_offsets=True,
     )
+
+
+_NVFP4_E5M3_CFG = dict(
+    ab_dtype=torch.float4_e2m1fn_x2,
+    c_dtype=torch.bfloat16,
+    d_dtype=torch.bfloat16,
+    cd_major="n",
+    acc_dtype=torch.float32,
+    mma_tiler_mn=(256, 256),
+    cluster_shape_mn=(2, 1),
+    sf_vec_size=16,
+    sf_dtype=torch.float8_e4m3fn,
+    vector_f32=False,
+    discrete_col_sfd=False,
+)
+
+
+def _make_glu_inputs(request, **overrides):
+    """Build a dense NVFP4 problem without running the reference check."""
+    cfg = grouped_gemm_swiglu_init(request, **{**_NVFP4_E5M3_CFG, **overrides})
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        enable_bias=cfg["enable_bias"],
+    )
+    return cfg, inputs
+
+
+def _run_glu_wrapper(cfg, inputs, sf_fp8_dtype_override):
+    """Call the wrapper directly.
+
+    The shared harness turns ValueError into pytest.skip and always runs the
+    reference check, neither of which suits the rejection and cache tests below.
+    """
+    from cudnn import grouped_gemm_glu_wrapper_sm100
+
+    return grouped_gemm_glu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        prob_tensor=inputs.get("prob_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="swiglu",
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_e5m3_is_not_cached_as_e4m3(request):
+    """sf_fp8_dtype_override must take part in the compile cache key.
+
+    Identical scale-factor bytes decode to different values under E4M3 and
+    UE5M3, so if sf_fp8_dtype_override were omitted from the key the second call would
+    reuse the first kernel and silently return E4M3 results.
+    """
+    _skip_unless_e5m3_supported()
+
+    # One problem, one set of scale-factor bytes, two interpretations. Any
+    # difference in the output can only come from sf_fp8_dtype_override.
+    cfg, inputs = _make_glu_inputs(request)
+    d_e4m3 = _run_glu_wrapper(cfg, inputs, None)["d_tensor"].float().clone()
+    d_e5m3 = _run_glu_wrapper(cfg, inputs, "e5m3")["d_tensor"].float().clone()
+
+    assert not torch.equal(
+        d_e5m3, d_e4m3
+    ), "e5m3 and e4m3 produced identical output from identical scale-factor bytes; sf_fp8_dtype_override is likely missing from the compile cache key"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "sf_fp8_dtype_override,overrides,expected",
+    [
+        pytest.param(
+            "e5m3",
+            dict(ab_dtype=torch.float8_e4m3fn, sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu),
+            "requires the NVFP4 recipe",
+            id="fp8_ab",
+        ),
+        pytest.param(
+            "e5m3",
+            dict(sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu),
+            "requires the NVFP4 recipe",
+            id="mxfp4_e8m0_carrier",
+        ),
+        pytest.param("e4m3", {}, "sf_fp8_dtype_override must be", id="e4m3_is_not_an_override"),
+        pytest.param("e5m2", {}, "sf_fp8_dtype_override must be", id="unknown_format"),
+    ],
+)
+def test_grouped_gemm_glu_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype_override, overrides, expected):
+    """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
+    cfg, inputs = _make_glu_inputs(request, **overrides)
+    with pytest.raises(ValueError, match=expected):
+        _run_glu_wrapper(cfg, inputs, sf_fp8_dtype_override)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_mxfp4_ignores_sf_fp8_dtype_override_default(request):
+    """Leaving the override at None must keep inferring E8M0 for MXFP4."""
+    _test_grouped_gemm_glu_dense_wrapper(
+        request=request,
+        sf_fp8_dtype_override=None,
+        **{**_NVFP4_E5M3_CFG, "sf_vec_size": 32, "sf_dtype": torch.float8_e8m0fnu},
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_bf16_rejects_sf_fp8_dtype_override(request):
+    """The BF16 backend has no scale factors, so any explicit override is an error.
+
+    This is what the None default buys: with an "e4m3" default the value would
+    always be non-None and could not be distinguished from an explicit request.
+    """
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+
+    try:
+        from cudnn import grouped_gemm_glu_wrapper_sm100
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    problem = make_grouped_gemm_glu_bf16_problem(discrete=False, b_major="k")
+    kwargs = dict(
+        a_tensor=problem["a"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        bias_tensor=problem["bias"],
+        prob_tensor=problem["prob"],
+        b_tensor=problem["b"],
+        sfb_tensor=None,
+    )
+    # None is accepted and dispatches to BF16 as usual.
+    grouped_gemm_glu_wrapper_sm100(**kwargs, sf_fp8_dtype_override=None)
+    with pytest.raises(ValueError, match="BF16 forbids scale control sf_fp8_dtype_override"):
+        grouped_gemm_glu_wrapper_sm100(**kwargs, sf_fp8_dtype_override="e5m3")
+
+
+# =============================================================================
+# Focused Rubin MXFP8 clamped GLU regression tests
+# =============================================================================
+
+
+@pytest.fixture
+def require_rubin_mxfp8():
+    """Gate only the explicitly marked Rubin regressions, not the generic suite."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires Rubin SM107")
+
+
+def _make_rubin_mxfp8_glu_api(p, vector_f32):
+    api = cudnn.GroupedGemmGluSm100(
+        sample_a=p["a"],
+        sample_c=p["c"],
+        sample_d=p["d"],
+        sample_sfa=p["sfa"],
+        sample_padded_offsets=p["offsets"],
+        sample_alpha=p["alpha"],
+        sample_prob=p["prob"],
+        sample_d_col=p["d_col"],
+        sample_sfd_row=p["sfd_row"],
+        sample_sfd_col=p["sfd_col"],
+        sample_amax=p["amax"],
+        sample_norm_const=p["norm"],
+        act_func="geglu",
+        sf_vec_size=32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        vector_f32=vector_f32,
+        generate_c=True,
+        **rubin_mxfp8_weight_arguments(p, samples=True),
+    )
+    assert api.check_support()
+    assert api._implementation._is_rubin_kernel
+    assert api._implementation._kernel.__module__.endswith("moe_blockscaled_grouped_gemm_glu_rubin")
+    api.compile()
+    return api
+
+
+def _execute_rubin_mxfp8_glu(api, p, parameters):
+    from cuda.bindings import driver as cuda
+
+    p["amax"].fill_(float("-inf"))
+    api.execute(
+        a_tensor=p["a"],
+        c_tensor=p["c"],
+        d_tensor=p["d"],
+        sfa_tensor=p["sfa"],
+        padded_offsets=p["offsets"],
+        alpha_tensor=p["alpha"],
+        prob_tensor=p["prob"],
+        d_col_tensor=p["d_col"],
+        sfd_row_tensor=p["sfd_row"],
+        sfd_col_tensor=p["sfd_col"],
+        amax_tensor=p["amax"],
+        norm_const_tensor=p["norm"],
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        **rubin_mxfp8_weight_arguments(p),
+        **parameters,
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_geglu_smoke():
+    """Small mandatory DSv4 case: unsupported on Rubin must fail, not skip."""
+    p = make_rubin_mxfp8_glu_problem(discrete=False, with_prob=False)
+    api = _make_rubin_mxfp8_glu_api(p, vector_f32=False)
+    _execute_rubin_mxfp8_glu(api, p, RUBIN_MXFP8_DSV4)
+    check_rubin_mxfp8_glu_unquantized(p, RUBIN_MXFP8_DSV4)
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L1
+@pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar", "packed"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_geglu_runtime_parameters(discrete, vector_f32, monkeypatch):
+    import cutlass.cute as cute
+
+    p = make_rubin_mxfp8_glu_problem(discrete=discrete, with_prob=True)
+    api = _make_rubin_mxfp8_glu_api(p, vector_f32)
+    compiled = api._implementation._compiled_kernel
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Changing runtime activation parameters must reuse the compiled kernel")
+
+    monkeypatch.setattr(cute, "compile", unexpected_compile)
+    for parameters in (RUBIN_MXFP8_DSV4, {}, RUBIN_MXFP8_CUSTOM, RUBIN_MXFP8_DSV4):
+        _execute_rubin_mxfp8_glu(api, p, parameters)
+        check_rubin_mxfp8_glu_unquantized(p, parameters)
+        assert api._implementation._compiled_kernel is compiled
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L1
+@pytest.mark.parametrize("discrete", [False, True], ids=["dense", "discrete"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_geglu_wrapper_defaults(discrete, monkeypatch):
+    from cuda.bindings import driver as cuda
+    from cudnn.gemm.cutedsl.grouped.glu import api as glu_api
+
+    # The wrapper generates output scales for MXFP8 inputs. Use actual MXFP8
+    # output here; the class tests above isolate the unquantized activation.
+    p = make_rubin_mxfp8_glu_problem(discrete=discrete, with_prob=True, quantized=True)
+    monkeypatch.setattr(glu_api, "_cache_of_GroupedGemmGluSm100Objects", {})
+    monkeypatch.setattr(glu_api, "_glu_wrapper_memo", {})
+    compile_count = 0
+    original_compile = cudnn.GroupedGemmGluSm100.compile
+
+    def count_compile(self, *args, **kwargs):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(self, *args, **kwargs)
+
+    monkeypatch.setattr(cudnn.GroupedGemmGluSm100, "compile", count_compile)
+    weights = rubin_mxfp8_weight_arguments(p)
+    if discrete:
+        weights.update(n=p["n"], b_dtype=p["a"].dtype)
+    common = dict(
+        a_tensor=p["a"],
+        sfa_tensor=p["sfa"],
+        padded_offsets=p["offsets"],
+        alpha_tensor=p["alpha"],
+        prob_tensor=p["prob"],
+        norm_const_tensor=p["norm"],
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        act_func="geglu",
+        sf_vec_size=32,
+        cluster_shape_mn=(2, 1),
+        generate_c=True,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        **weights,
+    )
+    saved_default = None
+    for parameters in ({}, RUBIN_MXFP8_DSV4, RUBIN_MXFP8_CUSTOM, RUBIN_MXFP8_DEFAULTS, {}):
+        result = cudnn.grouped_gemm_glu_wrapper_sm100(**common, **parameters)
+        torch.cuda.synchronize()
+        assert compile_count == 1, "Parameter changes across wrapper memo keys must reuse the compiled kernel"
+        rows = p["valid_rows"]
+        for name in ("c", "d", "d_col", "sfd_row", "sfd_col"):
+            p[name] = result[f"{name}_tensor"]
+        check_rubin_mxfp8_glu_quantized(p, parameters)
+        if not parameters and saved_default is None:
+            saved_default = result["d_tensor"].clone()
+        if parameters == RUBIN_MXFP8_DEFAULTS or (not parameters and saved_default is not None):
+            torch.testing.assert_close(result["d_tensor"].float()[rows], saved_default.float()[rows], rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L1
+@pytest.mark.parametrize(("discrete", "vector_f32"), [(False, True), (True, False)], ids=["dense-packed", "discrete-scalar"])
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_clamped_geglu_quantized_output(discrete, vector_f32):
+    p = make_rubin_mxfp8_glu_problem(discrete=discrete, with_prob=True, quantized=True)
+    api = _make_rubin_mxfp8_glu_api(p, vector_f32)
+    _execute_rubin_mxfp8_glu(api, p, RUBIN_MXFP8_DSV4)
+    check_rubin_mxfp8_glu_quantized(p, RUBIN_MXFP8_DSV4)
+    expected = rubin_mxfp8_glu_reference(p, RUBIN_MXFP8_DSV4)
+    start = 0
+    for expert, padded in enumerate(p["aligned_m"]):
+        torch.testing.assert_close(p["amax"][expert, 0], expected[start : start + padded].abs().max(), rtol=2e-5, atol=1e-7)
+        start += padded

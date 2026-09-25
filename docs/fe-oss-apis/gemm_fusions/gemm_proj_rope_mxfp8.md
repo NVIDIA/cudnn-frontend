@@ -2,6 +2,14 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on both input paths (BF16 and MXFP8) with `w_out_in=True` (the `[in, out]` weight layout reaches the kernel through a transposed strided view, which has no row-major JAX equivalent and raises a clear error). The E8M0 scale inputs stay `uint8` as with torch. Outputs are allocated as C-contiguous `jnp` arrays. The wrapper is eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `gemm_proj_rope_mxfp8_jax_sm100(x, w, cos, sin, x_scale=None, w_scale=None)` (built on `cudnn.jax.call`; see `gemm_amax.md` "Using JAX arrays"): same contract as the wrapper with `w_out_in=True`, dispatching on `x.dtype` (bfloat16 → BF16 GEMM; float8_e4m3fn plus E8M0 scales → MXFP8 GEMM), returning `(out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)` as fresh XLA-managed arrays — no manual synchronization needed, composes with `jax.jit` and CUDA graphs.
+
+The API is compiled with `--enable-tvm-ffi`: raw framework tensors go straight to the compiled kernel (no per-call `from_dlpack` conversion), cutting per-launch CPU overhead roughly in half for torch callers as well.
+
 ## Overview
 
 **Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize**: a persistent dense GEMM on NVIDIA Blackwell GPUs (SM100+) that projects activations, applies the Megatron MLA-YARN rotary embedding to each attention head's trailing rotary features, and MXFP8 (E4M3, block=32) quantizes the result in **both** the rowwise (D-direction) and columnwise (S-direction) layouts. Implemented with CUTLASS/CUTE.
@@ -151,6 +159,10 @@ Returns a `TupleDict` with keys `out_fp8_row`, `out_scales_row`, `out_fp8_col`, 
 - BF16 path: `x`, `w`, `cos`, `sin` are `bfloat16`.
 - MXFP8 path: `x`, `w` are `float8_e4m3fn` codes; `x_scale`, `w_scale` are `uint8` (E8M0); `cos`, `sin` are `bfloat16`.
 - Outputs (both paths): `out_fp8_row`, `out_fp8_col` are `float8_e4m3fn`; `out_scales_row`, `out_scales_col` are `uint8` (E8M0).
+- No fp4 (e2m1) input on either path: the fused projection epilogues -- this kernel and the
+  [gated attention block](../gated_attention_block.md)'s `fuse_norm_rope` fork twin alike -- are rendered for an
+  `e4m3` B operand. The gated block serves an MXFP4 `W_qkvg` on its **unfused** pipeline only (the FROST GEMM's
+  mixed MXFP8 x MXFP4 block-scale row); asking for it with `fuse_norm_rope=True` is a typed `NotImplementedError`.
 
 ### Shapes and divisibility
 - `tokens % TILE_M == 0` (`TILE_M = 128`); no tail handling.
@@ -172,10 +184,10 @@ The compiled-kernel lifecycle (`check_support`/`compile`/`execute`) lives in the
 
 ## Installation
 
-Requires the optional CuTeDSL dependencies:
+Requires the CuTeDSL dependencies, which ship with the package:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## Usage examples

@@ -1,0 +1,71 @@
+device: NVIDIA GB300
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+dtype: torch.bfloat16
+torch: 2.12.0a0+5aff3928d8.nv26.05
+transformer_engine: 2.15.0+42b84005
+nvidia-cudnn-frontend: 1.23.0
+nvidia-cutlass-dsl: 4.4.1
+timing mode: CUDA graph replay
+
+activation: swiglu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=8192, fused C input N=None, activation output N=4096
+fused cuDNN avg: 1.310 ms
+unfused TE avg:  1.637 ms
+speedup vs TE:   1.25x
+fused samples:   [1.225, 1.253, 1.322, 1.373, 1.379]
+TE samples:      [1.791, 1.649, 1.574, 1.557, 1.614]
+
+activation: dswiglu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=4096, fused C input N=8192, activation output N=8192
+fused cuDNN avg: 0.738 ms
+unfused TE avg:  1.593 ms
+speedup vs TE:   2.16x
+fused samples:   [0.71, 0.712, 0.718, 0.772, 0.777]
+TE samples:      [1.994, 1.593, 1.469, 1.458, 1.453]
+
+activation: srelu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=4096, fused C input N=None, activation output N=4096
+fused cuDNN avg: 0.678 ms
+unfused TE avg:  0.875 ms
+speedup vs TE:   1.29x
+fused samples:   [0.652, 0.65, 0.683, 0.696, 0.706]
+TE samples:      [0.937, 0.942, 0.845, 0.828, 0.824]
+
+activation: dsrelu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=4096, fused C input N=4096, activation output N=4096
+fused cuDNN avg: 0.688 ms
+unfused TE avg:  1.163 ms
+speedup vs TE:   1.69x
+fused samples:   [0.66, 0.664, 0.7, 0.691, 0.724]
+TE samples:      [1.344, 1.151, 1.118, 1.104, 1.1]
+
+activation: geglu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=8192, fused C input N=None, activation output N=4096
+fused cuDNN avg: 1.327 ms
+unfused TE avg:  1.642 ms
+speedup vs TE:   1.24x
+fused samples:   [1.229, 1.298, 1.346, 1.383, 1.378]
+TE samples:      [1.729, 1.631, 1.688, 1.599, 1.565]
+
+activation: dgeglu
+shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
+fused GEMM N=4096, fused C input N=8192, activation output N=8192
+fused cuDNN avg: 0.746 ms
+unfused TE avg:  1.732 ms
+speedup vs TE:   2.32x
+fused samples:   [0.717, 0.723, 0.726, 0.765, 0.797]
+TE samples:      [2.227, 1.756, 1.567, 1.559, 1.552]
+
+summary:
+activation   cudnn_ms      te_ms   te/cudnn
+swiglu          1.310      1.637      1.25x
+dswiglu         0.738      1.593      2.16x
+srelu           0.678      0.875      1.29x
+dsrelu          0.688      1.163      1.69x
+geglu           1.327      1.642      1.24x
+dgeglu          0.746      1.732      2.32x

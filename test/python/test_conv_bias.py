@@ -224,7 +224,7 @@ def test_conv_relu_execution_plan_creation(cudnn_handle):
                 for kernel_cfg in range(knob.min_value, knob.max_value + 1, knob.stride):
                     try:
                         graph.create_execution_plan(engine, {cudnn.knob_type.KERNEL_CFG: kernel_cfg})
-                    except RuntimeError:
+                    except (RuntimeError, cudnn.cudnnGraphNotSupportedError):
                         continue
 
     graph.check_support()

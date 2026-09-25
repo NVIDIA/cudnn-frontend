@@ -93,6 +93,12 @@ class CMakeBuild(build_ext):
             if hasattr(self, "parallel") and self.parallel:
                 # CMake 3.12+ only.
                 build_args += [f"-j{self.parallel}"]
+            else:
+                # Without an explicit -j, `cmake --build` compiles one TU at a
+                # time, so pip installs built the extension serially. Cap at 8:
+                # the extension has ~6 TUs, each peaking at 1-2 GB of compiler
+                # memory, so higher values buy nothing and only add pressure.
+                build_args += [f"-j{min(os.cpu_count() or 1, 8)}"]
 
         build_temp = Path(self.build_temp) / ext.name
         if not build_temp.exists():

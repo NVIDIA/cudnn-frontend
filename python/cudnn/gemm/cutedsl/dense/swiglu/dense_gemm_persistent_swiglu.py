@@ -6,6 +6,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes, get_num_tmem_alloc_cols
+from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -169,7 +171,7 @@ class PersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -332,11 +334,11 @@ class PersistentDenseGemmKernel:
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.ab12_dtype: Type[cutlass.Numeric] = ab12.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.ab12_layout = utils.LayoutEnum.from_tensor(ab12)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
+        self.ab12_layout = LayoutEnum.from_tensor(ab12)
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.c_layout = LayoutEnum.from_tensor(c)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -504,7 +506,7 @@ class PersistentDenseGemmKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         epi_tile_c: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cutlass.Float32,
     ):
@@ -540,7 +542,7 @@ class PersistentDenseGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
@@ -691,7 +693,7 @@ class PersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
@@ -785,7 +787,7 @@ class PersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
@@ -969,7 +971,7 @@ class PersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
@@ -1152,6 +1154,8 @@ class PersistentDenseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -1345,9 +1349,9 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         epi_tile_c: cute.Tile,
         ab12_dtype: Type[cutlass.Numeric],
-        ab12_layout: utils.LayoutEnum,
+        ab12_layout: LayoutEnum,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         smem_capacity: int,
         occupancy: int,
     ) -> Tuple[int, int, int]:
@@ -1368,11 +1372,11 @@ class PersistentDenseGemmKernel:
         :param ab12_dtype: Data type of operand AB12 (full GEMM output).
         :type ab12_dtype: type[cutlass.Numeric]
         :param ab12_layout: Layout enum of operand AB12.
-        :type ab12_layout: utils.LayoutEnum
+        :type ab12_layout: LayoutEnum
         :param c_dtype: Data type of operand C (SwiGLU output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: LayoutEnum
         :param smem_capacity: Total available shared memory capacity in bytes.
         :type smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
@@ -1449,7 +1453,7 @@ class PersistentDenseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> Tuple[PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor AB12.
 
         :param ab12: The output tensor AB12
@@ -1464,15 +1468,15 @@ class PersistentDenseGemmKernel:
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
             - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
+        :rtype: Tuple[PersistentTileSchedulerParams, tuple[int, int, int]]
         """
         ab12_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gab12 = cute.zipped_divide(ab12, tiler=ab12_shape)
         num_ctas_mnl = gab12[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        tile_sched_params = PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
+        grid = StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
 
@@ -1497,6 +1501,6 @@ class PersistentDenseGemmKernel:
         """
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        num_tmem_alloc_cols = get_num_tmem_alloc_cols(tCtAcc_fake)
 
         return num_tmem_alloc_cols

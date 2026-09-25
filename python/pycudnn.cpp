@@ -143,6 +143,14 @@ create_kernel_cache_submodule(py::module_ &);
 void
 init_properties(py::module_ &);
 
+// pybinds for direct-call GNN operations
+void
+init_gnn_submodule(py::module_ &);
+
+// pybinds for the native variant pack
+void
+init_variant_pack(py::module_ &);
+
 void
 set_dlhandle_cudnn(std::intptr_t dlhandle) {
 #ifdef _WIN32
@@ -158,6 +166,8 @@ PYBIND11_MODULE(_compiled_module, m) {
 
     init_properties(m);
     init_pygraph_submodule(m);
+    init_gnn_submodule(m);
+    init_variant_pack(m);
 
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 
@@ -391,6 +401,138 @@ PYBIND11_MODULE(_compiled_module, m) {
             throw_if_b2b_causal_conv1d_failed(
                 status, "cudnnB2BCausalConv1dBackward", kernel_size_proj, kernel_size_mixer);
         });
+#if CUDNN_VERSION >= 92600
+    m.def("fft_causal_conv1d_forward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t out_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type) {
+              auto status = detail::fft_causal_conv1d_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                              reinterpret_cast<const void *>(x_ptr),
+                                                              reinterpret_cast<const void *>(weight_ptr),
+                                                              reinterpret_cast<void *>(out_ptr),
+                                                              batch,
+                                                              dim,
+                                                              seq_len,
+                                                              kernel_size,
+                                                              static_cast<cudnnDataType_t>(data_type));
+              if (status != 0)
+                  throw std::runtime_error("cudnnFFTCausalConv1dForward failed with status " + std::to_string(status));
+          });
+
+    m.def("fft_causal_conv1d_backward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t dy_ptr,
+             std::intptr_t dx_ptr,
+             std::intptr_t dweight_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type) {
+              auto status = detail::fft_causal_conv1d_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                               reinterpret_cast<const void *>(x_ptr),
+                                                               reinterpret_cast<const void *>(weight_ptr),
+                                                               reinterpret_cast<const void *>(dy_ptr),
+                                                               reinterpret_cast<void *>(dx_ptr),
+                                                               reinterpret_cast<void *>(dweight_ptr),
+                                                               batch,
+                                                               dim,
+                                                               seq_len,
+                                                               kernel_size,
+                                                               static_cast<cudnnDataType_t>(data_type));
+              if (status != 0)
+                  throw std::runtime_error("cudnnFFTCausalConv1dBackward failed with status " + std::to_string(status));
+          });
+
+    m.def("long_fft_causal_conv1d_get_buffer_sizes",
+          [](int batch, int dim, int seq_len, int kernel_size, int data_type) {
+              size_t workspace_size_in_bytes     = 0;
+              size_t reserve_space_size_in_bytes = 0;
+              auto status                        = detail::long_fft_causal_conv1d_get_buffer_sizes(batch,
+                                                                            dim,
+                                                                            seq_len,
+                                                                            kernel_size,
+                                                                            static_cast<cudnnDataType_t>(data_type),
+                                                                            &workspace_size_in_bytes,
+                                                                            &reserve_space_size_in_bytes);
+              if (status != 0)
+                  throw std::runtime_error("cudnnLongFFTCausalConv1dGetBufferSizes failed with status " +
+                                           std::to_string(status));
+              return std::make_pair(workspace_size_in_bytes, reserve_space_size_in_bytes);
+          });
+
+    m.def("long_fft_causal_conv1d_forward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t out_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             std::intptr_t workspace_ptr,
+             size_t workspace_size_in_bytes,
+             std::intptr_t reserve_space_ptr,
+             size_t reserve_space_size_in_bytes) {
+              auto status = detail::long_fft_causal_conv1d_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                                   reinterpret_cast<const void *>(x_ptr),
+                                                                   reinterpret_cast<const void *>(weight_ptr),
+                                                                   reinterpret_cast<void *>(out_ptr),
+                                                                   batch,
+                                                                   dim,
+                                                                   seq_len,
+                                                                   kernel_size,
+                                                                   static_cast<cudnnDataType_t>(data_type),
+                                                                   reinterpret_cast<void *>(workspace_ptr),
+                                                                   workspace_size_in_bytes,
+                                                                   reinterpret_cast<void *>(reserve_space_ptr),
+                                                                   reserve_space_size_in_bytes);
+              if (status != 0)
+                  throw std::runtime_error("cudnnLongFFTCausalConv1dForward failed with status " +
+                                           std::to_string(status));
+          });
+
+    m.def("long_fft_causal_conv1d_backward",
+          [](std::intptr_t stream,
+             std::intptr_t dy_ptr,
+             std::intptr_t dx_ptr,
+             std::intptr_t dweight_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             std::intptr_t workspace_ptr,
+             size_t workspace_size_in_bytes,
+             std::intptr_t reserve_space_ptr,
+             size_t reserve_space_size_in_bytes) {
+              auto status = detail::long_fft_causal_conv1d_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                                    reinterpret_cast<const void *>(dy_ptr),
+                                                                    reinterpret_cast<void *>(dx_ptr),
+                                                                    reinterpret_cast<void *>(dweight_ptr),
+                                                                    batch,
+                                                                    dim,
+                                                                    seq_len,
+                                                                    kernel_size,
+                                                                    static_cast<cudnnDataType_t>(data_type),
+                                                                    reinterpret_cast<void *>(workspace_ptr),
+                                                                    workspace_size_in_bytes,
+                                                                    reinterpret_cast<void *>(reserve_space_ptr),
+                                                                    reserve_space_size_in_bytes);
+              if (status != 0)
+                  throw std::runtime_error("cudnnLongFFTCausalConv1dBackward failed with status " +
+                                           std::to_string(status));
+          });
+#endif
 #endif
 }
 

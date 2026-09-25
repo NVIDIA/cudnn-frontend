@@ -24,6 +24,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -47,8 +48,8 @@ from ..moe_sched_extension import (
     ContiguousAndConsistentGroupedGemmSchedExtension,
 )
 from ..moe_kernel_helpers import (
-    fmin,
     fmax,
+    tanh_clamp_unit,
     atomic_max_float32,
     compute_stages,
     compute_grid,
@@ -86,6 +87,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     :param epilogue_type: Epilogue activation type (``EpilogueType.NONE`` or ``EpilogueType.SRELU``).
+    :param tanh_clamp_scale: Optional soft-clamp scale ``s`` for the SRELU epilogue. When set,
+        computes ``(s * tanh(relu(x) / s)) ** 2`` in place of plain ``relu(x) ** 2``.
+        Trace-time constant; ``None`` (default) is bit-identical to the unclamped path.
     """
 
     FIX_PAD_SIZE = 256
@@ -145,6 +149,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         epilogue_type: int = EpilogueType.NONE.value,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -202,7 +207,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -217,6 +222,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
         self.epilogue_use_functor = False
         self.epilogue_type = epilogue_type
+        # Trace-time constant; must key the compile cache (see srelu/api.py).
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
 
         self.num_epilog_warps = len(self.epilog_warp_id)
 
@@ -574,6 +581,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     # ------------------------------------------------------------------
     # __call__
     # ------------------------------------------------------------------
@@ -617,13 +626,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -1173,7 +1182,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1236,7 +1245,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
         scheduler.internal_init()
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -1886,6 +1895,18 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mProb = real_prob[mPosition, 0, 0]
 
+                # Per-row scale applied to the activation below the subtile loop.
+                # Plain srelu: prob.
+                # Soft-clamped srelu: the activation is t^2 * (s^2 prob) with t = tanh(relu(x)/s),
+                # so s^2 is folded in here once per tile. This expression must match clamp_k_srelu
+                # in the dsrelu kernel.
+                if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value and self.tanh_clamp_scale is not None):
+                    clamp_s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+                    clamp_s2 = cutlass.Float32(self.tanh_clamp_scale * self.tanh_clamp_scale)
+                    prob_scale = cutlass.Float32(mProb) * clamp_s2
+                else:
+                    prob_scale = mProb
+
                 # C1 fix: phase-based acc stage indexing for overlapping_accum
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1905,15 +1926,15 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         if reverse_subtile:
                             real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx
 
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
-
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     if cutlass.const_expr(self.enable_bias):
                         # m7 fix: use real_subtile_idx directly (matches contiguous)
@@ -1965,14 +1986,43 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                     acc_vec = tTR_rAcc.load()
 
                     if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value):
-                        acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
-                                (acc_relu[i], acc_relu[i + 1]),
-                                (acc_relu[i], acc_relu[i + 1]),
-                                rnd="rn",
-                                ftz=False,
-                            )
+                        if cutlass.const_expr(self.tanh_clamp_scale is not None):
+                            # Soft-clamped squared ReLU: out = (s * tanh(relu(x)/s))^2 * w,
+                            # computed as t^2 * prob_scale where t = tanh(relu(x)/s), and
+                            # prob_scale = s^2 * w was folded once per tile.
+                            # tanh_clamp_unit is relu, tanh and the defensive t <= 1 cap in
+                            # two instructions (negative x -> t = 0, NaN -> 0).
+                            # The dsrelu kernel's d_srelu regen uses this same expression;
+                            # keep them identical.
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                    u0, u1 = cute.arch.mul_packed_f32x2(
+                                        (acc_vec[i], acc_vec[i + 1]),
+                                        (clamp_s_rcp, clamp_s_rcp),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    t0 = tanh_clamp_unit(u0)
+                                    t1 = tanh_clamp_unit(u1)
+                                    tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (t0, t1),
+                                        (t0, t1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                    t = tanh_clamp_unit(acc_vec[i] * clamp_s_rcp)
+                                    tTR_rAcc[i] = t * t
+                        else:
+                            acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
+                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                    (acc_relu[i], acc_relu[i + 1]),
+                                    (acc_relu[i], acc_relu[i + 1]),
+                                    rnd="rn",
+                                    ftz=False,
+                                )
                         acc_vec = tTR_rAcc.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
@@ -1980,13 +2030,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                             tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
                                 (acc_vec[i], acc_vec[i + 1]),
-                                (mProb, mProb),
+                                (prob_scale, prob_scale),
                                 rnd="rn",
                                 ftz=False,
                             )
                     else:
                         for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                            tCompute[i] = acc_vec[i] * mProb
+                            tCompute[i] = acc_vec[i] * prob_scale
 
                     if cutlass.const_expr(self.generate_amax):
                         thread_tile_amax = amax_reduction_per_thread(tCompute, thread_tile_amax)
@@ -2080,6 +2130,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             if cutlass.const_expr(self.generate_c):
                 c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     # ------------------------------------------------------------------
     # Internal: create extension based on weight_mode

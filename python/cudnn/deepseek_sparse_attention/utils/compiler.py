@@ -31,7 +31,9 @@ _ARCH_MAP = {
     (9, 0): "sm_90a",  # Hopper H100
     (10, 0): "sm_100a",  # Blackwell B200
     (10, 3): "sm_103a",  # Blackwell Ultra B300
-    (10, 7): "sm_100f",
+    # Rubin needs the arch-specific target: the MXFP8 kernels emit block-scaled
+    # MMAs (.scale_vec::1X) that ptxas rejects on the sm_100f family target.
+    (10, 7): "sm_107a",
 }
 
 

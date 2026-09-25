@@ -60,6 +60,16 @@ class NodeType(Enum):
     MOE_GROUPED_MATMUL = auto()
     BLOCK_SCALE_QUANTIZE = auto()
     BLOCK_SCALE_DEQUANTIZE = auto()
+    GDP = auto()
+    GDP_BWD = auto()
+    GDN_SUMMARY = auto()
+    KDA_SUMMARY = auto()
+    GDN2_SUMMARY = auto()
+    GDP_SUMMARY = auto()
+    GDN_SUMMARY_BWD = auto()
+    KDA_SUMMARY_BWD = auto()
+    GDN2_SUMMARY_BWD = auto()
+    GDP_SUMMARY_BWD = auto()
 
 
 @dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable
@@ -80,6 +90,11 @@ class Tensor:
         uid_assigned: True if UID was explicitly assigned
         reordering_type: Memory layout transformation type
         ragged_offset: Tensor for variable-length tensor offsets
+        alignment_value: caller's promise that every VALUE this tensor holds is a
+            multiple of it (1 = no promise). Unlike every other attribute here it
+            constrains the CONTENTS, not the layout, and it is not validated --
+            violating it is undefined behaviour. Only the MoE
+            first_token_offset tensor reads it.
     """
 
     name: str = ""
@@ -101,17 +116,11 @@ class Tensor:
     reordering_type: Any = None
     ragged_offset: Optional["Tensor"] = None
     ragged_offset_multiplier: int = 1
+    alignment_value: int = 1
     scalar_type: Any = None  # cudnn.scalar_type for tensor_scalar-created scalars
     # weakref to the owning graph (set at registration): identity mutations
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
     owner: Any = field(default=None, repr=False)
-
-    def __setattr__(self, name, value):
-        # direct attribute writes freeze with the owning graph (the fluent
-        # setters are guarded separately and give a richer error)
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError(f"cannot set Tensor.{name}: the owning graph is frozen after lowering/planning")
-        object.__setattr__(self, name, value)
 
     def _guard(self, what: str = "mutate a tensor attribute") -> None:
         g = self.owner() if self.owner is not None else None
@@ -128,6 +137,14 @@ class Tensor:
         """Set the data type."""
         self._guard()
         self.data_type = dtype
+        return self
+
+    def set_alignment_value(self, value: int) -> "Tensor":
+        """Promise every value this tensor holds is a multiple of `value`."""
+        self._guard()
+        if value < 1:
+            raise ValueError(f"alignment_value must be >= 1, got {value}")
+        self.alignment_value = value
         return self
 
     def set_name(self, name: str) -> "Tensor":
@@ -241,3 +258,99 @@ class Tensor:
 
     # NOTE: hash/eq are object identity (dataclass eq=False). uid and name are
     # mutable, so value-based hashing would violate the dict-key invariant.
+
+
+def describing_tensor(uid: int, dim, stride, data_type) -> Tensor:
+    """A Tensor describing a caller's buffer, built without the dataclass
+    ``__init__``.
+
+    ``execute()`` builds one of these per operand per call; the generated
+    ``__init__`` would set seventeen attributes and run two default factories
+    where only four fields are known. Every field
+    left unset resolves to the class attribute the dataclass already installed
+    for its default, so the result is indistinguishable from ``Tensor(...)`` --
+    ``test_describing_tensor_matches_the_dataclass`` compares them field by
+    field, and fails loudly if a new field arrives with a ``default_factory``
+    (those get no class attribute, so reading one would raise).
+    """
+    tensor = object.__new__(Tensor)
+    attributes = tensor.__dict__
+    attributes["uid"] = uid
+    attributes["dim"] = dim
+    attributes["stride"] = stride
+    attributes["data_type"] = data_type
+    return tensor
+
+
+def storage_geometry(dim, stride, data_type):
+    """A cuDNN (element) geometry as the STORAGE-slot geometry a buffer reports.
+
+    Every dtype but fp4 stores one element per slot, so the geometry is its
+    own. fp4 packs two elements per slot along the unit-stride axis (torch's
+    ``float4_e2m1fn_x2``, or a uint8 view): that extent halves and every other
+    stride halves with it. None when the extent is odd -- no slot geometry
+    spells it. Shared by the variant pack (which stores slots) and the engines
+    that compare a slot against a declaration.
+    """
+    dim = tuple(int(d) for d in dim)
+    if stride:
+        stride = tuple(int(x) for x in stride)
+    else:
+        acc, dense = 1, []
+        for d in reversed(dim):
+            dense.insert(0, acc)
+            acc *= d
+        stride = tuple(dense)
+    if data_type != _fp4_enum():
+        return dim, stride
+    # The packed axis is a unit-stride axis with an even extent above one -- a
+    # singleton axis may also carry stride 1 and must not be the one picked.
+    for c, (extent, step) in enumerate(zip(dim, stride)):
+        if step != 1 or extent <= 1 or extent % 2:
+            continue
+        if any(x % 2 for j, x in enumerate(stride) if j != c and x != 1):
+            continue
+        # a singleton axis keeps its (never stepped) unit stride
+        return tuple(d // 2 if j == c else d for j, d in enumerate(dim)), tuple(x if (j == c or x == 1) else x // 2 for j, x in enumerate(stride))
+    return None
+
+
+_FP4_ENUM = None
+
+
+def _fp4_enum():
+    # cudnn imports this module, so the enum is fetched on first use, once:
+    # storage_geometry runs per overridden operand per execute.
+    global _FP4_ENUM
+    if _FP4_ENUM is None:
+        import cudnn
+
+        _FP4_ENUM = cudnn.data_type.FP4_E2M1
+    return _FP4_ENUM
+
+
+def storage_slot_bytes(data_type) -> "int | None":
+    """Bytes per STORAGE slot of a declared dtype: 1 for fp4 (two elements per
+    slot), the element width otherwise, None when the width is unknown."""
+    if data_type == _fp4_enum():
+        return 1
+    from .datatypes import _CUDNN_TO_FROST_DTYPE_NAME
+    from .frost.buffers import DTYPE_ITEMSIZE
+
+    name = _CUDNN_TO_FROST_DTYPE_NAME.get(data_type)
+    return None if name is None else int(DTYPE_ITEMSIZE[name])
+
+
+def byte_size(tensor: Tensor) -> int:
+    """Bytes a dense tensor of this dim and dtype occupies, or 0 when the dtype
+    has no known width (a bare address describes neither)."""
+    from .datatypes import _CUDNN_TO_FROST_DTYPE_NAME
+    from .frost.buffers import DTYPE_ITEMSIZE
+
+    name = _CUDNN_TO_FROST_DTYPE_NAME.get(tensor.data_type)
+    if name is None or not tensor.dim:
+        return 0
+    total = DTYPE_ITEMSIZE[name]
+    for extent in tensor.dim:
+        total *= int(extent)
+    return total

@@ -4,6 +4,10 @@
 
 **Legacy dense-only API note:** This page documents the older dense-only grouped quant API. For new integrations, prefer the unified [Grouped GEMM + Quant (Unified)](grouped_gemm_quant_unified.md) page.
 
+## JAX support
+
+JAX arrays are **not supported**: all configurations consume the SFA scale-factor tensor as an MMA-permuted strided cute tensor argument, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + Quant fusion**: A contiguous grouped block-scaled GEMM with output quantization on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.
@@ -330,7 +334,7 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 | Format | ab_dtype | sf_dtype | sf_vec_size | d_dtype |
 |--------|----------|----------|-------------|-------------|
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` |
-| **NVF4** | `float4_e2m1fn_x2` or `uint8` | {`float8_e4m3fn`, `float8_e8m0fnu`} | {16, 32} | `{float16, bfloat16, float32}` |
+| **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e4m3fn`, `float8_e8m0fnu`\} | \{16, 32\} | `{float16, bfloat16, float32}` |
 
 #### Additional Type Constraints
 

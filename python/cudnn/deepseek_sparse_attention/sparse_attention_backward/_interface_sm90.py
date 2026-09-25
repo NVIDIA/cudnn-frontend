@@ -63,8 +63,11 @@ def flash_attn_bwd_sm90(
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
         d_sink: pre-allocated (nheads,), optional
-        topk_idxs: (total_S_q, topk_max) int32, global indices
-        topk_length: (total_S_q,) int32, per-query valid count, optional
+        topk_idxs: (total_S_q, topk_max) int32, global KV indices.
+            Entries outside `[0, S_kv)` are ignored in both compact and
+            non-compact modes.
+        topk_length: (total_S_q,) int32, optional per-query valid prefix
+            length, clamped to `[0, topk_max]` by the kernel.
         need_d_sink: return and compute d_sink when True
 
     Returns:
@@ -230,8 +233,7 @@ def flash_attn_bwd_sm90(
     have_topk_length = tlen4 is not None
     if have_topk_length:
         assert tlen4.dtype == torch.int32
-    else:
-        tlen4 = torch.empty(1, dtype=torch.int32, device=device)
+    # else: mTopkLength is read only under const_expr(have_topk_length); None at compile and launch (Rule 8).
     max_topk = topk4.shape[-1]
 
     num_threads = 256
@@ -261,7 +263,7 @@ def flash_attn_bwd_sm90(
         dq_tensor = to_cute_tensor(dq4)
         dkv_accum_tensor = to_cute_tensor(dkv_accum)
         topk_idxs_tensor = to_cute_tensor(topk4)
-        topk_length_tensor = to_cute_tensor(tlen4)
+        topk_length_tensor = to_cute_tensor(tlen4) if have_topk_length else None
 
         fa_bwd_obj = FlashAttentionDSABackwardSm90(
             dtype,

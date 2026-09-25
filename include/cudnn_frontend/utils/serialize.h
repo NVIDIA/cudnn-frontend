@@ -617,6 +617,11 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     if (ta.has_ragged_offset_multiplier()) {
         j["ragged_offset_multiplier"] = ta.ragged_offset_multiplier;
     }
+    // Emitted only when non-default so that graphs which never call set_alignment keep a
+    // byte-identical payload (and therefore an unchanged Graph::key()) across this change.
+    if (ta.alignment != Tensor_attributes::default_alignment) {
+        j["alignment"] = ta.alignment;
+    }
 }
 
 inline void
@@ -644,6 +649,8 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     if (j.contains("ragged_offset_multiplier")) {
         ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
     }
+    // Optional read, for backward compatibility with payloads that predate this key.
+    ta.alignment = j.value("alignment", Tensor_attributes::default_alignment);
 }
 
 NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
@@ -677,6 +684,21 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::TILE_M, "TILE_M"},
                                  {KnobType_t::TILE_N, "TILE_N"},
                                  {KnobType_t::WARP_SPEC_CFG, "WARP_SPEC_CFG"},
+                                 {KnobType_t::SWAP_AB, "SWAP_AB"},
+                                 {KnobType_t::INPUT_TMA_ENABLE, "INPUT_TMA_ENABLE"},
+                                 {KnobType_t::OUTPUT_TMA_ENABLE, "OUTPUT_TMA_ENABLE"},
+                                 {KnobType_t::TILE_CGA, "TILE_CGA"},
+                                 // frontend-only band (knobs.h)
+                                 {KnobType_t::SCHED_POLICY, "SCHED_POLICY"},
+                                 {KnobType_t::PACK_GQA, "PACK_GQA"},
+                                 {KnobType_t::SPLIT_KV, "SPLIT_KV"},
+                                 {KnobType_t::PIPELINE_ARCH, "PIPELINE_ARCH"},
+                                 {KnobType_t::MMA_TILE_M, "MMA_TILE_M"},
+                                 {KnobType_t::MMA_TILE_N, "MMA_TILE_N"},
+                                 {KnobType_t::MMA_TILE_K, "MMA_TILE_K"},
+                                 {KnobType_t::CTA_GROUP, "CTA_GROUP"},
+                                 {KnobType_t::WARPS_M, "WARPS_M"},
+                                 {KnobType_t::WARPS_N, "WARPS_N"},
                              })
 
 #endif

@@ -59,6 +59,7 @@ from cutlass.utils.blackwell_helpers import (
     make_smem_layout_a as _make_smem_layout_a,
     make_smem_layout_b as _make_smem_layout_b,
 )
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import gemm_ptx_partial as _gemm_ptx_partial
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
@@ -248,8 +249,8 @@ class DenseScoreRecomputeSm100:
         mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
 
         cta_group = tcgen05.CtaGroup.ONE
-        self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
+        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
@@ -442,7 +443,7 @@ class DenseScoreRecomputeSm100:
                 self.buffer_align_bytes,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         Q_mbar_ptr = storage.Q_mbar_ptr.data_ptr()
@@ -534,7 +535,9 @@ class DenseScoreRecomputeSm100:
         tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
         tStS_ref = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
-        warp_group_idx = tidx // self.WARPGROUP_SIZE
+        # Each warp belongs to one warpgroup. Preserve that uniformity across
+        # the load/MMA and epilogue branches to avoid redundant collectives.
+        warp_group_idx = cute.arch.make_warp_uniform(tidx // self.WARPGROUP_SIZE)
 
         # =====================================================================
         # Warpgroup 0 (warps 0-3): Load + MMA + Scheduler
