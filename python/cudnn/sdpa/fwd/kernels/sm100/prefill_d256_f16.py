@@ -1919,11 +1919,11 @@ def _host(
     meta_ptr: cute.Pointer,
     o_desc_ptr: cute.Pointer,
     problem_size: Tuple[int, int, int, int, int, int],
-    q_strides: Tuple[int, int, int],
-    k_strides: Tuple[int, int, int],
-    v_strides: Tuple[int, int, int],
-    o_strides: Tuple[int, int, int],
-    lse_strides: Tuple[int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_ext: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
@@ -1934,7 +1934,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -1947,9 +1947,11 @@ def _host(
     Operands are ``[B, S, H, D]`` with the head dim innermost (element stride 1);
     ``*_strides`` carry the (seq, head) element strides, K/V additionally the
     outer stride, which is the page stride of a paged pool and unused otherwise.
+    Every stride leaf is Int64 (the ``compile()`` fakes fix the width): a 16-bit
+    operand with S * H * D >= 2^27 elements would wrap the Int32 TMA-unit scaling.
     ``problem_size`` = (B, QH, KH, SQ, SKV, 0); under THD SQ/SKV are the packed
     token totals, under paged KV SKV is ``max_pages * PAGE_SIZE``. The batch
-    stride of a dense operand is ``S * seq_stride`` (Int64); a packed THD operand
+    stride of a dense operand is ``S * seq_stride``; a packed THD operand
     has batch extent 1 and binds the seq stride there (never stepped).
 
     ``lse_kind``: "dense" (B*SPLIT_KV, QH, SQ) in ``lse_strides``; "token" (SQ, QH)
@@ -2166,6 +2168,7 @@ def compile(  # noqa: A001
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
     thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
@@ -2178,11 +2181,11 @@ def compile(  # noqa: A001
         P(cutlass.Int32),
         P(cutlass.Int64),
         (0, 0, 0, 0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
         i32,
         cutlass.Float32(0.0),
         i32,
@@ -2193,7 +2196,7 @@ def compile(  # noqa: A001
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
         P(cutlass.Int32, 4) if PAGED_KV else None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

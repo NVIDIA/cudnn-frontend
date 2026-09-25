@@ -37,6 +37,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256
 # not a supported standalone execution configuration for this FP8 kernel.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256(PARAMS)
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d256_fp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -78,6 +82,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_PADDED,
 )
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 if CFG.DTYPE_QKV == 0:

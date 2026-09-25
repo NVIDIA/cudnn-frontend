@@ -53,6 +53,8 @@ cudnn.NodeType.KDA_SUMMARY
 cudnn.NodeType.KDA_SUMMARY_BWD
 cudnn.NodeType.LAYERNORM
 cudnn.NodeType.LAYERNORM_BWD
+cudnn.NodeType.MAMBA2
+cudnn.NodeType.MAMBA2_BWD
 cudnn.NodeType.MATMUL
 cudnn.NodeType.MATMUL_FP8
 cudnn.NodeType.MOE_GROUPED_MATMUL
@@ -293,7 +295,9 @@ cudnn.engines.is_backend_engine
 cudnn.engines.is_python_engine
 cudnn.engines.public_knobs_repr
 cudnn.experimental.ops
+cudnn.experimental.ops.layer_norm
 cudnn.experimental.ops.moe_grouped_matmul
+cudnn.experimental.ops.rms_norm
 cudnn.experimental.ops.swiglu_mlp
 cudnn.fla
 cudnn.fla.accelerate_fla
@@ -317,6 +321,12 @@ cudnn.flex_attention.MaskPlan.metadata
 cudnn.flex_attention.create_mask_plan
 cudnn.flex_attention.flex_attn_func
 cudnn.gemm
+cudnn.gemm.MhcProjectionBackward
+cudnn.gemm.MhcProjectionBackward.check_support
+cudnn.gemm.MhcProjectionBackward.compile
+cudnn.gemm.MhcProjectionBackward.execute
+cudnn.gemm.MhcProjectionBackward.scratch_workspace_bytes
+cudnn.gemm.mhc_projection_backward
 cudnn.gemm.moe_grouped_matmul
 cudnn.gemm.ops
 cudnn.gemm.ops.moe_grouped_matmul
@@ -377,6 +387,9 @@ cudnn.jax.call
 cudnn.jax.gemm_operand_spec
 cudnn.jax.grouped_gemm_dswiglu
 cudnn.jax.grouped_gemm_swiglu
+cudnn.jax.kimi_delta_attention
+cudnn.jax.kimi_delta_attention_bwd
+cudnn.jax.kimi_delta_attention_fwd
 cudnn.jax.neg_inf_init
 cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec
@@ -446,6 +459,7 @@ cudnn.linear_attention.gated_delta_product_summary_bwd
 cudnn.linear_attention.kimi_delta_attention
 cudnn.linear_attention.kimi_delta_attention_summary
 cudnn.linear_attention.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.mamba2
 cudnn.linear_attention.ops
 cudnn.linear_attention.ops.gated_delta_net
 cudnn.linear_attention.ops.gated_delta_net_summary
@@ -459,6 +473,7 @@ cudnn.linear_attention.ops.gated_delta_product_summary_bwd
 cudnn.linear_attention.ops.kimi_delta_attention
 cudnn.linear_attention.ops.kimi_delta_attention_summary
 cudnn.linear_attention.ops.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.ops.mamba2
 cudnn.moe_grouped_matmul_mode
 cudnn.moe_grouped_matmul_mode.GATHER
 cudnn.moe_grouped_matmul_mode.NONE
@@ -585,6 +600,8 @@ cudnn.pygraph.log
 cudnn.pygraph.logical_and
 cudnn.pygraph.logical_not
 cudnn.pygraph.logical_or
+cudnn.pygraph.mamba2
+cudnn.pygraph.mamba2_bwd
 cudnn.pygraph.matmul
 cudnn.pygraph.max
 cudnn.pygraph.min

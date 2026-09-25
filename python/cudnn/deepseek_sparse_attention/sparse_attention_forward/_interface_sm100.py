@@ -15,6 +15,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from cudnn._torch_stream import as_torch_stream
+
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 _compile_cache: dict = {}
@@ -76,7 +78,7 @@ def _launch_context(device: torch.device, stream):
             if int(stream_device) != device.index:
                 raise ValueError(f"stream belongs to cuda:{int(stream_device)}, but Q is on {device}")
             if int(stream) != consumer.cuda_stream:
-                consumer = torch.cuda.get_stream_from_external(int(stream), device.index)
+                consumer = as_torch_stream(int(stream), device)
                 context = torch.cuda.stream(consumer)
         with context:
             yield stream, consumer

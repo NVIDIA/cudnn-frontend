@@ -7,10 +7,10 @@ Unit tier (no GPU): recommend() emits ordered COMPLETE knob assignments — the
 same engine repeated with different sets, every set admissible, no cartesian
 blowup, cross-axis constraints never emitted, mode never on an entry.
 
-Executable tier (SM100): the ranked list carries knob-suffixed duplicates of
-one cell; the split_kv entry, pinned by name, builds, carves its partial slabs
-from the caller workspace, recombines correctly (O and Stats), and its
-(engine_id, knobs) tuple replays on a fresh graph.
+Executable tier (SM100): explicit public knob assignments build independently
+of recommendation order. The split plan carves its partial slabs from caller
+workspace, recombines correctly (O and Stats), and its (engine_id, knobs)
+record replays on a fresh graph.
 """
 
 import math
@@ -119,9 +119,13 @@ def test_split_model_sees_the_partial_pack_group_not_the_gqa_ratio(monkeypatch):
         facts = _facts(b=b, h_q=96, h_kv=8, s_q=1, s_kv=4096, causal=False, dtype=cudnn.data_type.BFLOAT16)
         f16 = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
         assert seen, "the split leg never consulted the wave-cost model"
+        # Geometry runners now consult the model too. Packed candidates carry
+        # p=4 (24 head groups), unpacked ones carry all 96 heads; no candidate
+        # may mistake the GQA ratio G=12 for p and model only eight heads.
+        assert {kw["heads_q"] for kw in seen} == {24, 96}
         for kw in seen:
-            assert (kw["q_tiles"], kw["heads_q"]) == (1, 24), f"split launch fed the GQA ratio, not the packed group: {kw}"
-            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == 24, kw["unsplit_launch"]
+            assert kw["q_tiles"] == 1
+            assert kw["unsplit_launch"] is not None and kw["unsplit_launch"].heads_q == kw["heads_q"], kw["unsplit_launch"]
             # The combine still reduces the graph's own (S_q, H, B) rows.
             assert kw["combine_rows"] == 1 * 96 * b
         assert f16[0].knobs.pack_gqa is True and f16[0].knobs.cga == 1 and f16[0].knobs.split_kv == want, (b, f16[0].knobs)
@@ -409,6 +413,39 @@ def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
 
 
 @pytest.mark.L0
+def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
+    """sm100 d128 MXFP8, causal: the FIRST proposed policy is plain LPT and LPT_L2 stays in the ranking as the
+    autotune runner (MEASURED on B200, 2026-09-22: LPT over the L2-budget arm's LPT_L2 +4.3..+10.4 % on six shapes,
+    GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
+    an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
+    still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
+    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.heuristics import _sched_points
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    mx_name, fp8_name = engines.engine_name(mxfp8=True), engines.engine_name(fp8=True)
+    quant = dict(s_q=8192, h_q=24, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16)
+    for h_kv in (8, 24):  # GQA 3 and no GQA, both measured
+        mx = _facts(is_mxfp8=True, h_kv=h_kv, **quant)
+        assert engines.effective_sched_policies(caps[mx_name], mx) == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), "domain unchanged"
+        assert _sched_points(caps[mx_name], mx) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], h_kv
+        plans = recommend("A", mx, {mx_name: 20510})
+        assert (plans[0].knobs.split_kv, plans[0].knobs.sched_policy) == (1, SCHED_LPT), plans[0].knobs
+        assert SCHED_LPT_L2 in {p.knobs.sched_policy for p in plans}, "LPT_L2 must stay an autotune runner"
+        # The measured no-change: the per-tensor FP8 d128 row keeps the L2-budget arm (2 MiB per head here).
+        fp8 = _facts(is_fp8=True, h_kv=h_kv, **quant)
+        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
+        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT_L2
+    # Scope: d128 only, SM100 row only, causal only.
+    assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
+
+
+@pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler():
     name = engines.engine_name(mxfp8=True)
     offered = {name: 20510}
@@ -437,11 +474,11 @@ def test_d512_mxfp8_primary_uses_measured_scheduler():
 
 @pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
-    """Placement is the SHARED layer's job (engines/heuristics._assemble):
-    proposals lead the backend's entries inside each mode block by standing
-    assumption, the delegating entry never leads an OPENSOURCE block, one
-    config repeated across blocks keeps its first position, and no final
-    entry carries a mode."""
+    """Placement is the SHARED layer's job (engines/heuristics._assemble): a
+    list WITHOUT the BACKEND marker keeps the historical order (ours lead the
+    backend's entries inside each mode block), the delegating entry never
+    leads an OPENSOURCE block, one config repeated across blocks keeps its
+    first position, and no final entry carries a mode."""
     ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
     backend = [
         PlanConfig(-1, None),  # delegating (mode None)
@@ -457,6 +494,36 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     # OPENSOURCE: ours + delegating, and never the backend's own entries.
     oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: ours, backend)
     assert [p.engine_id for p in oss] == [20500, 20500, -1]
+
+
+@pytest.mark.L0
+def test_assemble_places_the_backend_block_where_the_marker_sits():
+    """The BACKEND marker: ``[BACKEND, ours]`` puts the delegating entry and the
+    mode's backend entries ahead of ours; ``[ours, BACKEND]`` is the historical
+    order; the marker itself never reaches the list, a repeat is dropped, an
+    OPENSOURCE block ignores it (python-only + delegating), FALLBACK expands to
+    the FALLBACK entries, and with no backend entries the block is empty."""
+    from cudnn.engines.heuristics import BACKEND, is_backend_block
+
+    ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
+    backend = [
+        PlanConfig(-1, None),
+        PlanConfig(7, {"k": 1}, cpp_index=0, mode=cudnn.heur_mode.A),
+        PlanConfig(8, {"k": 2}, cpp_index=1, mode=cudnn.heur_mode.FALLBACK),
+    ]
+    trail = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in trail] == [-1, 7, 20500, 20500]
+    lead = _assemble([cudnn.heur_mode.A], lambda kind: ours + [BACKEND], backend)
+    assert [p.engine_id for p in lead] == [20500, 20500, -1, 7]
+    assert not any(is_backend_block(p) for p in trail + lead)
+    twice = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND, ours[0], BACKEND, ours[1]], backend)
+    assert [p.engine_id for p in twice] == [-1, 7, 20500, 20500]
+    oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: [BACKEND] + ours, backend)
+    assert [p.engine_id for p in oss] == [20500, 20500, -1], "OPENSOURCE stays python-only + delegating"
+    both = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: [BACKEND] + ours if kind == "A" else [BACKEND, ours[0]], backend)
+    assert [p.engine_id for p in both] == [-1, 7, 20500, 20500, 8], "FALLBACK block expands to the FALLBACK entries; dedup keeps first positions"
+    alone = _assemble([cudnn.heur_mode.A], lambda kind: [BACKEND] + ours, [])
+    assert [p.engine_id for p in alone] == [20500, 20500], "no backend entries: the block is empty and ours stay"
 
 
 @pytest.mark.L0
@@ -503,37 +570,32 @@ def _build_decodeish_graph(*, causal=True):
     st.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
     return g, (q, k, v, o, st), (B, H, SQ, SKV, D)
+
+
+def _append_explicit_f16_plan(g, *, split_kv):
+    engine = next(e for e in manifest.engines_for(g) if e.name == _F16)
+    knobs = {
+        cudnn.knob_type.TILE_M: 128,
+        cudnn.knob_type.TILE_N: 128,
+        cudnn.knob_type.TILE_CGA_M: 1,
+        cudnn.knob_type.SCHED_POLICY: 0,
+        cudnn.knob_type.SPLIT_KV: split_kv,
+        cudnn.knob_type.PACK_GQA: 0,
+    }
+    g.create_execution_plan(engine.engine_id, knobs)
+    index = g.get_execution_plan_count() - 1
+    assert g.get_engine_and_knobs_at_index(index) == (engine.engine_id, knobs)
+    return index
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_split_kv_plan_pinned_by_name_matches_reference():
+def test_explicit_split_kv_plan_matches_reference_and_roundtrips():
     """Issue F-2 regression: the split plan is graph-reachable, carves its
     slabs from the caller workspace, and recombines exactly."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph(causal=False)
-    # The split value depends on this device's SM count — ask the chooser
-    # rather than hard-coding one that only holds at one part's geometry.
-    from cudnn._device import device_info
-    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m
-    from cudnn.sdpa.fwd.heuristics import choose_split_kv
-
-    want = choose_split_kv(
-        q_tiles=-(-SQ // cga_tile_m(D)),
-        heads_q=H,
-        batch=B,
-        kv_tiles=-(-SKV // 128),
-        sm_count=device_info(torch.cuda.current_device()).sm_count,
-        combine_rows=SQ * H * B,
-        ctas_per_tile=2,
-    )
-    if want == 1:
-        pytest.skip("this part is small enough that the shape already fills it")
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    f16 = [n for n in names if n.split("[")[0] == "sdpa_fwd_prefill_sm100"]
-    assert len(f16) >= 3, f"expected knob-suffixed duplicates of the f16 family engine: {f16}"
-    split_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and f"split_kv={want}" in n)
+    split_idx = _append_explicit_f16_plan(g, split_kv=2)
     g.select_plan(split_idx)
     g.check_support()
     g.build_plans()
@@ -555,25 +617,33 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
 
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
-    assert knobs.split_kv == want
-    g2, _handles2, _ = _build_decodeish_graph(causal=False)
-    cfg = g2.create_execution_plan(eng_id, knobs)
-    assert cfg is not None
+    assert knobs[cudnn.knob_type.SPLIT_KV] == 2
+    g2, (q2, k2, v2, o2, st2), _ = _build_decodeish_graph(causal=False)
+    g2.create_execution_plan(eng_id, knobs)
+    replay_idx = g2.get_execution_plan_count() - 1
+    assert g2.get_engine_and_knobs_at_index(replay_idx) == (eng_id, knobs)
+    g2.select_plan(replay_idx)
+    g2.check_support()
+    g2.build_plans()
+    replay_o, replay_st = torch.empty_like(o_gpu), torch.empty_like(st_gpu)
+    replay_ws = torch.empty(g2.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    g2.execute({q2: q_gpu, k2: k_gpu, v2: v_gpu, o2: replay_o, st2: replay_st}, replay_ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replay_o, o_gpu, atol=0, rtol=0)
+    torch.testing.assert_close(replay_st, st_gpu, atol=0, rtol=0)
 
 
 @pytest.mark.L1
 @pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 device and nvidia-cutlass-dsl")
-def test_runner_up_sched_plan_builds_and_matches_the_winner():
-    """select_plan on a runner-up knob set compiles the adapter with exactly
-    that set and executes correctly — honored, not silently degraded."""
+def test_explicit_natural_unsplit_plan_builds_and_matches_reference():
+    """A pinned scheduler is honored regardless of the recommendation list."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    nat_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and "sched_policy=0" in n and "split_kv=1" in n)
+    nat_idx = _append_explicit_f16_plan(g, split_kv=1)
     g.select_plan(nat_idx)
     g.check_support()
     g.build_plans()
     eng_id, knobs = g.get_engine_and_knobs_at_index(nat_idx)
-    assert knobs.sched_policy == 0 and knobs.split_kv == 1
+    assert knobs[cudnn.knob_type.SCHED_POLICY] == 0 and knobs[cudnn.knob_type.SPLIT_KV] == 1
 
     torch.manual_seed(0)
     q_gpu = torch.randn(B, SQ, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)

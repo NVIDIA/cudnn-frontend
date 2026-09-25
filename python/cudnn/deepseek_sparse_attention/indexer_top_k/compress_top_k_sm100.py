@@ -43,8 +43,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, const_expr
 from cutlass._mlir.dialects import llvm
-from cutlass.utils.distributed import atomicAdd
-from cutlass.utils.smem_allocator import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
+from .indexer_top_k_varlen_util import atomicAdd
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
@@ -592,12 +592,12 @@ class CompressTopkStage2:
             else:
                 local_sum = Float32(0.0)
                 for slot in range(tidx, K, BT):
-                    local_sum = local_sum + cute.arch.exp(mVal[ob, oq, slot] - row_max)
+                    local_sum = local_sum + cute.math.exp(mVal[ob, oq, slot] - row_max, fastmath=True)
                 row_sum = _block_reduce_f32(local_sum, s_freduce, s_fbcast, tidx, self.num_warps, False)
                 inv_sum = Float32(1.0) / row_sum
                 for slot in range(tidx, K, BT):
                     # -inf padding maps exactly to zero.
-                    mSoftmax[ob, oq, slot] = cute.arch.exp(mVal[ob, oq, slot] - row_max) * inv_sum
+                    mSoftmax[ob, oq, slot] = cute.math.exp(mVal[ob, oq, slot] - row_max, fastmath=True) * inv_sum
 
     @cute.jit
     def __call__(

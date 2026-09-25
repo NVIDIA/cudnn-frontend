@@ -94,6 +94,16 @@ CFG, _TMA = make_cfg_d512(PARAMS)
 # the kwarg.  A single constant makes that class of drift impossible, and
 # test_sm107_descriptor_version_matches_the_smem_budget asserts it.
 DESC_VERSION: int = 1
+# Retry form of the per-KV-iteration RING waits (k/v/q _full/_empty, bmm1_done / bmm2_ready / bmm2_done, stat_* / xfer_*,
+# s_acc / o_empty, empty_mainloop): every such site is spelled ``.wait(..., spin=SPIN_RING_WAITS)``; the waits a warp
+# parks in for a whole tile (scheduler payload, tmem_dealloc, the TMA-STG's O-ready wait) and the end-of-kernel drains
+# keep the default sleeping form.  ``spin=True`` is the hint-less uniform spin (tile_dsl.barrier.wait); the decision is
+# a MEASURED per-kernel fact (Rubin node locked at 2376 MHz, A/B/A x3, control pair, TFLOPS ratios vs the sleeping
+# form), so it lives here once, like DESC_VERSION, and never as a literal at a call site
+# (test_sm107_ring_waits_take_the_module_spin_constant).  Flipping this constant IS the whole experiment.
+# Measured (with the predicated credit arrive): +1.1 / +1.6 % @ S=8K dense / causal (H128), +0.2 % @32K H64 (noise);
+# the weakest case of the opt-in set: either setting is acceptable if a re-measure reads inside control.
+SPIN_RING_WAITS: bool = True
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -931,9 +941,9 @@ def _sg0_softmax_kv_iter(
 ):
     cur_parity_S = sg0_xfer_state.idx
     cur_phase_S = sg0_xfer_state.phase
-    bars.mb_alpha_xfer_empty[cur_parity_S].wait(cur_phase_S)
-    bars.mb_p_xfer_empty[cur_parity_S].wait(cur_phase_S)
-    bars.mb_bmm1_done[bmm1_done_state.idx].wait(bmm1_done_state.phase)
+    bars.mb_alpha_xfer_empty[cur_parity_S].wait(cur_phase_S, spin=SPIN_RING_WAITS)
+    bars.mb_p_xfer_empty[cur_parity_S].wait(cur_phase_S, spin=SPIN_RING_WAITS)
+    bars.mb_bmm1_done[bmm1_done_state.idx].wait(bmm1_done_state.phase, spin=SPIN_RING_WAITS)
     sg0_xfer_state = advance(sg0_xfer_state, CFG.XFER_STAGES)
     bmm1_done_state = advance(bmm1_done_state, CFG.XFER_STAGES)
 
@@ -954,6 +964,13 @@ def _sg0_softmax_kv_iter(
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
+        # Pin the loads AHEAD of this iteration's `mb_s_acc_empty` arrive.  `tcgen05.ld` is asynchronous and
+        # the arrive (below) has no data dependency on the loaded registers, so without this wait ptxas is free to
+        # schedule the arrive between the two chunk loads -- and it did, once the mask code got shorter (the bit-word
+        # mask form): the parked MMA then overwrites the S parity slot under the still-pending second read, which shows
+        # as a two-launch delta on O.  The dense arm is ordered by its fused inline-asm `tcgen05.ld.red`; the
+        # d128 / d192 / d256 kernels by their P `tcgen05.st` + `wait(STORE)` data dependency.  One instruction.
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
@@ -1360,7 +1377,7 @@ def _compute_warp_group(
                         )
 
             # ---- End-of-tile: ship final stats (max, ell) ----
-            bars.mb_stats_xfer_empty.wait(stats_xfer_empty_phase)
+            bars.mb_stats_xfer_empty.wait(stats_xfer_empty_phase, spin=SPIN_RING_WAITS)
             stats_xfer_empty_phase = stats_xfer_empty_phase ^ cutlass.Int32(1)
 
             final_sum = total_sum_vec[0] + total_sum_vec[1]
@@ -1408,7 +1425,7 @@ def _compute_warp_group(
                 # Arm + wait alpha_xfer_full[parity_0].  Wrapper @p-gates
                 # on elect; wait spins on phase parity (atomically observable).
                 bars.mb_alpha_xfer_full[cur_parity_0].arrive(n_bytes=alphaXferBytes, pred=is_lead_warp & nvvm.elect_sync())
-                bars.mb_alpha_xfer_full[cur_parity_0].wait(alpha_full_state.phase)
+                bars.mb_alpha_xfer_full[cur_parity_0].wait(alpha_full_state.phase, spin=SPIN_RING_WAITS)
                 alpha_full_state = advance(alpha_full_state, CFG.XFER_STAGES)
 
                 # Notify sg0 (cross-sg peer) alpha slot is empty.
@@ -1423,11 +1440,11 @@ def _compute_warp_group(
                     cur_parity = alpha_full_state.idx
 
                     bars.mb_alpha_xfer_full[cur_parity].arrive(n_bytes=alphaXferBytes, pred=is_lead_warp & nvvm.elect_sync())
-                    bars.mb_alpha_xfer_full[cur_parity].wait(alpha_full_state.phase)
+                    bars.mb_alpha_xfer_full[cur_parity].wait(alpha_full_state.phase, spin=SPIN_RING_WAITS)
                     alpha_full_state = advance(alpha_full_state, CFG.XFER_STAGES)
 
                     # Wait prior BMM2 done so O is committed.
-                    bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase)
+                    bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
                     sg1_bmm2_done_state = advance(sg1_bmm2_done_state, CFG.XFER_STAGES)
 
                     # Read alpha[tid] from xfer_in[cur_parity].
@@ -1485,16 +1502,16 @@ def _compute_warp_group(
                     )
 
             # ---- Final BMM2-done wait (always runs — empty path covered) ----
-            bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase)
+            bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
             sg1_bmm2_done_state = advance(sg1_bmm2_done_state, CFG.XFER_STAGES)
 
             # ---- Epilogue ----
             epilogue_state = epilogue_state ^ cutlass.Int32(1)
-            bars.mb_tma_o_empty.wait(epilogue_state)
+            bars.mb_tma_o_empty.wait(epilogue_state, spin=SPIN_RING_WAITS)
 
             # Arm stats_xfer_full (sg0 delivers via DSMEM bulk_copy).
             bars.mb_stats_xfer_full.arrive(n_bytes=statsXferBytes, pred=is_lead_warp & nvvm.elect_sync())
-            bars.mb_stats_xfer_full.wait(stats_xfer_full_phase)
+            bars.mb_stats_xfer_full.wait(stats_xfer_full_phase, spin=SPIN_RING_WAITS)
             stats_xfer_full_phase = stats_xfer_full_phase ^ cutlass.Int32(1)
 
             # Per-thread lds_32 of final_ell / final_max.
@@ -1874,15 +1891,15 @@ def _mma_warp_group(
             if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
                 pass
             else:
-                bars.mb_tma_q_full.wait(q_full_phase)
+                bars.mb_tma_q_full.wait(q_full_phase, spin=SPIN_RING_WAITS)
                 q_full_phase = q_full_phase ^ cutlass.Int32(1)
 
                 for _kv in cutlass.range(kv_left, kv_right, 1, unroll=1):
                     cur_parity_K = s_acc_empty_state.idx
-                    bars.mb_s_acc_empty[cur_parity_K].wait(s_acc_empty_state.phase)
+                    bars.mb_s_acc_empty[cur_parity_K].wait(s_acc_empty_state.phase, spin=SPIN_RING_WAITS)
                     s_acc_empty_state = advance(s_acc_empty_state, CFG.XFER_STAGES)
 
-                    bars.mb_tma_k_full[kv_state_K.idx].wait(kv_state_K.phase)
+                    bars.mb_tma_k_full[kv_state_K.idx].wait(kv_state_K.phase, spin=SPIN_RING_WAITS)
                     desc_K = sK[kv_state_K.idx].desc()
                     # S_acc TMEM offset = parity * S_ACC_COLS (TmemTile layout).
                     s_acc_off = cur_parity_K * cutlass.Int32(LAYOUT.S_ACC_COLS)
@@ -1903,7 +1920,7 @@ def _mma_warp_group(
             if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
                 # Empty-kv branch — keep bmm2_done producer/consumer states
                 # in lockstep across mixed empty/normal sequences.
-                bars.mb_empty_mainloop.wait(empty_mainloop_phase)
+                bars.mb_empty_mainloop.wait(empty_mainloop_phase, spin=SPIN_RING_WAITS)
                 empty_mainloop_phase = empty_mainloop_phase ^ cutlass.Int32(1)
                 bars.mb_bmm2_done[bmm2_done_prod_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=nvvm.elect_sync())
                 bmm2_done_prod_state = advance(bmm2_done_prod_state, CFG.XFER_STAGES)
@@ -1917,10 +1934,10 @@ def _mma_warp_group(
                     # contributes 1, the non-leader forwarder contributes
                     # the other 1 (P12).
                     bars.mb_p_xfer_full[cur_parity].arrive(n_bytes=pXferBytes, pred=nvvm.elect_sync())
-                    bars.mb_p_xfer_full[cur_parity].wait(sg1_mma_state.phase)
+                    bars.mb_p_xfer_full[cur_parity].wait(sg1_mma_state.phase, spin=SPIN_RING_WAITS)
                     sg1_mma_state = advance(sg1_mma_state, CFG.XFER_STAGES)
 
-                    bars.mb_tma_v_full[kv_state_V.idx].wait(kv_state_V.phase)
+                    bars.mb_tma_v_full[kv_state_V.idx].wait(kv_state_V.phase, spin=SPIN_RING_WAITS)
 
                     accum_b2 = kv_loop > kv_left
 
@@ -1930,12 +1947,12 @@ def _mma_warp_group(
                     desc_V_n1 = sV[kv_state_V.idx].shifted(V_NBLOCK_ADVANCE_ELEMS).desc()
 
                     # N-block 0: writes O TMEM cols [0..BMM2_N_PER_CALL).
-                    bars.mb_bmm2_ready[bmm2_ready_state.idx].wait(bmm2_ready_state.phase)
+                    bars.mb_bmm2_ready[bmm2_ready_state.idx].wait(bmm2_ready_state.phase, spin=SPIN_RING_WAITS)
                     bmm2_ready_state = advance(bmm2_ready_state, CFG.XFER_STAGES * CFG.N_BMM2_CHUNKS)
                     mma_ss(bmm2_desc, desc_P, desc_V_n0, tmem_raw.subview(cutlass.Int32(LAYOUT.O_OFF)), accumulate=accum_b2)
 
                     # N-block 1: writes O TMEM cols [BMM2_N_PER_CALL..TILE_O).
-                    bars.mb_bmm2_ready[bmm2_ready_state.idx].wait(bmm2_ready_state.phase)
+                    bars.mb_bmm2_ready[bmm2_ready_state.idx].wait(bmm2_ready_state.phase, spin=SPIN_RING_WAITS)
                     bmm2_ready_state = advance(bmm2_ready_state, CFG.XFER_STAGES * CFG.N_BMM2_CHUNKS)
                     mma_ss(bmm2_desc, desc_P, desc_V_n1, tmem_raw.subview(cutlass.Int32(LAYOUT.O_OFF + CFG.BMM2_N_PER_CALL)), accumulate=accum_b2)
 
@@ -2060,7 +2077,7 @@ def _mma_warp_non_leader(
                     # partner (via DSMEM bulk_copy).  Wait local mbar
                     # (init = ONE_LANE — own arrive only).
                     bars.mb_p_xfer_full[nlmma_state.idx].arrive(n_bytes=pXferBytes, pred=nvvm.elect_sync())
-                    bars.mb_p_xfer_full[nlmma_state.idx].wait(nlmma_state.phase)
+                    bars.mb_p_xfer_full[nlmma_state.idx].wait(nlmma_state.phase, spin=SPIN_RING_WAITS)
                     cur_parity = nlmma_state.idx
                     nlmma_state = advance(nlmma_state, CFG.XFER_STAGES)
                     # DSMEM-arrive on leader's mb_p_xfer_full[parity] — leader's
@@ -2212,7 +2229,7 @@ def _tmaldg_warp_group(
         else:
             if is_sg0:
                 # ---- sg0: Q (one-shot per tile) + K_ring ----------------
-                bars.mb_tma_q_empty.wait(q_empty_phase)
+                bars.mb_tma_q_empty.wait(q_empty_phase, spin=SPIN_RING_WAITS)
                 q_empty_phase = q_empty_phase ^ cutlass.Int32(1)
                 bars.mb_tma_q_full.arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
                 tma_load_tile(
@@ -2225,7 +2242,7 @@ def _tmaldg_warp_group(
 
                 for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
                     kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
-                    bars.mb_tma_k_empty[kv_state.idx].wait(kv_state.phase)
+                    bars.mb_tma_k_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                     bars.mb_tma_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
                     tma_load_tile(
                         sK[kv_state.idx],
@@ -2243,7 +2260,7 @@ def _tmaldg_warp_group(
                 # TMA descriptors are UINT8-typed).
                 for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
                     kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
-                    bars.mb_tma_v_empty[kv_state.idx].wait(kv_state.phase)
+                    bars.mb_tma_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                     bars.mb_tma_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
                     tma_load_tile(
                         sV[kv_state.idx],
@@ -2421,11 +2438,11 @@ def _host(
     meta_ptr: cute.Pointer,
     o_desc_ptr: cute.Pointer,
     problem_size: Tuple[int, int, int, int, int, int],
-    q_strides: Tuple[int, int, int],
-    k_strides: Tuple[int, int, int],
-    v_strides: Tuple[int, int, int],
-    o_strides: Tuple[int, int, int],
-    lse_strides: Tuple[int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_ext: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
@@ -2436,7 +2453,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -2449,9 +2466,11 @@ def _host(
     Operands are ``[B, S, H, D]`` with the head dim innermost (element stride 1);
     ``*_strides`` carry the (seq, head) element strides, K/V additionally the
     outer stride, which is the page stride of a paged pool and unused otherwise.
+    Every stride leaf is Int64 (the ``compile()`` fakes fix the width): a 16-bit
+    operand with S * H * D >= 2^27 elements would wrap the Int32 TMA-unit scaling.
     ``problem_size`` = (B, QH, KH, SQ, SKV, 0); under THD SQ/SKV are the packed
     token totals, under paged KV SKV is ``max_pages * PAGE_SIZE``. The batch
-    stride of a dense operand is ``S * seq_stride`` (Int64); a packed THD operand
+    stride of a dense operand is ``S * seq_stride``; a packed THD operand
     has batch extent 1 and binds the seq stride there (never stepped).
 
     ``lse_kind``: "dense" (B, QH, SQ) in ``lse_strides``; "token" (SQ, QH)
@@ -2651,6 +2670,7 @@ def compile(  # noqa: A001
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     i32 = cutlass.Int32(0)
+    i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
     thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
@@ -2663,11 +2683,11 @@ def compile(  # noqa: A001
         P(cutlass.Int32),
         P(cutlass.Int64),
         (0, 0, 0, 0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
-        (0, 0, 0),
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
+        i64_3,
         i32,
         cutlass.Float32(0.0),
         i32,
@@ -2678,7 +2698,7 @@ def compile(  # noqa: A001
         None,
         None,
         None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

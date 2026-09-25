@@ -284,5 +284,10 @@
         "pair": 1.8158626746904232
       }
     }
-  ]
+  ],
+  "provenance": {
+    "frontend_path_sanitized": true,
+    "benchmark_driver_sha256": null,
+    "note": "The original measurement did not record the benchmark driver hash. The absolute environment.frontend_path was removed for publication. Kernel hashes and measured values are unchanged; no driver hash is inferred retroactively."
+  }
 }

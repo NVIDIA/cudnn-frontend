@@ -79,10 +79,7 @@ def _block_scaled_dtype_pairs():
 
 
 from ._bf16_api import GroupedGemmGluBf16API
-from ._blockscaled_api import (
-    GroupedGemmGluBlockScaledAPI,
-    _reject_unsupported_rubin_glu_tune_params,
-)
+from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
 
 @dataclass(frozen=True)
@@ -482,7 +479,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu")
         linear_offset: Linear offset applied to the up branch in the
             ``act_func == "geglu"`` activation, i.e.
-            ``out = (up + linear_offset) * silu(geglu_alpha * gate)``. Ignored
+            ``out = (up + linear_offset) * gate * sigmoid(geglu_alpha * gate)``
+            after clamping the gate and up branches. Ignored
             when ``act_func == "swiglu"``. When ``None`` (default), the offset
             is chosen based on ``act_func`` for backwards compatibility:
             ``1.0`` for ``"geglu"`` and ``0.0`` for ``"swiglu"``. Runtime
@@ -491,7 +489,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         geglu_alpha: Pre-sigmoid scaling factor for the GeGLU activation.
             The fused activation is
             ``out = (clamp(up, glu_clamp_min, glu_clamp_max) + linear_offset)
-                    * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))``.
+                    * gate_clamped * sigmoid(geglu_alpha * gate_clamped)``,
+            where ``gate_clamped = min(gate, glu_clamp_max)``.
             Defaults to ``1.702`` (GPT-OSS / scaled-GeGLU). Runtime parameter,
             intentionally not part of the cache key. Ignored when
             ``act_func == "swiglu"``.
@@ -1322,12 +1321,6 @@ def grouped_gemm_glu_wrapper_sm100(
             raise ValueError(_JAX_DENSE_B_ERROR)
         if bias_tensor is not None:
             raise ValueError(_JAX_BIAS_ERROR)
-    _reject_unsupported_rubin_glu_tune_params(
-        get_device_type() == "rubin",
-        geglu_alpha,
-        glu_clamp_max,
-        glu_clamp_min,
-    )
     call, backend = _normalize_glu_call(call)
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_glu_bf16_call(call, memo_key)

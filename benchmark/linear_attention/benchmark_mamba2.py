@@ -126,7 +126,10 @@ def main():
             mamba_commit=git("rev-parse", "HEAD"),
             mamba_dirty=bool(git("status", "--porcelain")),
         ),
-        source_sha256={str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+        source_sha256={
+            **{str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+            "benchmark/linear_attention/benchmark_mamba2.py": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        },
         modes=[],
     )
     for gate in (False, True):

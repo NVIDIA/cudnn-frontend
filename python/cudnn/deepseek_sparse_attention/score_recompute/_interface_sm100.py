@@ -17,10 +17,11 @@ import math
 from typing import Optional
 
 import torch
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
+import cuda.bindings.driver as cuda
 
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
@@ -774,36 +775,15 @@ def _dispatch_dense_indexer_tile_params(
     precision: str = "bf16",
     k_block_size: Optional[int] = None,
 ):
-    """Select (m_block_size, n_block_size, k_block_size) for dense indexer backward.
+    """Select (m_block_size, n_block_size, k_block_size) for indexer score recompute.
 
-    m_block_size = qhpkv * 2 (2 q_tokens per tile) when SMEM allows,
-    falling back to qhpkv when it doesn't.
-
-    Returns (m_block_size, n_block_size, k_block_size) where k_block_size=None
-    means no head_dim splitting.
-
-    Rules tuned on B200 via dense score sweeps.
+    M128 packs four query tokens for 32 heads or two for 64 heads.
     """
+    assert head_dim == 128, f"Indexer score requires head_dim=128, got {head_dim}"
     precision = precision.lower()
-    if precision == "mxfp8":
-        return 128, 128, 64 if k_block_size is None else k_block_size
-    if precision != "bf16":
+    if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
-
-    m = _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes=2)
-    n = 128
-
-    if head_dim == 128:
-        return m, n, 64 if k_block_size is None else k_block_size
-
-    # Fallback: auto-select from SMEM budget
-    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    k = _select_dense_k_block_size(head_dim_padded, m, n, per_head_elem_bytes=2)
-    if k == head_dim_padded:
-        k = None
-    if k_block_size is not None:
-        k = k_block_size
-    return m, n, k
+    return 128, 128, 64 if k_block_size is None else k_block_size
 
 
 # ---- Internal dense functions (explicit tile params) ------------------------

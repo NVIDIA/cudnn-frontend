@@ -104,18 +104,21 @@ implementation_names   = ['cudnn.attention_implementation.AUTO', 'cudnn.attentio
 # the rng identically and a config differs between them in the sink flag alone (CPython's
 # randint rejection-samples 32-bit words, so the total weight, not the number of options,
 # fixes the consumption; checked identical over 20000 seeds).
-def _frost_engines_enabled():
-    # The frontend's own reading of CUDNN_FRONTEND_ENABLE_FROST_ENGINES ("1"/"true"/"yes"/"on").
-    from cudnn.engines.manifest import opt_in_engines_enabled
-    return opt_in_engines_enabled()
+def _frost_engines_enabled(engine="sdpa_fwd_prefill_sm100"):
+    # Whether the manifest OFFERS the row: the SM100/SM120 f16 rows are default
+    # candidates (placed per measured shard), the others still answer to
+    # CUDNN_FRONTEND_ENABLE_FROST_ENGINES.
+    from cudnn.engines.manifest import MANIFEST
+    fam = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    return engine in fam.offered_ids()
 
 def _frost_sm100_unavailable_reason(engine="sdpa_fwd_prefill_sm100"):
     """Why the FROST SM100 f16/bf16 row would NOT serve a graph here, or None when it
-    would: the engines must be opted in, the device a pre-Rubin Blackwell (cc 10.0-10.6,
+    would: the engine must be offered by the manifest, the device a pre-Rubin Blackwell (cc 10.0-10.6,
     the row's arch domain) and a CuTe DSL at the FROST floor importable (the row declines
     without one and the native backend then serves the graph)."""
-    if not _frost_engines_enabled():
-        return "CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 required (FROST engines are opt-in)"
+    if not _frost_engines_enabled(engine):
+        return f"{engine} is not offered by the manifest (opt-in row without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)"
     major, minor = torch.cuda.get_device_capability()
     if not (100 <= major * 10 + minor <= 106):
         return f"{engine} serves cc 10.0-10.6 only; device is cc {major}.{minor}"
@@ -393,8 +396,21 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
         pytest.skip("no unified backend plan on this device")
     graph.select_plan(backend_plans[0])
     graph.check_support()
-    graph.build_plans()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
+    selected_engine, _ = graph.get_engine_and_knobs_at_index(backend_plans[0])
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1 and selected_engine in (10, 18):
+        # NVBug 6813175 affects the native 10X/107 engines (global indices 10/18): their ragged
+        # decode codegen emits a TMEM Stats round-trip wider than the ISA allows. The heuristic
+        # may instead select the working eng8 plan; that must run without this marker. A native
+        # 10/18 plan that builds successfully remains a strict XPASS so its fix is noticed.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=True,
+                raises=cudnn.cudnnGraphNotSupportedError,
+                reason="Selected native 10X/107 ragged-decode plan fails NVRTC (NVBug 6813175)",
+            )
+        )
+    graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()  # Inputs were created on the torch stream; the fixture handle owns another stream.
     graph.execute(pack, workspace, handle=cudnn_handle)
@@ -523,7 +539,12 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
     keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
     before = [frost_routing.snapshot().get(k, 0) for k in keys]
-    exec_sdpa(cfg, request, cudnn_handle)
+    # The assertion is "FROST served it": opt FROST in for the call so the placement
+    # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
+    # the backend -- the routing, not the default winner, is under test here.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        exec_sdpa(cfg, request, cudnn_handle)
     after  = [frost_routing.snapshot().get(k, 0) for k in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
@@ -566,6 +587,45 @@ def test_sdpa_fwd_paged_gqa_partial_pack_frost_L0(env_info, test_no, request, cu
     test.showConfig(test_no, request)
 
     _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=48, rng_seed=6607857), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fwd_paged_thd_decode_frost_L0(env_info, test_no, request, cudnn_handle):
+    """FlashInfer's prefill-style paged graph at one token per sequence (nvbug
+    6607857): ragged Q/O/Stats (ragged offsets + per-batch lengths) over page
+    pools + block tables at S_q == 1, d128, GQA.  Every other ragged graph keeps
+    the cga2 prefill THD leg; this one must ride the d128 decode tile's ragged-Q
+    leg (TILE_CGA_M=1, PackGQA, KV split + combine placing the ragged rows) --
+    asserted through the routing tally and the serving template."""
+
+    _require_frost_sm100()
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=32, with_high_probability=[4, 8]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=1, s_kv_min=16, s_kv_max=8192, s_q_distribution={"s_q=1":100, "s_q=s_kv":0, "s_q=random":0}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=128, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}),
+        head_count=RandomChoice({(64, 8, 8) : 2, (32, 8, 8) : 2, (16, 2, 2) : 1, (8, 8, 8) : 1}),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=1),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1}),
+        # page sizes the FROST paged contract serves (a multiple of 8 dividing the 128-row KV tile)
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.showConfig(test_no, request)
+
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, cga=1, template="decode_d128_f16")
 
 
 PARTIAL_PACK_PINNED_S_Q = [1, 2]
@@ -1536,6 +1596,11 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        # Block-scaled O epilogue (FROST d128 per-tensor FP8 only): FP4 O + E4M3
+        # scales per 16 d (16) or E4M3 O + UE8M0 scales per 32 d (32), with the
+        # sf_o output. exec_sdpa_fp8 folds it to 0 on configs the epilogue does
+        # not serve (paged / ragged / d != 128), so the draw stays a plain fp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         # KNOWN GAP: a dense "padded" draw currently runs as full — exec_sdpa_fp8
@@ -1671,6 +1736,219 @@ def test_sdpa_fp8_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
 
 
 # # ==================================
+# # L0 FP8 paged decode / paged prefill on the FROST SM100 per-tensor FP8 engine
+# # ==================================
+#
+# FlashInfer-shaped fp8 KV-cache decode / MTP: sdpa_fp8 over E4M3/E5M2 page pools,
+# s_q in [1, 8] ("s_q=1" weighted), GQA, page sizes {16, 32, 64, 128}, per-batch KV
+# lengths (partial last pages, zero-length sequences), and the masks a decode step
+# spells: none (plain decode), a causal upper bound top-left or bottom-right (MTP,
+# each batch's diagonal anchored at its own KV length) and a left sliding window.
+# Every request has >= 1 query token (the harness zeroes a dead Q row on BOTH sides
+# of the compare, so a draw of all-zero Q lengths would pass vacuously).
+#
+# Routing. FROST engines are opt-in; under the opt-in the fp8 row's proposal leads the
+# plan list for every paged fp8 graph it accepts, and every draw of the decode fuzz is
+# inside its paged envelope (d <= 128 at the fp8 graphs' 16-granularity, dense Q,
+# contract page sizes, bottom-right only under a causal bound), so each config ASSERTS
+# that sdpa_fwd_prefill_sm100_fp8 served it over the DEFAULT walk: the harness only
+# tallies which engine ran, and a silent fall-through to the backend would otherwise
+# hide a decline. The pinned cases are the FlashInfer-shaped 64/4 decode graph (the
+# capability win: without a Stats output cuDNN 9.26's backend engine fails to build it)
+# and a prefill-shaped chunked-prefill graph. All three opt in to the harness's
+# dead-page NaN poison (cfg.paged_nan_dead_pages): the FROST kernel promises a TMA-OOB
+# page -1 for every table slot past a sequence's live pages, so a dereferenced dead slot
+# fails the compare instead of passing silently. The harness pages K/V as HND pools
+# ([pages, H_kv, page, D]) only; NHD pools are covered by the strict twins' hnd
+# parametrization in test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py. The measured
+# gap to the backend's decode engine at decode shapes is a kernel follow-up
+# (SUPPORT_MATRIX_TRACKER.md gaps table: fp8 d128 decode tile), not a routing rule.
+
+FROST_FP8_ENGINE = "sdpa_fwd_prefill_sm100_fp8"
+FROST_FP8_ENGINE_KEY = f"frost:{FROST_FP8_ENGINE}"
+
+def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True):
+    """The fp8 twin of _exec_sdpa_on_frost: exec_sdpa_fp8, then assert the FROST FP8
+    engine served the graph (the harness only tallies which engine ran; a decline falls
+    through to the backend silently). ``strict`` turns the harness's own skips (a validator
+    rejection, "unsupported forward graph") into failures: a config that claims FROST
+    coverage must run."""
+    import frost_routing
+    before = frost_routing.snapshot().get(FROST_FP8_ENGINE_KEY, 0)
+    try:
+        exec_sdpa_fp8(cfg, request, cudnn_handle)
+    except pytest.skip.Exception as e:
+        if strict and not request.config.option.dryrun:
+            pytest.fail(f"FROST-asserting fp8 paged config must run, not skip: {e}", pytrace=False)
+        raise
+    after = frost_routing.snapshot().get(FROST_FP8_ENGINE_KEY, 0)
+    assert after == before + 1, f"expected {FROST_FP8_ENGINE_KEY} to serve this graph; routing tally: {frost_routing.snapshot()}"
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2005), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Decode / MTP-shaped (s_q <= 8) fp8 paged graphs over the DEFAULT plan walk, each
+    asserting the FROST fp8 row served it (block note above); a harness skip stays a skip."""
+    _require_frost_sm100(FROST_FP8_ENGINE)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[8, 16]),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 0}, with_high_probability=[(64, 64), (128, 128)], multiple_of=16),
+        head_count=RandomHeadGenerator(min=4, max=32, head_group_options=(1, 6, 1)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=5, causal=3, left_window_only=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 0}),
+        block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64, 128]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_paged = True
+    test.cfg.paged_nan_dead_pages = True
+    # A decode / MTP step has at least one query token per request; the KV lengths stay
+    # free (0 and partial-page sequences are the point of the paged draw).
+    test.cfg.seq_len_q = [max(1, n) for n in test.cfg.seq_len_q]
+    # Bottom-right alignment needs a causal upper bound (right_bound == 0 on the causal and
+    # sliding-window draws); a no-mask draw is plain decode and stays top-left.
+    if test.cfg.right_bound is None:
+        test.cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    # The FROST FP8 kernels bake a 4-binade lazy-rescale threshold (config_sm100.rescale_threshold)
+    # and the backend honors the same value; the reference mirrors what it is handed, so pin it.
+    test.cfg.rescale_threshold = 4.0
+    test.showConfig(test_no, request)
+
+    if request.node.name in test.blocked_tests:
+        pytest.skip(f"blocked test: {request.node.name}")
+    try:
+        # Set inside the try, after the blocked-test skip: a config that skips must not
+        # leak the value into the worker (the serializers read it into later graphs' JSON).
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+        _exec_sdpa_fp8_expect_frost(test.cfg, request, cudnn_handle, strict=False)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+@pytest.mark.L0
+def test_sdpa_fp8_fwd_paged_decode_pinned_frost_L0(env_info, request, cudnn_handle):
+    """FlashInfer-shaped fp8 KV-cache decode: B=32, 64/4 heads (PackGQA), d128, S_q=1,
+    page 16, mixed per-batch KV lengths up to 4096 (partial last pages, a zero-length
+    and a one-token sequence, page and tile boundaries); e4m3 pools, f16 O. Over the
+    default walk, asserting the FROST fp8 row served it (what a bisect of this path
+    needs; a harness skip fails). Without Stats (the FlashInfer spelling) cuDNN 9.26's
+    backend engine fails to build this graph -- the real-data twin over that spelling
+    is test_paged_graph_fp8_flashinfer_shaped_decode_default_walk in
+    test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py."""
+    _require_frost_sm100(FROST_FP8_ENGINE)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.float16,
+        rng_data_seed=2005,
+        rng_geom_seed=2005,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        paged_nan_dead_pages=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=32,
+        d_qk=128,
+        d_v=128,
+        s_q=1,
+        s_kv=4096,
+        h_q=64,
+        h_k=4,
+        h_v=4,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[1] * 32,
+        seq_len_kv=[4096, 1, 0, 17, 16, 15, 128, 129, 127, 2048, 3000, 4095, 33, 1000, 1279, 512,
+                    4096, 7, 8, 9, 640, 1023, 1024, 1025, 2047, 300, 77, 2500, 3999, 100, 200, 4000],
+        rescale_threshold=4.0,
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    try:
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+        _exec_sdpa_fp8_expect_frost(test.cfg, request, cudnn_handle, strict=True)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+@pytest.mark.L0
+def test_sdpa_fp8_fwd_paged_prefill_pinned_frost_L0(env_info, request, cudnn_handle):
+    """Paged (chunked) prefill over fp8 pools: B=4, 16/2 heads (PackGQA), d128, s_q=128,
+    page 16, e4m3 pools, f16 O, per-batch Q lengths (full, partial, one token) and KV
+    lengths (full, partial last page, one token, zero). Over the default walk, asserting
+    the FROST fp8 row served it (a fall-through to the backend or a harness skip fails)."""
+    _require_frost_sm100(FROST_FP8_ENGINE)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.float16,
+        rng_data_seed=2006,
+        rng_geom_seed=2006,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        paged_nan_dead_pages=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=128,
+        d_v=128,
+        s_q=128,
+        s_kv=1024,
+        h_q=16,
+        h_k=2,
+        h_v=2,
+        block_size=16,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=None,
+        right_bound=None,
+        seq_len_q=[128, 100, 1, 64],
+        seq_len_kv=[1024, 300, 17, 0],
+        rescale_threshold=4.0,
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, 1), request)
+
+    try:
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+        _exec_sdpa_fp8_expect_frost(test.cfg, request, cudnn_handle, strict=True)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+# # ==================================
 # # L0 FP8 THD (ragged) fprop tests
 # # ==================================
 
@@ -1799,6 +2077,12 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         # the NaN-poisoned capacity tails that catch the GitHub #624 class.
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
+        # Block-scaled O on the FROST d128 MXFP8 kernel: FP4 O + E4M3/16 scales (16)
+        # or E4M3 O + UE8M0/32 scales (32) with the sf_o output. exec_sdpa_mxfp8
+        # folds it to 0 on configs the epilogue does not serve (d != 128, unfuse_fma,
+        # a ragged KV tail without a covering causal band, FROST engines off, an arch
+        # without an MXFP8 engine row such as SM120), so the draw stays a plain mxfp8 run there.
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 

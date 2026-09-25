@@ -15,7 +15,11 @@ forward followed by backward, rather than the sum of separate measurements.
 | FP32 | SiLU | 90.20 | 391.15 | 482.51 | 876.17 | 1.82x |
 
 The JSON files include all raw timing samples, error metrics, source hashes,
-software versions and the clean upstream Mamba commit. Both implementations
+software versions and the clean upstream Mamba commit. The original driver hash
+was not recorded, and the absolute `environment.frontend_path` was removed for
+publication. The historical artifacts now state that provenance limitation
+explicitly; their measurements are unchanged. New runs hash the benchmark
+driver alongside the kernel sources. Both implementations
 run in the same process. Complete SSD includes timestep preprocessing, skip,
 optional SiLU, state propagation, backward recomputation and reductions. These
 are component timings; GatedRMSNorm, convolution, projections, model execution,
@@ -57,5 +61,5 @@ python benchmark/linear_attention/benchmark_mamba2.py \
 python benchmark/linear_attention/benchmark_mamba2.py \
   --mamba-repo /path/to/mamba --intermediate-dtype float32 --output fp32.json
 cd test/python
-pytest -s -q linear_attention/test_mamba2.py
+pytest -s -q linear_attention/test_mamba2_frost.py
 ```

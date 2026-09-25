@@ -3995,14 +3995,7 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
-    """Choose the tile strategy for one analyzed fusion chain.
-
-    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
-    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
-    bypasses the automatic pick; a request that does not spell a canonical
-    config is a decline (NotImplementedError), never a silent snap to a
-    neighbour. Without knobs this is the automatic strategy."""
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -4047,10 +4040,30 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
-    # skip splitK when dynamic_shape is enabled
-    if dynamic_shapes:
+    # skip splitK for MoE and dynamic shapes
+    if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose one strategy, or replay the exact supplied knobs."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    if knobs is not None or dynamic_shapes:
+        return config
+    from ..planning import select_strategy
+
+    return select_strategy(chain, config, probe=probe_chain)
+
+
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+    """Choose a bounded list with the single-plan recommendation first."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    if dynamic_shapes:
+        return [config]
+    from ..planning import select_strategies
+
+    return select_strategies(chain, config, probe=probe_chain)
 
 
 def _precheck_plain(
@@ -4537,7 +4550,6 @@ class CompiledMoeGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -4566,12 +4578,12 @@ class CompiledMoeGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -4968,7 +4980,6 @@ class CompiledMoeBlockScaleGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -5002,9 +5013,10 @@ class CompiledMoeBlockScaleGemm:
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):

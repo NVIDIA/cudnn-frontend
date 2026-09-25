@@ -30,6 +30,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -140,7 +141,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.tmem_dealloc_sync_bar_id = 3
 
         self.architecture = "sm_100"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.smem_capacity = get_smem_capacity_in_bytes(self.architecture)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     # ------------------------------------------------------------------
@@ -438,9 +439,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             self.sf_dtype = self.sf_dtype_override
         else:
             self.sf_dtype = sfa_gemm.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_gemm).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_gemm).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_gemm)
+        self.a_major_mode = LayoutEnum.from_tensor(a_gemm).mma_major_mode()
+        self.b_major_mode = LayoutEnum.from_tensor(b_gemm).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c_gemm)
 
         # =================================================================
         # Step 3: Setup kernel attributes
@@ -483,27 +484,21 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # =================================================================
         # Step 6: Launch helper kernel (both Dense and Discrete)
         # =================================================================
-        # Builds expert-wise SFA/SFB TMA descs (both modes) + C descs
-        # (Discrete only). The WgradSfTensormapConstructor is created inside
-        # the kernel body from the raw params — it has too many Constexpr
-        # fields for MLIR serialization as a kernel argument.
+        # Builds expert-wise A/B/SFA/SFB TMA descs (both modes) + C descs
+        # (Discrete only). A/B descriptors give Tensor2D inputs expert-local
+        # K bounds instead of the fixed physical-pool bound.
+        # The WgradSfTensormapConstructor is created inside the kernel body
+        # from the raw params — it has too many Constexpr fields for MLIR
+        # serialization as a kernel argument.
         # Dense passes None for C-related params; no if-else branch needed.
         sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
-            a_gemm_helper = a_gemm
-            b_gemm_helper = b_gemm
-            a_op_helper = a_op
-            b_op_helper = b_op
-            a_smem_layout_helper = a_smem_layout
-            b_smem_layout_helper = b_smem_layout
-        else:
-            a_gemm_helper = None
-            b_gemm_helper = None
-            a_op_helper = None
-            b_op_helper = None
-            a_smem_layout_helper = None
-            b_smem_layout_helper = None
+        a_gemm_helper = a_gemm
+        b_gemm_helper = b_gemm
+        a_op_helper = a_op
+        b_op_helper = b_op
+        a_smem_layout_helper = a_smem_layout
+        b_smem_layout_helper = b_smem_layout
 
         # Blackwell's epilogue tile is an MLIR-backed layout and must be
         # created outside the isolated helper-kernel region. Rubin uses a
@@ -800,7 +795,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sched_storage = storage.scheduler
 
@@ -850,7 +845,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],

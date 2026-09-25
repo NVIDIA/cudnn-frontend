@@ -9,6 +9,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
 from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import stream_context
 from typing import Optional
 
 from ..utils import make_tensor_strided_like
@@ -438,21 +439,25 @@ class SlidingWindowAttention(APIBase):
                         f"q_ragged_offset_tensor, k_ragged_offset_tensor, v_ragged_offset_tensor, o_ragged_offset_tensor, and stats_ragged_offset_tensor must be all provided or all None, got {q_ragged_offset_tensor}, {k_ragged_offset_tensor}, {v_ragged_offset_tensor}, {o_ragged_offset_tensor}, and {stats_ragged_offset_tensor}"
                     )
                 self._logger.info("Calculating ragged offsets internally assuming fully packed THD layout")
-                (
-                    q_ragged_offset_tensor,
-                    k_ragged_offset_tensor,
-                    v_ragged_offset_tensor,
-                    o_ragged_offset_tensor,
-                    stats_ragged_offset_tensor,
-                ) = self._calculate_ragged_offsets(
-                    seq_len_q_tensor,
-                    seq_len_kv_tensor,
-                    self.sample_q,
-                    self.sample_k,
-                    self.sample_v,
-                    self.sample_o,
-                    self.sample_stats,
-                )
+                # Produced AND allocated on the handle's stream (R1): the graph reads these on that
+                # stream after this call returns, and the caching allocator orders a block's reuse
+                # only against the stream it was allocated on.
+                with torch.cuda.device(q_tensor.device), stream_context(cudnn.get_stream(cudnn_handle), q_tensor.device):
+                    (
+                        q_ragged_offset_tensor,
+                        k_ragged_offset_tensor,
+                        v_ragged_offset_tensor,
+                        o_ragged_offset_tensor,
+                        stats_ragged_offset_tensor,
+                    ) = self._calculate_ragged_offsets(
+                        seq_len_q_tensor,
+                        seq_len_kv_tensor,
+                        self.sample_q,
+                        self.sample_k,
+                        self.sample_v,
+                        self.sample_o,
+                        self.sample_stats,
+                    )
 
         variant_pack = {
             self.q_cudnn: q_tensor,
@@ -470,13 +475,15 @@ class SlidingWindowAttention(APIBase):
             variant_pack[self.stats_cudnn] = stats_tensor
             variant_pack[self.stats_ragged_offset_cudnn] = stats_ragged_offset_tensor
 
-        workspace = torch.empty(
-            self._cudnn_swa_graph.get_workspace_size(),
-            device=q_tensor.device,
-            dtype=torch.uint8,
-        )
+        # Scratch is allocated on the handle's stream (R1): the graph runs there, and the caching
+        # allocator only orders a block's reuse against the stream it was allocated on.
+        with torch.cuda.device(q_tensor.device), stream_context(cudnn.get_stream(cudnn_handle), q_tensor.device):
+            workspace = torch.empty(
+                self._cudnn_swa_graph.get_workspace_size(),
+                device=q_tensor.device,
+                dtype=torch.uint8,
+            )
         self._cudnn_swa_graph.execute(variant_pack, workspace, handle=cudnn_handle)
-        torch.cuda.synchronize()
         self._logger.debug("Executed successfully")
 
     def __call__(self, *args, **kwargs) -> None:

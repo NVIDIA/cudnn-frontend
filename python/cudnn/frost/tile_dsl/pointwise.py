@@ -153,6 +153,94 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
 
 
+def fp32_to_e2m1_pack(values):
+    """Pack 16 fp32 into 8 E2M1 bytes (two Int32 words), element i in nibble i.
+
+    ``cvt.rn.satfinite.e2m1x2.f32 d, a, b`` puts ``a`` in the upper nibble, so
+    the pair (values[2j+1], values[2j]) lands as byte j.
+    """
+    assert len(values) == 16, f"fp32_to_e2m1_pack: expected 16 input values, got {len(values)}"
+    w0, w1 = inline_ptx(
+        "{ .reg .b8 b0, b1, b2, b3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, $3,  $2;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, $5,  $4;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, $7,  $6;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, $9,  $8;\n"
+        "mov.b32 $0, {b0, b1, b2, b3};\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, $11, $10;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, $13, $12;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, $15, $14;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, $17, $16;\n"
+        "mov.b32 $1, {b0, b1, b2, b3}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=list(values),
+    )
+    return cutlass.Vector.from_elements((w0, w1), cutlass.Int32)
+
+
+@cute.jit
+def fp32_to_e2m1x2(lo: cutlass.Float32, hi: cutlass.Float32) -> cutlass.Int32:
+    """Two fp32 -> one E2M1 pair byte (lo in the low nibble), returned zero-extended in an Int32."""
+    return inline_ptx(
+        "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, $2, $1; cvt.u32.u8 $0, b; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[lo, hi],
+    )
+
+
+@cute.jit
+def e4m3_scale_rcp(sf: cutlass.Float32):
+    """Round a positive fp32 scale to E4M3 and return ``(byte, 1/decoded)``.
+
+    The reciprocal is of the DECODED (rounded) scale so quantized data and the
+    stored scale stay self-consistent; a zero scale (all-zero block) yields 0.
+    """
+    byte_i32, dec = inline_ptx(
+        "{ .reg .b16 s16, h2lo; .reg .b32 h2;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 s16, $2, $2;\n"
+        "cvt.u32.u16 $0, s16;\n"
+        "and.b32 $0, $0, 0xFF;\n"
+        "cvt.rn.f16x2.e4m3x2 h2, s16;\n"
+        "mov.b32 {h2lo, s16}, h2;\n"
+        "cvt.f32.f16 $1, h2lo; }",
+        write_only_types=[cutlass.Int32, cutlass.Float32],
+        read_only_args=[sf],
+    )
+    inv = cutlass.Float32(1.0) / dec
+    if dec == cutlass.Float32(0.0):
+        inv = cutlass.Float32(0.0)
+    return byte_i32, inv
+
+
+@cute.jit
+def amax_to_ue8m0_rp(amax: cutlass.Float32):
+    """Encode ``amax / 448`` as a UE8M0 exponent byte (round up) and return ``(byte, 2^(127-e))``.
+
+    Same arithmetic as the MXFP8 bprop kernels' ``cvt_amax_to_e8m0_rp``: 448 is
+    ``1.75 * 2**8``, so the rounded-up scale exponent is the amax exponent minus
+    eight plus one when the significand exceeds 1.75. Byte 0 (amax == 0) maps to
+    an inverse of 0 so an all-zero block quantizes to zeros.
+    """
+    amax_bits = amax.bitcast(cutlass.Uint32)
+    exponent = (amax_bits >> 23) & cutlass.Uint32(0xFF)
+    mantissa = amax_bits & cutlass.Uint32(0x7FFFFF)
+    scale_exp = cutlass.Int32(exponent) - cutlass.Int32(8)
+    if mantissa > cutlass.Uint32(0x600000):
+        scale_exp = scale_exp + cutlass.Int32(1)
+    if exponent == cutlass.Uint32(0xFF):
+        scale_exp = cutlass.Int32(254)
+    if scale_exp < cutlass.Int32(0):
+        scale_exp = cutlass.Int32(0)
+    if scale_exp > cutlass.Int32(254):
+        scale_exp = cutlass.Int32(254)
+    inv = ((cutlass.Uint32(254) - cutlass.Uint32(scale_exp)) << 23).bitcast(cutlass.Float32)
+    if scale_exp == cutlass.Int32(0):
+        inv = cutlass.Float32(0.0)
+    if scale_exp == cutlass.Int32(254):
+        inv = cutlass.Uint32(1 << 22).bitcast(cutlass.Float32)
+    return scale_exp, inv
+
+
 @cute.jit
 def fp32_to_fp8x2(lo: cutlass.Float32, hi: cutlass.Float32, *, dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float8E4M3FN) -> cutlass.Uint16:
     """Pack two fp32 into fp8 bytes: low byte = fp8(lo), byte 1 = fp8(hi)."""
@@ -293,6 +381,104 @@ def ffma2(a_lo, a_hi, b_lo, b_hi, c_lo, c_hi):
         write_only_types=[cutlass.Float32, cutlass.Float32],
         read_only_args=[a_lo, a_hi, b_lo, b_hi, c_lo, c_hi],
     )
+
+
+# exp2 on the FMA pipe: a degree-3 minimax for 2^f on f in [0, 1), evaluated on PACKED fp32 pairs.
+# The three coefficients (fp32 bit patterns; c0 = 1.0) are shared with the host model in
+# test/python/sdpa/frost/test_tile_dsl_exp2_emul.py, which pins the error bound stated below.
+EXP2_EMUL_C1_BITS = 0x3F31F519  # 0.6951787
+EXP2_EMUL_C2_BITS = 0x3E6906A4  # 0.2275357
+EXP2_EMUL_C3_BITS = 0x3D9DF09D  # 0.0771246
+# Floor split: add 1.5 * 2^23 (0x4B400000) with round-toward-minus-infinity, subtract it back --
+# for |x| < 2^22 the sum is an integer-valued fp32, so ``t - magic == floor(x)`` exactly.
+EXP2_EMUL_FLOOR_MAGIC_BITS = 0x4B400000
+# 2^-127 is the smallest exponent the insertion below can encode: every x below is clamped there.
+EXP2_EMUL_CLAMP_BITS = 0xC2FE0000  # -127.0
+# Max relative error of the emulation vs the exact 2^x, MEASURED on the host model over every fp32
+# in [-1, 0) (2.0e8 values; the error depends on the fraction only) and 1.2e8 uniform samples of
+# [-126, 8]: 8.77e-5 (< 2^-13), at fraction f = 0.1008; every INTEGER x is exact (p(0) == 1.0).
+EXP2_EMUL_MAX_REL_ERR = 8.8e-5
+
+
+@cutlass.cute.jit
+def exp2_emul_pair(x_lo, x_hi):
+    """``(2**x_lo, 2**x_hi)`` on the FMA pipe -- no ``MUFU.EX2`` -- for a softmax exp burst.
+
+    Why it exists: a softmax kv-iteration on a 128-wide S tile issues 128 ``ex2.approx`` per
+    row.  On SM100 the MUFU pipe (4 lanes/clk/SMSP) is then the longest single pipe of the
+    softmax warps while the FP32 pipe has slack, so evaluating a compile-time subset of the
+    columns here (6 packed FP32/INT instructions per PAIR instead of one MUFU per element)
+    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Three sm100
+    prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
+    ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
+    d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
+    dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
+    +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
+    H=128/128).
+
+    What it computes (bit for bit the backend's split, all ops ``.ftz``):
+
+    1. ``x = max(x, -127)`` -- 2^-127 is the smallest exponent step 4 can insert;
+    2. ``n = floor(x)`` through ``add.rm.f32x2`` with 1.5 * 2^23 and a subtract back
+       (``EXP2_EMUL_FLOOR_MAGIC_BITS``); ``f = x - n`` in [0, 1), exact;
+    3. ``p(f) = 1 + f * (c1 + f * (c2 + f * c3))`` as three ``fma.rn.ftz.f32x2`` -- a degree-3
+       minimax for 2^f (``EXP2_EMUL_C{1,2,3}_BITS``);
+    4. ``p(f) * 2^n`` by adding ``n << 23`` into p's exponent field (``shl.b32`` + ``add.s32``).
+
+    Accuracy: max relative error **8.77e-5** (< 2^-13; ``EXP2_EMUL_MAX_REL_ERR``), MEASURED on the
+    host model over every fp32 in [-1, 0) and 1.2e8 samples of [-126, 8]; integer x are exact.
+    That is inside E4M3's 3 mantissa bits, and the fp32 row-sum of a 128-term softmax row moves by
+    ~1e-5 relative (the sm100 d128 MXFP8 kernel's LSE reads 6.1e-6 vs fp64 with 32 of 128 columns
+    emulated, the cuDNN backend kernel 6.0e-6; bar 1e-4).  For x in [-127, -126) the exponent
+    insertion yields a denormal bit pattern (a value below 2^-126, not 2^x) -- irrelevant against
+    a softmax row max of 2^4 and above, and the same as the backend.  Inputs must satisfy
+    x < 128 - 1 = 127 for the exponent add not to overflow; the softmax feeds
+    ``S * scale - (max - P_CAST_LOG2_SCALE) <= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE`` (8).
+
+    Every constant is a PTX immediate INSIDE the asm text: the libNVVM ``n``-constraint ICE of
+    :func:`opaque_f32_zero` concerns OPERANDS only."""
+    return inline_ptx(
+        "{ .reg .f32 f1, f2, f3, f4, f5, f6, f7; .reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10; .reg .s32 r1, r2, r3, r4, r5, r6, r7, r8; "
+        f"max.ftz.f32 f1, $2, 0f{EXP2_EMUL_CLAMP_BITS:08X}; max.ftz.f32 f2, $3, 0f{EXP2_EMUL_CLAMP_BITS:08X}; mov.b64 l1, {{f1, f2}}; "
+        f"mov.f32 f3, 0f{EXP2_EMUL_FLOOR_MAGIC_BITS:08X}; mov.b64 l2, {{f3, f3}}; "
+        "add.rm.ftz.f32x2 l7, l1, l2; sub.rn.ftz.f32x2 l8, l7, l2; sub.rn.ftz.f32x2 l9, l1, l8; "
+        f"mov.f32 f7, 0f{EXP2_EMUL_C3_BITS:08X}; mov.b64 l6, {{f7, f7}}; mov.f32 f6, 0f{EXP2_EMUL_C2_BITS:08X}; mov.b64 l5, {{f6, f6}}; "
+        f"mov.f32 f5, 0f{EXP2_EMUL_C1_BITS:08X}; mov.b64 l4, {{f5, f5}}; mov.f32 f4, 0f3F800000; mov.b64 l3, {{f4, f4}}; "
+        "fma.rn.ftz.f32x2 l10, l9, l6, l5; fma.rn.ftz.f32x2 l10, l10, l9, l4; fma.rn.ftz.f32x2 l10, l10, l9, l3; "
+        "mov.b64 {r1, r2}, l7; mov.b64 {r3, r4}, l10; "
+        "shl.b32 r5, r1, 23; add.s32 r7, r5, r3; shl.b32 r6, r2, 23; add.s32 r8, r6, r4; "
+        "mov.b32 $0, r7; mov.b32 $1, r8; }",
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[x_lo, x_hi],
+    )
+
+
+def exp2_mixed(vec, emul_pairs, N: int):
+    """Element-wise ``2**vec`` over an ``N``-wide fp32 Vector, with the pairs listed in
+    ``emul_pairs`` (pair p = elements 2p, 2p+1; a trace-time frozenset of ints) evaluated by
+    :func:`exp2_emul_pair` on the FMA pipe and every other element by MUFU
+    (``cute.math.exp2(fastmath=True)``).  An empty ``emul_pairs`` traces the plain vector exp2,
+    so an all-MUFU chunk stays IR-identical to the unsplit kernel.  Trace-time helper (plain
+    Python over traced values), like :func:`row_max_reduction`.  Which pairs to emulate is a
+    ptxas-schedule property of the CONSUMING kernel -- tune it there, per kernel, by A/B
+    (``sm100/prefill_d128_mxfp8.py`` documents its sweep)."""
+    assert N % 2 == 0, f"exp2_mixed: N={N} must be even"
+    if not emul_pairs:
+        return cute.math.exp2(vec, fastmath=True)
+    bad = [p for p in emul_pairs if not (0 <= p < N // 2)]
+    assert not bad, f"exp2_mixed: pair indices {bad} outside [0, {N // 2})"
+    elems = []
+    for p in range(N // 2):
+        lo = cutlass.Float32(vec[2 * p])
+        hi = cutlass.Float32(vec[2 * p + 1])
+        if p in emul_pairs:
+            lo, hi = exp2_emul_pair(lo, hi)
+        else:
+            lo = cute.math.exp2(lo, fastmath=True)
+            hi = cute.math.exp2(hi, fastmath=True)
+        elems.append(lo)
+        elems.append(hi)
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
 
 
 @cutlass.cute.jit
