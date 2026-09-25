@@ -14,10 +14,21 @@ import torch
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
 try:
+    import triton
+    from packaging.version import Version
+
     from ._plan import _HcaPlan
     from ._workspace import workspace_layout
 except ImportError as exc:
     raise ImportError("Aligned HCA requires torch and nvidia-cudnn-frontend[cutedsl,triton]") from exc
+
+
+def _check_device_support(device):
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 3), (10, 7)):
+        raise NotImplementedError("Aligned HCA requires GB300 or Rubin")
+    if capability == (10, 7) and Version(triton.__version__) < Version("3.8.0"):
+        raise NotImplementedError(f"Aligned HCA on Rubin requires Triton >=3.8.0; found {triton.__version__}")
 
 
 def _specs(local_tokens, kv_rows):
@@ -89,14 +100,19 @@ class AlignedHCABackward(APIBase):
 
     @staticmethod
     def supports_configuration(local_tokens, cp_size, device):
-        return (
+        if not (
             type(local_tokens) is int
             and type(cp_size) is int
             and cp_size in (4, 8, 16)
             and local_tokens % 128 == 0
             and 8192 <= local_tokens * cp_size <= 131072
-            and torch.cuda.get_device_capability(device) in ((10, 3), (10, 7))
-        )
+        ):
+            return False
+        try:
+            _check_device_support(device)
+        except NotImplementedError:
+            return False
+        return True
 
     def check_support(self):
         q_shape = self.descriptors["q"].shape
@@ -116,8 +132,7 @@ class AlignedHCABackward(APIBase):
             self._check_dtype(desc, dtype, name=name)
             if desc.device != device:
                 raise ValueError("All HCA tensors must be on the same device")
-        if not self.supports_configuration(layout.local_tokens, self.cp_size, device):
-            raise NotImplementedError("Aligned HCA requires GB300 or Rubin")
+        _check_device_support(device)
         self._layout = layout
         self._is_supported = True
         return True

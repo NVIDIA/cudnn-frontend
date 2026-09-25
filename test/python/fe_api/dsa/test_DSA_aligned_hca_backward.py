@@ -19,6 +19,10 @@ def require_supported_device():
         pytest.skip("Aligned HCA requires GB300 or Rubin")
     pytest.importorskip("cutlass")
     pytest.importorskip("triton")
+    from cudnn import AlignedHCABackward
+
+    if not AlignedHCABackward.supports_configuration(4096, 16, "cuda"):
+        pytest.skip("Aligned HCA on Rubin requires Triton >=3.8.0")
 
 
 def declarations(sequence_length=65536, cp_size=16):
@@ -274,3 +278,38 @@ def test_unsupported_geometry(local_tokens, cp_size):
     from cudnn import AlignedHCABackward
 
     assert not AlignedHCABackward.supports_configuration(local_tokens, cp_size, "cuda")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "capability,version,supported",
+    [
+        ((10, 3), "3.7.0", True),
+        ((10, 3), "3.7.1", True),
+        ((10, 3), "3.8.0", True),
+        ((10, 7), "3.7.1", False),
+        ((10, 7), "3.8.0", True),
+        ((10, 7), "3.8.0+nv", True),
+        ((10, 7), "3.10.0", True),
+        ((10, 0), "3.8.0", False),
+    ],
+)
+def test_triton_version_support(monkeypatch, capability, version, supported):
+    import triton
+    from cudnn import AlignedHCABackward
+    from cudnn.deepseek_sparse_attention.aligned_hca_backward import api as api_module
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(triton, "__version__", version)
+    api = AlignedHCABackward(*declarations(), cp_rank=0)
+    assert api.supports_configuration(4096, 16, "cuda") is supported
+    with patch.object(api_module, "_HcaPlan") as plan:
+        if supported:
+            assert api.check_support()
+        else:
+            message = "Rubin requires Triton >=3.8.0" if capability == (10, 7) else "requires GB300 or Rubin"
+            with pytest.raises(NotImplementedError, match=message):
+                api.check_support()
+            with pytest.raises(NotImplementedError, match=message):
+                api.compile()
+        plan.assert_not_called()

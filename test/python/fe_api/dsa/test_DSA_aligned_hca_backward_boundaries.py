@@ -15,6 +15,10 @@ def require_supported_device():
         pytest.skip("Aligned HCA requires GB300 or Rubin")
     pytest.importorskip("cutlass")
     pytest.importorskip("triton")
+    from cudnn import AlignedHCABackward
+
+    if not AlignedHCABackward.supports_configuration(4096, 16, "cuda"):
+        pytest.skip("Aligned HCA on Rubin requires Triton >=3.8.0")
 
 
 def constant_case(rank):

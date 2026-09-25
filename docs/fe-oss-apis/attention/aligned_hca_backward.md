@@ -16,8 +16,9 @@ python -m pip install -e '.[cutedsl,triton]' torch
 ```
 
 The implementation uses precompiled Triton kernels and cuDNN graph matmuls.
-It is Torch-only and requires Triton 3.7 or later. The implementation is
-validated with CUDA 13.2, cuDNN frontend 1.31, cuDNN 9.21 and GB300;
+It is Torch-only and requires Triton 3.7 or later on GB300. Rubin requires
+Triton 3.8.0 or later (validated with 3.8.0).
+The implementation is validated with CUDA 13.2, cuDNN frontend 1.31, cuDNN 9.21 and GB300;
 Rubin validation uses CUDA 13.4 and cuDNN 9.26.
 Importing `cudnn` does not eagerly import this API or its optional dependencies.
 
@@ -75,7 +76,8 @@ storage with inputs or one another.
 `1 / sqrt(512)`.
 
 `AlignedHCABackward.supports_configuration(L, cp_size, device)` checks the
-architecture and sequence/CP geometry; `check_support()` validates the full tensor contract.
+architecture, Triton version and sequence/CP geometry; `check_support()` validates
+the full tensor contract and reports an unsupported Triton version before compilation.
 
 KV rows 0-127 hold the preceding boundary, the next `L` rows hold local
 tokens, and the remaining rows hold rank-major compressed storage. Each rank
