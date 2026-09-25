@@ -364,7 +364,7 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     chain = analyze(_graph(2048, 256, 256, 9, variant, dtype)[0])
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
         label = cfg.name

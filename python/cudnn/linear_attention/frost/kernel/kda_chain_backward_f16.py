@@ -306,6 +306,41 @@ def chain_backward_host(
     )
 
 
+def build_configs(io_dtype, state_dtype, transition_dtype, gate_dtype, *, fused_h_m, series, coarse, use_dstate0, **flags):
+    summary_cfg = None
+    transition_cfg = None
+    if fused_h_m:
+        summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags)
+    else:
+        transition_cfg = kda_recompute_f16.build_cfg(
+            io_dtype,
+            transition_dtype,
+            gate_dtype,
+            use_initial_state=False,
+            store_final_state=True,
+            enable_checkpoints=False,
+            seed_checkpoints=False,
+            seed_identity=True,
+            v_is_zero=True,
+            **dict(flags, d_v=flags["d_k"]),
+        )
+    series_cfg = None
+    if series:
+        series_cfg = kda_recompute_f16.build_cfg(
+            io_dtype,
+            state_dtype if not coarse else cutlass.Float32,
+            gate_dtype,
+            use_initial_state=not coarse,
+            store_final_state=False,
+            enable_checkpoints=True,
+            seed_checkpoints=coarse,
+            **flags,
+        )
+    bwd_summary_cfg = kda_bprop_summary_f16.build_cfg(io_dtype, gate_dtype, use_dstate_in=False, **flags)
+    bprop_cfg = kda_bprop_f16.build_cfg(io_dtype, gate_dtype, use_dstate_in=True, use_dstate0=use_dstate0, use_initial_state=True, **flags)
+    return summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg
+
+
 def build_chain_backward(
     *,
     q,
@@ -378,9 +413,9 @@ def build_chain_backward(
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
     kernel compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
     HO = gate.shape[1]
     if not safe_gate:
         a_log = None
@@ -424,7 +459,15 @@ def build_chain_backward(
         int(chain_rows),
     )
     if key not in chain_backward_cache:
-        flags = dict(
+        summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
+            io_dtype,
+            get_dtype(state_x.dtype) if series and not coarse else cutlass.Float32,
+            get_dtype(state_m.dtype),
+            gate_dtype,
+            fused_h_m=fused_h_m,
+            series=series,
+            coarse=coarse,
+            use_dstate0=dstate0 is not None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
@@ -433,47 +476,7 @@ def build_chain_backward(
             allow_neg_eigval=allow_neg_eigval,
             max_active_clusters=num_sm,
             d_k=DK,
-        )
-        summary_cfg = None
-        transition_cfg = None
-        if fused_h_m:
-            summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, d_v=DV, **flags)
-        else:
-            transition_cfg = kda_recompute_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_m.dtype),
-                gate_dtype,
-                use_initial_state=False,
-                store_final_state=True,
-                enable_checkpoints=False,
-                seed_checkpoints=False,
-                seed_identity=True,
-                v_is_zero=True,
-                d_v=DK,
-                **flags,
-            )
-        series_cfg = None
-        if series:
-            series_cfg = kda_recompute_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_x.dtype) if not coarse else cutlass.Float32,
-                gate_dtype,
-                use_initial_state=not coarse,
-                store_final_state=False,
-                enable_checkpoints=True,
-                seed_checkpoints=coarse,
-                d_v=DV,
-                **flags,
-            )
-        bwd_summary_cfg = kda_bprop_summary_f16.build_cfg(io_dtype, gate_dtype, use_dstate_in=False, d_v=do.shape[2], **flags)
-        bprop_cfg = kda_bprop_f16.build_cfg(
-            io_dtype,
-            gate_dtype,
-            use_dstate_in=True,
-            use_dstate0=dstate0 is not None,
-            use_initial_state=True,
             d_v=DV,
-            **flags,
         )
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)

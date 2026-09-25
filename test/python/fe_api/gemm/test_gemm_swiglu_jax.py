@@ -28,7 +28,24 @@ def swiglu_block_ref(ab12_ref, n):
     cols = np.arange(n).reshape(n // 32, 32)
     input_idx, gate_idx = cols[0::2].reshape(-1), cols[1::2].reshape(-1)
     gate = ab12_ref[:, gate_idx]
-    return ab12_ref[:, input_idx] * (gate / (1 + np.exp(-gate)))
+    # Keep the exponential bounded for large negative gates in quantized GEMMs.
+    exp_neg_abs = np.exp(-np.abs(gate))
+    sigmoid = np.where(gate >= 0, 1 / (1 + exp_neg_abs), exp_neg_abs / (1 + exp_neg_abs))
+    return ab12_ref[:, input_idx] * (gate * sigmoid)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_swiglu_block_ref_large_gates(dtype):
+    gates = np.array([-1000, -100, -1, 0, 1, 100, 1000], dtype=dtype)
+    ab12 = np.ones((len(gates), 64), dtype=dtype)
+    ab12[:, 32:] = gates[:, None]
+    expected = np.array([0, -100 * np.exp(-100), -1 / (1 + np.e), 0, 1 / (1 + 1 / np.e), 100, 1000])
+
+    with np.errstate(over="raise", invalid="raise"):
+        actual = swiglu_block_ref(ab12, 64)
+
+    np.testing.assert_allclose(actual, np.broadcast_to(expected[:, None], actual.shape), rtol=1e-6, atol=1e-43)
 
 
 def make_ab_bf16(mn, k, rng):

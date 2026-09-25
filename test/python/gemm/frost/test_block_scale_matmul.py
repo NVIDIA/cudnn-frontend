@@ -78,6 +78,11 @@ def _build_nvfp4_graph(
     out_major="n",
 ):
     sf_k = K // block_size
+    sf_m, sf_n = M, N
+    if reorder:
+        # F8_128x4 descriptors include the padding in the reordered SF buffers.
+        sf_m, sf_n = _ceil_div(M, 128) * 128, _ceil_div(N, 128) * 128
+        sf_k = _ceil_div(sf_k, 4) * 4
     b_dt = b_dt if b_dt is not None else a_dt
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
@@ -93,15 +98,15 @@ def _build_nvfp4_graph(
     sf_kw = dict(reordering_type=cudnn.tensor_reordering.F8_128x4) if reorder else {}
     SFA = g.tensor(
         name="SFA",
-        dim=[1, M, sf_k],
-        stride=[M * sf_k, sf_k, 1],
+        dim=[1, sf_m, sf_k],
+        stride=[sf_m * sf_k, sf_k, 1],
         data_type=sf_dt,
         **sf_kw,
     )
     SFB = g.tensor(
         name="SFB",
-        dim=[1, sf_k, N],
-        stride=[sf_k * N, 1, sf_k],
+        dim=[1, sf_k, sf_n],
+        stride=[sf_k * sf_n, 1, sf_k],
         data_type=sf_dt,
         **sf_kw,
     )
@@ -567,6 +572,78 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo,a_dtype,b_dtype,out_dtype",
+    [
+        ("nvfp4", "fp4_e2m1", "fp4_e2m1", "bf16"),
+        ("mxfp4", "fp4_e2m1", "fp4_e2m1", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e4m3", "bf16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e4m3", "fp8_e5m2", "fp16"),
+        ("mxfp8", "fp8_e5m2", "fp8_e4m3", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("profile_device", ["b200", "rubin"])
+def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, combo, a_dtype, b_dtype, out_dtype):
+    from gemm_test_utils import skip_unless_pipeline_active
+    from cudnn.engines import is_python_engine
+    from cudnn.gemm.frost import planning, tile_config
+    from cudnn.gemm.frost.dtypes import CUDNN_FROM_DTYPE
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    skip_unless_pipeline_active(by_name(_SPLITK_BS_CFG))
+    if profile_device == "b200":
+        monkeypatch.setattr(planning, "current_device_properties", lambda: planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864))
+        monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
+        monkeypatch.setattr(C, "_sm_count", lambda: 148)
+    elif torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rubin profile requires an SM107 GPU")
+    m, n, k = 192, 160, 4160
+    torch.manual_seed(919)
+    a, b, sfa, sfb, reference, bs, sf_dt, _ = _make_block_scale_inputs(combo, m, n, k)
+    if combo == "mxfp8":
+        torch_dtypes = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+        a = torch.randint(-2, 3, (1, m, k), device="cuda").to(torch_dtypes[a_dtype])
+        b = torch.randint(-2, 3, (1, n, k), device="cuda").to(torch_dtypes[b_dtype])
+        reference = (a[0].double() * sfa.double().repeat_interleave(bs, -1)) @ (b[0].double() * sfb.double().repeat_interleave(bs, -1)).t()
+    output_torch = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    reference = reference.to(output_torch)
+    sfa = _to_blocked(sfa).view(1, _ceil_div(m, 128) * 128, -1)
+    sfb = _to_blocked(sfb).view(1, _ceil_div(n, 128) * 128, -1)
+
+    def graph():
+        g = _build_nvfp4_graph(m, n, k, block_size=bs, sf_dt=sf_dt, a_dt=CUDNN_FROM_DTYPE[a_dtype], b_dt=CUDNN_FROM_DTYPE[b_dtype])
+        _, binding = analyze_with_binding(g)
+        binding.outputs[0].set_data_type(CUDNN_FROM_DTYPE[out_dtype])
+        g.validate()
+        g.build_operation_graph()
+        return g, binding
+
+    g, _ = graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    records = [g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())]
+    records = [(engine, knobs) for engine, knobs in records if is_python_engine(engine)]
+    assert len(records) == 8
+    assert len({GemmKnobs.from_public(knobs).to_config() for _, knobs in records}) == 8
+    if profile_device == "rubin":
+        assert all(GemmKnobs.from_public(knobs).to_config().mma_tile_k_bytes == 64 for _, knobs in records)
+    for engine, knobs in records:
+        replay, binding = graph()
+        replay.create_execution_plan(engine, knobs)
+        index = replay.get_execution_plan_count() - 1
+        replay.select_plan(index)
+        replay.check_support()
+        replay.build_plans()
+        assert replay.get_engine_and_knobs_at_index(index) == (engine, knobs)
+        y = torch.full((1, m, n), float("nan"), device="cuda", dtype=output_torch)
+        workspace = torch.empty(max(1, replay.get_workspace_size()), device="cuda", dtype=torch.uint8)
+        pack = {binding.a_operands[0]: a, binding.b_operands[0]: b, binding.sfa_operands[0]: sfa, binding.sfb_operands[0]: sfb, binding.outputs[0]: y}
+        replay.execute_plan_at_index(pack, workspace, index=index)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y[0], reference, rtol=0, atol=0)
+
+
 def _splitk_workspace(compiled):
     """(Workspace, buffer); the caller keeps both alive across the launch."""
     from cudnn.frost.workspace import Workspace
@@ -578,27 +655,37 @@ def _splitk_workspace(compiled):
 
 
 def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force_stg=False):
-    """Block-scale matmul vs a torch dequant-matmul reference."""
+    """Block-scale matmul vs a torch dequant-matmul reference.
+
+    ``combo`` is ``nvfp4`` / ``mxfp4`` / ``mxfp8`` (both sides alike) or ``mxfp8_x_mxfp4`` -- the
+    MIXED catalog row: e4m3 A against an e2m1 B under E8M0 / 32 scales (the gated attention
+    block's stage (1) with an MXFP4 weight), so the shape/cluster sweep covers it beyond the
+    single 256x256x512 shape of ``test_mixed_mxfp8_mxfp4_numerics``."""
     dev = "cuda"
     torch.manual_seed(0)
-    is_fp4 = combo in ("nvfp4", "mxfp4")
+    mixed = combo == "mxfp8_x_mxfp4"
+    a_fp4 = combo in ("nvfp4", "mxfp4")
+    b_fp4 = a_fp4 or mixed
     bs = 16 if combo == "nvfp4" else 32
     sf_k = K // bs
-    a_dt = cudnn.data_type.FP4_E2M1 if is_fp4 else cudnn.data_type.FP8_E4M3
+    a_dt = cudnn.data_type.FP4_E2M1 if a_fp4 else cudnn.data_type.FP8_E4M3
+    b_dt = cudnn.data_type.FP4_E2M1 if b_fp4 else cudnn.data_type.FP8_E4M3
     sf_dt = cudnn.data_type.FP8_E4M3 if combo == "nvfp4" else cudnn.data_type.FP8_E8M0
 
-    if is_fp4:
-        lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    if a_fp4:
         a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
-        b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
         a_rt = a_u8.view(torch.float4_e2m1fn_x2)
-        b_rt = b_u8.view(torch.float4_e2m1fn_x2)
         a_deq = _unpack_fp4(a_u8, lut).view(M, K)
-        b_deq = _unpack_fp4(b_u8, lut).view(N, K)
     else:
         a_rt = (torch.randn(1, M, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
-        b_rt = (torch.randn(1, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
         a_deq = a_rt.float().view(M, K)
+    if b_fp4:
+        b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+        b_rt = b_u8.view(torch.float4_e2m1fn_x2)
+        b_deq = _unpack_fp4(b_u8, lut).view(N, K)
+    else:
+        b_rt = (torch.randn(1, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
         b_deq = b_rt.float().view(N, K)
 
     if combo == "nvfp4":
@@ -608,9 +695,11 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n", split_k=1, force
         sfa_log = _rand_e8m0((M, sf_k), dev)
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
-    g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
+    g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, b_dt=b_dt, out_major=out_major)
     compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k), force_stg_epi=force_stg)
     assert compiled.block_scale
+    if mixed:
+        assert compiled.chain.block_scale.mma_block_scale_kind == "MXF8F6F4"
     ws, _ws_buf = _splitk_workspace(compiled)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
@@ -649,16 +738,16 @@ _SPLITK_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
     "moe,force_stg,budget,stages",
     [
         (False, True, 27648, 0),
-        (False, True, 28160, 1),
+        (False, True, 28672, 1),
         (False, True, 334848, 12),
         (False, True, 335359, 12),
-        (False, True, 335360, 13),
+        (False, True, 335872, 13),
         (False, False, 351248, 12),
         (False, False, 352272, 13),
         (True, True, 336896, 12),
-        (True, True, 337408, 13),
+        (True, True, 337920, 13),
         (True, False, 353296, 12),
-        (True, False, 353808, 13),
+        (True, False, 354320, 13),
     ],
 )
 def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch):
@@ -671,8 +760,12 @@ def test_block_scale_sf_ring_budget(moe, force_stg, budget, stages, monkeypatch)
     if moe:
         chain = dataclasses.replace(chain, moe=MoeSpec(num_experts=1, num_groups=3))
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
-    # The dense template puts D after the SF rings; MoE puts it before them.
-    # At an exact STG fit, the last SF ring needs no trailing alignment pad.
+    # Both templates declare the SF rings FIRST (their Tcgen05SmemDesc.build()
+    # roots must stay below 256 KiB on sm107), then A, then B; the dense template
+    # puts D after the rings, MoE before them.  So EVERY SF ring is followed by
+    # another ring and pads to 1024 B: at an odd depth the two 512 B-per-stage SF
+    # rings cost 2 x 512 B of padding, at an even depth none -- which is why the
+    # odd-depth exact-fit budgets below sit 1024 B above the payload sum.
     with C.force_stg_epi(force_stg):
         if stages == 0:
             with pytest.raises(NotImplementedError, match="no AB stage fits"):
@@ -688,17 +781,17 @@ def test_block_scale_sf_ring_budget_omits_fake_scales(fake_a, monkeypatch):
     from cudnn.gemm.frost import tile_config
 
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 328192)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 328704)
     g, *_ = _build_one_sided_block_scale_graph(fake_a=fake_a, raw_dt=_DT_E4M3, scaled_dt=_DT_E4M3, sf_dt=_DT_E8M0, block_size=32)
     chain = analyze(g)
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma")
     with C.force_stg_epi(True):
         src = C._render_block_scale_tile_constants(cfg, chain, select_template(chain, cfg))
-    assert "ab_stages = 13\n" in src  # a single SF ring fits without any padding
+    assert "ab_stages = 13\n" in src  # a single SF ring, padded to 1024 B ahead of the A ring (13 x 512 -> 6656 + 512)
 
 
 @pytest.mark.parametrize(
-    "na,nb,budget,stages", [(1, 2, 310784, 8), (1, 2, 311808, 9), (2, 1, 299520, 6), (2, 1, 300544, 7), (2, 2, 258048, 4), (2, 2, 259584, 5)]
+    "na,nb,budget,stages", [(1, 2, 310784, 8), (1, 2, 312320, 9), (2, 1, 299520, 6), (2, 1, 301056, 7), (2, 2, 258048, 4), (2, 2, 260096, 5)]
 )
 def test_block_scale_sf_ring_budget_distinct_operands(na, nb, budget, stages, monkeypatch):
     from cudnn.gemm.frost import tile_config
@@ -1927,9 +2020,9 @@ def test_auto_config_is_accepted_by_the_registry(M, N):
 # --- SF blob packing guard -------------------------------------------------
 # The templates rebuild the F8_128x4 layout from the SF BASE POINTER alone (a
 # packed run of 512-B atoms, 128 rows x 4 SF-K), so a blob that is not one dense
-# byte run of that size is read out of bounds and silently miscomputes. The
-# graph declares the LOGICAL scale factors, whose shape legitimately differs from
-# the reordered blob, so only the call site can check this.
+# byte run of that size is read out of bounds and silently miscomputes. Padded
+# graph descriptors alone cannot guarantee the runtime blob's storage span;
+# the call site must check it too.
 _SF_GUARD_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
@@ -2209,6 +2302,13 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
         ("mxfp8", "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma", 384, 512, 256),
         ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
         ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster1x4_1ctamma", 512, 1024, 512),
+        # The MIXED row (e4m3 A x e2m1 B, E8M0 / 32) beyond its single 256x256x512 case: the gated
+        # attention block's forced stage-(1) config in BOTH MMA K forms (K32 padded E2M1, Rubin K64
+        # native-packed), a tail M, a multi-tile N and a deep K -- the shapes its numerics are read at.
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", 1000, 512, 4096),
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma", 1000, 512, 4096),
+        ("mxfp8_x_mxfp4", _SM107_128 + "_1ctamma", 256, 384, 768),
+        ("mxfp8_x_mxfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
     ],
     ids=lambda v: v if isinstance(v, str) else str(v),
 )

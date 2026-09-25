@@ -2134,6 +2134,7 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
     ``tensor.fill_()`` works only while the caller happened to pass a torch
     tensor, and the variant pack exists so that it does not have to.
     """
+    fills = []
     for spec, tensor in zip(chain.outputs, outputs):
         if not spec.is_reduction:
             continue
@@ -2147,16 +2148,15 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
         # its range.
         shape, strides = tuple(tensor.shape), tuple(tensor.stride())
         word = buffers.init_word(red.compute_dtype, value)
-        if buffers.is_contiguous(shape, strides):
-            buffers.fill_word_async(tensor.data_ptr(), int(tensor.numel()), word, stream)
-        else:
-            buffers.fill_word_strided_async(tensor.data_ptr(), shape, strides, tensor.element_size(), word, stream)
-
-
-def _finalize_reductions(chain, out_bufs) -> None:
-    for k, o in enumerate(chain.outputs):
-        if o.source.startswith("reduction_") and chain.reductions[int(o.source.rsplit("_", 1)[1])].mode == "norm2":
-            out_bufs[k].sqrt_()
+        if tensor.element_size() != 4:
+            raise ValueError("MoE reduction outputs require 4-byte elements")
+        plan = buffers.strided_fill_plan(shape, strides)
+        if plan is None:
+            raise ValueError(f"MoE reduction output cannot write an element twice (shape {shape} stride {strides})")
+        fills.append((tensor.data_ptr(), plan, word))
+    # Validate every output before the first write, including contiguous ones.
+    for ptr, plan, word in fills:
+        buffers.apply_fill_plan(ptr, plan, word, stream)
 
 
 @dataclass
@@ -3247,6 +3247,8 @@ def _check_executable(chain: FusionChain) -> None:
     MoE is the exception and stays on its own launchers: it is >= 2 launches
     with a workspace, and has no recipe to lower from.
     """
+    if any(red.mode == "norm2" for red in chain.reductions):
+        raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
     if chain.has_moe:
         return
     if not _TVM_FFI_OK:
@@ -3254,8 +3256,6 @@ def _check_executable(chain: FusionChain) -> None:
         # same `cutedsl` extra as the DSL these kernels are written in, so a
         # build without it has no DSL either and was already declining.
         raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
-    if any(red.mode == "norm2" for red in chain.reductions):
-        raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
 def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
@@ -3317,14 +3317,7 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
-    """Choose the tile strategy for one analyzed fusion chain.
-
-    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
-    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
-    bypasses the automatic pick; a request that does not spell a canonical
-    config is a decline (NotImplementedError), never a silent snap to a
-    neighbour. Without knobs this is the automatic strategy."""
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -3369,10 +3362,30 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
-    # skip splitK when dynamic_shape is enabled
-    if dynamic_shapes:
+    # skip splitK for MoE and dynamic shapes
+    if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose one strategy, or replay the exact supplied knobs."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    if knobs is not None or dynamic_shapes:
+        return config
+    from ..planning import select_strategy
+
+    return select_strategy(chain, config, probe=probe_chain)
+
+
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+    """Choose a bounded list with the single-plan recommendation first."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    if dynamic_shapes:
+        return [config]
+    from ..planning import select_strategies
+
+    return select_strategies(chain, config, probe=probe_chain)
 
 
 def _precheck_plain(
@@ -3398,6 +3411,7 @@ def _precheck_moe(
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    _check_executable(chain)
     reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -3451,6 +3465,7 @@ def _precheck_moe_block_scale(
 ) -> None:
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
+    _check_executable(chain)
     reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -3853,7 +3868,6 @@ class CompiledMoeGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -3882,12 +3896,12 @@ class CompiledMoeGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -3986,9 +4000,7 @@ class CompiledMoeGemm:
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         if self.chain.is_multi_gemm or self.chain.ops:
             pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            r = self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
+            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
         return self._launch_single(a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream)
 
     def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None):
@@ -4224,7 +4236,6 @@ class CompiledMoeBlockScaleGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -4258,9 +4269,10 @@ class CompiledMoeBlockScaleGemm:
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -4403,9 +4415,7 @@ class CompiledMoeBlockScaleGemm:
                 )
                 for ai, bi in self.chain.gemm_operands
             ]
-            r = self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
+            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
         return self._launch_single(
             a_bufs[0],
             b_bufs[0],

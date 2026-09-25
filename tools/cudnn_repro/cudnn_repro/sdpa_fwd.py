@@ -88,6 +88,8 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
         cfg["with_rope"] = True
     if "unfuse_fma" in node:
         cfg["with_unfuse_fma"] = bool(node.get("unfuse_fma", False))
+    if "stats_use_log2" in node:
+        cfg["with_stats_log2"] = bool(node.get("stats_use_log2", False))
     left_bound = utils.parse_optional_int(node.get("left_bound"))
     right_bound = utils.parse_optional_int(node.get("right_bound"))
     if right_bound is None and node.get("causal_mask", False):

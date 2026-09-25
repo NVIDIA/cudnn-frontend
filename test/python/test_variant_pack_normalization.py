@@ -355,3 +355,124 @@ def test_a_bare_address_for_an_fp4_tensor_is_lent_the_storage_geometry():
     _, tb = g._describe(0x2000, b.get_uid())
     assert (tuple(ta.dim), tuple(ta.stride)) == ((1, 256, 128), (32768, 128, 1))
     assert (tuple(tb.dim), tuple(tb.stride)) == ((1, 128, 512), (65536, 1, 128))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [512, 2560])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_reordered_scale_blob_keeps_physical_capacity(capacity, rank):
+    from cudnn.datatypes import _dlpack_code_bits
+
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    token = g.tensor(name="token", dim=[1, 137, 128], stride=[137 * 128, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    scale = g.tensor(
+        name="scale",
+        dim=[1, 256, 4],
+        stride=[1024, 4, 1],
+        data_type=cudnn.data_type.FP8_E8M0,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    shape = (capacity,) if rank == 1 else (1, capacity // 4, 4)
+    blob = torch.empty(shape, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert operand.numel() * operand.element_size() == capacity
+    assert tuple(operand.shape) == ((1, capacity, 1) if rank == 1 else shape)
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()
+    assert pack.native.dtype(slot) == _dlpack_code_bits(cudnn.data_type.FP8_E8M0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [4096, 4097])
+def test_reordered_batched_flat_scale_blob_preserves_batch_count(capacity):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[4, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[4, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(capacity, dtype=torch.uint8, device="cuda")
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    operand = pack.operand(pack.index_of(scale))
+    assert list(operand.shape) == ([4, capacity // 4, 1] if capacity % 4 == 0 else [capacity])
+    assert list(operand.stride()) == ([capacity // 4, 1, 1] if capacity % 4 == 0 else [1])
+    assert operand.numel() == capacity
+    assert operand.data_ptr() == blob.data_ptr()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stride", [(1023, 0), (1024, 1), (1, 2)])
+def test_reordered_scale_blob_keeps_noncontiguous_view(stride):
+    g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(name="scale", dim=[1, 128, 4], stride=[512, 4, 1], data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    token = g.tensor(name="token", dim=[1, 128, 128], stride=[16384, 128, 1], data_type=cudnn.data_type.FP8_E4M3)
+    g.block_scale_dequantize(token, scale, block_size=[1, 32]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    blob = torch.empty(2048, dtype=torch.uint8, device="cuda").as_strided((2, 512), stride)
+    pack = g._normalize({scale.get_uid(): blob}, None)
+    slot = pack.index_of(scale)
+    operand = pack.operand(slot)
+    assert tuple(operand.shape) == tuple(blob.shape)
+    assert tuple(operand.stride()) == stride
+    assert slot not in pack.graph_described
+    assert operand.data_ptr() == blob.data_ptr()
+
+
+@pytest.mark.L0
+def test_override_many_matches_the_per_operand_path():
+    """The single-crossing override (``VariantPackNative.override_many``) must land exactly where the
+    per-operand Python path did: storage-slot geometry (fp4 packing), the axis-order permutation against
+    the buffer's EFFECTIVE strides (an omitted stride vector is compact row-major, not "no strides"),
+    and the declared dtype when the slots are as wide. Differential over producers with and without
+    strides, a column-major declaration, fp4 packing, singleton axes and a dtype-only declaration."""
+    from cudnn import _pybind_module as native_mod
+    from cudnn._pygraph import _in_axis_order_of
+    from cudnn.datatypes import _dlpack_code_bits, _dlpack_lanes
+    from cudnn.graph_types import storage_geometry
+
+    bf16, fp4 = cudnn.data_type.BFLOAT16, cudnn.data_type.FP4_E2M1
+    bf16_dl = (*_dlpack_code_bits(bf16), _dlpack_lanes(bf16))
+    fp4_dl = (*_dlpack_code_bits(fp4), _dlpack_lanes(fp4))
+    ptr = 0x10000
+    # (declared geometry or None, declared dtype, producer shape, producer stride or () for omitted, override shape, override stride)
+    cases = [
+        (([1, 8, 8], [64, 1, 8]), bf16, (1, 8, 8), (), [1, 4, 8], [64, 1, 8]),  # omitted strides, column-major declaration
+        (([1, 8, 8], [64, 1, 8]), bf16, (1, 8, 8), (64, 8, 1), [1, 4, 8], [64, 1, 8]),  # the same, strides spelled out
+        (([1, 8, 8], [64, 8, 1]), bf16, (1, 8, 8), (), [1, 4, 8], [32, 8, 1]),  # row-major: identity permutation
+        (([1, 8, 8], [64, 8, 1]), fp4, (1, 8, 4), (), [1, 4, 8], [32, 8, 1]),  # fp4: unit-stride extent halves, other strides halve
+        (([2, 1, 8], [8, 8, 1]), bf16, (2, 1, 8), (8, 8, 1), [1, 1, 8], [8, 8, 1]),  # singleton / tied-stride axis
+        (None, bf16, (8, 8), (8, 1), [4, 8], [8, 1]),  # dtype-only declaration (no storage geometry)
+    ]
+    for decl, dtype, pshape, pstride, oshape, ostride in cases:
+        dl = (*_dlpack_code_bits(dtype), _dlpack_lanes(dtype))
+        layout = native_mod.DeclaredLayout(1)
+        if decl is not None:
+            st = storage_geometry(decl[0], decl[1], dtype)
+            layout.set(0, list(st[0]), list(st[1]), 1 if dtype == fp4 else 2, *dl)
+        else:
+            layout.set_dtype(0, *dl)
+        # a producer whose own dtype is a byte (FlashInfer-style blob) so the declared dtype applies when as wide
+        own = (1, 8, 1) if dtype == fp4 else dl
+        old, new = native_mod.VariantPackNative(1), native_mod.VariantPackNative(1)
+        for pk in (old, new):
+            pk.set_operand(0, ptr, tuple(pshape), tuple(pstride), *own, -1, 2, 0)
+        # the per-operand path as _normalize wrote it before
+        storage = storage_geometry(oshape, ostride, dtype)
+        old.override_operand(0, *_in_axis_order_of(storage[0], storage[1], old.stride(0)), *dl)
+        new.override_many(layout, [0], [list(oshape)], [list(ostride)])
+        assert (list(new.shape(0)), list(new.stride(0)), new.dtype(0)) == (list(old.shape(0)), list(old.stride(0)), old.dtype(0)), (
+            decl,
+            dtype,
+            pshape,
+            pstride,
+            (list(new.shape(0)), list(new.stride(0))),
+            (list(old.shape(0)), list(old.stride(0))),
+        )
+    # an odd fp4 extent has no storage geometry: both paths refuse it
+    layout = native_mod.DeclaredLayout(1)
+    layout.set(0, [1, 8, 4], [32, 4, 1], 1, *fp4_dl)
+    pk = native_mod.VariantPackNative(1)
+    pk.set_operand(0, ptr, (1, 8, 4), (), 1, 8, 1, -1, 2, 0)
+    assert storage_geometry([1, 8, 7], [56, 7, 1], fp4) is None
+    with pytest.raises(ValueError, match="fp4"):
+        pk.override_many(layout, [0], [[1, 8, 7]], [[56, 7, 1]])

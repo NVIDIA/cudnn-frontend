@@ -98,9 +98,9 @@ from cutlass.utils.blackwell_helpers import (
     make_smem_layout_b as _make_smem_layout_b,
     make_smem_layout_epi as _make_smem_layout_epi,
 )
-from cutlass.utils.layout import LayoutEnum
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32
@@ -796,12 +796,12 @@ class IndexerBackwardSm100:
             f"SharedStorage ({SharedStorage.size_in_bytes()} bytes) exceeds {_max_smem_bytes} bytes (227KB), " f"smem_topk_capacity={smem_topk_capacity}"
         )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         Q_mbar_ptr = storage.Q_mbar.data_ptr()
         mbar = storage.mbar.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf.ptr
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],
@@ -2777,7 +2777,7 @@ class IndexerBackwardSm100:
         s_full_1_phase = Int32(persistent_row_phase if const_expr((self.num_topk_blocks // 2) & 1) else 0)
 
         dw_accum = cute.make_rmem_tensor(tSrS_shape, Float32)
-        for ei in cutlass.range_constexpr(cute.size(dw_accum)):
+        for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
             dw_accum[ei] = Float32(0.0)
 
         tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
@@ -2861,7 +2861,7 @@ class IndexerBackwardSm100:
             # Phase 2: Convert dS f32→bf16, then use STSM on the production
             # tile or the native-layout coordinate fallback on other shapes.
             tSrS_f16 = cute.make_rmem_tensor(tSrS.shape, self.q_dtype)
-            for ei in cutlass.range_constexpr(cute.size(tSrS)):
+            for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
                 tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
             if const_expr(use_stmatrix_ds):
@@ -3012,7 +3012,7 @@ class IndexerBackwardSm100:
             # 16 full-warp reductions and repeatedly scanning all 64 values.
             sum_low = Float32(0.0)
             sum_high = Float32(0.0)
-            for ei in cutlass.range_constexpr(cute.size(dw_accum)):
+            for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
                 if (ei // 2) % 2 == 0:
                     sum_low = sum_low + dw_accum[ei]
                 else:
@@ -3035,7 +3035,7 @@ class IndexerBackwardSm100:
             for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
                 h = warp_base_h + h_local
                 my_partial = Float32(0.0)
-                for ei in cutlass.range_constexpr(cute.size(dw_accum)):
+                for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
                     if const_expr(use_stmatrix_ds):
                         elem_h = cute.get(tCcS[ei], mode=[0])
                     else:
@@ -3608,7 +3608,7 @@ class ScoreGradSm100:
             class ShortRowStorage:
                 warp_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.num_warps], 128]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
             storage = smem.allocate(ShortRowStorage)
             warp_sums = storage.warp_sums.get_tensor(cute.make_layout((self.num_warps,), stride=(1,)))
             warp_sum = cute.arch.warp_reduction_sum(g0 + g1 + g2 + g3)
@@ -3638,7 +3638,7 @@ class ScoreGradSm100:
                 # thread partials and reduced them serially in thread 0.
                 warp_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.num_warps], 128]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
             storage = smem.allocate(SharedStorage)
             warp_sums = storage.warp_sums.get_tensor(cute.make_layout((self.num_warps,), stride=(1,)))
 

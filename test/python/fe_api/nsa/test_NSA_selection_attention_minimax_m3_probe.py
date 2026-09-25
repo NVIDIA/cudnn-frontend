@@ -112,8 +112,8 @@ def _run_targeted_causal_case(*, future_first: bool, scale: float = 1.0 / math.s
     if not torch.cuda.is_available():
         pytest.skip("Selection-attention causal regression requires CUDA")
     major, minor = torch.cuda.get_device_capability()
-    if major != 10:
-        pytest.skip(f"Selection-attention causal regression targets SM10x, found SM{major}{minor}")
+    if (major, minor) != (9, 0) and major != 10:
+        pytest.skip(f"Selection-attention causal regression targets SM90/SM10x, found SM{major}{minor}")
 
     try:
         from cuda.bindings import driver as cuda
@@ -206,8 +206,8 @@ def test_minimax_m3_selection_attention_block128_causal_probe():
     if not torch.cuda.is_available():
         pytest.skip("MiniMax-M3 selection probe requires CUDA")
     major, minor = torch.cuda.get_device_capability()
-    if major != 10:
-        pytest.skip(f"MiniMax-M3 selection probe targets SM10x, found SM{major}{minor}")
+    if (major, minor) != (9, 0) and major != 10:
+        pytest.skip(f"MiniMax-M3 selection probe targets SM90/SM10x, found SM{major}{minor}")
 
     try:
         from cuda.bindings import driver as cuda

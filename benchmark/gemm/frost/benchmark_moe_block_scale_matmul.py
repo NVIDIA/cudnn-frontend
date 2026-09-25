@@ -19,6 +19,7 @@ import cudnn.gemm.frost  # noqa: F401
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
@@ -117,9 +118,9 @@ def _build_spec_map():
     strategy. Enumerated from an nvfp4 graph (template set is combo-independent)."""
     chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
-    for t, cfg in _candidates(chain):
+    for t, cfg in _candidates(chain, sweep_swap_ab=True):
         label = cfg.name
-        m[label] = (cfg, cfg.cta_group)
+        m[label] = (cfg, getattr(cfg, "cta_group", 1))
     return m
 
 
@@ -141,8 +142,8 @@ def _mkdata(S: int, N: int, K: int, E: int, combo: str):
         tok = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
         w = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
     else:
-        tok = (torch.randn(1, S, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
-        w = (torch.randn(E, N, K, device=dev) * 0.5).to(torch.float8_e4m3fn)
+        tok = torch.randn(1, S, K, device=dev).mul_(0.5).to(torch.float8_e4m3fn)
+        w = torch.randn(E, N, K, device=dev).mul_(0.5).to(torch.float8_e4m3fn)
 
     if combo == "nvfp4":
         sfa_log = torch.randint(1, 4, (S, sf_k), device=dev).to(torch.float8_e4m3fn)
@@ -152,7 +153,11 @@ def _mkdata(S: int, N: int, K: int, E: int, combo: str):
         sfb_log = rand_e8m0((E, N, sf_k), dev)
 
     # SFA padded to 128 rows PER GROUP (group sizes need not be 128-aligned); SFB per-expert.
-    sfa = torch.cat([to_blocked(sfa_log[g * group_m : (g + 1) * group_m]) for g in range(E)]).view(1, -1, 1)
+    sfa = torch.cat([to_blocked(sfa_log[g * group_m : (g + 1) * group_m]).view(torch.uint8) for g in range(E)])
+    # Runtime binding requires capacity for every legal group split, beyond this even split.
+    sfa_storage = torch.zeros(segmented_row_scale_capacity_rows(S, E) * ((sf_k + 3) // 4 * 4), dtype=torch.uint8, device=dev)
+    sfa_storage[: sfa.numel()].copy_(sfa)
+    sfa = sfa_storage.view(sfa_log.dtype).view(1, -1, 1)
     sfb = torch.cat([to_blocked(sfb_log[e]) for e in range(E)]).reshape(E, sf_k, N)
     out = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
     return tok, w, sfa, sfb, out

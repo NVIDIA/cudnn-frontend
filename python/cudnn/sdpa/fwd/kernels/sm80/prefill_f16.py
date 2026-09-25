@@ -858,7 +858,7 @@ def _sdpa_kernel(
     # O accumulator — m_blocks * SV_N_FRAGS * 4 fp32 per lane, m-block major.
     # mma_step indexes acc as ``acc[m_block * SV_N_FRAGS*4 + n_frag*4 + i]``.
     O_acc = cutlass.Array(cutlass.Float32, m_blocks * SV_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-    for i in cutlass.range_constexpr(m_blocks * SV_N_FRAGS * 4):
+    for i in cutlass.range(m_blocks * SV_N_FRAGS * 4, unroll_full=True):
         O_acc[i] = cutlass.Float32(0.0)
 
     # ---- Online-softmax per-lane state ------------------------------------
@@ -929,7 +929,7 @@ def _sdpa_kernel(
         # TILE_M=64.  S_acc is flat, m-block major:
         #   ``S_acc[m_block * QK_N_FRAGS*4 + n_frag*4 + i]``.
         S_acc = cutlass.Array(cutlass.Float32, m_blocks * QK_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-        for i in cutlass.range_constexpr(m_blocks * QK_N_FRAGS * 4):
+        for i in cutlass.range(m_blocks * QK_N_FRAGS * 4, unroll_full=True):
             S_acc[i] = cutlass.Float32(0.0)
 
         # ---- Step 1: issue V[i] cp.async ---------------------------------
@@ -1415,6 +1415,10 @@ def _sdpa_kernel(
                 trim_bot = q_row_base_i32 + block_row_bot
                 lse_top = cutlass.Float32(arith.select((trim_top < eff_sq).ir_value(), lse_top.ir_value(), _ninf.ir_value()))
                 lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
+            # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
+            if cutlass.const_expr(PARAMS.stats_log2):
+                lse_top = lse_top * cutlass.Float32(1.4426950408889634)
+                lse_bot = lse_bot * cutlass.Float32(1.4426950408889634)
             lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top) * LSE_S_STRIDE_E
             lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot) * LSE_S_STRIDE_E
 

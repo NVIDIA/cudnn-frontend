@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from typing import Callable, Union
 
 import cuda.bindings.driver as cuda
@@ -10,6 +11,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as sm90_utils
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 """
 A NSA(Native Sparse Attention) attention forward pass example for NVIDIA Ampere SM90 architecture using Cute DSL.
@@ -145,10 +147,10 @@ class HopperSelectAttentionFwd:
             ),
         )
 
-        self.Q_layout = utils.LayoutEnum.from_tensor(Q)
-        self.K_layout = utils.LayoutEnum.from_tensor(K)
-        self.V_layout = utils.LayoutEnum.from_tensor(V)
-        self.O_layout = utils.LayoutEnum.from_tensor(O)
+        self.Q_layout = LayoutEnum.from_tensor(Q)
+        self.K_layout = LayoutEnum.from_tensor(K)
+        self.V_layout = LayoutEnum.from_tensor(V)
+        self.O_layout = LayoutEnum.from_tensor(O)
 
         self.Q_dtype = Q.element_type
         self.K_dtype = K.element_type
@@ -498,7 +500,7 @@ class HopperSelectAttentionFwd:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         Q_smem_layout = cute.slice_(Q_smem_layout_staged, (None, None, 0))

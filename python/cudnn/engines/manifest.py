@@ -97,9 +97,10 @@ class EngineFamily:
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
     # ("module", "callable") ranking (engine_id, knobs) for this family, given
-    # its facts and the backend's entries. The family is the smallest scope that
-    # can rank -- an engine cannot see its siblings. None falls back to one
-    # default plan per accepting engine, ahead of the backend's.
+    # its facts and offered ids; a BACKEND marker in the list says where the
+    # backend's own block goes (engines/heuristics). The family is the smallest
+    # scope that can rank -- an engine cannot see its siblings. None falls back
+    # to one default plan per accepting engine, ahead of the backend's.
     heuristics: Optional[Tuple[str, str]] = None
     # ("module", "callable") validating a graph of this family natively in
     # python -- ``validate_graph(graph) -> bool`` runs the family's version- and
@@ -186,8 +187,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_summary_frost": EngineSlot(2),
             "kda_cake": EngineSlot(3),
             "kda_hopper": EngineSlot(4),
+            "kda_hopper_cuda": EngineSlot(5),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+        # Ordering only, and only on Hopper: slot order is identity, not
+        # preference, so without this the slot-1 cuTile engine wins every sm90
+        # graph by default despite the two sm90 engines being faster there.
+        heuristics=("cudnn.linear_attention.kda_heuristics", "recommend"),
     ),
     EngineFamily(
         GDN2_ID_BASE,
@@ -230,10 +236,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         #   4 sm100_d128_fp8, 6 sm100_d192_d128, 9 sm100_d192_d128_fp8,
         #   10 sm100_d192_d128_mxfp8
         slots={
-            "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
+            "sdpa_fwd_prefill_sm120": EngineSlot(5),
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
             "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
-            "sdpa_fwd_prefill_sm100": EngineSlot(11, opt_in=True),
+            "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13, opt_in=True),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
@@ -241,7 +247,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
-        heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+        heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
     ),
     EngineFamily(
@@ -322,9 +328,10 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 def resolve_heuristics(family: EngineFamily):
     """The family's proposal callable, or None when it declares none.
 
-    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]`` — pure
-    and backend-blind; placement against the backend's entries happens once
-    for every family in ``engines/heuristics._assemble``.
+    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]``; the
+    list may hold the ``BACKEND`` marker once to say where the backend's own
+    block goes (ours first when absent). Mode blocks, the delegating entry and
+    dedup happen once for every family in ``engines/heuristics._assemble``.
     """
     return _resolve(family, family.heuristics, "heuristics")
 

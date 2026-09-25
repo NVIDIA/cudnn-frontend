@@ -2885,7 +2885,7 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
     files = template_files()
-    assert len(files) == 10, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    assert len(files) == 12, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3587,6 +3587,48 @@ def _splitk_data(B, M, N, K, torch_in=torch.bfloat16, torch_out=torch.bfloat16):
     c = torch.zeros(B, M, N, dtype=torch_out, device="cuda")
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch_out)
     return a, b, c, ref
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "B,M,N,K,normal",
+    [
+        (1, 128, 128, 1024, False),
+        (1, 128, 4096, 8192, False),
+        (1, 256, 256, 16384, False),
+        (3, 96, 160, 4096, True),
+        (1, 192, 160, 2112, True),
+        (1, 129, 96, 8192, True),
+    ],
+)
+def test_joint_strategy_selected_config_executes(B, M, N, K, normal):
+    """Numerics only: replay B200-profile choices on the active tcgen05 GPU."""
+    from cudnn.gemm.frost.compiler import _auto_split_k, jit_from_cudnn_graph, probe_chain
+    from cudnn.gemm.frost.planning import DeviceProperties, select_strategy
+    from cudnn.gemm.frost.tile_config import select_config
+
+    graph, A, Bt, C = _splitk_graph(B, M, N, K)
+    chain = analyze(graph)
+    baseline = _auto_split_k(chain, select_config(M, N, 1, K=K, sm_count=148), sm_count=148)
+    config = select_strategy(chain, baseline, device=DeviceProperties(100, "NVIDIA B200", 148, 132644864), probe=probe_chain)
+    if (M, N, K) == (128, 128, 1024):
+        assert config.split_k_slices == 1
+    elif (M, N, K) == (128, 4096, 8192):
+        assert config.cta_tile_m == config.cta_tile_n == 128 and config.split_k_slices == 4
+    elif (M, N, K) == (256, 256, 16384):
+        assert config.split_k_slices > 4 and config.split_k_slices & (config.split_k_slices - 1)
+    compiled = jit_from_cudnn_graph(graph, config=config)
+    if normal:
+        torch.manual_seed(917)
+        a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        b = torch.randn(B, N, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        out = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
+        reference = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
+    else:
+        a, b, out, reference = _splitk_data(B, M, N, K)
+    out.fill_(float("nan"))
+    _run_splitk(compiled, {A: a, Bt: b, C: out})
+    torch.testing.assert_close(out, reference, rtol=0.01 if normal else 0, atol=0.005 if normal else 0)
 
 
 # Shapes cover what split-K changes: K tails, M tails, batch.

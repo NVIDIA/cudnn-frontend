@@ -85,6 +85,12 @@ def test_importing_cudnn_ops_pulls_no_framework():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("module", ["cudnn.ops.norm", "cudnn.experimental.ops"])
+def test_importing_norm_op_packages_pulls_no_framework(module):
+    _assert_absent(_imported_by(f"import cudnn\nimport {module}"), f"import {module}")
+
+
+@pytest.mark.L0
 def test_importing_nvfp4_qat_package_pulls_no_framework():
     """Import the QAT namespace without materializing torch or Triton."""
     stage = "import cudnn.sdpa.bwd.qat"
@@ -131,6 +137,40 @@ except ImportError as error:
     assert "pip install nvidia-cudnn-frontend[cutedsl]" in str(error)
 else:
     raise AssertionError("lazy symbol access unexpectedly succeeded without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "module,symbol",
+    [
+        ("cudnn.ops.norm", "layer_norm"),
+        ("cudnn.experimental.ops", "rms_norm"),
+    ],
+)
+def test_norm_symbols_report_install_hint_without_torch(module, symbol):
+    probe = f"""
+import importlib
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+package = importlib.import_module({module!r})
+try:
+    getattr(package, {symbol!r})
+except ImportError as error:
+    assert "torch" in str(error), str(error)
+    assert "pip install nvidia-cudnn-frontend[cutedsl]" in str(error), str(error)
+else:
+    raise AssertionError("lazy norm symbol unexpectedly loaded without torch")
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
@@ -221,3 +261,26 @@ def test_support_check_pulls_no_framework(module):
     process that merely asks whether an engine applies.
     """
     _assert_absent(_imported_by(f"import cudnn\nimport {module}"), module)
+
+
+@pytest.mark.parametrize("symbol", ["causal_conv1d", "fft_causal_conv1d"])
+@pytest.mark.parametrize("import_order", ["submodule_first", "sibling_first", "symbol_first"])
+def test_ops_callable_exports_survive_import_order(symbol, import_order):
+    """A same-named implementation module must not replace the callable API."""
+    probe = f"""
+import importlib
+import cudnn.ops
+symbol = {symbol!r}
+order = {import_order!r}
+if order == "symbol_first":
+    first = getattr(cudnn.ops, symbol)
+elif order == "sibling_first" and symbol == "causal_conv1d":
+    assert callable(cudnn.ops.causal_conv1d_nwh)
+module = importlib.import_module("cudnn.ops." + symbol)
+export = getattr(cudnn.ops, symbol)
+assert callable(export), type(export)
+assert export is getattr(module, symbol)
+assert getattr(cudnn.ops, symbol) is export
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr

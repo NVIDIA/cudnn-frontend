@@ -19,30 +19,13 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4, st_global, st_global_v2, st_global_v4
+from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
 USE_PDL = True
 
 THREADS_PER_CTA = 512
 FWD_LANES = 4
-FWD_COPY_BITS = 128
 FWD_ROWS_PER_GROUP = 1
-FWD_LOAD_VEC = {2: ld_global_v2, 4: ld_global_v4}[FWD_COPY_BITS // 32]
-FWD_STORE_VEC = {2: st_global_v2, 4: st_global_v4}[FWD_COPY_BITS // 32]
-
-
-def pairwise_sum(terms):
-    """Balanced trace-time tree sum of a power-of-two list of Float32."""
-    while len(terms) > 1:
-        terms = [terms[i] + terms[i + 1] for i in range(0, len(terms), 2)]
-    return terms[0]
-
-
-def fwd_vec_chunks(d: int) -> int:
-    """Accesses each lane makes per row.  FWD_LANES lanes share a row and every
-    access moves FWD_COPY_BITS of it."""
-    per_access = FWD_COPY_BITS // 16
-    return d // FWD_LANES // per_access
 
 
 @cute.kernel
@@ -70,9 +53,7 @@ def frost_l2norm_qk(
     the row.  Tail rows clamp their loads and skip stores."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-    vec_chunks = cutlass.const_expr(fwd_vec_chunks(d))
-    words = cutlass.const_expr(FWD_COPY_BITS // 32)
-    access_bytes = cutlass.const_expr(FWD_COPY_BITS // 8)
+    vec_chunks = cutlass.const_expr(d // (FWD_LANES * 8))
     bid = cute.arch.block_idx()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     grp = tidx // cutlass.Int32(FWD_LANES)
@@ -117,10 +98,10 @@ def frost_l2norm_qk(
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         chunks = []
         for c in cutlass.range_constexpr(vec_chunks):
-            voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(access_bytes)
-            packed = [cutlass.Int32(0)] * words
+            voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(16)
+            packed = [cutlass.Int32(0)] * 4
             if on_phase:
-                packed = list(FWD_LOAD_VEC(src_addr + voff.to(cutlass.Int64), cutlass.Int32))
+                packed = list(ld_global_v4(src_addr + voff.to(cutlass.Int64), cutlass.Int32))
             pairs = [f16x2_to_f32(w, dtype=mQ.element_type) for w in packed]
             chunks.append(tuple(v for pair in pairs for v in pair))
         rows.append(row)
@@ -130,15 +111,16 @@ def frost_l2norm_qk(
     for r in cutlass.range_constexpr(FWD_ROWS_PER_GROUP):
         acc = cutlass.Float32(0.0)
         for c in cutlass.range_constexpr(vec_chunks):
-            acc = acc + pairwise_sum([v * v for v in vals[r][c]])
+            v = vals[r][c]
+            acc = acc + (((v[0] * v[0] + v[1] * v[1]) + (v[2] * v[2] + v[3] * v[3])) + ((v[4] * v[4] + v[5] * v[5]) + (v[6] * v[6] + v[7] * v[7])))
         inv = l2norm_inv(lane_group_sum(acc, FWD_LANES))
         if rows[r] < n_rows:
             for c in cutlass.range_constexpr(vec_chunks):
-                voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(access_bytes)
+                voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(16)
                 f = vals[r][c]
                 scaled = [fmul2(f[i], f[i + 1], inv, inv) for i in range(0, len(f), 2)]
                 packed = [fp32_to_fp16(lo, hi, dtype=mQ.element_type) for lo, hi in scaled]
-                FWD_STORE_VEC(workspace_addrs[r] + voff.to(cutlass.Int64), packed, cutlass.Int32)
+                st_global_v4(workspace_addrs[r] + voff.to(cutlass.Int64), packed, cutlass.Int32)
             if lane_idx == cutlass.Int32(0):
                 st_global(nrm_addrs[r], inv, cutlass.Float32)
     if cutlass.const_expr(USE_PDL):
@@ -189,18 +171,20 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
 
 
-def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, stream) -> L2NormQkRecipe:
+def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, stream) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  Sources
     are read through their own strides; ``expand_num > 1`` writes the q rows
     onto sub-token ``expand_phase`` of the expanded workspace, leaving the
     off-phase rows untouched.  ``expand_fill`` instead walks every expanded q
     row and normalizes a zero row on the off-phase ones, so q_n and inv_q come
-    out fully written on the expanded timeline."""
+    out fully written on the expanded timeline.  ``skip_q`` walks the k rows
+    alone (the state summaries take no q); q, q_n and inv_q are then never
+    read and may alias the k buffers."""
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, d_k = (int(s_) for s_ in k.shape)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
-    n_q_rows = total * h_q * (int(expand_num) if expand_fill else 1)
+    n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))

@@ -34,6 +34,7 @@ _BF16_OK = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >
 # probe() does not map it at all ("unsupported buffer dtype (code=10, bits=8)"),
 # which is a separate gap and not this fix's business.
 _DTYPES = [
+    torch.uint8,
     torch.float16,
     torch.float32,
     pytest.param(torch.bfloat16, marks=pytest.mark.skipif(not _BF16_OK, reason="bfloat16 needs SM80+")),
@@ -75,3 +76,54 @@ def test_probe_is_capture_safe(dtype):
         t.add_(1)
     graph.replay()
     torch.cuda.synchronize()
+
+
+@requires_cuda
+@pytest.mark.parametrize("layout", ["contiguous", "offset", "transpose", "step", "unit", "empty", "empty_offset", "scalar"])
+def test_byte_probe_matches_exported_geometry(layout):
+    storage = torch.empty(1024, dtype=torch.uint8, device="cuda")
+    views = {
+        "contiguous": storage.reshape(32, 32),
+        "offset": storage[128:384].reshape(16, 16),
+        "transpose": storage.reshape(32, 32).T,
+        "step": storage[::2],
+        "unit": storage.as_strided((1, 32), (700, 1), 128),
+        "empty": storage[:0],
+        "empty_offset": storage[128:128],
+        "scalar": storage[128],
+    }
+    value = views[layout]
+    exported = value.__cuda_array_interface__
+    expected = (exported["data"][0], exported["shape"], exported["strides"], "uint8", value.device.index)
+    assert buffers.probe(value) == expected
+
+
+@requires_cuda
+def test_byte_tensor_subclass_keeps_its_export_protocol():
+    storage = torch.empty(256, dtype=torch.uint8, device="cuda")
+
+    class ExportSlice(torch.Tensor):
+        @property
+        def __cuda_array_interface__(self):
+            result = storage.__cuda_array_interface__.copy()
+            result["shape"] = (128,)
+            return result
+
+    value = storage.as_subclass(ExportSlice)
+    assert buffers.probe(value) == (storage.data_ptr(), (128,), None, "uint8", storage.device.index)
+
+
+@requires_cuda
+def test_byte_tensor_mode_keeps_its_export_protocol():
+    storage = torch.empty(256, dtype=torch.uint8, device="cuda")
+    exported = storage.__cuda_array_interface__.copy()
+    exported["shape"] = (128,)
+
+    class ExportMode(torch.overrides.TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            if getattr(func, "__self__", None) is torch.Tensor.__cuda_array_interface__:
+                return exported
+            return func(*args, **(kwargs or {}))
+
+    with ExportMode():
+        assert buffers.probe(storage) == (storage.data_ptr(), (128,), None, "uint8", storage.device.index)
