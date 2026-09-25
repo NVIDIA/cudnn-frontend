@@ -133,3 +133,11 @@ Intercept the compiled consumer for negative tests so intentional aliasing never
 reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
+
+### Prepared SM120 dense launches
+
+SM120 masks the rightmost KV tile for every mask mode, unlike SM100's
+padding-dependent tail rule. A shared binder must preserve that distinction.
+`test_sm120_prepared_bounded_geometry_override` shrinks an unpadded plan to
+S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
+dimensions as compile-time constants: the same binder fixes those per plan.
