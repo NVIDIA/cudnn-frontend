@@ -516,8 +516,10 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     A complete assignment additionally checks the final O store's layout.
     Runtime geometry still has to fit the compiled binder's per-call contract.
     """
-    if capabilities.sm_lo not in (100, 107) or facts.is_fp8 or facts.is_mxfp8:
+    if capabilities.sm_lo not in (100, 107, 120) or facts.is_fp8 or facts.is_mxfp8:
         return "this engine has no prepared shape/stride override executor"
+    if capabilities.sm_lo == 120 and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1):
+        return "prepared SM120 serves dense unsplit half-precision launches"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:
