@@ -30,8 +30,10 @@ SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `is_override_shape_enabled=True` retain compatible prepared SM100/SM107 f16/bf16
 plans: dense zero-copy layouts, split-KV with a non-overlapping final O layout,
 and supported unsplit THD. Each runtime override must remain inside that plan's
-compiled geometry, dtype, layout and workspace envelope. Tensor-only paths
-(including FP8/MXFP8, synthesized KV-tail padding, bias and SM120) decline;
+compiled geometry, dtype, layout and workspace envelope. SM120/SM121 FP16/BF16
+also supports prepared dense unsplit launches, with
+native KV-tail masking and bounded runtime geometry. SM120 THD/split and
+tensor-only paths (FP8/MXFP8, synthesized KV-tail padding and bias) decline;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
