@@ -334,7 +334,7 @@ api.execute(
 
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread block cluster shape `(CLUSTER_M, CLUSTER_N)`
-  - Constraints: positive powers of 2, both <= 4, `CLUSTER_M * CLUSTER_N <= 16`
+  - Constraints: positive powers of 2, both &lt;= 4, `CLUSTER_M * CLUSTER_N <= 16`
   - Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 
 - `sf_vec_size: int`
@@ -422,7 +422,7 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 | Format | ab_dtype | sf_dtype | sf_vec_size | c_dtype | d_dtype |
 |--------|----------|----------|-------------|---------|---------|
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | `{float32, float16, bfloat16}` | `{float16, bfloat16, float8_e4m3fn, float8_e5m2, float4_e2m1fn_x2}` |
-| **NVF4** | `float4_e2m1fn_x2` or `uint8` | {`float8_e8m0fnu`, `float8_e4m3fn`} | {16, 32} | `{float32, float16, bfloat16}` | `{float16, bfloat16, float32}` |
+| **NVF4** | `float4_e2m1fn_x2` or `uint8` | \{`float8_e8m0fnu`, `float8_e4m3fn`\} | \{16, 32\} | `{float32, float16, bfloat16}` | `{float16, bfloat16, float32}` |
 
 #### Additional Type Constraints
 

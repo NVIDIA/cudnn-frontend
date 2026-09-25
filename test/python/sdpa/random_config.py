@@ -42,8 +42,13 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
 
 
 def packed_token_capacity(seq_lens):
-    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
-    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+    """Token capacity of a packed (ragged) buffer: total tokens rounded up to the
+    next multiple of 64, always strictly greater than the total. The surplus
+    guarantees every ragged buffer has a capacity tail past the last ragged
+    offset — the harnesses NaN-poison that tail so an engine that reads it
+    (e.g. binding K/V views to capacity instead of live token counts,
+    GitHub #624) fails deterministically instead of only on recycled memory."""
+    return (sum(seq_lens) // 64 + 1) * 64
 
 
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
@@ -63,7 +68,7 @@ def compute_default_BHSD_strides(shape):
     return tuple(strides)
 
 
-def compute_packed_strides(shape, token_gap=0):
+def compute_packed_strides(shape, token_gap=0, head_gap=0):
     """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1).
 
     ``token_gap`` widens the token stride to ``h*d + token_gap`` elements —
@@ -71,12 +76,14 @@ def compute_packed_strides(shape, token_gap=0):
     ``token_gap == h*d`` this is exactly a K or V view of a kv-interleaved
     ``[T, 2, H, D]`` buffer (token stride ``2*h*d``), the layout
     ``torch.nn.attention.varlen`` users produce by slicing a fused KV
-    projection."""
+    projection. ``head_gap`` widens the head stride to ``d + head_gap``; the
+    token record then spans ``h * (d + head_gap) + token_gap``."""
     if shape is None:
         return None
     _, h, s, d = shape
-    token_stride = h * d + token_gap
-    return (s * token_stride, d, token_stride, 1)
+    head_stride = d + head_gap
+    token_stride = h * head_stride + token_gap
+    return (s * token_stride, head_stride, token_stride, 1)
 
 
 @dataclass
@@ -97,6 +104,12 @@ class ExecConfig:
     is_alibi: bool = None
     is_infer: bool = True
     is_paged: bool = False
+    # Paged only: NaN-fill every K/V pool page no per-batch seq_len_kv reaches (a dead
+    # block-table slot), so an engine that dereferences it poisons O. Opt-in because it
+    # is a FROST-kernel promise (TMA-OOB page -1 past the live pages), not the paged
+    # contract: the backend engine loads and masks whole tile-rounded page ranges and
+    # needs finite data there. Set by tests pinned to a FROST paged engine.
+    paged_nan_dead_pages: bool = False
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
@@ -115,11 +128,20 @@ class ExecConfig:
     is_dropout: bool = None
     is_determin: bool = None
     is_mxfp8: bool = False
+    # FP8 / MXFP8 forward only: block-scaled O epilogue (the sdpa_fp8 / sdpa_mxfp8
+    # sf_o output). 0 = plain O, 16 = FP4_E2M1 O + E4M3 scale per 16 d, 32 =
+    # FP8_E4M3 O + UE8M0 scale per 32 d. Applied only where the FROST d128
+    # epilogue serves the config (dense, d_qk = d_v = 128); exec_sdpa_fp8 /
+    # exec_sdpa_mxfp8 fold it to 0 otherwise.
+    o_block_scale: int = 0
 
     with_score_max: bool = False
     with_score_sum_exp: bool = False
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
+    # Forward writes base-2 stats (sdpa(stats_use_log2=True)); the harness restores the
+    # natural-log form before the backward, which consumes natural-log stats only.
+    with_stats_log2: bool = False
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
     # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
@@ -137,6 +159,23 @@ class ExecConfig:
     # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
     # unaffected (the gap only fills strides left None).
     with_ragged_token_gap: bool = True
+    # Sibling of the above for the HEAD axis (stride[1] != d, e.g. head-interleaved
+    # buffers): each ragged tensor independently widens its head stride by 0-3
+    # units of 16 bytes, only where d itself is 16-byte granular so every head base
+    # keeps the packed layout's alignment class. Drawn after the token gaps from the
+    # same RNG, so existing seeds keep their token layouts.
+    with_ragged_head_gap: bool = True
+    # Packed (THD) token capacities, first-class: buffer allocation sizes the
+    # packed Q/O and K/V buffers from these (not a locally recomputed
+    # sum-of-seq-lens), knobs may fuzz slack capacity beyond the packed
+    # minimum, and when declare_total_seq_len is True they are declared on
+    # the graph via sdpa(max_total_seq_len_q/kv=...). None -> derived as
+    # packed_token_capacity(seq_len_*) in fill_derived_fields.
+    total_q: int = None
+    total_kv: int = None
+    # Declare total_q/total_kv on the forward graph (max_total_seq_len_q/kv).
+    # The backward graph always declares them (it must size dq_acc).
+    declare_total_seq_len: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -206,6 +245,19 @@ class ExecConfig:
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
+        # Packed token capacities: default to the minimal packed capacity of
+        # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
+        # slack-capacity fuzz) must cover the packed payload.
+        if self.is_ragged:
+            seq_len_q = self.seq_len_q or [self.s_q] * (self.batches or 1)
+            seq_len_kv = self.seq_len_kv or [self.s_kv] * (self.batches or 1)
+            if self.total_q is None:
+                self.total_q = packed_token_capacity(seq_len_q)
+            if self.total_kv is None:
+                self.total_kv = packed_token_capacity(seq_len_kv)
+            assert self.total_q >= sum(seq_len_q), f"total_q={self.total_q} < sum(seq_len_q)"
+            assert self.total_kv >= sum(seq_len_kv), f"total_kv={self.total_kv} < sum(seq_len_kv)"
+
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
         # with_ragged_token_gap (default True): per-tensor token-stride gaps,
         # re-derived deterministically from rng_geom_seed (so
@@ -217,29 +269,33 @@ class ExecConfig:
         #    packed strides (#537).
         _gap_applicable = (
             self.is_ragged
-            and self.with_ragged_token_gap
+            and (self.with_ragged_token_gap or self.with_ragged_head_gap)
             and not self.is_cu_seq_len
             and not self.with_ragged_offset_multiplier
             and not (self.data_type is not None and self.data_type.itemsize == 1)
         )
         if _gap_applicable:
             _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
-            # Draw ALL FOUR gaps up front, in fixed Q/K/V/O order: an
+            # Draw ALL gaps up front, in fixed Q/K/V/O order: an
             # explicitly provided stride must not shift the gaps the
             # remaining tensors get (same rng_geom_seed -> same per-tensor
             # layouts regardless of which strides were overridden).
-            _gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _token_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gap_quantum = 16 // (self.data_type.itemsize if self.data_type is not None else 2)
 
-            def _make_gap_fn(gap_tokens):
+            def _make_gap_fn(token_gap_units, head_gap_units):
                 def _gapped(shape):
                     if shape is None:
                         return None
                     h, d = shape[1], shape[3]
-                    return compute_packed_strides(shape, gap_tokens * h * d)
+                    token_gap = token_gap_units * h * d if self.with_ragged_token_gap else 0
+                    head_gap = head_gap_units * _head_gap_quantum if self.with_ragged_head_gap and d % _head_gap_quantum == 0 else 0
+                    return compute_packed_strides(shape, token_gap, head_gap)
 
                 return _gapped
 
-            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_gaps[n]) for n in ("q", "k", "v", "o"))
+            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_token_gaps[n], _head_gaps[n]) for n in ("q", "k", "v", "o"))
         elif self.is_ragged:
             gap_q = gap_k = gap_v = gap_o = compute_packed_strides
         else:
@@ -352,14 +408,27 @@ class RandomizationContext:
         randoms_.with_ragged_offset_multiplier = randoms["is_ragged_or_padded_or_full"] in ("ragged_mult", "cu_ragged_mult")
 
         if randoms["is_ragged_or_padded_or_full"] != "full":
-            # ~10% chance of 0-length sequence for each batch
-            randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
-            # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
-            randoms_.seq_len_kv = [
-                # 0 if rng.random() < 0.1 else rng.randint(randoms_.seq_len_q[i], randoms_.s_kv) for i in range(randoms_.batches)
-                rng.randint(1, randoms_.s_kv)
-                for i in range(randoms_.batches)
-            ]
+            # Per-batch lengths draw U(0, s_max) — zero is a legal length, not
+            # a special case — with an extra ~3% forced-zero boost per entry
+            # (a pure uniform would make zeros ~1/(s+1) rare and zero-length
+            # handling would go untested in practice). Q and KV draw
+            # independently.
+            randoms_.seq_len_q = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_q) for _ in range(randoms_.batches)]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_kv) for i in range(randoms_.batches)]
+
+        # Packed token capacities (first-class). Default is the minimal packed
+        # capacity; the optional total_token_slack knob widens capacity beyond
+        # it in whole 64-token steps — a buffer bigger than its payload, the
+        # normal shape of a reused/pooled varlen workspace.
+        if randoms_.is_ragged:
+            slack = randoms.get("total_token_slack", "packed")
+            def _capacity(seq_lens):
+                cap = packed_token_capacity(seq_lens)
+                if slack == "slack":
+                    cap += 64 * rng.randint(1, 4)
+                return cap
+            randoms_.total_q = _capacity(randoms_.seq_len_q)
+            randoms_.total_kv = _capacity(randoms_.seq_len_kv)
 
         # Decide the left and right bounds for the sliding window mask (None = no bound)
         randoms_.left_bound = None
@@ -374,8 +443,9 @@ class RandomizationContext:
             randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
             randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
         elif randoms["with_sliding_mask"] == "band_around_diag":
-            randoms_.left_bound = rng.randint(1, randoms_.s_kv // 2)
-            randoms_.right_bound = rng.randint(1, randoms_.s_kv // 2)
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
         elif randoms["with_sliding_mask"] == "causal":
             randoms_.right_bound = 0
 
@@ -386,13 +456,18 @@ class RandomizationContext:
         randoms_.shape_stats = (randoms_.batches, randoms_.h_q, randoms_.s_q, 1)
 
         if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
-            randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
-            randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
+            # Q/O strides stay None: fill_derived_fields (called before
+            # return) draws the seeded per-tensor token gaps there, with the
+            # auto-packed fallbacks for the cu / offset-multiplier forms
+            # (#538) and 1-byte data types (#537). Assigning packed strides
+            # here would bypass that knob for the whole randomized fleet —
+            # exactly how the numel()//token_stride capacity bug (issue #613)
+            # stayed invisible to these sweeps.
             if randoms_.ragged_stats_layout == "head_major":
                 # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
                 # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
                 # token-major one its sequence stride is 1 instead of h_q.
-                t_q = packed_token_capacity(randoms_.seq_len_q)
+                t_q = randoms_.total_q
                 randoms_.stride_stats = (randoms_.h_q * t_q, t_q, 1, 1)
             else:
                 randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
@@ -403,17 +478,19 @@ class RandomizationContext:
             indices.append(3)
             gaps_q = [0, 0, 0, 0]
             gaps_o = [0, 0, 0, 0]
+            gaps_stats = [0, 0, 0, 0]
 
             if rng.randint(0, 1) == 0:  # 50% chance of gaps
                 gaps_q = [rng.randint(0, 8) for _ in range(3)]
                 gaps_o = [rng.randint(0, 8) for _ in range(3)]
+                gaps_stats = [rng.randint(0, 8) for _ in range(3)]
                 gaps_q.append(elem_align * rng.randint(0, 2))
                 gaps_o.append(elem_align * rng.randint(0, 2))
+                gaps_stats.append(elem_align * rng.randint(0, 2))
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
-            # TODO: Randomize stride_stats once all layouts are supported correctly.
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bhsd")
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
 
         # Decide K, V
         randoms_.shape_k = (
@@ -425,8 +502,7 @@ class RandomizationContext:
         randoms_.shape_v = (randoms_.batches, randoms_.h_v, randoms_.s_kv, randoms_.d_v)
 
         if randoms_.is_ragged:  # Ideally K ragged and V ragged
-            randoms_.stride_k = get_strides_from_layout(randoms_.shape_k, "bshd")
-            randoms_.stride_v = get_strides_from_layout(randoms_.shape_v, "bshd")
+            pass  # K/V strides stay None -> seeded token gaps in fill_derived_fields
 
         else:
             indices = [0, 1, 2]
@@ -444,6 +520,10 @@ class RandomizationContext:
             randoms_.stride_k = get_strides_from_indices(randoms_.shape_k, indices, gaps_k, rng)
             randoms_.stride_v = get_strides_from_indices(randoms_.shape_v, indices, gaps_v, rng)
 
+        # Fill whatever was left None (ragged Q/K/V/O strides) through the
+        # same derivation every ExecConfig takes — one source of truth for
+        # the ragged token-gap draw and its fallbacks.
+        randoms_.fill_derived_fields()
         return randoms_
 
 
@@ -551,10 +631,14 @@ class RandomHiddenDimSize:
         d_v_max: int,
         head_dim_distribution: dict[Any, int],
         with_high_probability: Optional[List[tuple[int, int]]] = None,
+        multiple_of: int = 8,
     ):
 
-        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=8)
-        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=8)
+        # multiple_of: the head-dim granularity of the random draw (8, the default, keeps
+        # every existing seed's sequence; the fp8 graphs need 16, so their sweeps pass 16
+        # rather than skipping the draws the harness would reject).
+        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=multiple_of)
+        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=multiple_of)
         self.distribution = RandomChoice(head_dim_distribution)
         self.with_high_probability = with_high_probability
 

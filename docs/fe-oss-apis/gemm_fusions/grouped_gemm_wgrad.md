@@ -5,10 +5,10 @@ SM100+ APIs for grouped MoE weight gradients. The same public surface dispatches
 BF16 inputs to the BF16 kernel and preserves the legacy FP4/FP8 block-scaled
 backend.
 
-Install the optional CuTe DSL dependencies before importing either API:
+The CuTe DSL dependencies both APIs need ship with the package:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## JAX support
@@ -91,6 +91,35 @@ operand pair. It preserves the pre-existing scale-factor contract: provide
 `sfa_tensor` and `sfb_tensor`, and provide `global_scale_a` and
 `global_scale_b` where the selected low-precision format requires them. BF16
 does not reinterpret these controls; it rejects them instead.
+
+Torch block-scaled callers in dense or discrete output mode that retain
+operations for CUDA Graph replay may provide a caller-owned
+`descriptor_workspace`; pass this extension by keyword. Allocate its size with
+`get_grouped_gemm_wgrad_workspace_size_sm100`, keep it alive for as long as the
+captured call site may replay, and do not share it between call sites that may
+overlap. This lets multiple same-signature calls share one compiled kernel
+without sharing mutable runtime TMA descriptors. Callers that omit this
+argument retain the compatibility behavior that isolates cached API instances
+by explicit dense output address; discrete callers retain the compiled
+operation's internal workspace.
+
+```python
+workspace = torch.empty(
+    cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(num_experts),
+    dtype=torch.uint8,
+    device=a_tensor.device,
+)
+result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
+    a_tensor=a_tensor,
+    b_tensor=b_tensor,
+    sfa_tensor=sfa_tensor,
+    sfb_tensor=sfb_tensor,
+    offsets_tensor=offsets_tensor,
+    wgrad_tensor=wgrad_tensor,
+    descriptor_workspace=workspace,
+    output_mode="dense",
+)
+```
 
 ## API usage
 

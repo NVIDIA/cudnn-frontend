@@ -1,18 +1,41 @@
 # Licensing
 
 cudnn-frontend is distributed primarily under the **Apache License 2.0**
-(see [LICENSE.txt](LICENSE.txt)). A subset of files remain under the **MIT
-License** (see [LICENSE-MIT.txt](LICENSE-MIT.txt)). Every source file carries
-an SPDX `SPDX-License-Identifier:` tag declaring which license applies to it.
+(see [LICENSE.txt](LICENSE.txt)). Some files retain **MIT** or **BSD-3-Clause**
+terms for pre-existing code. Every source file carries an SPDX
+`SPDX-License-Identifier:` expression declaring the applicable licenses.
 
 To find the license of any file, read its SPDX tag, e.g.:
 
 ```
-SPDX-License-Identifier: Apache-2.0   # most files
-SPDX-License-Identifier: MIT          # the files listed below
+SPDX-License-Identifier: Apache-2.0
+SPDX-License-Identifier: MIT
+SPDX-License-Identifier: Apache-2.0 AND MIT
+SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 ```
 
 Third-party attributions are in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
+
+## Apache-2.0 modifications to existing licensed code
+
+The OSS warning cleanup licenses its NVIDIA modifications under Apache-2.0,
+including changes to files with retained MIT or BSD-3-Clause code. Their headers
+identify the scope of the modifications and use an SPDX `AND` expression to
+preserve the pre-existing terms. This is not an alternative-license choice:
+both sets of applicable terms must be respected. See the
+[SPDX license-expression specification](https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/#d43-conjunctive-and-operator).
+
+Original copyright notices, provenance comments, and embedded license texts
+remain intact. MIT terms are reproduced in [LICENSE-MIT.txt](LICENSE-MIT.txt),
+and upstream license texts and attributions are reproduced in
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt). Where an existing file
+carries both an MIT declaration and a BSD notice, its expression retains both.
+The adapted CUTLASS static scheduler in `python/cudnn/_cutlass_helpers/` likewise
+retains BSD-3-Clause for the upstream code and applies Apache-2.0 to local changes.
+
+An Apache-2.0 modification does not assert that upstream authors relicensed
+their contributions. Files whose complete NVIDIA ownership is established can
+use Apache-2.0 alone; `_fp8_quant.py` in `block_sparse_attention/` is one such file.
 
 ## Why some files remain under MIT
 
@@ -27,7 +50,8 @@ owned by NVIDIA. Files are kept under MIT in two cases:
    (yet) been obtained. Determined by `git blame` on `develop`: a file stays
    MIT if any external contributor's lines survive in it.
 2. **Third-party-derived code** — the file is derived from external open
-   source (FlashAttention, QuACK) and carries the original author's copyright.
+   source (FlashAttention, QuACK, or CUTLASS) and carries the original author's
+   copyright.
 
 If/when a listed external contributor grants consent, the files attributed to
 them below can be moved to Apache 2.0 by flipping their SPDX tag.
@@ -103,12 +127,14 @@ surviving external line(s) in each file (blame on `origin/develop`).
 > Note: `dlpack_version.txt` is a plain version-string file that cannot carry
 > a header comment; it is listed here and governed by MIT via this manifest.
 
-## Category 2 — MIT, third-party-derived (29 files)
+## Category 2 — Third-party-derived files retaining MIT terms (36 files)
 
-Derived from FlashAttention (BSD-3-Clause) and/or QuACK (Apache-2.0); they
-retain their original authors' copyright notices. See THIRD_PARTY_LICENSES.txt.
-The commit link(s) are the NVIDIA import commits that introduced the surviving
-derived lines.
+Derived from FlashAttention or CUTLASS (both BSD-3-Clause) and/or QuACK
+(Apache-2.0); they retain their original authors' copyright notices. See
+THIRD_PARTY_LICENSES.txt. Files with Apache-2.0 modifications retain MIT in their
+compound SPDX expression. The commit link(s) are the NVIDIA import commits that
+introduced the surviving derived lines. This historical list does not enumerate
+every later import; the source headers and third-party notices also cover those.
 
 | File | Import commit(s) |
 |------|------------------|
@@ -141,4 +167,10 @@ derived lines.
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/bwd_tile_scheduler.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/mma.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`74efc0d`](https://github.com/NVIDIA/cudnn-frontend/commit/74efc0d44a11005326e797201b58adb1399b4733) (#321) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/primitives.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`7016b04`](https://github.com/NVIDIA/cudnn-frontend/commit/7016b04077c4c53ee00ba39a86ab1067a7542e8c) (#316) |
-
+| `python/cudnn/hstu/hstu_attention/_kernels/blackwell_helpers.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/block_info.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/fast_math.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/mask.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/mma_sm100_desc.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/tile_scheduler.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu/hstu_attention/_kernels/utils.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |

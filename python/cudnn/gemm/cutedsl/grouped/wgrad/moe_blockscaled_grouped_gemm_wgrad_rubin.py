@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """Rubin (SM107) block-scaled MoE grouped GEMM weight-gradient kernel."""
 
@@ -7,6 +10,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import get_smem_capacity_in_bytes
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -86,7 +90,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.architecture = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.smem_capacity = get_smem_capacity_in_bytes(self.architecture)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     def _setup_attributes(self) -> None:
@@ -98,7 +102,11 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
         valid_quantization = (
             self.a_dtype is cutlass.Float4E2M1FN
             and self.b_dtype is cutlass.Float4E2M1FN
-            and ((self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 16) or (self.sf_dtype is cutlass.Float8E8M0FNU and self.sf_vec_size == 32))
+            and (
+                (self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 16)
+                or (self.sf_dtype is cutlass.Float8E8M0FNU and self.sf_vec_size == 32)
+                or (self.sf_dtype is cutlass.FloatNV8E5M3FNU and self.sf_vec_size == 16)
+            )
         ) or (
             self.a_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
             and self.b_dtype is self.a_dtype
@@ -106,7 +114,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
             and self.sf_vec_size == 32
         )
         if not valid_quantization:
-            raise ValueError("Rubin wgrad supports NVFP4, MXFP4, MXFP8-E4M3, " "or MXFP8-E5M2 block scaling.")
+            raise ValueError("Rubin wgrad supports NVFP4 (E4M3 or E5M3 scales), MXFP4, MXFP8-E4M3, or MXFP8-E5M2 block scaling.")
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError("Rubin wgrad requires Float32 accumulators.")
         if self.a_dtype.width == 4 and (self.a_major_mode != OperandMajorMode.K or self.b_major_mode != OperandMajorMode.K):
@@ -125,7 +133,12 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
         self.mma_tiler = (*self.mma_inst_shape_mn, mma_tiler_k)
         self.mma_tiler_sfb = (*self.mma_inst_shape_mn_sfb, mma_tiler_k)
 
-        use_sf_window = self.sf_vec_size == 16 and self.sf_dtype is cutlass.Float8E4M3FN and self.mma_tiler[1] == 256 and self.mma_tiler[2] == 512
+        use_sf_window = (
+            self.sf_vec_size == 16
+            and self.sf_dtype in (cutlass.Float8E4M3FN, cutlass.FloatNV8E5M3FNU)
+            and self.mma_tiler[1] == 256
+            and self.mma_tiler[2] == 512
+        )
         self.sf_window_k = self.instruction_k * 2 if use_sf_window else self.mma_tiler[2]
         self.num_mma_instructions_per_sf_window = self.sf_window_k // self.instruction_k
         self.num_sf_windows_per_ab_stage = self.mma_tiler[2] // self.sf_window_k

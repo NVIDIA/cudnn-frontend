@@ -300,6 +300,9 @@ def run_discrete_dswiglu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    act_func: str = "dswiglu",
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
 ) -> Dict[str, torch.Tensor]:
     num_experts = len(b_ref_list)
     n = b_ref_list[0].shape[0]
@@ -336,15 +339,27 @@ def run_discrete_dswiglu_ref(
     c_input = c_full.index_select(dim=1, index=dest_idx_ab)
     c_gate = c_full.index_select(dim=1, index=dest_idx_glu)
     sig = torch.sigmoid(c_gate)
-    swish = c_gate * sig
+    if act_func == "dsituglu":
+        gate_tanh = torch.tanh(c_gate / situ_beta1)
+        up_tanh = torch.tanh(c_input / situ_beta2)
+        gate_value = situ_beta1 * gate_tanh * sig
+        up_value = situ_beta2 * up_tanh
+        gate_grad = (1.0 - gate_tanh.square()) * sig
+        gate_grad = gate_grad + situ_beta1 * gate_tanh * sig * (1.0 - sig)
+        up_grad = 1.0 - up_tanh.square()
+        ref_dprob = gate_value * up_value * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * gate_value * up_grad
+        dswiglu = ref * prob * up_value * gate_grad
+    else:
+        swish = c_gate * sig
+        ref_dprob = swish * c_input * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * swish
+        dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
-    ref_dprob = swish * c_input * ref
     chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
     ref_tensors["dprob_ref"] = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)
-
-    prob = prob_tensor.expand(-1, n, -1)
-    ab = ref * prob * swish
-    dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
     ref_d = torch.empty_like(c_full)
     ref_d.index_copy_(dim=1, index=dest_idx_ab, source=ab.index_select(dim=1, index=src_idx_n))
@@ -426,6 +441,9 @@ def check_ref_discrete_dswiglu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        act_func=cfg.get("act_func", "dswiglu"),
+        situ_beta1=cfg.get("situ_beta1", 4.0),
+        situ_beta2=cfg.get("situ_beta2", 25.0),
     )
 
     torch.cuda.synchronize()

@@ -14,15 +14,13 @@ import importlib
 from typing import Any
 
 _LAZY_EXPORTS = {
-    "SdpafwdSm100D256": (".api", "SdpafwdSm100D256"),
-    "sdpa_fwd_wrapper_sm100_d256": (".api", "sdpa_fwd_wrapper_sm100_d256"),
     "SdpaFwdDsl": (".api_dsl", "SdpaFwdDsl"),
     "SdpaFwdDslSm100": (".api_dsl", "SdpaFwdDslSm100"),
     "SdpaFwdDslSm120": (".api_dsl", "SdpaFwdDslSm120"),
     "sdpa_fwd_wrapper_dsl_sm100": (".api_dsl", "sdpa_fwd_wrapper_dsl_sm100"),
     "sdpa_fwd_wrapper_dsl_sm120": (".api_dsl", "sdpa_fwd_wrapper_dsl_sm120"),
-    "SdpafwdSm80": (".api", "SdpafwdSm80"),
-    "sdpa_fwd_wrapper_sm80": (".api", "sdpa_fwd_wrapper_sm80"),
+    "SdpaFwdDslSm80": (".api_dsl", "SdpaFwdDslSm80"),
+    "sdpa_fwd_wrapper_sm80": (".api_dsl", "sdpa_fwd_wrapper_sm80"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

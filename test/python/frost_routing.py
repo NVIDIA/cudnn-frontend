@@ -14,6 +14,11 @@ stays visible per op family without touching the cudnn package itself.
 
 COUNTS: "dict[str, int]" = {}
 
+# The most recently tallied graph: ``(engine name or None, its PlanConfig.knobs
+# or None)``. Lets a test assert WHICH plan of an engine served (a kernel
+# flavor selected by a knob value), where COUNTS only says which engine.
+LAST_PLAN: "tuple" = (None, None)
+
 
 def note(key: str) -> None:
     COUNTS[key] = COUNTS.get(key, 0) + 1

@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -263,6 +264,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         enable_bias: bool = False,
         use_single_group_runtime_offsets: bool = False,
     ):
@@ -366,7 +368,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -381,7 +383,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.num_epilog_warps = len(self.epilog_warp_id)
 
         self.act_func = act_func
-        if act_func not in ["swiglu", "geglu"]:
+        self.situ_beta1 = float(situ_beta1)
+        if act_func not in ["swiglu", "geglu", "situglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
     def _setup_attributes(self):
@@ -698,6 +701,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -728,6 +733,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         geglu_alpha: cutlass.Float32 = 1.702,
         glu_clamp_max: cutlass.Float32 = 7.0,
         glu_clamp_min: cutlass.Float32 = -7.0,
+        situ_beta1: cutlass.Float32 = 4.0,
+        situ_beta2: cutlass.Float32 = 25.0,
     ):
         """Execute the GEMM.
 
@@ -743,7 +750,13 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             out = (clamp(up, min=glu_clamp_min, max=glu_clamp_max) + linear_offset)
                   * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))
 
-        They are ignored when ``act_func == "swiglu"``.
+        ``situ_beta1`` and ``situ_beta2`` configure SiTU-GLU:
+
+            out = beta1 * tanh(gate / beta1) * sigmoid(gate)
+                  * beta2 * tanh(up / beta2)
+
+        GeGLU parameters are ignored unless ``act_func == "geglu"`` and SiTU
+        parameters are ignored unless ``act_func == "situglu"``.
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
@@ -751,12 +764,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -1090,6 +1103,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             geglu_alpha,
             glu_clamp_max,
             glu_clamp_min,
+            situ_beta1,
+            situ_beta2,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1553,6 +1568,33 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 if cutlass.const_expr(self.has_prob):
                     tCompute[i] = tCompute[i] * mProb
 
+    @cute.jit
+    def situglu_act(
+        self,
+        tCompute: cute.Tensor,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        mProb: cute.Tensor,
+        beta1: cutlass.Float32,
+        beta2: cutlass.Float32,
+    ):
+        beta1_rcp = cutlass.Float32(1.0 / self.situ_beta1)
+        beta2_rcp = cute.arch.rcp_approx(beta2)
+        beta_product = beta1 * beta2
+        for i in cutlass.range_constexpr(cute.size(tCompute)):
+            gate = acc_vec_gate[i]
+            up = acc_vec_up[i]
+            gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
+            up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
+            if cutlass.const_expr(self.situ_beta1 == 4.0):
+                # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
+                sigmoid = cutlass.Float32(0.5) + gate_tanh * cute.arch.rcp_approx(cutlass.Float32(1.0) + gate_tanh * gate_tanh)
+            else:
+                sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            tCompute[i] = beta_product * gate_tanh * sigmoid * up_tanh
+            if cutlass.const_expr(self.has_prob):
+                tCompute[i] = tCompute[i] * mProb
+
     # GPU device kernel
     @cute.kernel
     def kernel(
@@ -1598,6 +1640,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         geglu_alpha: cutlass.Float32 = 1.702,
         glu_clamp_max: cutlass.Float32 = 7.0,
         glu_clamp_min: cutlass.Float32 = -7.0,
+        situ_beta1: cutlass.Float32 = 4.0,
+        situ_beta2: cutlass.Float32 = 25.0,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1645,7 +1689,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1721,7 +1765,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2733,6 +2777,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, linear_offset, geglu_alpha)
                     elif cutlass.const_expr(self.act_func == "swiglu"):
                         self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
+                    elif cutlass.const_expr(self.act_func == "situglu"):
+                        self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
 
                     #
                     # Generate amax
@@ -2892,6 +2938,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             #
             c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     def epilog_tmem_copy_and_partition(
         self,

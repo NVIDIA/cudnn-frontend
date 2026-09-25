@@ -18,9 +18,28 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
         return "tf32"
     if isinstance(op, tcgen05.mma.MmaI8Op):
         return "i8"
-    if isinstance(op, tcgen05.mma.MmaF8F6F4Op):
+    # CUTLASS 4.4 renamed the ordinary (non block-scaled) FP8 op to
+    # MmaFP8Op.  Keep the old spelling as well so this repository remains
+    # usable with the CUTLASS revision it originally targeted.
+    fp8_op_types = tuple(
+        op_type
+        for op_type in (
+            getattr(tcgen05.mma, "MmaFP8Op", None),
+            getattr(tcgen05.mma, "MmaF8F6F4Op", None),
+        )
+        if op_type is not None
+    )
+    if isinstance(op, fp8_op_types):
         return "f8f6f4"
-    if isinstance(op, tcgen05.mma.MmaMXF8F6F4Op):
+    mxfp8_op_types = tuple(
+        op_type
+        for op_type in (
+            getattr(tcgen05.mma, "MmaMXF8Op", None),
+            getattr(tcgen05.mma, "MmaMXF8F6F4Op", None),
+        )
+        if op_type is not None
+    )
+    if isinstance(op, mxfp8_op_types):
         return "mxf8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF4Op):
         return "mxf4"

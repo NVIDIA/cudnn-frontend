@@ -12,12 +12,30 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 SEQ_Q_TILES = (32, 64, 128)
 SEQ_KV_TILES = (64, 128)
 SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
+# (q_tile, kv_tile) the kernel runs at for a padded d_qk when a tile is left at
+# 0. Lives here (not on the kernel class) so the family heuristics can list the
+# pair as the plan's public knobs without importing the DSL.
+DEFAULT_TILES = {32: (128, 64), 64: (64, 128), 128: (64, 64), 192: (32, 64), 256: (32, 64)}
+ROW_ROUND = 128
 
 
 def padded_head_dim(d: int) -> "int | None":
-    """Smallest native bin >= ``d``, or ``None`` when ``d`` exceeds every bin."""
+    """Smallest native kernel head-dim size >= ``d``, or ``None`` when ``d`` exceeds them all."""
 
     return min((b for b in SUPPORTED_HEAD_DIMS if b >= d), default=None)
+
+
+def padded_head_dims(d_qk: int, d_v: int) -> "tuple[int, int] | None":
+    """Native kernel head-dim sizes for a head-dim pair."""
+
+    d_qk_pad = padded_head_dim(d_qk)
+    d_v_pad = padded_head_dim(d_v)
+    if d_qk_pad is None or d_v_pad is None:
+        return None
+    # Unequal dims must both be multiples of 64 (one smem swizzle).
+    if d_v_pad != d_qk_pad:
+        d_v_pad = max(d_v_pad, 64)
+    return d_qk_pad, d_v_pad
 
 
 @dataclass(frozen=True)
@@ -25,9 +43,9 @@ class TemplateParams:
     """Per-graph parameters that change the traced SM120 backward kernel.
 
     Tensor geometry deliberately stays out of this record. Scalar dimensions
-    are inputs to the template module's per-shape ``compile()`` cache, while
-    strides follow the fixed compact-BSHD kernel contract. This frozen record
-    identifies the import-time specialization shared by all compatible shapes.
+    are inputs to the template module's per-shape ``compile()`` cache. This
+    frozen record identifies the import-time specialization shared by all
+    compatible shapes.
     """
 
     dtype_qkv: int = DTYPE_FP16
@@ -45,6 +63,13 @@ class TemplateParams:
     # Sink Attention
     sink_present: bool = False
     dsink_present: bool = False
+    # Deterministic two-kernel split
+    det_2kernel: bool = False
+    # Additive bias and its gradient output.
+    bias_present: bool = False
+    dbias_present: bool = False
+    bias_is_fp32: bool = False
+    dbias_is_fp32: bool = False
 
 
 def validate_params(params: TemplateParams) -> None:
@@ -69,6 +94,14 @@ def validate_params(params: TemplateParams) -> None:
         raise ValueError("SM120 SDPA bwd: seq_q_lens_present requires seq_kv_lens_present (padding mask)")
     if params.dsink_present and not params.sink_present:
         raise ValueError("SM120 SDPA bwd: dsink_present requires sink_present (a dSink output needs the sink logits)")
+    if params.det_2kernel and not params.deterministic:
+        raise ValueError("SM120 SDPA bwd: det_2kernel is a deterministic-mode split and requires deterministic=True")
+    if params.det_2kernel and (params.window_size_left is not None or params.seq_kv_lens_present or params.seq_q_lens_present):
+        raise ValueError("SM120 SDPA bwd: det_2kernel does not support sliding-window or padding masks (use the relay path)")
+    if params.dbias_present and not params.bias_present:
+        raise ValueError("SM120 SDPA bwd: dbias_present requires bias_present (a dBias output needs the bias input)")
+    if (params.bias_is_fp32 and not params.bias_present) or (params.dbias_is_fp32 and not params.dbias_present):
+        raise ValueError("SM120 SDPA bwd: bias_is_fp32 / dbias_is_fp32 only apply when the matching feature is present")
     if params.q_tile not in (0,) + SEQ_Q_TILES:
         raise ValueError(f"SM120 SDPA bwd: q_tile must be one of {(0,) + SEQ_Q_TILES} (0 = per-head-dim default); got {params.q_tile}")
     if params.kv_tile not in (0,) + SEQ_KV_TILES:

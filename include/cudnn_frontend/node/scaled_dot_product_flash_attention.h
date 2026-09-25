@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 #include "../../cudnn_frontend_Heuristics.h"
@@ -140,11 +141,6 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     SDPANodeBase(SDPA_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP<DerivedT>(context), attributes(std::move(attributes_)) {}
-
-    SDPA_attributes const*
-    get_sdpa_attributes() const override {
-        return &attributes;
-    }
 
     bool
     is_paged_v() const {
@@ -286,7 +282,30 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
+
+        // O is not a caller tensor: the graph factory creates it with output_tensor(), so its
+        // dim/stride are unset unless the caller declares them, and infer_properties_node()
+        // materializes a packed BHSD layout for an undeclared one (the same contract Stats, Max
+        // and Sum_exp follow). Only a caller-declared layout can be judged in pre -- running the
+        // rank/stride check on "not yet derived" properties would report a legal omission as an
+        // invalid O. The materialized layout is re-checked in post_validate_node().
+        {
+            auto const& o_tensor    = attributes.outputs.at(output_names::O);
+            bool const o_dim_set    = !o_tensor->get_dim().empty();
+            bool const o_stride_set = !o_tensor->get_stride().empty();
+
+            RETURN_CUDNN_FRONTEND_ERROR_IF(o_dim_set != o_stride_set,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "The dim and stride for output_names::O must be declared together, or "
+                                           "both left unset to have them inferred.");
+            if (o_dim_set) {
+                CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
+            }
+        }
+
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
 
         if (attributes.generate_stats.value_or(false) == true) {
             CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
@@ -442,9 +461,34 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         // [n, 1, 1, 1] (contiguous) form the cuDNN backend requires.
         promote_index_tensors_to_4d();
 
+        // O is created by the graph factory with output_tensor(); when the caller leaves both dim
+        // and stride unset, materialize the packed BHSD layout here -- the same way the Stats, Max
+        // and Sum_exp outputs below are materialized. The composite node's bmm2 (built in
+        // expand_node()) then honours this declaration instead of inferring its own, and validate()
+        // -- which never expands the composite -- still sees a complete output tensor.
+        {
+            auto const& o_tensor = attributes.outputs.at(output_names::O);
+            if (o_tensor->get_dim().empty() && o_tensor->get_stride().empty()) {
+                auto const& q_dim = attributes.inputs[input_names::Q]->get_dim();
+                auto const& v_dim = attributes.inputs[input_names::V]->get_dim();
+                auto const b      = q_dim[0];
+                auto const h_q    = q_dim[1];
+                auto const s_q    = q_dim[2];
+                auto const d_v    = v_dim[3];
+                o_tensor->set_dim({b, h_q, s_q, d_v}).set_stride({h_q * s_q * d_v, s_q * d_v, d_v, 1});
+            }
+        }
+
         if (attributes.generate_stats.value_or(false)) {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
+
+            // Stats is always computed and stored in FP32, regardless of the io data type.
+            // Default an unset data type here instead of fill_from_context, which would
+            // wrongly assign the io data type.
+            if (stats->get_data_type() == DataType_t::NOT_SET) {
+                stats->set_data_type(DataType_t::FLOAT);
+            }
 
             if (stats_dim.empty()) {
                 // Fill properties of virtual tensors
@@ -486,19 +530,68 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     error_t
     post_validate_node() const override final {
-#define CUDNN_FE_VALIDATE_STRIDE(port, port_map)                                                                \
-    {                                                                                                           \
-        auto const& t = port_map.find(port);                                                                    \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            t->second->get_stride().back() != 1,                                                                \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
-                std::string(#port));                                                                            \
-    }
+        // Runs after infer_properties_node(), so O now carries either the layout the caller
+        // declared or the packed BHSD layout inference materialized for an undeclared one. That
+        // is why the rank/last-stride check for this derived output lives here and not in
+        // pre_validate_node(): an unset O is derived, not invalid. Codes and messages are the ones
+        // the pre-validation check used to emit for a caller-declared O.
+        {
+            auto const& o_tensor = attributes.outputs.at(output_names::O);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(o_tensor->get_dim().size() != 4 || o_tensor->get_stride().size() != 4,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "The dim and stride for output_names::O must have rank 4");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                o_tensor->get_stride()[3] != 1,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "The stride for the last dimension corresponding to the embedding size per head should be 1 for "
+                "output_names::O");
+        }
 
-        CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
 
-#undef CUDNN_FE_VALIDATE_STRIDE
+        // Stats is always computed and stored in FP32. A narrower declared type makes the kernel
+        // write FP32 values past the end of the user's buffer (silent corruption / IMA), so
+        // reject it loudly here. An unset data type is allowed: shape inference defaults it to
+        // FP32 (see infer_properties_node) rather than letting fill_from_context assign the io
+        // data type.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_stats && stats_out->second->get_data_type() != DataType_t::FLOAT &&
+                                           stats_out->second->get_data_type() != DataType_t::NOT_SET,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The Stats output of sdpa must be an FP32 tensor.");
+
+        // The forward Stats store honours the declared B/H/S strides since cuDNN 9.12 (backend
+        // commit 543ae842a7); before that a non-ragged Stats output was written at packed-BHSD
+        // offsets whatever its declared layout. The backward *read* of a non-ragged Stats input has
+        // the same limitation until 9.26 -- that guard lives in CompositeSDPABackwardNode.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 91200) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.12.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
+
+        // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
+        {
+            bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                                   attributes.outputs.at(output_names::O)->get_ragged_offset();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) &&
+                    !is_ragged,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
+        }
 
         return {error_code_t::OK, ""};
     }
@@ -899,6 +992,9 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         if (attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end()) {
             softmax_attributes.set_sink(attributes.inputs[input_names::SINK_TOKEN]);
         }
+        // Base-2 Stats: on cuDNN 9.21+ this softmax lowers to the unified softmax operation, whose
+        // descriptor carries the log-base attribute (cuDNN 9.27+); the composite engine honors it.
+        softmax_attributes.set_stats_use_log2(attributes.stats_use_log2);
         // Special non-functional-style call. Needed because output already created and provided to user.
         softmax(last_output,
                 softmax_attributes,
@@ -1122,6 +1218,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     // sequence length). Set at expand time when eligible.
     mutable bool use_sm90_ordered_dq_deterministic = false;
     mutable bool is_d256_on_blackwell              = false;  // Will be edited in pre_validate_node()
+    // Head dims in (256, 512] on Blackwell. This band has NO cuDNN backend
+    // plan -- it is served only by the frontend-only FROST engine
+    // (sdpa_bwd_sm100), which is opt-in. Recorded so override_heuristics_query()
+    // does not pin a backend engine that cannot possibly finalize here.
+    mutable bool is_d512_on_blackwell = false;  // Will be edited in pre_validate_node()
 
     // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
     // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
@@ -1191,6 +1292,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
 
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
+
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         // validate backend limitations for the operation
@@ -1244,6 +1349,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             "cuDNN 9.14.0 has a known bug with non-causal + s_kv > 1024 + sliding window attention. "
             "Please consider upgrading to 9.14.1 or newer.");
 
+        // Pre-9.26 backward bug on ragged graphs with a sink token
+        auto const& sink_token = attributes.inputs.find(input_names::SINK_TOKEN);
+        bool const has_sink    = (sink_token != attributes.inputs.end() && sink_token->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            is_ragged && has_sink && detail::get_backend_version() < 92600,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "SDPA backward with ragged offsets and a sink token requires cuDNN 9.26.0 or newer "
+            "(older versions hit an out-of-bounds read in the compute_dot_do_o pre-pass).");
+
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         int32_t const sm_version = context.get_sm_version();
         int32_t const prop_major = sm_version / 10;
@@ -1276,9 +1390,26 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 is_d256_on_blackwell = true;
                 attributes.is_deterministic_algorithm = true;
             } else {
-                RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                // Head dims in (256, 512] on BOTH sides are served by the
+                // frontend-only FROST SM100 backward engine (sdpa_bwd_sm100),
+                // which runs the band through its native d = 512 tiles: the TMA
+                // descriptors carry the real extent and the overshoot is
+                // hardware zero-filled, so the padded lanes contribute nothing.
+                // The floor is the engine's -- below it the d256 flavors are the
+                // right kernel and this one would pad by more than 2x. Multiple
+                // of 8 rather than the forward surface's 16: the backward's
+                // stage-3 epilogue narrows its store vector from 32 B to 16 B
+                // when d is not also a multiple of 16, which the forward has no
+                // equivalent lever for. As on the forward path, the cuDNN
+                // backend itself has no plan for the band, so a graph that does
+                // not select that engine still fails at plan creation.
+                bool const d512_supported =
+                    (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 8 == 0) && (d_v % 8 == 0);
+                is_d512_on_blackwell = d512_supported;
+                RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)) && !d512_supported,
                                             error_code_t::GRAPH_NOT_SUPPORTED,
-                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v");
+                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v, "
+                                            "unless both head dims are in (256, 512] and multiples of 8");
             }
         } else {
             // validate basic dimension requirements
@@ -1406,15 +1537,33 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
 
-        if(detail::get_backend_version() >= 91801) {
+        if (detail::get_backend_version() >= 91801) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-	    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
-	}
+        }
+
+        // Non-ragged Stats INPUT layouts other than packed BHSD are not correctly read prior to 9.26.0
+        // (the forward store honours the declared layout since 9.12; see SDPANodeBase).
+        // TODO: move to sdpa_support_surface.h once the backward path grows a
+        // SDPA_backward_attributes support surface there — today that file serves only the
+        // forward attributes.
+        if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
+            auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
+            auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
+            bool const stats_is_packed_bhsd = stats_stride[3] == 1 &&
+                                              stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!stats_is_packed_bhsd,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "For cuDNN version below 9.26.0, a non-ragged Stats input of sdpa_backward must be "
+                                        "a packed BHSD tensor.");
+        }
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,
@@ -2125,6 +2274,17 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
+        // The (256, 512] band has no cuDNN backend plan at all -- only the
+        // opt-in frontend FROST engine serves it. Pinning a backend engine id
+        // here bypasses the heuristics query entirely, and the pinned config
+        // then fails to finalize with CUDNN_STATUS_NOT_SUPPORTED, which
+        // surfaces as a generic backend-API error rather than "not supported".
+        // Decline the override and let heuristics run: it returns no configs
+        // and create_execution_plans reports GRAPH_NOT_SUPPORTED, which is what
+        // a caller (and every test harness) can act on.
+        if (is_d512_on_blackwell) {
+            return {-1, {}};
+        }
         int32_t const sm_version = context.get_sm_version();
         bool const use_new_knobs = detail::get_backend_version() >= 92300;
         // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
@@ -2432,6 +2592,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
             if (has_output(output_names::Stats)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Stats] =
                     attributes.outputs[output_names::Stats];
+                softmax_attrs.set_stats_use_log2(attributes.stats_use_log2);
             }
             if (has_output(output_names::Max)) {
                 softmax_attrs.outputs[Softmax_attributes::output_names::Max] = attributes.outputs[output_names::Max];
@@ -2521,6 +2682,7 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         } else {
             auto stats_it = attributes.outputs.find(SDPA_attributes::output_names::Stats);
             if (stats_it != attributes.outputs.end() && stats_it->second) {
+                // stats_use_log2 cannot reach this pre-9.21 path: the support surface rejects it below 9.27.
                 auto backend_stats = tensors[stats_it->second->get_uid()]->get_desc()->get_backend_descriptor();
                 _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
                                                                CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,

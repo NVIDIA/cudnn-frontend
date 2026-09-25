@@ -20,7 +20,7 @@ import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
+from cudnn.jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec
 from .api import GemmSwigluSm100
 
 # config_key -> (kernel instance, max_active_clusters). The instance does not vary
@@ -145,16 +145,14 @@ def gemm_swiglu_jax_sm100(
         jax.ShapeDtypeStruct((m, n, l), framework_dtype(ab12_dtype, "jax")),  # ab12
         jax.ShapeDtypeStruct((m, n // 2, l), framework_dtype(c_dtype, "jax")),  # c
     )
-    # Outputs are donated pre-initialized inputs: the bridge's leading-dim inference
-    # rejects trailing-unit-dim buffers on pure results, and the donated-input path
-    # carries the explicit (1, 0, 2) layout spec.
+    # Neither output needs zeroing: the kernel writes ab12 and c in full over (m, n, l)
+    # and (m, n // 2, l). Zero-filling them was a full-size device write per dispatch.
     if not is_quantized:
         ab12_tensor, c_tensor = call(
             _swiglu_adapter,
             output_shape_dtype=out_types,
             input_spec=(operand, operand),
             output_spec=(operand, operand),
-            initialized_outputs={0: zeros_init, 1: zeros_init},
             kernel=kernel,
             mac=mac,
             alpha=float(alpha),
@@ -166,7 +164,6 @@ def gemm_swiglu_jax_sm100(
             output_shape_dtype=(out_types[1], out_types[0]),
             input_spec=(operand, operand, sf, sf),
             output_spec=(operand, operand),
-            initialized_outputs={0: zeros_init, 1: zeros_init},
             kernel=kernel,
             mac=mac,
             alpha=float(alpha),

@@ -101,7 +101,7 @@ def expected_shape(rule, m: int, n: int) -> tuple:
     return tuple(v if s == CONST else (m if s == FROM_M else n // v) for s, v in rule)
 
 
-def _output_rule(spec, chain: FusionChain) -> tuple:
+def _output_rule(spec, chain: FusionChain, *, physical_mn_swapped: bool = False) -> tuple:
     """How one output's shape follows from (M, N), as a per-axis rule.
 
     The single answer to a question that used to be asked in two places and
@@ -110,18 +110,28 @@ def _output_rule(spec, chain: FusionChain) -> tuple:
     """
     batch = chain.matmul.batch
     if spec.is_quant_scale:
-        return tuple((CONST, int(d)) for d in spec.dim)
-    if not spec.is_reduction:
-        return ((CONST, batch), (FROM_M, 0), (FROM_N, 2 if spec.dtype == "fp4_e2m1" else 1))
-    red_idx = int(spec.source.rsplit("_", 1)[1])
-    if chain.reductions[red_idx].grouped_by_moe:
-        return tuple((CONST, int(d)) for d in spec.dim)
-    # A reduced axis collapses to 1; the rest follow the problem size.
-    return (
-        (CONST, 1 if spec.dim[0] == 1 else batch),
-        (CONST, 1) if spec.dim[1] == 1 else (FROM_M, 0),
-        (CONST, 1) if spec.dim[2] == 1 else (FROM_N, 1),
-    )
+        rule = tuple((CONST, int(d)) for d in spec.dim)
+        qi = int(spec.source.rsplit("_", 1)[1])
+        if physical_mn_swapped and chain.quants[qi].scale_reorder == "F8_128x4":
+            # Reordered scales are physical atoms, unchanged by swapping the
+            # logical quantization axis. Compact scale tables do transpose.
+            return rule
+    elif not spec.is_reduction:
+        rule = ((CONST, batch), (FROM_M, 0), (FROM_N, 2 if spec.dtype == "fp4_e2m1" else 1))
+    else:
+        red_idx = int(spec.source.rsplit("_", 1)[1])
+        if chain.reductions[red_idx].grouped_by_moe:
+            rule = tuple((CONST, int(d)) for d in spec.dim)
+        else:
+            # A reduced axis collapses to 1; the rest follow the problem size.
+            rule = (
+                (CONST, 1 if spec.dim[0] == 1 else batch),
+                (CONST, 1) if spec.dim[1] == 1 else (FROM_M, 0),
+                (CONST, 1) if spec.dim[2] == 1 else (FROM_N, 1),
+            )
+    # The transformed IR is [B, new-M, new-N], but the user's unchanged buffer
+    # still presents [B, old-M, old-N] = [B, new-N, new-M].
+    return (rule[0], rule[2], rule[1]) if physical_mn_swapped else rule
 
 
 @dataclass(frozen=True)
@@ -453,8 +463,8 @@ def _declared_layout(tensor) -> tuple:
         return (), ()
 
 
-def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool) -> Operand:
-    declared = _DECLARED_AXES["b" if is_b else "a"]
+def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool, declared_is_b: bool | None = None) -> Operand:
+    declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(
@@ -479,17 +489,38 @@ def build(compiled) -> GemmRecipe:
     chain: FusionChain = compiled.chain
     mm = chain.matmul
     binding = compiled.binding
+    swap_ab = compiled.config.swap_ab
     order = {}
     for i, t in enumerate(binding.bound_tensors()):
         order.setdefault(id(t), i)
 
     inputs = [
-        _operand(order[id(t)], f"A operand[{i}]", t, major=mm.a_major, dtype=mm.a_dtype, batch=mm.a_batch, is_b=False) for i, t in enumerate(binding.a_operands)
+        _operand(
+            order[id(t)],
+            f"A operand[{i}]",
+            t,
+            major=mm.a_major,
+            dtype=mm.a_dtype,
+            batch=mm.a_batch,
+            is_b=False,
+            declared_is_b=swap_ab,
+        )
+        for i, t in enumerate(binding.a_operands)
     ] + [
-        _operand(order[id(t)], f"B operand[{i}]", t, major=mm.b_major, dtype=mm.b_dtype, batch=mm.b_batch, is_b=True) for i, t in enumerate(binding.b_operands)
+        _operand(
+            order[id(t)],
+            f"B operand[{i}]",
+            t,
+            major=mm.b_major,
+            dtype=mm.b_dtype,
+            batch=mm.b_batch,
+            is_b=True,
+            declared_is_b=not swap_ab,
+        )
+        for i, t in enumerate(binding.b_operands)
     ]
 
-    out_reqs = _output_align_reqs(chain, compiled.use_tma_store, vec_bytes=compiled.vec_bytes_epi)
+    out_reqs = _output_align_reqs(chain, compiled.tma_slots, vec_bytes=compiled.vec_bytes_epi)
     aux_reqs = _aux_align_reqs(chain, vec_bytes=compiled.vec_bytes_epi)
     outputs, seeds = [], []
     for i, (spec, t) in enumerate(zip(chain.outputs, binding.outputs)):
@@ -502,7 +533,7 @@ def build(compiled) -> GemmRecipe:
             Output(
                 index=order[id(t)],
                 role=spec.source,
-                rule=_output_rule(spec, chain),
+                rule=_output_rule(spec, chain, physical_mn_swapped=swap_ab),
                 align=out_reqs[i],
                 raw=bool(spec.is_reduction or spec.is_quant_scale),
                 init=init,
@@ -530,8 +561,12 @@ def build(compiled) -> GemmRecipe:
     heads = [(op.index, None) for op in inputs] + [(s.index, None) for s in sf]
     outs = [(o.index, None) for o in outputs]
     auxs = [(x.index, x.ref) for x in aux]
-    tma = bool(compiled.use_tma_store) and not chain.is_multi_gemm
-    arg_plan = tuple(heads + (auxs + outs[:1] if tma else outs + auxs))
+    # Taps, aux, then the TMA-C slots in slot order -- an output on the TMA
+    # surface binds a trailing TMA-only kernel parameter.
+    slots = compiled.tma_slots
+    taps = [o for i, o in enumerate(outs) if i not in slots]
+    tmas = [outs[i] for i in sorted(slots) if i < len(outs)]
+    arg_plan = tuple(heads + taps + auxs + tmas)
 
     # Block-scale multi-GEMM sends ONE A and ONE B stride triple and requires the
     # rest to match it; every other flavor sends each operand's own.

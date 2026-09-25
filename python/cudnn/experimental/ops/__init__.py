@@ -3,18 +3,39 @@
 
 import importlib
 import sys
+from typing import Any
 
-from .sdpa import scaled_dot_product_attention
+# Implementations live with their owning operation families. Expose them here
+# lazily so importing this experimental compatibility package does not pull in
+# PyTorch until a specific operation is requested.
+_LAZY_ALIASES = {
+    "moe_grouped_matmul": "cudnn.gemm.ops.moe_grouped_matmul",
+    "swiglu_mlp": "cudnn.gemm.ops.swiglu_mlp",
+    "rms_norm": "cudnn.ops.norm.rmsnorm",
+    "layer_norm": "cudnn.ops.norm.layernorm",
+}
 
-# moe_grouped_matmul now lives with the rest of the GEMM family in
-# cudnn.gemm.ops. Alias the module into this package so that both
-# ``from cudnn.experimental.ops import moe_grouped_matmul`` and
-# ``import cudnn.experimental.ops.moe_grouped_matmul`` keep resolving.
-_moe_mod = importlib.import_module("cudnn.gemm.ops.moe_grouped_matmul")
-sys.modules[__name__ + ".moe_grouped_matmul"] = _moe_mod
-moe_grouped_matmul = _moe_mod.moe_grouped_matmul
+
+def __getattr__(name: str) -> Any:
+    try:
+        target = _LAZY_ALIASES[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    try:
+        module = importlib.import_module(target)
+    except ImportError as error:
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
+    sys.modules[f"{__name__}.{name}"] = module
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
-    "scaled_dot_product_attention",
     "moe_grouped_matmul",
+    "swiglu_mlp",
+    "rms_norm",
+    "layer_norm",
 ]

@@ -18,9 +18,14 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import logging
+import re as _re
 import struct
+import sys
 
 from cudnn import _pybind_module
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
@@ -99,6 +104,14 @@ def dtype_name(buf) -> str:
     return str(buf.dtype).split(".")[-1]
 
 
+def data_ptr(buf) -> int:
+    """Device address of a tensor-like (``data_ptr()`` or the CUDA array interface)."""
+    fn = getattr(buf, "data_ptr", None)
+    if fn is not None:
+        return fn()
+    return buf.__cuda_array_interface__["data"][0]
+
+
 class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 
@@ -148,6 +161,14 @@ class DeviceView:
     def view_as(self, other):
         return self.reshape(tuple(other.shape))
 
+    def stride(self):
+        st = []
+        acc = 1
+        for s in reversed(self.shape):
+            st.append(acc)
+            acc *= s
+        return tuple(reversed(st))
+
     def contiguous(self):
         return self  # row-major contiguous by construction
 
@@ -184,9 +205,12 @@ class DeviceView:
 
 
 class DeviceBuffer(DeviceView):
-    """A uint8 device allocation this process owns, for the paths where no
-    caller buffer exists. Allocated on the CURRENT context, so the caller owns
-    the context this memory belongs to."""
+    """A uint8 device allocation this process owns. Allocated on the CURRENT
+    context, so the caller owns the context this memory belongs to.
+
+    No production path may own one (Rule 8: plans and engines carve scratch from
+    the caller's workspace). Kept for tests that need a driver-owned allocation
+    whose GC-timed release must not invalidate a stream capture."""
 
     def __init__(self, nbytes: int, device_id: int):
         from cuda.bindings import driver as _drv
@@ -197,14 +221,31 @@ class DeviceBuffer(DeviceView):
         super().__init__(int(ptr), (int(nbytes),), "uint8", device_id)
 
     def __del__(self):
-        # At interpreter teardown the context can already be gone, which makes
-        # the free fail on memory the driver has reclaimed anyway.
+        # Cyclic GC can run during someone else's CUDA graph capture. This
+        # allocation is no longer live; releasing it must not invalidate that
+        # capture. Relax only this thread's safety check, and always restore it.
         try:
             from cuda.bindings import driver as _drv
 
-            _drv.cuMemFree(self.data_ptr())
+            ptr = getattr(self, "_ptr", 0)
+            if not ptr:
+                return
+            err, previous = _drv.cuThreadExchangeStreamCaptureMode(_drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+            if int(err) != 0:
+                _LOG.warning("cudnn.frost: cannot release DeviceBuffer: capture-mode exchange failed: %s", err)
+                return
+            try:
+                (err,) = _drv.cuMemFree(ptr)
+                if int(err) == 0:
+                    self._ptr = 0
+                elif err not in (_drv.CUresult.CUDA_ERROR_DEINITIALIZED, _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED):
+                    _LOG.warning("cudnn.frost: cuMemFree failed: %s", err)
+            finally:
+                err, _ = _drv.cuThreadExchangeStreamCaptureMode(previous)
+                if int(err) != 0:
+                    _LOG.warning("cudnn.frost: restoring capture mode failed: %s", err)
         except Exception:  # noqa: BLE001
-            pass
+            pass  # Interpreter teardown may already have unloaded CUDA / logging.
 
 
 def probe(buf):
@@ -232,6 +273,21 @@ def _dlpack_geometry(buf):
     set to None when the buffer IS readable but its dtype has no name in
     ``DTYPES``; dim and stride are real in that case and worth keeping.
     """
+    # The common scratch buffer is a plain CUDA uint8 Tensor. Its public
+    # metadata already contains the CAI facts, without constructing/parsing an
+    # interface dictionary. Do not import torch or bypass a subclass's protocol.
+    torch = sys.modules.get("torch")
+    if (
+        torch is not None
+        and type(buf) is torch.Tensor
+        and not torch.overrides.has_torch_function_unary(buf)
+        and buf.dtype is torch.uint8
+        and buf.is_cuda
+        and buf.layout is torch.strided
+    ):
+        ptr = buf.data_ptr() if buf.numel() else 0  # CAI's empty-buffer convention
+        strides = None if buf.is_contiguous() else tuple(buf.stride())
+        return ptr, tuple(buf.shape), strides, "uint8", buf.device.index
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
@@ -440,6 +496,8 @@ def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int
 # version, so the check belongs where an engine can still decline.
 CUTEDSL_MIN_VERSION = (4, 7, 0)
 
+_RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
+
 _DSL_STATE = None
 
 
@@ -490,11 +548,37 @@ def cutedsl_too_old(version):
     dist, ver = version
     if dist != "nvidia-cutlass-dsl":
         return False
-    try:
-        parts = tuple(int(x) for x in ver.split("+", 1)[0].split(".")[:3])
-    except ValueError:
+    # PEP 440 public versions: keep the leading integer of each release component
+    # so a prerelease of X ("4.6.2a0", "4.6.2rc1") compares as X -- below the
+    # floor it is too old, at/above it is not. Local labels ("+...") are dropped,
+    # and a dotted post/dev segment ("4.6.post1", "4.6.2.dev0") ends the release
+    # segment: what precedes it is the version being compared.
+    parts = []
+    for component in ver.split("+", 1)[0].split(".")[:3]:
+        m = _RELEASE_INT.match(component)
+        if m is None:
+            break
+        parts.append(int(m.group(1)))
+    if not parts:
         return False
-    return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+    # A short public version ("4.6") means the omitted components are zero
+    # ("4.6.0"), so it compares against the floor instead of slipping past it.
+    parts += [0] * (3 - len(parts))
+    return tuple(parts) < CUTEDSL_MIN_VERSION
+
+
+def cutedsl_requirement_error(what):
+    """Message naming the installed DSL version when it is below the floor, else None.
+
+    Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
+    version problem, not as a missing dependency: pyproject's floor is the
+    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    """
+    installed, version = cutedsl_state()
+    if not installed or not cutedsl_too_old(version):
+        return None
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
 
 
 def current_device_id():

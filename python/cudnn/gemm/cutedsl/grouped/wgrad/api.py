@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, overload
+from typing import Any, Literal, Optional, Tuple, overload
 import os
 
 from cuda.bindings import driver as cuda
@@ -29,8 +29,9 @@ from ..backend_utils import (
     _torch_stream_context,
     backend_cache_key,
     select_grouped_gemm_backend,
+    wrapper_operand_meta,
 )
-from ..moe_utils import WGradInputOrder
+from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
 
 def _block_scaled_dtype_pairs():
@@ -46,6 +47,33 @@ def _block_scaled_dtype_pairs():
 
 
 _cache_of_GroupedGemmWgradSm100Objects = {}
+
+
+def get_grouped_gemm_wgrad_workspace_size_sm100(
+    num_experts: int,
+    *,
+    output_mode: str = "dense",
+    input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+) -> int:
+    """Return required runtime TMA-descriptor workspace bytes."""
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    try:
+        weight_mode = MoEWeightMode(output_mode)
+    except ValueError as exc:
+        raise ValueError(f"unsupported output_mode {output_mode!r}") from exc
+    try:
+        normalized_input_order = WGradInputOrder(input_order)
+    except ValueError as exc:
+        raise ValueError(f"unsupported input_order {input_order!r}") from exc
+    return max(
+        WgradSfTensormapConstructor.get_workspace_size(
+            normalized_input_order,
+            weight_mode,
+            num_experts,
+        ),
+        1,
+    )
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
@@ -109,6 +137,7 @@ class GroupedGemmWgradSm100(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     ) -> None:
@@ -133,6 +162,7 @@ class GroupedGemmWgradSm100(APIBase):
                     ("sample_global_scale_a", kwargs["sample_global_scale_a"]),
                     ("sample_global_scale_b", kwargs["sample_global_scale_b"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                    ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                 ),
                 block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
@@ -174,6 +204,8 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: None = None,
         global_scale_b: None = None,
+        current_stream: Optional[cuda.CUstream] = None,
+        descriptor_workspace: None = None,
     ) -> None: ...
 
     # Block-scaled implementation
@@ -190,6 +222,8 @@ class GroupedGemmWgradSm100(APIBase):
         *,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
+        current_stream: Optional[cuda.CUstream] = None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def execute(
@@ -204,10 +238,17 @@ class GroupedGemmWgradSm100(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        descriptor_workspace: Optional[torch.Tensor] = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
-        self._implementation.execute(
+        if descriptor_workspace is not None and not isinstance(
+            self._implementation,
+            GroupedGemmWgradBlockScaledAPI,
+        ):
+            raise ValueError("descriptor_workspace requires the block-scaled WGrad backend")
+        execute_kwargs = dict(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             sfa_tensor=sfa_tensor,
@@ -219,6 +260,9 @@ class GroupedGemmWgradSm100(APIBase):
             global_scale_b=global_scale_b,
             current_stream=current_stream,
         )
+        if descriptor_workspace is not None:
+            execute_kwargs["descriptor_workspace"] = descriptor_workspace
+        self._implementation.execute(**execute_kwargs)
 
 
 def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
@@ -230,6 +274,26 @@ def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tup
     stride = tuple(int(value) for value in tensor_stride)
     layout = stride if exact_stride else tuple(index for index, _ in sorted(enumerate(stride), key=lambda item: (item[1], tensor_shape[item[0]])))
     return (shape, layout, _convert_to_cutlass_data_type(tensor.dtype), get_device(tensor))
+
+
+def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream):
+    if framework == "torch":
+        import torch
+
+        allocator = torch.zeros if accumulate_on_output else torch.empty
+        with _torch_stream_context(current_stream, a_tensor.device):
+            return allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "torch"), device=a_tensor.device)
+    import jax
+    import jax.numpy as jnp
+
+    # C-contiguous expert/M/N-order output; the kernel writes into this buffer
+    # on the launch stream, so materialize it before its pointer is taken.
+    allocator = jnp.zeros if accumulate_on_output else jnp.empty
+    return jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
+
+
+# Operand-metadata key -> (op, framework, output shape, output dtype); see wrapper_operand_meta.
+_wgrad_wrapper_memo: dict = {}
 
 
 def grouped_gemm_wgrad_wrapper_sm100(
@@ -248,11 +312,71 @@ def grouped_gemm_wgrad_wrapper_sm100(
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     accumulate_on_output: bool = False,
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
+    *,
+    descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    memo_dense_output_identity = None
+    if (
+        output_mode == "dense"
+        and wgrad_tensor is not None
+        and descriptor_workspace is None
+        and sfa_tensor is not None
+        and sfb_tensor is not None
+        and hasattr(wgrad_tensor, "data_ptr")
+    ):
+        # A block-scaled API without caller-owned descriptor storage is bound to
+        # one explicit dense output. Keep memo lookup from bypassing that
+        # compatibility isolation without moving backend selection onto memo hits.
+        memo_dense_output_identity = int(wgrad_tensor.data_ptr())
+    memo_key = (
+        type(a_tensor),
+        wrapper_operand_meta(a_tensor),
+        wrapper_operand_meta(b_tensor),
+        wrapper_operand_meta(sfa_tensor),
+        wrapper_operand_meta(sfb_tensor),
+        wrapper_operand_meta(offsets_tensor),
+        output_mode,
+        wrapper_operand_meta(wgrad_tensor),
+        wrapper_operand_meta(wgrad_ptrs),
+        descriptor_workspace is not None,
+        memo_dense_output_identity,
+        wrapper_operand_meta(global_scale_a),
+        wrapper_operand_meta(global_scale_b),
+        acc_dtype,
+        wgrad_dtype,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        sf_vec_size,
+        sf_fp8_dtype_override,
+        accumulate_on_output,
+        input_order,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _wgrad_wrapper_memo.get(memo_key)
+    if memo is not None:
+        op, framework, wgrad_shape, memo_wgrad_dtype = memo
+        if wgrad_tensor is None and wgrad_ptrs is None:
+            wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
+        op.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            offsets_tensor=offsets_tensor,
+            wgrad_tensor=wgrad_tensor,
+            wgrad_ptrs=wgrad_ptrs,
+            descriptor_workspace=descriptor_workspace,
+            global_scale_a=global_scale_a,
+            global_scale_b=global_scale_b,
+            current_stream=current_stream,
+        )
+        return TupleDict(wgrad_tensor=wgrad_tensor)
+
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wgrad_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -285,27 +409,28 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("global_scale_a", global_scale_a),
             ("global_scale_b", global_scale_b),
             ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
+            ("sf_fp8_dtype_override", sf_fp8_dtype_override),
         ),
         block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
     if framework == "jax" and backend is GroupedGemmBackend.BLOCK_SCALED:
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
+    if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
+        raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
+    explicit_dense_output_identity = None
+    if (
+        backend is GroupedGemmBackend.BLOCK_SCALED
+        and framework == "torch"
+        and output_mode == "dense"
+        and wgrad_tensor is not None
+        and descriptor_workspace is None
+    ):
+        # Compatibility path: callers that do not own descriptor workspace keep
+        # the validated one-API-instance-per-output isolation.
+        explicit_dense_output_identity = int(wgrad_tensor.data_ptr())
+    wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
-        wgrad_shape = (expert_cnt, hidden, intermediate)
-        if framework == "torch":
-            import torch
-
-            allocator = torch.zeros if accumulate_on_output else torch.empty
-            with _torch_stream_context(current_stream, a_tensor.device):
-                wgrad_tensor = allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "torch"), device=a_tensor.device)
-        else:
-            import jax
-            import jax.numpy as jnp
-
-            # C-contiguous expert/M/N-order output; the kernel writes into this buffer
-            # on the launch stream, so materialize it before its pointer is taken.
-            allocator = jnp.zeros if accumulate_on_output else jnp.empty
-            wgrad_tensor = jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
+        wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
     cache_key = backend_cache_key(
         backend,
         get_device_type(),
@@ -324,9 +449,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
         tuple(mma_tiler_mn),
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
+        sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        explicit_dense_output_identity,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -355,6 +482,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             sf_vec_size=sf_vec_size,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
         )
@@ -372,6 +500,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             raise RuntimeError("Unsupported configuration")
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
+    _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,
@@ -380,6 +509,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         offsets_tensor=offsets_tensor,
         wgrad_tensor=wgrad_tensor,
         wgrad_ptrs=wgrad_ptrs,
+        descriptor_workspace=descriptor_workspace,
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
         current_stream=current_stream,

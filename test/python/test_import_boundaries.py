@@ -17,6 +17,7 @@ Each check runs in a FRESH interpreter: once a module is imported in the test
 process it stays, so an in-process assertion would pass for the wrong reason.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -50,14 +51,173 @@ def _imported_by(code: str) -> set:
     return _modules(code) - _modules("")
 
 
-def _assert_absent(mods: set, stage: str) -> None:
-    present = sorted(m for m in _HEAVY if m in mods)
+def _assert_absent(module_names: set, stage: str) -> None:
+    present = sorted(m for m in _HEAVY if m in module_names)
     assert not present, f"{stage} imported {present}; it must not"
 
 
 @pytest.mark.L0
 def test_importing_cudnn_pulls_no_framework():
     _assert_absent(_imported_by("import cudnn"), "import cudnn")
+
+
+@pytest.mark.L0
+def test_gnn_import_failure_has_optional_dependency_guidance():
+    code = """
+import sys
+sys.modules["torch"] = None
+import cudnn
+try:
+    cudnn.gnn
+except ImportError as error:
+    # GNN does not use CuTeDSL, but this is currently the existing optional
+    # dependency extra that installs Torch.
+    assert "nvidia-cudnn-frontend[cutedsl]" in str(error)
+else:
+    raise AssertionError("cudnn.gnn unexpectedly imported without torch")
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.L0
+def test_importing_cudnn_ops_pulls_no_framework():
+    _assert_absent(_imported_by("import cudnn\nimport cudnn.ops"), "import cudnn.ops")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("module", ["cudnn.ops.norm", "cudnn.experimental.ops"])
+def test_importing_norm_op_packages_pulls_no_framework(module):
+    _assert_absent(_imported_by(f"import cudnn\nimport {module}"), f"import {module}")
+
+
+@pytest.mark.L0
+def test_importing_nvfp4_qat_package_pulls_no_framework():
+    """Import the QAT namespace without materializing torch or Triton."""
+    stage = "import cudnn.sdpa.bwd.qat"
+    imported = _imported_by(stage)
+    _assert_absent(imported, stage)
+    assert "triton" not in imported, f"{stage} imported triton; it must not"
+
+
+def test_nvfp4_qat_missing_framework_retains_specific_install_hint():
+    """Preserve the QAT Triton extra hint alongside develop's named errors."""
+    probe = """
+import sys
+sys.modules["torch"] = None
+import cudnn
+try:
+    cudnn.Nvfp4AttentionQatBackward
+except ImportError as error:
+    assert "torch" in str(error), str(error)
+    assert "nvidia-cudnn-frontend[cutedsl,triton]" in str(error), str(error)
+else:
+    raise AssertionError("QAT API unexpectedly imported without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
+def test_ops_symbol_reports_install_hint_without_torch():
+    probe = """
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import cudnn.ops
+try:
+    cudnn.ops.fft_causal_conv1d
+except ImportError as error:
+    assert "pip install nvidia-cudnn-frontend[cutedsl]" in str(error)
+else:
+    raise AssertionError("lazy symbol access unexpectedly succeeded without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "module,symbol",
+    [
+        ("cudnn.ops.norm", "layer_norm"),
+        ("cudnn.experimental.ops", "rms_norm"),
+    ],
+)
+def test_norm_symbols_report_install_hint_without_torch(module, symbol):
+    probe = f"""
+import importlib
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+package = importlib.import_module({module!r})
+try:
+    getattr(package, {symbol!r})
+except ImportError as error:
+    assert "torch" in str(error), str(error)
+    assert "pip install nvidia-cudnn-frontend[cutedsl]" in str(error), str(error)
+else:
+    raise AssertionError("lazy norm symbol unexpectedly loaded without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
+def test_d192_f16_kernel_compile_does_not_require_torch(tmp_path):
+    if importlib.util.find_spec("cutlass") is None:
+        pytest.skip("cutlass/dsl not installed")
+    probe = """
+import importlib.abc
+import pathlib
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import cudnn
+import cutlass
+import cutlass.cute as cute
+from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
+from cudnn.frost.template_loader import load_template
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/sm100/prefill_d192_d128_f16.py"
+load_template(str(path), TemplateParams(dtype_qkv=3), tag="d192_f16_no_torch")
+
+class Ex2Probe:
+    @cute.jit
+    def __call__(self):
+        self.kernel().launch(grid=(1, 1, 1), block=(1, 1, 1))
+
+    @cute.kernel
+    def kernel(self):
+        ex2_emulation_2(cutlass.Float32(0.25), cutlass.Float32(-0.5))
+
+cute.compile(Ex2Probe(), options="--enable-tvm-ffi")
+assert "torch" not in sys.modules
+"""
+    probe_path = tmp_path / "d192_f16_no_torch.py"
+    probe_path.write_text(probe)
+    run = subprocess.run([sys.executable, str(probe_path)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
 
 
 @pytest.mark.L0
@@ -101,3 +261,26 @@ def test_support_check_pulls_no_framework(module):
     process that merely asks whether an engine applies.
     """
     _assert_absent(_imported_by(f"import cudnn\nimport {module}"), module)
+
+
+@pytest.mark.parametrize("symbol", ["causal_conv1d", "fft_causal_conv1d"])
+@pytest.mark.parametrize("import_order", ["submodule_first", "sibling_first", "symbol_first"])
+def test_ops_callable_exports_survive_import_order(symbol, import_order):
+    """A same-named implementation module must not replace the callable API."""
+    probe = f"""
+import importlib
+import cudnn.ops
+symbol = {symbol!r}
+order = {import_order!r}
+if order == "symbol_first":
+    first = getattr(cudnn.ops, symbol)
+elif order == "sibling_first" and symbol == "causal_conv1d":
+    assert callable(cudnn.ops.causal_conv1d_nwh)
+module = importlib.import_module("cudnn.ops." + symbol)
+export = getattr(cudnn.ops, symbol)
+assert callable(export), type(export)
+assert export is getattr(module, symbol)
+assert getattr(cudnn.ops, symbol) is export
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr

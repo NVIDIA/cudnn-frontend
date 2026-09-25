@@ -22,10 +22,31 @@ def note_frost_routing(graph, label="graph"):
 
     engine = getattr(graph, "selected_engine", None)
     if engine is not None:
-        print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph")
+        # The selected plan's knobs alongside the engine: a test that pins a
+        # kernel FLAVOR behind a knob (the d128 decode tile is TILE_CGA_M=1 on
+        # sdpa_fwd_prefill_sm100) reads frost_routing.LAST_PLAN after exec_sdpa.
+        cfg = getattr(graph, "_selected_plan_config", None)
+        knobs = getattr(cfg, "knobs", None)
+        print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph" + (f" with knobs {knobs}" if knobs is not None else ""))
         frost_routing.note(f"frost:{engine.name}")
+        frost_routing.LAST_PLAN = (engine.name, knobs)
+        # One engine row can lower onto several kernel templates (the SM100
+        # d256 flavor: decode_d256_f16 for decode-shaped graphs, the prefill
+        # tile otherwise); the executor names the one that serves this plan.
+        template = _kernel_template_of(graph)
+        if template:
+            frost_routing.note(f"frost:{engine.name}:{template}")
     else:
         frost_routing.note(f"native:{label}")
+        frost_routing.LAST_PLAN = (None, None)
+
+
+def _kernel_template_of(graph):
+    """The template file stem serving the selected FROST plan (``kernel_template``
+    on the compiled executor, set by engines.lower_dsl_prefill), or None."""
+    plans = getattr(graph, "_compiled_plans", None) or {}
+    plan = plans.get(getattr(graph, "_plan_index", None))
+    return getattr(getattr(plan, "_compiled", None), "kernel_template", None)
 
 def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
     """
@@ -59,6 +80,62 @@ def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
         tensor[mask < sparsity] = 0
 
     return tensor
+
+def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16, head_axis=1, valid_rows=None):
+    """
+    Overwrite a random subset of q rows (at least one) so their attention
+    scores against every k row are deeply negative — below the fp32 exp
+    underflow cliff (score < ~-87) — while keeping every value exactly
+    representable in all tested dtypes.
+
+    Real models (e.g. Qwen2.5) routinely produce heads whose entire score row
+    is < -100. Sparse-small-int test data concentrates scores near 0 and never
+    reaches that regime, which let a masking-order bug in the decode softmax
+    (row max taken over unmasked oob kv columns) ship undetected: with all
+    valid scores negative, an oob score of 0 poisons the max and every valid
+    probability underflows to exactly 0 (pytorch/pytorch#193893).
+
+    Mechanism: draw a random +-1 direction u of length d; shift all of k by
+    +k_shift*u and set each selected q row to -m*u, with m a power of two
+    sized so the mean score -m*k_shift*d*attn_scale lands near `target`.
+    Powers of two and |k| <= abs_max + k_shift stay exact in fp8 e4m3/e5m2,
+    fp16, bf16 and fp32, preserving the suite's exact-arithmetic philosophy.
+    (Rows that are subsequently RoPE-rotated lose the guarantee — the
+    rotation mixes u across positions — which is fine: the data stays valid,
+    those tests just may not exercise the negative regime.)
+
+    GQA/MQA: inject only into the first q-head of each kv-head group — otherwise the large
+    u-aligned dK/dV partials cancel in the cross-head reduce, amplifying its staging rounding.
+
+    Args:
+        q, k: tensors whose innermost dim is d; a "row" is one index of
+            q.shape[:-1] (works for bhsd, bshd and packed thd layouts alike).
+        rng: torch.Generator on q's device.
+        attn_scale: the attention scale the test will use, so the injected
+            magnitude lands past the underflow cliff after scaling.
+        k_shift: integer amplitude of the common k component.
+        target: desired post-scale score for the selected rows.
+        row_fraction: fraction of eligible q rows to overwrite (min 1 row).
+        head_axis: which dim of q/k is the head (1 for bhsd/thd, 2 for bshd).
+        valid_rows: optional bool tensor of shape q.shape[:-1]; restricts
+            sampling to True rows (e.g. rows a padded layout actually uses).
+    """
+    d = q.shape[-1]
+    assert k.shape[-1] == d
+    u = (torch.randint(0, 2, (d,), generator=rng, device=q.device, dtype=torch.int64) * 2 - 1).to(torch.float32)
+    m = 2.0 ** math.ceil(math.log2(max(8.0, abs(target) / (k_shift * d * attn_scale))))
+    k.add_((k_shift * u).to(k.dtype))
+    lead = q.shape[:-1]
+    n_rows = math.prod(lead)
+    rows = torch.arange(n_rows, device=q.device)
+    if valid_rows is not None:
+        rows = rows[valid_rows.reshape(-1)]
+    heads_per_group = q.shape[head_axis] // max(1, k.shape[head_axis])
+    if heads_per_group > 1:
+        rows = rows[torch.unravel_index(rows, lead)[head_axis] % heads_per_group == 0]
+    count = max(1, int(rows.numel() * row_fraction))
+    sel = rows[torch.randperm(rows.numel(), generator=rng, device=q.device)[:count]]
+    q[torch.unravel_index(sel, lead)] = (-m * u).to(q.dtype)
 
 def create_sparse_int_tensor(shape, dtype, rng, *, device='cuda', sparsity=0.8, abs_max=2, memory_format=None):
     """
@@ -102,11 +179,11 @@ def print_tensor_stats(tensor, tag=None):
     numel = t.numel()
 
     # Compute hash using torch.hash_tensor (fast GPU operation)
-    # FP8 types not supported by hash_tensor, view as int8
-    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        hash_value = torch.hash_tensor(t.view(torch.int8))
-    else:
-        hash_value = torch.hash_tensor(t)
+    # FP8 / packed FP4 / UE8M0 byte types are not supported by hash_tensor (nor
+    # by the statistics below): hash and count them as raw bytes.
+    if t.element_size() == 1 and t.dtype not in (torch.int8, torch.uint8, torch.bool):
+        t = t.view(torch.int8)
+    hash_value = torch.hash_tensor(t)
 
     # Compute statistics (all GPU operations)
     num_zeros = numel - torch.count_nonzero(t).item()
@@ -335,9 +412,13 @@ def create_container_and_page_table(tensor, block_size):
 
     reshaped = torch.cat((cat_tensor.clone()).chunk(blocks_per_batch, dim=2), dim=0)
 
+    # Page p of batch b lives at pool index p*B + b (the chunk/cat above). The
+    # table is stored ROW-MAJOR — each batch's page list contiguous, strides
+    # (table_size, table_size, 1, 1) on the (B, 1, table_size, 1) declaration —
+    # which is what every framework hands cuDNN (FlashInfer, vLLM, SGLang,
+    # Megatron/TE, PyTorch all keep [B, max_pages] int32 row-major).
     table_size = math.ceil(S/block_size)
-    page_table = torch.linspace(0, B*table_size-1, B*table_size, device='cuda', dtype=torch.int32).reshape(table_size,1,B,1)
-    page_table = torch.transpose(page_table,0,2)
+    page_table = torch.arange(B*table_size, device='cuda', dtype=torch.int32).reshape(table_size, B).t().contiguous().reshape(B, 1, table_size, 1)
 
     return(reshaped, page_table)
 

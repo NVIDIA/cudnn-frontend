@@ -5,22 +5,30 @@
 The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. JAX arrays are additionally accepted wherever the kernel's tensor layouts are expressible as row-major arrays (each API's page has a "JAX support" section with its exact contract):
 
 - **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cudnn.jax.call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
-- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Dense weight mode, column-major bias layouts, and kernels whose scale factors are MMA-permuted tensor arguments (grouped swiglu/srelu/quant/dswiglu, glu_hadamard, block-scaled glu/dglu/wgrad backends) reject JAX with clear errors.
+- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. They dispatch JAX calls to `cudnn.jax.grouped_gemm_swiglu` / `grouped_gemm_dswiglu`; matching `cudnn.torch` aliases remain available. Existing Torch behavior and wrapper defaults are unchanged. Other dense weight modes, column-major bias layouts, and grouped srelu/quant, glu_hadamard, and block-scaled unified glu/dglu/wgrad backends reject JAX with clear errors.
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
+- [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
+- [FLA Integration Shims](fla.md)
+- [Kimi Delta Attention in JAX](kda_jax.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
+- [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)
+- [Tail RoPE + Microscaled QDQ](rope_qdq.md)
+- [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
 - [Grouped GEMM (BF16)](gemm_fusions/grouped_gemm.md)
 - [Grouped GEMM + GLU (Unified)](gemm_fusions/grouped_gemm_glu.md)
 - [Grouped GEMM + GLU + Hadamard](gemm_fusions/grouped_gemm_glu_hadamard.md)
+- [Grouped GEMM + GLU + Hadamard + Quant](gemm_fusions/grouped_gemm_glu_hadamard_quant.md)
 - [Grouped GEMM + dGLU (Unified)](gemm_fusions/grouped_gemm_dglu.md)
 - [Grouped GEMM + SwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_swiglu.md)
 - [Grouped GEMM + dSwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_dswiglu.md)
-- [Grouped GEMM + sReLU (Unified)](gemm_fusions/grouped_gemm_srelu.md)
+- [Grouped GEMM + sReLU (Unified)](gemm_fusions/grouped_gemm_srelu.md) — optionally tanh
+  soft-clamped via `tanh_clamp_scale`
 - [Grouped GEMM + dsReLU (Unified)](gemm_fusions/grouped_gemm_dsrelu.md)
 - [Discrete Grouped GEMM + SwiGLU](gemm_fusions/discrete_grouped_gemm_swiglu.md)
 - [Discrete Grouped GEMM + dSwiGLU](gemm_fusions/discrete_grouped_gemm_dswiglu.md)
@@ -28,22 +36,32 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
+- [DeepSeek Sparse Attention (DSA)](dsa.md)
+- [Flex Attention](attention/flex_attention.md) and [mask plan design](attention/flex_attention_design.md)
+- [HSTU Attention (Blackwell SM100/SM103)](hstu/hstu_attention.md)
+- [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
+- [DSv4.1 Vision RoPE Backward](attention/vision_rope_backward.md)
+- [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
-- [SDPA Forward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256)
-- [SDPA Backward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
+- [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [DSv4.1 mHC projection/RMS backward](gemm_fusions/mhc_projection_bwd.md)
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax, GEMM + SwiGLU, and the grouped GEMM APIs require the `cutedsl` optional dependency, which can be installed via:
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2` and `apache-tvm-ffi` are required dependencies (and the DSL pulls `cuda-python` in transitively):
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
+(`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra now names only `cuda-python`. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
 
-The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
+The Triton NVFP4 attention QAT backward API additionally requires the
+`triton` extra. Its API page documents the framework and GPU requirements.
+
+Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
 pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
@@ -54,7 +72,14 @@ After installation, you can import the APIs directly from the `cudnn` package, i
 
 ## API Usage
 
-Each operation exposes two APIs:
+The causal-convolution family exposes semantic PyTorch operations only through
+`cudnn.ops.causal_conv1d` and `cudnn.ops.causal_conv1d_update`; they return
+ordinary tensors and keep prepared kernel objects private. The wrapper and
+class conventions below apply to prepared frontend-only kernel APIs.
+
+Most compiler-style operations expose the following two APIs. Functional
+autograd integrations such as BSA and Flex Attention instead document their
+own wrapper and reusable-plan lifecycle on their operation pages.
 
 ### 1. High-level wrapper
 
@@ -123,6 +148,15 @@ Methods:
 - CUDA stream (`current_stream` in class API, `stream` in wrapper)
   - The cuda stream to use for operation kernel execution.
   - Default: None (uses default stream)
+
+- Determinism
+  - Several kernels reduce with cross-CTA atomics, so those outputs are not bit-exact run to
+    run. Kernels react to `torch.use_deterministic_algorithms(True)`: they switch to a
+    deterministic path where one exists, and otherwise raise (or warn, under
+    `warn_only`) rather than silently return a non-reproducible result.
+  - Where a deterministic path exists it can also be selected per call with
+    `deterministic=True`, independent of the torch setting. See
+    [Grouped GEMM + dsReLU](gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob).
 
 
 ## File structure and examples

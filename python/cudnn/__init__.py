@@ -21,17 +21,15 @@ symbols_to_import = [
     "backend_version",
     "backend_version_string",
     "get_last_error_string",
-    "destroy_handle",
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
     "knob_type",
-    "create_handle",
+    "FRONTEND_KNOB_TYPE_BASE",
+    "is_frontend_knob_type",
     "create_kernel_cache",
     "create_device_properties",
-    "get_stream",
     "numerical_note",
-    "set_stream",
     "build_plan_policy",
     "data_type",
     "tensor_reordering",
@@ -56,13 +54,97 @@ for _optional_symbol in [
     "causal_conv1d_nwh_backward",
     "b2b_causal_conv1d_forward",
     "b2b_causal_conv1d_backward",
+    "gnn_agg_op",
+    "gnn_agg_simple_forward",
+    "gnn_agg_simple_backward",
+    "fft_causal_conv1d_forward",
+    "fft_causal_conv1d_backward",
+    "long_fft_causal_conv1d_get_buffer_sizes",
+    "long_fft_causal_conv1d_forward",
+    "long_fft_causal_conv1d_backward",
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
+
+from ._handle import Handle, DeviceInfo
+
+# Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
+# is a cudnn.Handle, or a bare int for a framework-created foreign handle).
+handle = Handle
+
+
+def create_handle():
+    """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
+
+    The Handle wraps the backend ``cudnnHandle_t`` and is bound to the current
+    CUDA device. Anywhere the backend needs the raw ``cudnnHandle_t`` it is
+    extracted explicitly via ``to_backend_handle()`` (grep it to trace every
+    handoff) -- the Handle is never silently coerced to an int, so a Handle that
+    reaches a binding unconverted fails loudly rather than being magically cast.
+    """
+    raw = _pybind_module.create_handle()
+    ordinal = None
+    try:
+        from .frost.device import current_device
+
+        ordinal = current_device()
+    except Exception:
+        ordinal = None  # no GPU visible / cuda-python absent: resolve lazily on .device
+    # Seed the stream from the backend's actual stream (a fresh handle runs on
+    # stream 0) so a python plan and a backend plan on this handle agree on the
+    # stream, instead of the python side falling back to torch's current stream.
+    return Handle(raw, ordinal, _pybind_module.get_stream(raw))
+
+
+def set_stream(handle, stream):
+    """Set the CUDA stream a cuDNN handle runs on (wraps the compiled ``cudnnSetStream``).
+
+    ``cudnnSetStream`` is not free: for a non-null stream it issues several CUDA driver queries
+    on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
+    internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
+    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so the
+    :class:`cudnn.Handle` remembers its last stream and skips the backend call when it has not
+    changed; a steady-state loop pays it once. (Assumes a Handle is not driven from two streams
+    concurrently, which is the normal single-stream case; a caller that does needs its own handle
+    per stream regardless.)
+    """
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    if handle.stream == stream:
+        return
+    if handle.backend_handle is not None:
+        _pybind_module._raw_set_stream(handle.backend_handle, stream)
+    handle.stream = stream
+
+
+def get_stream(handle):
+    """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
+    backend round-trip."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    return handle.stream
+
+
+def destroy_handle(handle):
+    """Destroy a :class:`cudnn.Handle` (wraps the compiled binding). The backend handle is cleared
+    after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
+    C++ (a double-destroy or a later set_stream)."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    backend = handle.backend_handle
+    if backend is None:
+        handle.stream = None
+        return None
+    _pybind_module._raw_destroy_handle(backend)
+    handle.backend_handle = None
+    handle.stream = None
+    return None
+
+
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.27.0"
+__version__ = "1.31.0"
 
 
 def _tensor(
@@ -201,9 +283,18 @@ _EAGER_PUBLIC_NAMES = (
             "causal_conv1d_nwh_backward",
             "b2b_causal_conv1d_forward",
             "b2b_causal_conv1d_backward",
+            "gnn_agg_op",
+            "gnn_agg_simple_forward",
+            "gnn_agg_simple_backward",
         )
         if symbol in globals()
     ),
+    "create_handle",
+    "destroy_handle",
+    "get_stream",
+    "set_stream",
+    "Handle",
+    "DeviceInfo",
     "__version__",
     "NodeType",
     "Tensor",
@@ -217,11 +308,121 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
+_MOE_EP_OPTIONAL_IMPORTS = {
+    "moe_ep",
+    "BlockScaledTensor",
+    "MoeEp",
+    "MoeEpConfig",
+    "MoeEpDataPathConfig",
+    "MoeEpFc1WeightLayout",
+    "MoeEpModelConfig",
+    "MoeEpParallelConfig",
+    "MoeEpAutotuneCandidateResult",
+    "MoeEpAutotuneResult",
+    "MoeEpBackwardWeightStaging",
+    "MoeEpBackwardWeights",
+    "MoeEpForwardWeightStaging",
+    "MoeEpForwardWeights",
+    "MoeEpNativeBackwardWeights",
+    "MoeEpNativeDiscreteBackwardWeights",
+    "MoeEpNativeDiscreteForwardWeights",
+    "MoeEpNativeDiscreteWeight",
+    "MoeEpNativeForwardWeights",
+    "MoeEpNativeWeight",
+    "MoeEpNativeWeightLayout",
+    "MoeEpNativeWeightStorageMode",
+    "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingForwardOutputs",
+    "MoeEpTrainingWgradOperands",
+    "MoeEpTuningConfig",
+    "MoeFormat",
+    "MoeTensor",
+    "pack_backward_weights",
+    "pack_forward_weights",
+}
+_OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
+    "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
+    "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
+    "rope_qdq_inplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
+    "EngramGateSavedForward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "EngramGateSavedBackward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_forward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "engram_gate_saved_backward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
+    "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+}
+_OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "TailRoPEForward": (".rope", "TailRoPEForward"),
+    "tail_rope": (".rope", "tail_rope"),
+    "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
+    "vision_rope_backward_wrapper": (".rope", "vision_rope_backward_wrapper"),
+    "RopeQDQInplace": (".rope", "RopeQDQInplace"),
+    "rope_qdq_inplace": (".rope", "rope_qdq_inplace"),
+    "EngramGateSavedForward": (".engram", "EngramGateSavedForward"),
+    "EngramGateSavedBackward": (".engram", "EngramGateSavedBackward"),
+    "engram_gate_saved_forward": (".engram", "engram_gate_saved_forward"),
+    "engram_gate_saved_backward": (".engram", "engram_gate_saved_backward"),
+    "gnn": (".gnn", None),
+    "moe_ep": (".moe_ep", None),
+    "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
+    "MoeEp": (".moe_ep", "MoeEp"),
+    "MoeEpConfig": (".moe_ep", "MoeEpConfig"),
+    "MoeEpDataPathConfig": (".moe_ep", "MoeEpDataPathConfig"),
+    "MoeEpFc1WeightLayout": (".moe_ep", "MoeEpFc1WeightLayout"),
+    "MoeEpModelConfig": (".moe_ep", "MoeEpModelConfig"),
+    "MoeEpParallelConfig": (".moe_ep", "MoeEpParallelConfig"),
+    "MoeEpAutotuneCandidateResult": (
+        ".moe_ep",
+        "MoeEpAutotuneCandidateResult",
+    ),
+    "MoeEpAutotuneResult": (".moe_ep", "MoeEpAutotuneResult"),
+    "MoeEpBackwardWeightStaging": (".moe_ep", "MoeEpBackwardWeightStaging"),
+    "MoeEpBackwardWeights": (".moe_ep", "MoeEpBackwardWeights"),
+    "MoeEpForwardWeightStaging": (".moe_ep", "MoeEpForwardWeightStaging"),
+    "MoeEpForwardWeights": (".moe_ep", "MoeEpForwardWeights"),
+    "MoeEpNativeBackwardWeights": (".moe_ep", "MoeEpNativeBackwardWeights"),
+    "MoeEpNativeDiscreteBackwardWeights": (
+        ".moe_ep",
+        "MoeEpNativeDiscreteBackwardWeights",
+    ),
+    "MoeEpNativeDiscreteForwardWeights": (
+        ".moe_ep",
+        "MoeEpNativeDiscreteForwardWeights",
+    ),
+    "MoeEpNativeDiscreteWeight": (".moe_ep", "MoeEpNativeDiscreteWeight"),
+    "MoeEpNativeForwardWeights": (".moe_ep", "MoeEpNativeForwardWeights"),
+    "MoeEpNativeWeight": (".moe_ep", "MoeEpNativeWeight"),
+    "MoeEpNativeWeightLayout": (".moe_ep", "MoeEpNativeWeightLayout"),
+    "MoeEpNativeWeightStorageMode": (
+        ".moe_ep",
+        "MoeEpNativeWeightStorageMode",
+    ),
+    "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
+    "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
+    "MoeEpTrainingWgradOperands": (
+        ".moe_ep",
+        "MoeEpTrainingWgradOperands",
+    ),
+    "MoeEpTuningConfig": (".moe_ep", "MoeEpTuningConfig"),
+    "MoeFormat": (".moe_ep", "MoeFormat"),
+    "MoeTensor": (".moe_ep", "MoeTensor"),
+    "pack_backward_weights": (".moe_ep", "pack_backward_weights"),
+    "pack_forward_weights": (".moe_ep", "pack_forward_weights"),
+    "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
+    "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
+    "create_mask_plan": (".flex_attention", "create_mask_plan"),
+    "flex_attn_func": (".flex_attention", "flex_attn_func"),
+    "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
+    "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
+    "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -230,60 +431,158 @@ _LAZY_OPTIONAL_IMPORTS = {
     "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.swiglu",
+        "gemm_swiglu_wrapper_sm100",
+    ),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
+    "MhcProjectionBackward": (".gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "mhc_projection_backward": (".gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
-    "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
+    "gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.srelu",
+        "gemm_srelu_wrapper_sm100",
+    ),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
-    "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "gemm_dsrelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.dsrelu",
+        "gemm_dsrelu_wrapper_sm100",
+    ),
     "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
     "gemm_amax_jax_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_jax_sm100"),
-    "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
-    "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
-    "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
-    "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
+    "GemmProjRopeMxfp8Bf16InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Bf16InSm100",
+    ),
+    "GemmProjRopeMxfp8Mxfp8InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Mxfp8InSm100",
+    ),
+    "gemm_proj_rope_mxfp8_wrapper_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_wrapper_sm100",
+    ),
+    "gemm_proj_rope_mxfp8_jax_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_jax_sm100",
+    ),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
-    "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
+    "rmsnorm_rht_amax_wrapper_sm100": (
+        ".rmsnorm_rht_amax",
+        "rmsnorm_rht_amax_wrapper_sm100",
+    ),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
-    "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "grouped_gemm_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wrapper_sm100",
+    ),
     "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
-    "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
-    "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
-    "grouped_gemm_dsrelu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_jax_sm100"),
-    "grouped_gemm_wgrad_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_jax_sm100"),
-    "discrete_grouped_gemm_swiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_jax_sm100"),
-    "discrete_grouped_gemm_dswiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_jax_sm100"),
+    "grouped_gemm_glu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_jax_sm100",
+    ),
+    "grouped_gemm_dglu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_jax_sm100",
+    ),
+    "grouped_gemm_dsrelu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dsrelu_jax_sm100",
+    ),
+    "grouped_gemm_wgrad_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_jax_sm100",
+    ),
+    "discrete_grouped_gemm_swiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_jax_sm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_jax_sm100",
+    ),
     "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
-    "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_swiglu_wrapper_sm100",
+    ),
     "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
-    "grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dswiglu_wrapper_sm100",
+    ),
     "GroupedGemmSreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSreluSm100"),
-    "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_srelu_wrapper_sm100",
+    ),
     "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
     "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
-    "SdpafwdSm100D256": (".sdpa", "SdpafwdSm100D256"),
-    "sdpa_fwd_wrapper_sm100_d256": (".sdpa", "sdpa_fwd_wrapper_sm100_d256"),
-    "SdpabwdSm100D256": (".sdpa", "SdpabwdSm100D256"),
-    "sdpa_bwd_wrapper_sm100_d256": (".sdpa", "sdpa_bwd_wrapper_sm100_d256"),
+    "hstu_attention_forward": (".hstu.hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": (".hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": (".hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": (".hstu.hstu_lmsd", "hstu_lmsd_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
-    "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
+    "grouped_gemm_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_wrapper_sm100",
+    ),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
-    "grouped_gemm_glu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_wrapper_sm100"),
-    "GroupedGemmGluHadamardSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardSm100"),
-    "grouped_gemm_glu_hadamard_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+    "grouped_gemm_glu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardSm100",
+    ),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardQuantSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardQuantSm100",
+    ),
+    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_quant_wrapper_sm100",
+    ),
     "GroupedGemmDgluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDgluSm100"),
-    "grouped_gemm_dglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_wrapper_sm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_wrapper_sm100",
+    ),
     "GroupedGemmWgradSm100": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm100"),
-    "grouped_gemm_wgrad_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_wrapper_sm100"),
+    "get_grouped_gemm_wgrad_workspace_size_sm100": (
+        ".gemm.cutedsl.grouped",
+        "get_grouped_gemm_wgrad_workspace_size_sm100",
+    ),
+    "grouped_gemm_wgrad_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_wrapper_sm100",
+    ),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
-    "DiscreteGroupedGemmSwigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmSwigluSm100"),
-    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
-    "DiscreteGroupedGemmDswigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmDswigluSm100"),
-    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmSwigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmSwigluSm100",
+    ),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_wrapper_sm100",
+    ),
+    "DiscreteGroupedGemmDswigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmDswigluSm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_wrapper_sm100",
+    ),
 }
 
 
@@ -293,10 +592,57 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+        raise ImportError(_optional_dependency_message(name, e)) from e
 
     globals()[name] = value
     return value
+
+
+# `cuda` (cuda-python) is deliberately NOT here: it is a separate dependency the
+# `[cutedsl]` extra installs, so a missing `cuda` wants that install, not a DSL upgrade.
+_DSL_STACK_MODULES = ("cutlass", "tvm_ffi", "nvidia_cutlass_dsl", "cudnn")
+
+
+def _missing_non_dsl_module(error: BaseException):
+    """Name of the missing module when the failure is a ModuleNotFoundError outside
+    the CuTe DSL stack, else None.
+
+    Walks the exception chain; the first ModuleNotFoundError decides. ``cudnn``
+    counts as the DSL stack because a kernel package failing to import on an old
+    DSL surfaces as a missing cudnn.* submodule.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModuleNotFoundError):
+            name = error.name or ""
+            top = name.split(".", 1)[0]
+            return name if top and top not in _DSL_STACK_MODULES else None
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def _optional_dependency_message(name: str, error: Exception) -> str:
+    install_hint = _OPTIONAL_DEPENDENCY_INSTALL_HINTS.get(name, _OPTIONAL_DEPENDENCY_INSTALL_HINT)
+    # A DSL that is installed but below the floor must not be reported as a
+    # missing dependency: "pip install [cutedsl]" would change nothing. The
+    # converse holds too: a failure that is plainly NOT the DSL's -- a missing
+    # third-party module such as torch -- must not be blamed on the DSL version
+    # just because an old DSL happens to be installed.
+    missing = _missing_non_dsl_module(error)
+    if missing is not None:
+        # Name the module: the install hint alone does not fetch a missing framework
+        # (torch, jax) and only fetches cuda-python via the extra.
+        return f"{name} requires the {missing!r} module, which is not installed. {install_hint}: {error}"
+    try:
+        from .frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error(name)
+    except Exception:
+        too_old = None
+    if too_old is not None:
+        return f"{too_old}: {error}"
+    return f"{name} requires optional dependencies. {install_hint}: {error}"
 
 
 def __getattr__(name: str) -> Any:
@@ -331,6 +677,24 @@ def __getattr__(name: str) -> Any:
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
+
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
+
+    if name == "fla":
+        # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.
+        # Deferred so `import cudnn` never eagerly imports torch / the FLA shim.
+        _fla = importlib.import_module(".fla", __name__)
+        globals()["fla"] = _fla
+        return _fla
 
     if name in _LAZY_OPTIONAL_IMPORTS:
         return _load_optional_symbol(name)

@@ -9,6 +9,8 @@ Reference: continugous_blockscaled_grouped_gemm_swiglu_quant_fusion.py (lines 35
 """
 
 import torch
+import functools
+
 import pytest
 from typing import Optional, Tuple, List, Dict, Any
 from fe_api.test_fe_api_utils import (
@@ -94,23 +96,40 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = (
     ]
 )
 
-GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = (
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE = (
     GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_SWIGLU_COMMON_MARKS
     + [
         pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 256)]),
-        pytest.mark.parametrize(
-            "sf_vec_size,sf_dtype",
-            [
-                (16, torch.float8_e8m0fnu),
-                (16, torch.float8_e4m3fn),
-                (32, torch.float8_e8m0fnu),
-                (32, torch.float8_e4m3fn),
-            ],
-        ),
         pytest.mark.parametrize("discrete_col_sfd", [False]),
     ]
 )
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype",
+        [
+            (16, torch.float8_e8m0fnu),
+            (16, torch.float8_e4m3fn),
+            (32, torch.float8_e8m0fnu),
+            (32, torch.float8_e4m3fn),
+        ],
+    ),
+]
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_WITH_E5M3 = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
+        [
+            (16, torch.float8_e8m0fnu, None),
+            (16, torch.float8_e4m3fn, None),
+            (32, torch.float8_e8m0fnu, None),
+            (32, torch.float8_e4m3fn, None),
+            (16, torch.float8_e4m3fn, "e5m3"),
+        ],
+        ids=["v16_e8m0", "v16_e4m3", "v32_e8m0", "v32_e4m3", "v16_e5m3"],
+    ),
+]
 
 GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP8 = (
     GROUPED_GEMM_SWIGLU_FP8_TYPE_MARKS
@@ -140,9 +159,12 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP4 = (
 )
 
 
-def with_grouped_gemm_swiglu_params_fp4(func):
+def with_grouped_gemm_swiglu_params_fp4(func=None, *, with_e5m3: bool = False):
     """Decorator to apply grouped GEMM SwiGLU FP4 test parameters."""
-    for mark in reversed(GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4):
+    if func is None:
+        return functools.partial(with_grouped_gemm_swiglu_params_fp4, with_e5m3=with_e5m3)
+    param_marks = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_WITH_E5M3 if with_e5m3 else GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4
+    for mark in reversed(param_marks):
         func = mark(func)
     return func
 
@@ -877,3 +899,187 @@ def check_ref_grouped_gemm_swiglu(
 
     else:
         raise NotImplementedError(f"Unsupported dtype: {cfg['d_dtype']}")
+
+
+# =============================================================================
+# Focused Rubin MXFP8 clamped GLU regression helpers
+# =============================================================================
+
+RUBIN_MXFP8_DSV4 = dict(geglu_alpha=1.0, linear_offset=0.0, glu_clamp_max=10.0, glu_clamp_min=-10.0)
+RUBIN_MXFP8_DEFAULTS = dict(geglu_alpha=1.702, linear_offset=1.0, glu_clamp_max=7.0, glu_clamp_min=-7.0)
+RUBIN_MXFP8_CUSTOM = dict(geglu_alpha=0.625, linear_offset=0.5, glu_clamp_max=5.0, glu_clamp_min=-3.0)
+
+
+def make_mxfp8_constant_scales(experts, rows, cols, value):
+    # Preserve the existing allocator's MMA shape AND strides. Constant scales
+    # avoid a separate layout conversion kernel in this focused acceptance test.
+    storage, _ = create_sf_layout_tensor(experts, rows, cols, 32)
+    return storage.fill_(value).to(torch.float8_e8m0fnu).cuda()
+
+
+def make_rubin_mxfp8_glu_problem(*, discrete, with_prob, quantized=False):
+    n, k = 512, 256
+    group_m = [17, 273, 63]
+    total_m, aligned_m, offsets = create_mask(group_m, m_aligned=256)
+    _, a = create_and_permute_tensor(1, total_m, k, False, torch.float8_e4m3fn)
+    _, dense_b = create_and_permute_tensor(len(group_m), n, k, False, torch.float8_e4m3fn)
+    a_values = torch.zeros_like(a, dtype=torch.float32)
+    b_values = torch.zeros_like(dense_b, dtype=torch.float32)
+    # E4M3-representable values at/beyond all tested clamp boundaries. A gate
+    # of -20 distinguishes upper-only clipping from an incorrect symmetric clamp.
+    boundaries = torch.tensor([-20, -11, -10, -9, -7, -6, -5, -4, -3, -1, 0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 20], device="cuda")
+    start = 0
+    valid_rows = []
+    for expert, (count, padded) in enumerate(zip(group_m, aligned_m)):
+        rows = torch.arange(count, device="cuda")
+        a_values[start + rows, rows % 32, 0] = 1.0
+        valid_rows.append(start + rows)
+        start += padded
+        for block in range(n // 64):
+            channel = torch.arange(32, device="cuda")[:, None]
+            selector = torch.arange(32, device="cuda")[None, :]
+            b_values[block * 64 : block * 64 + 32, :32, expert] = boundaries[(selector + channel + block + expert) % len(boundaries)]
+            b_values[block * 64 + 32 : (block + 1) * 64, :32, expert] = boundaries[(selector * 3 + channel + 2 * block + expert) % len(boundaries)]
+    a.copy_(a_values.to(a.dtype))
+    dense_b.copy_(b_values.to(dense_b.dtype))
+    alpha = torch.tensor([1.0, 0.5, 2.0], device="cuda")
+    prob = None
+    if with_prob:
+        probabilities = torch.tensor([0.0, 0.25, 1.0], device="cuda")
+        prob = probabilities[torch.arange(total_m, device="cuda") % 3].reshape(total_m, 1, 1)
+    sfa = make_mxfp8_constant_scales(1, total_m, k, 0.5)
+    sfb = make_mxfp8_constant_scales(len(group_m), n, k, 2.0)
+    d_dtype = torch.float8_e4m3fn if quantized else torch.bfloat16
+    _, c = create_and_permute_tensor(1, total_m, n, False, torch.bfloat16)
+    _, d = create_and_permute_tensor(1, total_m, n // 2, False, d_dtype)
+    # The block-scaled API still constructs a D_col descriptor without SFD.
+    _, d_col = create_and_permute_tensor(1, total_m, n // 2, False, d_dtype)
+    p = dict(
+        a=a,
+        b=dense_b,
+        sfa=sfa,
+        sfb=sfb,
+        alpha=alpha,
+        prob=prob,
+        offsets=offsets,
+        c=c,
+        d=d,
+        amax=torch.empty((len(group_m), 1), device="cuda"),
+        d_col=d_col,
+        sfd_row=None,
+        sfd_col=None,
+        norm=None,
+        discrete=discrete,
+        n=n,
+        k=k,
+        aligned_m=aligned_m,
+        valid_rows=torch.cat(valid_rows),
+    )
+    if discrete:
+        # Real per-expert allocations, not pointers into one dense B allocation.
+        p["b_list"] = [dense_b[:, :, expert].clone(memory_format=torch.contiguous_format) for expert in range(len(group_m))]
+        p["sfb_list"] = [make_mxfp8_constant_scales(1, n, k, 2.0) for _ in group_m]
+        p["b_ptrs"] = torch.tensor([b.data_ptr() for b in p["b_list"]], dtype=torch.int64, device="cuda")
+        p["sfb_ptrs"] = torch.tensor([sf.data_ptr() for sf in p["sfb_list"]], dtype=torch.int64, device="cuda")
+    if quantized:
+        p["sfd_row"] = make_mxfp8_constant_scales(1, total_m, n // 2, 1.0)
+        p["sfd_col"] = make_mxfp8_constant_scales(1, n // 2, total_m, 1.0)
+        p["norm"] = torch.ones(1, device="cuda")
+
+    # Read back quantized payloads and apply the actual known E8M0 scale values.
+    # Sparse A makes these products exactly representable before the activation.
+    c_ref = torch.empty((total_m, n, 1), dtype=torch.float32, device="cuda")
+    start = 0
+    for expert, padded in enumerate(aligned_m):
+        a_dequant = a[start : start + padded, :, 0].float() * 0.5
+        b_dequant = (p["b_list"][expert] if discrete else dense_b[:, :, expert]).float() * 2.0
+        c_ref[start : start + padded, :, 0] = (a_dequant @ b_dequant.T) * alpha[expert]
+        start += padded
+    p["c_ref"] = c_ref
+    return p
+
+
+def rubin_mxfp8_glu_reference(p, parameters):
+    params = RUBIN_MXFP8_DEFAULTS | parameters
+    # Each 64-column pair is 32 gate columns followed by 32 up columns.
+    paired = p["c_ref"].squeeze(-1).reshape(-1, p["n"] // 64, 2, 32)
+    gate = paired[:, :, 0, :].reshape(-1, p["n"] // 2).clamp(max=params["glu_clamp_max"])
+    up = paired[:, :, 1, :].reshape(-1, p["n"] // 2).clamp(min=params["glu_clamp_min"], max=params["glu_clamp_max"])
+    expected = gate * torch.sigmoid(params["geglu_alpha"] * gate) * (up + params["linear_offset"])
+    if p["prob"] is not None:
+        expected *= p["prob"].squeeze(-1)
+    return expected.unsqueeze(-1)
+
+
+def rubin_mxfp8_weight_arguments(p, *, samples=False):
+    if p["discrete"]:
+        if samples:
+            return dict(num_experts=len(p["aligned_m"]), b_shape=(p["n"], p["k"]), b_dtype=p["a"].dtype, b_major="k")
+        return dict(b_ptrs=p["b_ptrs"], sfb_ptrs=p["sfb_ptrs"])
+    if samples:
+        return dict(sample_b=p["b"], sample_sfb=p["sfb"])
+    return dict(b_tensor=p["b"], sfb_tensor=p["sfb"])
+
+
+def check_rubin_mxfp8_glu_unquantized(p, parameters):
+    expected = rubin_mxfp8_glu_reference(p, parameters)
+    rows = p["valid_rows"]
+    # C must remain the unclipped GEMM result even when D saturates at the limits.
+    torch.testing.assert_close(p["c"][rows], p["c_ref"][rows].to(p["c"].dtype), rtol=0, atol=0)
+    torch.testing.assert_close(p["d"][rows].float(), expected[rows], rtol=0.005, atol=1e-7)
+    start = 0
+    for expert, padded in enumerate(p["aligned_m"]):
+        torch.testing.assert_close(p["amax"][expert, 0], expected[start : start + padded].abs().max(), rtol=2e-5, atol=1e-7)
+        start += padded
+
+
+def _mxfp8_roundtrip_e8m0(values):
+    """Use the format converter already used by the suite's MXFP8 reference."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    source = values.contiguous()
+    storage = torch.empty_like(source, dtype=torch.uint8)
+    encoded = from_dlpack(storage, assumed_align=16)
+    encoded.element_type = cutlass.Float8E8M0FNU
+    cute.testing.convert(from_dlpack(source, assumed_align=16), encoded)
+    decoded = torch.empty_like(source)
+    cute.testing.convert(encoded, from_dlpack(decoded, assumed_align=16))
+    return decoded
+
+
+def _mxfp8_logical_scales(storage, rows, blocks):
+    # This is the allocator's documented M(32x4xrest_m), K(4xrest_k), L
+    # indexing, not a reshape of the physical MMA-interleaved bytes.
+    m = torch.arange(rows, device=storage.device)[:, None]
+    k = torch.arange(blocks, device=storage.device)[None, :]
+    return storage.float()[m % 32, (m // 32) % 4, m // 128, k % 4, k // 4, 0]
+
+
+def check_mxfp8_quantized_output(expected, *, row_output, col_output, row_scales, col_scales):
+    """Check E8M0 scales, E4M3 payloads and reconstructed values in both directions."""
+    expected = expected.squeeze(-1)
+    for transpose, output, scale_storage in ((False, row_output, row_scales), (True, col_output, col_scales)):
+        ref = expected.T.contiguous() if transpose else expected
+        data = output.squeeze(-1).float()
+        data = data.T.contiguous() if transpose else data
+        rows, cols = ref.shape
+        block_amax = ref.reshape(rows, cols // 32, 32).abs().amax(dim=-1)
+        expected_sf = _mxfp8_roundtrip_e8m0(block_amax * (1.0 / 448.0))
+        actual_sf = _mxfp8_logical_scales(scale_storage, rows, cols // 32)
+        # Validate scale and payload independently, then bound reconstruction
+        # error per block so the largest expert cannot hide tiny/zero blocks.
+        torch.testing.assert_close(actual_sf, expected_sf, rtol=0, atol=0)
+        scale = expected_sf.repeat_interleave(32, dim=1)
+        quantized_ref = (ref * scale.reciprocal().clamp(max=torch.finfo(torch.float32).max)).to(torch.float8_e4m3fn).float()
+        torch.testing.assert_close(data, quantized_ref, rtol=0.065, atol=2**-9)
+        reconstructed = data * scale
+        bound = block_amax.repeat_interleave(32, dim=1) * 0.065 + 1e-7
+        assert torch.all((reconstructed - ref).abs() <= bound)
+
+
+def check_rubin_mxfp8_glu_quantized(p, parameters):
+    expected = rubin_mxfp8_glu_reference(p, parameters)
+    torch.testing.assert_close(p["c"][p["valid_rows"]], p["c_ref"][p["valid_rows"]].bfloat16(), rtol=0, atol=0)
+    check_mxfp8_quantized_output(expected, row_output=p["d"], col_output=p["d_col"], row_scales=p["sfd_row"], col_scales=p["sfd_col"])

@@ -39,11 +39,18 @@ GDN2_ID_BASE = PYTHON_ENGINE_ID_BASE + 300  # 20_300..20_399
 FROST_GEMM_ID_BASE = PYTHON_ENGINE_ID_BASE + 400  # 20_400..20_499
 FROST_SDPA_FWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 500  # 20_500..20_599
 FROST_SDPA_BWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 600  # 20_600..20_699
+GDP_ID_BASE = PYTHON_ENGINE_ID_BASE + 700  # 20_700..20_799
+FROST_CONV_ID_BASE = PYTHON_ENGINE_ID_BASE + 800  # 20_800..20_899
 
 # The delegating entry: the backend picks among candidates it holds but does not
 # expose as plans (heur_mode.OPENSOURCE). It has no C++ plan index and no
 # (engine_id, knobs) pair to replay — C++ builds and runs it itself.
 BACKEND_HEURISTIC_ENGINE_ID = -1
+
+# The placement marker a family hook may put in its proposal list: "the backend's
+# own ranked block for this mode goes here". Expanded by
+# ``engines/heuristics._assemble``; it never reaches ``graph.plans``.
+BACKEND_BLOCK_ENGINE_ID = -2
 
 
 def is_python_engine(engine_id: int) -> bool:

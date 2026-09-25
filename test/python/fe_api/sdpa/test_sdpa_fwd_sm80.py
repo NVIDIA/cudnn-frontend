@@ -22,22 +22,19 @@ def _is_sm80() -> bool:
     return (major, minor) == (8, 0)
 
 
-def _dsl_available() -> bool:
-    # The kernels need the CuTe DSL *with* cutlass.experimental (cutlass-dsl
-    # >= 4.7). The package imports lazily (PEP 562), so a missing/old DSL
-    # only surfaces at kernel-load time — probe it here so the suite SKIPS
-    # instead of erroring mid-test.
-    try:
-        import cutlass.experimental  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def _has_supported_cutedsl() -> bool:
+    """Rule 7 (python/cudnn/AGENTS.md): skip below CUTEDSL_MIN_VERSION instead of
+    failing inside the DSL when the kernel module loads."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    return bool(installed) and not cutedsl_too_old(version)
 
 
-pytestmark = pytest.mark.skipif(
-    not (_is_sm80() and _dsl_available()),
-    reason="SM80 SDPA API requires an SM80 (A100) device and nvidia-cutlass-dsl >= 4.7.",
-)
+pytestmark = [
+    pytest.mark.skipif(not _is_sm80(), reason="SM80 SDPA API requires an SM80 (A100) device"),
+    pytest.mark.skipif(not _has_supported_cutedsl(), reason="requires nvidia-cutlass-dsl at or above cudnn.frost.buffers.CUTEDSL_MIN_VERSION"),
+]
 
 
 def _bshd_randn(b, h, s, d, **kw):
@@ -96,7 +93,7 @@ def test_sdpa_fwd_sm80_smoke():
 def test_sdpa_fwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
     """End-to-end check against torch reference SDPA (full sweep, L2)."""
     try:
-        from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -147,7 +144,7 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
     test_mhas_v2::test_sdpa_random_bwd_L0 once a random config combined a
     tile-aligned S_q with bottom-right padding."""
     try:
-        from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -179,19 +176,113 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
 def test_sdpa_fwd_sm80_check_support_rejections():
     """check_support rejects out-of-envelope heads and bad layouts eagerly."""
     try:
-        from cudnn.sdpa import SdpafwdSm80
+        from cudnn.sdpa.fwd import SdpaFwdDslSm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
     b, h, s = 1, 4, 128
     q = torch.zeros((b, s, h, 512), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
     lse = torch.zeros((b, h, s), dtype=torch.float32, device="cuda")
-    api = SdpafwdSm80(sample_q=q, sample_k=q, sample_v=q, sample_o=q, sample_lse=lse)
+    api = SdpaFwdDslSm80(sample_q=q, sample_k=q, sample_v=q, sample_o=q, sample_lse=lse)
     with pytest.raises(ValueError, match="exceeds"):
         api.check_support()
 
     q64 = torch.zeros((b, s, h, 64), dtype=torch.float32, device="cuda").permute(0, 2, 1, 3)
     lse64 = torch.zeros((b, h, s), dtype=torch.float32, device="cuda")
-    api = SdpafwdSm80(sample_q=q64, sample_k=q64, sample_v=q64, sample_o=q64, sample_lse=lse64)
+    api = SdpaFwdDslSm80(sample_q=q64, sample_k=q64, sample_v=q64, sample_o=q64, sample_lse=lse64)
     with pytest.raises(ValueError, match="dtype"):
         api.check_support()
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_sm80_thd_off_flavor_head_dim():
+    """Off-flavor THD head dim (d=96 rides the llama d=128 envelope): Q/K are
+    host-padded to the flavor width, and the kernel derives its Q/K row
+    strides from the runtime ``d`` — so the launch must pass the PADDED
+    width, or every row past the first reads the wrong address."""
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+
+    H, D = 4, 96
+    lens = [80, 33]
+    t = sum(lens)
+    cu = torch.tensor([0, lens[0], t], dtype=torch.int32, device="cuda")
+    q = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    v = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    scale = 1.0 / math.sqrt(D)
+    out = sdpa_fwd_wrapper_sm80(
+        q,
+        k,
+        v,
+        is_causal=True,
+        scale_softmax=scale,
+        cum_seqlen_q_tensor=cu,
+        cum_seqlen_k_tensor=cu,
+        max_s_q=max(lens),
+    )
+    o = out["o_tensor"]
+    for b0, b1 in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        o_ref = _ref_sdpa(
+            q[0, b0:b1].permute(1, 0, 2)[None],
+            k[0, b0:b1].permute(1, 0, 2)[None],
+            v[0, b0:b1].permute(1, 0, 2)[None],
+            is_causal=True,
+            window_size=(-1, -1),
+            scale=scale,
+        )
+        torch.testing.assert_close(o[0, b0:b1].permute(1, 0, 2)[None], o_ref, rtol=1e-2, atol=4e-3)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_sm80_thd_compile_key_plan_time_only():
+    """Issue #604 regression: the packed THD token totals are RUNTIME values,
+    so two varlen calls with different totals must re-bind ONE compiled
+    artifact (the template module's per-shape lru sees a single miss) —
+    never mint a compile per step, which is the continuous-batching
+    pathology no correctness test catches."""
+    from cudnn.frost import template_loader
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+
+    H, D = 4, 128
+
+    def varlen(lens):
+        import itertools
+
+        t = int(sum(lens))
+        cu = torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device="cuda")
+        q = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+        return sdpa_fwd_wrapper_sm80(
+            q,
+            k,
+            v,
+            is_causal=True,
+            cum_seqlen_q_tensor=cu,
+            cum_seqlen_k_tensor=cu,
+            max_s_q=int(max(lens)),
+        )
+
+    def cache_totals():
+        # The lru counters are session-global (earlier tests in a full run
+        # accumulate misses), so assert on DELTAS across our calls only.
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "sm80" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
+        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+
+    varlen([96, 160])  # first call: one compile
+    n_modules_before = len(template_loader._MODULES)
+    misses_0, hits_0 = cache_totals()
+    varlen([128, 64, 320])  # different totals AND batch count... same artifact?
+    # Different logical batch counts legitimately re-specialize (the cu fake
+    # length is plan-time); different TOKEN TOTALS at the same batch count
+    # must not.
+    varlen([64, 192])  # same n_seqs as call 1, different totals
+    assert len(template_loader._MODULES) == n_modules_before, "a new template specialization was minted by runtime data"
+    misses_1, hits_1 = cache_totals()
+    # Call 2 (n_seqs=3) may legitimately re-specialize once; call 3 shares
+    # call 1's key (n_seqs=2, different token totals) and MUST cache-hit.
+    assert misses_1 - misses_0 <= 1, f"THD compile key leaked runtime data: {misses_1 - misses_0} new misses"
+    assert hits_1 - hits_0 >= 1, "expected a cache hit on the same-batch-count re-call"

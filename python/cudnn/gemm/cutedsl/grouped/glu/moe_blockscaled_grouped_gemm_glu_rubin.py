@@ -15,14 +15,15 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, CollectorOp
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -50,7 +51,7 @@ from ..moe_kernel_helpers import (
     fmax,
     atomic_max_float32,
     silu_f32,
-    silu_f32_geglu_scaled,
+    silu_f32_scaled,
     compute_stages,
     compute_grid,
     get_dtype_rcp_limits,
@@ -84,7 +85,17 @@ class BlockScaledMoEGroupedGemmGluKernel:
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
+        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN/FloatNV8E5M3FNU + sf_vec_size: 16
+
+    :note: FloatNV8E5M3FNU scale factors are Rubin-only and reachable solely through
+        the FP4xFP4 atom (SM107MmaMXF4NVF4Op); the FP8 atom accepts Float8E8M0FNU only.
+        torch has no e5m3 dtype, so the frontend passes such scale factors as
+        torch.float8_e4m3fn storage and overrides the CuTe element type at compile
+        time -- see ``sf_fp8_dtype_override`` in ``_blockscaled_api.py``.
+        ``can_implement`` below does not model this: it reports E5M3 as unsupported
+        because its shared validator is arch-agnostic and other callers are SM100,
+        where E5M3 scales really are invalid. The block-scaled API validates the
+        combination itself and never calls ``can_implement``.
 
     :note: Supported accumulator data types:
         - Float32
@@ -212,6 +223,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = True,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
@@ -244,6 +256,13 @@ class BlockScaledMoEGroupedGemmGluKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param expert_cnt: Number of experts (compile-time constant).
         :type expert_cnt: int
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
+        :type sf_fp8_dtype_override: Optional[Literal["e5m3"]]
 
         :raises ValueError: If FIX_PAD_SIZE is not divisible by mma_tiler_mn[0].
         """
@@ -273,6 +292,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -326,7 +346,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
@@ -696,6 +716,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -723,6 +745,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
     ):
         """Execute the GEMM.
 
@@ -730,19 +755,33 @@ class BlockScaledMoEGroupedGemmGluKernel:
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
+
+        For ``act_func == "geglu"``, runtime ``cutlass.Float32`` parameters
+        configure the activation:
+
+            gate_clamped = min(gate, glu_clamp_max)
+            up_clamped = clamp(up, min=glu_clamp_min, max=glu_clamp_max)
+            out = gate_clamped * sigmoid(geglu_alpha * gate_clamped)
+                  * (up_clamped + linear_offset)
+
+        The optional routing probability multiplies this result. Stored C
+        retains the GEMM-plus-bias values before activation clamping.
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -1105,6 +1144,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
             self.sched_params,
             epilogue_op,
             linear_offset,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1433,7 +1475,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
         return tCgSFDCol_mnl
 
     @cute.jit
-    def geglu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor, linear_offset: cutlass.Float32 = 1.0):
+    def geglu_act(
+        self,
+        tCompute: cute.Tensor,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        mProb: cute.Tensor,
+        linear_offset: cutlass.Float32 = 1.0,
+        alpha: cutlass.Float32 = 1.702,
+    ):
         if cutlass.const_expr(self.vectorized_f32):
             # GeGlu Packed Version
             LOG2_E = cutlass.Float32(1.4426950408889634)
@@ -1441,7 +1491,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
                 scaled_gate_0, scaled_gate_1 = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                    (1.702, 1.702),
+                    (alpha, alpha),
                     rnd="rn",
                     ftz=False,
                 )
@@ -1506,7 +1556,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             # GeGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
-                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_geglu_scaled(acc_vec_gate[i], fastmath=True)
+                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_scaled(acc_vec_gate[i], alpha=alpha, fastmath=True)
                 if cutlass.const_expr(self.has_prob):
                     tCompute[i] = tCompute[i] * mProb
 
@@ -1613,6 +1663,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1659,7 +1712,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1735,7 +1788,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2376,6 +2429,19 @@ class BlockScaledMoEGroupedGemmGluKernel:
                     expert_idx = tile_info[0]
 
                     gBias_tile = gBias_nl[(None, mma_n_coord, expert_idx)]
+
+                    # For dynamic MNKL, cuteDSL drops the 128bit alignment requirement
+                    # but we know that during runtime the alignment is always 16 bytes.
+                    gBias_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            gBias_tile.element_type,
+                            gBias_tile.iterator.toint(),
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        gBias_tile.layout,
+                    )
+
                     tBs_gBias = thr_bias_g2s.partition_S(gBias_tile)
 
                     # Predicate: check if this thread's chunk is within N
@@ -2834,12 +2900,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                             )
 
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            geglu_max_val = cutlass.Float32(7.0)
-                            geglu_min_val = cutlass.Float32(-7.0)
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
+                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], glu_clamp_min)
 
                         acc_vec_gate = tTR_rAcc_gate.load()
                         acc_vec_up = tTR_rAcc_up.load()
@@ -2847,7 +2911,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         # SwiGlu or GeGLU
                         tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
+                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset, geglu_alpha)
                         elif cutlass.const_expr(self.act_func == "swiglu"):
                             self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
 
@@ -3006,6 +3070,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
             #
             c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     def epilog_tmem_copy_and_partition(
         self,

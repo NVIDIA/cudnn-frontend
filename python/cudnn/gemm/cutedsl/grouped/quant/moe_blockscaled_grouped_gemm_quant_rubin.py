@@ -15,15 +15,16 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 from enum import Enum
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, CollectorOp
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -85,6 +86,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param generate_c: Generate C output tensor.
     :param enable_bias: Fuse bias addition.
     :param expert_cnt: Number of experts.
+    :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+        as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+        (default) leaves the format inferred, as every caller did before this
+        knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+        scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+        torch has no e5m3 dtype -- only the CuTe element type is overridden.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     """
@@ -185,6 +192,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         epilogue_type: int = EpilogueType.NONE.value,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         # Hardware MMA instruction M: 2CTA → 256, 1CTA → 128
@@ -216,6 +224,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -264,7 +273,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
@@ -532,12 +541,11 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
         d_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
 
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
-        )
+        a_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        b_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        sfa_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
+        sfb_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
+        ab_bytes_per_stage = a_bytes_per_stage + b_bytes_per_stage + sfa_bytes_per_stage + sfb_bytes_per_stage
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
@@ -558,14 +566,47 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
 
         d_stage_bytes = d_bytes_per_stage * (2 if generate_sfd else 1)
-        # Reserve headroom: the aligned SharedStorage struct consumes ~1.5 KB more than this
-        # byte sum (the sC/sD/sD_col MemRanges are 1024-B aligned, adding padding). Without it
+        # Reserve headroom: the aligned SharedStorage struct consumes more than this
+        # byte sum (the large MemRanges are 1024-B aligned, adding padding). Without it
         # the extra D stage can push tight tiles (e.g. 256x256, which already packs 9 A/B stages)
         # past the sm_107 SMEM cap and fail the launch config. 512x256 keeps its extra stage.
         smem_headroom = 1536
-        leftover = num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes) - ab_bytes_per_stage * num_ab_stage - smem_headroom
-        if leftover > 0:
-            num_d_stage += leftover // d_stage_bytes
+        smem_budget = num_smem_capacity // occupancy
+        base_d_stage = num_d_stage
+
+        def expanded_d_stage(n_ab):
+            leftover = smem_budget - (mbar_helpers_bytes + epi_bytes + sinfo_bytes) - ab_bytes_per_stage * n_ab - smem_headroom
+            return base_d_stage + (leftover // d_stage_bytes if leftover > 0 else 0)
+
+        buffer_align_bytes = 1024
+
+        def round_align(nbytes):
+            return (nbytes + buffer_align_bytes - 1) // buffer_align_bytes * buffer_align_bytes
+
+        def shared_storage_bytes(n_ab, n_d):
+            # Exact size of the SharedStorage struct in __call__ for these stage
+            # counts: mbars/scheduler head padded to the first 1024-B-aligned
+            # buffer, one aligned extent per MemRange, and sBias/sAmax plus the
+            # trailing padding that rounds the struct itself up to 1024 B.
+            total = mbar_helpers_bytes
+            total += round_align(c_bytes_per_stage * num_c_stage)
+            total += round_align(d_bytes_per_stage * n_d) * (2 if generate_sfd else 1)
+            total += round_align(a_bytes_per_stage * n_ab)
+            total += round_align(b_bytes_per_stage * n_ab)
+            total += round_align(sfa_bytes_per_stage * n_ab)
+            total += round_align(sfb_bytes_per_stage * n_ab)
+            total += round_align(bias_bytes + 4 * 4)  # sBias + sAmax (4 epilog warps)
+            return total
+
+        num_d_stage = expanded_d_stage(num_ab_stage)
+        # The byte-sum estimate above ignores the per-buffer alignment padding, so a
+        # tight config (fp8 256x256: 9 A/B stages with only 480 B of modeled slack)
+        # can produce a struct that exceeds the sm_107 SMEM cap by the padding bytes
+        # and CUDA rejects the launch (CUDA_LAUNCH_INVALID_CONFIG). Shed A/B stages
+        # until the exact struct fits.
+        while num_ab_stage > 1 and shared_storage_bytes(num_ab_stage, num_d_stage) > smem_budget:
+            num_ab_stage -= 1
+            num_d_stage = expanded_d_stage(num_ab_stage)
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage
 
@@ -689,6 +730,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -727,14 +770,21 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        # Scale factors may arrive under a stand-in element type: FloatNV8E5M3FNU has
+        # no torch dtype and TVM-FFI cannot marshal it, so e5m3 scales are passed as
+        # Float8E4M3FN storage of the same width and reinterpreted here. This must
+        # happen before _setup_attributes(), which picks the MMA atom off sf_dtype.
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -1385,7 +1435,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1445,7 +1495,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
         scheduler.internal_init()
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2239,6 +2289,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         if reverse_subtile:
                             real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - subtile_idx
 
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
                     # C1 fix: fence + early release for overlapping_accum
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
@@ -2246,9 +2299,6 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
-
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     # For breuse, update mProb based on which M half this subtile belongs to.
                     # With transform, subtiles interleave M groups: even = bkeep, odd = breuse.
@@ -2508,6 +2558,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             if cutlass.const_expr(self.generate_c):
                 c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     # ------------------------------------------------------------------
     # Internal: create extension based on weight_mode

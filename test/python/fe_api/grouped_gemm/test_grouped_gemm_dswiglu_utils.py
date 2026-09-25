@@ -7,6 +7,8 @@ Contains test configuration fixtures, tensor creation, and reference implementat
 """
 
 import torch
+import functools
+
 import pytest
 from typing import Optional, Tuple, List, Dict, Any
 from fe_api.test_fe_api_utils import (
@@ -18,6 +20,10 @@ from fe_api.test_fe_api_utils import (
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
 )
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
+    RUBIN_MXFP8_DEFAULTS,
+    make_mxfp8_constant_scales,
+    make_rubin_mxfp8_glu_problem,
+    check_mxfp8_quantized_output,
     get_dtype_rcp_limits,
 )
 
@@ -97,22 +103,39 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8 = (
     ]
 )
 
-GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = (
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE = (
     GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
     + [
-        pytest.mark.parametrize(
-            "sf_vec_size,sf_dtype",
-            [
-                (16, torch.float8_e8m0fnu),
-                (16, torch.float8_e4m3fn),
-                (32, torch.float8_e8m0fnu),
-                (32, torch.float8_e4m3fn),
-            ],
-        ),
         pytest.mark.parametrize("discrete_col_sfd", [False]),
     ]
 )
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_WITH_E5M3 = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
+        [
+            (16, torch.float8_e8m0fnu, None),
+            (16, torch.float8_e4m3fn, None),
+            (32, torch.float8_e8m0fnu, None),
+            (32, torch.float8_e4m3fn, None),
+            (16, torch.float8_e4m3fn, "e5m3"),
+        ],
+        ids=["v16_e8m0", "v16_e4m3", "v32_e8m0", "v32_e4m3", "v16_e5m3"],
+    ),
+]
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype",
+        [
+            (16, torch.float8_e8m0fnu),
+            (16, torch.float8_e4m3fn),
+            (32, torch.float8_e8m0fnu),
+            (32, torch.float8_e4m3fn),
+        ],
+    ),
+]
 
 GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP8 = (
     GROUPED_GEMM_DSWIGLU_FP8_TYPE_MARKS
@@ -140,9 +163,12 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP4 = (
 )
 
 
-def with_grouped_gemm_dswiglu_params_fp4(func):
+def with_grouped_gemm_dswiglu_params_fp4(func=None, *, with_e5m3: bool = False):
     """Decorator to apply grouped GEMM dSwiGLU FP4 test parameters."""
-    for mark in reversed(GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4):
+    if func is None:
+        return functools.partial(with_grouped_gemm_dswiglu_params_fp4, with_e5m3=with_e5m3)
+    param_marks = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_WITH_E5M3 if with_e5m3 else GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4
+    for mark in reversed(param_marks):
         func = mark(func)
     return func
 
@@ -353,8 +379,11 @@ def run_grouped_gemm_dswiglu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    act_func: str = "dswiglu",
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
 ) -> Dict[str, torch.Tensor]:
-    """Run reference implementation for grouped GEMM dSwiGLU backward.
+    """Run reference implementation for grouped GEMM dGLU backward.
 
     Based on the reference in continugous_blockscaled_grouped_gemm_dswiglu_quant_fusion.py
 
@@ -385,6 +414,9 @@ def run_grouped_gemm_dswiglu_ref(
     :param d_dtype: Output D tensor dtype
     :param sf_vec_size: Scale factor vector size
     :param sf_dtype: Scale factor dtype
+    :param act_func: Activation function (``"dswiglu"`` or ``"dsituglu"``)
+    :param situ_beta1: Gate tanh scale for dSiTU-GLU
+    :param situ_beta2: Up-branch tanh scale for dSiTU-GLU
     :return: Dictionary of reference tensors
     """
     n, k, l = b_ref.shape
@@ -432,18 +464,29 @@ def run_grouped_gemm_dswiglu_ref(
     c_input = c_full.index_select(dim=1, index=dest_idx_ab)  # shape [M, N, L]
     c_gate = c_full.index_select(dim=1, index=dest_idx_glu)  # shape [M, N, L]
     sig = torch.sigmoid(c_gate)
-    swish = c_gate * sig
+    if act_func == "dsituglu":
+        gate_tanh = torch.tanh(c_gate / situ_beta1)
+        up_tanh = torch.tanh(c_input / situ_beta2)
+        gate_value = situ_beta1 * gate_tanh * sig
+        up_value = situ_beta2 * up_tanh
+        gate_grad = (1.0 - gate_tanh.square()) * sig
+        gate_grad = gate_grad + situ_beta1 * gate_tanh * sig * (1.0 - sig)
+        up_grad = 1.0 - up_tanh.square()
+        ref_dprob = gate_value * up_value * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * gate_value * up_grad
+        dswiglu = ref * prob * up_value * gate_grad
+    else:
+        swish = c_gate * sig
+        ref_dprob = swish * c_input * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * swish
+        dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
     # Step 3: Compute dprob reference
-    ref_dprob = swish * c_input * ref
     chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
     ref_dprob = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)  # (m, 1, l)
     ref_tensors["dprob_ref"] = ref_dprob
-
-    # Step 4: Compute dSwiGLU formulas
-    prob = prob_tensor.expand(-1, n, -1)
-    ab = ref * prob * swish
-    dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
     # Step 5: Interleave [dswiglu, ab] back into swizzled [M, N, 1] by 32-wide blocks
     ref_d = torch.empty_like(c_full)
@@ -539,6 +582,9 @@ def check_ref_grouped_gemm_dswiglu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        act_func=cfg.get("act_func", "dswiglu"),
+        situ_beta1=cfg.get("situ_beta1", 4.0),
+        situ_beta2=cfg.get("situ_beta2", 25.0),
     )
 
     torch.cuda.synchronize()
@@ -686,3 +732,103 @@ def check_ref_grouped_gemm_dswiglu(
                 )
     else:
         raise NotImplementedError(f"Unsupported dtype: {cfg['d_dtype']}")
+
+
+# =============================================================================
+# Focused Rubin MXFP8 clamped dGLU regression helpers
+# =============================================================================
+
+
+def make_rubin_mxfp8_dglu_problem(*, discrete):
+    # Reuse the already-tested forward fixture's exactly representable C,
+    # including +/-L and out-of-range values in alternating 32-column blocks.
+    p = make_rubin_mxfp8_glu_problem(discrete=discrete, with_prob=True)
+    p["c"].copy_(p["c_ref"].bfloat16())
+    p["n"] //= 2
+    total_m, experts = p["c"].shape[0], len(p["aligned_m"])
+    _, b = create_and_permute_tensor(experts, p["n"], p["k"], False, torch.float8_e4m3fn)
+    values = torch.zeros_like(b, dtype=torch.float32)
+    levels = torch.tensor([0.25, 0.5, 1.0, 2.0], device="cuda")
+    cols = torch.arange(p["n"], device="cuda")[:, None]
+    selectors = torch.arange(32, device="cuda")[None, :]
+    for expert in range(experts):
+        values[:, :32, expert] = levels[(cols + selectors + expert) % len(levels)]
+    b.copy_(values.to(b.dtype))
+    p["b"] = b
+    p["sfb"] = make_mxfp8_constant_scales(experts, p["n"], p["k"], 2.0)
+    if discrete:
+        p["b_list"] = [b[:, :, expert].clone(memory_format=torch.contiguous_format) for expert in range(experts)]
+        p["sfb_list"] = [make_mxfp8_constant_scales(1, p["n"], p["k"], 2.0) for _ in range(experts)]
+        p["b_ptrs"] = torch.tensor([weight.data_ptr() for weight in p["b_list"]], device="cuda", dtype=torch.int64)
+        p["sfb_ptrs"] = torch.tensor([sf.data_ptr() for sf in p["sfb_list"]], device="cuda", dtype=torch.int64)
+    # dGeGLU C is already scaled by the forward operation. beta is deliberately
+    # nonunit: applying it again would corrupt the activation and its derivative.
+    p["beta"] = torch.tensor([0.5, 2.0, 4.0], device="cuda")
+    p["dprob"] = torch.zeros((total_m, 1, 1), dtype=torch.float32, device="cuda")
+    p["amax"] = torch.empty((experts, 2, 1), dtype=torch.float32, device="cuda")
+    # Unlike the forward API, MXFP8 dGLU requires quantized FP8 D outputs.
+    dtype = torch.float8_e4m3fn
+    _, p["d_row"] = create_and_permute_tensor(1, total_m, p["n"] * 2, False, dtype)
+    _, p["d_col"] = create_and_permute_tensor(1, total_m, p["n"] * 2, False, dtype)
+    p["sfd_row"] = make_mxfp8_constant_scales(1, total_m, p["n"] * 2, 1.0)
+    p["sfd_col"] = make_mxfp8_constant_scales(1, p["n"] * 2, total_m, 1.0)
+    p["norm"] = torch.ones(1, device="cuda")
+    return p
+
+
+def rubin_mxfp8_dglu_reference(p, parameters):
+    params = RUBIN_MXFP8_DEFAULTS | parameters
+    m = p["c"].shape[0]
+    upstream = torch.empty((m, p["n"]), device="cuda", dtype=torch.float32)
+    start = 0
+    for expert, padded in enumerate(p["aligned_m"]):
+        a = p["a"][start : start + padded, :, 0].float() * 0.5
+        b = (p["b_list"][expert] if p["discrete"] else p["b"][:, :, expert]).float() * 2.0
+        # The dGLU contract scales BOTH GEMM operands by alpha. This is distinct
+        # from activation geglu_alpha and is required for dC and dprob alike.
+        upstream[start : start + padded] = (a @ b.T) * p["alpha"][expert].square()
+        start += padded
+    with torch.enable_grad():
+        c = p["c"].squeeze(-1).float().detach().requires_grad_()
+        probability = p["prob"].squeeze(-1).float().detach().requires_grad_()
+        pairs = c.reshape(m, p["n"] // 32, 2, 32)
+        gate = pairs[:, :, 0, :].reshape(m, p["n"])
+        up = pairs[:, :, 1, :].reshape(m, p["n"])
+        # FE retains derivative 1 at the clamp boundaries. Select the original
+        # input at equality explicitly: torch.clamp uses derivative 0 in PyTorch 2.14+.
+        gate = torch.where(gate > params["glu_clamp_max"], params["glu_clamp_max"], gate)
+        up = torch.where(up < params["glu_clamp_min"], params["glu_clamp_min"], up)
+        up = torch.where(up > params["glu_clamp_max"], params["glu_clamp_max"], up)
+        unweighted = gate * torch.sigmoid(params["geglu_alpha"] * gate) * (up + params["linear_offset"])
+        output = unweighted * probability
+        dc, dprob = torch.autograd.grad(output, (c, probability), grad_outputs=upstream)
+        dprob_scale = (unweighted.detach() * upstream).abs().sum(dim=1, keepdim=True)
+    return dc.unsqueeze(-1), dprob.unsqueeze(-1), dprob_scale.unsqueeze(-1)
+
+
+def _check_rubin_mxfp8_dprob(p, expected, scale):
+    rows = p["valid_rows"]
+    error = (p["dprob"][rows] - expected[rows]).abs()
+    bound = scale[rows] * 2e-5 + 1e-6
+    assert torch.all(error <= bound), f"dprob max error {error.max().item()}, max allowed bound {bound.max().item()}"
+    # Routing probability zero must zero dC but must NOT zero dprob.
+    zero_prob = p["prob"][rows, 0, 0] == 0
+    assert torch.any(expected[rows][zero_prob].abs() > 1.0)
+
+
+def _check_rubin_mxfp8_dglu_amax(p, expected):
+    grouped = expected.squeeze(-1).reshape(-1, p["n"] // 32, 2, 32)
+    start = 0
+    for expert, padded in enumerate(p["aligned_m"]):
+        for branch in range(2):
+            maximum = grouped[start : start + padded, :, branch, :].abs().max()
+            torch.testing.assert_close(p["amax"][expert, branch, 0], maximum, rtol=2e-5, atol=1e-7)
+        start += padded
+
+
+def check_rubin_mxfp8_dglu_quantized(p, parameters):
+    expected, dprob, dprob_scale = rubin_mxfp8_dglu_reference(p, parameters)
+    _check_rubin_mxfp8_dprob(p, dprob, dprob_scale)
+    if p["amax"] is not None:
+        _check_rubin_mxfp8_dglu_amax(p, expected)
+    check_mxfp8_quantized_output(expected, row_output=p["d_row"], col_output=p["d_col"], row_scales=p["sfd_row"], col_scales=p["sfd_col"])

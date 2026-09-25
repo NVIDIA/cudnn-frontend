@@ -36,6 +36,11 @@ from .glu_hadamard.api import (
     grouped_gemm_glu_hadamard_wrapper_sm100,
 )
 
+from .glu_hadamard_quant.api import (
+    GroupedGemmGluHadamardQuantSm100,
+    grouped_gemm_glu_hadamard_quant_wrapper_sm100,
+)
+
 from .dglu.api import (
     GroupedGemmDgluSm100,
     grouped_gemm_dglu_wrapper_sm100,
@@ -43,6 +48,7 @@ from .dglu.api import (
 
 from .wgrad.api import (
     GroupedGemmWgradSm100,
+    get_grouped_gemm_wgrad_workspace_size_sm100,
     grouped_gemm_wgrad_wrapper_sm100,
 )
 
@@ -66,9 +72,12 @@ __all__ = [
     "grouped_gemm_glu_wrapper_sm100",
     "GroupedGemmGluHadamardSm100",
     "grouped_gemm_glu_hadamard_wrapper_sm100",
+    "GroupedGemmGluHadamardQuantSm100",
+    "grouped_gemm_glu_hadamard_quant_wrapper_sm100",
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
     "GroupedGemmWgradSm100",
+    "get_grouped_gemm_wgrad_workspace_size_sm100",
     "grouped_gemm_wgrad_wrapper_sm100",
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",

@@ -10,6 +10,7 @@ import torch
 
 from gemm_test_utils import (
     requires_sm100,
+    requires_sm107,
     Plan as _plan,
     kw as _kw,
     E2M1 as _E2M1,
@@ -120,7 +121,65 @@ def test_shared_dequant_dedup():
     assert chain.num_b_operands == 2
     assert chain.gemm_operands == [(0, 0), (0, 1)]
     assert chain.has_block_scale
-    assert chain.block_scale.combo == "nvfp4"
+    assert (chain.block_scale.sf_dtype, chain.block_scale.block_size) == ("fp8_e4m3", 16)
+
+
+def _build_split_dequant_graph(*, sfa1=None, sfb1=None, a_block=16, a1_block=16, share_a=True):
+    """Two block-scaled GEMMs whose dequantizes may disagree. `sfa1`/`sfb1` name a
+    SECOND scale-factor tensor for GEMM 1 over the SAME packed data."""
+    M, N, K, bs = 256, 128, 512, 16
+    sf_k = K // bs
+    rk = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    a_dt, sf_dt = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+
+    def _sf(name, mn, leading):
+        dim = [1, M, sf_k] if leading else [1, sf_k, mn]
+        stride = [M * sf_k, sf_k, 1] if leading else [sf_k * mn, 1, sf_k]
+        return g.tensor(name=name, dim=dim, stride=stride, data_type=sf_dt, **rk)
+
+    A0 = g.tensor(name="A0", dim=[1, M, K], stride=[M * K, K, 1], data_type=a_dt)
+    A1 = A0 if share_a else g.tensor(name="A1", dim=[1, M, K], stride=[M * K, K, 1], data_type=a_dt)
+    SFA0 = _sf("SFA0", M, True)
+    B0 = g.tensor(name="B0", dim=[1, K, N], stride=[K * N, 1, K], data_type=a_dt)
+    B1 = B0 if sfb1 is not None else g.tensor(name="B1", dim=[1, K, N], stride=[K * N, 1, K], data_type=a_dt)
+    SFB0 = _sf("SFB0", N, False)
+    d0 = g.block_scale_dequantize(input=A0, descale=SFA0, block_size=[1, a_block])
+    d1 = g.block_scale_dequantize(input=A1, descale=_sf(sfa1, M, True) if sfa1 else SFA0, block_size=[1, a1_block])
+    e0 = g.block_scale_dequantize(input=B0, descale=SFB0, block_size=[bs, 1])
+    e1 = g.block_scale_dequantize(input=B1, descale=_sf(sfb1, N, False) if sfb1 else SFB0, block_size=[bs, 1])
+    Y = g.mul(a=g.swish(input=g.matmul(A=d0, B=e0, name="mm0")), b=g.matmul(A=d1, B=e1, name="mm1"))
+    Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+@pytest.mark.parametrize(
+    "kw,operand",
+    [
+        (dict(sfa1="SFA1"), "A"),
+        (dict(sfb1="SFB1"), "B"),
+        (dict(a1_block=32), "A"),
+    ],
+    ids=["different_sfa", "different_sfb", "different_block_size"],
+)
+def test_one_packed_tensor_carries_one_dequant(kw, operand):
+    """Operands dedup by the PACKED-DATA tensor, so two dequantizes of one tensor
+    would collapse onto the first and run both GEMMs with its scale factor -- a
+    wrong answer the variant pack cannot even express, since the dropped SF is
+    then not a graph input. The analyzer rejects it instead."""
+    with pytest.raises(ValueError, match=f"{operand} operand .* dequantized more than once"):
+        analyze(_build_split_dequant_graph(**kw))
+
+
+def test_agreeing_dequants_still_dedup():
+    """The rejection keys on the dequantize's PARAMETERS, not on how many nodes
+    there are: two dequantizes that describe the same thing still collapse to one
+    operand, and distinct data tensors stay distinct."""
+    shared = analyze(_build_split_dequant_graph())
+    assert (shared.num_a_operands, shared.num_b_operands) == (1, 2)
+    assert shared.gemm_operands == [(0, 0), (0, 1)]
+    distinct = analyze(_build_split_dequant_graph(share_a=False))
+    assert (distinct.num_a_operands, distinct.num_b_operands) == (2, 2)
 
 
 def test_shared_dequant_reduction_detected():
@@ -212,7 +271,8 @@ def _run(combo, config_name, M, N, K):
     g = _build_dual_bs_graph(M, N, K, combo=combo)
     compiled = _plan(g, **_kw(config_name))
     assert compiled.chain.is_multi_gemm and compiled.block_scale
-    assert compiled.chain.block_scale.combo == combo
+    _bs = compiled.chain.block_scale
+    assert (_bs.sf_dtype, _bs.block_size) == (("fp8_e4m3", 16) if combo == "nvfp4" else ("fp8_e8m0", 32))
 
     c = torch.zeros(1, M, N, dtype=torch.float32, device=dev)
     compiled(_vp_bs_mg(compiled, pairs, c))
@@ -289,21 +349,6 @@ def _run_reduction(
             128,
             512,
         ),
-        # 1ctamma static (no CLC, 1 tile/CTA).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
         # 2ctamma CLC (2-CTA MMA pair, cluster2x1; cta_n=128 → 2×128+SF fits 512).
         (
             "nvfp4",
@@ -324,21 +369,6 @@ def _run_reduction(
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        # 2ctamma static (no CLC, 1 tile/pair).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),
@@ -425,13 +455,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
         ),
         (
             "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
             256,
             128,
@@ -441,13 +464,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),
@@ -500,3 +516,30 @@ def test_dual_block_scale_matmul_reduction_rejects_int32():
     )
     with pytest.raises(NotImplementedError, match="fp32 compute/output"):
         jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+
+
+# ---------------------------------------------------------------------------
+# sm107 (64-byte-K MMA): the same dual block-scale SwiGLU chain
+# ---------------------------------------------------------------------------
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
+    ],
+)
+def test_sm107_dual_block_scale_matmul_numerics(combo, config_name):
+    """Two parallel block-scale GEMMs sharing A + one epilogue. Both GEMMs land
+    in TMEM alongside the per-operand SF words — the tighter budget the 576
+    columns buy back."""
+    _run(combo, config_name, 256, 128, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_sm107_dual_block_scale_matmul_swiglu_quant_epilogue(combo):
+    test_dual_block_scale_matmul_swiglu_quant_epilogue(combo, "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma")

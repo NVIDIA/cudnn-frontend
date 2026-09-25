@@ -34,9 +34,21 @@ class Device:
         return self.type if self.index is None else f"{self.type}:{self.index}"
 
 
+_torch_tensor_cls: Any = None
+
+
 def is_torch_tensor(tensor: Any) -> bool:
-    torch = sys.modules.get("torch")
-    return torch is not None and isinstance(tensor, torch.Tensor)
+    # Called ~40x per grouped-GEMM launch (once per operand per metadata read), so the
+    # sys.modules probe and the .Tensor attribute lookup are worth caching. torch cannot
+    # be un-imported, so the class is stable once resolved; until then this re-probes.
+    global _torch_tensor_cls
+    cls = _torch_tensor_cls
+    if cls is None:
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return False
+        cls = _torch_tensor_cls = torch.Tensor
+    return isinstance(tensor, cls)
 
 
 def is_jax_array(tensor: Any) -> bool:
@@ -134,11 +146,11 @@ def cuda_is_available() -> bool:
     return err == cudart.cudaError_t.cudaSuccess and count > 0
 
 
-def get_compute_capability() -> Tuple[int, int]:
-    """(major, minor) of the current CUDA device, without requiring torch."""
+def get_compute_capability(device_index: Optional[int] = None) -> Tuple[int, int]:
+    """(major, minor) of the selected CUDA device (current if omitted), without requiring torch."""
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_available():
-        return torch.cuda.get_device_capability(torch.cuda.current_device())
+        return torch.cuda.get_device_capability(torch.cuda.current_device() if device_index is None else device_index)
     from cuda.bindings import runtime as cudart
 
     def _check(result):
@@ -147,7 +159,7 @@ def get_compute_capability() -> Tuple[int, int]:
             raise RuntimeError(f"CUDA runtime error: {err}")
         return values[0] if len(values) == 1 else values
 
-    device = _check(cudart.cudaGetDevice())
+    device = _check(cudart.cudaGetDevice()) if device_index is None else device_index
     major = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, device))
     minor = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMinor, device))
     return major, minor
