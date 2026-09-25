@@ -5599,6 +5599,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
+    Dense GQA/MQA is served natively: K and V are bound at their real H_kv
+    heads and the kernel maps each Q head to its KV head
+    (``kv_head_idx = head_idx // (H_q // H_kv)``), so execute() copies no
+    K/V heads.
+
     Known deviations, pre-existing and tracked rather than introduced here: an
     off-flavor head dim pads V (and O, via a scratch) host-side; sink logits
     are rescaled to log2 units with one (H,)-element multiply per execute.
@@ -5845,12 +5850,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         self._compiled_kernel = self._k_mod.compile(
             b=self.batch_size,
-            # Dense GQA is served by adapter-side K/V head expansion until the
-            # kernels' native dense-GQA path is qualified (class docstring), so
-            # the artifact is compiled against the EXPANDED head count — the
-            # shapes execute() actually binds.
             h=self.h_q,
-            h_kv=self.h_q,
+            h_kv=self.h_kv,
             sq=self.s_q_max,
             skv=self.s_k_max,
             d=self.head_dim_qk,
@@ -5870,26 +5871,25 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         return ws_align(b * h * s * d * 2)  # fp16/bf16 only on this row
 
     def scratch_workspace_bytes(self) -> int:
-        """Per-execute scratch (issue #514): dense_flex gathers, the GQA head
-        expansion, the V head-dim pad, the kernel-layout O staging those need,
-        strided-LSE staging, and the sinks log2 rescale — everything execute()
-        would otherwise allocate. Sized in execute()'s carve order."""
+        """Per-execute scratch (issue #514): dense_flex gathers, the V head-dim
+        pad, the kernel-layout O staging those need, and the sinks log2
+        rescale — everything execute() would otherwise allocate.
+        Sized in execute()'s carve order."""
         self._ensure_support_checked()
         if self.thd:
             return 0  # engine rows never lower THD; the wrapper path allocates
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
         b, hq, sq, skv = self.batch_size, self.h_q, self.s_q_max, self.s_k_max
-        gqa = self.h_kv != self.h_q
         pad_v = self.head_dim_v < self.flavor_d_v
         total = self._bshd_gather_bytes(self.q_desc)
-        # K/V: layout gather, GQA expansion, and the V pad share ONE carved
-        # buffer each (expanded heads at the padded flavor width).
-        if gqa or self._bshd_gather_bytes(self.k_desc):
-            total += ws_align(b * skv * hq * self.head_dim_qk * elem)
+        # K/V are bound at the real H_kv heads (the kernel maps Q heads to KV
+        # heads itself): K needs scratch only for a layout gather; V also for
+        # the head-dim pad, which shares its one carved buffer.
+        total += self._bshd_gather_bytes(self.k_desc)
         if pad_v:
-            total += ws_align(b * skv * hq * self.flavor_d_v * elem)
-        elif gqa or self._bshd_gather_bytes(self.v_desc):
-            total += ws_align(b * skv * hq * self.head_dim_v * elem)
+            total += ws_align(b * skv * self.h_kv * self.flavor_d_v * elem)
+        else:
+            total += self._bshd_gather_bytes(self.v_desc)
         # O: the compiled ABI is (B, SQ, H, flavor_d_v) — staged for the padded
         # envelope or a non-BSHD (dense_flex) caller buffer.
         if pad_v:
@@ -5948,8 +5948,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         with _torch_stream_context(current_stream, device):
             pad_v = self.head_dim_v < self.flavor_d_v
-            gqa = self.h_kv != self.h_q
-            reps = self.h_q // self.h_kv
 
             def _gather_bshd(t: torch.Tensor) -> torch.Tensor:
                 """Compact BSHD view/gather of logical BHSD ``t`` (dense_flex)."""
@@ -5963,26 +5961,20 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 return dst
 
             def _kv_operand(t: torch.Tensor, fd: Optional[int]) -> torch.Tensor:
-                """K/V kernel operand: layout gather, GQA head expansion, and
-                the head-dim pad in ONE carved buffer (allocating fallbacks on
-                the wrapper path)."""
+                """K/V kernel operand at the real H_kv heads: layout gather,
+                and the head-dim pad in one carved buffer (allocating fallback
+                on the wrapper path)."""
                 view = t.transpose(1, 2)  # (b, s, h_kv, d)
                 bb, ss, hh, dd = view.shape
                 fd = dd if fd is None else fd
-                if not gqa and fd == dd:
+                if fd == dd:
                     return _gather_bshd(t)
                 if carver is not None:
-                    dst = carver.take(bb * ss * self.h_q * fd, t.dtype).view(bb, ss, hh, reps, fd)
-                    if fd != dd:
-                        dst[..., dd:].zero_()
-                    dst[..., :dd].copy_(view.unsqueeze(3))
-                    return dst.view(bb, ss, self.h_q, fd)
-                out = view.repeat_interleave(reps, dim=2) if gqa else view
-                if fd != dd:
-                    out = _sm80_pad_last_dim(out, fd)
-                elif not out.is_contiguous():
-                    out = out.contiguous()
-                return out
+                    dst = carver.take(bb * ss * hh * fd, t.dtype).view(bb, ss, hh, fd)
+                    dst[..., dd:].zero_()
+                    dst[..., :dd].copy_(view)
+                    return dst
+                return _sm80_pad_last_dim(view, fd)
 
             Q = _gather_bshd(q_tensor)
             K = _kv_operand(k_tensor, None)

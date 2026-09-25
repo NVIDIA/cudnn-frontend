@@ -274,9 +274,10 @@ def test_bwd_engine_end_to_end_d256():
 @pytest.mark.L0
 @pytest.mark.parametrize("gqa", [1, 4], ids=["mha", "gqa4x"])
 def test_fwd_engine_bhsd_contiguous_layout(gqa):
-    """dense_flex delivery: BHSD-contiguous buffers (the test_mhas_v2 norm)
-    and GQA head expansion must both be normalized by the lowering — this was
-    the CI 'stride order' failure of 2026-07-29."""
+    """dense_flex delivery: BHSD-contiguous buffers (the test_mhas_v2 norm),
+    with MHA and with dense GQA (K/V gathered at their real H_kv heads), must
+    be normalized by the lowering — this was the CI 'stride order' failure of
+    2026-07-29."""
     h_kv = H // gqa
     g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     st_q = (H * S * D, S * D, D, 1)  # BHSD-contiguous
@@ -302,6 +303,74 @@ def test_fwd_engine_bhsd_contiguous_layout(gqa):
         q_buf.float(), k_buf.float().repeat_interleave(gqa, dim=1), v_buf.float().repeat_interleave(gqa, dim=1), is_causal=True, scale=_SCALE
     ).to(torch.float16)
     torch.testing.assert_close(o_buf, ref, rtol=1e-2, atol=4e-3)
+
+
+def _dense_gqa_ref(q, k, v, scale):
+    """fp64 causal SDPA reference for GQA: O and the natural-log LSE per row.
+    K/V heads are repeated here, in the reference only."""
+    rep = q.shape[1] // k.shape[1]
+    qd = q.double()
+    kd = k.double().repeat_interleave(rep, dim=1)
+    vd = v.double().repeat_interleave(rep, dim=1)
+    scores = (qd @ kd.transpose(-1, -2)) * scale
+    keep = torch.ones(scores.shape[-2], scores.shape[-1], dtype=torch.bool, device=scores.device).tril()
+    scores = scores.masked_fill(~keep, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ vd, torch.logsumexp(scores, dim=-1)
+
+
+@pytest.mark.L0
+@_SM80
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256)], ids=["d64", "d128", "d192_d128", "d256"])
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (8, 1)], ids=["g2", "g4", "mqa"])
+def test_fwd_engine_dense_gqa_ratios(d_qk, d_v, h_q, h_kv):
+    """Dense GQA/MQA on the SM80 engine: K/V are bound at their real H_kv heads
+    and the kernel maps each Q head to its KV head, so a wrong mapping is a
+    silent wrong answer (MQA lands on a valid head even when off by one).
+    Every ratio x every flavor, O and Stats against an fp64 reference; the
+    SM80 twin of test_dsl_sm100_dense_gqa_ratios."""
+    b, s = 2, 256
+    scale = 1.0 / math.sqrt(d_qk)
+    g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q = g.tensor(name="q", dim=(b, h_q, s, d_qk), stride=_bshd_stride(b, h_q, s, d_qk), data_type=_HALF)
+    k = g.tensor(name="k", dim=(b, h_kv, s, d_qk), stride=_bshd_stride(b, h_kv, s, d_qk), data_type=_HALF)
+    v = g.tensor(name="v", dim=(b, h_kv, s, d_v), stride=_bshd_stride(b, h_kv, s, d_v), data_type=_HALF)
+    o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=scale, use_causal_mask=True, generate_stats=True)
+    o.set_output(True).set_dim((b, h_q, s, d_v)).set_stride(_bshd_stride(b, h_q, s, d_v)).set_data_type(_HALF)
+    stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    _native_then_pin(g, _FWD)
+
+    torch.manual_seed(0)
+    q_buf = torch.randn(b, s, h_q, d_qk, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    k_buf = torch.randn(b, s, h_kv, d_qk, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    v_buf = torch.randn(b, s, h_kv, d_v, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    o_buf = torch.full((b, s, h_q, d_v), float("nan"), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    stats_buf = torch.full((b, h_q, s, 1), float("nan"), dtype=torch.float32, device="cuda")
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
+    torch.cuda.synchronize()
+
+    o_ref, lse_ref = _dense_gqa_ref(q_buf, k_buf, v_buf, scale)
+    torch.testing.assert_close(o_buf.double(), o_ref, rtol=1e-2, atol=4e-3)
+    torch.testing.assert_close(stats_buf.squeeze(-1).double(), lse_ref, rtol=3e-2, atol=5e-2)
+
+
+@pytest.mark.L0
+@_SM80
+@pytest.mark.parametrize("h_kv", [2, 1], ids=["gqa2x", "mqa"])
+def test_fwd_engine_dense_gqa_needs_no_workspace(h_kv):
+    """Rule 2 detector: with compact BSHD Q/K/V/O, dense GQA/MQA binds K/V at
+    their real H_kv heads, so the forward carves no scratch at all (it used to
+    carve an H_q-head copy of K and V on every execute). Inverted from the old
+    'GQA expansion must be carved' assertion (test/AGENTS.md)."""
+    g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = _bshd_stride(B, H, S, D)
+    st_kv = _bshd_stride(B, h_kv, S, D)
+    q = g.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    k = g.tensor(name="k", dim=(B, h_kv, S, D), stride=st_kv, data_type=_HALF)
+    v = g.tensor(name="v", dim=(B, h_kv, S, D), stride=st_kv, data_type=_HALF)
+    o, _ = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=False)
+    o.set_output(True).set_dim((B, H, S, D)).set_stride(st).set_data_type(_HALF)
+    _native_then_pin(g, _FWD)
+    assert g.get_workspace_size() == 0, "dense GQA must bind K/V at H_kv heads; a non-zero forward workspace means a hidden K/V copy is back"
 
 
 @_SM80
@@ -359,12 +428,16 @@ def test_engine_execute_does_not_allocate():
     either SM80 engine must not touch the CUDA caching allocator — every
     per-execute buffer is carved from the caller's workspace.  Asserted on the
     allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
-    clone/contiguous on the execute path would advance.  The geometry is
-    chosen to force real staging on both directions: GQA (fwd K/V head
-    expansion) and a strided stats buffer (fwd LSE staging + bwd gather),
-    so the fwd workspace is non-zero too."""
+    clone/contiguous on the execute path would advance.  The geometry keeps
+    real scratch in both directions: O is BHSD in both graphs and the SM80
+    kernels read and write BSHD, so the fwd stages O through the workspace and
+    the bwd gathers it (on top of its kernel-internal buffers).  Dense GQA
+    itself needs no fwd scratch any more
+    (test_fwd_engine_dense_gqa_needs_no_workspace); the strided stats buffer
+    rides the stride-aware LSE store and load, which copy nothing."""
     H_KV = H // 2
     st_kv = _bshd_stride(B, H_KV, S, D)
+    st_o = (H * S * D, S * D, D, 1)  # BHSD O: the SM80 kernels do not store it natively
     # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
     # layout mhas draws under randomized stats strides (cuDNN >= 9.26, #304).
     stats_stride = (2 * H * S, 2 * S, 2, 1)
@@ -375,15 +448,15 @@ def test_engine_execute_does_not_allocate():
     k = g.tensor(name="k", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
     v = g.tensor(name="v", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
     o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True)
-    o.set_output(True).set_data_type(_HALF)
+    o.set_output(True).set_dim((B, H, S, D)).set_stride(st_o).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
     _native_then_pin(g, _FWD)
-    assert g.get_workspace_size() > 0, "GQA expansion + strided-LSE staging must be carved, not allocated"
+    assert g.get_workspace_size() > 0, "the BHSD O must be staged through the carved workspace, not allocated"
     torch.manual_seed(0)
     q_buf = _buf()
     k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
     v_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
-    o_buf = torch.empty_like(q_buf)
+    o_buf = torch.empty(B, H, S, D, dtype=torch.float16, device="cuda")  # BHSD, matching st_o
     stats_buf = torch.empty(2 * B * H * S, dtype=torch.float32, device="cuda").as_strided((B, H, S, 1), stats_stride)
     ws = _ws(g)
     vp = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}
@@ -393,7 +466,7 @@ def test_engine_execute_does_not_allocate():
     qb = gb.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
     kb = gb.tensor(name="k", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
     vb = gb.tensor(name="v", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
-    ob = gb.tensor(name="o", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    ob = gb.tensor(name="o", dim=(B, H, S, D), stride=st_o, data_type=_HALF)
     dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
     statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=stats_stride, data_type=cudnn.data_type.FLOAT)
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
