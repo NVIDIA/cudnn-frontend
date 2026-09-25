@@ -397,16 +397,17 @@ def test_sdpa_ragged_decode_stats(cudnn_handle, request, dtype, offset_dtype, us
     graph.select_plan(backend_plans[0])
     graph.check_support()
     print("Ragged Stats backend plan:", graph.get_plan_name_at_index(backend_plans[0]))
-    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1 and cudnn.backend_version() < 92800:
-        # NVBug 6813175: the native ragged s_q == 1 decode codegen fails NVRTC on the Rubin-ranked plan on
-        # cuDNN 9.26 / 9.27. Fixed in the 9.28.0.13 nightly (the strict marker XPASSed on every SM107 id,
-        # pipeline 69411352): 9.28+ must build it -- backend_version() cannot tell .12 from .13, so the
-        # floor is the release line, not the build.
+    selected_engine, _ = graph.get_engine_and_knobs_at_index(backend_plans[0])
+    if torch.cuda.get_device_capability() == (10, 7) and s_q == 1 and selected_engine in (10, 18):
+        # NVBug 6813175 affects the native 10X/107 engines (global indices 10/18): their ragged
+        # decode codegen emits a TMEM Stats round-trip wider than the ISA allows. The heuristic
+        # may instead select the working eng8 plan; that must run without this marker. A native
+        # 10/18 plan that builds successfully remains a strict XPASS so its fix is noticed.
         request.node.add_marker(
             pytest.mark.xfail(
                 strict=True,
                 raises=cudnn.cudnnGraphNotSupportedError,
-                reason="Rubin ranks the native ragged-decode plan first and it fails NVRTC on cuDNN 9.26/9.27 (NVBug 6813175)",
+                reason="Selected native 10X/107 ragged-decode plan fails NVRTC (NVBug 6813175)",
             )
         )
     graph.build_plans()
