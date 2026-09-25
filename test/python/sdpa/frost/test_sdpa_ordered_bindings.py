@@ -4,7 +4,6 @@
 
 import cudnn
 import pytest
-import torch
 
 import test_execute_overload as ordered_cases
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
@@ -14,9 +13,12 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 @pytest.fixture
 def frost_attention_case(cudnn_handle):
-    graph, tensors = ordered_cases._graph(cudnn_handle, "frost")
-    yield graph, tensors, cudnn_handle, "frost"
-    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+    original_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        graph, tensors = ordered_cases._graph(cudnn_handle, "frost")
+        yield graph, tensors, cudnn_handle, "frost"
+    finally:
+        cudnn.set_stream(cudnn_handle, original_stream)
 
 
 def test_frost_ordered_matches_mapping_with_fresh_buffers_and_uid_order(frost_attention_case):

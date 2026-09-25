@@ -152,11 +152,21 @@ def _assert_result(buffers, q_len=_Q, kv_len=_KV):
         torch.testing.assert_close(buffers["lse"][batch * q_len : (batch + 1) * q_len].double(), expected_lse, atol=2e-3, rtol=2e-3)
 
 
+@pytest.fixture(autouse=True)
+def _preserve_handle_stream(cudnn_handle):
+    # Also cover tests that call _graph directly and setup failures/skips.
+    original_stream = cudnn.get_stream(cudnn_handle) if cudnn_handle is not None else None
+    try:
+        yield
+    finally:
+        if cudnn_handle is not None:
+            cudnn.set_stream(cudnn_handle, original_stream)
+
+
 @pytest.fixture(params=["backend", "frost"])
 def attention_case(request, cudnn_handle):
     graph, tensors = _graph(cudnn_handle, request.param)
-    yield graph, tensors, cudnn_handle, request.param
-    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+    return graph, tensors, cudnn_handle, request.param
 
 
 @pytest.mark.L0
