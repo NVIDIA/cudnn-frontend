@@ -4192,7 +4192,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
 
 
 class SdpaFwdDslSm120(SdpaFwdDsl):
-    """Compile and execute fixed-length SM120/SM121 SDPA forward.
+    """Compile and execute SM120/SM121 SDPA forward.
 
     Q, K, V, and O use logical ``(B, H, S, D)`` shapes over any dense layout
     with the head dim innermost (``dense_flex``, same envelope as SM100):
@@ -4212,8 +4212,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     variable-length) batches, whose per-shape compile is deferred to
     ``execute()`` because the packed token totals are runtime values.
 
-    ``scale_softmax`` is a runtime parameter. Dtype, shape, tile sizes, masks,
-    and length-tensor / sink / THD presence are compile-time specializations.
+    Dense unsplit FP16/BF16 plans with zero-copy layouts use a prepared pointer
+    entry: batch, sequence lengths and Int64 strides bind at execute without
+    tensor reconstruction. Head counts/dimensions and scheduler knobs remain
+    compile-time constants; bounded shape overrides keep those fixed.
+
+    ``scale_softmax`` is a runtime parameter. Dtype, head geometry, tile sizes,
+    masks and length-tensor / sink / THD presence specialize every path. Legacy
+    tensor entries additionally specialize dense batch and sequence extents.
     ``tile_m`` / ``tile_n`` are honored on every template within its kernel
     table (``config_sm120.tile_domain``); left unset, each runs the largest KV
     tile of that table that fits SMEM.
@@ -4586,6 +4592,33 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             split_kv=self.split_kv,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
+        self._dense_spec = None
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        if (
+            not self._fp8
+            and not self.thd
+            and self.split_kv == 1
+            and all(dense_bind_strides(tuple(desc.shape), tuple(desc.stride), 2) is not None for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc))
+        ):
+            from cudnn.sdpa.fwd.prepared import build_dense_spec
+
+            self._compiled_kernel = self._k_mod.compile(
+                compute_capability=self.compute_capability,
+                b=1,
+                qh=self.h_q,
+                kh=self.h_kv,
+                sq=1,
+                skv=1,
+                d_qk=self.head_dim_qk,
+                d_v=self.head_dim_v,
+                has_lse=self.lse_desc is not None,
+                prepared=True,
+                persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
+            )
+            self._dense_spec = build_dense_spec(self, scale_softmax=None)
+            self._logger.debug("compile completed (prepared dense)")
+            return
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
             # compile as dynamic extents and max_sq is a runtime launch
@@ -4720,6 +4753,30 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 )
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
+        if self._dense_spec is not None:
+            from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+
+            current_stream = self._get_default_stream(current_stream)
+            stream_int = int(current_stream)
+            _ensure_current_context(stream_int, q_tensor.device.index)
+            facts = {
+                name: facts_of_tensor(t)
+                for name, t in dict(
+                    q=q_tensor,
+                    k=k_tensor,
+                    v=v_tensor,
+                    o=o_tensor,
+                    lse=lse_tensor,
+                    sinks=sinks,
+                    seq_q_lens=seq_q_lens,
+                    seq_kv_lens=seq_kv_lens,
+                ).items()
+            }
+            frame = bind_dense(self._dense_spec, facts, current_stream, stream_int)
+            frame[self._dense_spec.index["scale_softmax_log2"]] = scale_softmax_log2
+            self._dense_spec.fn(*frame)
+            self._logger.debug("execute completed (prepared dense)")
+            return
         if self.thd:
             self._execute_thd(
                 q_tensor,

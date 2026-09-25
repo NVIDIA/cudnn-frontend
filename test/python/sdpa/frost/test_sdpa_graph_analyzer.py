@@ -106,7 +106,7 @@ def test_probe_accepts_dsv4_causal():
     assert engines.engine_name() in _eligible(g)
 
 
-@pytest.mark.parametrize("unsupported", ["sm120", "synth_kv"])
+@pytest.mark.parametrize("unsupported", ["sm80", "synth_kv"])
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
     """Graph admission declines legacy executors before loading a DSL adapter."""
@@ -116,8 +116,8 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
     from cudnn.engines.base import PlanConfig
     from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
 
-    arch = "sm120" if unsupported == "sm120" else "sm100"
-    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0) if arch == "sm120" else (10, 0))
+    arch = "sm80" if unsupported == "sm80" else "sm100"
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0) if arch == "sm80" else (10, 0))
     if opt_in:
         monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     else:
@@ -145,6 +145,36 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
         backend = [PlanConfig(7, {}, mode=cudnn.heur_mode.A)]
         assert rank(graph, [engine], backend, [cudnn.heur_mode.A]) == [PlanConfig(7, {})]
     lower.assert_not_called()
+
+
+@pytest.mark.parametrize("d", [128, 256, 512])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_sm120_override_admits_prepared_dense_and_declines_legacy_routes(monkeypatch, d, opt_in):
+    """Explicit SM120 dense plans admit overrides; unmigrated routes still decline."""
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    if opt_in:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    else:
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm120"))
+    lower = Mock(side_effect=AssertionError("capability checking must not compile"))
+    engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, strides = _mk_qkv(graph, d=d)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    engine.check_support(graph)
+    lower.assert_not_called()
+    facts = _facts(graph)
+    assert engines._prepared_decline_reason(spec.capabilities, facts, 1) is None
+    assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is not None
+    for change in (dict(thd=True), dict(has_paged_kv=True), dict(is_fp8=True), dict(is_mxfp8=True)):
+        assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
 
 
 @pytest.mark.parametrize("d", [128, 256])
