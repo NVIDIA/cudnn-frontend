@@ -377,6 +377,7 @@ class SparseScoreRecomputeSm100:
             K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.S_mbar_size]
             reduce_sync_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.reduce_sync_mbar_size]
+            metadata_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_holding_buf: Int32
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
@@ -411,6 +412,7 @@ class SparseScoreRecomputeSm100:
         K_mbar_ptr = storage.K_mbar_ptr.data_ptr()
         S_mbar_ptr = storage.S_mbar_ptr.data_ptr()
         reduce_sync_mbar_ptr = storage.reduce_sync_mbar_ptr.data_ptr()
+        metadata_mbar_ptr = storage.metadata_mbar_ptr.data_ptr()
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf.ptr
         clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
@@ -459,6 +461,9 @@ class SparseScoreRecomputeSm100:
                 cute.arch.mbarrier_init(S_mbar_ptr + 2 * _si, 1)
                 cute.arch.mbarrier_init(S_mbar_ptr + 2 * _si + 1, self.s_empty_arrive_count)
             cute.arch.mbarrier_init(reduce_sync_mbar_ptr, self.reduce_sync_arrive_count)
+            for _mi in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_init(metadata_mbar_ptr + 2 * _mi, self.WARP_SIZE)
+                cute.arch.mbarrier_init(metadata_mbar_ptr + 2 * _mi + 1, self.WARPGROUP_SIZE)
 
         # CLC persistent scheduling pipeline
         cluster_size = cute.size(self.cluster_shape_mn)
@@ -517,6 +522,13 @@ class SparseScoreRecomputeSm100:
                     m_block = work_tile.tile_idx[0]
                     batch_idx = work_tile.tile_idx[2]
 
+                    # Metadata has its own producer/consumer handoff. Q/K MMA
+                    # completion does not order every metadata writer, and a
+                    # later Q tile can otherwise overwrite a live metadata slot.
+                    metadata_slot = tile_count % 2
+                    metadata_phase = (tile_count // 2) & 1
+                    cute.arch.mbarrier_wait(metadata_mbar_ptr + 2 * metadata_slot + 1, metadata_phase ^ 1)
+
                     # PerHead data load (double-buffered)
                     per_head_buf_off = (tile_count % 2) * self.m_block_size
                     for ri in cutlass.range_constexpr(rows_per_thread):
@@ -545,6 +557,7 @@ class SparseScoreRecomputeSm100:
                                 else:
                                     sTopkIdx[topk_idx_buf_off + topk_pos] = Int32(-1)
                     cute.arch.fence_view_async_shared()
+                    cute.arch.mbarrier_arrive(metadata_mbar_ptr + 2 * metadata_slot)
 
                     # TMA Q load (1 barrier, num_k_chunks TMA copies)
                     Q_producer.reset()
@@ -693,6 +706,9 @@ class SparseScoreRecomputeSm100:
             while work_tile.is_valid_tile:
                 m_block = work_tile.tile_idx[0]
                 batch_idx = work_tile.tile_idx[2]
+                metadata_slot = tile_count % 2
+                metadata_phase = (tile_count // 2) & 1
+                cute.arch.mbarrier_wait(metadata_mbar_ptr + 2 * metadata_slot, metadata_phase)
                 per_head_offset = (tile_count % 2) * self.m_block_size
                 topk_idx_offset = (tile_count % 2) * self.topk
                 if cutlass.const_expr(self.score_type == "attention"):
@@ -760,6 +776,7 @@ class SparseScoreRecomputeSm100:
                         per_head_offset=per_head_offset,
                         topk_idx_offset=topk_idx_offset,
                     )
+                cute.arch.mbarrier_arrive(metadata_mbar_ptr + 2 * metadata_slot + 1)
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
@@ -1093,6 +1110,12 @@ class SparseScoreRecomputeSm100:
             v = sScoreAll[wi + 1]
             global_max = v if v > global_max else global_max
 
+        # The next reduction reuses these four words. Join readers before
+        # any warp can overwrite its slot for the next max/sum or query tile.
+        cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
+        cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_sync_phase)
+        reduce_sync_phase = reduce_sync_phase ^ 1
+
         return global_max, reduce_sync_phase
 
     @cute.jit
@@ -1117,6 +1140,12 @@ class SparseScoreRecomputeSm100:
         for wi in cutlass.range_constexpr(self.num_warps_in_epi_wg - 1):
             global_sum = global_sum + sScoreAll[wi + 1]
 
+        # The next reduction reuses these four words. Join readers before
+        # any warp can overwrite its slot for the next max/sum or query tile.
+        cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
+        cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_sync_phase)
+        reduce_sync_phase = reduce_sync_phase ^ 1
+
         return global_sum, reduce_sync_phase
 
     @cute.jit
@@ -1139,6 +1168,12 @@ class SparseScoreRecomputeSm100:
         global_sum = sScoreAll[0]
         for wi in cutlass.range_constexpr(self.num_warps_in_epi_wg - 1):
             global_sum = global_sum + sScoreAll[wi + 1]
+
+        # The next reduction reuses these four words. Join readers before
+        # any warp can overwrite its slot for the next max/sum or query tile.
+        cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
+        cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_sync_phase)
+        reduce_sync_phase = reduce_sync_phase ^ 1
 
         return global_sum, reduce_sync_phase
 

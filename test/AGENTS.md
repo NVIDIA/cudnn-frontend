@@ -151,3 +151,8 @@ per-slot barrier-phase drift. Keep the focused regressions in
 a boundary that distinguishes the usable 227 KiB from the nominal 228 KiB;
 `test_DSA_sparse_attention_score_recompute_uses_launchable_smem_budget` must
 fail against the old planner before accepting the fix.
+
+Sparse metadata and cross-warp reduction scratch also need explicit reader
+completion before reuse. Run racecheck on both indexer and attention cases:
+ordering Q/K MMA alone does not publish every metadata lane's stores, and a
+max-to-sum reduction can overwrite shared scratch before all warps read it.
