@@ -63,6 +63,10 @@ class GraphFwdUid(IntEnum):
     sink_token = 13
     scale_o = 14  # block-scaled O: the FP4 global scale (python-only input of sdpa_mxfp8)
     sf_o = 15  # block-scaled O: per-(b, h) F8_128x4 scale planes (python-only output)
+    kv_seq_len = 16
+    q_seq_len = 17
+    k_block_table = 18
+    v_block_table = 19
 
 
 class GraphBwdUid(IntEnum):
@@ -164,13 +168,23 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        with_sink_token=False,
                        with_unfuse_fma=False,
                        implementation=cudnn.attention_implementation.AUTO,
-                       o_block_scale=0):
+                       o_block_scale=0,
+                       paged_block_size=0):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
     d_qk_scale_padded = ceil_div(ceil_div(d_qk, block_size), 4) * 4
     d_vo_padded = ceil_div(d_vo, 128) * 128
     s_kv_scale_padded = ceil_div(ceil_div(s_kv, block_size), 4) * 4
+    # Paged: K/V and their descales are page pools [num_pages, H, page, .] behind
+    # (b, 1, table, 1) block tables; the padding mask carries the per-batch lengths.
+    is_paged = paged_block_size > 0
+    b_kv, s_kv_rows = b, s_kv
+    if is_paged:
+        table_size = ceil_div(s_kv, paged_block_size)
+        b_kv, s_kv_rows = table_size * b, paged_block_size
+        s_kv_padded = paged_block_size
+        s_kv_scale_padded = ceil_div(paged_block_size, block_size)
 
     # Build graph
     graph = cudnn.pygraph(
@@ -179,14 +193,14 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         compute_data_type=cudnn.data_type.FLOAT
     )
 
-    # Q, K, V, O tensors: (b, h, s, d) dims, BHSD-physical strides -- except for a
-    # block-scaled O draw, whose sf_o output has no backend lowering: it runs on
-    # the FROST MXFP8 engine, which serves BSHD-physical Q/K/V/O only.
-    bshd = bool(o_block_scale)
+    # Q, K, V, O tensors: (b, h, s, d) dims, BSHD-physical strides for the draws only the
+    # FROST MXFP8 engine serves (a block-scaled O, whose sf_o output has no backend lowering,
+    # and paged pools -- HND page pools for K/V); BHSD-physical otherwise.
+    bshd = bool(o_block_scale) or is_paged
     q_stride = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1) if bshd else (h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1)
-    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if bshd else (h_k * s_kv * d_qk, s_kv * d_qk, d_qk, 1)
-    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if bshd else (h_v * s_kv * d_vo, s_kv * d_vo, d_vo, 1)
     o_stride = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1) if bshd else (h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1)
+    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if (bshd and not is_paged) else (h_k * s_kv_rows * d_qk, s_kv_rows * d_qk, d_qk, 1)
+    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if (bshd and not is_paged) else (h_v * s_kv_rows * d_vo, s_kv_rows * d_vo, d_vo, 1)
     q = graph.tensor(
         uid=GraphFwdUid.q,
         dim=(b, h_q, s_qo, d_qk),
@@ -195,13 +209,13 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     )
     k = graph.tensor(
         uid=GraphFwdUid.k,
-        dim=(b, h_k, s_kv, d_qk),
+        dim=(b_kv, h_k, s_kv_rows, d_qk),
         stride=k_stride,
         data_type=cudnn_itype
     )
     v = graph.tensor(
         uid=GraphFwdUid.v,
-        dim=(b, h_v, s_kv, d_vo),
+        dim=(b_kv, h_v, s_kv_rows, d_vo),
         stride=v_stride,
         data_type=cudnn_itype
     )
@@ -219,7 +233,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     )
 
     # SF_K: [B, H_k, S_kv_padded, D_scale_padded], d_scale contiguous
-    sf_k_dims = (b, h_k, s_kv_padded, d_qk_scale_padded)
+    sf_k_dims = (b_kv, h_k, s_kv_padded, d_qk_scale_padded)
     sf_k_strides = (h_k * s_kv_padded * d_qk_scale_padded, s_kv_padded * d_qk_scale_padded, d_qk_scale_padded, 1)
     sf_k = graph.tensor(
         uid=GraphFwdUid.sf_k,
@@ -230,7 +244,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     )
 
     # SF_V: [B, H_v, S_scale_padded, D_v_padded], s_scale contiguous
-    sf_v_dims = (b, h_v, s_kv_scale_padded, d_vo_padded)
+    sf_v_dims = (b_kv, h_v, s_kv_scale_padded, d_vo_padded)
     sf_v_strides = (h_v * s_kv_scale_padded * d_vo_padded, s_kv_scale_padded * d_vo_padded, d_vo_padded, 1)
     sf_v = graph.tensor(
         uid=GraphFwdUid.sf_v,
@@ -245,6 +259,17 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     if with_sink_token:
         sink_token = graph.tensor(uid=GraphFwdUid.sink_token, dim=(1, h_q, 1, 1), stride=(h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
+    paged_kwargs = {}
+    if is_paged:
+        paged_kwargs = dict(
+            use_padding_mask=True,
+            seq_len_kv=graph.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32),
+            seq_len_q=graph.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32),
+            paged_attention_k_table=graph.tensor(uid=GraphFwdUid.k_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32),
+            paged_attention_v_table=graph.tensor(uid=GraphFwdUid.v_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32),
+            paged_attention_max_seq_len_kv=s_kv,
+        )
+
     sdpa_kwargs = dict(
         q=q, k=k, v=v,
         descale_q=sf_q, descale_k=sf_k, descale_v=sf_v,
@@ -256,6 +281,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         sink_token=sink_token,
         unfuse_fma=with_unfuse_fma,
         implementation=implementation,
+        **paged_kwargs,
     )
     if o_block_scale:
         # Block-scaled O: the sf_o output (per-(b, h) F8_128x4 planes) rides
@@ -857,6 +883,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     with_unfuse_fma = getattr(cfg, 'with_unfuse_fma', False)
     rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
 
+    is_paged = bool(getattr(cfg, "is_paged", False))
+    paged_block_size = int(cfg.block_size) if is_paged else 0
+    if is_paged:
+        assert cfg.is_infer, "paged MXFP8 is forward-only"
+        # A padded draw carries per-batch lengths; a full one binds every batch at its maximum.
+        seq_len_q_list = list(cfg.seq_len_q) if cfg.seq_len_q else [s_qo] * b
+        seq_len_kv_list = list(cfg.seq_len_kv) if cfg.seq_len_kv else [s_kv] * b
+
     # Get input/output types from config
     torch_itype = cfg.data_type if hasattr(cfg, 'data_type') and cfg.data_type else torch.float8_e4m3fn
     torch_otype = cfg.output_type if hasattr(cfg, 'output_type') and cfg.output_type else torch.bfloat16
@@ -907,6 +941,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             with_unfuse_fma=with_unfuse_fma,
             implementation=cfg.implementation,
             o_block_scale=o_block_scale,
+            paged_block_size=paged_block_size,
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -941,12 +976,38 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     fill_sparse_small_int(v_f32, rng_data, sparsity=0.8, abs_max=2)
 
     q_fp8_d, sf_q_d_ref, sf_q_d_swizzle, q_fp8_s, sf_q_s_ref, sf_q_s_swizzle = quantize_to_mxfp8(q_f32, b, h_q, s_qo, d_qk, block_size, torch_itype, with_ref=not perf)
-    k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
-    v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
-    if o_block_scale:
-        # The graph declared BSHD-physical Q/K/V for this draw (see generate_graph_fwd);
-        # the per-(b, h) F8_128x4 scale planes are layout-independent.
-        q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
+    if is_paged:
+        # Quantize the pools (pool index p*b + batch, the harness's paging order) and fold back to the
+        # dense reference operands: page boundaries are 32-aligned, so the per-32 groups match dense.
+        nblocks = ceil_div(s_kv, paged_block_size)
+        num_pages = nblocks * b
+
+        def _to_pool(x):
+            pad = nblocks * paged_block_size - s_kv
+            if pad:
+                x = torch.cat((x, torch.zeros(b, x.shape[1], pad, x.shape[3], device="cuda", dtype=x.dtype)), dim=2)
+            return torch.cat(x.chunk(nblocks, dim=2), dim=0)
+
+        def _to_dense(pool):
+            return torch.cat(pool.chunk(nblocks, dim=0), dim=2)[:, :, :s_kv].contiguous()
+
+        k_pool_fp8, sf_k_pool_ref, sf_k_d_swizzle, *_ = quantize_to_mxfp8(_to_pool(k_f32), num_pages, h_k, paged_block_size, d_qk, block_size, torch_itype, with_ref=not perf)
+        _, _, _, v_pool_fp8, sf_v_pool_ref, sf_v_s_swizzle = quantize_to_mxfp8(_to_pool(v_f32), num_pages, h_v, paged_block_size, d_vo, block_size, torch_itype, with_ref=not perf)
+        k_fp8_d = _to_dense(k_pool_fp8)
+        v_fp8_s = _to_dense(v_pool_fp8)
+        sf_k_d_ref = sf_v_s_ref = None
+        if not perf:
+            sf_k_d_ref = _to_dense(sf_k_pool_ref.reshape(num_pages, h_k, paged_block_size, d_qk)).reshape(b * h_k, s_kv, d_qk)
+            sf_v_s_ref = _to_dense(sf_v_pool_ref.reshape(num_pages, h_v, paged_block_size, d_vo)).reshape(b * h_v, s_kv, d_vo)
+        block_table_gpu = torch.empty((b, 1, nblocks, 1), device="cuda", dtype=torch.int32)
+        block_table_gpu.copy_(torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(nblocks, 1, b, 1).transpose(0, 2))
+    else:
+        k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
+        v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
+        if o_block_scale:
+            # The graph declared BSHD-physical Q/K/V for this draw (see generate_graph_fwd);
+            # the per-(b, h) F8_128x4 scale planes are layout-independent.
+            q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
 
     # Generate sink_token if needed
     sink_token_gpu = None
@@ -961,7 +1022,13 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         o_gpu = torch.full((b, s_qo, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda").transpose(1, 2)
     else:
         o_gpu = torch.empty(b, h_q, s_qo, d_vo, dtype=torch_otype, device="cuda")
+    if is_paged:  # BSHD-physical Q/O, as the graph declares
+        q_fp8_d = q_fp8_d.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+        o_gpu = torch.empty(b, s_qo, h_q, d_vo, dtype=torch_otype, device="cuda").permute(0, 2, 1, 3)
     stats_gpu = torch.empty(b, h_q, s_qo, 1, dtype=torch.float32, device="cuda")
+    if is_paged:  # NaN, so a padded row the kernel skips cannot pass the O := 0 / LSE := -inf checks
+        o_gpu.fill_(float("nan"))
+        stats_gpu.fill_(float("nan"))
     amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
 
     sf_o_gpu = scale_o_gpu = None
@@ -1000,9 +1067,16 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.sf_o)] = sf_o_gpu
         if scale_o_gpu is not None:
             variant_pack[int(GraphFwdUid.scale_o)] = scale_o_gpu
+    if is_paged:
+        variant_pack[int(GraphFwdUid.k)] = k_pool_fp8
+        variant_pack[int(GraphFwdUid.v)] = v_pool_fp8
+        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, device="cuda", dtype=torch.int32)
+        variant_pack[int(GraphFwdUid.k_block_table)] = block_table_gpu
+        variant_pack[int(GraphFwdUid.v_block_table)] = block_table_gpu
 
     # Execute
-    workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    workspace = torch.empty(max(graph_fwd.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     torch.cuda.synchronize()
     if perf:
         times_ms = time_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
@@ -1036,19 +1110,37 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         assert error == 0, f"stats mismatch: {error} elements differ"
         assert compare_amax(amax_o_gpu, o_ref, rtol=0.05, tag="amax(block-scaled, pre-scale)"), "Amax mismatch: 1 element differs"
     elif not perf:
+        padding = None
+        if is_paged:
+            padding = (torch.tensor(seq_len_q_list, device="cuda", dtype=torch.int32), torch.tensor(seq_len_kv_list, device="cuda", dtype=torch.int32))
         o_ref, stats_ref = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
                                        torch_itype=torch_itype, output_type=torch_otype,
                                        left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                                       sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
+                                       sink_token=sink_token_gpu, rescale_threshold=rescale_threshold, padding=padding)
         o_f16 = o_ref.to(torch.bfloat16)
         stats_bwd = stats_ref
+        o_cmp, stats_cmp = o_gpu, stats_gpu
+        if is_paged:
+            # Padded (dead) query rows: the engine writes O := 0 / LSE := -inf there. Check that,
+            # then compare the live rows against the reference.
+            dead_q = (torch.arange(s_qo, device="cuda")[None, :] >= padding[0][:, None]).view(b, 1, s_qo, 1)
+            assert not o_gpu.float()[dead_q.expand(b, h_q, s_qo, d_vo)].any(), "padded query rows must write O := 0"
+            assert torch.isneginf(stats_gpu[dead_q.expand(b, h_q, s_qo, 1)]).all(), "padded query rows must write LSE := -inf"
+            o_ref = o_ref.masked_fill(dead_q, 0)
+            stats_cmp = stats_gpu.masked_fill(dead_q, 0)
+            stats_ref = stats_ref.masked_fill(dead_q, 0)
         for actual, expected, atol, rtol, name in (
-            (o_gpu, o_ref, 0.12, 0.20, "output"),
-            (stats_gpu, stats_ref, 0.05, 0.05, "stats"),
+            (o_cmp, o_ref, 0.12, 0.20, "output"),
+            (stats_cmp, stats_ref, 0.05, 0.05, "stats"),
         ):
             error = compare_tensors(actual, expected, atol, rtol, name)
             assert error == 0, f"{name} mismatch: {error} elements differ"
-        assert compare_amax(o_gpu, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
+        if is_paged:
+            # A split plan rounds P against each split's own max, not the reference's single running max, so max|O|
+            # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
+            assert compare_amax(amax_o_gpu, o_cmp, rtol=torch.finfo(torch_otype).eps, tag="amax(graph output)"), "Amax_O mismatch"
+        else:
+            assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")

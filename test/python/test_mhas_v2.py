@@ -2118,6 +2118,132 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 # # ==================================
+# # L0 MXFP8 paged KV cache on the FROST SM100 MXFP8 row
+# # ==================================
+#
+# sdpa_mxfp8 over page pools whose F8_128x4 descales page with K/V (page_size % 128). The
+# cuDNN backend declines every MXFP8 paged graph, so each config asserts FROST routing.
+
+FROST_MXFP8_ENGINE = "sdpa_fwd_prefill_sm100_mxfp8"
+FROST_MXFP8_ENGINE_KEY = f"frost:{FROST_MXFP8_ENGINE}"
+
+
+def _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle):
+    """exec_sdpa_mxfp8, then assert the FROST MXFP8 row served the graph; a harness skip
+    (every engine declined) is a failure here, so an unserved config cannot pass silently."""
+    before = frost_routing.snapshot().get(FROST_MXFP8_ENGINE_KEY, 0)
+    try:
+        exec_sdpa_mxfp8(cfg, request, cudnn_handle)
+    except pytest.skip.Exception as e:
+        if not request.config.option.dryrun:
+            pytest.fail(f"FROST-asserting mxfp8 paged config must run, not skip: {e}", pytrace=False)
+        raise
+    after = frost_routing.snapshot().get(FROST_MXFP8_ENGINE_KEY, 0)
+    assert after == before + 1, f"expected {FROST_MXFP8_ENGINE_KEY} to serve this graph; routing tally: {frost_routing.snapshot()}"
+
+
+def _run_mxfp8_paged(test, test_no, request, cudnn_handle):
+    test.showConfig(test_no, request)
+    if request.node.name in test.blocked_tests:
+        pytest.skip(f"blocked test: {request.node.name}")
+    try:
+        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(test.cfg.rescale_threshold)
+        _exec_sdpa_mxfp8_expect_frost(test.cfg, request, cudnn_handle)
+    finally:
+        if "CUDNN_RESCALE_THRESHOLD" in os.environ:
+            del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2006), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
+    """Decode / MTP-shaped (s_q <= 8) MXFP8 paged graphs at page sizes 128 / 256, d256, over the
+    default plan walk, each asserting the FROST MXFP8 row served it."""
+    _require_frost_sm100(FROST_MXFP8_ENGINE)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[4, 16]),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1": 6, "s_q=s_kv": 0, "s_q=random": 4}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=256, d_qk_max=256, d_v_min=256, d_v_max=256, head_dim_distribution={"d_qk=d_v": 1}),
+        head_count=RandomHeadGenerator(min=2, max=32, head_group_options=(1, 8, 2)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float16: 1, torch.bfloat16: 1}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=5, causal=3, left_window_only=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
+        with_sink_token=RandomChoice({True: 1, False: 3}),
+        block_size=RandomBlockSize(min=128, max=256, with_high_probability=[128, 256]),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_mxfp8 = True
+    test.cfg.is_paged = True
+    # A decode / MTP step has at least one query token per request. KV lengths stay free.
+    test.cfg.seq_len_q = [max(1, n) for n in test.cfg.seq_len_q]
+    # Bottom-right alignment needs a causal upper bound.
+    if test.cfg.right_bound is None:
+        test.cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    # The FROST MXFP8 kernels bake the 4-binade lazy-rescale threshold.
+    test.cfg.rescale_threshold = 4.0
+    _run_mxfp8_paged(test, test_no, request, cudnn_handle)
+
+
+MXFP8_PAGED_PINNED_CASES = [
+    # (id, batches, h_q, h_kv, s_q, s_kv, block_size, diag_align, right_bound, seq_len_kv)
+    ("qwen35_decode", 32, 32, 2, 1, 4096, 128, cudnn.diagonal_alignment.TOP_LEFT, None, [4096, 1, 0, 129, 2049, 4095, 130, 3000] * 4),
+    ("qwen35_mtp4_br", 8, 32, 2, 4, 4096, 128, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0, [4096, 4, 700, 129, 2049, 4095, 130, 3000]),
+    ("chunked_prefill_512", 2, 8, 2, 512, 8192, 256, cudnn.diagonal_alignment.BOTTOM_RIGHT, 0, [8192, 700]),
+]
+
+
+@pytest.mark.parametrize("case_id,batches,h_q,h_kv,s_q,s_kv,block_size,diag_align,right_bound,seq_len_kv", MXFP8_PAGED_PINNED_CASES, ids=[c[0] for c in MXFP8_PAGED_PINNED_CASES])
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_paged_pinned_frost_L0(env_info, case_id, batches, h_q, h_kv, s_q, s_kv, block_size, diag_align, right_bound, seq_len_kv, request, cudnn_handle):
+    """Qwen3.5-shaped MXFP8 paged decode / MTP and a chunked-prefill step, pinned."""
+    _require_frost_sm100(FROST_MXFP8_ENGINE)
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.bfloat16,
+        rng_data_seed=2006,
+        rng_geom_seed=2006,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_mxfp8=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=batches,
+        d_qk=256,
+        d_v=256,
+        s_q=s_q,
+        s_kv=s_kv,
+        h_q=h_q,
+        h_k=h_kv,
+        h_v=h_kv,
+        block_size=block_size,
+        diag_align=diag_align,
+        right_bound=right_bound,
+        rescale_threshold=4.0,
+        seq_len_q=[s_q] * batches,
+        seq_len_kv=list(seq_len_kv),
+    )
+    test.cfg.fill_derived_fields()
+    _run_mxfp8_paged(test, (request.node.name, len(MXFP8_PAGED_PINNED_CASES)), request, cudnn_handle)
+
+
+# # ==================================
 # # L0 MXFP8 bprop tests
 # # ==================================
 

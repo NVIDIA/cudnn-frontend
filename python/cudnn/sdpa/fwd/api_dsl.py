@@ -1890,8 +1890,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "the d128 decode tile's ragged-Q leg rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2",
         )
         self._not_implemented_error_if(
-            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),
-            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD and split-KV are not wired)",
+            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1 or self.paged),
+            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD, split-KV and paged KV are not wired)",
         )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -1918,21 +1918,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d128 per-tensor FP8 kernel; every kernel file without it (MXFP8,
+            # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
             self._not_implemented_error_if(self._device_cc == (10, 7), "paged KV is not wired on the SM107 sibling kernels (SM100 line only)")
             self._not_implemented_error_if(
-                self._fp8 and not self._pertensor,
-                "paged KV is not wired for MXFP8 (the F8_128x4 block-scale atoms bundle 128 rows of one head and cannot be assembled from sub-tile pages)",
-            )
-            self._not_implemented_error_if(
                 self._fp8 and self.thd,
                 "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
             )
             self._not_implemented_error_if(
-                self._fp8 and self.has_sink,
+                self._pertensor and self.has_sink,
                 "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)",
             )
             self._not_implemented_error_if(
@@ -1940,11 +1936,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._fp8 and self.flavor != (128, 128),
+                self._pertensor and self.flavor != (128, 128),
                 f"paged KV for per-tensor FP8 is wired on the d128 flavor only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
-                f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,  # config_sm100 tags flavors by d_qk (d192 = the d192x128 kernel)
+                not self._fp8 and f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,
                 f"paged KV is wired on the {sorted(_SM100_PAGED_KV_FLAVORS)} flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._value_error_if(not self.seq_kv_lens_present, "paged KV requires per-batch KV lengths (seq_kv_lens_present)")
@@ -1954,6 +1950,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._value_error_if(
                 p % 8 != 0 or (p < _SM100_TILE_N and _SM100_TILE_N % p != 0) or (p > _SM100_TILE_N and p % _SM100_TILE_N != 0),
                 f"page_size {p} must be a multiple of 8 that divides {_SM100_TILE_N} or is a multiple of it",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and not self._pertensor and p % _SM100_TILE_N != 0,
+                f"paged MXFP8 KV needs page_size to be a multiple of {_SM100_TILE_N} (whole F8_128x4 SF atoms per page); got {p}",
             )
         if self.split_kv > 1:
             # Split-KV: partials weighted by the per-split LSE, recombined by
@@ -2483,6 +2483,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # Block-scaled O on the MXFP8 kernels: whether the scale_o operand
                 # exists (None-specialized identity fold otherwise; has_scale_o).
                 fp8_kwargs["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
+            if self.paged:
+                # The MXFP8 template pins pool and table strides at compile time. The logical
+                # KV maximum leaves the key (_PAGED_COMPILE_SKV).
+                fp8_kwargs.update(
+                    k_stride=self._paged_pool_stride(self.k_desc),
+                    v_stride=self._paged_pool_stride(self.v_desc),
+                    block_table_stride=self.paged_table_stride,
+                    block_table_v_stride=self.paged_table_v_stride,
+                    skv=_PAGED_COMPILE_SKV,
+                )
             self._compiled_kernel = self._k_mod.compile(**fp8_kwargs)
         self._combine_kernel = None
         # What the combine's amax slot is COMPILED for.  Under a split the main
@@ -3043,6 +3053,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     current_stream,
                     workspace=workspace,
                     gate=gate,
+                    block_table=block_table,
+                    block_table_v=block_table_v,
                     sf_o=sf_o,
                     scale_o=scale_o,
                 )
@@ -3515,9 +3527,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _ceil_div(x: int, a: int) -> int:
         return (x + a - 1) // a
 
-    def _reshape_sf(self, sf: torch.Tensor, h: int, n_tiles: int, sf_smem_size: int) -> torch.Tensor:
+    def _reshape_sf(self, sf: torch.Tensor, h: int, n_tiles: int, sf_smem_size: int, batch: Optional[int] = None) -> torch.Tensor:
         """cuDNN F8_128x4 scale-factor tensor (FP8_E8M0) → the kernel's per-tile
-        int8 view ``[B, H, n_tiles, sf_smem_size]``.
+        int8 view ``[B, H, n_tiles, sf_smem_size]`` (``batch`` overrides B for a paged SF pool).
 
         cuDNN packs the 128×4 SF atom contiguously (``F8_128x4`` reordering); a Q/K
         tile is 128 rows × d/32 d-blocks and a V tile is 128 rows × 4 s-blocks, so
@@ -3531,7 +3543,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``[B·H·s_padded, 4]`` swizzle output).  So B comes from the graph facts,
         never from ``sf.shape[0]``, and only the total size is validated.
         """
-        b = self.batch_size
+        b = self.batch_size if batch is None else batch
         flat = _sf_storage_order_bytes(sf, "sf")
         if flat.numel() != b * h * n_tiles * sf_smem_size:
             raise ValueError(
@@ -3598,6 +3610,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         current_stream=None,
         workspace=None,
         gate=None,
+        block_table=None,
+        block_table_v=None,
         sf_o=None,
         scale_o=None,
     ):
@@ -3704,8 +3718,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return
 
         Q = self._to_bshd(q_tensor)
-        K = self._to_bshd(k_tensor)
-        V = self._to_bshd(v_tensor)
+        if self.paged:
+            # A view, never a copy: _to_bshd's .contiguous() fallback would gather the whole cache.
+            K = k_tensor.permute(0, 2, 1, 3)
+            V = v_tensor.permute(0, 2, 1, 3)
+            sf_batch = int(k_tensor.shape[0])
+            n_kv_tiles = self.paged_page_size // _SM100_TILE_N
+        else:
+            K = self._to_bshd(k_tensor)
+            V = self._to_bshd(v_tensor)
+            sf_batch = None
+            n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
         if self.o_block_scale == 16:
             # FP4 O arrives as its byte container ((B, H, S, d/2) in
             # float4_e2m1fn_x2 / uint8 / fp8 spelling); the kernel binds it as
@@ -3731,11 +3754,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sf_o_kwargs["scale_o_t"] = self._scale_view(scale_o, "scale_o", device)
             else:
                 self._value_error_if(scale_o is not None, "this specialization was compiled without scale_o; construct the API with sample_scale_o")
+        paged_kwargs = {"block_table_tensor": block_table, "block_table_v_tensor": block_table_v} if self.paged else {}
 
         n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
-        n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
         sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
-        sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
+        sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K, sf_batch)
         # The BF16 PV specialization keeps the common FP8-family SF_V ABI, but
         # BMM2 does not consume it. Bind a cached correctly shaped dummy rather
         # than materializing a sliced contiguous tensor on every launch.
@@ -3750,7 +3773,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ),
             )
             if self.pv_bf16
-            else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+            else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V, sf_batch)
         )
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
@@ -3811,6 +3834,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # kernel's _host, after `stream`; absent on ungated builds.
             **({"gate_tensor": G} if G is not None else {}),
             **sf_o_kwargs,
+            **paged_kwargs,
             stream=current_stream,
         )
         if self.split_kv > 1:

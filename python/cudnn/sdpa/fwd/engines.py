@@ -880,13 +880,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # epilogue (sf_o) over pools are not validated, so those two pairs stay
         # declined on the fp8 row.
         if facts.is_mxfp8:
-            return "paged KV is served by the f16/bf16 and per-tensor FP8 kernels only (MXFP8 block-scale atoms bundle 128 rows of one head)"
+            if facts.page_size % 128 != 0:
+                # A page must hold whole 128-row F8_128x4 SF atoms.
+                return f"paged MXFP8 KV needs page_size to be a multiple of 128; got {facts.page_size}"
+            if facts.thd:
+                return "paged MXFP8 KV with THD queries is not wired"
         if facts.is_fp8 and facts.thd:
             return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
         if facts.is_fp8 and facts.has_sink:
             return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
-        if facts.is_fp8 and facts.o_block_scale:
-            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)"
+        if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
+            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if capabilities.paged_d_shapes is not None:
@@ -1250,6 +1254,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_padded_stats=True,
             padded_stats=True,
             cu_seq_len=True,
+            # The SF pools page with K/V. mismatch() gates page_size % 128.
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
