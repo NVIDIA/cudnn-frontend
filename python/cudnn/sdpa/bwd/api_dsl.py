@@ -1781,10 +1781,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch (issue #514): dense_flex gathers / head-dim pad
-        staging for the five input operands, strided-stats staging, and the
-        kernel-internal buffers (``sm80/bprop_f16.scratch_bytes``; the generic
-        kernel's set covers the d64 fast path's). All plan-time state — no
-        arguments."""
+        staging for the five input operands, and the kernel-internal buffers
+        (``sm80/bprop_f16.scratch_bytes``; the generic kernel's set covers the
+        d64 fast path's). All plan-time state — no arguments."""
         self._ensure_support_checked()
         if self.thd:
             return self._thd_scratch_bytes()
