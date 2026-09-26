@@ -221,6 +221,9 @@ def test_sm120_prepared_thd_capture_rebind(d, binder, monkeypatch):
     from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
     from test_sdpa_prepared_thd import _buffers, _pack, _reference, _thd_graph
 
+    # No old tensor-compiler entry should be needed even during plan build.
+    for name in ("make_fake_tensor", "make_fake_compact_tensor"):
+        monkeypatch.setattr(cute.runtime, name, lambda *a, **k: pytest.fail("half THD must use the prepared pointer compiler"))
     b, ql, kl, hq, hk = 3, 17, 65, 4, 2
     g, tensors = _thd_graph(b, ql, kl, hq, hk, d, arch="sm120")
     prepared = g._compiled_plans[g._plan_index]._prepared

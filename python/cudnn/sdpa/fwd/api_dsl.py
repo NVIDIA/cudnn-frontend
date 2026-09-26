@@ -4302,13 +4302,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     bottom-right causal masks; left sliding
     windows; optional per-batch query and key/value lengths; optional
     per-Q-head attention-sink logits; and THD (ragged / fully packed
-    variable-length) batches, whose per-shape compile is deferred to
-    ``execute()`` because the packed token totals are runtime values.
+    variable-length) batches, compiled at plan time with runtime token totals.
 
-    Dense unsplit FP16/BF16 plans with zero-copy layouts use a prepared pointer
-    entry: batch, sequence lengths and Int64 strides bind at execute without
-    tensor reconstruction. Head counts/dimensions and scheduler knobs remain
-    compile-time constants; bounded shape overrides keep those fixed.
+    FP16/BF16 THD and zero-copy dense plans, including dense split-KV, use a
+    prepared pointer entry: pointers, sequence lengths and Int64 strides bind
+    at execute without tensor reconstruction. Head geometry and scheduler
+    knobs remain compile-time constants; split plans also retain batch/Q size.
 
     ``scale_softmax`` is a runtime parameter. Dtype, head geometry, tile sizes,
     masks and length-tensor / sink / THD presence specialize every path. Legacy
