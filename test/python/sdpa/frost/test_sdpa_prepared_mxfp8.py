@@ -140,7 +140,20 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
+    if override:
+        # Pin the executor under test. Unrelated backend heuristics can fail
+        # before the physical-stride fixture reaches a FROST launch.
+        from cudnn.engines import MANIFEST
+        from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs
+
+        name = engine_name(arch=arch, mxfp8=True)
+        family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+        caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
+        cgas = dict(caps.cgas_by_d_shape).get((d, dv), caps.cgas)
+        knobs = SdpaFwdKnobs(tile_m=max(caps.tile_ms), tile_n=max(caps.tile_ns), cga=max(cgas), split_kv=split_kv, sched_policy=0, pack_gqa=False)
+        g.create_execution_plan(family.offered_ids()[name], knobs)
+    else:
+        g.create_execution_plans([cudnn.heur_mode.A])
     chosen = select_engine(g, engine_name(arch=arch, mxfp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace
