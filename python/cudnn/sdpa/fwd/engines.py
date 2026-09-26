@@ -528,8 +528,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         or facts.has_epilogue_gate
     ):
         return "prepared FP8 serves SM100 native head dimensions, unsplit, non-paged scalar-scaled outputs"
-    if capabilities.sm_lo == 120 and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1):
-        return "prepared SM120 serves dense unsplit half-precision launches"
+    if capabilities.sm_lo == 120 and facts.has_paged_kv:
+        return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:

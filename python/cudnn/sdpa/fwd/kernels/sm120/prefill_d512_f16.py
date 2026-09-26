@@ -1877,7 +1877,7 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
             raise ValueError("head dimensions must be multiples of 8 (TMA 16-byte global-stride rule at 2 B/elem)")
 
-        # The pointer entry is validated by prepared.bind_dense; tensor callers
+        # The pointer entry is validated by the shared prepared binder; tensor callers
         # retain the original trace-time geometry and layout checks.
         if cutlass.const_expr(not prepared):
             # THD compiles the token extents DYNAMIC (mode 1 is a symbol, not an
@@ -2019,6 +2019,10 @@ class SM120FusedMultiHeadAttentionForward:
             )
         else:
             tma_q_desc = tma_k_desc
+        # Prepared THD carries the current batch in the metadata extent; tensor
+        # entries retain their compile-time batch. Device readers already derive
+        # the same batch from this layout, so setup and consumers stay in step.
+        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -2028,7 +2032,7 @@ class SM120FusedMultiHeadAttentionForward:
                 thd_q_lens,
                 thd_kv_lens,
                 thd_lens_form,
-                cutlass.Int32(self.thd_batch),
+                cutlass.Int32(thd_batch),
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
@@ -2044,7 +2048,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen)
             else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
         )
-        n_batch = self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
+        n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # Dense: a flat grid over the units, capped at thd_n_ctas — the persistent
         # CTA count the adapter sizes to the machine (0 = one CTA per unit). The
@@ -2105,29 +2109,13 @@ def compile(  # noqa: A001
     prepared: bool = False,
     persistent_ctas: int = 0,
 ) -> Callable:
-    """Compile and cache one architecture-specific compact BSHD shape.
+    """Compile a prepared pointer entry or the remaining dense tensor entry.
 
-    ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
-    head dim (P@V output width).
-
-    THD specializations pack the batch: ``b`` is the real sequence count and
-    ``sq``/``skv`` are IGNORED — the packed token totals are runtime values
-    (they change every step under continuous batching), so the token extents
-    compile DYNAMIC (``cute.sym_int``) and the cache key stays plan-time-only;
-    callers must not pass them. ``max_sq`` (the longest sequence's Q length,
-    which sizes the per-sequence grid) is likewise a RUNTIME ``__call__``
-    argument, not a compile parameter. THD strides carry a ZERO batch stride
-    (the real view's batch stride is ``t * token_stride``, a runtime value;
-    the fake rebuilds it symbolically — batch extent 1 never steps).
-
-    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
-    ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
-    at all instead of a dummy. Dense ``lse_stride`` carries the caller's
-    declared ``(B, H, Sq)`` element strides into the compiled tensor. THD LSE
-    is token-major ``(T, H)`` by default;
-    ``lse_head_major=True`` switches to head-major ``(H, lse_head_stride)``
-    (FlashAttention's ``softmax_lse`` layout), where ``lse_head_stride`` is the
-    caller-declared head-row stride (``>= T``, a shape — part of the cache key).
+    All half THD plans use ``prepared=True``. Their batch/Q envelope and
+    Stats packing specialize the host; packed capacities, strides and device
+    length pointers bind at execution. No THD tensor fakes are constructed.
+    Dense conversion routes retain shape/stride-specialized tensor operands.
+    ``has_lse=False`` compiles out the Stats store without a dummy buffer.
     """
 
     _cache_key = _template_key(globals(), locals(), "compile")
@@ -2158,18 +2146,14 @@ def compile(  # noqa: A001
         qh_per_kh=qh // kh,
     )
     if prepared:
-        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key)
+        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
+    if PARAMS.thd_varlen:
+        raise ValueError("SM120 half THD uses prepared=True; the tensor entry is dense-only")
     if PARAMS.split_kv > 1 and not has_lse:
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    if lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):
+    if lse_stride is not None and PARAMS.split_kv > 1:
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
-    fake_batch = 1 if PARAMS.thd_varlen else b
-    if PARAMS.thd_varlen:
-        # Dynamic packed token totals: one symbol per ragged group (Q/O and
-        # the LSE share t_q; K/V share t_kv), so a new total re-binds the same
-        # compiled artifact instead of minting a new one (issue #552).
-        sq = cute.sym_int(divisibility=1)
-        skv = cute.sym_int(divisibility=1)
+    fake_batch = b
     # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on the
     # batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.
     o_fake_batch = fake_batch * PARAMS.split_kv
@@ -2178,20 +2162,13 @@ def compile(  # noqa: A001
     def _fake_bshd(shape, stride):
         if stride is None:
             return cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if PARAMS.thd_varlen:
-            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
-            # a runtime value: rebuild it from the dynamic token extent.
-            return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((fake_batch, sq, qh, d_qk), q_stride)
     fake_k = _fake_bshd((fake_batch, skv, kh, d_qk), k_stride)
     fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
     fake_o = _fake_bshd((o_fake_batch, sq, qh, d_v), o_stride)
-    if PARAMS.thd_varlen:
-        fake_lse_shape = (b, qh, lse_padded_rows) if lse_padded_rows else ((qh, lse_head_stride) if lse_head_major else (sq, qh))
-    else:
-        fake_lse_shape = (lse_fake_batch, qh, sq)
+    fake_lse_shape = (lse_fake_batch, qh, sq)
     if not has_lse:
         # No Stats output: the LSE argument is None-specialized and the store
         # is compiled out entirely — no dummy buffer exists at any level.
@@ -2203,7 +2180,7 @@ def compile(  # noqa: A001
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
                 fake_lse_shape,
-                stride_order=(1, 0) if (PARAMS.thd_varlen and not lse_padded_rows) else (2, 1, 0),
+                stride_order=(2, 1, 0),
                 assumed_align=4,
             )
         )
@@ -2225,22 +2202,10 @@ def compile(  # noqa: A001
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * b + 4,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr ]
+        (b,),
         stride_order=(0,),
         assumed_align=4,
     )
-    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
-    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
-    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
-    # thd_lens_form bitmask, so no compile key grows (Rule 4).
-    if PARAMS.thd_varlen:
-        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_lens_form = cutlass.Int32(0)
-    else:
-        fake_thd_q_lens = None
-        fake_thd_kv_lens = None
-        fake_thd_lens_form = None
     return _compile_cached(
         kernel,
         fake_q,
@@ -2253,9 +2218,9 @@ def compile(  # noqa: A001
         fake_seq_kv_lens,
         cutlass.Float32(1.0),
         cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
-        fake_thd_q_lens,
-        fake_thd_kv_lens,
-        fake_thd_lens_form,
+        None,
+        None,
+        None,
         cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

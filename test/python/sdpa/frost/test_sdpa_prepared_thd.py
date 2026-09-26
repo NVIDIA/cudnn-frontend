@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
-def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16):
+def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100"):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
     stride (the declaration's span is then far below the buffer's)."""
@@ -69,7 +69,7 @@ def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, o
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name()
+    want = engine_name(arch=arch)
     g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
     g.check_support()
     g.build_plans()
