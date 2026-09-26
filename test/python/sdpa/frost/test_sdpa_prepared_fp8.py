@@ -346,7 +346,12 @@ def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv):
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared is not None
     owner = plan._prepared.spec.owner
-    bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), device="cuda", dtype=torch.bfloat16)
+    try:
+        bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), device="cuda", dtype=torch.bfloat16)
+    except torch.OutOfMemoryError:
+        # A concurrent pytest worker may consume memory after the precheck.
+        # Numerical failures and launch errors remain outside this guard.
+        pytest.skip("wide physical row-stride storage unavailable under current GPU memory pressure")
     vp[tensors["o"]] = bufs["o"]
     overrides = dict(override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1]])
     bufs["o"].fill_(float("nan"))
@@ -399,3 +404,27 @@ def test_prepared_fp8_dense_input_strides(d, dv):
     bufs["o"].fill_(float("nan"))
     captured.replay()
     _check(bufs, thd=False)
+
+
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch):
+    """An empty packed Q has no host launch, but its reduction output is zero."""
+    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=True)
+    for name in ("q", "o", "lse"):
+        buf = bufs[name]
+        bufs[name] = torch.empty((0, *buf.shape[1:]), device=buf.device, dtype=buf.dtype)
+        vp[tensors[name]] = bufs[name]
+    for name in ("cu_q", "off_q", "off_o", "off_lse"):
+        if name in tensors:
+            vp[tensors[name]] = torch.zeros_like(vp[tensors[name]])
+    spec = g._compiled_plans[g._plan_index]._prepared.spec
+    monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("empty Q must not launch attention"))
+    bufs["amax_o"].fill_(999)
+    g.execute(vp, ws)
+    torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))
+    captured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(captured):
+        g.execute(vp, ws)
+    bufs["amax_o"].fill_(999)
+    captured.replay()
+    torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))

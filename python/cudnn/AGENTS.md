@@ -474,6 +474,15 @@ window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
 (`test_torch_stream.py`).
 
+For a host-overhead migration, measure warm enqueue and captured GPU replay
+separately, and check changed-input outputs after timing. A tiny async memset
+can introduce cross-engine waits between graph kernels even when their kernel
+durations improve. If replay regresses, inspect profiler timestamps between
+nodes as well as individual kernel durations; the prepared FP8 scalar amax
+reset uses an SM kernel to avoid that wait. Keep the empty-input reduction
+identity correct when no attention host is launched
+(`test_prepared_fp8_empty_thd_resets_amax_without_attention`).
+
 
 **Rule 9 — backend and FROST share one FE Python graph contract; no special
 treatment at the caller boundary.**

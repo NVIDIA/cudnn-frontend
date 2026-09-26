@@ -16,6 +16,14 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 
 
 @cute.kernel
+def _reset_amax_kernel(amax: cute.Pointer):
+    amax.store(cutlass.Float32(0.0))
+
+
+_reset_amax_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
 def _unscale_amax_kernel(amax: cute.Pointer, scale: cute.Pointer):
     amax.store(amax.load() / scale.load())
 
@@ -129,6 +137,9 @@ def host(
         # The diagonal-only fast case specializes equal lengths. Prepared
         # execution permits rectangular overrides, so retain the general mask.
         args += (False,)
+    # Keep the scalar reset on the SM execution path. A captured driver
+    # memset creates an extra engine dependency before the attention kernel.
+    _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_host(
         *args,
         scale_softmax_log2,
