@@ -558,6 +558,15 @@ expressible, with one discipline separating them:
 
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
+- A SET-valued axis gets a model of its own when "unmentioned" would mean "no":
+  the mask band is decided through `cudnn/sdpa/band.py` -- the graph's
+  `BandFacts` (left bound present, right mode unbounded / causal / finite-right,
+  top-left or bottom-right anchor) against the row's `Capabilities.band`
+  (`BandSupport`). The legacy mask flags stay the declaration spelling and are
+  mapped onto that set once, in `Capabilities.__post_init__`; a row that serves
+  only unmasked graphs, or only a causal diagonal, says so instead of leaving an
+  axis to default, and the matcher asks every axis in both directions so an
+  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;

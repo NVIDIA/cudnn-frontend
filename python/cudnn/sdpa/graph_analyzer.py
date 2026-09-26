@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa import band
 
 _LOG = logging.getLogger(__name__)
 
@@ -470,6 +471,18 @@ class SdpaGraphFacts:
     # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
+
+    @property
+    def band(self) -> "band.BandFacts":
+        """This graph's mask band, in the canonical model (cudnn.sdpa.band).
+
+        A VIEW, not a second source: the raw resolved fields above stay the
+        facts every other consumer reads (heuristics, lowerings, configs) and
+        :meth:`cudnn.sdpa.band.BandFacts.from_sdpa_facts` is the one place they
+        are normalized into (left bound, right mode, anchor).  Engines decide
+        support by comparing this against their row's ``Capabilities.band``.
+        """
+        return band.BandFacts.from_sdpa_facts(self)
 
 
 _SDPA_NODE_TYPES = (
