@@ -23,7 +23,7 @@ head-major, never dense-padded.**
   classification can only check `stride_s == 1 and stride_h >= 1`. In the
   THD path the packed total is a *device* value — Rule 3 bans reading it
   back, so `stride_h >= T` is **caller contract** (stated in
-  `_thd_lse_view`'s docstring), not something the adapter verifies:
+  the prepared THD binding contract), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
   legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,

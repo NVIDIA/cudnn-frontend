@@ -208,3 +208,17 @@ A capability row's `sm_lo` names its lower bound, not the actual device.
 Prepared admission must respect the adapter's exact device support even when
 the row spans later compute capabilities. Include future-cc rejection controls
 alongside the supported device in `test_prepared_fp8_override_capability_envelope`.
+
+### MXFP8 prepared scale-factor bindings
+
+Dense V scale factors for D > 128 are plane-major; THD factors are packed
+per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
+inputs; reshaping a dense buffer does not produce the THD contract. Rebind
+E8M0 exponent values as well as pointers and validate after graph replay.
+The MXFP8 split combine has no per-tensor output scalar: specialize its
+scale pointer to None and remove Amax unscaling, rather than handing a NULL
+runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
+covers every native flavor with requested Amax. Physical SF stride units are
+16 bytes; widen tile-count products before multiplication. The L1
+`test_prepared_mxfp8_sf_head_stride_above_int32_units` steps a physical 64-GiB
+head stride and checks numerical output, with resource-only OOM skips.
