@@ -2464,7 +2464,7 @@ def compile(  # noqa: A001
                 assumed_align=16,
             )
         )
-    from cudnn.sdpa.fwd.kernels.sm100.fp8_host import make_fake_aux
+    from cudnn.sdpa.fwd.kernels._fp8_host import make_fake_aux
 
     aux = make_fake_aux(b, qh, amax_align=4)
     return _compile_cached(
@@ -2495,7 +2495,7 @@ def compile(  # noqa: A001
     )
 
 
-from cudnn.sdpa.fwd.kernels.sm100.fp8_host import host as _host_prepared
+from cudnn.sdpa.fwd.kernels._fp8_host import host as _host_prepared
 
 
 # Pointer geometry/scales bind through one shared host; this module owns
@@ -2511,7 +2511,7 @@ def compile_prepared(
     scale_o_in_combine: bool = False,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
-    from cudnn.sdpa.fwd.kernels.sm100.fp8_host import LSE_KINDS, compile_host
+    from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
     if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
         raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")

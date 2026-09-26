@@ -519,12 +519,12 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if capabilities.sm_lo not in (100, 107, 120) or facts.is_mxfp8:
         return "this engine has no prepared shape/stride override executor"
     if facts.is_fp8 and (
-        capabilities.sm_lo not in (100, 120)
+        capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
         or facts.o_block_scale
         or facts.has_epilogue_gate
     ):
-        return "prepared FP8 serves SM100 or SM120 scalar-scaled outputs"
+        return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:

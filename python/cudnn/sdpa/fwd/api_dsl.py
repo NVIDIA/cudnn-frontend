@@ -2565,7 +2565,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8
             and self._pertensor
             and self._device_cc[0] == 10
-            and self._device_cc != (10, 7)
             and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.o_block_scale
             and self.gate_desc is None
@@ -2574,6 +2573,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.paged and self.paged_table_stride != self.paged_table_v_stride:
             # The pointer ABI has one table-stride pair. Retain the tensor
             # compiler's two declared layouts for this existing static route.
+            return False
+        if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor != (128, 128):
             return False
         from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 

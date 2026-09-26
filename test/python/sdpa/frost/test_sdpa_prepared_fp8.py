@@ -181,7 +181,7 @@ def _check(bufs, *, thd, b=2, sq=128, skv=128):
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_prepared_fp8_rebind_scales_and_buffers(thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch):
     """All scalar output dtypes use the pointer entry, including every THD route."""
-    from cudnn.sdpa.fwd.kernels.sm100 import fp8_host
+    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
 
     def legacy_fake(*args, **kwargs):
         pytest.fail("prepared launch reentered the legacy tensor compiler")

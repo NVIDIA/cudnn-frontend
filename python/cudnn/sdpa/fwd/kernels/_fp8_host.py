@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Shared SM100 per-tensor FP8 host binding and compile-time auxiliary operands."""
+"""Shared SM100/SM107 per-tensor FP8 host binding and compile-time auxiliary operands."""
 
 from types import SimpleNamespace
 from typing import Optional, Tuple
@@ -57,6 +57,8 @@ def host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    partial_slot: cutlass.Constexpr[bool],
+    optional_amax: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind dense or THD pointer views and launch the selected FP8 host.
@@ -124,9 +126,11 @@ def host(
         args += (False,)
     # Keep the scalar reset on the SM execution path. A captured driver
     # memset creates an extra engine dependency before the attention kernel.
-    if cutlass.const_expr(cfg.SPLIT_KV == 1):
+    if cutlass.const_expr(cfg.SPLIT_KV == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    kernel_kwargs = dict(o_partial_f32=o_partial_f32, prepared=True)
+    kernel_kwargs = dict(prepared=True)
+    if cutlass.const_expr(partial_slot):
+        kernel_kwargs.update(o_partial_f32=o_partial_f32)
     if cutlass.const_expr(getattr(cfg, "PAGED_KV", False)):
         kernel_kwargs.update(block_table_tensor=block_table_tensor, block_table_v_tensor=block_table_v_tensor, paged_hnd_prepared=paged_hnd)
     kernel_host(
@@ -138,7 +142,7 @@ def host(
         scalar(descale_k_ptr),
         scalar(descale_v_ptr),
         None if cutlass.const_expr(scale_o_ptr is None) else scalar(scale_o_ptr),
-        scalar(amax_o_ptr),
+        None if cutlass.const_expr(optional_amax and not has_amax) else scalar(amax_o_ptr),
         seq_q_lens_addr,
         thd_q_lens_tensor,
         thd_kv_lens_tensor,
@@ -151,7 +155,22 @@ def host(
 
 
 def compile_host(
-    kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine=False, paged_hnd=False
+    kernel_host,
+    cfg,
+    storage_dtype,
+    output_dtype,
+    d256,
+    cache_key,
+    d_qk,
+    d_v,
+    has_lse,
+    lse_kind,
+    has_amax,
+    scale_o_in_combine=False,
+    paged_hnd=False,
+    *,
+    partial_slot=True,
+    optional_amax=False,
 ):
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")
@@ -204,6 +223,8 @@ def compile_host(
         d_v,
         lse_kind,
         paged_hnd,
+        partial_slot,
+        optional_amax,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,
