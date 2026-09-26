@@ -315,3 +315,71 @@ def test_declines_bf16_intermediates_with_ssd_gate(surface):
 
         with pytest.raises(NotImplementedError, match="SiLU gate requires intermediate_dtype=float32"):
             Mamba2FrostEngine().check_support(graph)
+
+
+@pytest.mark.parametrize("heads,length", [(64, 1), (64, 33), (64, 64), (64, 65), (128, 128), (128, 129)])
+def test_nemotron_merged_backward(heads, length, monkeypatch):
+    values = inputs(length, heads=heads, groups=8, mode="skip")
+    values["A"] = (-torch.empty(heads, device="cuda").uniform_(1, 16)).requires_grad_()
+    delta = torch.exp(torch.empty(heads, device="cuda").uniform_(-6.9, -2.3))
+    values["dt_bias"] = (delta + torch.log(-torch.expm1(-delta))).requires_grad_()
+    refs = {name: t.detach().double().requires_grad_() for name, t in values.items()}
+    engine = importlib.import_module("cudnn.linear_attention.frost.mamba2_engine")
+    compile_step, components = engine._compile_step, []
+
+    def record(component, *args):
+        components.append(component)
+        return compile_step(component, *args)
+
+    monkeypatch.setattr(engine, "_compile_step", record)
+    out = mamba2(**values)
+    dy = torch.randn_like(out)
+    grads = torch.autograd.grad(out, tuple(values.values()), dy)
+    assert "chunks64" in components
+    expected = reference(refs)[0]
+    assert_error(out, expected)
+    wanted = torch.autograd.grad(expected, tuple(refs.values()), dy.double())
+    for name, actual, ref in zip(values, grads, wanted):
+        try:
+            assert_error(actual, ref)
+        except AssertionError as exc:
+            raise AssertionError(f"{name}: {exc}") from exc
+
+
+def test_nemotron_backward_rebind_capture(monkeypatch):
+    values = inputs(63, heads=64, groups=8, mode="skip")
+    values["dO"] = torch.randn_like(values["x"])
+    graph, ports, handle = ops._get_graph(values, True, 32, "float32")
+    out = ops._outputs(values, True)
+    pack = {port: {**values, **out}[name] for name, port in ports.items()}
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    cudnn.set_stream(handle=handle, stream=stream.cuda_stream)
+
+    def no_allocation(*args, **kwargs):
+        raise AssertionError("allocation or compilation during graph.execute")
+
+    with monkeypatch.context() as patch:
+        for name in ("empty", "empty_like", "zeros", "zeros_like"):
+            patch.setattr(torch, name, no_allocation)
+        engine = importlib.import_module("cudnn.linear_attention.frost.mamba2_engine")
+        patch.setattr(engine, "_compile_step", no_allocation)
+        with torch.cuda.stream(stream):
+            graph.execute(pack, workspace=workspace, handle=handle)
+    stream.synchronize()
+    values["x"] = (-values["x"]).detach().requires_grad_()
+    pack[ports["x"]] = values["x"]
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured, stream=stream):
+            graph.execute(pack, workspace=workspace, handle=handle)
+        for _ in range(3):
+            captured.replay()
+    stream.synchronize()
+    refs = {name: t.detach().double().requires_grad_() for name, t in values.items() if name != "dO"}
+    expected = reference(refs)[0]
+    wanted = torch.autograd.grad(expected, tuple(refs.values()), values["dO"].double())
+    for name, ref in zip(("dX", "dDt", "dA", "dB", "dC", "dD", "d_dt_bias"), wanted):
+        assert_error(out[name], ref)

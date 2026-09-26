@@ -164,3 +164,13 @@ amplify this cancellation; test the decline at both graph and torch entry points
 Component benchmarks should
 use the model's Triton chunk size (128 for these Nemotron configurations) and
 validate captured output/gradient buffers after replay, as well as before it.
+
+
+The Nemotron merged backward uses 64-token work units over a 32-token state
+scan. Test both 32- and 64-token boundaries, including odd final scan chunks
+(e.g. L=33 and L=129), against FP64 gradients. The final reverse checkpoint
+must be stored even when a pair has only one scan chunk. Verify the merged
+route is reached with no final-state loss and no forward checkpoint reuse;
+those optional contracts deliberately select the general backward. The
+`test_nemotron_merged_backward` and `test_nemotron_backward_rebind_capture`
+cases cover dispatch, tails and the actual captured destination buffers.

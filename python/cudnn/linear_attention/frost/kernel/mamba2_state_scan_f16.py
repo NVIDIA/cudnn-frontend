@@ -17,9 +17,15 @@ from cudnn.frost.tile_dsl.tma import cp_async_commit, cp_async_wait
 
 
 class Mamba2StateScan:
-    def __init__(self, batch, length, heads, groups, split_directions=False, reverse_only=False, early_tmem_release=False):
+    def __init__(self, batch, length, heads, groups, split_directions=False, reverse_only=False, early_tmem_release=False, checkpoint_stride=1):
         self.batch, self.length, self.heads, self.groups = batch, length, heads, groups
         self.nchunks = (length + 31) // 32
+        # One FP32 state checkpoint is written every ``checkpoint_stride`` BT=32 steps: the
+        # forward state at the first step of a group and the reverse adjoint at
+        # its last step.  The scan still advances 32 tokens at a time, so only
+        # the global-memory footprint shrinks.
+        self.checkpoint_stride = checkpoint_stride
+        self.ngroups = (self.nchunks + checkpoint_stride - 1) // checkpoint_stride
         self.split_directions = split_directions
         self.reverse_only = reverse_only
         self.early_tmem_release = early_tmem_release
@@ -163,15 +169,31 @@ class Mamba2StateScan:
                     updated.wait(phase ^ 1)
                 state = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(base, cutlass.Float32), num=8)
                 nvvm.tcgen05_wait("load")
-                for j in cutlass.range_constexpr(16):
-                    r = warp * 16 + lane // 4 + 8 * (j % 2)
-                    col = (lane % 4) * 2 + (j // 2) * 8
-                    ci = (bh * self.nchunks + chunk) * 8192 + r * 128 + state_tile * 64 + col
-                    pair = cutlass.Vector.from_elements((state[2 * j], state[2 * j + 1]), cutlass.Float32).to(seeds.element_type)
+                keep = cutlass.Int32(1)
+                if cutlass.const_expr(self.checkpoint_stride != 1):
+                    fwd_keep = cutlass.Int32(0)
+                    rev_keep = cutlass.Int32(0)
+                    if chunk % self.checkpoint_stride == 0:
+                        fwd_keep = cutlass.Int32(1)
+                    if chunk % self.checkpoint_stride == self.checkpoint_stride - 1:
+                        rev_keep = cutlass.Int32(1)
+                    if cutlass.const_expr(self.nchunks % self.checkpoint_stride != 0):
+                        if chunk == self.nchunks - 1:
+                            rev_keep = cutlass.Int32(1)
+                    keep = fwd_keep
                     if reverse:
-                        (adjoints.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
-                    else:
-                        (seeds.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
+                        keep = rev_keep
+                if keep != 0:
+                    ckblock = chunk // self.checkpoint_stride
+                    for j in cutlass.range_constexpr(16):
+                        r = warp * 16 + lane // 4 + 8 * (j % 2)
+                        col = (lane % 4) * 2 + (j // 2) * 8
+                        ci = (bh * self.ngroups + ckblock) * 8192 + r * 128 + state_tile * 64 + col
+                        pair = cutlass.Vector.from_elements((state[2 * j], state[2 * j + 1]), cutlass.Float32).to(seeds.element_type)
+                        if reverse:
+                            (adjoints.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
+                        else:
+                            (seeds.iterator.raw_ptr() + ci).store(pair, alignment=seeds.element_type.width // 4)
                 nvvm.tcgen05_st("16x256b", nvvm.make_tmem_ptr(base, cutlass.Float32), state * decay[stage])
                 xwords = []
                 if cutlass.const_expr(dy.element_type != cutlass.Float32):

@@ -88,6 +88,14 @@ high/low BF16 operands for the cotangent and state contractions. This avoids
 losing the gate gradient in cancellation-sensitive parameter reductions. The
 BF16 mode is supported only without this optional gate.
 
+For ungated FP32 backward with H=64/128, G=8, D and dt_bias present, no
+initial state or final-state gradient input, and no saved checkpoints, one CTA handles
+64 tokens and all 128 state columns. The scan still advances in 32-token steps,
+but stores one checkpoint per pair. This removes cross-state-tile dX/dDt
+partials while retaining FP32 checkpoint and B/C-gradient storage. Other
+supported combinations use the general 32-token backward. The public
+`chunk_size=32` contract and the layout of saved forward checkpoints are unchanged.
+
 By default backward recomputes chunk-entry states. With
 `reuse_forward_states=True`, forward saves `[B,H,ceil(L/32),64,128]` states instead.
 At `B=2,L=2048,H=64` this retains 256 MiB in FP32 or 128 MiB in BF16. The choice
@@ -161,7 +169,8 @@ python benchmark/linear_attention/benchmark_mamba2.py \
 ```
 
 The default shape is `B=2,L=2048,H=64,P=64,N=128,G=8`, BF16 I/O.
-The native engine uses chunk size 32; Triton uses the Nemotron default of 128
+The native public chunk size is 32; the default ungated FP32 backward below
+processes pairs of those chunks. Triton uses the Nemotron default of 128
 (`--triton-chunk-size` can select another baseline). The script checks all
 gradients and final states before timing and again from the captured buffers
 after CUDA Graph replay. `--reuse-forward-states` measures the checkpointed

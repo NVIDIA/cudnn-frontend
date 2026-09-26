@@ -70,6 +70,7 @@ def _compile_step(component, geometry, options, descriptors, device):
     from .kernel.mamba2_prefill_f16 import Mamba2Prefill
     from .kernel.mamba2_state_scan_f16 import Mamba2StateScan
     from .kernel.mamba2_bprop_f16 import Mamba2BackwardChunks
+    from .kernel.mamba2_bprop64 import Mamba2BackwardChunks64
     from .kernel.mamba2_reduce import Mamba2BackwardReduce
     from .kernel.mamba2_gate_fwd import Mamba2GateForward
     from .kernel.mamba2_gate_bwd import Mamba2GateBackward
@@ -79,13 +80,16 @@ def _compile_step(component, geometry, options, descriptors, device):
         "forward": lambda: Mamba2Prefill(b, length, h, g, parallel_scores=True, early_tmem_release=True),
         "gate_forward": lambda: Mamba2GateForward(b * length * h * 64),
         "gate_backward": lambda: Mamba2GateBackward(b, length, h),
-        "scan": lambda: Mamba2StateScan(b, length, h, g, split_directions=options[0], reverse_only=options[1], early_tmem_release=True),
+        "scan": lambda: Mamba2StateScan(
+            b, length, h, g, split_directions=options[0], reverse_only=options[1], early_tmem_release=True, checkpoint_stride=options[2]
+        ),
         "chunks": lambda: Mamba2BackwardChunks(b, length, h, g, 2, early_tmem_release=True, reuse_j_storage=True),
-        "reduce": lambda: Mamba2BackwardReduce(b, length, h, g),
+        "chunks64": lambda: Mamba2BackwardChunks64(b, length, h, g),
+        "reduce": lambda: Mamba2BackwardReduce(b, length, h, g, chunk_size=options[0], state_tiles=options[1]),
     }
     types = {"bfloat16": cutlass.BFloat16, "float32": cutlass.Float32}
     args = [None if d is None else make_fake_compact_tensor(types[d[0]], (d[1],), assumed_align=16) for d in descriptors]
-    key = json.dumps(("mamba2_n128_v2", component, geometry, options, descriptors, device))
+    key = json.dumps(("mamba2_n128_v3", component, geometry, options, descriptors, device))
     return compile_cached(constructors[component](), *args, make_fake_stream(), cache_key=key, options="--enable-tvm-ffi")
 
 
@@ -120,7 +124,21 @@ class CompiledMamba2:
 
         xshape = (facts.batch, facts.length, facts.heads, 64)
         state_shape = (facts.batch, facts.heads, 64, 128)
-        blocks = (facts.batch, facts.heads, (facts.length + 31) // 32)
+        # The merged backward CTA owns all N=128 columns and two logical
+        # 32-token chunks. Preserve the general path for optional state/gate
+        # contracts and explicit BF16 intermediates; public chunk_size stays 32.
+        merged_backward = (
+            facts.is_bwd
+            and facts.intermediate_dtype == "float32"
+            and facts.heads in (64, 128)
+            and facts.groups == 8
+            and present("D") is not None
+            and present("dt_bias") is not None
+            and not any(present(name) for name in ("z", "initial_state", "d_final_state", "state_checkpoints"))
+        )
+        backward_chunk = 64 if merged_backward else 32
+        state_tiles = 1 if merged_backward else 2
+        blocks = (facts.batch, facts.heads, (facts.length + backward_chunk - 1) // backward_chunk)
         checkpoints_shape = blocks + (64, 128)
         bc_partials_shape = (facts.batch, facts.length, facts.heads, 128)
         intermediate = facts.intermediate_dtype
@@ -144,14 +162,18 @@ class CompiledMamba2:
             step(
                 "scan",
                 ("x", dy, "dt", "A", "B", "C", present("dt_bias"), present("initial_state"), present("d_final_state"), seeds, adjoints, di),
-                (bool(present("initial_state") or present("d_final_state") or facts.length < 128), bool(present("state_checkpoints"))),
+                (
+                    bool(present("initial_state") or present("d_final_state") or facts.length < 128),
+                    bool(present("state_checkpoints")),
+                    2 if merged_backward else 1,
+                ),
             )
             dbp, dcp = scratch("_dbp", intermediate, bc_partials_shape), scratch("_dcp", intermediate, bc_partials_shape)
-            dxp = scratch("_dxp", "float32", bc_partials_shape)
-            ddtp = scratch("_ddtp", "float32", xshape[:-1] + (2,))
-            dap, dbiasp = scratch("_dap", "float32", blocks + (2,)), scratch("_dbiasp", "float32", blocks + (2,))
+            dxp = None if merged_backward else scratch("_dxp", "float32", bc_partials_shape)
+            ddtp = None if merged_backward else scratch("_ddtp", "float32", xshape[:-1] + (2,))
+            dap, dbiasp = scratch("_dap", "float32", blocks + (state_tiles,)), scratch("_dbiasp", "float32", blocks + (state_tiles,))
             step(
-                "chunks",
+                "chunks64" if merged_backward else "chunks",
                 (
                     "x",
                     dy,
@@ -163,10 +185,10 @@ class CompiledMamba2:
                     present("dt_bias"),
                     seeds,
                     adjoints,
-                    dxp,
+                    "dX" if merged_backward else dxp,
                     dbp,
                     dcp,
-                    ddtp,
+                    "dDt" if merged_backward else ddtp,
                     dap,
                     None if present("z") else ddp,
                     dbiasp,
@@ -174,7 +196,7 @@ class CompiledMamba2:
             )
             dd = present("dD") or scratch("_dD", "float32", (facts.heads,))
             dbias = present("d_dt_bias") or scratch("_d_dt_bias", "float32", (facts.heads,))
-            step("reduce", (dbp, dcp, dap, ddp, dbiasp, "dB", "dC", "dA", dd, dbias, dxp, ddtp, "dX", "dDt"))
+            step("reduce", (dbp, dcp, dap, ddp, dbiasp, "dB", "dC", "dA", dd, dbias, dxp, ddtp, "dX", "dDt"), (backward_chunk, state_tiles))
         if not layout.size:
             layout.add(1)  # FrostLaPlan's caller-workspace protocol always has a base pointer.
         self.workspace_size = layout.size

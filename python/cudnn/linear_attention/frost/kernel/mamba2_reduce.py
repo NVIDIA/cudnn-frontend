@@ -10,16 +10,18 @@ import cuda.bindings.driver as cuda
 
 
 class Mamba2BackwardReduce:
-    def __init__(self, batch, length, heads, groups, mode=3):
+    def __init__(self, batch, length, heads, groups, mode=3, chunk_size=32, state_tiles=2):
         self.tokens, self.heads, self.groups = batch * length, heads, groups
         self.mode = mode
-        self.batch, self.nchunks = batch, (length + 31) // 32
+        self.state_tiles = state_tiles
+        self.batch, self.nchunks = batch, (length + chunk_size - 1) // chunk_size
 
     @cute.jit
     def __call__(self, dbp, dcp, dap, ddp, dbiasp, db, dc, da, dd, dbias, dxp, ddtp, dx, ddt, stream: cuda.CUstream):
         if cutlass.const_expr(self.mode & 1):
             self.bc(dbp, dcp, db, dc).launch(grid=((self.tokens * self.groups + 3) // 4, 1, 1), block=(128, 1, 1), stream=stream)
-        self.partials(dxp, ddtp, dx, ddt).launch(grid=((self.tokens * self.heads * 64 + 1023) // 1024, 1, 1), block=(128, 1, 1), stream=stream)
+        if cutlass.const_expr(dxp is not None):
+            self.partials(dxp, ddtp, dx, ddt).launch(grid=((self.tokens * self.heads * 64 + 1023) // 1024, 1, 1), block=(128, 1, 1), stream=stream)
         if cutlass.const_expr(self.mode & 2):
             self.params(dap, ddp, dbiasp, da, dd, dbias).launch(grid=(self.heads, 1, 1), block=(128, 1, 1), stream=stream)
 
@@ -57,9 +59,13 @@ class Mamba2BackwardReduce:
             if partial < self.batch * self.nchunks:
                 batch, chunk = partial // self.nchunks, partial % self.nchunks
                 idx = (batch * self.heads + h) * self.nchunks + chunk
-                va += dap[idx * 2] + dap[idx * 2 + 1]
                 vd += ddp[idx]
-                vb += dbiasp[idx * 2] + dbiasp[idx * 2 + 1]
+                if cutlass.const_expr(self.state_tiles == 2):
+                    va += dap[idx * 2] + dap[idx * 2 + 1]
+                    vb += dbiasp[idx * 2] + dbiasp[idx * 2 + 1]
+                else:
+                    va += dap[idx]
+                    vb += dbiasp[idx]
         for off in [16, 8, 4, 2, 1]:
             va += nvvm.shfl_sync(0xFFFFFFFF, va, off, 31, kind=nvvm.Shfl.BFLY)
             vb += nvvm.shfl_sync(0xFFFFFFFF, vb, off, 31, kind=nvvm.Shfl.BFLY)
