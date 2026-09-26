@@ -147,6 +147,9 @@ navigation:
           - page: Dynamic Shapes and Kernel Cache
             path: ../../utilities/dynamic-kernel-cache.md
             slug: dynamic-kernel-cache
+          - page: Limiting Execution Plan Shared Memory
+            path: ../../utilities/shared-memory-limit.md
+            slug: shared-memory-limit
           - page: 'Framework integration performance: getting the best per-call performance from cuDNN Frontend'
             path: ../../utilities/framework_integration_performance.md
             slug: framework_integration_performance
