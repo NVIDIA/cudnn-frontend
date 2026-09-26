@@ -1139,3 +1139,74 @@ class TupleDict(dict):
                 raise IndexError(f"index {key} out of range for TupleDict with {len(self._keys)} items")
             return super().__getitem__(self._keys[key])
         return super().__getitem__(key)
+
+
+# Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is
+# used so the per-sequence O TMA descriptors carved for the THD path satisfy
+# the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
+# 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
+_WS_ALIGN = 128
+
+
+def ws_align(nbytes: int) -> int:
+    """Round a scratch-chunk size up to the carve alignment (128 B)."""
+    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
+
+
+class WorkspaceCarver:
+    """Carves fixed-size, aligned scratch views out of the CALLER's workspace (R2).
+
+    An APIBase adapter that records a non-zero workspace requirement
+    (``scratch_workspace_bytes()`` / ``get_workspace_size()``) is handed the
+    caller's buffer at execute and carves its per-execute scratch from it
+    instead of allocating. Chunks are dealt sequentially at 128-byte relative
+    alignment and never reach beyond the buffer; an absent, non-torch, or
+    undersized buffer raises immediately with the required size in the message
+    (never silent corruption). Constructing the carver without taking a chunk
+    is the validation step for a backend graph that consumes the workspace
+    whole (``pygraph.execute(variant_pack, workspace)``). ``align`` is the base
+    alignment the consumer needs: 16 bytes by default; a path that carves TMA
+    descriptors out of the buffer asks for ``_WS_ALIGN`` (cuTensorMap wants 64).
+    """
+
+    def __init__(self, workspace, required: int, owner: str, *, align: int = 16):
+        if workspace is None:
+            raise ValueError(
+                f"cudnn: {owner} requires a {required}-byte workspace but execute() "
+                f"received none; allocate graph.get_workspace_size() bytes (uint8, on the "
+                f"graph's device) and pass the buffer to execute()"
+            )
+        if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
+            raise TypeError(f"cudnn: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
+        torch = _torch()
+        if not workspace.is_contiguous():
+            # reshape(-1) would copy a strided view: a hidden allocation carved into instead of the caller's buffer.
+            raise ValueError(f"cudnn: {owner} workspace must be contiguous; got shape {tuple(workspace.shape)} strides {tuple(workspace.stride())}")
+        flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
+        flat = flat.view(-1)
+        if flat.numel() < required:
+            raise ValueError(
+                f"cudnn: {owner} requires a {required}-byte workspace; the provided "
+                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
+            )
+        if flat.data_ptr() % align != 0:
+            raise ValueError(f"cudnn: {owner} workspace must be at least {align}-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
+        self._flat = flat
+        self._off = 0
+        self._owner = owner
+
+    def take(self, numel: int, dtype) -> Any:
+        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
+        nbytes = int(numel) * dtype.itemsize
+        start, end = self._off, self._off + nbytes
+        if end > self._flat.numel():
+            raise ValueError(f"cudnn: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
+        self._off = start + ws_align(nbytes)
+        try:
+            return self._flat[start:end].view(dtype)
+        except RuntimeError as exc:
+            raise ValueError(f"cudnn: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
+
+    def remaining(self) -> Any:
+        """The unconsumed tail (uint8) — handed down to a nested carver."""
+        return self._flat[self._off :]

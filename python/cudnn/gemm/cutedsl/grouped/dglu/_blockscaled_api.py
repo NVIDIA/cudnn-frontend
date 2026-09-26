@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg, retain_workspace
 from cuda.bindings import driver as cuda
 import math
 import os
@@ -1369,6 +1369,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
         )
+        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

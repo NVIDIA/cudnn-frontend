@@ -11,6 +11,7 @@ import torch
 from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant.rht_utils import HADAMARD_SIZE
 from test_low_precision_matmul import float4_e2m1fn_x2_to_float32
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
@@ -543,6 +544,7 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         alpha_tensor=inputs["alpha_tensor"],
         prob_tensor=inputs["prob_tensor"],
         rht_rowwise_tensor=outputs["rht_rowwise_tensor"],
+        workspace=ws(api),
     )
 
     _check_outputs(
@@ -957,6 +959,8 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_cache_dynamic_m_smoke(request, 
     monkeypatch.setattr(grouped_gemm_glu_hadamard_quant_api.GroupedGemmGluHadamardQuantSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_glu_hadamard_quant_api.GroupedGemmGluHadamardQuantSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_glu_hadamard_quant_api.GroupedGemmGluHadamardQuantSm100, "execute", lambda self, **kwargs: None)
+    # The wrapper sizes the workspace from the API; with check_support stubbed out the real sizing has no kernel to ask.
+    monkeypatch.setattr(grouped_gemm_glu_hadamard_quant_api.GroupedGemmGluHadamardQuantSm100, "scratch_workspace_bytes", lambda self: 128)
 
     cfg = _make_cfg(
         request,

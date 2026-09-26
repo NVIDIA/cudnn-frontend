@@ -1150,10 +1150,9 @@ def _run_grouped_wgrad_kernel(
 
     if prefix not in ("fc1", "fc2"):
         raise ValueError(f"prefix must be 'fc1' or 'fc2', got {prefix!r}")
-    # The fixed WGrad output identity isolates the cached API object's mutable
-    # TMA descriptor workspace. Multiple captured grouped-WGrad call sites must
-    # use distinct outputs or explicit descriptor_workspace tensors; sequential
-    # reuse of one output on one stream is supported.
+    # The wrapper allocates the TMA-descriptor scratch per call on the launch
+    # stream (the plan owns none); pass descriptor_workspace= to replay a
+    # captured call site over a caller-owned buffer.
     return cudnn.grouped_gemm_wgrad_wrapper_sm100(
         a_tensor=getattr(operands, f"{prefix}_a").transpose(0, 1),
         b_tensor=getattr(operands, f"{prefix}_b"),

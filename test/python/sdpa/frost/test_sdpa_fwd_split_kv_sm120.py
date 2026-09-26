@@ -131,11 +131,21 @@ def test_sm120_does_not_split_a_full_part():
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
-@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
-def test_sm120_split_with_and_without_workspace(workspace):
-    result = _sm120_case(8, 1, 128, 32768, workspace=workspace)
-    assert result.split == result.expected_split
+def test_sm120_split_carves_the_partials_from_the_workspace():
+    """The split-major partials live in the caller's workspace (R2), and the
+    recombined answer matches fp32."""
+    result = _sm120_case(8, 1, 128, 32768, workspace=True, split_kv=2)
+    assert result.split == 2 and result.workspace_bytes > 0
     assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+@pytest.mark.no_workspace_shim
+def test_sm120_split_requires_a_workspace():
+    """A direct caller that passes no workspace gets the R2 contract error --
+    the adapter never allocates the partials itself (the suite's autouse shim
+    is off here)."""
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        _sm120_case(8, 1, 128, 32768, workspace=False, split_kv=2)
 
 
 def test_sm120_split_writes_the_recombined_lse():

@@ -46,8 +46,8 @@ kernels it owns. Two contracts follow:
 1. **One launch stream through both routes.** A graph-API plan launched through `plan.jit(vp, stream=)` runs on
    its `stream` argument; through `plan.graph.execute(vp, workspace, handle)` it runs on the handle's stream. DSL
    stages run on torch's current stream. A block resolves the stream once in `execute()` and passes it to every
-   stage: the JIT route gets it directly, the graph route gets a per-`(device, stream)` cached `cudnn.Handle`
-   with `set_stream()` (`gated_attention_block/kernels/proj_gemm.py::handle_for_stream`). Refusing an explicit
+   stage: the JIT route gets it directly, the graph route gets the per-device `cudnn.Handle` re-streamed to it
+   with `set_stream()` (`gated_attention_block/kernels/proj_gemm.py::graph_handle`). Refusing an explicit
    stream argument is not enough — the ambient non-default stream of `with torch.cuda.stream(s)` must be honoured
    too, or the projections race the norm/SDPA stages. The block's test parks the default stream and runs on a
    side stream, comparing bitwise.
