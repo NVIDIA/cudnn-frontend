@@ -77,6 +77,10 @@ class Graph : public ICudnn, public INode {
     // These are mutable because execute() is const but needs non-const access for pointer extraction.
     mutable std::unordered_map<uid_t, pass_by_values_t> cached_pass_by_value;
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
+    // How many entries of cached_workspace_modifications need a frontend CUDA
+    // graph node (operation_type 0 == memcpy, 1 == memset). Counted once when the
+    // cache is filled, and used by the direct-population eligibility check.
+    int64_t cached_node_producing_workspace_modifications = 0;
 
     // char: 'x'=hex, 'd'=decimal, 'b'=base64
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
@@ -669,6 +673,10 @@ class Graph : public ICudnn, public INode {
         }
 
         // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
         std::vector<void *> device_ptrs;
         std::vector<uid_t> uids;
 
@@ -817,6 +825,10 @@ class Graph : public ICudnn, public INode {
         // Get the BE's cuda graph
 
         // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
         std::vector<void *> device_ptrs;
         device_ptrs.reserve(variant_pack_uids.size());
         std::vector<uid_t> uids;
@@ -872,6 +884,218 @@ class Graph : public ICudnn, public INode {
         // Destroy the BE graph as it now has been cloned into a node
         // It was initialized by internals of backend, but the responsibility to destroy it is on FE.
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_destroy(backend_cuda_graph_guard.release()));
+
+        return {error_code_t::OK, ""};
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct (unwrapped) CUDA graph population.
+    //
+    // populate_cuda_graph() always wraps the backend's CUDA graph in a
+    // frontend-owned child graph node, and additionally emits one frontend
+    // memcpy/memset node per node-producing workspace modification. When the
+    // cached workspace modifications produce no CUDA graph node at all, that
+    // wrapper is the only thing the frontend adds, and the backend graph can be
+    // populated straight into an empty caller-owned graph instead.
+    //
+    // Eligibility is derived from the same cache that populate_cuda_graph() and
+    // update_cuda_graph() already use to decide whether to emit frontend nodes.
+    // It is deliberately NOT "workspace_size == 0": a plan may need a non-zero
+    // workspace, and the frontend may rebind workspace pointers into the variant
+    // pack, without producing any CUDA graph node (operation_type >= 2 entries
+    // below only rewrite variant pack pointers).
+    //
+    // These entry points are explicit and paired on purpose. An update has to
+    // know how the graph it is handed was populated, and that cannot be
+    // recovered from the graph's topology without guessing: a backend graph may
+    // legitimately have a single root node, or a root node that is itself a
+    // child graph node. Callers that populate with
+    // populate_cuda_graph_direct() must update with update_cuda_graph_direct()
+    // for the same graph, and callers of the existing populate_cuda_graph()
+    // must keep using update_cuda_graph().
+    // -----------------------------------------------------------------------
+
+    /// True when populate_cuda_graph() would not have to add any frontend
+    /// CUDA graph node for the plan that is currently selected.
+    bool
+    cuda_graph_direct_population_eligible() const {
+        return cached_node_producing_workspace_modifications == 0;
+    }
+
+    /// Recomputes cached_node_producing_workspace_modifications from the cached
+    /// workspace modifications. Called wherever that cache is (re)filled.
+    void
+    count_node_producing_workspace_modifications_() {
+        int64_t count = 0;
+        for (auto const &[uid, data] : cached_workspace_modifications) {
+            const auto &[operation_type, offset, vec_data] = data;
+            // 0 == memcpy node, 1 == memset node. Any other value only rewrites
+            // a variant pack pointer and does not need a CUDA graph node.
+            if (operation_type == 0 || operation_type == 1) {
+                ++count;
+            }
+            (void)uid;
+            (void)offset;
+            (void)vec_data;
+        }
+        cached_node_producing_workspace_modifications = count;
+    }
+
+    error_t
+    populate_cuda_graph_direct(cudnnHandle_t handle,
+                               std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                               void *workspace,
+                               cudaGraph_t cudnn_cuda_graph) {
+        // First get all the uids from the map
+        std::unordered_map<Tensor_attributes::uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_to_pointer_map.size());
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return populate_cuda_graph_direct(handle, tensor_uid_to_pointer_map, workspace, cudnn_cuda_graph);
+    }
+
+    error_t
+    populate_cuda_graph_direct(cudnnHandle_t handle,
+                               std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                               void *workspace,
+                               cudaGraph_t cudnn_cuda_graph) {
+        size_t numNodes = 0;
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
+        RETURN_CUDNN_FRONTEND_ERROR_IF(numNodes != 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "cuda graph provided to populate_cuda_graph_direct is not empty. cuDNN requires "
+                                       "it to be empty for the corresponding update APIs to work correctly.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !cuda_graph_direct_population_eligible(),
+            error_code_t::INVALID_VALUE,
+            "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it cannot be populated directly. Use "
+            "populate_cuda_graph() instead.");
+
+        ///////////////////////////////////////
+        //// PASS BY VALUE TENSOR HANDLING ////
+        ///////////////////////////////////////
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, cached_pass_by_value));
+
+        ////////////////////////////
+        //// WORKSPACE HANDLING ////
+        ////////////////////////////
+        // Only pointer rebinding is needed here; by construction none of these
+        // entries produces a CUDA graph node.
+        for (auto const &entry : cached_workspace_modifications) {
+            uid_to_device_ptrs[entry.first] = static_cast<char *>(workspace) + std::get<1>(entry.second);
+        }
+
+        // Make sure device pointer is provided for all uids expected for this plan
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
+        std::vector<void *> device_ptrs;
+        std::vector<uid_t> uids;
+        device_ptrs.reserve(variant_pack_uids.size());
+        uids.reserve(variant_pack_uids.size());
+        for (auto const &uid : variant_pack_uids) {
+            auto search = uid_to_device_ptrs.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " does not exist in variant pack.");
+            device_ptrs.push_back(search->second);
+            uids.push_back(uid);
+        }
+
+        detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "Failed to create variant pack's backend descriptor.");
+
+        // offset workspace by the already used fe graph workspace
+        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
+
+        int64_t candidate = plans.candidate;
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
+
+        // The backend graph goes directly into the caller's graph: no temporary
+        // graph is created and no child graph node is added.
+        _CUDNN_CHECK_CUDNN_ERROR(detail::populate_cuda_graph(handle,
+                                                             plans.execution_plans[candidate]->get_raw_desc(),
+                                                             variant_pack_descriptor.get_ptr(),
+                                                             cudnn_cuda_graph));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    update_cuda_graph_direct(cudnnHandle_t handle,
+                             std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
+                             void *workspace,
+                             cudaGraph_t cudnn_cuda_graph) {
+        // First get all the uids from the map
+        std::unordered_map<Tensor_attributes::uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_to_pointer_map.size());
+        for (auto const &[tensor, pointer] : tensor_to_pointer_map) {
+            tensor_uid_to_pointer_map.emplace(tensor->get_uid(), pointer);
+        }
+
+        return update_cuda_graph_direct(handle, tensor_uid_to_pointer_map, workspace, cudnn_cuda_graph);
+    }
+
+    error_t
+    update_cuda_graph_direct(cudnnHandle_t handle,
+                             std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
+                             void *workspace,
+                             cudaGraph_t cudnn_cuda_graph) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !cuda_graph_direct_population_eligible(),
+            error_code_t::INVALID_VALUE,
+            "This graph needs cuDNN Frontend auxiliary CUDA graph nodes, so it cannot be updated directly. Use "
+            "update_cuda_graph() instead.");
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            extend_tensor_map_with_pass_by_value_tensors_(uid_to_device_ptrs, cached_pass_by_value));
+        for (auto const &entry : cached_workspace_modifications) {
+            uid_to_device_ptrs[entry.first] = static_cast<char *>(workspace) + std::get<1>(entry.second);
+        }
+
+        // Legacy Slice aliasing: the plan expects the destination UID to point at the source
+        // pointer plus a byte offset, so materialise those entries before looking them up.
+        CHECK_CUDNN_FRONTEND_ERROR(make_variant_pack_replacements(uid_to_device_ptrs, variant_pack_replacements));
+
+        std::vector<void *> device_ptrs;
+        std::vector<uid_t> uids;
+        device_ptrs.reserve(variant_pack_uids.size());
+        uids.reserve(variant_pack_uids.size());
+        for (auto const &uid : variant_pack_uids) {
+            auto search = uid_to_device_ptrs.find(uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) + " does not exist in variant pack.");
+            device_ptrs.push_back(search->second);
+            uids.push_back(uid);
+        }
+
+        detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "Failed to create variant pack's backend descriptor.");
+
+        void *cudnn_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, cudnn_workspace));
+
+        int64_t candidate = plans.candidate;
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(candidate));
+
+        // The graph is the backend graph itself: update it in place with the
+        // original execution plan.
+        _CUDNN_CHECK_CUDNN_ERROR(detail::update_cuda_graph(handle,
+                                                           plans.execution_plans[candidate]->get_raw_desc(),
+                                                           variant_pack_descriptor.get_ptr(),
+                                                           cudnn_cuda_graph));
 
         return {error_code_t::OK, ""};
     }
@@ -957,6 +1181,7 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(
                 collect_tensors_in_workspace_subtree(cached_workspace_modifications, temp_offset));
         }
+        count_node_producing_workspace_modifications_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
 
@@ -1795,6 +2020,7 @@ class Graph : public ICudnn, public INode {
         // Initialize the execution caches from deserialized data
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
+        count_node_producing_workspace_modifications_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
         // eager prep below would early-return with the old slot layout.
