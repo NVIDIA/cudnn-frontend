@@ -44,6 +44,11 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
+# CUDA exposes 227 KiB (232448 bytes) as B200's maximum opt-in dynamic shared
+# memory per block.  Budgeting the nominal 228 KiB asks the driver to launch an
+# impossible 233472-byte kernel at H128/D512.
+_SM100_SMEM_BYTES = 227 * 1024
+
 
 # Execute-path contract checks (Rule 1 / R5): raise, never .contiguous() / .to(dtype).
 def _require_unit_innermost(t: Optional[torch.Tensor], name: str) -> None:
@@ -208,8 +213,7 @@ def _sparse_indexer_score_recompute(
         _require_int32_contiguous(topk_length, "topk_length")
     _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     sK_per_stage = n_block_size * head_dim_padded * 2  # BF16
     sQ_size = m_block_size * head_dim_padded * 2  # BF16
@@ -219,15 +223,15 @@ def _sparse_indexer_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -424,8 +428,7 @@ def _sparse_attn_score_recompute(
         _require_int32_contiguous(topk_length, "topk_length")
     _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     k_block_size_eff = k_block_size if k_block_size is not None else head_dim_padded
     sK_per_stage = n_block_size * k_block_size_eff * 2  # BF16
@@ -436,15 +439,15 @@ def _sparse_attn_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -659,8 +662,6 @@ def sparse_attn_score_recompute(
 # =============================================================================
 # Dense backward: full KV via TMA, no topk
 # =============================================================================
-
-_SM100_SMEM_BYTES = 228 * 1024
 
 
 def _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes):
