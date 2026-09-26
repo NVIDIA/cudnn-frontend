@@ -5762,6 +5762,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._k_mod = None
         self._params = None
         self._lse_stride: Optional[tuple[int, int, int]] = None
+        self._thd_meta_fn = None
+        self._thd_lse_head_stride = 0
+        self._thd_lse_token_major = False
+        self._t_q_cap = 0
+        self._t_kv_cap = 0
+        self._thd_dummy_i32 = None
+        self._thd_dummy_f32 = None
+        self._thd_dummy_io = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -5776,7 +5784,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             "block-scaled O (sf_o / FP4 O) is served by the SM100-family per-tensor FP8 engines only",
         )
 
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
@@ -5786,12 +5794,18 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             _shape, _stride = tuple(desc.shape), tuple(desc.stride)
-            self._value_error_if(
-                not dense_layout_ok(_shape, _stride),
-                f"{desc.name} must have the head dim innermost-contiguous (stride 1) and "
-                f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
-                f"strides allowed); got stride {_stride} shape {_shape}",
-            )
+            if self.thd:
+                self._not_implemented_error_if(
+                    not packed_layout_ok(_shape, _stride) or not self._thd_declared(desc)[1],
+                    f"SM80 THD {desc.name} requires compact packed BSHD strides; got {_stride} for shape {_shape}",
+                )
+            else:
+                self._value_error_if(
+                    not dense_layout_ok(_shape, _stride),
+                    f"{desc.name} must have the head dim innermost-contiguous (stride 1) and "
+                    f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
+                    f"strides allowed); got stride {_stride} shape {_shape}",
+                )
 
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -5834,17 +5848,68 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
-            self._value_error_if(
-                not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
-                f"LSE must use a dense-compatible B/H/S permutation or padded layout "
-                f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
-            )
-            self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
+            if self.thd:
+                packing = thd_stats_packing(int(self.lse_desc.stride[1]), int(self.lse_desc.stride[2]), h_qo)
+                if self.max_total_seq_len_q == 0 and tuple(self.lse_desc.stride[1:3]) == (0, 1):
+                    # A zero-token packed Stats tensor has no head span, so
+                    # PyTorch naturally reports a zero head stride.
+                    packing = "head_major"
+                self._not_implemented_error_if(
+                    self.thd_stats_padded or packing is None,
+                    f"SM80 THD Stats must be packed token-major or head-major; got stride {self.lse_desc.stride}",
+                )
+                self._thd_lse_token_major = packing == "token_major"
+                self._thd_lse_head_stride = int(self.lse_desc.stride[1])
+                if self._thd_lse_token_major:
+                    # The batch axis has extent one in the packed kernel ABI;
+                    # its stride is never stepped. Both remaining strides are
+                    # static, independent of the dynamic packed token total.
+                    self._lse_stride = (0, 1, h_qo)
+            else:
+                self._value_error_if(
+                    not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
+                    f"LSE must use a dense-compatible B/H/S permutation or padded layout "
+                    f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
+                )
+                self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         self._not_implemented_error_if(
-            self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
+            not self.thd and (self.cu_seq_q_lens or self.cu_seq_kv_lens),
+            "SdpaFwdDslSm80 does not serve dense cu_seq_len graphs",
         )
+        if self.thd:
+            self._not_implemented_error_if(
+                self.cu_seq_q_lens and self.seq_q_lens_present,
+                "SM80 THD Q lengths cannot be both per-batch and cumulative",
+            )
+            self._not_implemented_error_if(
+                (d_qk, d_v) not in _SM80_FLAVOR_DIMS.values(),
+                f"SM80 THD graph path supports native head dims {sorted(_SM80_FLAVOR_DIMS.values())} only",
+            )
+            self._not_implemented_error_if(
+                self._bias_present or self.has_sink or self._rope_max_s,
+                "SM80 THD graph path does not support bias, sinks, or RoPE fusion",
+            )
+            self._not_implemented_error_if(
+                not self.seq_kv_lens_present and not self.cu_seq_kv_lens,
+                "SM80 THD graph path requires Q and KV lengths",
+            )
+            self._t_q_cap = self._thd_declared_total(b * s_qo, self.max_total_seq_len_q)
+            self._t_kv_cap = self._thd_declared_total(b * s_kv, self.max_total_seq_len_kv)
+            if self.lse_desc is not None and not self._thd_lse_token_major:
+                if self.max_total_seq_len_q is None:
+                    # A compact packed Stats head stride also declares a
+                    # conservative Q capacity when no explicit total exists.
+                    # Runtime Q/O buffers must still fit this planned bound.
+                    self._t_q_cap = min(self._t_q_cap, self._thd_lse_head_stride)
+                self._not_implemented_error_if(
+                    self._thd_lse_head_stride < self._t_q_cap,
+                    f"SM80 THD head-major Stats stride must cover packed Q capacity {self._t_q_cap}; got {self._thd_lse_head_stride}",
+                )
+                # A static head stride is part of the declared layout. Keeping
+                # it explicit also lets a later execute rebind a smaller Q
+                # token extent without changing the compiled LSE addressing.
+                self._lse_stride = (0, self._thd_lse_head_stride, 1)
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,
             "SM80 SDPA: window_size_right without is_causal=True has no diagonal to anchor to",
@@ -5917,6 +5982,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         else:
             _VALID = ("auto", "natural", "default", "lpt", "lpt_l2")
             self._value_error_if(token not in _VALID, f"scheduler must be one of {_VALID}; got {token!r}")
+        if self.thd:
+            self._not_implemented_error_if(
+                token not in ("auto", "natural", "default"),
+                "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)",
+            )
+            token = "default"
         self.sched_token, self.sched_l2_mib = _sm80_resolve_scheduler(
             scheduler=token,
             flavor=self.flavor,
@@ -5962,35 +6033,63 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             is_causal=self.mask_token in ("causal", "causal_swa"),
             has_swa=self.mask_token in ("swa", "causal_swa"),
             causal_bottom_right=self.causal_bottom_right,
-            has_seq_kv_lens=self.seq_kv_lens_present,
-            has_seq_q_lens=self.seq_q_lens_present,
+            has_seq_kv_lens=self.seq_kv_lens_present and not self.thd,
+            has_seq_q_lens=self.seq_q_lens_present and not self.thd,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
             has_bias=self._bias_present,
             bias_is_fp32=self._bias_fp32,
             has_rope=self._rope_max_s > 0,
-            thd_varlen=False,
+            thd_varlen=self.thd,
             sched_policy=_sm80_sched_policy_int(self.sched_token),
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         self._compiled_kernel = self._k_mod.compile(
-            b=self.batch_size,
+            b=1 if self.thd else self.batch_size,
             # Dense GQA is served by adapter-side K/V head expansion until the
             # kernels' native dense-GQA path is qualified (class docstring), so
             # the artifact is compiled against the EXPANDED head count — the
             # shapes execute() actually binds.
             h=self.h_q,
-            h_kv=self.h_q,
-            sq=self.s_q_max,
-            skv=self.s_k_max,
+            h_kv=self.h_kv if self.thd else self.h_q,
+            sq=0 if self.thd else self.s_q_max,
+            skv=0 if self.thd else self.s_k_max,
             d=self.head_dim_qk,
             swa_window=int(self.swa_window_runtime),
             rope_max_s=self._rope_max_s,
             lse_stride=self._lse_stride,
+            n_batch_logical=self.batch_size if self.thd else 0,
         )
+        if self.thd:
+            self._compile_thd_meta()
+            device = self.q_desc.device
+            self._thd_dummy_i32 = self._dummy("sm80_thd_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
+            self._thd_dummy_f32 = self._dummy("sm80_thd_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            self._thd_dummy_io = self._dummy(f"sm80_thd_{self.dtype}", device, lambda: torch.ones(1, dtype=self.dtype, device=device))
         self._logger.debug("compile completed")
+
+    def _compile_thd_meta(self) -> None:
+        """Build the device-side lengths-to-cumulative-offsets launch at plan time."""
+        import cutlass
+        from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+
+        from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+        from cudnn.sdpa.bwd.kernels.thd_helpers import thd_meta_host
+
+        b = self.batch_size
+        i32 = lambda n: make_fake_compact_tensor(cutlass.Int32, (n,), stride_order=(0,), assumed_align=4)  # noqa: E731
+        self._thd_meta_fn = cutlass.cute.compile(
+            thd_meta_host,
+            i32(THD_META_WORDS(b)),
+            i32(b + 1 if self.cu_seq_q_lens else b),
+            i32(b + 1 if self.cu_seq_kv_lens else b),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            make_fake_stream(use_tvm_ffi_env_stream=False),
+            options="--enable-tvm-ffi",
+        )
 
     def _bshd_gather_bytes(self, desc) -> int:
         """Bytes to gather ``desc`` into a compact BSHD buffer, or 0 when its
@@ -6008,7 +6107,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         would otherwise allocate. Sized in execute()'s carve order."""
         self._ensure_support_checked()
         if self.thd:
-            return 0  # engine rows never lower THD; the wrapper path allocates
+            from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+
+            return ws_align(THD_META_WORDS(self.batch_size) * 4)
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
         b, hq, sq, skv = self.batch_size, self.h_q, self.s_q_max, self.s_k_max
         gqa = self.h_kv != self.h_q
@@ -6032,6 +6133,119 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             total += ws_align(hq * 4)  # sinks * log2(e) product
         return total
 
+    def _execute_thd(
+        self,
+        q_tensor: torch.Tensor,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        o_tensor: torch.Tensor,
+        lse_tensor: Optional[torch.Tensor],
+        seq_q_lens: Optional[torch.Tensor],
+        seq_kv_lens: Optional[torch.Tensor],
+        scale_softmax: Optional[float],
+        workspace: Optional[torch.Tensor],
+        current_stream: Optional[cuda.CUstream],
+    ) -> None:
+        """Bind native packed buffers and launch the already-compiled THD artifact."""
+        import cutlass
+        from cutlass.cute.runtime import from_dlpack as from_dlpack_raw
+
+        device = self.q_desc.device
+        self._value_error_if(seq_q_lens is None or seq_kv_lens is None, "SM80 THD requires Q and KV lengths")
+        q_lens = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+        kv_lens = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+        self._value_error_if(q_lens.device != device or kv_lens.device != device, f"SM80 THD lengths must be on {device}")
+        self._value_error_if((lse_tensor is None) != (self.lse_desc is None), "SM80 THD Stats presence must match the compiled plan")
+
+        t_q = self._thd_declared_total(
+            min(self._thd_capacity(q_tensor, self.q_desc), self._thd_capacity(o_tensor, self.o_desc)),
+            self.max_total_seq_len_q,
+        )
+        if self.max_total_seq_len_q is None and self.lse_desc is not None and not self._thd_lse_token_major:
+            # The packed head-major Stats stride is an exact Q-token bound
+            # when the caller did not supply max_total_seq_len_q. Q/O may
+            # legitimately carry extra allocation capacity beyond it.
+            t_q = min(t_q, self._thd_lse_head_stride)
+        t_kv = self._thd_declared_total(
+            min(self._thd_capacity(k_tensor, self.k_desc), self._thd_capacity(v_tensor, self.v_desc)),
+            self.max_total_seq_len_kv,
+        )
+        self._value_error_if(t_q > self._t_q_cap or t_kv > self._t_kv_cap, "SM80 THD token extent exceeds the planned envelope")
+        q = self._thd_view(q_tensor, self.q_desc, t_q)
+        k = self._thd_view(k_tensor, self.k_desc, t_kv)
+        v = self._thd_view(v_tensor, self.v_desc, t_kv)
+        o = self._thd_view(o_tensor, self.o_desc, t_q)
+
+        lse = None
+        if lse_tensor is not None:
+            self._value_error_if(
+                lse_tensor.dtype != torch.float32 or lse_tensor.device != device,
+                f"SM80 THD Stats must be fp32 on {device}",
+            )
+            if self._thd_lse_token_major:
+                self._value_error_if(
+                    lse_tensor.ndim != 2 or lse_tensor.shape[0] < t_q or lse_tensor.shape[1] != self.h_q or tuple(lse_tensor.stride()) != (self.h_q, 1),
+                    f"SM80 THD token-major Stats must have shape (>= {t_q}, {self.h_q}) and compact strides",
+                )
+                lse = lse_tensor.as_strided((1, self.h_q, t_q), (0, 1, self.h_q), lse_tensor.storage_offset())
+            else:
+                if t_q == 0:
+                    self._value_error_if(lse_tensor.numel() != 0, "SM80 THD zero-token Stats must be empty")
+                else:
+                    self._value_error_if(
+                        lse_tensor.ndim != 3
+                        or lse_tensor.shape[0] != 1
+                        or lse_tensor.shape[1] != self.h_q
+                        or lse_tensor.shape[2] < t_q
+                        or tuple(lse_tensor.stride()[1:]) != (self._thd_lse_head_stride, 1),
+                        f"SM80 THD head-major Stats must have shape (1, {self.h_q}, >= {t_q}) and strides (head={self._thd_lse_head_stride}, token=1)",
+                    )
+                lse = lse_tensor.as_strided(
+                    (1, self.h_q, t_q),
+                    (0, self._thd_lse_head_stride, 1),
+                    lse_tensor.storage_offset(),
+                )
+
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm80 THD")
+        from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+
+        meta = carver.take(THD_META_WORDS(self.batch_size), torch.int32)
+        b = self.batch_size
+        cu_q = meta[b : 2 * b + 1]
+        cu_kv = meta[2 * b + 1 : 3 * b + 2]
+        scale = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
+        launch_stream = self._get_default_stream(current_stream)
+        tvm = lambda tensor: from_dlpack_raw(tensor, enable_tvm_ffi=True)  # noqa: E731
+
+        with _torch_stream_context(current_stream, device):
+            lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
+            self._thd_meta_fn(tvm(meta), tvm(q_lens), tvm(kv_lens), cutlass.Int32(lens_form), cutlass.Int32(b), launch_stream)
+            _sm80_call(
+                self._compiled_kernel,
+                q=q,
+                k=k,
+                v=v,
+                o=o,
+                lse=lse,
+                seq_kv=self._thd_dummy_i32,
+                seq_q=self._thd_dummy_i32,
+                sinks_log2=self._thd_dummy_f32,
+                bias=self._thd_dummy_io,
+                cu_q=cu_q,
+                cu_k=cu_kv,
+                rope_cs=self._thd_dummy_f32,
+                n_kv_tiles=(t_kv + self.kernel_tile_n - 1) // self.kernel_tile_n,
+                scale_log2=scale * _LOG2E,
+                sq=t_q,
+                skv=t_kv,
+                d=self.head_dim_qk,
+                right_bound=int(self.right_bound_runtime),
+                inv_scale=1.0 / scale,
+                thd_q_tiles=(self.s_q_max + self.kernel_tile_m - 1) // self.kernel_tile_m,
+                n_batch_logical=b,
+                stream=launch_stream,
+            )
+
     # ------------------------------------------------------------------
     def execute(
         self,
@@ -6052,6 +6266,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        if self.thd:
+            self._value_error_if(
+                sinks is not None or bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept sinks, bias, or RoPE tensors"
+            )
+            self._execute_thd(q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_q_lens, seq_kv_lens, scale_softmax, workspace, current_stream)
+            return
         p = self._params
 
         # Init-time flags are compile-time specializations; execute must match

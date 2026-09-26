@@ -1777,7 +1777,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     if p.has_lse:
         fake_lse = (
             cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
-            if lse_stride is not None and not p.thd_varlen
+            if lse_stride is not None
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
                 (_b, h, _sq),
