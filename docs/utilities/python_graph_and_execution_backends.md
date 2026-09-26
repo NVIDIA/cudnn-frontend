@@ -84,10 +84,48 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
-  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
-  a python plan is compiled for the shapes the graph declared, so `execute()`
-  refuses them rather than silently running a different problem. Simple eager
-  engines implement `execute()` only.
+  handle/stream/workspace. Runtime shape/stride overrides are supported by the
+  cuDNN backend and compatible `VariantPack` plans. A legacy uid-map plan rejects
+  overrides rather than silently ignoring them. Simple eager engines implement
+  `execute()` only.
+
+#### Ordered bindings for repeated execution
+
+`graph.execute` accepts either its existing tensor mapping or a tuple/list of
+buffers paired with a `tensor_uids` tuple/list. Both forms use the selected plan,
+workspace, and handle in the same way for the cuDNN backend and Python engines,
+including FROST. There is no additional preparation call:
+
+```python
+# Q, K, V, O are graph tensors; q, k, v, out are runtime buffers.
+uids = (Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid())
+graph.execute((q, k, v, out), workspace, handle=handle, tensor_uids=uids)
+```
+
+UIDs must be distinct integers, with one UID per buffer; their order need not
+be sorted. As with mappings, buffers for unused UIDs are ignored, explicit
+bindings take precedence over graph-bound inputs, and all required operands
+must be supplied. The parameter name `tensor_dict` is retained for existing
+keyword callers; it accepts the buffer sequence when `tensor_uids` is present.
+`execute_plan_at_index` accepts the same ordered form.
+
+Existing `override_uids`, `override_shapes`, and `override_strides` arguments
+also work with ordered bindings. Supply all three together, using the graph's
+axis order and element units. Each override UID must name an operand, and
+geometry must be supported by the selected plan. This form does not extend an
+engine's supported layouts or dynamic-shape envelope.
+
+FE prepares the graph's binding layout internally and reuses the most recent
+UID/override metadata by value. Changing a list in place is observed on the
+next call. Every execution reads the current buffers and workspace and creates
+its own pointer pack; the cache retains no runtime tensors, addresses, or
+stream. Buffer descriptions, capacity, and device information remain available
+to engine validation. Bare addresses retain the existing caller-responsibility
+contract; use real buffer objects when metadata must be validated.
+
+Buffer and workspace lifetimes remain the caller's responsibility through GPU
+completion, and through all replays of a captured CUDA graph. Changing a later
+call's bindings does not update an already captured graph's addresses.
 
 #### The variant pack is normalized once
 

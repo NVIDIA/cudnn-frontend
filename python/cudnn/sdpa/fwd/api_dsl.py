@@ -2320,7 +2320,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
         # extent and stride is a runtime argument, so the compile key is layout-only and the
         # dense / THD launches bind pointers through cudnn.sdpa.fwd.prepared.
-        _explicit = bool(getattr(self._k_mod, "EXPLICIT_ABI", False))
+        self._prepared_fp8 = self._can_prepare_fp8()
+        _explicit = bool(getattr(self._k_mod, "EXPLICIT_ABI", False)) or self._prepared_fp8
         self._thd_spec = self._dense_spec = None
         # Backstop only: check_support already declined every flavor whose
         # kernel lacks the gate (rule 8b twin); reaching this means the twin and
@@ -2352,7 +2353,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         _bpe_o = self._o_dtype().itemsize
         self._bshd_declared = (
             (None, None, None, None)
-            if (self.thd or (not _explicit and "q_stride" not in _kc) or (self._fp8 and (self._device_cc != (10, 7) or self.flavor != (256, 256))))
+            if (
+                self.thd
+                or (not _explicit and "q_stride" not in _kc)
+                or (self._fp8 and not self._prepared_fp8 and (self._device_cc != (10, 7) or self.flavor != (256, 256)))
+            )
             else (
                 self._bshd_zero_copy_stride(self.q_desc, _bpe_qkv),
                 None if self.paged else self._bshd_zero_copy_stride(self.k_desc, _bpe_qkv),
@@ -2369,7 +2374,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # One artifact per layout kind: THD, dense and paged all compile HERE, at plan
             # time, and execute() only binds pointers. has_lse=False compiles the LSE store
             # out; a split requires the in-kernel LSE (the per-split LSE is the combine weight).
-            self._compiled_kernel = self._k_mod.compile(**self._explicit_compile_kwargs())
+            compile_fn = self._k_mod.compile_prepared if self._prepared_fp8 else self._k_mod.compile
+            self._compiled_kernel = compile_fn(**self._explicit_compile_kwargs())
             self._build_prepared_specs()
         elif self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -2463,6 +2469,55 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         self._logger.debug("compile completed")
 
+    def _can_prepare_fp8(self):
+        if not (
+            self._fp8
+            and self._pertensor
+            and self._device_cc[0] == 10
+            and self._device_cc != (10, 7)
+            and (self.head_dim_qk, self.head_dim_v) == (128, 128)
+            and self._o_dtype() in (torch.bfloat16, torch.float16)
+            and not self.paged
+            and self.split_kv == 1
+            and not self.o_block_scale
+            and self.gate_desc is None
+        ):
+            return False
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        return self.thd or all(
+            dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None
+            for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc)
+        )
+
+    def _prepared_quant_offset(self):
+        if self.thd:
+            b = self.batch_size
+            return ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
+        return 0
+
+    def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream):
+        """Prepared FP8 always uses caller scratch, including omitted scales / amax.
+
+        Standalone callers allocate scratch_workspace_bytes() before execute;
+        graph callers use get_workspace_size(). No plan-owned scalar buffers.
+        """
+        from cudnn.sdpa.fwd.prepared import execute_quantized, facts_of_tensor
+
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (prepared FP8)", align=_WS_ALIGN if self.thd else 16)
+        stream = self._get_default_stream(stream)
+        stream_int = int(stream)
+        _ensure_current_context(stream_int, q.device.index)
+        facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
+        if self.thd:
+            facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
+            spec = self._thd_spec
+        else:
+            facts.update(seq_q_lens=facts_of_tensor(q_lens), seq_kv_lens=facts_of_tensor(kv_lens))
+            spec = self._dense_spec
+        execute_quantized(spec, facts, ws_ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+        self._logger.debug("execute (prepared FP8) completed")
+
     def _explicit_compile_kwargs(self) -> dict:
         """The compile key of an explicit-ABI template: only what specializes the
         traced code (every extent and stride is a runtime argument)."""
@@ -2479,8 +2534,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import inspect
 
         km = self._k_mod
-        accepted = inspect.signature(km.compile).parameters
+        compile_fn = km.compile_prepared if getattr(self, "_prepared_fp8", False) else km.compile
+        accepted = inspect.signature(compile_fn).parameters
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "has_amax" in accepted:
+            kw["has_amax"] = self.has_amax_o
         if "d_qk" in accepted:  # head-dim envelope
             kw.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
         if "paged_hnd" in accepted and self.paged:
@@ -2658,9 +2716,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         own chunks — synthesized seq_len_kv — on top; see
         ``engines.lower_dsl_prefill``). ``execute()`` REQUIRES the buffer
         whenever this is non-zero (R2) and never allocates on the caller's behalf.
+        Prepared FP8 also keeps its unused amax and identity-scale words there.
         """
         self._ensure_support_checked()
         b, qh = self.batch_size, self.h_q
+        if self._can_prepare_fp8():
+            return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
             # [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
             # No packed-LSE chunk: with a Stats output the kernel writes the
@@ -2738,8 +2799,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         aligned, 128-byte aligned for a THD plan whose scratch holds TMA
         descriptors), REQUIRED whenever ``scratch_workspace_bytes()`` is non-zero:
         every per-execute scratch buffer (THD metadata / O descriptors, the
-        split partials) is carved from it, and a missing one raises the R2
-        contract error.
+        split partials, prepared FP8's unused amax and identity-scale words)
+        is carved from it, and a missing one raises the R2 contract error.
 
         ``block_table`` / ``block_table_v``: paged KV only — ``(B, max_pages)``
         int32 device tensors (``block_table_v`` defaults to ``block_table``);
@@ -2856,6 +2917,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         elif lse_tensor is not None:
             lse_tensor = self._checked_lse_view(lse_tensor)
 
+        if getattr(self, "_prepared_fp8", False):
+            self._execute_fp8_prepared(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                sinks,
+                seq_q_lens,
+                seq_kv_lens,
+                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o),
+                scale_val,
+                workspace,
+                current_stream,
+            )
+            return
         if self._fp8 and self._pertensor:
             # Per-tensor FP8 (sdpa_fp8): scalar descales fold into the softmax scale
             # (descale_q·descale_k) and o_scale_fused (descale_v·scale_o).
