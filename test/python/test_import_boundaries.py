@@ -303,3 +303,22 @@ assert getattr(cudnn.ops, symbol) is export
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
+
+
+def test_nvfp4_conversion_declines_old_dsl_before_kernel_import():
+    """The supported package floor must produce an operation-specific decline."""
+    probe = """
+import importlib
+import sys
+from cudnn.frost import buffers
+buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
+try:
+    importlib.import_module("cudnn.ops.nvfp4")
+except ImportError as exc:
+    assert "4.7.0" in str(exc) and "4.6.2" in str(exc), str(exc)
+else:
+    raise AssertionError("NVFP4 conversion accepted unsupported DSL 4.6.2")
+assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
