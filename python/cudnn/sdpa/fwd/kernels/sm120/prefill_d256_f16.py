@@ -1552,7 +1552,7 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
             raise ValueError("head dimensions must be multiples of 8 (TMA 16-byte global-stride rule at 2 B/elem)")
 
-        # The pointer entry is validated by prepared.bind_dense; tensor callers
+        # The pointer entry is validated by the shared prepared binder; tensor callers
         # retain the original trace-time geometry and layout checks.
         if cutlass.const_expr(not prepared):
             # THD compiles the token extents DYNAMIC (mode 1 is a symbol, not an
@@ -1658,6 +1658,10 @@ class SM120FusedMultiHeadAttentionForward:
 
         tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
         tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
+        # Prepared THD carries the current batch in the metadata extent; tensor
+        # entries retain their compile-time batch. Device readers already derive
+        # the same batch from this layout, so setup and consumers stay in step.
+        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -1667,7 +1671,7 @@ class SM120FusedMultiHeadAttentionForward:
                 thd_q_lens,
                 thd_kv_lens,
                 thd_lens_form,
-                cutlass.Int32(self.thd_batch),
+                cutlass.Int32(thd_batch),
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
@@ -1683,7 +1687,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen)
             else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
         )
-        n_batch = self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
+        n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # LPT / LPT_L2 flatten the 3-D grid so the decode can order the whole tile
         # set globally (heaviest causal rows first); NATURAL keeps the zero-overhead
@@ -1797,7 +1801,7 @@ def compile(  # noqa: A001
         qh_per_kh=qh // kh,
     )
     if prepared:
-        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key)
+        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
     if PARAMS.split_kv > 1 and not has_lse:
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
     if lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):

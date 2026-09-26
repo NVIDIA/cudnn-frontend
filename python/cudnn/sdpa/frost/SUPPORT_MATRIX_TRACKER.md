@@ -34,9 +34,12 @@ compiled geometry, dtype, layout and workspace envelope. SM100/SM103 per-tensor
 FP8 E4M3/E5M2 also supports prepared dense and THD at exact D128, with FP16/BF16
 output, split-KV=1 and non-paged KV. Device scales rebind each call; requested
 Amax_O is reset and unscaled on the launch stream. SM120/SM121 FP16/BF16 also
-supports prepared dense unsplit launches, with native KV-tail masking and bounded
-runtime geometry. SM120 THD/split, quantized outputs, other FP8 flavors, MXFP8,
-synthesized KV-tail padding and bias remain tensor-only and decline overrides;
+supports prepared dense, dense split-KV and unsplit THD launches, with native
+KV-tail masking and bounded runtime geometry. Split partials retain the input
+half dtype; final Stats conversion runs in the common combine. Split plans keep
+the declared batch and Q length, while KV may shrink within its envelope. THD lengths and
+metadata stay on device, including mixed length forms and padded Stats.
+Quantized outputs, other FP8 flavors, MXFP8, synthesized KV-tail padding and bias remain tensor-only and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
