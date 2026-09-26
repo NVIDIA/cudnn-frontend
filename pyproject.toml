@@ -134,6 +134,7 @@ include-package-data = true
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
+"cudnn.sdpa.bwd.compact_gqa" = ["csrc/*.cpp"]
 include = ["**/*"]
 "cudnn.moe_ep._megamoe_backend.cutedsl_src" = [
     "LICENSE.Apache-2.0",
