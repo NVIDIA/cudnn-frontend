@@ -149,8 +149,8 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
 
 @pytest.mark.parametrize("d", [128, 256, 512])
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_sm120_override_admits_prepared_dense_and_declines_legacy_routes(monkeypatch, d, opt_in):
-    """Explicit SM120 dense plans admit overrides; unmigrated routes still decline."""
+def test_sm120_override_admits_prepared_half_and_declines_legacy_routes(monkeypatch, d, opt_in):
+    """SM120 dense, split and THD half plans admit overrides; quantized routes still decline."""
     from dataclasses import replace
     from unittest.mock import Mock
 
@@ -172,8 +172,9 @@ def test_sm120_override_admits_prepared_dense_and_declines_legacy_routes(monkeyp
     lower.assert_not_called()
     facts = _facts(graph)
     assert engines._prepared_decline_reason(spec.capabilities, facts, 1) is None
-    assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is not None
-    for change in (dict(thd=True), dict(has_paged_kv=True), dict(is_fp8=True), dict(is_mxfp8=True)):
+    assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is None
+    assert engines._prepared_decline_reason(spec.capabilities, replace(facts, thd=True), 1) is None
+    for change in (dict(has_paged_kv=True), dict(is_fp8=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
 
 

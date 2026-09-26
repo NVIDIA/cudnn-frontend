@@ -878,33 +878,35 @@ def test_dsl_sm120_execute_contract_mismatches():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, has_sink=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="sinks is required"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     with pytest.raises(ValueError, match="lse_tensor is required"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
     # Sinks are consumed as fp32 directly — no implicit cast (which would
     # allocate and launch a kernel on the execute hot path).
     with pytest.raises(ValueError, match="sinks must be float32"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks.to(torch.bfloat16))
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks.to(torch.bfloat16))
 
     # Compiled WITHOUT sink or LSE: providing either is rejected, and the
     # matching call runs with no LSE buffer anywhere (store compiled out).
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="without sink support"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
     with pytest.raises(ValueError, match="without an LSE output"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     # Same contract for per-batch lengths: a specialization compiled without
     # them must not silently ignore a provided tensor (nor, the other way,
     # substitute a zeros dummy that would mask every row).
     seq_kv = torch.full((1,), 128, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="without per-batch KV lengths"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
     with pytest.raises(ValueError, match="without per-batch Q lengths"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
     torch.cuda.synchronize()
     expected = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128))
     torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
@@ -925,13 +927,15 @@ def test_dsl_sm120_execute_contract_mismatches():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_thd, thd=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="lse_tensor is required"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv)
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="without an LSE output"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv, lse_tensor=lse_thd)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv, lse_tensor=lse_thd)
 
     # Right-band contract (band model): window_size_right is the causal
     # diagonal's right bound (0 = plain causal) and therefore requires
@@ -1097,7 +1101,7 @@ def test_dsl_sm120_thd_cu_seq_len_zero_lens():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=37)
-def test_dsl_sm120_thd_compile_key_plan_time_only():
+def test_dsl_sm120_thd_compile_key_plan_time_only(monkeypatch):
     """Issue #552: the THD compile key carries NO packed totals.
 
     ``compile()`` builds the one artifact at plan time (the token extents
@@ -1119,13 +1123,16 @@ def test_dsl_sm120_thd_compile_key_plan_time_only():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     # Plan-time compile: no deferred sentinel, the artifact already exists.
     assert api._compiled_kernel != "thd-deferred"
     info_plan = api._k_mod.compile.cache_info()
+    compile_entry = api._k_mod.compile
+    monkeypatch.setattr(api._k_mod, "compile", lambda *a, **k: pytest.fail("execute must not look up the compile cache"))
 
     def _run_and_check(seq_lens):
         lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
         torch.cuda.synchronize()
         base_q = q.transpose(1, 2).reshape(b * s, h, d)
         base_k = k.transpose(1, 2).reshape(b * s, h, d)
@@ -1143,9 +1150,9 @@ def test_dsl_sm120_thd_compile_key_plan_time_only():
 
     _run_and_check([200, 150])
     _run_and_check([64, 33])
-    info_exec = api._k_mod.compile.cache_info()
+    info_exec = compile_entry.cache_info()
     assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
-    assert info_exec.hits >= info_plan.hits + 2
+    assert info_exec == info_plan
 
 
 @pytest.mark.L0
@@ -1182,18 +1189,19 @@ def test_dsl_sm120_thd_execute_never_syncs():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
 
     # Warm-up outside the guarded region: allocator pools and lazy launcher
     # state populate here, so the guarded execute reuses cached blocks.
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     o_ref = o.clone()
     o.zero_()
     prev_sync_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode(2)
     try:
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     finally:
         torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
@@ -1220,6 +1228,7 @@ def test_dsl_sm120_thd_execute_cuda_graph_capture():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
 
     def _check(seq_lens):
@@ -1237,11 +1246,11 @@ def test_dsl_sm120_thd_execute_cuda_graph_capture():
             torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
             off += length
 
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     # Clobber O before each replay: the warm-up (and nothing else) has already
     # produced the [200, 150] answer, so without this the first assertion
     # would be satisfied by stale warm-up output even if replay did nothing.
@@ -1274,6 +1283,7 @@ def test_dsl_sm120_thd_cu_nonzero_base_normalized():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cu_seq_q_lens=True, cu_seq_kv_lens=True)
     assert api.check_support()
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
 
     def _run(base_q, base_kv):
         # Distinct Q/KV prefix tensors with DIFFERENT lengths and bases: a
@@ -1282,7 +1292,7 @@ def test_dsl_sm120_thd_cu_nonzero_base_normalized():
         cu_q = torch.tensor([base_q, base_q + 200, base_q + 350], dtype=torch.int32, device="cuda")
         cu_kv = torch.tensor([base_kv, base_kv + 180, base_kv + 310], dtype=torch.int32, device="cuda")
         o.zero_()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu_q, seq_kv_lens=cu_kv)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu_q, seq_kv_lens=cu_kv)
         torch.cuda.synchronize()
         return o.clone()
 
@@ -1891,13 +1901,15 @@ def test_dsl_sm120_thd_padded_stats_execute_checks_the_buffer():
     api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
     assert api.check_support() and api.thd_stats_padded
     api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     bad_dtype = lse.to(torch.bfloat16)
     with pytest.raises(ValueError, match="lse_tensor must be float32"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=bad_dtype)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=bad_dtype)
     torch.cuda.synchronize()
     assert torch.isnan(bad_dtype).all()  # rejected before the seed: an fp32 -inf fill would have left 0 / -inf bf16 pairs
     with pytest.raises(ValueError, match="padded lse_tensor must have"):
         api.execute(
+            workspace=ws,
             q_tensor=q,
             k_tensor=k,
             v_tensor=v,
@@ -1907,10 +1919,10 @@ def test_dsl_sm120_thd_padded_stats_execute_checks_the_buffer():
             lse_tensor=torch.empty(b, h, s + 1, dtype=torch.float32, device="cuda"),
         )
     with pytest.raises(ValueError, match="padded lse_tensor must have"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse[:, :, :-1])
     with pytest.raises(ValueError, match="lse_tensor must be on"):  # a host pointer would reach the raw CUDA fill
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
+        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse.cpu())
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
     torch.cuda.synchronize()
     for i, n in enumerate(lens.tolist()):
         assert torch.isfinite(lse[i, :, :n]).all(), f"batch {i}: valid rows not written"
