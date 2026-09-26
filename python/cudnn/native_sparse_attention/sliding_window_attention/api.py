@@ -501,6 +501,8 @@ class SlidingWindowAttention(APIBase):
         required = self.get_workspace_size()
         if required > 0:
             WorkspaceCarver(workspace, required, "SlidingWindowAttention")  # validates None / undersized / unaligned (R2)
+            if not workspace.is_cuda or workspace.device != self.sample_q.device:
+                raise ValueError(f"SlidingWindowAttention: workspace must be on the plan's device {self.sample_q.device}, got {workspace.device}")
         # pygraph.execute lowers workspace=None to a null pointer, legal only when the plan needs 0 bytes.
         self._cudnn_swa_graph.execute(variant_pack, workspace if required > 0 else None, handle=cudnn_handle)
         self._logger.debug("Executed successfully")

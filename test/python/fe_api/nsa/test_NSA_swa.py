@@ -368,6 +368,12 @@ def test_nsa_swa_execute_requires_workspace(request):
     device = execute_kwargs["q_tensor"].device
     with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
         swa.execute(**execute_kwargs, workspace=torch.empty(required - 1, dtype=torch.uint8, device=device))
+    with pytest.raises(ValueError, match="workspace must be on the plan's device"):
+        swa.execute(**execute_kwargs, workspace=torch.empty(required, dtype=torch.uint8))
+    other = next((i for i in range(torch.cuda.device_count()) if i != device.index), None)
+    if other is not None:
+        with pytest.raises(ValueError, match="workspace must be on the plan's device"):
+            swa.execute(**execute_kwargs, workspace=torch.empty(required, dtype=torch.uint8, device=f"cuda:{other}"))
     swa.execute(**execute_kwargs, workspace=torch.empty(required, dtype=torch.uint8, device=device))
 
 
