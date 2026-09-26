@@ -277,7 +277,7 @@ class IndexerBackwardV2Sm100:
         # in for T <= 7 regardless). The low-tile regime is checked against a
         # strict fp64 recompute by the topk 128/256/384 cases of
         # test_DSA_indexer_backward_wrapper_v2 in
-        # test/python/fe_api/dsa/test_DSA_indexer_backward.py.
+        # test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py.
         assert self.num_tiles >= 1, self.num_tiles
         # metadata parity slots (sIdx/sG double buffer + pipe_M stages)
         self.meta_stage = 2

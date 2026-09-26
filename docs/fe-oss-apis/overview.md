@@ -163,4 +163,4 @@ Methods:
 ## File structure and examples
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
-- Correctness tests/samples are implemented in the `test/python/fe_api` directory.
+- Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).

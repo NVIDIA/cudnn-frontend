@@ -321,7 +321,7 @@ Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink
 lifts the running max, `exp(sink − max)` joins the denominator, `LSE = max + log(sum)`)
 that is independent of `S_q`, of the mask and of the paged loader. Hardware-validated
 on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
-`test_sdpa_fwd_dsl_sm100.py`, the `test/python/test_mhas_v2.py` `S_q = 1` sweeps
+`test_sdpa_fwd_dsl_sm100.py`, the `test/python/sdpa/graph/test_mhas_v2.py` `S_q = 1` sweeps
 (`test_sdpa_random_sq1_L0`, `test_sdpa_random_sq1_unified_L1`,
 `test_sdpa_random_lean_attn_L0`, `test_sdpa_random_lean_attn_unified_L1` draw
 `with_sink_token` 1:3 when FROST engines are enabled, sink-free otherwise) and the
