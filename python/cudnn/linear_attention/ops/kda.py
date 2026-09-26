@@ -351,7 +351,6 @@ def run_kda_fwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("kimi_delta_attention: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
@@ -398,7 +397,14 @@ def run_kda_fwd(
     ):
         if tensor is not None and tensor.device != device:
             raise ValueError(f"kimi_delta_attention: {tensor_name} must be on q's device ({device}); got {tensor.device}")
-    state0 = initial_state if initial_state is not None else None
+    # The graph declares packed operands (no strides), and the plan reserves no repack staging: a
+    # fused-projection slice or any other non-contiguous view is repacked here, in the torch-op layer.
+    q, k, v, g, beta, cu_seqlens = (t.contiguous() for t in (q, k, v, g, beta, cu_seqlens))
+    a_log = a_log.contiguous() if a_log is not None else None
+    dt_bias = dt_bias.contiguous() if dt_bias is not None else None
+    state_indices = state_indices.contiguous() if state_indices is not None else None
+    # A pooled initial_state (state_indices given) keeps its padded slot stride: that stride IS the contract.
+    state0 = initial_state.contiguous() if initial_state is not None and state_indices is None else initial_state
     checkpoint = int(checkpoint_every_n_tokens)
 
     cache_key = make_fprop_cache_key(
@@ -476,7 +482,7 @@ def run_kda_fwd(
         t["v"]: v,
         t["g"]: g,
         t["beta"]: beta,
-        t["cu"]: cu,
+        t["cu"]: cu_seqlens,
         t["O"]: o,
     }
     if state0 is not None:
@@ -849,10 +855,9 @@ def kda_bwd(
     d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
-    if 0 in dO.stride():
-        dO = dO.contiguous()
+    dO = dO.contiguous()  # the packed-declared graph reads dO through compact offsets: any view is repacked here
     check_dtype("dO", dO, q.dtype)
-    if d_final_state is not None and 0 in d_final_state.stride():
+    if d_final_state is not None:
         d_final_state = d_final_state.contiguous()
     HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
@@ -865,7 +870,6 @@ def kda_bwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("kimi_delta_attention: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
@@ -904,7 +908,13 @@ def kda_bwd(
     ):
         if tensor is not None and tensor.device != device:
             raise ValueError(f"kimi_delta_attention: {tensor_name} must be on q's device ({device}); got {tensor.device}")
-    state0 = initial_state if initial_state is not None else None
+    # The graph declares packed operands (no strides), and the plan reserves no repack staging: a
+    # fused-projection slice or any other non-contiguous view is repacked here, in the torch-op layer.
+    q, k, v, g, beta, cu_seqlens = (t.contiguous() for t in (q, k, v, g, beta, cu_seqlens))
+    a_log = a_log.contiguous() if a_log is not None else None
+    dt_bias = dt_bias.contiguous() if dt_bias is not None else None
+    state_checkpoints = state_checkpoints.contiguous() if state_checkpoints is not None else None
+    state0 = initial_state.contiguous() if initial_state is not None else None
     dstate_in = d_final_state if d_final_state is not None else None
 
     cache_key = make_bprop_cache_key(
@@ -984,7 +994,7 @@ def kda_bwd(
         t["v"]: v,
         t["g"]: g,
         t["beta"]: beta,
-        t["cu"]: cu,
+        t["cu"]: cu_seqlens,
         t["dO"]: dO,
         t["dQ"]: dq,
         t["dK"]: dk,

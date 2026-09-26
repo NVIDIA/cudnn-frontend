@@ -1201,6 +1201,28 @@ def test_dsl_sm120_thd_execute_never_syncs():
 
 
 @pytest.mark.L0
+@pytest.mark.no_workspace_shim
+def test_dsl_sm120_thd_execute_requires_a_workspace():
+    """R2: THD scratch ([meta | v_stub]) is carved from the caller's workspace;
+    a direct caller that passes none gets the contract error, never a hidden
+    allocation (the suite's autouse workspace shim is off here)."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120, ws_align
+
+    b, h, s, d = 2, 4, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    # [meta(4B+4 int32) | v_stub(H_kv * D_v tokens of the input dtype)]
+    assert api.scratch_workspace_bytes() == ws_align((4 * b + 4) * 4) + ws_align(h * d * 2)
+    lens = torch.full((b,), s, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=47)
 def test_dsl_sm120_thd_execute_cuda_graph_capture():
     """Issue #552 endgame (SM120): THD execute is CUDA-GRAPH CAPTURABLE — no

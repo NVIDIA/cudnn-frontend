@@ -566,6 +566,7 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_wrapper_sm100",
     ),
+    "wgrad_expert_ptrs": (".gemm.cutedsl.grouped.wgrad", "wgrad_expert_ptrs"),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
     "DiscreteGroupedGemmSwigluSm100": (
         ".gemm.cutedsl.discrete_grouped",
