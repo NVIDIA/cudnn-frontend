@@ -303,11 +303,12 @@ def test_prepared_mxfp8_sf_head_stride_above_int32_units(d, dv):
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
 @pytest.mark.L0
-def test_prepared_mxfp8_sf_physical_permutation(thd, d, dv):
+@pytest.mark.parametrize("carrier", [torch.uint8, torch.int32])
+def test_prepared_mxfp8_sf_physical_permutation(thd, d, dv, carrier):
     g, vp, ws, bufs, ts = _case(thd=thd, d=d, dv=dv)
     for name in ("sf_q", "sf_k", "sf_v"):
         # Same byte stream with a different logical axis order, deliberately noncontiguous.
-        vp[ts[name]] = bufs[name].permute(3, 1, 0, 2)
+        vp[ts[name]] = bufs[name].view(carrier).permute(3, 1, 0, 2)
     g.execute(vp, ws)
     _check(bufs, thd=thd)
 
@@ -342,3 +343,33 @@ def test_prepared_mxfp8_execute_has_no_allocation_or_sync(thd, split, monkeypatc
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
     torch.cuda.synchronize()
     _check(bufs, thd=thd, skv=512)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_prepared_mxfp8_graph_and_adapter_bind_same_frame(thd, d, dv, monkeypatch):
+    g, vp, ws, bufs, _ = _case(thd=thd, d=d, dv=dv)
+    plan = g._compiled_plans[g._plan_index]
+    prepared = plan._prepared
+    assert prepared is not None
+    frames = []
+    original = prepared.spec.fn
+
+    def record(*args):
+        frames.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(prepared.spec, "fn", record)
+    g.execute(vp, ws)
+    _check(bufs, thd=thd)
+    plan._prepared, plan.takes_variant_pack = None, False
+    try:
+        g.execute(vp, ws)
+        _check(bufs, thd=thd)
+    finally:
+        plan._prepared, plan.takes_variant_pack = prepared, True
+    assert len(frames) == 2
+    for i, name in enumerate(prepared.spec.order):
+        if name != "stream":
+            assert str(frames[0][i]) == str(frames[1][i]), name
