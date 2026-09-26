@@ -1,0 +1,13 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,8836,8836,16,16,80,80,gqa,,64,3.6718,108.869,24.642,1.5847,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,15376,15376,16,16,80,80,gqa,,64,10.433945,116.013,15.09,0.9704,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,24336,24336,16,16,80,80,gqa,,64,26.826842,113.031,9.289,0.5974,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,35344,35344,16,16,80,80,gqa,,64,57.004407,112.2,6.349,0.4083,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,47376,47376,16,16,80,80,gqa,,64,102.683105,111.915,4.725,0.3038,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,62500,62500,16,16,80,80,gqa,,64,180.237408,110.965,3.551,0.2284,20,True,,NVIDIA A100 80GB PCIe,cudnn 9.27.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,8836,8836,16,16,80,80,gqa,,64,4.145411,96.43,21.827,1.4036,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,15376,15376,16,16,80,80,gqa,,64,11.599486,104.356,13.574,0.8729,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,24336,24336,16,16,80,80,gqa,,64,29.041451,104.412,8.581,0.5518,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,35344,35344,16,16,80,80,gqa,,64,61.246793,104.428,5.909,0.38,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,47376,47376,16,16,80,80,gqa,,64,109.431853,105.013,4.433,0.2851,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,62500,62500,16,16,80,80,gqa,,64,191.966352,104.185,3.334,0.2144,20,True,,NVIDIA A100 80GB PCIe,cudnn_oss plan=sdpa_fwd_prefill_sm80[PACK_GQA=0; SCHED_POLICY=0; SPLIT_KV=1],
