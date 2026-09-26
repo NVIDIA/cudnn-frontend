@@ -25,21 +25,21 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
-def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False):
+def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
     stride (the declaration's span is then far below the buffer's)."""
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=dtype,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         is_override_shape_enabled=override_enabled,
     )
     q_bs = ragged_batch_stride if ragged_batch_stride is not None else ql * hq * d
     kv_bs = ragged_batch_stride if ragged_batch_stride is not None else kl * hk * d
-    tq = g.tensor(dim=[b, hq, ql, d], stride=[q_bs, d, hq * d, 1], data_type=cudnn.data_type.BFLOAT16, name="q")
-    tk = g.tensor(dim=[b, hk, kl, d], stride=[kv_bs, d, hk * d, 1], data_type=cudnn.data_type.BFLOAT16, name="k")
-    tv = g.tensor(dim=[b, hk, kl, d], stride=[kv_bs, d, hk * d, 1], data_type=cudnn.data_type.BFLOAT16, name="v")
+    tq = g.tensor(dim=[b, hq, ql, d], stride=[q_bs, d, hq * d, 1], data_type=dtype, name="q")
+    tk = g.tensor(dim=[b, hk, kl, d], stride=[kv_bs, d, hk * d, 1], data_type=dtype, name="k")
+    tv = g.tensor(dim=[b, hk, kl, d], stride=[kv_bs, d, hk * d, 1], data_type=dtype, name="v")
     i32 = cudnn.data_type.INT32
     t_cu_q = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name="cu_q")
     t_cu_kv = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name="cu_kv")
@@ -76,12 +76,12 @@ def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, o
     return g, dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
 
 
-def _buffers(b, ql, kl, hq, hk, d, seed=0):
+def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16):
     torch.manual_seed(seed)
-    q = torch.randn(b * ql, hq, d, device=DEV, dtype=torch.bfloat16)
-    k = torch.randn(b * kl, hk, d, device=DEV, dtype=torch.bfloat16)
-    v = torch.randn(b * kl, hk, d, device=DEV, dtype=torch.bfloat16)
-    o = torch.empty(b * ql, hq, d, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(b * ql, hq, d, device=DEV, dtype=dtype)
+    k = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype)
+    v = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype)
+    o = torch.empty(b * ql, hq, d, device=DEV, dtype=dtype)
     lse = torch.empty(b * ql, hq, device=DEV, dtype=torch.float32)
     cu_q = (torch.arange(0, b + 1, device=DEV, dtype=torch.int32) * ql).contiguous()
     cu_kv = (torch.arange(0, b + 1, device=DEV, dtype=torch.int32) * kl).contiguous()
@@ -144,6 +144,11 @@ class _Recorder:
     def __init__(self, spec):
         self.spec, self.frames, self._fn = spec, [], spec.fn
         spec.fn = self
+        self._native = getattr(spec, "native", None)
+        if self._native is not None:
+            # Native plans retain the official launch entry at prepare time.
+            # Re-prepare after installing this test-only recorder.
+            spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
 
     def __call__(self, *frame):
         self.frames.append(dict(zip(self.spec.order, frame)))
@@ -151,6 +156,8 @@ class _Recorder:
 
     def restore(self):
         self.spec.fn = self._fn
+        if self._native is not None:
+            self.spec.native = self._native
 
 
 @requires_pre_rubin_blackwell
@@ -1129,6 +1136,130 @@ def test_override_enabled_dense_plan_honors_bounded_kv(d, split):
 
 @requires_pre_rubin_blackwell
 @requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeypatch):
+    """Both entry points use native admission with fresh buffers/workspace/stream.
+
+    Replaying after input mutation checks that capture bound the current stream,
+    and poisoned outputs catch incomplete writes after warm launches.
+    """
+    b, ql, kl, hq, hk, d = 2, 8, 64, 8, 2, 128
+    fe_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g, t = _thd_graph(b, ql, kl, hq, hk, d, dtype=fe_dtype)
+    plan = _plan(g)
+    assert plan._prepared.spec.native is not None
+    bufs = _buffers(b, ql, kl, hq, hk, d, dtype=dtype)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    monkeypatch.setattr(prep_mod, "facts_of_roles", lambda *args: pytest.fail("native graph launch must not rebuild Python facts"))
+    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *args: pytest.fail("native f16 contract must not fall back to Python binding"))
+
+    def execute(buffers, workspace):
+        bindings = _pack(t, buffers)
+        if ordered:
+            items = list(reversed(list(bindings.items())))
+            g.execute([buffer for _, buffer in items], workspace, tensor_uids=[tensor.get_uid() for tensor, _ in items])
+        else:
+            g.execute(bindings, workspace)
+
+    def verify():
+        o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
+        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+
+    with torch.cuda.stream(stream):
+        execute(bufs, ws)
+    stream.synchronize()
+    verify()
+    with torch.cuda.stream(stream):
+        # Verify each route independently: otherwise a no-op standalone path
+        # could leave the preceding graph's correct outputs untouched.
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        # The tensor/standalone route must share the same native evaluator.
+        prepared = plan._prepared
+        plan._prepared, plan.takes_variant_pack = None, False
+        try:
+            execute(bufs, ws)
+        finally:
+            plan._prepared, plan.takes_variant_pack = prepared, True
+    stream.synchronize()
+    verify()
+    bufs = _buffers(b, ql, kl, hq, hk, d, seed=4, dtype=dtype)
+    ws = torch.empty_like(ws)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        execute(bufs, ws)
+    stream.synchronize()
+    verify()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        execute(bufs, ws)
+    with torch.cuda.stream(stream):
+        bufs["q"].mul_(0.5)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    verify()
+    # Replacement/replanning state must never patch an earlier captured frame.
+    # The captured graph still refers to the first buffers and workspace.
+    old_bufs, old_ws = bufs, ws
+    replacement = _buffers(b, ql, kl, hq, hk, d, seed=9, dtype=dtype)
+    new_ws = torch.empty_like(ws)
+    execute(replacement, new_ws)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+        old_bufs["q"].mul_(0.5)
+        graph.replay()
+    stream.synchronize()
+    assert old_ws is ws  # retain capture's metadata/workspace owners through replay
+    verify()
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+def test_native_thd_concurrent_streams_use_independent_frames():
+    from concurrent.futures import ThreadPoolExecutor
+
+    b, ql, kl, hq, hk, d = 2, 8, 64, 8, 2, 128
+    g, t = _thd_graph(b, ql, kl, hq, hk, d)
+    assert _plan(g)._prepared.spec.native is not None
+    buffers = [_buffers(b, ql, kl, hq, hk, d, seed=i + 1) for i in range(2)]
+    workspaces = [torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8) for _ in range(2)]
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    handles = [cudnn.create_handle() for _ in range(2)]
+    for handle, stream in zip(handles, streams):
+        cudnn.set_stream(handle, stream.cuda_stream)
+    torch.cuda.synchronize()
+
+    def run(i):
+        for _ in range(3):
+            g.execute(_pack(t, buffers[i]), workspaces[i], handle=handles[i])
+        streams[i].synchronize()
+
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(run, range(2)))
+        for bufs in buffers:
+            o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
+            torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+    finally:
+        try:
+            for stream in streams:
+                stream.synchronize()
+        finally:
+            for handle in handles:
+                cudnn.destroy_handle(handle)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("d", [128, 256, 512])
 def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
@@ -1138,6 +1269,7 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
     g, t = _thd_graph(b, ql, kl, hq, hk, d, causal=False, override_enabled=True)
+    assert _plan(g)._prepared.spec.native is not None
     bufs = _buffers(b, ql, kl, hq, hk, d)
     bufs["o"] = torch.empty_strided((b * ql, hq, d), (row_stride, d, 1), device=DEV, dtype=torch.bfloat16)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
