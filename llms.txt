@@ -19,6 +19,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [Normalizations (LayerNorm, RMSNorm, BatchNorm, InstanceNorm)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Normalizations.md)
 - [MoE Grouped Matmul](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/MoeGroupedMatmul.md)
 - [Pointwise](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Pointwise.md)
+- [Custom weight dequantization (experimental)](docs/operations/WeightDequantize.md)
 - [Block Scaling (MXFP8/NVFP4 quantization)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/BlockScaling.md)
 - [RoPE](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/RoPE.md)
 - [Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/CausalConv1d.md)

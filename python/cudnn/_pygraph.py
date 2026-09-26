@@ -2998,6 +2998,15 @@ _STRUCTURED_OPS = {
         outputs=("OUT_0",),
         push_output_dims=True,  # cuDNN needs the reduced output dims explicitly
     ),
+    "weight_dequantize": dict(
+        node_type=NodeType.WEIGHT_DEQUANTIZE,
+        inputs=("weights",),
+        list_inputs=("auxiliaries",),
+        attrs=("source", "entry", "abi_version", "tile_shape", "cta_smem_bytes", "stage_smem_bytes", "input_alignment", "constants"),
+        outputs=("Y",),
+        push_output_dims=True,
+        no_cdt=True,
+    ),
     "block_scale_dequantize": dict(
         node_type=NodeType.BLOCK_SCALE_DEQUANTIZE,
         inputs=("input", "descale"),

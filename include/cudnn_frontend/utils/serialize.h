@@ -553,6 +553,21 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_quantize_attributes::output_names,
                                  {Block_scale_quantize_attributes::output_names::scale, "scale"},
                              })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(Weight_dequantize_attributes::input_names,
+                             {
+                                 {Weight_dequantize_attributes::input_names::WEIGHTS, "WEIGHTS"},
+                                 {Weight_dequantize_attributes::input_names::AUX_0, "AUX_0"},
+                                 {Weight_dequantize_attributes::input_names::AUX_1, "AUX_1"},
+                                 {Weight_dequantize_attributes::input_names::AUX_2, "AUX_2"},
+                                 {Weight_dequantize_attributes::input_names::AUX_3, "AUX_3"},
+                                 {Weight_dequantize_attributes::input_names::AUX_4, "AUX_4"},
+                                 {Weight_dequantize_attributes::input_names::AUX_5, "AUX_5"},
+                                 {Weight_dequantize_attributes::input_names::AUX_6, "AUX_6"},
+                                 {Weight_dequantize_attributes::input_names::AUX_7, "AUX_7"},
+                             })
+NLOHMANN_JSON_SERIALIZE_ENUM(Weight_dequantize_attributes::output_names,
+                             {{Weight_dequantize_attributes::output_names::Y, "Y"}})
+
 NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_dequantize_attributes::input_names,
                              {
                                  {Block_scale_dequantize_attributes::input_names::X, "X"},

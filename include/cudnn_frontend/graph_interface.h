@@ -38,6 +38,7 @@
 #include "node/sdpa_fp8_bwd.h"
 #include "node/block_scale_quantize.h"
 #include "node/block_scale_dequantize.h"
+#include "node/weight_dequantize.h"
 #include "node/concatenate.h"
 #include "node/moe_grouped_matmul.h"
 #include "node/moe_grouped_matmul_bwd.h"
@@ -2060,6 +2061,11 @@ class Graph : public ICudnn, public INode {
     std::array<std::shared_ptr<Tensor_attributes>, 2> block_scale_quantize(std::shared_ptr<Tensor_attributes>,
                                                                            Block_scale_quantize_attributes);
 
+    std::shared_ptr<Tensor_attributes>
+    weight_dequantize(std::shared_ptr<Tensor_attributes> weights,
+                      std::vector<std::shared_ptr<Tensor_attributes>> auxiliaries,
+                      Weight_dequantize_attributes attributes);
+
     std::shared_ptr<Tensor_attributes> block_scale_dequantize(std::shared_ptr<Tensor_attributes>,
                                                               std::shared_ptr<Tensor_attributes>,
                                                               Block_scale_dequantize_attributes);
@@ -2698,6 +2704,11 @@ class Graph : public ICudnn, public INode {
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_bwd_attributes);
                         sub_nodes.emplace_back(
                             std::make_unique<CompositeSDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
+                    } else if (tag == "WEIGHT_DEQUANTIZE") {
+                        auto attributes = j_sub_node.get<Weight_dequantize_attributes>();
+                        CHECK_TENSORS(attributes);
+                        FILL_GLOBAL_IO_TENSOR_MAP(attributes);
+                        sub_nodes.emplace_back(std::make_unique<WeightDequantizeNode>(std::move(attributes), context));
                     } else if (tag == "MATMUL") {
                         auto matmul_attributes = j_sub_node.get<Matmul_attributes>();
                         CHECK_TENSORS(matmul_attributes);
@@ -3804,6 +3815,23 @@ Graph::block_scale_quantize(std::shared_ptr<Tensor_attributes> x, Block_scale_qu
     sub_nodes.emplace_back(std::make_unique<BlockScaleQuantizeNode>(std::move(attributes), context));
 
     return {Y, scale};
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::weight_dequantize(std::shared_ptr<Tensor_attributes> weights,
+                         std::vector<std::shared_ptr<Tensor_attributes>> auxiliaries,
+                         Weight_dequantize_attributes attributes) {
+    using Attr = Weight_dequantize_attributes;
+    auto y = attributes.outputs[Attr::output_names::Y] = output_tensor(attributes.name + "::Y");
+    attributes.inputs.clear();
+    attributes.inputs[Attr::input_names::WEIGHTS] = weights;
+    attributes.auxiliary_count                    = static_cast<int64_t>(auxiliaries.size());
+    // An excessive count is rejected by validate(), before lowering. Do not
+    // invent extra ABI port identifiers for an unsupported input list.
+    for (size_t i = 0; i < std::min<size_t>(8, auxiliaries.size()); ++i)
+        attributes.inputs[static_cast<Attr::input_names>(i + 1)] = auxiliaries[i];
+    sub_nodes.emplace_back(std::make_unique<WeightDequantizeNode>(std::move(attributes), context));
+    return y;
 }
 
 inline std::shared_ptr<Tensor_attributes>
