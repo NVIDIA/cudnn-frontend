@@ -342,6 +342,8 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "pack_forward_weights",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "AlignedHCABackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "aligned_hca_backward_wrapper": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
@@ -424,6 +426,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
+    "AlignedHCABackward": (".deepseek_sparse_attention", "AlignedHCABackward"),
+    "aligned_hca_backward_wrapper": (".deepseek_sparse_attention", "aligned_hca_backward_wrapper"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
     "CSACompressorBackward": (".csa", "CSACompressorBackward"),

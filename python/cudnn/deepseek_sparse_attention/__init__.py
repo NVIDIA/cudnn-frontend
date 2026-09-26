@@ -6,6 +6,8 @@ from importlib import import_module
 _SYMBOLS = {
     "SparseAttentionForward": (".sparse_attention_forward", "SparseAttentionForward"),
     "sparse_attention_forward_wrapper": (".sparse_attention_forward", "sparse_attention_forward_wrapper"),
+    "AlignedHCABackward": (".aligned_hca_backward", "AlignedHCABackward"),
+    "aligned_hca_backward_wrapper": (".aligned_hca_backward", "aligned_hca_backward_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
