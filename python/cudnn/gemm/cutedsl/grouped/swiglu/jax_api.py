@@ -3,12 +3,22 @@
 
 """Contiguous grouped MXFP8 SwiGLU with quantization through cudnn.jax.call."""
 
+import math
+import os
+
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils
+from cutlass.cute.nvgpu import OperandMajorMode
 
-from cudnn.api_base import TupleDict
-from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
-from .api import GroupedGemmSwigluSm100
+from cudnn.api_base import TupleDict, ceil_div
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import get_compute_capability
+from ..canonical_jax import check_grouped_shapes, check_jax_inputs, grouped_call, output_type, sf_array, sf_shape
+from ..glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
+from ..moe_utils import MoEWeightMode
+
+kernel_cache = {}
 
 
 @cute.jit
@@ -16,11 +26,16 @@ def grouped_swiglu_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, 
     kernel(
         a=a,
         b=b,
+        sfb=sfb,
+        n=cutlass.Int32(0),
+        k=cutlass.Int32(0),
+        b_stride_size=cutlass.Int64(0),
+        b_major_mode=OperandMajorMode.K,
+        workspace_ptr=cute.make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128),
         c=c,
         d=d,
         d_col=d_col,
         sfa=sfa,
-        sfb=sfb,
         sfd_row_tensor=sfd_row,
         sfd_col_tensor=sfd_col,
         amax_tensor=None,
@@ -28,9 +43,69 @@ def grouped_swiglu_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, 
         padded_offsets=padded_offsets,
         alpha=alpha,
         prob=prob,
+        bias=None,
         max_active_clusters=mac,
         stream=stream,
     )
+
+
+def swiglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn):
+    check_grouped_shapes(inputs, outputs, backward=False)
+    m, k = inputs["a"].shape
+    experts, n, _ = inputs["b"].shape
+    rest_k = ceil_div(ceil_div(k, 32), 4)
+    for name, rows, groups in (("sfa", m, 1), ("sfb", n, experts)):
+        if math.prod(inputs[name].shape) != 512 * ceil_div(rows, 128) * rest_k * groups:
+            raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
+    if _convert_to_cutlass_data_type(inputs["prob"].dtype) not in (cutlass.Float32, cutlass.BFloat16):
+        raise ValueError("prob must be float32 or bfloat16")
+    if experts > 1024:
+        raise ValueError(f"expert count must be <= 1024, got {experts}")
+    use_2cta_instrs = mma_tiler_mn[0] == 256
+    cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
+    if not BlockScaledMoEGroupedGemmGluBiasKernel.can_implement(
+        _convert_to_cutlass_data_type(inputs["a"].dtype),
+        cutlass.Float8E8M0FNU,
+        32,
+        cutlass.Float32,
+        _convert_to_cutlass_data_type(outputs["d"].dtype),
+        use_2cta_instrs,
+        tuple(mma_tiler_mn),
+        cluster_shape_mn,
+        m,
+        n,
+        k,
+        experts,
+        "k",
+        "k",
+        "n",
+        BlockScaledMoEGroupedGemmGluBiasKernel.FIX_PAD_SIZE,
+    ):
+        raise ValueError("Unsupported grouped GEMM SwiGLU tile, cluster, alignment, or layout configuration")
+    margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin)
+    if config not in kernel_cache:
+        major, minor = get_compute_capability()
+        if major * 10 + minor < 100:
+            raise RuntimeError(f"GroupedGemmSwiglu requires SM100+ compute capability, but found SM{major}{minor}")
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
+        if mac <= 0:
+            raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
+        kernel = BlockScaledMoEGroupedGemmGluBiasKernel(
+            sf_vec_size=32,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=tuple(mma_tiler_mn),
+            cluster_shape_mn=cluster_shape_mn,
+            vectorized_f32=False,
+            generate_sfd=True,
+            discrete_col_sfd=False,
+            expert_cnt=experts,
+            weight_mode=MoEWeightMode.DENSE,
+            act_func="swiglu",
+        )
+        kernel_cache[config] = (kernel, mac)
+    return kernel_cache[config]
 
 
 def grouped_gemm_swiglu(
@@ -57,6 +132,7 @@ def grouped_gemm_swiglu(
     6-D SF buffers. Output storage is zero-initialized for untouched padding.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
     use cudnn.jax.grouped_gemm_dswiglu for the fused backward operation.
+    Runs the unified grouped GEMM GLU kernel with act_func="swiglu".
     """
     inputs = dict(
         a=a_tensor,
@@ -80,7 +156,7 @@ def grouped_gemm_swiglu(
         sfd_row=output_type(sf_shape(m, n // 2), cutlass.Float8E8M0FNU),
         sfd_col=output_type(sf_shape(n // 2, m), cutlass.Float8E8M0FNU),
     )
-    kernel, mac = grouped_plan(GroupedGemmSwigluSm100, inputs, outputs, backward=False, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+    kernel, mac = swiglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn)
     result = grouped_call(
         grouped_swiglu_adapter,
         kernel,
