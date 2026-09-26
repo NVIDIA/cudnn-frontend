@@ -58,8 +58,11 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
-Block-scaled FP8 outputs, MXFP8,
-synthesized KV-tail padding and bias remain tensor-only and decline overrides;
+SM100/SM103 MXFP8 scalar outputs also use prepared launches for fixed dense
+and bounded THD geometry; dense MXFP8 overrides remain declined because SF
+batch/head pitches are plan-fixed. SM107 MXFP8, block-scaled outputs,
+MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding and bias retain their
+tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
