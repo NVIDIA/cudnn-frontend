@@ -21,10 +21,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major
 
-from ._interface import indexer_fwd as indexer_fwd_sm100
+from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
-
-TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
 
 
 class IndexerForward(APIBase):
@@ -32,6 +30,13 @@ class IndexerForward(APIBase):
 
     The backend interface owns lazy compilation and its kernel cache. Hopper
     dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
+
+    ``sample_out`` / the ``out`` passed to ``execute()`` is the contiguous
+    padded ``(B, S_q, S_k_padded)`` allocation (``S_k_padded % 4 == 0``);
+    ``execute()`` binds ``out[..., :S_k]`` to the kernel directly, so the row
+    stride stays ``S_k_padded`` and columns ``[S_k, S_k_padded)`` are never
+    written. Q/K/W must have a unit innermost stride; other layouts are
+    declined in ``check_support()`` (Rule 2 / R5) rather than copied.
     """
 
     def __init__(
@@ -39,7 +44,7 @@ class IndexerForward(APIBase):
         sample_q: torch.Tensor,  # (B, S_q, H_q, D) BF16
         sample_k: torch.Tensor,  # (B, S_k, H_kv, D) BF16
         sample_w: torch.Tensor,  # (B, S_q, H_q) BF16
-        sample_out: torch.Tensor,  # (B, S_q, S_k_padded) FP32
+        sample_out: torch.Tensor,  # (B, S_q, S_k_padded) FP32, contiguous
         ratio: int = 4,
         qhead_per_kv_head: Optional[int] = None,
         m_block_size: int = 128,
@@ -118,6 +123,16 @@ class IndexerForward(APIBase):
         self._check_dtype(self.w_desc, torch.bfloat16, name="W")
         self._check_dtype(self.o_desc, torch.float32, name="Out")
 
+        for desc, name in ((self.q_desc, "Q"), (self.k_desc, "K"), (self.w_desc, "W")):
+            self._not_implemented_error_if(
+                desc.stride[-1] != 1,
+                f"IndexerForward reads {name} with a unit innermost stride natively; got strides {desc.stride}",
+            )
+        # The padded allocation; execute() binds its [..., :S_k] view directly.
+        self._not_implemented_error_if(
+            not self.o_desc.is_contiguous(),
+            f"IndexerForward writes Out through a contiguous (B, S_q, S_k_padded) buffer; got strides {self.o_desc.stride}",
+        )
         self._value_error_if(
             s_k_padded_from_out % TMA_ALIGN_ELEMS != 0,
             f"Out seqlen_k dim must be a multiple of {TMA_ALIGN_ELEMS}, got {s_k_padded_from_out}",
@@ -163,12 +178,16 @@ class IndexerForward(APIBase):
         if self._compiled_kernel is None:
             raise ValueError("IndexerForward kernel not compiled")
 
-        # APIBase callers provide a TMA-aligned output allocation, while the
-        # shared interface describes only the logical K columns. Passing the
-        # logical view lets the interface manage any internal padded buffer
-        # without exposing padded columns as scores.
+        # `out` is the padded (B, S_q, S_k_padded) allocation the descriptor
+        # promised; the kernel binds the [..., :S_k] view with that row stride
+        # (no staging, no copy-back). _indexer_fwd_bound re-checks the live strides.
+        padded_shape = (self.batch_size, self.s_q, self.s_k_padded)
+        if tuple(out.shape) != padded_shape or not out.is_contiguous():
+            raise ValueError(
+                f"out must be the contiguous {padded_shape} fp32 allocation declared to IndexerForward; got shape {tuple(out.shape)}, strides {tuple(out.stride())}"
+            )
         logical_out = out[..., : self.s_k]
-        indexer_fwd_sm100(
+        _indexer_fwd_bound(
             q,
             k,
             w,
@@ -218,6 +237,17 @@ def indexer_forward_wrapper(
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
     local q[0].
+
+    On SM100 the kernel writes a ``(B, S_q, ceil4(S_k))`` (THD:
+    ``(total_q, ceil4(max_seqlen_k))``) padded buffer through its ``[..., :S_k]``
+    view. The wrapper keeps the torch-op contract on top of that: a returned
+    ``scores`` is contiguous (one copy when ``S_k % 4 != 0``), and a
+    caller-provided ``out`` of the logical shape is filled whatever its layout
+    (a padded-stride view is bound directly; anything else is staged and copied
+    back, so the caller's tensor keeps its identity). Strided ``q``/``k``/``w``/
+    scales are made contiguous here on the launch stream as a torch-op
+    convenience (one copy kernel each). ``IndexerForward`` itself declines all
+    of that in ``check_support()`` and binds only a padded-stride ``out``.
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
@@ -266,10 +296,9 @@ def indexer_forward_wrapper(
     if return_lse or lse_out is not None:
         raise NotImplementedError("SM100 dense indexer forward does not expose LSE; " "LSE is produced by dense_indexer_score_recompute_wrapper")
 
-    # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
-    # internally): it owns output allocation + TMA padding and uses a single
-    # shape-agnostic compile cache. cu_seqlens_q/k / max_seqlen_q/k are None for
-    # BSHD; seqlen is then derived from the tensor shapes at runtime.
+    # indexer_fwd is the dense convenience entry: it normalises strided inputs,
+    # allocates / stages `out` and returns the torch-op layout, all on `stream`.
+    # BSHD and THD both go through it (it branches on cu_seqlens internally).
     scores = indexer_fwd_sm100(
         q,
         k,

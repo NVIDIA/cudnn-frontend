@@ -190,7 +190,7 @@ class DenseScoreRecomputeSm100:
         mK: cute.Tensor,  # BSHD (bs, seqlen_k, n_heads_kv, head_dim) or THD (total_k, n_heads_kv, head_dim) BF16
         mPerHead: cute.Tensor,  # BSH (bs, seqlen_q, n_heads_q) or TH (total_q, n_heads_q) — W (BF16) or LSE (FP32)
         mOut: cute.Tensor,  # BSS (bs, seqlen_q, seqlen_k) or TS (total_q, max_seqlen_k) FP32
-        mDenom: cute.Tensor,  # BS (bs, seqlen_q) or T (total_q,) FP32
+        mDenom: cute.Tensor | None,  # BS (bs, seqlen_q) or T (total_q,) FP32; None when the mode never writes it
         softmax_scale: Float32 | float,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -205,6 +205,10 @@ class DenseScoreRecomputeSm100:
         ``mCandBatchOffsets`` contains compact-buffer slab bases for batches
         whose candidate counts differ. It is unused by dense score recompute
         and attention.
+
+        ``mDenom`` may be ``None`` only for a specialization that never writes
+        the denominator (``compute_lse=False`` in the unified indexer subclass);
+        the slot is then compiled out (Rule 8, recipe R3).
         """
 
         self.q_dtype = mQ.element_type
@@ -316,8 +320,11 @@ class DenseScoreRecomputeSm100:
             mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
 
         # --- Denom layout: BS (bs, sq) -> (sq, bs) ; T (total_q,) stays ---
-        Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
-        mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
+        if const_expr(mDenom is not None):
+            Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
+            mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
+        else:
+            assert not getattr(self, "compute_lse", True), "mDenom is None but this specialization writes the denominator"
 
         # --- Grid and kernel dispatch (CLC persistent scheduling) ---
         # Grid sized using max_seqlen_q for varlen so persistent scheduling
@@ -366,7 +373,7 @@ class DenseScoreRecomputeSm100:
         mK,
         mPerHead,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         softmax_scale: Float32 | float,
         tma_atom_Q,
         tma_atom_K,
@@ -778,7 +785,7 @@ class DenseScoreRecomputeSm100:
                         q_causal_offset,
                     )
                     per_head_offset = (tile_count % 2) * self.m_block_size
-                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
+                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1) if const_expr(mDenom is not None) else None
                     if cutlass.const_expr(self.score_type == "attention"):
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                         s_full_phase_bits, reduce_phase = self._epilogue_attention_dense(

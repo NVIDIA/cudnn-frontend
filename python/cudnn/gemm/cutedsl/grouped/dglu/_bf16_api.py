@@ -38,7 +38,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, retain_workspace
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
 
@@ -681,6 +681,7 @@ class GroupedGemmDgluBf16API(APIBase):
             dbias_tensor=dbias_tensor,
             activation_tensor=activation_tensor,
         )
+        retain_workspace(self, workspace, current_stream)
         self._compiled_kernel(
             a_tensor,
             c_tensor,

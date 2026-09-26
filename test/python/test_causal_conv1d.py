@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 
 import cudnn
+from cudnn.ops.causal_conv1d import (
+    b2b_causal_conv1d,
+    causal_conv1d,
+    causal_conv1d_nwh,
+)  # not via the lazy `cudnn.ops` attributes: importing the submodule first rebinds them to the module
 
 pytestmark = pytest.mark.L0
 
@@ -178,7 +183,7 @@ def test_causal_conv1d_autograd(dtype, kernel_size, activation):
     x = x_data.detach().requires_grad_(True)
     weight = weight_data.detach().requires_grad_(True)
     bias = bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.causal_conv1d(x, weight, bias, activation=activation)
+    actual = causal_conv1d(x, weight, bias, activation=activation)
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)
@@ -207,7 +212,7 @@ def test_causal_conv1d_nwh_autograd(dtype, kernel_size, activation):
     x = x_data.detach().requires_grad_(True)
     weight = weight_data.detach().requires_grad_(True)
     bias = bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    actual = causal_conv1d_nwh(x, weight, bias, activation=activation)
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)
@@ -255,7 +260,7 @@ def test_b2b_causal_conv1d_autograd(dtype):
     weights_proj = weights_proj_data.detach().requires_grad_(True)
     weights_mixer = weights_mixer_data.detach().requires_grad_(True)
     skip_bias = skip_bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.b2b_causal_conv1d(x, weights_proj, weights_mixer, skip_bias)
+    actual = b2b_causal_conv1d(x, weights_proj, weights_mixer, skip_bias)
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)
@@ -287,11 +292,11 @@ def test_causal_conv1d_compiled_autograd(layout):
     if layout == "nhw":
         x_data = _make_tensor((batch, dim, seq_len), torch.bfloat16, scale=0.1)
         weight_data = _make_tensor((dim, kernel_size), torch.bfloat16, scale=0.5)
-        op = cudnn.ops.causal_conv1d
+        op = causal_conv1d
     else:
         x_data = _make_tensor((batch, seq_len, dim), torch.bfloat16, scale=0.1)
         weight_data = _make_tensor((kernel_size, dim), torch.bfloat16, scale=0.5)
-        op = cudnn.ops.causal_conv1d_nwh
+        op = causal_conv1d_nwh
     bias_data = _make_tensor((dim,), torch.bfloat16, scale=0.1)
     grad_out = _make_tensor(x_data.shape, torch.bfloat16, scale=0.1)
 

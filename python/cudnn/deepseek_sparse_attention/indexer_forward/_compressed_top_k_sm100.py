@@ -10,7 +10,6 @@ BSHD/THD buffer management for indexer_forward.
 
 from __future__ import annotations
 
-from threading import Lock
 from typing import Optional
 
 import torch
@@ -92,8 +91,6 @@ def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) 
 
 
 _compile_cache: dict = {}
-_denom_placeholder_cache: dict = {}
-_denom_placeholder_cache_lock = Lock()
 
 # Stage-2 fuses softmax over the selected logits. It is returned by default
 # because the indexer backward KL-loss path consumes this probability tensor.
@@ -108,35 +105,6 @@ def _make_i64_cand_buffer_compile_tensor():
         stride=(1,),
         assumed_align=16,
     )
-
-
-def _get_fwd_unified_denom_placeholder(
-    shape: tuple[int, ...],
-    device: torch.device,
-) -> torch.Tensor:
-    """Return a shaped view backed by a stable power-of-two capacity bucket."""
-    if device.type == "cuda":
-        device_index = torch.cuda.current_device() if device.index is None else device.index
-        alloc_device = torch.device("cuda", device_index)
-    else:
-        device_index = device.index
-        alloc_device = device
-
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    capacity = 1 << (max(1, numel) - 1).bit_length()
-    key = (alloc_device.type, device_index, len(shape), capacity)
-
-    # Buckets are never replaced or evicted: CUDA graphs may retain the
-    # placeholder address captured during warmup. The lock prevents concurrent
-    # first-use allocations from racing to populate the same bucket.
-    with _denom_placeholder_cache_lock:
-        cached = _denom_placeholder_cache.get(key)
-        if cached is None:
-            cached = torch.empty((capacity,), dtype=torch.float32, device=alloc_device)
-            _denom_placeholder_cache[key] = cached
-    return cached[:numel].view(shape)
 
 
 def _compress_local_to_global_bshd_(idx: torch.Tensor, seqlen_k: int) -> torch.Tensor:
@@ -664,12 +632,9 @@ def indexer_fwd_compress_topk(
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
     unified_kv_stage = 4
-    if want_lse:
-        lse_buf = lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)
-        denom_tmp = lse_buf
-    else:
-        lse_buf = None
-        denom_tmp = _get_fwd_unified_denom_placeholder((bs, seqlen_q), device)
+    # Without LSE the denom slot is compiled out: None at compile and launch (R3).
+    lse_buf = (lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)) if want_lse else None
+    denom_tmp = lse_buf
 
     if precision == "mxfp8":
         sf_groups = _ceil_div(head_dim, sf_vec_size)
@@ -725,7 +690,7 @@ def indexer_fwd_compress_topk(
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         cand_cute = _to_cute_tensor(cand_gemm, leading_dim=1 if cand_2d else 0)
-        denom_cute = _to_cute_tensor(denom_tmp)
+        denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
         cbo_cute = _to_cute_tensor(cand_batch_offsets, leading_dim=0) if cand_batch_offsets is not None else None
         current_stream = resolve_stream(None)
@@ -1011,7 +976,7 @@ def _run_compress_gemm_varlen(
         # offsets back merely to validate caller-owned scratch; the caller
         # guarantees that the buffer was sized for the supplied sequence data.
         cand = cand_buffer.view(-1)
-    denom_tmp = lse_out if want_lse else _get_fwd_unified_denom_placeholder((total_q,), device)
+    denom_tmp = lse_out if want_lse else None  # dead slot compiled out (R3)
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
@@ -1051,7 +1016,7 @@ def _run_compress_gemm_varlen(
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
             cand_cute = _make_i64_cand_buffer_compile_tensor()
-            denom_cute = _to_cute_tensor(denom_tmp)
+            denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
             cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
             cu_q_scale_cute = _to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0)
@@ -1139,7 +1104,7 @@ def _run_compress_gemm_varlen(
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         cand_cute = _make_i64_cand_buffer_compile_tensor()
-        denom_cute = _to_cute_tensor(denom_tmp)
+        denom_cute = _to_cute_tensor(denom_tmp) if denom_tmp is not None else None
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
         offs_cute = _to_cute_tensor(offsets, leading_dim=0)

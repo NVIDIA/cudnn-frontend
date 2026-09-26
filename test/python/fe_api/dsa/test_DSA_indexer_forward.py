@@ -74,6 +74,186 @@ def _allocate_inputs(cfg):
     return q, k, w
 
 
+def _require_sm100():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ GPU required")
+
+
+def _sm100_mqa_inputs(b, s_q, s_k, h_q=64, d=128):
+    device = torch.device("cuda")
+    q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(b, s_k, 1, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+    return q, k, w
+
+
+def _allocation_count() -> int:
+    torch.cuda.synchronize()
+    return torch.cuda.memory_stats()["allocation.all.allocated"]
+
+
+_PLACEHOLDER_POOL_NAMES = (
+    "_denom_placeholder_cache",
+    "_denom_placeholder_cache_lock",
+    "_get_fwd_denom_placeholder",
+    "_get_fwd_unified_denom_placeholder",
+    "_return_output",
+)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_denom_slot_compiled_out(compile_allocates_nothing):
+    """Forward compiles compute_lse=False with denom=None (Rule 8, R3): no module-level placeholder pool, no per-execute allocation."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_forward import _compressed_top_k_sm100 as compressed_impl
+        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    for module in (dense_impl, compressed_impl):
+        for name in _PLACEHOLDER_POOL_NAMES:
+            assert not hasattr(module, name), f"{module.__name__}.{name} still exists"
+
+    b, s_q, s_k, ratio = 1, 128, 512, 4
+    q, k, w = _sm100_mqa_inputs(b, s_q, s_k)
+    out = torch.empty(b, s_q, s_k, dtype=torch.float32, device=q.device)
+    api = DSA.IndexerForward(q, k, w, out, ratio=ratio)
+    assert api.check_support()
+    compile_allocates_nothing(api)
+    api.execute(q, k, w, out)  # the kernel compiles lazily on the first execute
+    before = _allocation_count()
+    for _ in range(3):
+        api.execute(q, k, w, out)
+    assert _allocation_count() == before
+    check_ref_indexer_forward(q, k, w, out, ratio)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+def test_padded_out_is_bound_directly(compile_allocates_nothing):
+    """S_k % 4 != 0: the (B, S_q, ceil4(S_k)) allocation is bound through its [..., :S_k] view; no staging, no copy-back, tail untouched."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    b, s_q, s_k, ratio = 2, 1000, 1001, 1
+    s_k_padded = 1004
+    q, k, w = _sm100_mqa_inputs(b, s_q, s_k)
+    sentinel = 12345.0
+    out = torch.full((b, s_q, s_k_padded), sentinel, dtype=torch.float32, device=q.device)
+    api = DSA.IndexerForward(q, k, w, out, ratio=ratio)
+    assert api.check_support()
+    compile_allocates_nothing(api)
+    api.execute(q, k, w, out)
+    before = _allocation_count()
+    for _ in range(3):
+        api.execute(q, k, w, out)
+    assert _allocation_count() == before
+    check_ref_indexer_forward(q, k, w, out[..., :s_k], ratio)
+    assert torch.equal(out[..., s_k:], torch.full_like(out[..., s_k:], sentinel))
+
+    # The strict entry the plan binds: a contiguous (B, S_q, 1001) buffer has 4004-byte rows, not bindable; out is required.
+    plain = torch.empty(b, s_q, s_k, dtype=torch.float32, device=q.device)
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        dense_impl._indexer_fwd_bound(q, k, w, ratio=ratio, out=plain)
+    with pytest.raises(ValueError, match="requires out"):
+        dense_impl._indexer_fwd_bound(q, k, w, ratio=ratio)
+
+    # The convenience entry (imported by Megatron-LM without out=) keeps develop's torch-op contract.
+    scores = dense_impl.indexer_fwd(q, k, w, ratio=ratio)
+    assert scores.shape == (b, s_q, s_k) and scores.is_contiguous()
+    check_ref_indexer_forward(q, k, w, scores, ratio)
+    got = dense_impl.indexer_fwd(q, k, w, ratio=ratio, out=plain)
+    assert got is plain and torch.equal(plain, scores), "an unbindable caller out is staged and copied back"
+
+    scores = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio)["scores"]
+    assert scores.shape == (b, s_q, s_k) and scores.is_contiguous(), "the wrapper's default result keeps the torch-op layout"
+    check_ref_indexer_forward(q, k, w, scores, ratio)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_wrapper_ragged_k_out_layouts():
+    """S_k % 4 != 0 at the torch-op layer (the plan binds only a padded-stride view): the default result is
+    contiguous; a caller's contiguous ``out`` is filled and returned (identity kept, staged + copied back);
+    a caller's padded-stride view is bound directly; a wrong shape is refused; a non-default stream works."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    b, s_q, s_k, ratio = 2, 64, 1001, 1
+    q, k, w = _sm100_mqa_inputs(b, s_q, s_k)
+    dev = q.device
+    reference = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio)["scores"]
+    assert reference.is_contiguous()
+    check_ref_indexer_forward(q, k, w, reference, ratio)
+
+    plain = torch.full((b, s_q, s_k), -7.0, dtype=torch.float32, device=dev)
+    got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=plain)["scores"]
+    assert got is plain and torch.equal(plain, reference)
+
+    padded = torch.full((b, s_q, 1004), -7.0, dtype=torch.float32, device=dev)
+    view = padded[..., :s_k]
+    got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=view)["scores"]
+    assert got is view and torch.equal(view, reference)
+    assert torch.equal(padded[..., s_k:], torch.full_like(padded[..., s_k:], -7.0)), "the pad columns are never written"
+
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        strided_out = torch.empty(b, s_q, 2 * s_k, dtype=torch.float32, device=dev)[..., ::2]
+        got = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=strided_out, stream=side.cuda_stream)["scores"]
+    torch.cuda.synchronize()
+    assert got is strided_out and torch.equal(strided_out, reference)
+
+    with pytest.raises(ValueError, match="out must have shape"):
+        DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, out=torch.empty(b, s_q, 1004, dtype=torch.float32, device=dev))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=27)
+def test_check_support_declines_non_unit_innermost_stride():
+    """check_support() declines strided Q/K/W and a non-contiguous padded Out (Rule 2 / R5); the wrapper keeps its documented .contiguous() convenience."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    b, s_q, s_k, h_q, d, ratio = 1, 64, 256, 64, 128, 4
+    q, k, w = _sm100_mqa_inputs(b, s_q, s_k, h_q=h_q, d=d)
+    device = q.device
+    out = torch.empty(b, s_q, s_k, dtype=torch.float32, device=device)
+
+    q_t = torch.randn(b, s_q, d, h_q, dtype=torch.bfloat16, device=device).transpose(2, 3)
+    k_t = torch.randn(b, d, s_k, 1, dtype=torch.bfloat16, device=device).permute(0, 2, 3, 1)
+    w_t = torch.randn(b, h_q, s_q, dtype=torch.bfloat16, device=device).transpose(1, 2)
+    for tensor, expected_shape in ((q_t, q.shape), (k_t, k.shape), (w_t, w.shape)):
+        assert tensor.shape == expected_shape and tensor.stride(-1) != 1
+
+    for args in ((q_t, k, w), (q, k_t, w), (q, k, w_t)):
+        with pytest.raises(NotImplementedError, match="unit innermost stride"):
+            DSA.IndexerForward(*args, out, ratio=ratio).check_support()
+    out_strided = torch.empty(b, s_q, s_k + 4, dtype=torch.float32, device=device)[..., :s_k]
+    with pytest.raises(NotImplementedError, match="contiguous"):
+        DSA.IndexerForward(q, k, w, out_strided, ratio=ratio).check_support()
+
+    with pytest.raises(ValueError, match="unit innermost stride"):
+        dense_impl._indexer_fwd_bound(q_t, k, w, ratio=ratio, out=out)
+    check_ref_indexer_forward(q_t, k, w, dense_impl.indexer_fwd(q_t, k, w, ratio=ratio), ratio)
+
+    scores = DSA.indexer_forward_wrapper(q_t, k, w, ratio=ratio)["scores"]
+    check_ref_indexer_forward(q_t, k, w, scores, ratio)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_forward_params
@@ -317,6 +497,8 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
         _require_sm90()
     elif torch.cuda.get_device_capability()[0] not in (9, 10):
         pytest.skip("Requires Hopper or Blackwell")
+    if recompute and torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("Dense score recompute declines THD on SM90 (BSHD-native kernel); see test_DSA_dense_score_recompute.py")
     device = torch.device("cuda")
     shapes = [(1, 1), (3, 7), (7, 67), (11, 70)]
     h_kv, d = 1, 128

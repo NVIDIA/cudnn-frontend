@@ -252,6 +252,167 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_le
                 )
 
 
+# ---------------------------------------------------------------------------
+# Rule 8 detectors on the classes (recipes R5 / R3 / R9)
+# ---------------------------------------------------------------------------
+
+_SMALL_CFG = {"b": 2, "s_q": 8, "s_kv": 256, "head_dim": 128, "qhead_per_kv_head": 32, "topk": 128}
+
+
+def _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out, topk_length=None):
+    if score_type == "indexer":
+        return DSA.SparseIndexerScoreRecompute(
+            sample_q_indexer=q,
+            sample_k_indexer=k,
+            sample_weights=aux,
+            sample_topk_indices=topk_indices,
+            sample_out=out,
+            sample_topk_length=topk_length,
+            qhead_per_kv_head=q.shape[2],
+        )
+    return DSA.SparseAttnScoreRecompute(
+        sample_q_attn=q,
+        sample_k_attn=k,
+        sample_lse=aux,
+        sample_topk_indices=topk_indices,
+        sample_out=out,
+        softmax_scale=q.shape[-1] ** -0.5,
+        sample_topk_length=topk_length,
+        qhead_per_kv_head=q.shape[2],
+    )
+
+
+def _sparse_case(score_type, has_topk_length=False):
+    from cudnn import DSA
+
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Sparse score recompute requires SM90+")
+    q, k, aux, topk_indices, topk_length = _allocate(_SMALL_CFG, score_type, has_topk_length)
+    out = torch.empty(topk_indices.shape, dtype=torch.float32, device="cuda")
+    return DSA, q, k, aux, topk_indices, topk_length, out
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_sparse_score_recompute_output_contiguity_declined(score_type):
+    """R5: a layout the kernel cannot address natively is declined in check_support(), never copied."""
+    DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
+    b, s_q, topk = topk_indices.shape
+    out_t = torch.empty(b, topk, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)  # (b, s_q, topk) view, non-contiguous
+    with pytest.raises(NotImplementedError, match="out must be contiguous"):
+        _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out_t).check_support()
+    idx_t = torch.empty(b, topk, s_q, dtype=torch.int32, device="cuda").transpose(1, 2)
+    with pytest.raises(NotImplementedError, match="topk_indices must be contiguous"):
+        _sparse_plan(DSA, score_type, q, k, aux, idx_t, out).check_support()
+    q_strided = torch.empty(*q.shape[:-1], 2 * q.shape[-1], dtype=q.dtype, device="cuda")[..., ::2]  # innermost stride 2
+    with pytest.raises(NotImplementedError, match="Q must have a unit innermost stride"):
+        _sparse_plan(DSA, score_type, q_strided, k, aux, topk_indices, out).check_support()
+    assert _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_sparse_score_recompute_wrapper_stages_noncontiguous_out(score_type):
+    """The eager wrapper fills a non-contiguous caller ``out`` (staged + copied back, identity kept); the class declines it."""
+    DSA, q, k, aux, topk_indices, _, _ = _sparse_case(score_type)
+    b, s_q, topk = topk_indices.shape
+    out_t = torch.empty(b, topk, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)
+    if score_type == "indexer":
+        reference = DSA.sparse_indexer_score_recompute_wrapper(q, k, aux, topk_indices, qhead_per_kv_head=q.shape[2])["predict"]
+        got = DSA.sparse_indexer_score_recompute_wrapper(q, k, aux, topk_indices, qhead_per_kv_head=q.shape[2], out=out_t)["predict"]
+    else:
+        scale = q.shape[-1] ** -0.5
+        reference = DSA.sparse_attn_score_recompute_wrapper(q, k, aux, topk_indices, scale, qhead_per_kv_head=q.shape[2])["target"]
+        got = DSA.sparse_attn_score_recompute_wrapper(q, k, aux, topk_indices, scale, qhead_per_kv_head=q.shape[2], out=out_t)["target"]
+    torch.cuda.synchronize()
+    assert got is out_t
+    torch.testing.assert_close(out_t, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_sparse_score_recompute_execute_requires_outputs(score_type, compile_allocates_nothing):
+    """out is a required execute argument, re-validated live (Rule 1): missing raises, a strided view raises."""
+    DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
+    plan = _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    with pytest.raises(TypeError):
+        plan.execute(q, k, aux, topk_indices)
+    b, s_q, topk = topk_indices.shape
+    out_t = torch.empty(b, topk, s_q, dtype=torch.float32, device="cuda").transpose(1, 2)
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        plan.execute(q, k, aux, topk_indices, out_t)
+    with pytest.raises(ValueError, match="topk_length was not declared"):
+        plan.execute(q, k, aux, topk_indices, out, topk_length=torch.ones(b, s_q, dtype=torch.int32, device="cuda"))
+
+
+def _executes_allocate_nothing(plan, run, repeats=3):
+    """R9: warm once, then no torch allocation and no host sync across ``repeats`` executes."""
+    run()  # warm: the score backend compiles on the first execute
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(repeats):
+            run()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    return torch.cuda.memory_stats()["allocation.all.allocated"] - before
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@pytest.mark.parametrize("has_topk_length", [False, True])
+@torch_fork_set_rng(seed=7)
+def test_DSA_sparse_score_recompute_execute_allocates_nothing_and_never_synchronizes(score_type, has_topk_length, compile_allocates_nothing):
+    from cuda.bindings import driver as cuda
+
+    DSA, q, k, aux, topk_indices, topk_length, out = _sparse_case(score_type, has_topk_length)
+    plan = _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out, topk_length)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    delta = _executes_allocate_nothing(plan, lambda: plan.execute(q, k, aux, topk_indices, out, topk_length=topk_length, current_stream=stream))
+    if torch.cuda.get_device_capability()[0] == 9 and delta != 0:
+        pytest.xfail("SM90 keeps the per-head (B,S,H)->(B,H,S) transpose copy (Rule 8 batch item D4, deferred)")
+    assert delta == 0, f"{type(plan).__name__}.execute() made {delta} torch allocation(s) across 3 warm executes"
+    check_ref_sparse_score_recompute(
+        score_type,
+        q,
+        k if score_type == "indexer" else aux,
+        topk_indices,
+        out,
+        aux=aux if score_type == "indexer" else k,
+        softmax_scale=q.shape[-1] ** -0.5,
+        topk_length=topk_length,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=8)
+def test_DSA_sparse_score_recompute_sm100_topk_length_none_compiles_out(score_type, monkeypatch):
+    """R3: without topk_length the SM100 mTopkLength slot is None at compile and launch (no (1,1) placeholder), keyed have_topk_length=False."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100 sparse score kernel")
+    from cuda.bindings import driver as cuda
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm100
+
+    fn = _interface_sm100._sparse_indexer_score_recompute if score_type == "indexer" else _interface_sm100._sparse_attn_score_recompute
+    monkeypatch.setattr(fn, "compile_cache", {})
+    DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
+    plan = _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out)
+    assert plan.check_support()
+    plan.compile()
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    delta = _executes_allocate_nothing(plan, lambda: plan.execute(q, k, aux, topk_indices, out, current_stream=stream))
+    assert delta == 0, f"a dead topk_length slot must be compiled out, not allocated per execute ({delta} allocations)"
+    (key,) = fn.compile_cache.keys()
+    assert key[-3] is False, f"compile key must carry have_topk_length=False: {key}"
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("topk", [384, 1152])
 def test_DSA_sparse_indexer_score_recompute_resets_partial_tmem_ring(topk):

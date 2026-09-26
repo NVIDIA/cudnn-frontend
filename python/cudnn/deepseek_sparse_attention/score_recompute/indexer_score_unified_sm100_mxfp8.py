@@ -185,7 +185,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         mQScale: cute.Tensor,
         mKScale: cute.Tensor,
         mOut: cute.Tensor,
-        mDenom: cute.Tensor,
+        mDenom: cute.Tensor | None,
         softmax_scale: Float32 | float,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -197,6 +197,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         stream: cuda.CUstream,
         mCandBatchOffsets: cute.Tensor | None = None,
     ):
+        # mDenom is None when compute_lse is off: the slot is compiled out (R3).
         # Runtime tensor metadata is needed to build CuTe layouts and compile
         # the matching kernel.  The element dtypes become compile-time constants
         # inside cute.compile.
@@ -392,8 +393,11 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
             mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
 
-        Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
-        mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
+        if const_expr(mDenom is not None):
+            Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
+            mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
+        else:
+            assert not self.compute_lse, "mDenom is None but compute_lse=True writes the denominator"
 
         # Persistent scheduler grid: one logical work tile per m block and
         # batch.  The kernel itself walks all dense K blocks for that m tile.
@@ -524,7 +528,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         S_mbar_ptr,
         reduce_sync_mbar_ptr,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         num_n_blocks_compute,
         seqlen_k,
         seqlen_q,
@@ -730,7 +734,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         S_mbar_ptr,
         reduce_sync_mbar_ptr,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         num_n_blocks_compute,
         seqlen_k,
         seqlen_q,
@@ -952,7 +956,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         mQScale,
         mKScale,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         softmax_scale: Float32 | float,
         tma_atom_Q,
         tma_atom_K,
@@ -1517,7 +1521,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         mOut_cur = mOut
                     else:
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
-                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
+                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1) if const_expr(mDenom is not None) else None
                     if cutlass.const_expr(self.qhead_per_kvhead == 64):
                         # Preserve the tuned QH64 single-token specialization.
                         s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
@@ -1611,7 +1615,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         mOut_cur = mOut
                     else:
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
-                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
+                    mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1) if const_expr(mDenom is not None) else None
                     if cutlass.const_expr(self.qhead_per_kvhead == 64):
                         # Preserve the tuned QH64 single-token specialization.
                         s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(

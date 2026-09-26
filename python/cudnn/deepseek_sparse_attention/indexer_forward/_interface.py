@@ -4,13 +4,14 @@
 """
 Indexer Forward Interface — CuTe DSL backend.
 
-Wraps IndexerForwardSm100 (DSL kernel) with compile caching, TMA padding,
-and torch.Tensor ↔ cute.Tensor conversion.
+Wraps IndexerForwardSm100 (DSL kernel) with compile caching and
+torch.Tensor ↔ cute.Tensor conversion. The dense path binds the caller's
+``out`` view directly (no staging buffer, no copy-back) and compiles the
+unused LSE slot out.
 """
 
 from __future__ import annotations
 
-from threading import Lock
 from typing import Optional
 
 import torch
@@ -21,6 +22,7 @@ import cutlass.cute as cute
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from .indexer_fwd_sm100_mxfp8 import IndexerForwardSm100Mxfp8
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+from cudnn._torch_stream import copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
     maybe_contiguous as _maybe_contiguous,
@@ -84,57 +86,43 @@ def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) 
         raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
 
 
-def _return_output(
+# The score kernel binds ``out`` through a 16-byte-aligned dynamic layout, so
+# the fp32 row stride must be a multiple of 4 elements (and cover ceil4(S_k)).
+TMA_ALIGN_ELEMS = 4
+
+
+def padded_seqlen_k(seqlen_k: int) -> int:
+    return _ceil_div(int(seqlen_k), TMA_ALIGN_ELEMS) * TMA_ALIGN_ELEMS
+
+
+def _validate_out_view(
     out: torch.Tensor,
-    out_orig: Optional[torch.Tensor],
-    *,
-    need_pad: bool,
-    current_stream=None,
-) -> torch.Tensor:
-    with _torch_stream_context(current_stream):
-        if out_orig is not None and out.data_ptr() != out_orig.data_ptr():
-            out_orig.copy_(out)
-            return out_orig
-        if out_orig is None and need_pad:
-            return out.contiguous()
-    return out
+    out_shape: tuple[int, ...],
+    seqlen_k_dim: int,
+    device: torch.device,
+) -> None:
+    seqlen_k_padded = padded_seqlen_k(seqlen_k_dim)
+    if out.dtype != torch.float32 or not out.is_cuda or out.device != device:
+        raise ValueError(f"out must be a float32 CUDA tensor on {device}, got {out.dtype} on {out.device}")
+    if tuple(out.shape) != out_shape:
+        raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+    strides = tuple(out.stride())
+    if (
+        strides[-1] != 1
+        or strides[-2] % TMA_ALIGN_ELEMS != 0
+        or strides[-2] < seqlen_k_padded
+        or any(s % TMA_ALIGN_ELEMS for s in strides[:-2])
+        or out.data_ptr() % 16
+    ):
+        padded_shape = (*out_shape[:-1], seqlen_k_padded)
+        raise ValueError(
+            f"out must be a view with a {seqlen_k_padded}-element (16-byte-aligned) row stride; "
+            f"allocate {padded_shape} fp32 and pass out[..., :{seqlen_k_dim}]; got strides {strides}"
+        )
 
 
 # Module-level compile cache
 _compile_cache: dict = {}
-_denom_placeholder_cache: dict = {}
-_denom_placeholder_cache_lock = Lock()
-
-
-def _get_fwd_denom_placeholder(
-    shape: tuple[int, ...],
-    device: torch.device,
-    current_stream=None,
-) -> torch.Tensor:
-    """Return a shaped view backed by a stable power-of-two capacity bucket."""
-    if device.type == "cuda":
-        device_index = torch.cuda.current_device() if device.index is None else device.index
-        alloc_device = torch.device("cuda", device_index)
-    else:
-        device_index = device.index
-        alloc_device = device
-
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    capacity = 1 << (max(1, numel) - 1).bit_length()
-    key = (alloc_device.type, device_index, len(shape), capacity)
-
-    # Buckets are never replaced or evicted: CUDA graphs may retain the
-    # placeholder address captured during warmup. The lock prevents concurrent
-    # first-use allocations from racing to populate the same bucket.
-    with _denom_placeholder_cache_lock:
-        cached = _denom_placeholder_cache.get(key)
-        if cached is None:
-            with _torch_stream_context(current_stream):
-                cached = torch.empty((capacity,), dtype=torch.float32, device=alloc_device)
-            _denom_placeholder_cache[key] = cached
-    return cached[:numel].view(shape)
 
 
 def indexer_fwd(
@@ -200,8 +188,16 @@ def indexer_fwd(
         w: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)`` [BF16]
         ratio: compression ratio (int), default 4
         qhead_per_kv_head: auto inferred if None
-        out: optional output tensor. BSHD: ``(bs, seqlen_q, seqlen_k)``.
-             THD: ``(total_q, max_seqlen_k)`` with local-K columns.
+        out: optional dense-score output (must be ``None`` for the compressed
+             path). BSHD: ``(bs, seqlen_q, seqlen_k)``; THD:
+             ``(total_q, max_seqlen_k)`` with local-K columns. ``None``
+             allocates on ``current_stream`` and returns a contiguous result.
+             A caller ``out`` whose row stride is a multiple of 4 fp32 elements
+             and at least ``ceil4(seqlen_k)`` (e.g. ``buf[..., :seqlen_k]`` of a
+             ``(..., ceil4(seqlen_k))`` allocation) is bound directly; any other
+             layout of the logical shape is staged and copied back (identity
+             kept). Strided q/k/w/q_scale/k_scale are made contiguous here.
+             ``_indexer_fwd_bound`` is the strict, allocation-free entry.
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         precision: ``"bf16"`` for the existing BF16 kernel or ``"mxfp8"``
             for the SM100 MXFP8 kernel.
@@ -224,9 +220,6 @@ def indexer_fwd(
                ``(total_q, max_seqlen_k)`` [FP32]
     """
     current_stream = resolve_stream(current_stream)
-    q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
-    q_scale = _maybe_contiguous(q_scale, current_stream)
-    k_scale = _maybe_contiguous(k_scale, current_stream)
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
@@ -251,7 +244,12 @@ def indexer_fwd(
 
         # All eager allocations, copies, both kernel launches, and the optional
         # local-to-global conversion must use the caller-selected stream.
+        # The compressed path is a torch-op layer (no APIBase engine), so it
+        # keeps the strided-input .contiguous() convenience.
         with _torch_stream_context(current_stream):
+            q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
+            q_scale = _maybe_contiguous(q_scale, current_stream)
+            k_scale = _maybe_contiguous(k_scale, current_stream)
             if cu_seqlens_q is not None or cu_seqlens_k is not None:
                 if cu_seqlens_q is None or cu_seqlens_k is None:
                     raise ValueError("THD compressed-logits top-k requires both cu_seqlens_q and cu_seqlens_k")
@@ -318,6 +316,123 @@ def indexer_fwd(
                     deterministic=deterministic,
                 )
 
+    # Dense convenience layer (torch-op semantics; ``IndexerForward`` binds
+    # ``_indexer_fwd_bound`` directly and declines all of this in check_support).
+    q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
+    q_scale = _maybe_contiguous(q_scale, current_stream)
+    k_scale = _maybe_contiguous(k_scale, current_stream)
+    out_shape, seqlen_k_dim = _dense_out_shape(q, k, cu_seqlens_q, max_seqlen_k)
+    out_orig = out
+    if out is not None:
+        if out.dtype != torch.float32 or not out.is_cuda or out.device != q.device:
+            raise ValueError(f"out must be a float32 CUDA tensor on {q.device}, got {out.dtype} on {out.device}")
+        if tuple(out.shape) != out_shape:
+            raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+        try:
+            _validate_out_view(out, out_shape, seqlen_k_dim, q.device)
+        except ValueError:
+            out = None  # not bindable: staged through a padded buffer and copied back
+    need_pad = padded_seqlen_k(seqlen_k_dim) != seqlen_k_dim
+    if out is None:
+        with _torch_stream_context(current_stream):
+            out = torch.empty((*out_shape[:-1], padded_seqlen_k(seqlen_k_dim)), dtype=torch.float32, device=q.device)[..., :seqlen_k_dim]
+    _indexer_fwd_bound(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=qhead_per_kv_head,
+        out=out,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        num_threads=num_threads,
+        q_stage=q_stage,
+        kv_stage=kv_stage,
+        sm_scale=sm_scale,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
+        precision=precision,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+        sf_vec_size=sf_vec_size,
+        current_stream=current_stream,
+    )
+    return _finish_dense_out(out, out_orig, need_pad=need_pad, current_stream=current_stream)
+
+
+def _dense_out_shape(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    max_seqlen_k: Optional[int],
+) -> tuple[tuple[int, ...], int]:
+    if cu_seqlens_q is not None:
+        if max_seqlen_k is None:
+            raise ValueError("THD input requires max_seqlen_q and max_seqlen_k")
+        return (int(q.shape[0]), int(max_seqlen_k)), int(max_seqlen_k)
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError(f"BSHD q/k must be 4D, got q {tuple(q.shape)} k {tuple(k.shape)}")
+    return (int(q.shape[0]), int(q.shape[1]), int(k.shape[1])), int(k.shape[1])
+
+
+def _finish_dense_out(
+    out: torch.Tensor,
+    out_orig: Optional[torch.Tensor],
+    *,
+    need_pad: bool,
+    current_stream=None,
+) -> torch.Tensor:
+    """Copy a staged result back into the caller's ``out`` (identity kept) or make an allocated padded view contiguous."""
+    with _torch_stream_context(current_stream):
+        if out_orig is not None and out_orig is not out:
+            copy_into_on_stream(out_orig, out, current_stream, out_orig.device)  # R1 staging: the destination is recorded first
+            return out_orig
+        if out_orig is None and need_pad:
+            return out.contiguous()
+    return out
+
+
+def _indexer_fwd_bound(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ratio: int = 4,
+    qhead_per_kv_head: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    num_threads: int = 384,
+    q_stage: int = 2,
+    kv_stage: int = 4,
+    sm_scale: float = 1.0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
+    *,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    current_stream=None,
+) -> torch.Tensor:
+    """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
+    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
+    current_stream = resolve_stream(current_stream)
+    precision = precision.lower()
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if ratio <= 0:
+        raise ValueError(f"ratio must be > 0, got {ratio}")
+
     if precision == "bf16":
         for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
             assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
@@ -335,6 +450,12 @@ def indexer_fwd(
             raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
         if sf_vec_size != 32:
             raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
+
+    # The kernel addresses these natively through a unit innermost stride;
+    # IndexerForward.check_support() declines anything else (Rule 2 / R5).
+    for tensor, name in ((q, "q"), (k, "k"), (w, "w"), (q_scale, "q_scale"), (k_scale, "k_scale")):
+        if tensor is not None and tensor.stride(-1) != 1:
+            raise ValueError(f"indexer_fwd reads {name} with a unit innermost stride natively; got strides {tuple(tensor.stride())}")
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -363,7 +484,6 @@ def indexer_fwd(
         seqlen_k_dim = int(max_seqlen_k)
         device = q.device
         out_shape = (total_q, seqlen_k_dim)
-        out_buf_shape = None
     else:
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
@@ -371,7 +491,6 @@ def indexer_fwd(
         if seqlen_q_dim > seqlen_k_dim * ratio:
             raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
-        out_buf_shape = None
 
     if n_heads_kv != 1:
         raise ValueError("SM100 indexer forward currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}")
@@ -431,29 +550,15 @@ def indexer_fwd(
             if tuple(k_scale.shape) != k_shape:
                 raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
 
-    # TMA S2G requires globalStride aligned to 16 bytes.
-    # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).
-    TMA_ALIGN_ELEMS = 4
-    seqlen_k_padded = (seqlen_k_dim + TMA_ALIGN_ELEMS - 1) // TMA_ALIGN_ELEMS * TMA_ALIGN_ELEMS
-    need_pad = seqlen_k_padded != seqlen_k_dim
-    out_orig = out
-
-    if need_pad:
-        out_buf_shape = (total_q, seqlen_k_padded) if is_varlen else (bs, seqlen_q_dim, seqlen_k_padded)
-        with _torch_stream_context(current_stream):
-            out_buf = torch.empty(out_buf_shape, dtype=torch.float32, device=device)
-        out = out_buf[:, :seqlen_k_dim] if is_varlen else out_buf[:, :, :seqlen_k_dim]
-    elif out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty(out_shape, dtype=torch.float32, device=device)
-    else:
-        assert out.shape == out_shape, f"out must have shape {out_shape}, got {tuple(out.shape)}"
-        assert out.dtype == torch.float32 and out.is_cuda
+    if out is None:
+        raise ValueError(
+            f"indexer_fwd requires out: allocate {(*out_shape[:-1], padded_seqlen_k(seqlen_k_dim))} fp32 and pass "
+            f"out[..., :{seqlen_k_dim}] (indexer_forward_wrapper allocates it for you)"
+        )
+    _validate_out_view(out, out_shape, seqlen_k_dim, device)
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None
-        denom_tmp_shape = (total_q,) if is_varlen else (bs, seqlen_q_dim)
-        denom_tmp = _get_fwd_denom_placeholder(denom_tmp_shape, device, current_stream=current_stream)
         compile_key = (
             "mxfp8",
             q.dtype,
@@ -479,7 +584,7 @@ def indexer_fwd(
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
             out_cute = _to_cute_tensor(out)
-            denom_cute = _to_cute_tensor(denom_tmp)
+            denom_cute = None  # compute_lse=False: dead slot, compiled out (R3)
             cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
             cu_q_scale_cute = _to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen else None
@@ -538,7 +643,7 @@ def indexer_fwd(
                 q_scale,
                 k_scale,
                 out,
-                denom_tmp,
+                None,
                 scale_arg,
                 max_q_arg,
                 max_k_arg,
@@ -549,12 +654,10 @@ def indexer_fwd(
                 q_causal_offsets,
                 current_stream,
             )
-        return _return_output(out, out_orig, need_pad=need_pad, current_stream=current_stream)
+        return out
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
-    denom_tmp_shape = (total_q,) if is_varlen else (bs, seqlen_q_dim)
-    denom_tmp = _get_fwd_denom_placeholder(denom_tmp_shape, device, current_stream=current_stream)
     compile_key = (
         "bf16",
         q.dtype,
@@ -575,7 +678,7 @@ def indexer_fwd(
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         out_cute = _to_cute_tensor(out)
-        denom_cute = _to_cute_tensor(denom_tmp)
+        denom_cute = None  # compute_lse=False: dead slot, compiled out (R3)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
         q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
@@ -626,7 +729,7 @@ def indexer_fwd(
             k,
             w,
             out,
-            denom_tmp,
+            None,
             scale_arg,
             max_q_arg,
             max_k_arg,
@@ -635,4 +738,4 @@ def indexer_fwd(
             q_causal_offsets,
             current_stream,
         )
-    return _return_output(out, out_orig, need_pad=need_pad, current_stream=current_stream)
+    return out
