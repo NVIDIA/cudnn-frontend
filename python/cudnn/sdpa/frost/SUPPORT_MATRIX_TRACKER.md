@@ -11,9 +11,10 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 `score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
 **declined by every FROST SDPA engine on every arch**.
 
-**Base-2 stats (`stats_use_log2`)** are served natively by every FROST forward
-engine: the request is a plan-time epilogue specialization (natural-log LSE
-scaled by log2(e) right before the store; -inf rows stay -inf). It is a
+**Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
+SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
+specialization (natural-log LSE scaled by log2(e) right before the store; -inf
+rows stay -inf). It is a
 convention gate rather than a kernel feature — serving a base-2 request with
 natural-log values would be correct O plus silently wrong Stats, so the
 capability row must stay in step with the kernels. Under split-KV the per-split
@@ -54,6 +55,153 @@ the graph rides another flavor's envelope with TMA zero-padding (correct, but pa
 the larger flavor's MMA cost) · ❔ **accepted by the capability row but not
 validated on this path** — treat as untested, not as a guarantee · ❌ declined at
 plan time · — not applicable · ⁿ footnote.
+
+---
+
+## SM90 (Hopper, cc 9.0 exactly)
+
+Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (opt-in).
+Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
+all use FP16 or all BF16. The native head tile is **(512, 512)**. The row's
+envelope is floored at 256 (`d_envelope_floors`): `D_QK` and `D_V`
+independently accept positive multiples of 8 in **(256, 512]**, and the exact
+native hit always passes. Pairs inside the envelope are **envelope-served at
+the full D512 compute cost**, with TMA zero-fill and output clipping, so the
+floor caps that at 2x padding.
+
+The floor is a **routing** change, not only a claim change: SM90 is the only
+cc-9.0 row, so an f16/bf16 Hopper graph with either head dim at or below 256
+now gets no FROST plan at all and falls back to the cuDNN backend. Unfloored,
+this row led the preference order and took such graphs at up to 64x
+zero-padding. Deliberate asymmetry: `config_sm90.head_dims_mismatch` still
+serves every multiple of 8 in `(0, 512]`, so a direct standalone-adapter caller
+keeps the full envelope — the row is narrower than the adapter, which is the
+safe direction.
+
+H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
+torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
+this tree, run from the development checkout against this package — gave 1115
+passed, 2 skipped (both the intentional protocol-fault diagnostic) and 1 failed
+before the sink-at-decode refusal was dropped; seven of those files drive the
+graph API, so the run covers `mismatch`, the lowering and the binding. After
+the drop, the two files that pin refusals were re-run: 394 passed, 3 failed.
+Every failure, before or after, is a test pinning the superseded
+sink-at-decode behaviour, to be inverted when that suite lands here:
+`test_shared_contract_validator_refusals[sink]` (the validator rule #1095
+removed), `test_shared_contract_native_refusal_table[sink]` and
+`test_standalone_wrapper_refusals[sq1-sink]` (the SM90 refusal). The sink at
+`S_q == 1` itself: `test_sdpa_fwd_dsl_sm90.py` — landing here, repinning
+`test_sdpa_fwd_dsl_sm100.py`'s `_ARCH` to run that suite at SM90's head dim plus
+the SM90-only half (envelope floor, adapter declines, template, THD arm,
+wrapper) — was RED with the refusal (five typed declines at build, under a
+strict pin) and is green without it; a one-off FP64 probes matched 61/61 cases
+(fp16/bf16, MHA/GQA/MQA, `S_kv` 1/63/64/65/129, unmasked / top-left /
+bottom-right / left window / right band
+/ both bounds, zero-KV and trimmed-Q batches, PackGQA with sinks ±20 / 0 /
+−inf, Stats natural / base-2 / omitted, head dims (192, 128), and a THD
+envelope of one in the sequence- and cumulative-length forms with both packed
+Stats layouts), and the same graph ran on an explicit stream with torch's sync
+detector in error mode, through rebound buffers, and under CUDA-graph replay,
+bit-identical to eager. No kernel change was needed. Other DSL versions are
+unverified.
+
+| Feature | Native (512, 512) / envelope (256, 512], independently ×8ʷ |
+|---|:--:|
+| FP16 / BF16 Q/K/V/O | ✅ / ⚠️ |
+| Dense layouts within `dense_flex`, with native TMA stride alignment | ✅ / ⚠️ |
+| Packed token-major THD Q/K/V/O | ✅ / ⚠️ |
+| Optional FP32 Stats, natural-log or base-2 (`stats_use_log2`); strided / permuted dense Stats within `dense_flex`; packed THD token-major / head-major Stats | ✅ / ⚠️ |
+| Unmasked / top-left causal / bottom-right causal | ✅ / ⚠️ |
+| Left/right diagonal bands; bottom-right requires a right bound | ✅ / ⚠️ |
+| Bottom-right or left-window `S_q > S_kv` with padding or THD | ✅ / ⚠️ |
+| Dense padding with INT32 per-batch Q/KV lengths and Stats | ✅ / ⚠️ |
+| THD INT32 sequence or cumulative Q/KV lengths | ✅ / ⚠️ |
+| Ragged `S_kv` (no tile rule; masked natively, no synthesized lengths) | ✅ / ⚠️ |
+| GQA / MQA; dense PackGQA when the head ratio divides 64 | ✅ / ⚠️ |
+| Decode-shaped (`S_q == 1`) | ✅ / ⚠️ |
+| Per-head FP32 sink at any `S_q`, decode (`S_q == 1`, declared explicitly by the row) included: a keyless row is O = 0 / LSE = sink, a `seq_len_q`-trimmed row stays O = 0 / LSE = −inf | ✅ / ⚠️ |
+| Host scale, including literal zero and negative values (the sign is a compile-time specialization) | ✅ / ⚠️ |
+| Softmax precision unset / FLOAT | ✅ / ⚠️ |
+| FP8/MXFP8, Amax_O output, mixed output dtype, bias, paged KV, fused epilogue gate, backward | ❌ |
+| Dense-padded THD Stats; dense cumulative lengths or Q-only trim | ❌ |
+| Either head dim ≤ 256 (below the envelope floor; served by the adapter directly, not by this row) | ❌ |
+
+The following are **declined, pending**:
+
+| Case | Current enforcement |
+|---|---|
+| Unpadded bottom-right `S_q > S_kv` | Shared validator; native declaration for direct callers |
+| Unpadded left-window `S_q > S_kv`, including vacuous raw bounds | Shared validator; native declaration |
+| Bottom-right band with only a left bound | Shared eligibility; contradictory direct constructor arguments |
+| Tight-tail dense layouts outside `dense_flex` | Shared eligibility; native declaration |
+| THD PackGQA | Shared eligibility; native declaration |
+| Head-major THD data, including `S_max == 1` | Shared eligibility where detectable; native declaration always |
+| THD with `SCHED_LPT` or `SCHED_LPT_L2` | Native declaration at build |
+| Gapped THD sequences | Caller-contract violation; offset values are never read, so this is not detected |
+
+Explicit records stay partial: `{}` exports `{}` before and after build.
+The adapter defaults to unpacked execution. Dense causal and right-widened
+declarations take LPT_L2 while one KV head's K+V (`S_kv·(D_QK+D_V)·2` bytes)
+fits 50 MiB and LPT above it, the shared SM100/SM120 rule; others take NATURAL. Heuristics use the shared
+ordering (for example, 8/2 GQA packs first at `S_q=32`, unpacked first at `S_q=1024`), and
+THD offers NATURAL/unpacked only. Requested values remain unchanged; public
+float and string knob keys follow shared integer coercion. Tiles are 64/64,
+CGA and split-KV are 1; split-KV >1 declines. Schedulers are NATURAL, plain
+LPT, and LPT_L2 blocks of a power of two of whole KV groups within 50 MiBʷ.
+
+Dense launches attention with zero workspace. THD launches setup then attention
+with `align128(16*B+16) + 128*(B+3)` bytes: the Int32 metadata, then `B+3`
+tensor maps in SM100's slot order, carved as one plain chunk. The maps need an
+absolute 128-byte boundary, so the workspace base must be 128-byte aligned (a
+torch allocation is); the compiled launcher refuses any other base before
+either launch. The shared carver copies a non-view-flattenable rank-2
+workspace, while a 1-D strided workspace reaches the adapter and is refused.
+Capture safety requires a contiguous or view-flattenable workspace.
+
+THD sequences start at packed Q/KV prefixes times each port's token stride.
+Ragged-offset declarations are required for THD Stats, but their values and
+multipliers are never read. Stats packing uses the shared classifier; a
+head-major head stride covering the live total is a caller contract, as on the
+sibling adapters (Rule S1). Accessed padded V rows must be finite. O, Stats and
+workspace must not overlap other operands (caller contract, unchecked as on the
+sibling adapters), and storage must outlive the stream.
+
+SM90 is an ordinary `ENGINE_SPECS` row using the unchanged shared validator,
+matcher, heuristics, lowering and binding. Native refusals are owned by
+`SdpaFwdDslSm90.check_support`, as in the sibling adapters; the adapter shares
+`api_dsl.py` with SM80 and SM120 and is exported lazily from `cudnn.sdpa.fwd`.
+The row is additive: `mismatch`, `recommend`, the validator, the lowering and
+the binding are unchanged by it, so the nine other rows' eligibility and
+ordering are what they were. That is a statement about the host code, not
+numerical validation on those architectures.
+
+ʷ **The kernel (`sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
+`setmaxnreg` (24, 240, 240). WG0 issues the TMA loads, WG1 runs QK (m64n64k512,
+SS), the online softmax and PV on O columns [0, 256) (RS), WG2 PV on [256, 512)
+(SS) from the P WG1 stages in SMEM — the head dim splits because a 64-row FP32 O
+accumulator over 512 columns costs 256 registers per thread against a WGMMA `N`
+of at most 256. Q, K and V/O are single-stage 64 × 512 regions of eight SW128
+slabs, V and O aliasing one: 222,408 B of 232,448 B, so **one CTA per SM**, and
+single-stage K/V means **the producer cannot run a KV tile ahead**. P is the one
+multi-stage region, a three-stage WG1→WG2 ring; alpha and the inverse row sums
+cross through FP32 SMEM arrays. The KV walk is reverse: boundary tiles mask,
+interior ones do not. SW128 only: `wgmma_descriptor` hard-codes the 8-row ×
+128-byte atom, so a narrower swizzle would be misread, and the head tile is whole
+slabs (512 × 2 B is eight). The scale's sign is a compile-time specialization (a
+negative scale anchors each row at its raw minimum), plus an FP64 path for scales
+that would overflow the FP32 products.
+**LPT_L2 departs from the shared rule**: SM120 passes the raw 50 MiB, so its
+block is `floor(budget / per-group)` KV groups; SM90 floors that count to a power
+of two. The raw width measured 3–14 % slower here (short last block under one
+wave); a balanced width is the follow-up.
+**Measured** on H200 (132 SMs), bf16, forward with O + Stats, against cuDNN
+9.24.0 (FE 1.30.0, CUDA 13.0, DSL 4.8.0.dev0, 5 alternating rounds; SOL against
+the 1071 TFLOPS BF16 MMA peak). DeepSeek-V4 Flash, the #991 set (b=2, 64/1 heads,
+causal + SWA 128), `S` 2k / 4k / 8k / 16k: 3.57 / 3.70 / 3.82 / 3.95x, 201–217
+TFLOPS against 55–57, 18.8–20.3 % SOL. Gemma4 full attention (b=1, 32/4 heads,
+causal), same lengths: 5.46 / 5.72 / 5.78 / 5.72x, 491–577 TFLOPS against
+90–100, 45.8–53.9 % SOL. The windowed shape's lower SOL is per-CTA fixed cost
+over its three KV tiles.
 
 ---
 
@@ -1000,15 +1148,16 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
-| Backward pass entirely | SM107 |
+| Backward pass entirely | SM90, SM107 |
 | Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward split-KV, PackGQA | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, THD on all of them as of 2026-09-09, and the dense padded-Q trim as of #1037; these two are the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
+| f16/bf16 forward split-KV | SM90, SM107 (Rubin), SM80 — none sets `split_kv_supported` |
+| f16/bf16 forward PackGQA | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, THD on all of them as of 2026-09-09, and the dense padded-Q trim as of #1037; this is the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
-| MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
+| MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
@@ -1017,13 +1166,13 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
-| Bias forward | SM100, SM107, SM120 |
+| Bias forward | SM90, SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 and per-tensor FP8 d128 (see ᵖ); the d512 flavor, mxfp8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries, the attention sink and a block-scaled O (`sf_o`) over FP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
-| Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ): SM107 f16/bf16 and SM120 f16/bf16 accept it since the validator lift (f16/bf16 `sdpa()` graphs only) but are ❔; the FP8 / MXFP8 rows were never gated by that rule and stay ❔ as before |
+| Attention sink at `S_q == 1` validated | every row except SM100/SM103 f16/bf16 (see ˢ) and SM90 f16/bf16: SM107 f16/bf16 and SM120 f16/bf16 accept it since the validator lift (f16/bf16 `sdpa()` graphs only) but are ❔; the FP8 / MXFP8 rows were never gated by that rule and stay ❔ as before. SM90 f16/bf16 is validated too (H200, `test_sdpa_fwd_dsl_sm90.py`: the #1095 accept graphs under a strict SM90 pin — dense packed / unpacked with a keyless batch, a THD envelope of one in both packed Stats layouts, base-2 Stats); paged KV and split-KV stay declined there by their own rows |
 | Paged FP8 decode tile: the d128 paged FP8 kernel is a prefill tile (one 128-row Q tile per batch and KV head), so a decode-shaped (`S_q <= 8`) paged FP8 graph runs it FROST-first under the opt-in — fp8 d128 paged decode, S_q=1, B=32, 96/8 heads (group 12 does not divide the tile, PackGQA off, one live row per tile), B200: prefill tile 807 us vs the backend engine 54.9 us (ᵖ); follow-up: an fp8 d128 decode tile (the quantized twin of ᵈᵗ) | SM100, SM103 — per-tensor FP8 paged d128 |
 | Paged FP8 short-`S_q` prefill: an S_q=64 fp8 paged prefill graph (B=4, 16/4 heads, d128, page 16, max KV 2048, e4m3, bf16 O) defaults to the FROST `PACK_GQA=1` / `SPLIT_KV=2` plan at 50.0 us GPU / 186-189 us CPU enqueue against the backend engine's 28.7 us / 15-16 us (148-SM SM100, cuDNN 9.25.1, independent review measurement; B200 / cuDNN 9.26: 204.7 vs 30.4 us at S_q=64, 135.6 vs 31.9 us at S_q=512, ᵖ); follow-up: the prefill tile's tile / split heuristics for short-`S_q` paged fp8 and the fp8 d128 decode tile's MTP reach | SM100, SM103 — per-tensor FP8 paged d128 |
 

@@ -744,8 +744,15 @@ cudnn.sdpa.fwd.SdpaFwdDslSm80.compile
 cudnn.sdpa.fwd.SdpaFwdDslSm80.execute
 cudnn.sdpa.fwd.SdpaFwdDslSm80.paged
 cudnn.sdpa.fwd.SdpaFwdDslSm80.scratch_workspace_bytes
+cudnn.sdpa.fwd.SdpaFwdDslSm90
+cudnn.sdpa.fwd.SdpaFwdDslSm90.check_support
+cudnn.sdpa.fwd.SdpaFwdDslSm90.compile
+cudnn.sdpa.fwd.SdpaFwdDslSm90.execute
+cudnn.sdpa.fwd.SdpaFwdDslSm90.paged
+cudnn.sdpa.fwd.SdpaFwdDslSm90.scratch_workspace_bytes
 cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm100
 cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm120
+cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm90
 cudnn.sdpa.fwd.sdpa_fwd_wrapper_sm80
 cudnn.set_stream
 cudnn.tensor
