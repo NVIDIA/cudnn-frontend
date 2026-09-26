@@ -2571,6 +2571,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.gate_desc is None
         ):
             return False
+        if self.paged and self.paged_table_stride != self.paged_table_v_stride:
+            # The pointer ABI has one table-stride pair. Retain the tensor
+            # compiler's two declared layouts for this existing static route.
+            return False
         from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
         return self.thd or all(

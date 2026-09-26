@@ -1159,6 +1159,7 @@ def _run_graph_fp8(
     return_case=False,
     override=False,
     explicit_split=None,
+    v_table_layout=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1198,7 +1199,14 @@ def _run_graph_fp8(
         is_override_shape_enabled=override,
     )
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
-    tk, tv = g.tensor_like(bt), g.tensor_like(bt)
+    bt_v = bt
+    if v_table_layout == "strided":
+        raw = torch.full((B, 1, max_pages * 2 + 1, 1), -1, device=dev, dtype=torch.int32)
+        bt_v = raw[:, :, 1::2, :]
+        bt_v.copy_(bt)
+    elif v_table_layout == "batch_inner":
+        bt_v = bt.transpose(0, 2).contiguous().transpose(0, 2)
+    tk, tv = g.tensor_like(bt), g.tensor_like(bt_v)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
 
     def _stns():
@@ -1258,7 +1266,7 @@ def _run_graph_fp8(
         k: k_c,
         v: v_c,
         tk: bt,
-        tv: bt,
+        tv: bt_v,
         sq_t: slq,
         sk_t: slk,
         o: o_gpu,

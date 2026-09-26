@@ -252,6 +252,9 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     )[feature]
     if feature == "sm107":
         caps = replace(caps, sm_lo=107, sm_hi=119)
+    if feature == "paged":
+        table = graph.tensor(dim=(B, 1, 8, 1), stride=(8, 8, 1, 1), data_type=cudnn.data_type.INT32)
+        changed.update(paged_k_table_t=table, paged_v_table_t=table)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
     if feature in ("supported", "split", "head_dim") or (arch == "sm100" and feature == "paged"):
         assert reason is None
@@ -2348,3 +2351,45 @@ def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
     for split in (1, 2):
         knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
         assert engines.mismatch(spec.capabilities, facts, knobs) is None
+
+
+@pytest.mark.parametrize("entry", ["graph", "standalone"])
+@pytest.mark.parametrize("v_stride", [(8, 1), (17, 2), (1, B)])
+@pytest.mark.parametrize("split", [1, 4])
+def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    graph = _mk_paged_graph()
+    facts = _facts(graph)
+    facts.paged_v_table_t.set_stride((v_stride[0], 1, v_stride[1], 1))
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, shape_overrides=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    if entry == "graph":
+        reason = engines._prepared_decline_reason(caps, facts, split)
+        if v_stride == (8, 1):
+            assert reason is None
+        else:
+            assert reason is not None and "table strides" in reason
+        return
+
+    q = SimpleNamespace(shape=(B, H, 1, 128), stride=(H * 128, 128, H * 128, 1), dtype=torch.float8_e4m3fn)
+    o = SimpleNamespace(shape=q.shape, stride=q.stride, dtype=torch.bfloat16)
+    api = SimpleNamespace(
+        _fp8=True,
+        _pertensor=True,
+        _device_cc=(10, 0),
+        _o_dtype=lambda: torch.bfloat16,
+        o_block_scale=0,
+        gate_desc=None,
+        paged=True,
+        thd=False,
+        split_kv=split,
+        q_desc=q,
+        o_desc=o,
+        paged_table_stride=(8, 1),
+        paged_table_v_stride=v_stride,
+    )
+    assert SdpaFwdDslSm100._can_prepare_fp8(api) == (v_stride == (8, 1))

@@ -158,6 +158,13 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+Test both graph prepared-plan admission and the standalone adapter's compiler
+selection when retaining a tensor fallback. Declining the graph attachment alone
+can still compile a prepared artifact inside the adapter and fail at execution.
+`test_fp8_paged_prepared_table_stride_admission` checks both decisions for distinct
+K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
+checks the retained tensor path numerically and under CUDA Graph replay.
+
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales
 in place after CUDA Graph capture and check outputs after replay.

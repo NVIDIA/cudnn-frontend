@@ -529,6 +529,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
+    if facts.is_fp8 and facts.has_paged_kv and _table_stride(facts.paged_k_table_t) != _table_stride(facts.paged_v_table_t):
+        return "prepared FP8 paged KV requires matching K/V table strides"
     if facts.thd:
         if facts.has_epilogue_gate:
             return "prepared THD overrides cannot use an epilogue gate"

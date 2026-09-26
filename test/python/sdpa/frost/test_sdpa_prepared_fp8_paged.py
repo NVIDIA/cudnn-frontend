@@ -222,3 +222,35 @@ def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect
             message = "16-byte aligned"
     with pytest.raises(ValueError, match=message):
         g.execute(vp, ws, **overrides)
+
+
+@pytest.mark.parametrize("v_table_layout", ["strided", "batch_inner"])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("hnd", [False, True])
+def test_fp8_paged_distinct_table_strides_keep_tensor_executor(v_table_layout, split, hnd):
+    g, vp, ws, bufs, tensors = paged._run_graph_fp8(
+        2,
+        4,
+        2,
+        128,
+        16,
+        16,
+        [256, 193],
+        hnd,
+        out_dt=torch.bfloat16,
+        s_q=16,
+        explicit_split=split,
+        return_case=True,
+        v_table_layout=v_table_layout,
+    )
+    assert g._compiled_plans[g._plan_index]._prepared is None
+    assert bufs["k_table"].stride() != bufs["v_table"].stride()
+    # The helper already checks O, Stats and Amax against a reference on the
+    # nonprepared path; replay also retains both declared table strides.
+    with shared._cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            g.execute(vp, ws)
+        old_o = bufs["o"].clone()
+        bufs["o"].fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(bufs["o"], old_o, atol=0, rtol=0)
