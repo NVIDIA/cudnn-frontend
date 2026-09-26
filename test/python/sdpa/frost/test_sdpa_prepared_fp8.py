@@ -28,6 +28,7 @@ def _case(
     dv=None,
     padded=False,
     output_dtype=torch.bfloat16,
+    output_padding=0,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -78,6 +79,12 @@ def _case(
     out = torch.empty((b * sq, hq, dv) if thd else (b, sq, hq, dv), device="cuda", dtype=output_dtype)
     if not thd:
         out = out.transpose(1, 2)
+    if output_padding:
+        assert not thd
+        storage = torch.full((b, sq, hq, dv + output_padding), 12, device="cuda", dtype=output_dtype)
+        out = storage[..., :dv].transpose(1, 2)
+        buffers["o_storage"] = storage
+        o.set_stride(out.stride())
     if thd:
         if dv == d:
             o.set_ragged_offset(tensors["off_q"])
@@ -428,3 +435,21 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
     bufs["amax_o"].fill_(999)
     captured.replay()
     torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))
+
+
+@pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("padding", [8, 16])
+def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding):
+    """One-byte O needs 16-element TMA alignment; other pitches retain conversion."""
+    g, vp, ws, bufs, _ = _case(output_dtype=output_dtype, output_padding=padding)
+    assert (g._compiled_plans[g._plan_index]._prepared is not None) == (padding == 16)
+    g.execute(vp, ws)
+    _check(bufs, thd=False)
+    captured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(captured):
+        g.execute(vp, ws)
+    bufs["descale_v"].mul_(0.5)
+    bufs["o"].fill_(float("nan"))
+    captured.replay()
+    _check(bufs, thd=False)
+    assert torch.all(bufs["o_storage"][..., 128:] == 12)

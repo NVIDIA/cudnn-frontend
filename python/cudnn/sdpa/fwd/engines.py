@@ -552,7 +552,11 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     for tensor in tensors:
         if (
             tensor is None
-            or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 1 if facts.is_fp8 and tensor in (facts.q_t, facts.k_t, facts.v_t) else 2)
+            or dense_bind_strides(
+                tuple(tensor.get_dim()),
+                tuple(tensor.get_stride()),
+                1 if tensor.get_data_type() in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2) else 2,
+            )
             is None
         ):
             return "prepared overrides require input and unsplit-output layouts that bind without a copy"
