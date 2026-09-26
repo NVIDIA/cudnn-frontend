@@ -825,6 +825,41 @@ view guarantees goes on the fake too (`sym_int64(divisibility=8)` for the HSTU
 fp32 accumulator).
 
 
+**Rule 9 — backend and FROST share one FE Python graph contract; no special
+treatment at the caller boundary.**
+
+- **Same API and semantics.** For workloads supported by both engines, graph
+  preparation and execution must accept the same arguments and preserve the
+  same meaning of bindings, shape/stride overrides, outputs, workspace, streams,
+  capture/replay, ownership, and invalidation. Users and integrations such as
+  FlashInfer must not branch on the selected engine to invoke a different API.
+  A private method consumed outside FE is still a caller boundary for this rule.
+- **Preparation belongs inside FE.** Prepare plan-derived binding state during
+  build/compile. Geometry first supplied through execute-time overrides can be
+  prepared and reused internally when it becomes known; it does not require an
+  extra caller-visible preparation step. Keep current buffer observations and
+  required checks per call. Any optional lower-level interface needs a demonstrated
+  benefit beyond internal caching and must serve both engines under one contract.
+- **Optimize the shared path.** Reuse provider-independent preparation,
+  UID ordering, metadata validation, binding, and caching work so host-overhead
+  improvements benefit both engines. A backend-only prepared entry plus the old
+  FROST path is not a unified optimization; neither is merely renaming that entry.
+  Engine-specific launch lowering stays internal, without forcing either engine
+  through a slower common implementation. This does not require factoring kernel
+  pipeline templates into a common implementation.
+- **Capabilities may differ; the contract must not.** Express real differences
+  through support checks and plan selection. Decline unsupported requests under
+  the common contract; never silently ignore an argument, weaken validation, or
+  require a caller-side workaround for one engine. Any internal fallback must
+  preserve the same execution and lifetime semantics.
+- **Verify both routes explicitly.** Changes to this shared contract need tests
+  using supported plans from both engines with the same caller code, covering
+  fresh bindings, overrides, replan/invalidation, workspace/stream changes, and
+  capture/replay as applicable. Check outputs and invalid-input behavior, not
+  heuristic ranking or plan-list order. For shared host optimizations, measure
+  both routes and report their scope separately; one engine's result is not proof
+  for the other.
+
 ## Frontend-only kernel package layout
 
 ```

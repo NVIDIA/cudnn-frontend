@@ -379,8 +379,12 @@ def _run(
     g.build_plans()
     if not stats:
         # No Stats output: the kernel compiles the LSE store out (has_lse=False)
-        # — no dummy buffer exists at any level, so the dense workspace is 0.
-        assert g.get_workspace_size() == 0
+        # — any prepared scratch serves quantization scalars, not a dummy LSE.
+        prepared = g._compiled_plans[g._plan_index]._prepared
+        if prepared is not None:
+            assert not prepared.spec.has_lse  # scratch may hold the unused amax / identity scale
+        else:
+            assert g.get_workspace_size() == 0
     vp[o] = Ob
     if amax:
         vp[amx_o] = amax_o
@@ -1372,10 +1376,10 @@ def test_fp8_padding(in_key, causal):
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
-def test_fp8_stats_less_zero_workspace(in_key):
+def test_fp8_stats_less_no_dummy_lse(in_key):
     """No Stats output: the kernel compiles the LSE store out (has_lse=False),
-    no dummy buffer exists at any level, and the dense graph reports
-    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_O
+    no dummy LSE exists. Prepared launches report caller-owned scalar scratch
+    independently of Stats (asserted inside ``_run``). The Amax_O
     atomicMax write is independent of the LSE and still produced."""
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
@@ -1893,7 +1897,8 @@ def test_fp8_sm100_execute_lse_contract():
     api.compile()
     with pytest.raises(ValueError, match="without an LSE output"):
         api.execute(lse_tensor=lse, **ex)
-    api.execute(**ex)
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=dev, dtype=torch.uint8)
+    api.execute(workspace=workspace, **ex)
     torch.cuda.synchronize()
     o_ref = _ref(q8, q8, q8, dq, dq, dq, "e4m3", scale=api.scale_softmax, is_causal=True)
     torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
@@ -2195,7 +2200,8 @@ def test_fp8_stats_log2_every_flavor(d_qk, d_v):
         )
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, descale_q=dq, descale_k=dk, descale_v=dv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=q.device, dtype=torch.uint8)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
         torch.cuda.synchronize()
         want = expected * (math.log2(math.e) if log2 else 1.0)
         # The develop D256 kernel has the same 0.0171 natural-LSE error on
