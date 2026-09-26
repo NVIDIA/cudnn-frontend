@@ -3652,7 +3652,8 @@ def _host(
 
     tma_q_sf_desc = _build_sf_desc(sf_q_tensor, q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
     tma_k_sf_desc = _build_sf_desc(sf_k_tensor, kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K, KH)
-    v_sf_groups = b_sf * KH * kv_sf_num_tiles
+    # Widen before the group and byte products that form the V-plane stride.
+    v_sf_groups = cutlass.Int64(b_sf) * cutlass.Int64(KH) * kv_sf_num_tiles
     v_sf_plane_bytes = v_sf_groups * SF_BYTES_PER_BLOCK
     if cutlass.const_expr(CFG.THD_VARLEN):
         # THD packs both D/128 planes for each (head, sequence tile)

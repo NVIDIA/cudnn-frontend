@@ -165,6 +165,11 @@ can still compile a prepared artifact inside the adapter and fail at execution.
 K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
 checks the retained tensor path numerically and under CUDA Graph replay.
 
+For descriptor stride products, inspect the traced multiplication intermediates,
+not just the final cast or Python annotation. MXFP8 V scales use a separate
+plane stride: `test_mxfp8_v_scale_plane_stride_multiplies_in_int64` checks the
+real host expression before descriptor encoding and must fail before widening.
+
 The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
 FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
 with a move; a new sibling file alone is not exercised by that lane.
