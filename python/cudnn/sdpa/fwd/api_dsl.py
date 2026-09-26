@@ -5363,109 +5363,31 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     def _execute_thd(
         self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None
     ):
-        """THD (ragged) execute: packed ``(1, T, H, D)`` views + cu_seqlens.
+        """Execute every half THD plan through its prepared pointer binding."""
+        if self._thd_spec is None:
+            raise RuntimeError("SM120 half THD requires a compiled prepared launch")
+        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
 
-        ``lse_tensor``, when given, is the caller's ragged Stats buffer, in its
-        declared layout: token-major packed ``(T, H)`` in the first ``T*H``
-        elements, or head-major ``(H, head_stride)`` with tokens contiguous
-        within each head row.
-        """
-
-        if self._thd_spec is not None:
-            from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
-
-            spec = self._thd_spec
-            current_stream = self._get_default_stream(current_stream)
-            stream_int = int(current_stream)
-            _ensure_current_context(stream_int, q_buf.device.index)
-            if workspace is None:
-                raise ValueError(f"SdpaFwdDslSm120 requires a {spec.scratch_bytes}-byte workspace; pass scratch_workspace_bytes() bytes")
-            if workspace.device != q_buf.device or not workspace.is_contiguous():
-                raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
-            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (THD)", spec.scratch_bytes)
-            buffers = (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
-            if spec.native is not None:
-                execute_native_thd_tensors(spec, buffers, ws_ptr, current_stream, scale_softmax_log2)
-            else:
-                roles = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
-                facts = {name: facts_of_tensor(tensor) for name, tensor in zip(roles, buffers)}
-                frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
-                if frame is not None:
-                    frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-                    spec.fn(*frame)
-            self._logger.debug("execute completed (prepared THD)")
-            return
-
-        # Resolve the launch stream BEFORE packing: the metadata upload inside
-        # _thd_pack must be ordered against the kernel launch below.
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(q_buf.device).cuda_stream)
-
-        # A token-major LSE shares the Q/O dynamic token symbol, so its
-        # capacity joins their floor; head-major carries its own declared
-        # head_stride (covering the packed total is caller contract — t_q is
-        # a device value, Rule 3).
-        lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major and not self.thd_stats_padded) else None
-        pack = self._thd_pack(
-            q_buf,
-            k_buf,
-            v_buf,
-            o_buf,
-            seq_q_lens,
-            seq_kv_lens,
-            workspace,
-            "SdpaFwdDslSm120 (THD)",
-            current_stream=current_stream,
-            lse_tokens_cap=lse_cap,
-        )
-        if pack is None:
-            # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
-            self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
-            return
-
-        lse = None
-        if lse_tensor is not None:
-            if self.thd_stats_padded:
-                lse = self._thd_padded_lse_view(lse_tensor)  # per-batch padded (b, h, s_max) in the declared strides, checked
-            elif self.thd_stats_head_major:
-                head_stride = self.thd_stats_head_stride
-                lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
-            else:
-                lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
-        self._seed_padded_lse(lse, current_stream)  # -inf on the rows past each sequence's length (padded Stats only)
-
-        # Sinks are None-specialized like the LSE when the graph has no sink
-        # token.
-        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
-
-        import cutlass
-
-        # PLAN-TIME-ONLY compile key (issue #552): this lru-cached call
-        # re-binds the artifact compile() already built. The K/V strides are
-        # taken from the BOUND views because the all-KV-zero clamp swaps in
-        # packed batch-1 views (that rare shape mints its own cache entry);
-        # the batch stride is zeroed out of the key (a runtime value the
-        # kernel rebuilds symbolically).
-        kwargs = self._thd_compile_kwargs()
-        kwargs.update(k_stride=(0, *pack.K.stride()[1:]), v_stride=(0, *pack.V.stride()[1:]))
-        fn = self._k_mod.compile(**kwargs)
-        fn(
-            pack.Q,
-            pack.K,
-            pack.V,
-            pack.O,
-            lse,
-            sinks_t,
-            pack.seq_q_dummy,  # SM120 kernels keep a tensor slot
-            pack.meta,
-            cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(pack.max_sq),
-            pack.q_lens_dev,
-            pack.kv_lens_dev,
-            cutlass.Int32(pack.lens_form),
-            cutlass.Int32(self._persistent_ctas(pack.Q.device)),
-            current_stream,
-        )
+        spec = self._thd_spec
+        current_stream = self._get_default_stream(current_stream)
+        stream_int = int(current_stream)
+        _ensure_current_context(stream_int, q_buf.device.index)
+        if workspace is None:
+            raise ValueError(f"SdpaFwdDslSm120 requires a {spec.scratch_bytes}-byte workspace; pass scratch_workspace_bytes() bytes")
+        if workspace.device != q_buf.device or not workspace.is_contiguous():
+            raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (THD)", spec.scratch_bytes)
+        buffers = (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
+        if spec.native is not None:
+            execute_native_thd_tensors(spec, buffers, ws_ptr, current_stream, scale_softmax_log2)
+        else:
+            roles = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
+            facts = {name: facts_of_tensor(tensor) for name, tensor in zip(roles, buffers)}
+            frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
+            if frame is not None:
+                frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
+                spec.fn(*frame)
+        self._logger.debug("execute completed (prepared THD)")
 
     def _persistent_ctas(self, device) -> int:
         """CTA count for a persistent grid (THD on every template, dense on d512).
