@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
 
@@ -27,6 +29,9 @@ from cudnn.hstu.hstu_attention._kernels.block_sparse_builder import (
     build_hstu_d256_bwd_block_sparse,
     build_hstu_k2q_block_sparse,
     build_hstu_q2k_block_sparse,
+    hstu_d256_bwd_block_sparse_workspace_bytes,
+    hstu_k2q_block_sparse_workspace_bytes,
+    hstu_q2k_block_sparse_workspace_bytes,
 )
 
 from .block_sparse_ref import (
@@ -48,6 +53,37 @@ _DYNAMIC_METADATA_SHAPE_CASES = (
     ((129,), (257,)),
     ((257, 65), (385, 129)),
 )
+
+
+def _builder_ws(kind, cu_seqlens_q, *, max_seqlen_q, max_seqlen_k, block_size=None):
+    """Caller-owned workspace for one direct builder call (R2), sized by the builder's own byte function."""
+    batch_size = cu_seqlens_q.numel() - 1
+    if kind == "q2k":
+        nbytes = hstu_q2k_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+    elif kind == "k2q":
+        nbytes = hstu_k2q_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+    else:
+        nbytes = hstu_d256_bwd_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k)
+    return torch.empty(nbytes, dtype=torch.uint8, device=cu_seqlens_q.device)
+
+
+def _workspace_for(api):
+    workspace_bytes = api.scratch_workspace_bytes()
+    if workspace_bytes == 0:
+        return None
+    return torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+
+
+@contextlib.contextmanager
+def _capture_allocating_nothing(graph):
+    """``torch.cuda.graph(graph)`` whose body must make no caching-allocator allocation (Rule 8).
+
+    The counters are read inside the window: ``capture_begin`` itself accounts for two."""
+    with torch.cuda.graph(graph):
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        yield
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+    assert allocated == 0, f"{allocated} allocation(s) inside the capture"
 
 
 def _assert_q2k_metadata_equal(actual, expected) -> None:
@@ -178,7 +214,7 @@ def test_q2k_builder_matches_reference_for_packed_tails(tile_m, pattern):
         "block_size": (tile_m, 128),
     }
 
-    actual = build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs)
+    actual = build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs, workspace=_builder_ws("q2k", cu_q, **kwargs))
     expected = q2k_block_sparse_reference(func, cu_q, cu_k, **kwargs)
     _assert_q2k_metadata_equal(actual, expected)
     assert actual.block_size == (tile_m, 128)
@@ -208,8 +244,8 @@ def test_q2k_k2q_builders_classify_endpoint_boundaries_exactly():
         "max_seqlen_k": k_length,
         "block_size": (tile_q, 128),
     }
-    q2k = build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs)
-    k2q = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs)
+    q2k = build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs, workspace=_builder_ws("q2k", cu_q, **kwargs))
+    k2q = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs, workspace=_builder_ws("k2q", cu_q, **kwargs))
     _assert_q2k_metadata_equal(
         q2k,
         q2k_block_sparse_reference(func, cu_q, cu_k, **kwargs),
@@ -284,6 +320,7 @@ def test_q2k_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("q2k", cu_q, **kwargs),
         )
     stream.synchronize()
     _assert_q2k_metadata_equal(
@@ -298,6 +335,7 @@ def test_q2k_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("q2k", cu_q, **kwargs),
         )
     stream.synchronize()
     expected_empty = q2k_block_sparse_reference(func, cu_q, cu_k, **kwargs)
@@ -325,18 +363,14 @@ def test_q2k_builder_is_cuda_graph_replayable_after_func_mutation():
         "block_size": (128, 128),
     }
 
+    workspace = _builder_ws("q2k", cu_q, **kwargs)
     # Compile and finish all lazy setup before capture.
-    build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs)
+    build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_metadata = build_hstu_q2k_block_sparse(
-            func,
-            cu_q,
-            cu_k,
-            **kwargs,
-        )
+    with _capture_allocating_nothing(graph):
+        captured_metadata = build_hstu_q2k_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     func.zero_()
@@ -367,7 +401,7 @@ def test_k2q_builder_matches_reference_for_packed_tails(tile_q, pattern):
         "block_size": (tile_q, 128),
     }
 
-    actual = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs)
+    actual = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs, workspace=_builder_ws("k2q", cu_q, **kwargs))
     expected = k2q_block_sparse_reference(func, cu_q, cu_k, **kwargs)
     _assert_q2k_metadata_equal(actual, expected)
     _assert_csr_rows_are_strictly_ascending(actual)
@@ -418,6 +452,7 @@ def test_k2q_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("k2q", cu_q, **kwargs),
         )
     stream.synchronize()
     _assert_q2k_metadata_equal(
@@ -432,6 +467,7 @@ def test_k2q_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("k2q", cu_q, **kwargs),
         )
     stream.synchronize()
     expected_empty = k2q_block_sparse_reference(func, cu_q, cu_k, **kwargs)
@@ -459,18 +495,14 @@ def test_k2q_builder_is_cuda_graph_replayable_after_func_mutation():
         "block_size": (128, 128),
     }
 
+    workspace = _builder_ws("k2q", cu_q, **kwargs)
     # Compile and finish all lazy setup before capture.
-    build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs)
+    build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_metadata = build_hstu_k2q_block_sparse(
-            func,
-            cu_q,
-            cu_k,
-            **kwargs,
-        )
+    with _capture_allocating_nothing(graph):
+        captured_metadata = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     func.zero_()
@@ -504,7 +536,7 @@ def test_k2q_builder_handles_many_intervals_and_logical_tails(func_num):
         "block_size": (128, 128),
     }
 
-    actual = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs)
+    actual = build_hstu_k2q_block_sparse(func, cu_q, cu_k, **kwargs, workspace=_builder_ws("k2q", cu_q, **kwargs))
     expected = k2q_block_sparse_reference(func, cu_q, cu_k, **kwargs)
     _assert_q2k_metadata_equal(actual, expected)
     _assert_csr_rows_are_strictly_ascending(actual)
@@ -537,6 +569,7 @@ def test_k2q_builder_scan_spans_multiple_scan_blocks():
         max_seqlen_q=1,
         max_seqlen_k=1,
         block_size=(128, 128),
+        workspace=_builder_ws("k2q", cu_q, max_seqlen_q=1, max_seqlen_k=1, block_size=(128, 128)),
     )
 
     assert int(actual.mask_block_cnt.sum()) == 0
@@ -595,6 +628,7 @@ def test_builders_support_batch_size_above_cuda_grid_y_limit():
         max_seqlen_q=1,
         max_seqlen_k=1,
         block_size=(256, 128),
+        workspace=_builder_ws("q2k", cu, max_seqlen_q=1, max_seqlen_k=1, block_size=(256, 128)),
     )
     k2q = build_hstu_k2q_block_sparse(
         func,
@@ -603,6 +637,7 @@ def test_builders_support_batch_size_above_cuda_grid_y_limit():
         max_seqlen_q=1,
         max_seqlen_k=1,
         block_size=(128, 128),
+        workspace=_builder_ws("k2q", cu, max_seqlen_q=1, max_seqlen_k=1, block_size=(128, 128)),
     )
     d256_q2k, d256_k2q = build_hstu_d256_bwd_block_sparse(
         func,
@@ -610,6 +645,7 @@ def test_builders_support_batch_size_above_cuda_grid_y_limit():
         cu,
         max_seqlen_q=1,
         max_seqlen_k=1,
+        workspace=_builder_ws("d256", cu, max_seqlen_q=1, max_seqlen_k=1),
     )
 
     for tensors in (q2k, k2q, d256_q2k, d256_k2q):
@@ -642,6 +678,7 @@ def test_d256_bwd_paired_builder_matches_packed_tail_oracles(pattern):
         cu_q,
         cu_k,
         **kwargs,
+        workspace=_builder_ws("d256", cu_q, **kwargs),
     )
     block_kwargs = {**kwargs, "block_size": (256, 128)}
     expected_q2k = q2k_block_sparse_reference(
@@ -689,6 +726,7 @@ def test_d256_paired_builder_preserves_transposed_edges_with_different_row_distr
         cu_k,
         max_seqlen_q=q_length,
         max_seqlen_k=k_length,
+        workspace=_builder_ws("d256", cu_q, max_seqlen_q=q_length, max_seqlen_k=k_length),
     )
     kwargs = {
         "max_seqlen_q": q_length,
@@ -743,6 +781,7 @@ def test_d256_bwd_q256_supertile_with_different_q128_states_is_mask():
         cu_k,
         max_seqlen_q=256,
         max_seqlen_k=128,
+        workspace=_builder_ws("d256", cu_q, max_seqlen_q=256, max_seqlen_k=128),
     )
     kwargs = {
         "max_seqlen_q": 256,
@@ -792,6 +831,7 @@ def test_d256_bwd_paired_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("d256", cu_q, **kwargs),
         )
     stream.synchronize()
     block_kwargs = {**kwargs, "block_size": (256, 128)}
@@ -811,6 +851,7 @@ def test_d256_bwd_paired_builder_rebuilds_mutated_func_on_current_stream():
             cu_q,
             cu_k,
             **kwargs,
+            workspace=_builder_ws("d256", cu_q, **kwargs),
         )
     stream.synchronize()
     expected_q2k = q2k_block_sparse_reference(
@@ -853,17 +894,13 @@ def test_d256_bwd_paired_builder_is_graph_replayable_after_func_mutation():
 
     # Finish JIT setup before capture; every replay still reclassifies the
     # shared state matrix and compacts both orientations.
-    build_hstu_d256_bwd_block_sparse(func, cu_q, cu_k, **kwargs)
+    workspace = _builder_ws("d256", cu_q, **kwargs)
+    build_hstu_d256_bwd_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_q2k, captured_k2q = build_hstu_d256_bwd_block_sparse(
-            func,
-            cu_q,
-            cu_k,
-            **kwargs,
-        )
+    with _capture_allocating_nothing(graph):
+        captured_q2k, captured_k2q = build_hstu_d256_bwd_block_sparse(func, cu_q, cu_k, **kwargs, workspace=workspace)
     torch.cuda.synchronize()
 
     func.zero_()
@@ -1158,10 +1195,12 @@ def test_forward_graph_rebuilds_metadata_after_func_mutation(dtype):
     )
     api.check_support()
     api.compile()
+    workspace = _workspace_for(api)
 
+    # The first execute of this shape runs inside the capture and must allocate nothing (Rule 8).
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(q, k, v, out, cu_q, cu_k, func)
+    with _capture_allocating_nothing(graph):
+        api.execute(q, k, v, out, cu_q, cu_k, func, workspace=workspace)
     graph.replay()
     torch.cuda.synchronize()
     full_output = out.clone()
@@ -1499,7 +1538,7 @@ def test_arbitrary_backward_all_empty_is_exact_zero(dtype, head_dim):
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_d256_empty_preallocated_noncontiguous_outputs_are_zero(dtype):
+def test_d256_empty_preallocated_outputs_decline_noncontiguous_and_zero_contiguous(dtype):
     q_lengths = (129,)
     k_lengths = (257,)
     q, k, v, cu_q, cu_k = _packed_qkv(
@@ -1515,7 +1554,22 @@ def test_d256_empty_preallocated_noncontiguous_outputs_are_zero(dtype):
         pattern="empty",
         device=q.device,
     )
+    common = {
+        "sample_do": do,
+        "sample_q": q,
+        "sample_k": k,
+        "sample_v": v,
+        "sample_cu_seqlens_q": cu_q,
+        "sample_cu_seqlens_k": cu_k,
+        "max_seqlen_q": max(q_lengths),
+        "max_seqlen_k": max(k_lengths),
+        "sample_func": func,
+        "alpha": 0.7,
+        "scaling_seqlen": 128.0,
+    }
 
+    # Head-interleaved gradient views are not compact: the D=256 TMA kernels decline them (R5)
+    # instead of staging a compact copy and copying back.
     output_storage = [
         torch.full(
             (reference.shape[0], 2, *reference.shape[1:]),
@@ -1527,26 +1581,27 @@ def test_d256_empty_preallocated_noncontiguous_outputs_are_zero(dtype):
     ]
     dq, dk, dv = (storage[:, 0] for storage in output_storage)
     assert not dq.is_contiguous()
-    assert not dk.is_contiguous()
-    assert not dv.is_contiguous()
+    with pytest.raises(NotImplementedError, match=r"dq_tensor .* contiguous"):
+        HSTUBwdSm100(sample_dq=dq, sample_dk=dk, sample_dv=dv, **common).check_support()
+    assert all(bool(torch.all(storage == 7.0)) for storage in output_storage)
 
-    api = HSTUBwdSm100(
-        sample_do=do,
-        sample_q=q,
-        sample_k=k,
-        sample_v=v,
-        sample_dq=dq,
-        sample_dk=dk,
-        sample_dv=dv,
-        sample_cu_seqlens_q=cu_q,
-        sample_cu_seqlens_k=cu_k,
-        max_seqlen_q=max(q_lengths),
-        max_seqlen_k=max(k_lengths),
-        sample_func=func,
-        alpha=0.7,
-        scaling_seqlen=128.0,
-    )
+    # Contiguous gradient prefixes of a larger allocation are served; the kernel zeroes exactly
+    # the rows it owns and the workspace carries the paired block metadata.
+    padded_storage = [
+        torch.full(
+            (reference.shape[0] + 8, *reference.shape[1:]),
+            7.0,
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        for reference in (q, k, v)
+    ]
+    dq, dk, dv = (storage[: reference.shape[0]] for storage, reference in zip(padded_storage, (q, k, v)))
+    assert dq.is_contiguous() and dk.is_contiguous() and dv.is_contiguous()
+    api = HSTUBwdSm100(sample_dq=dq, sample_dk=dk, sample_dv=dv, **common)
     api.check_support()
+    workspace = _workspace_for(api)
+    assert workspace is not None
     api.compile()
     torch.cuda.synchronize()
 
@@ -1565,12 +1620,13 @@ def test_d256_empty_preallocated_noncontiguous_outputs_are_zero(dtype):
         cu_q,
         cu_k,
         func,
+        workspace=workspace,
     )
     torch.cuda.synchronize()
 
-    for output, storage in zip((dq, dk, dv), output_storage):
+    for output, storage, reference in zip((dq, dk, dv), padded_storage, (q, k, v)):
         assert int(torch.count_nonzero(output)) == 0
-        assert bool(torch.all(storage[:, 1] == 7.0))
+        assert bool(torch.all(storage[reference.shape[0] :] == 7.0))
 
 
 @pytest.mark.L0
@@ -1681,9 +1737,11 @@ def test_backward_graph_rebuilds_metadata_after_func_mutation(
     )
     api.check_support()
     api.compile()
+    workspace = _workspace_for(api)
 
+    # The first execute of this shape runs inside the capture and must allocate nothing (Rule 8).
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with _capture_allocating_nothing(graph):
         api.execute(
             do,
             q,
@@ -1695,6 +1753,7 @@ def test_backward_graph_rebuilds_metadata_after_func_mutation(
             cu_q,
             cu_k,
             func,
+            workspace=workspace,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -1809,6 +1868,19 @@ def test_auto_block_metadata_builder_cache_reuses_dynamic_shapes():
     build_hstu_k2q_block_sparse.compile_cache.clear()
     build_hstu_d256_bwd_block_sparse.compile_cache.clear()
 
+    # compile_only compiles from fakes, touches no workspace and returns None (R11).
+    probe_q_lengths, probe_k_lengths = _DYNAMIC_METADATA_SHAPE_CASES[0]
+    probe_cu_q = packed_cu_seqlens(probe_q_lengths, device="cuda")
+    probe_cu_k = packed_cu_seqlens(probe_k_lengths, device="cuda")
+    probe_func = make_arbitrary_func(probe_q_lengths, probe_k_lengths, pattern="mixed", device="cuda")
+    probe_kwargs = {"max_seqlen_q": max(probe_q_lengths), "max_seqlen_k": max(probe_k_lengths)}
+    assert build_hstu_q2k_block_sparse(probe_func, probe_cu_q, probe_cu_k, block_size=(256, 128), compile_only=True, **probe_kwargs) is None
+    assert build_hstu_k2q_block_sparse(probe_func, probe_cu_q, probe_cu_k, block_size=(128, 128), compile_only=True, **probe_kwargs) is None
+    assert build_hstu_d256_bwd_block_sparse(probe_func, probe_cu_q, probe_cu_k, compile_only=True, **probe_kwargs) is None
+    assert len(build_hstu_q2k_block_sparse.compile_cache) == 1
+    assert len(build_hstu_k2q_block_sparse.compile_cache) == 1
+    assert len(build_hstu_d256_bwd_block_sparse.compile_cache) == 1
+
     for q_lengths, k_lengths in _DYNAMIC_METADATA_SHAPE_CASES:
         cu_q = packed_cu_seqlens(q_lengths, device="cuda")
         cu_k = packed_cu_seqlens(k_lengths, device="cuda")
@@ -1828,6 +1900,7 @@ def test_auto_block_metadata_builder_cache_reuses_dynamic_shapes():
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_size=(256, 128),
+            workspace=_builder_ws("q2k", cu_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, block_size=(256, 128)),
         )
         _assert_q2k_metadata_equal(
             q2k,
@@ -1848,6 +1921,7 @@ def test_auto_block_metadata_builder_cache_reuses_dynamic_shapes():
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_size=(128, 128),
+            workspace=_builder_ws("k2q", cu_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, block_size=(128, 128)),
         )
         _assert_q2k_metadata_equal(
             k2q,
@@ -1867,6 +1941,7 @@ def test_auto_block_metadata_builder_cache_reuses_dynamic_shapes():
             cu_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            workspace=_builder_ws("d256", cu_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k),
         )
         paired_kwargs = {
             "max_seqlen_q": max_seqlen_q,
@@ -1927,19 +2002,17 @@ def test_auto_block_metadata_consumer_cache_reuses_dynamic_shapes(head_dim):
         max_seqlen_q = max(q_lengths)
         max_seqlen_k = max(k_lengths)
 
+        fwd_args = (q, k, v, cu_q, cu_k, max_seqlen_q, max_seqlen_k, -1, -1, alpha, func)
+        fwd_workspace = torch.empty(
+            _interface.hstu_varlen_fwd_100_scratch_bytes(*fwd_args, scaling_seqlen=scaling_seqlen),
+            dtype=torch.uint8,
+            device=q.device,
+        )
         actual_out, _ = _interface.hstu_varlen_fwd_100(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            -1,
-            -1,
-            alpha,
-            func,
+            *fwd_args,
             scaling_seqlen=scaling_seqlen,
+            out=torch.empty_like(q),
+            workspace=fwd_workspace,
         )
         expected_out = arbitrary_forward_reference(
             q,
@@ -1969,25 +2042,14 @@ def test_auto_block_metadata_consumer_cache_reuses_dynamic_shapes(head_dim):
             alpha=alpha,
             scaling_seqlen=scaling_seqlen,
         )
-        actual_grads = _interface.hstu_varlen_bwd_100(
-            do,
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            None,
-            None,
-            None,
-            -1,
-            -1,
-            alpha,
-            func,
-            False,
-            scaling_seqlen,
+        dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
+        bwd_args = (do, q, k, v, cu_q, cu_k, max_seqlen_q, max_seqlen_k, dq, dk, dv, -1, -1, alpha, func, False, scaling_seqlen)
+        bwd_workspace = torch.empty(
+            _interface.hstu_varlen_bwd_100_scratch_bytes(*bwd_args),
+            dtype=torch.uint8,
+            device=q.device,
         )
+        actual_grads = _interface.hstu_varlen_bwd_100(*bwd_args, workspace=bwd_workspace)
         for actual_grad, expected_grad in zip(actual_grads, expected_grads):
             torch.testing.assert_close(
                 actual_grad.float(),
@@ -2104,3 +2166,33 @@ def test_fp16_forward_exceeds_legacy_k_limit():
         scaling_seqlen=64.0,
     )
     torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_builder_workspace_bytes_match_carve(tile_m):
+    """Host-only R2 accounting: every carve plan consumes exactly the bytes its sizing function declares."""
+    from cudnn.api_base import WorkspaceCarver
+    from cudnn.hstu.hstu_attention._kernels.block_sparse_builder import (
+        carve_hstu_d256_bwd_workspace,
+        carve_hstu_k2q_workspace,
+        carve_hstu_q2k_workspace,
+    )
+
+    def carved_bytes(nbytes, carve):
+        carver = WorkspaceCarver(torch.empty(nbytes, dtype=torch.uint8), nbytes, "test")
+        carve(carver)
+        return carver._off
+
+    block_size = (tile_m, 128)
+    for batch_size in (1, 3, 513):
+        for max_seqlen_q in (1, 127, 128, 257):
+            for max_seqlen_k in (1, 127, 128, 257):
+                geometry = {"batch_size": batch_size, "max_seqlen_q": max_seqlen_q, "max_seqlen_k": max_seqlen_k}
+                q2k_bytes = hstu_q2k_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+                assert carved_bytes(q2k_bytes, lambda carver: carve_hstu_q2k_workspace(carver, block_size=block_size, **geometry)) == q2k_bytes
+                k2q_bytes = hstu_k2q_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k, block_size)
+                assert carved_bytes(k2q_bytes, lambda carver: carve_hstu_k2q_workspace(carver, block_size=block_size, **geometry)) == k2q_bytes
+                d256_bytes = hstu_d256_bwd_block_sparse_workspace_bytes(batch_size, max_seqlen_q, max_seqlen_k)
+                assert carved_bytes(d256_bytes, lambda carver: carve_hstu_d256_bwd_workspace(carver, **geometry)) == d256_bytes
+                assert q2k_bytes % 128 == 0 and k2q_bytes % 128 == 0 and d256_bytes % 128 == 0
