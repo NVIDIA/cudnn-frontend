@@ -35,6 +35,7 @@ import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
@@ -48,6 +49,10 @@ from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
 _SM80 = "SdpaFwdDslSm80"
+# Same adapter as SM80: one kernel skeleton, two device families.  The row
+# states the box (flavor + tile geometry) it was validated on and the exact
+# (major, minor) set it may run on; the adapter no longer hardcodes either.
+_SM89 = "SdpaFwdDslSm80"
 
 
 def _adapter(name: str):
@@ -234,6 +239,14 @@ class Capabilities:
     seq_q_trim: bool = False
     right_band_widening: bool = False
 
+    # The band axes a graph may request, as the PRE-MODEL declaration spelling:
+    # causal (right bound 0), bottom-right anchor, sliding window (left bound),
+    # right-band widening (right bound > 0).  They remain the spelling every
+    # long-standing row uses and are mapped ONCE, in __post_init__ below, onto
+    # ``band`` -- the canonical set this probe decides with.  A row that needs a
+    # RESTRICTED claim (e.g. an unmasked-only future SM89 row) declares ``band``
+    # directly and leaves these False; declaring both is allowed only while they
+    # agree exactly, and disagreeing raises rather than one silently winning.
     causal: bool = False
     bottom_right: bool = False
     swa: bool = False
@@ -387,19 +400,59 @@ class Capabilities:
     # pins it).
     paged_d_shapes: Optional[frozenset] = None
 
+    # The canonical band-support SET this row claims (cudnn.sdpa.band), the
+    # model the probe decides with.  APPENDED at the end for the append-only
+    # contract; ``None`` means "derive from the legacy flags above" and a row
+    # needing a restricted claim passes an explicit BandSupport instead (e.g.
+    # ``band=BandSupport.unmasked_only()`` for an unmasked-only kernel).
+    # __post_init__ resolves it, so ``capabilities.band`` is never None after
+    # construction -- and a legacy flag that is SET but outside an explicit
+    # claim is refused there, rather than letting field order decide.
+    band: Optional["band.BandSupport"] = None
+
+    def __post_init__(self) -> None:
+        """Single normalization layer: legacy mask flags -> canonical band set."""
+        if self.band is None:
+            object.__setattr__(
+                self,
+                "band",
+                band.BandSupport.from_legacy_flags(
+                    causal=self.causal,
+                    bottom_right=self.bottom_right,
+                    swa=self.swa,
+                    right_band_widening=self.right_band_widening,
+                ),
+            )
+            return
+        # A band-only declaration is the point of the model, so only the flags
+        # that are actually SET constrain the explicit claim: each of them must
+        # name an axis the declared band serves (the legacy spelling is then a
+        # redundant, narrower view of the same claim).  The all-default legacy
+        # block is the spelling of "nothing declared" and leaves the band alone.
+        legacy_axes = (
+            ("causal", self.causal, band.RIGHT_CAUSAL in self.band.right),
+            ("right_band_widening", self.right_band_widening, band.RIGHT_FINITE in self.band.right),
+            ("swa", self.swa, band.LEFT_WINDOW in self.band.left),
+            ("bottom_right", self.bottom_right, band.ANCHOR_BOTTOM_RIGHT in self.band.anchors),
+        )
+        conflicting = sorted(name for name, set_flag, served in legacy_axes if set_flag and not served)
+        if conflicting:
+            raise ValueError(
+                "Capabilities declares an explicit band support "
+                f"{self.band.as_dict()} that does not serve the legacy mask flags {conflicting} set with it; the two "
+                "spellings must state the same claim (clear the flags or widen the band) -- conflicting declarations "
+                "are never silently resolved"
+            )
+
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
     """True when the causal band (plain or right-widened) provably masks every
     KV column >= S_kv, so a ragged KV tail cannot leak into the softmax.
 
-    The last unmasked column is (S_q - 1) + R top-left or (S_kv - 1) + R
-    bottom-right (R = the right-band bound, 0 for plain causal)."""
-    if not (facts.causal or facts.right_band_widening):
-        return False
-    r = facts.right_bound or 0
-    if facts.bottom_right:
-        return r == 0
-    return facts.s_q + r <= facts.s_kv
+    The band x geometry rule itself lives on the canonical model
+    (``band.BandFacts.covers_kv_tail``); this is the facts-taking alias the
+    lowering, the split gates and the KV-tail rule below share."""
+    return band.BandFacts.from_sdpa_facts(facts).covers_kv_tail(facts.s_q, facts.s_kv)
 
 
 def _synth_kv_padding(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -740,6 +793,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if capabilities.sm_lo == 89 and facts.h_q != facts.h_kv:
+        # The Ada row's L20 run covered the equal-head layout only: a GQA/MQA
+        # graph reaches the same template through the KV-head broadcast (or
+        # PackGQA), neither of which was measured on this part.  Declined rather
+        # than served unmeasured -- the SM80 row keeps serving A100 either way.
+        return "GQA / MQA (H_q != H_kv) is not claimed by this SM89 row"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
     if facts.s_q == 1 and not capabilities.decode:
@@ -788,6 +847,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     elif "bshd" in capabilities.layouts and not facts.bshd_layout:
         return "Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
 
+    # The band decision goes through the canonical model: BandFacts is what the
+    # GRAPH asks for, ``capabilities.band`` (normalized in __post_init__ from the
+    # row's legacy flags, or declared directly by a restricted row) is what this
+    # ENGINE serves.  Built HERE, after the cheap arch/dtype/shape declines, so a
+    # probe that is going to reject the graph anyway does not pay for it; the
+    # checks are spliced in at the positions this probe has always used, so the
+    # first reported reason -- part of the contract -- is unchanged.
+    # band.BandSupport.decline() is the same decision in a single call.
+    band_facts = band.BandFacts.from_sdpa_facts(facts)
+    band_support = capabilities.band
     for fact, cap, label in (
         (facts.has_bias, capabilities.bias, "bias"),
         (facts.has_dropout, capabilities.dropout, "dropout"),
@@ -802,9 +871,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.has_stats_log2, capabilities.stats_log2, "stats_use_log2 (base-2 stats)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
-        (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
-        (facts.causal, capabilities.causal, "causal mask"),
-        (facts.window_left is not None, capabilities.swa, "sliding window"),
+        # Both sides of the band are SETS, so each axis is asked in BOTH
+        # directions: the mode the graph requests has to be one the row claims,
+        # INCLUDING the mode it requests by leaving a flag unset.  A row that
+        # serves the causal diagonal only must therefore not fall through to the
+        # unmasked case -- that fall-through is what the model exists to stop.
+        (True, band_support.serves_right_mode(band_facts.right_mode), band.LABEL_RIGHT[band_facts.right_mode]),
+        (True, band_support.serves_left_mode(band_facts.left_mode), band.LABEL_LEFT[band_facts.left_mode]),
         (facts.padded, capabilities.padded, "padding mask"),
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.wants_stats, capabilities.stats, "stats output"),
@@ -913,8 +986,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
             return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
 
-    if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
-        return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
+    if band_facts.right_mode == band.RIGHT_FINITE and band_facts.right_bound is not None and band_facts.right_bound < 0:
+        return f"negative diagonal_band_right_bound ({band_facts.right_bound}) is not supported"
 
     if facts.has_cu_seq_len:
         # cu_seq_len_* ((B+1,) prefix sums, cuDNN 9.24+). The THD lowering
@@ -934,11 +1007,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # DECLARES the output must go to an engine that writes it.
         return "graph requests the Amax_S output, which the FROST engines do not produce"
 
-    if facts.bottom_right:
-        if not (facts.causal or facts.right_band_widening):
-            return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
-        if not capabilities.bottom_right:
-            return "graph uses bottom-right causal, which this kernel does not support"
+    if band_facts.anchor == band.ANCHOR_BOTTOM_RIGHT and not band_facts.has_diagonal:
+        return band.REASON_ANCHOR_WITHOUT_DIAGONAL
+    if not band_support.serves_anchor(band_facts):
+        return band.anchor_reason("kernel", anchor=band_facts.anchor)
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported by this kernel"
 
@@ -1678,6 +1750,98 @@ def _sm80_spec() -> EngineSpec:
     )
 
 
+def _sm89_spec() -> EngineSpec:
+    """SM89 (Ada / L20) prefill row: the SAME ``prefill_f16`` template and the same
+    frozen gptoss geometry as ``sdpa_fwd_prefill_sm80``, on a part with 99 KiB of
+    opt-in SMEM per block instead of A100's 164 KiB.
+
+    This row exists because "the SM80 kernels do not run on Ada" is an
+    ARTIFACT OF THE SHARED SKELETON'S LARGEST FLAVOR: the SM80 row has to carry
+    the d=256 flavor, whose pinned point allocates 128 KiB (sQ_buf 64 KiB +
+    sK_buf 64 KiB), so cc 8.0 exactly is the honest gate for that row.  The d64
+    gptoss point allocates 32 KiB and fits Ada with room to spare, so it is
+    served here under a box that claims ONLY what was measured on an L20.
+
+    Deliberately narrow (see the SM89 execution plan's scope table):
+      * forward, FP16/BF16, prefill only.  No backward, no FP8/MXFP8, no
+        native-FP32 output.
+      * ``d_shapes={(64, 64)}`` exactly, ``d_pad_multiple=1``: the adapter pads
+        head dims host-side, so a graph with d < 64 rides the d64 kernel rather
+        than any envelope, and a graph with d > 64 is declined instead of
+        silently landing on the 128-wide flavor (which does not fit Ada).
+      * dense BSHD / dense_flex only: THD is gated off by the SM80 forward row
+        already, and the L20 run did not qualify it.
+      * masks: the band claim is explicit and RESTRICTED (see ``band=`` below),
+        because the legacy capability flags can only WIDEN a row.  Measured on
+        the L20: unmasked, top-left causal and ``sliding_window_length=W`` (W
+        keys ending at self), on square AND rectangular graphs (256x512 and
+        512x256 both get a plan).  NOT claimed: the bottom-right anchor — a
+        rectangular bottom-right-causal graph is DECLINED by this row (the
+        backend's plans stand instead), which the test file pins as a rejection
+        rather than a silent fallback; and right-band widening, whose kwarg is
+        accepted and IGNORED (the served output is bit-identical to plain
+        top-left causal with and without ``diagonal_band_right_bound``), so
+        advertising it would be a false capability.  ``padded``/``sink``/
+        ``bias``/``decode`` are NOT claimed either: each needs its own L20
+        evidence, and the SM80 row keeps serving A100 regardless.
+      * ``tile_ms``/``tile_ns`` stay empty: the tile geometry is the row's
+        validated box, not a user knob, and an unvalidated tile is exactly what
+        the row must not advertise.
+    """
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm89",
+        capabilities=Capabilities(
+            sm_lo=89,
+            sm_hi=89,  # Ada (L20): the 99 KiB opt-in SMEM part this was measured on
+            phase="prefill",
+            d_shapes=frozenset({(64, 64)}),
+            d_pad_multiple=1,  # host-side head-dim padding, like the SM80 row
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            # Mask claim in the canonical spelling.  The flags alone would
+            # derive exactly this (`causal` + `swa`, nothing else), but stating
+            # it explicitly is what makes the ANCHOR restriction part of the
+            # row's identity rather than an accident of two booleans being
+            # absent: this row serves the top-left anchor only.  The L20 run
+            # qualified top-left causal on square AND rectangular graphs; a
+            # RECTANGULAR bottom-right-causal graph -- the case where the two
+            # anchors really are different masks -- is DECLINED by this row and
+            # the backend's plans stand in (test_sm89_d64.py pins that
+            # rejection), so the anchor has no measurement behind it and is not
+            # claimed.
+            causal=True,
+            swa=True,
+            band=band.BandSupport(
+                right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
+                left=frozenset({band.LEFT_NONE, band.LEFT_WINDOW}),
+                anchors=frozenset({band.ANCHOR_TOP_LEFT}),
+            ),
+            stats=True,
+            stats_log2=True,
+            lse_optional=True,
+            decode=False,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # NOT claimed: right_band_widening.  The kwarg is ACCEPTED but the
+            # L20 measurement found the served output bit-identical to plain
+            # top-left causal with and without ``diagonal_band_right_bound``, so
+            # the row must not advertise a widening it does not apply.  That is
+            # a kernel-side gap to investigate separately, not a row to widen.
+        ),
+        lower=partial(
+            lower_dsl_prefill,
+            api_type=_SM89,
+            # The validated box and the device family: both are plan-time data
+            # on the row, so the adapter cannot silently serve another part or
+            # another tile geometry under this engine's name.
+            api_ctor_extra={
+                "device_cc": ((8, 9),),
+                "flavor_params": {"flavor": "gptoss", "d_qk": 64, "d_v": 64, "tile_m": 128, "tile_n": 64, "num_warps": 4},
+            },
+        ),
+    )
+
+
 def _sm120_spec() -> EngineSpec:
     from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
 
@@ -1805,6 +1969,7 @@ def lower_dsl_prefill(
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
     api_type: str = _SM100,
+    api_ctor_extra: Optional[dict] = None,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -1813,6 +1978,13 @@ def lower_dsl_prefill(
     ``EngineSpec.lower`` may bind a different implementation through
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
+
+    ``api_ctor_extra`` carries plan-time data a row states about itself that the
+    shared adapter cannot know: which device family the row was validated on,
+    and which kernel box (flavor + tile geometry) it was measured at.  The keys
+    are checked against the adapter's constructor here, loudly and at build
+    time, and applied after construction but BEFORE ``check_support()`` so the
+    gate they feed is the row's own rather than a default.
     """
     from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
@@ -1832,7 +2004,20 @@ def lower_dsl_prefill(
     api_cls = _adapter(api_type)
     _ctor_params = frozenset(inspect.signature(api_cls.__init__).parameters)
     _exec_params = frozenset(inspect.signature(api_cls.execute).parameters)
+    # A row's own plan-time data (device family, validated kernel box). The keys
+    # are checked against the adapter's signature HERE, loudly and at build time,
+    # so a typo in a row fails on the first graph instead of silently doing
+    # nothing -- and they reach the constructor BEFORE check_support(), which is
+    # the gate they feed.
+    api_ctor_extra = dict(api_ctor_extra) if api_ctor_extra else {}
+    if api_ctor_extra:
+        _unknown = set(api_ctor_extra) - _ctor_params
+        if _unknown:
+            raise ValueError(
+                f"cudnn.sdpa: engine {spec.name} declares adapter construction extras " f"{sorted(_unknown)} that {api_cls.__name__}.__init__ does not accept"
+            )
     api = api_cls(
+        **api_ctor_extra,
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
@@ -2292,6 +2477,10 @@ ENGINE_SPECS = (
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),
+    # SM89 sits last: it is the narrowest row and overlaps SM80's d64 box on
+    # Ada, so putting it after the A100 row leaves every existing tie-break
+    # untouched on cc 8.0 (where the SM89 row is not eligible at all).
+    _sm89_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

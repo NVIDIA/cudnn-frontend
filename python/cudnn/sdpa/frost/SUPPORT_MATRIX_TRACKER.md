@@ -21,6 +21,20 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
+**Band masks** (`causal` / `bottom_right` / `swa` / `right_band_widening`) are
+declared through the canonical model in `cudnn/sdpa/band.py`, which separates the
+band a GRAPH asks for (`BandFacts`: left bound present or not / right mode
+unbounded · causal · finite-right / top-left · bottom-right anchor, plus the
+"a bottom-right anchor needs a diagonal" combination rule) from the band SET a
+row serves (`BandSupport`, held on each row as `Capabilities.band` and derived
+from the legacy flags by one normalization layer). The legacy flags stay the
+declaration spelling of every row below; the point of the model is that a
+RESTRICTED row is expressible — the causal-only claim of the MXFP8 backward, or
+the top-left-anchor-only claim of the SM89 forward row — instead of an
+unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
+directions, so a mode the graph requests by leaving a flag unset (unbounded
+right band, no left bound, top-left anchor) is part of the row's claim too.
+
 `sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
 ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
 SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
@@ -993,6 +1007,74 @@ deterministic dQ, head-dim envelope padding (carved staging at the packed
 capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
 wrapper-only fusion no engine row admits. The forward row
 still declines THD (the wrapper's `cu_seqlen` path serves it).
+
+---
+
+## SM89 (Ada / L20, cc 8.9 exactly)
+
+Engines: `sdpa_fwd_prefill_sm89`. Same template as SM80 (`sm80/prefill_f16.py`)
+and the same frozen gptoss geometry — `mma.sync` + `cp.async`, no tcgen05, no
+clusters, host-side head-dim zero-padding, so there is no alignment rule. What
+differs is the DEVICE: Ada exposes 99 KiB of opt-in SMEM per block (101376 B on
+an L20, queried) instead of A100's 164 KiB. The SM80 row has to carry the d=256
+flavor, whose pinned point allocates 128 KiB (sQ_buf 64 KiB + sK_buf 64 KiB);
+cc 8.0 exactly is therefore the honest gate *for that row*, and it is unchanged.
+The d64 gptoss point allocates only 32 KiB (16 + 16) and so is served here under
+a box that claims only what was measured on an L20.
+
+**Measured on 1× L20 (cc 8.9), 2026-09-18**: FP16 and BF16, dense and
+top-left-causal, `S_q = S_kv ∈ {128, 256, 512, 1024}` against an FP64
+reference (max |ΔO| within the FP16/BF16 round-off budget, max |ΔStats| ≤ 4e-3),
+plus registration / capability-box / rejection cases. Mask families were fitted from the kernel
+rather than assumed: `sliding_window_length=W` keeps the W keys ending at self
+(forbidding `i - j >= W`; 4.3e-4 against 1.04 for the "keys left of self"
+reading) and `diagonal_band_right_bound` is accepted but has **no effect** —
+the served output stays bit-identical to plain top-left causal. The row serves rectangular
+graphs too (`S_q`, `S_kv` independent), and that is exactly where the anchor
+matters: a rectangular `use_causal_mask_bottom_right` graph is **declined** —
+the backend's plans stand — which the test file pins as a rejection rather than
+a silent fallback. Not measured here: padding, sinks, bias, THD, decode,
+GQA-with-native-KV, d ≠ 64, FP8/MXFP8, SM86.
+
+| Feature | d64 (GPT-OSS) |
+|---|:--:|
+| | F |
+| **Data types** | |
+| FP16 / BF16 | ✅ |
+| FP8 / MXFP8 | ❌ |
+| **Layout** | |
+| BSHD / `dense_flex` | ✅ |
+| THD / ragged | ❌ |
+| `cu_seq_len_q/kv` | ❌ |
+| Strided / permuted Stats | ✅ |
+| **Masks / features** | |
+| Unmasked | ✅ (square and rectangular) |
+| Causal (top-left) | ✅ (square and rectangular) |
+| Causal bottom-right | ❌ declined: a rectangular bottom-right graph gets a backend plan, not this row's |
+| Causal right-band widening | ❌ accepted-and-ignored kwarg — not served |
+| Sliding window (left, `sliding_window_length=W`) | ✅ keeps the W keys ending at self |
+| Padding mask / padded-Q trim | ❌ |
+| Attention sink | ❌ |
+| Base-2 stats (`stats_use_log2`) | ✅ |
+| Bias | ❌ |
+| GQA / MQA | ❌ |
+| Ragged `S_kv` | ✅ |
+| Decode-shaped (`S_q == 1`) | ❌ |
+| Split-KV | ❌ |
+
+The ❌ cells above are **not** statements that the kernel cannot do them; they
+are cells this row does not claim, because the L20 session that added the row
+qualified only f16/bf16 dense + top-left causal. Each one moves to ✅ by adding
+its own L20 case to `test/python/sdpa/frost/test_sm89_d64.py` and editing this
+table in the same commit, per Rule S2. `tile_ms`/`tile_ns` stay empty on the row
+for the same reason: the (tile_m=128, tile_n=64, 4 warps) point is the row's
+validated box, not a user knob, and the plan-time SMEM gate now declines any
+geometry whose compile-time allocation exceeds the device's per-block opt-in
+limit instead of failing at launch.
+
+Not served by this row and **not** claimed anywhere: SM86 (a different 99 KiB
+part with a different instruction budget) and any H100/Blackwell head dim. The
+same kernel skeleton would have to be re-measured on those parts first.
 
 ---
 
