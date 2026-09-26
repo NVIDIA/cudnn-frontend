@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""SM100/SM107 and SM120 f16 forward launches, prepared once and bound per call.
+"""SM100/SM107/SM120 half and SM100 FP8 launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
@@ -92,8 +92,81 @@ def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
     return pack.native._facts_as(indices, BufferFacts, _DTYPE_BY_CODE)
 
 
+_QUANT_ROLES = ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
+_QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
+
+
+class QuantizedLaunchSpec(NamedTuple):
+    has_amax: bool
+    scratch_offset: int  # unused amax and an identity scale, in caller-owned workspace
+
+
+def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None):
+    """Bind the shared geometry and runtime FP8 scalars before initializing or launching.
+
+    Scales remain device pointers. The compiled host unscales a requested amax on the
+    same stream; an unrequested amax uses the plan's declared scratch word. Standalone
+    callers may omit scales (identity), while graph bindings require their declared UIDs.
+    """
+    quant = spec.quant
+    if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
+        raise ValueError("cudnn.sdpa: prepared FP8 requires an aligned caller workspace")
+    patches = {}
+    identity = workspace_ptr + quant.scratch_offset + 4
+    needs_identity = False
+    for name in _QUANT_ROLES:
+        f = facts.get(name)
+        if f is None:
+            if name == "amax_o":
+                ptr = workspace_ptr + quant.scratch_offset
+            else:
+                ptr = identity
+                needs_identity = True
+        else:
+            _on_plan_device(spec, name, f)
+            if f.dtype != "float32" or f.numel != 1 or not f.contiguous or (f.span >= 0 and f.span < 1) or not f.ptr or f.ptr % 4:
+                raise ValueError(f"cudnn.sdpa: {name} must be one aligned float32 device element with sufficient storage when observed")
+            if name == "amax_o" and not quant.has_amax:
+                raise ValueError("cudnn.sdpa: this specialization does not produce amax_o")
+            ptr = f.ptr
+        patches[name + "_ptr"] = ptr
+    # Scalar output must not overwrite any input or caller output. Workspace alias
+    # detection is kept byte-based: Q/K/V are one byte, O is two, scales are four.
+    amax = patches["amax_o_ptr"]
+    if facts.get("amax_o") is not None and workspace_ptr < amax + 4 and amax < workspace_ptr + quant.scratch_offset + 8:
+        raise ValueError("cudnn.sdpa: prepared FP8 workspace overlaps amax_o")
+    for name, f in facts.items():
+        if f is None or name == "amax_o":
+            continue
+        # A declared raw address carries no observed allocation span. Its
+        # declared footprint still detects aliases; capacity remains the
+        # caller's contract, as for the shared dense metadata bindings.
+        span = f.span if f.span >= 0 else (0 if f.numel == 0 else 1 + sum((n - 1) * st for n, st in zip(f.shape, f.strides)))
+        if span <= 0:
+            continue
+        width = _buffers.DTYPE_ITEMSIZE[f.dtype]
+        scratch_end = workspace_ptr + quant.scratch_offset + 8
+        if workspace_ptr < f.ptr + span * width and f.ptr < scratch_end:
+            raise ValueError(f"cudnn.sdpa: prepared FP8 workspace overlaps {name}")
+        if amax < f.ptr + span * width and f.ptr < amax + 4:
+            raise ValueError(f"cudnn.sdpa: amax_o overlaps {name}")
+    if isinstance(spec, ThdLaunchSpec):
+        frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
+    else:
+        frame = bind_dense(spec, facts, stream, stream_int)
+    if needs_identity:
+        _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
+    _buffers.memset_zero_async(amax, 4, stream_int)
+    if frame is not None:
+        for name, ptr in patches.items():
+            frame[spec.index[name]] = ptr
+        if scale_softmax_log2 is not None:
+            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
+        spec.fn(*frame)
+
+
 class ThdLaunchSpec:
-    """Plan-time facts of one THD f16 launch (built by :func:`build_thd_spec`); read-only after
+    """Plan-time facts of one THD launch (built by :func:`build_thd_spec`); read-only after
     build except for its bounded cache of immutable validated geometry."""
 
     __slots__ = (
@@ -103,6 +176,7 @@ class ThdLaunchSpec:
         "index",
         "template",
         "native",
+        "quant",
         "b",
         "qh",
         "kh",
@@ -179,7 +253,8 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    order = [n for n, p in inspect.signature(km._host).parameters.items() if "Constexpr" not in str(p.annotation)]
+    host = km._host_prepared if getattr(api, "_prepared_fp8", False) else km._host
+    order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
     wrapper_sig = getattr(compiled, "_kwargs_wrapper", None) or compiled
@@ -201,6 +276,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
+    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
@@ -249,7 +325,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL)
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - (_QUANT_SLOTS if s.quant is not None else frozenset()))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
@@ -671,6 +747,11 @@ class PreparedThdLaunch:
         if spec.paged:
             uids["block_table"] = binding.paged_k_table.get_uid()
             uids["block_table_v"] = binding.paged_v_table.get_uid()
+        if spec.quant is not None:
+            for name in _QUANT_ROLES:
+                tensor = getattr(binding, name)
+                if tensor is not None:
+                    uids[name] = tensor.get_uid()
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
@@ -690,6 +771,9 @@ class PreparedThdLaunch:
             self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
             return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        if self.spec.quant is not None:
+            execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
+            return
         frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
         if frame is not None:
             self.spec.fn(*frame)
@@ -731,6 +815,7 @@ class DenseLaunchSpec:
         "order",
         "index",
         "template",
+        "quant",
         "b",
         "qh",
         "kh",
@@ -794,6 +879,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s = DenseLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
+    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
@@ -892,7 +978,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("ragged_q_div", s.ragged_divs[0] if s.ragged else 1)
     if s.ragged and "ragged_q_addr" not in s.index:
         raise NotImplementedError(f"{km.__name__}: the ragged-Q decode leg needs the ragged_q_addr host slot")
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE)
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE - (_QUANT_SLOTS if s.quant is not None else frozenset()))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
@@ -1309,6 +1395,11 @@ class PreparedDenseLaunch:
             uids["ragged_o"] = binding.ragged_o.get_uid()
             if spec.combine is not None and spec.combine.has_stats:
                 uids["ragged_lse"] = binding.ragged_stats.get_uid()
+        if spec.quant is not None:
+            for name in _QUANT_ROLES:
+                tensor = getattr(binding, name)
+                if tensor is not None:
+                    uids[name] = tensor.get_uid()
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
@@ -1321,6 +1412,9 @@ class PreparedDenseLaunch:
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        if self.spec.quant is not None:
+            execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
+            return
         if self.spec.combine is not None:
             bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
             if bound is None:

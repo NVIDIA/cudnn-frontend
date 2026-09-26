@@ -1137,7 +1137,8 @@ def test_override_enabled_dense_plan_honors_bounded_kv(d, split):
 @requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
+@pytest.mark.parametrize("ordered", [False, True])
+def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeypatch):
     """Both entry points use native admission with fresh buffers/workspace/stream.
 
     Replaying after input mutation checks that capture bound the current stream,
@@ -1155,13 +1156,21 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
     monkeypatch.setattr(prep_mod, "facts_of_roles", lambda *args: pytest.fail("native graph launch must not rebuild Python facts"))
     monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *args: pytest.fail("native f16 contract must not fall back to Python binding"))
 
+    def execute(buffers, workspace):
+        bindings = _pack(t, buffers)
+        if ordered:
+            items = list(reversed(list(bindings.items())))
+            g.execute([buffer for _, buffer in items], workspace, tensor_uids=[tensor.get_uid() for tensor, _ in items])
+        else:
+            g.execute(bindings, workspace)
+
     def verify():
         o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d)
         torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
 
     with torch.cuda.stream(stream):
-        g.execute(_pack(t, bufs), ws)
+        execute(bufs, ws)
     stream.synchronize()
     verify()
     with torch.cuda.stream(stream):
@@ -1173,7 +1182,7 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
         prepared = plan._prepared
         plan._prepared, plan.takes_variant_pack = None, False
         try:
-            g.execute(_pack(t, bufs), ws)
+            execute(bufs, ws)
         finally:
             plan._prepared, plan.takes_variant_pack = prepared, True
     stream.synchronize()
@@ -1184,12 +1193,12 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
     with torch.cuda.stream(stream):
         bufs["o"].fill_(float("nan"))
         bufs["lse"].fill_(float("nan"))
-        g.execute(_pack(t, bufs), ws)
+        execute(bufs, ws)
     stream.synchronize()
     verify()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        g.execute(_pack(t, bufs), ws)
+        execute(bufs, ws)
     with torch.cuda.stream(stream):
         bufs["q"].mul_(0.5)
         bufs["o"].fill_(float("nan"))
@@ -1202,7 +1211,7 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, monkeypatch):
     old_bufs, old_ws = bufs, ws
     replacement = _buffers(b, ql, kl, hq, hk, d, seed=9, dtype=dtype)
     new_ws = torch.empty_like(ws)
-    g.execute(_pack(t, replacement), new_ws)
+    execute(replacement, new_ws)
     torch.cuda.synchronize()
     with torch.cuda.stream(stream):
         old_bufs["q"].mul_(0.5)
