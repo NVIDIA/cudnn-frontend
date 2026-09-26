@@ -591,3 +591,14 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Formatting: black, line length 160.
 
 CUDA-owning objects, GC-timed release and stream capture: Rule 8.
+
+
+## DSA training composition
+
+Metadata for backward and targets has two different ordering contracts. Training
+may compact valid active indices only if forward and backward share that exact
+metadata. Score targets must preserve original slots, mask invalid/inactive
+entries, and normalize over retained slots after summing heads. Never reuse
+compacted training indices as the caller-visible target order. Detector:
+`fe_api/dsa/test_DSA_training.py::test_native_training_and_original_score_slots`
+checks holes, duplicates, bounded lengths, all-masked rows and target alignment.
