@@ -1128,7 +1128,7 @@ class TestPreparedSm107Fp8:
             kwargs.setdefault("arch", "sm107")
             return original(**kwargs)
 
-        monkeypatch.setattr(shared, "_case", case)
+        monkeypatch.setattr(_prepared_fp8_checks, "_case", case)
 
     @pytest.mark.parametrize("thd", [False, True])
     @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
