@@ -19,10 +19,10 @@ def require_sm100():
         pytest.skip("SM100 is required")
 
 
-def prepared_kwargs(kind):
+def prepared_kwargs(kind, groups=(512,) * 4):
     from cuda.bindings import driver as cuda
 
-    inputs = natural_inputs(mxfp8_inputs([512] * 4))
+    inputs = natural_inputs(mxfp8_inputs(list(groups), tensor_m=sum(groups)))
     result = {name: inputs[name] for name in ("a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "alpha_tensor", "prob_tensor", "norm_const_tensor")}
     result.update(
         padded_offsets=inputs["padded_offsets_tensor"],
@@ -73,6 +73,18 @@ def test_prepared_uses_fresh_values_and_routing(kind, check):
     result = plan.run(check=check, **current)
     assert_exact_outputs(result, wrapper_call(kind, current))
     assert not torch.equal(raw_bytes(initial_result["d_tensor"]), raw_bytes(result["d_tensor"]))
+
+
+@pytest.mark.parametrize("kind", ["glu", "quant"])
+@pytest.mark.parametrize("check", [False, True])
+def test_prepared_serves_new_routed_rows(kind, check):
+    from cudnn.gemm.cutedsl.grouped.prepared import prepare_grouped_gemm
+
+    plan = prepare_grouped_gemm(kind, reuse_row_outputs=True, **prepared_kwargs(kind))
+    for groups in ((256, 768, 512, 1024), (512,) * 4, (256,) * 4):
+        current = prepared_kwargs(kind, groups)
+        assert_exact_outputs(plan.run(check=check, **current), wrapper_call(kind, current))
+    assert prepare_grouped_gemm(kind, **prepared_kwargs(kind, (256,) * 4)).api is plan.api
 
 
 def test_prepared_quant_preserves_supplied_output_identity():

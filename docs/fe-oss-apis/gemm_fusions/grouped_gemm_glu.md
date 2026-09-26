@@ -636,21 +636,24 @@ plan = prepare_grouped_gemm("glu", **kwargs)
 outputs = plan.run(**kwargs)
 ```
 
-Preparation fixes tensor shapes, strides, dtypes, devices, optional-operand
-presence, scalar configuration, and environment specialization. Each `run`
-receives the current tensor operands, including current routing offsets;
-preparation does not retain sample inputs. Tensor values and addresses may
-change. Prepare another plan when its metadata or configuration changes.
+Preparation fixes tensor shapes other than the routed row count M, strides,
+dtypes, devices, optional-operand presence, scalar configuration, and
+environment specialization. Each `run` receives the current tensor operands,
+including current routing offsets, and may change M (A, prob, and the SFA
+buffer size); outputs follow the call's M without recompiling. Preparation does
+not retain sample inputs. Tensor values and addresses may change. Prepare
+another plan when other metadata or configuration changes.
 
-Each plan owns its workspace and belongs to its preparation CUDA stream.
-That stream must be current during preparation and execution; use separate
-plans for other streams. `run(check=True)` validates the contract by default.
+Each plan belongs to its preparation CUDA stream. That stream must be current
+during preparation and execution; use separate plans for other streams. Plans
+with the same configuration on one stream share one compiled kernel and its
+workspace. `run(check=True)` validates the contract by default.
 `check=False` skips metadata/configuration checks and the current-PyTorch-stream
 check: the caller must guarantee all those invariants and ordered execution
 on the preparation stream. It does not permit concurrent use of a plan.
 
 With `reuse_row_outputs=True`, GLU retains only `d_tensor` and
-`sfd_row_tensor` as scratch. The next call overwrites them, so queue all their
+`sfd_row_tensor` as scratch. The next call with the same M overwrites them, so queue all their
 consumers before that call on the same stream, joining other-stream consumers
 first. Retaining a returned dictionary does not preserve those row outputs.
 C, D_col, and SFD_col receive fresh storage on every call for backward consumers.
