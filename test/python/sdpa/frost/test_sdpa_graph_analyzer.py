@@ -260,7 +260,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
         table = graph.tensor(dim=(B, 1, 8, 1), stride=(8, 8, 1, 1), data_type=cudnn.data_type.INT32)
         changed.update(paged_k_table_t=table, paged_v_table_t=table)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature in ("supported", "split", "head_dim") or (arch == "sm100" and feature == "paged"):
+    if feature in ("supported", "split", "head_dim", "sm107") or (arch == "sm100" and feature == "paged"):
         assert reason is None
     else:
         assert reason is not None
