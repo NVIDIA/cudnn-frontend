@@ -70,6 +70,13 @@ pytest fe_api/gemm/          # OSS kernel tests
 
 ### Confirm you are testing the code you edited
 
+Bind tensor views in the graph's declared axis order. A BSHD allocation and
+a BHSD declaration can have identical shapes when H == S; shape equality then
+preserves the producer's strides and cannot infer the intended transpose.
+Use a metadata-only transpose at the test binding boundary, keeping the
+reference's allocation unchanged. `test_sdpa_fp8_paged_equal_head_and_query_axes`
+covers this collision through the actual FP8 harness and prepared executor.
+
 `pip install -e .` does **not** put the package on `sys.path`. It installs a
 `sys.meta_path` finder (`__editable___nvidia_cudnn_frontend_*_finder.py`) whose
 `MAPPING` hard-codes an absolute path to the checkout it was installed from.
