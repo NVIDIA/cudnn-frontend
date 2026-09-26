@@ -635,7 +635,10 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
     ta.set_uid(j.at("uid").get<Tensor_attributes::uid_t>());
 
-    if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
+    // contains(), and not the const operator[].
+    // That overload only checks the key with a JSON_ASSERT, which NDEBUG removes.
+    // A damaged tensor entry would then dereference end().
+    if (ta.is_pass_by_value && j.contains("pass_by_value") && !j["pass_by_value"].is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
     }
     if (j.contains("ragged_offset_uid")) {
