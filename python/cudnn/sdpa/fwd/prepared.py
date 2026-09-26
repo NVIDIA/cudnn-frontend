@@ -131,7 +131,7 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             ptr = f.ptr
         patches[name + "_ptr"] = ptr
     # Scalar output must not overwrite any input or caller output. Workspace alias
-    # detection is kept byte-based: Q/K/V are one byte, O is two, scales are four.
+    # detection uses each operand's declared element width, including FP8 O.
     amax = patches["amax_o_ptr"]
     if facts.get("amax_o") is not None and workspace_ptr < amax + 4 and amax < workspace_ptr + quant.scratch_offset + 8:
         raise ValueError("cudnn.sdpa: prepared FP8 workspace overlaps amax_o")
@@ -156,13 +156,16 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         frame = bind_dense(spec, facts, stream, stream_int)
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
-    _buffers.memset_zero_async(amax, 4, stream_int)
     if frame is not None:
         for name, ptr in patches.items():
             frame[spec.index[name]] = ptr
         if scale_softmax_log2 is not None:
             frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
         spec.fn(*frame)
+    else:
+        # No addressable Q token: there is no compiled host launch to reset
+        # its reduction output, but Amax_O must still describe the empty O.
+        _buffers.memset_zero_async(amax, 4, stream_int)
 
 
 class ThdLaunchSpec:

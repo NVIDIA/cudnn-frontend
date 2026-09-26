@@ -520,14 +520,14 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "this engine has no prepared shape/stride override executor"
     if facts.is_fp8 and (
         capabilities.sm_lo != 100
-        or (facts.d_qk, facts.d_v) != (128, 128)
-        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        or (facts.d_qk, facts.d_v) not in ((128, 128), (192, 128), (256, 256), (512, 512))
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
         or facts.has_paged_kv
         or (split_kv or 1) > 1
         or facts.o_block_scale
         or facts.has_epilogue_gate
     ):
-        return "prepared FP8 serves SM100 d128 unsplit, non-paged half outputs"
+        return "prepared FP8 serves SM100 native head dimensions, unsplit, non-paged scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
@@ -552,7 +552,11 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     for tensor in tensors:
         if (
             tensor is None
-            or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 1 if facts.is_fp8 and tensor in (facts.q_t, facts.k_t, facts.v_t) else 2)
+            or dense_bind_strides(
+                tuple(tensor.get_dim()),
+                tuple(tensor.get_stride()),
+                1 if tensor.get_data_type() in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2) else 2,
+            )
             is None
         ):
             return "prepared overrides require input and unsplit-output layouts that bind without a copy"

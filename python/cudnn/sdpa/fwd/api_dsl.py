@@ -2530,8 +2530,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self._pertensor
             and self._device_cc[0] == 10
             and self._device_cc != (10, 7)
-            and (self.head_dim_qk, self.head_dim_v) == (128, 128)
-            and self._o_dtype() in (torch.bfloat16, torch.float16)
+            and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128), (256, 256), (512, 512))
+            and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.paged
             and self.split_kv == 1
             and not self.o_block_scale

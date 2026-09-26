@@ -129,6 +129,11 @@ ordered after that read.**
   accepting an arbitrary declared D stride, or explicitly require D-contiguous
   storage. Test padding canaries as well as numerical output; the detector is
   `test_pointer_combine_strided_outputs_and_dead_splits`.
+- TMA alignment checks use each operand's actual element width. FP8 Q/K/V
+  can produce half or FP8 O; treating O as always two bytes admits strides
+  aligned to eight elements that are illegal for one-byte O. Keep engine and
+  adapter admission in agreement; the detector is
+  `test_prepared_fp8_output_stride_uses_output_element_width`.
 
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**

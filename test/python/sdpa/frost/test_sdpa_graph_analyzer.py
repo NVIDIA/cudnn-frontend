@@ -224,22 +224,22 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
-@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
-@pytest.mark.parametrize("feature", ["supported", "head_dim", "fp8_output", "paged", "split", "block_scaled_output", "gate", "sm107"])
-def test_prepared_fp8_override_capability_envelope(dtype_o, feature):
-    """D128 FP8-to-half is eligible; the other quantized routes retain their tensor entry."""
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v):
+    """Native FP8 dimensions with scalar-scaled outputs use the prepared entry."""
     from dataclasses import replace
 
     graph = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(graph, d=128)
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
-    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o)
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o, d_qk=d_qk, d_v=d_v)
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
     changed = dict(
         supported={},
-        head_dim=dict(d_qk=256, d_v=256),
-        fp8_output=dict(dtype_o=cudnn.data_type.FP8_E4M3),
+        head_dim=dict(d_qk=112, d_v=112),
         paged=dict(has_paged_kv=True),
         split={},
         block_scaled_output=dict(o_block_scale=32),
@@ -254,6 +254,31 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature):
     else:
         assert reason is not None
         assert "prepared FP8" in reason
+
+
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+@pytest.mark.parametrize("padding", [8, 16])
+def test_prepared_fp8_output_stride_uses_output_element_width(dtype_o, padding):
+    """Eight-element padding meets half TMA alignment, but not FP8 alignment."""
+    fp8 = cudnn.data_type.FP8_E4M3
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, _ = _mk_qkv(graph, d=128)
+    for tensor in (q, k, v):
+        tensor.set_data_type(fp8)
+    scales = {
+        name: graph.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name=name)
+        for name in ("descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o")
+    }
+    o, _, _, _ = graph.sdpa_fp8(q=q, k=k, v=v, attn_scale=0.1, generate_stats=False, **scales)
+    pitch = 128 + padding
+    _finish_output(o, dims, (S * H * pitch, pitch, H * pitch, 1), dtype=dtype_o)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
+    supported = padding == 16 or dtype_o in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    reason = engines._prepared_decline_reason(spec.capabilities, facts, 1)
+    assert (reason is None) == supported
+    assert (engines.analyze_for(spec, graph, knobs)[1] is None) == supported
 
 
 def test_probe_accepts_bf16():
