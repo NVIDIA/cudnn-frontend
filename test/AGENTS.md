@@ -151,3 +151,18 @@ padding-dependent tail rule. A shared binder must preserve that distinction.
 `test_sm120_prepared_bounded_geometry_override` shrinks an unpadded plan to
 S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
 dimensions as compile-time constants: the same binder fixes those per plan.
+
+### Sparse score-recompute resource boundaries
+
+Exercise non-power-of-two TMEM slot counts and partial ring wraps across
+persistent query tiles; a full-ring single-tile case misses slot aliasing and
+per-slot barrier-phase drift. Keep the focused regressions in
+`fe_api/dsa/test_DSA_sparse_score_recompute.py`. For SM100 SMEM planning, test
+a boundary that distinguishes the usable 227 KiB from the nominal 228 KiB;
+`test_DSA_sparse_attention_score_recompute_uses_launchable_smem_budget` must
+fail against the old planner before accepting the fix.
+
+Sparse metadata and cross-warp reduction scratch also need explicit reader
+completion before reuse. Run racecheck on both indexer and attention cases:
+ordering Q/K MMA alone does not publish every metadata lane's stores, and a
+max-to-sum reduction can overwrite shared scratch before all warps read it.
