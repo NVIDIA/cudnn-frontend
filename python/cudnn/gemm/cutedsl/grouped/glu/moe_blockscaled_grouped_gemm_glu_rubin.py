@@ -2763,11 +2763,11 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 mProb_br = cutlass.Float32(1.0)
                 if cutlass.const_expr(self.has_prob):
                     real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
-                    mProb = real_prob[mPosition_base, 0, 0]
+                    mProb = real_prob[mPosition_base, 0, 0].to(cutlass.Float32)
                     mProb_bk = mProb
                     mProb_br = mProb
                     if cutlass.const_expr(self.enable_breuse):
-                        mProb_br = real_prob[mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0]
+                        mProb_br = real_prob[mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0].to(cutlass.Float32)
 
                 #
                 # Wait for accumulator buffer full

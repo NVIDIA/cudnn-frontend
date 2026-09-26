@@ -2658,7 +2658,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 mProb = cutlass.Float32(1.0)
                 if cutlass.const_expr(self.has_prob):
                     real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
-                    mProb = real_prob[mPosition, 0, 0]
+                    mProb = real_prob[mPosition, 0, 0].to(cutlass.Float32)
 
                 #
                 # Wait for accumulator buffer full

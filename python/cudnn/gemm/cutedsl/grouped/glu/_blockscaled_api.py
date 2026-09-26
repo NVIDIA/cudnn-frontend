@@ -594,9 +594,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self.use_2cta_instrs and self.mma_tiler_mn[0] != 256,
             f"MMA tiler M must be 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
         )
+        supported_tile_n = (128, 256) if self.weight_mode == MoEWeightMode.DENSE and not self._is_rubin_kernel else (256,)
         self._value_error_if(
-            self.mma_tiler_mn[1] != 256,
-            f"MMA tiler N must be 256, got {self.mma_tiler_mn[1]}",
+            self.mma_tiler_mn[1] not in supported_tile_n,
+            f"MMA tiler N must be in {supported_tile_n}, got {self.mma_tiler_mn[1]}",
         )
         self._value_error_if(
             self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,

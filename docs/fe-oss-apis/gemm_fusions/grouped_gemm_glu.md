@@ -510,7 +510,7 @@ Providing both or neither raises `ValueError`.
 - `acc_dtype`: Must be `torch.float32`
 - `mma_tiler_mn`: Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
   - `TILE_M ∈ {128, 256}`
-  - `TILE_N = 256`
+  - `TILE_N = 256`; dense block-scaled weights on SM100 also accept `TILE_N = 128`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
 - `vector_f32`: Enable packed f32 operations. Default: `False`
@@ -577,7 +577,7 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - `N` must be divisible by 64 (two consecutive 32-column blocks for GLU pairing)
 - Expert count must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned` (256)
-- All supported kernel configurations require `mma_tiler_mn[1] == 256`
+- Bias, discrete weights, and Rubin require `mma_tiler_mn[1] == 256`
 - `use_single_group_runtime_offsets=True` is supported only by the block-scaled
   kernel with exactly one expert. In this mode the kernel derives
   `padded_offsets[0]` from runtime `A.shape[0]` and does not load its value from
