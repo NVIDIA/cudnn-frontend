@@ -569,6 +569,11 @@ backward) and its workspace (about one payload-equivalent of bytes).
 
 ## SM107 (Rubin, cc 10.7–11.9)
 
+These engines require a CuTe DSL build with the `sm_107a` target. Public
+4.7.0 meets the shared DSL floor but lacks this target; graph admission and
+standalone support checks decline it with the installed version before compile.
+SM100/SM120 keep their existing 4.7.0 floor.
+
 Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
 (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale). **No
 backward** on the Rubin line — those graphs fall through to the backend.

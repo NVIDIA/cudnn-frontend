@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""SM100/SM107/SM120 half and SM100 FP8 launches, prepared once and bound per call.
+"""SM100/SM107/SM120 half and per-tensor FP8 launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
@@ -108,6 +108,7 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
     Scales remain device pointers. The compiled host unscales a requested amax on the
     same stream; an unrequested amax uses the plan's declared scratch word. Standalone
     callers may omit scales (identity), while graph bindings require their declared UIDs.
+    Return whether attention launched, for standalone empty-THD diagnostics.
     """
     quant = spec.quant
     if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
@@ -180,6 +181,7 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         # No addressable Q token: there is no compiled host launch to reset
         # its reduction output, but Amax_O must still describe the empty O.
         _buffers.memset_zero_async(amax, 4, stream_int)
+    return frame is not None
 
 
 class ThdLaunchSpec:

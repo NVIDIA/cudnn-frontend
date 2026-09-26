@@ -24,6 +24,37 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
+    # device with a fake compiler target; actual Rubin tests use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
+@pytest.mark.parametrize("dsl_version", ["4.7.0", "0.3.0+internal"])
+def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_version):
+    import torch
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import engines
+
+    dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    caps = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
+    error = engines.mismatch(caps[engines.engine_name(arch="sm107", fp8=True)], _fp8_facts(device_cc=(10, 7)))
+    assert "sm_107a" in error and dsl_version in error
+    assert engines.mismatch(caps[engines.engine_name(arch="sm100", fp8=True)], _fp8_facts()) is None
+    with pytest.raises(NotImplementedError, match="sm_107a") as exc:
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None).check_support()
+    assert dsl_version in str(exc.value)
+
+
 def _load(rubin, **params):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
@@ -977,7 +1008,9 @@ def _run_fp8_gated(q8, k8, v8, descales, gate, *, dtype_o, causal, sched_policy=
     assert api.check_support()
     api.compile()
     dq, dk, dv = descales
-    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv)
+    size = api.scratch_workspace_bytes()
+    workspace = torch.empty(size, dtype=torch.uint8, device=q8.device) if size else None
+    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
     if gate_on:
         kw["gate"] = gate
     if amax_o is not None:

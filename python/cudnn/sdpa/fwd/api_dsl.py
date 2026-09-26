@@ -24,6 +24,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn._device import ensure_current_context as _ensure_current_context
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import (
     DTYPE_BF16,
@@ -1354,7 +1355,13 @@ class SdpaFwdDsl(APIBase):
                 block_table_v=facts_of_tensor(block_table_v),
             )
             spec = self._dense_spec
-        execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+        launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+        # Preserve the retired tensor path's diagnostics at the live entry.
+        if self.thd:
+            if launched:
+                self._logger.debug("execute (FP8 per-tensor THD) completed")
+            else:
+                self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
         self._logger.debug("execute (prepared FP8) completed")
 
     def _o_dtype(self):
@@ -1783,6 +1790,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        arch_error = cutedsl_arch_requirement_error(self._device_cc)
+        self._not_implemented_error_if(arch_error is not None, arch_error)
         # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode; Rubin has
         # no decode tile (supported_cgas_for never offers cga=1 there).
         self._not_implemented_error_if(
@@ -3878,11 +3887,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         in-kernel and divided by scale_o on device post-kernel -- unless the
         specialization folded it out (``has_amax_o=False`` on a kernel that
         carries ``has_amax``), in which case the amax slot binds None and
-        nothing is reset or divided. THD/varlen rides the shared packed
-        lowering (``_thd_pack``); the scale folding and the amax protocol are
-        identical. ``gate`` is the fused epilogue gate (dense only; O's shape,
+        nothing is reset or divided. THD/varlen uses the prepared entry.
+        ``gate`` is the fused epilogue gate (dense only; O's shape,
         bf16), bound as a zero-copy BSHD view at the compiled strides.
         """
+        if self.thd:
+            raise RuntimeError("per-tensor FP8 THD requires the prepared launch entry")
+
         import cutlass
 
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
@@ -3909,71 +3920,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # compiled out and the slot binds None (no reset, no divide). Legacy
         # kernels keep the dummy slot regardless of the flag.
         _amax_folded = getattr(self, "_amax_folded_out", False)
-
-        if self.thd:
-            # amax_o reset first (launch-stream ordered): the degenerate
-            # early-returns below leave the correct 0 (no valid row).
-            amax_o_buf = None if _amax_folded else self._amax_slot(amax_o, "amax_o", device)
-            if amax_o_buf is not None:
-                with _torch_stream_context(current_stream, device):
-                    amax_o_buf.zero_()
-            lse_cap = self._thd_lse_tokens_cap(lse_tensor)
-            pack = self._thd_pack(
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                sinks,
-                seq_kv_lens,
-                seq_q_lens,
-                workspace,
-                "SdpaFwdDslSm100 (FP8 THD)",
-                current_stream=current_stream,
-                lse_tokens_cap=lse_cap,
-            )
-            if pack is None:
-                self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
-                # no addressable Q token: every padded Stats row is unwritten, and the contract is -inf on all of them
-                self._seed_padded_lse(self._thd_padded_lse_view(lse_tensor), current_stream)
-                return
-            LSE = self._thd_lse_view(lse_tensor, pack.t_q)
-            self._seed_padded_lse(LSE, current_stream)
-            # PLAN-TIME-ONLY compile key: re-binds the artifact compile()
-            # already built (the packed totals are dynamic extents).
-            fn = self._k_mod.compile(**self._thd_compile_kwargs())
-            thd_lens_args = (
-                (0, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))  # 0: no dense Q-length address on THD
-                if self._quantized_q_lens_abi
-                else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
-            )
-            fn(
-                pack.Q,
-                pack.K,
-                pack.V,
-                pack.O,
-                LSE,
-                pack.sinks_t,
-                pack.meta,
-                pack.o_desc,
-                (b, h_q, h_kv, 0, 0, 0),
-                cutlass.Float32(scale_softmax_log2),
-                cutlass.Float32(o_scale_fused),
-                cutlass.Int32(pack.units),
-                dq_t,
-                dk_t,
-                dv_t,
-                so_t,
-                amax_o_buf,
-                *thd_lens_args,
-                stream=current_stream,
-            )
-            with _torch_stream_context(current_stream, device):
-                if amax_o is not None and amax_o_buf is not None:
-                    # Device divisor: same div_, no readback; scale_o > 0 is
-                    # caller contract (None bound a cached 1.0 above).
-                    amax_o_buf.div_(so_t)
-            self._logger.debug("execute (FP8 per-tensor THD) completed")
-            return
 
         # Declared zero-copy strides (Rubin; (None,)*4 elsewhere -> the historical
         # compact-view-or-copy behaviour), mirroring the dense half path.

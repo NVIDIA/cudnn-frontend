@@ -233,9 +233,9 @@ def compile_host(
 
 
 def make_fake_aux(b, qh, *, amax_align=16):
-    """Dense tensor-entry auxiliaries for remaining paged/conversion/block-scale paths.
+    """Dense tensor-entry auxiliaries for remaining legacy layouts and fused outputs.
 
-    Prepared launches never construct these tensor fakes. All SM100 per-tensor
+    Prepared launches never construct these tensor fakes. All SM100/SM107 per-tensor
     FP8 THD routes now use the pointer entry, so no packed metadata, descriptor
     arrays, dynamic head extents or length-array fakes remain here.
     """

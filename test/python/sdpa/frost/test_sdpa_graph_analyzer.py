@@ -39,6 +39,10 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Pure capability tests also construct Rubin facts on non-Rubin DSL builds.
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
 
 
 def _mk_graph(**kwargs) -> cudnn.pygraph:
