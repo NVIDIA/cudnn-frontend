@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, compute_reference_amax
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
@@ -252,6 +253,7 @@ def _run_compile_execute(
         bias_tensor=inputs["bias_tensor"],
         situ_beta1=execute_situ_beta1,
         situ_beta2=execute_situ_beta2,
+        workspace=ws(api),
     )
 
     if execute_empty_input:

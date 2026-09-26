@@ -92,3 +92,52 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
             return
     with torch.cuda.stream(as_torch_stream(stream, device)):
         yield
+
+
+def record_streams(tensors, stream, device=None) -> None:
+    """Order the caching allocator's reuse of each tensor's block behind the work already
+    enqueued on ``stream`` (R1): ``tensor.record_stream(as_torch_stream(stream, device))``
+    for every CUDA tensor in ``tensors`` (``None`` entries skipped).
+
+    A no-op only when ``stream`` is None (the work runs on torch's current stream under the
+    caller's own context). A launch stream that happens to be torch's current stream is still
+    recorded: the allocator orders reuse against the tensor's ALLOCATION stream, which may be
+    another one when the caller entered a side-stream context before calling.
+    """
+    if stream is None:
+        return
+    import torch
+
+    consumer = None
+    for tensor in tensors:
+        if tensor is None or not tensor.is_cuda:
+            continue
+        if consumer is None:
+            consumer = as_torch_stream(stream, device if device is not None else tensor.device)
+        tensor.record_stream(consumer)
+
+
+def contiguous_on_stream(tensor, stream, device=None):
+    """``tensor`` itself when it is None or contiguous; otherwise a contiguous copy made on
+    ``stream`` after ``record_streams((tensor,), stream, device)``.
+
+    The recording is what makes the copy safe to rebind over: a wrapper doing
+    ``t = t.contiguous()`` under ``stream_context(side)`` drops the caller's reference while
+    the copy kernel is still queued on ``side``; if the caller also releases ``t``, its block
+    returns to the allocator's pool for the caller's stream and the next same-size allocation
+    there overwrites what the copy has yet to read.
+    """
+    if tensor is None or tensor.is_contiguous():
+        return tensor
+    record_streams((tensor,), stream, device)
+    with stream_context(stream, device):
+        return tensor.contiguous()
+
+
+def copy_into_on_stream(dst, src, stream, device=None) -> None:
+    """``dst.copy_(src)`` on ``stream`` with both tensors recorded there first: the wrapper copy-back
+    into a caller-owned buffer is asynchronous too, so neither a ``dst`` the caller releases right
+    after the call nor a ``src`` allocated on another stream may be reused under the pending copy."""
+    record_streams((src, dst), stream, device)
+    with stream_context(stream, device):
+        dst.copy_(src)

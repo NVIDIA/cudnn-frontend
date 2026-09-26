@@ -194,6 +194,30 @@ def test_sdpa_fwd_sm80_check_support_rejections():
         api.check_support()
 
 
+@pytest.mark.L0
+@pytest.mark.no_workspace_shim
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_sm80_gqa_staging_requires_a_workspace():
+    """R2: the GQA head expansion stages K/V in the caller's workspace; a direct
+    adapter caller that passes none gets the contract error, never a hidden
+    allocation (``sdpa_fwd_wrapper_sm80`` allocates ``scratch_workspace_bytes()``
+    per call and passes it)."""
+    from cudnn.sdpa.fwd import SdpaFwdDslSm80
+
+    b, h_q, h_kv, s, d = 1, 8, 2, 128, 128
+    q = _bshd_randn(b, h_q, s, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h_kv, s, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h_kv, s, d, dtype=torch.float16, device="cuda")
+    o = torch.empty((b, s, h_q, d), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    lse = torch.empty((b, h_q, s), dtype=torch.float32, device="cuda")
+    api = SdpaFwdDslSm80(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse)
+    assert api.check_support()
+    api.compile()
+    assert api.scratch_workspace_bytes() > 0
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_sdpa_fwd_sm80_thd_off_flavor_head_dim():

@@ -72,6 +72,7 @@ import os
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_90a")
 
 import math
+from collections import namedtuple
 
 import torch
 
@@ -83,6 +84,9 @@ import cutlass.utils.hopper_helpers as hh
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cudadrv
+
+from cudnn.frost.buffers import DTYPE_ITEMSIZE
+from cudnn.frost.workspace import Workspace, WorkspaceLayout
 
 BF16 = cutlass.BFloat16
 F32 = cutlass.Float32
@@ -1098,7 +1102,13 @@ def kda_launch(
 
 
 _CACHE = {}
-_WS = {}
+
+# Build-time description of the kernel's scratch: the launch constants and the
+# nine backing regions as (name, offset, dtype, shape). The three transposed
+# operands (kgt, utt, mtt) are views of kg/ut/mt and reserve nothing.
+Layout = namedtuple("Layout", "nch prep_nch nseg nop regions size")
+
+_SCRATCH_ORDER = ("mw", "qg", "kg", "ut", "z", "av", "ss", "mt", "ct")
 
 
 def _pick_nseg(T, N, H):
@@ -1123,54 +1133,78 @@ def _pick_nseg(T, N, H):
     return best
 
 
-def _ws(nch, H, N, nseg, device):
-    """Scratch buffers for one shape, returned as ALREADY-CONVERTED CuTe tensors.
+def workspace_layout(T, H, N):
+    """Build-time carve of the kernel's scratch for one shape (Rule 8 / R2).
 
-    These twelve buffers are keyed by shape and never change identity, so
-    re-running ``from_dlpack`` on them at every launch is pure overhead -- it was
-    12 of the 21 conversions per call, and DLPack conversion dominated this
-    kernel's host time. Convert once here; only the caller's own operands need
-    per-call conversion. The torch buffers stay alive in the cache entry because
-    the CuTe tensors borrow their memory rather than owning it.
+    Nine dense regions, 128-aligned, in ``_SCRATCH_ORDER``; ``size`` is what an
+    engine adds to its ``get_workspace_size()``. No region needs zeroing: every
+    phase writes a region before any phase reads it.
     """
-    key = (nch, H, N, nseg, str(device))
-    w = _WS.get(key)
-    if w is None:
-        c = nch * H
-        kg = torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device)
-        ut = torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device)
-        nop = max(N * H * nseg, 1)
-        mt = torch.empty((nop, 128, 128), dtype=torch.bfloat16, device=device)
-        w = (
-            torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device),
-            torch.empty((c * 16, 128), dtype=torch.bfloat16, device=device),
-            kg,
-            ut,
-            torch.empty((c * 16, 16), dtype=torch.bfloat16, device=device),
-            torch.empty((c, 128), dtype=torch.float32, device=device),
-            kg.t(),
-            ut.t(),
-            torch.empty((nop, 128, 128), dtype=torch.float32, device=device),
-            mt,
-            mt.reshape(nop * 128, 128).t(),
-            torch.empty((nop, 128, 128), dtype=torch.float32, device=device),
-        )
-        w = (w, tuple(from_dlpack(b, assumed_align=16) for b in w))
-        _WS[key] = w
-    return w[1]
+    nch = T // 16 + N + 1
+    prep_nch = (T + 15) // 16 + N - 1
+    nseg = _pick_nseg(T, N, H)
+    nop = max(N * H * nseg, 1)
+    c = nch * H
+    shapes = {
+        "mw": ("bfloat16", (c * 16, 128)),
+        "qg": ("bfloat16", (c * 16, 128)),
+        "kg": ("bfloat16", (c * 16, 128)),
+        "ut": ("bfloat16", (c * 16, 128)),
+        "z": ("bfloat16", (c * 16, 16)),
+        "av": ("float32", (c, 128)),
+        "ss": ("float32", (nop, 128, 128)),
+        "mt": ("bfloat16", (nop, 128, 128)),
+        "ct": ("float32", (nop, 128, 128)),
+    }
+    layout = WorkspaceLayout()
+    regions = []
+    for name in _SCRATCH_ORDER:
+        dtype, shape = shapes[name]
+        regions.append((name, layout.add(math.prod(shape) * DTYPE_ITEMSIZE[dtype]), dtype, shape))
+    return Layout(nch, prep_nch, nseg, nop, tuple(regions), layout.size)
+
+
+def scratch_tensors(workspace, layout, offset=0):
+    """The twelve CuTe scratch tensors in ``kda_launch`` order, over the regions
+    of ``layout`` carved from ``workspace`` (a :class:`~cudnn.frost.workspace.Workspace`)
+    starting at ``offset``.
+
+    One DLPack conversion each; the transposes are ``permute`` views of kg/ut/mt.
+    The result owns no memory and its geometry is fixed per shape, so a caller
+    may keep it for as long as the workspace base pointer is unchanged.
+    """
+    view = {name: workspace.view(offset + off, dtype, shape) for name, off, dtype, shape in layout.regions}
+    ordered = (
+        view["mw"],
+        view["qg"],
+        view["kg"],
+        view["ut"],
+        view["z"],
+        view["av"],
+        view["kg"].permute(1, 0),
+        view["ut"].permute(1, 0),
+        view["ss"],
+        view["mt"],
+        view["mt"].reshape(layout.nop * 128, 128).permute(1, 0),
+        view["ct"],
+    )
+    return tuple(from_dlpack(t, assumed_align=16) for t in ordered)
 
 
 def run(q, k, v, g, beta, cu_seqlens, initial_state, o, final_state):
     """Launch from torch tensors (standalone / test entry point).
 
     Converts the nine operands to CuTe tensors and defers to :func:`run_cute`.
-    A caller that already holds CuTe tensors -- cuDNN's engine reaches them
-    straight off the variant pack -- should call that directly and skip the
-    torch round trip, which is two DLPack conversions per operand rather than
-    one.
+    This is the CALLER side of the workspace contract: the scratch is allocated
+    here, per call, on torch's current stream. cuDNN's engine
+    (``kda_engine.KdaHopperPlan``) instead carves it from the workspace its own
+    caller passes and reaches the operands straight off the variant pack.
     """
     T, H, D = q.shape
     N = initial_state.shape[0]
+    layout = workspace_layout(T, H, N)
+    buf = torch.empty(layout.size, dtype=torch.uint8, device=q.device)
+    ws = scratch_tensors(Workspace(buf, layout.size, "kda_prefill_sm90.run"), layout)
     run_cute(
         from_dlpack(q, assumed_align=16),
         from_dlpack(k, assumed_align=16),
@@ -1185,24 +1219,24 @@ def run(q, k, v, g, beta, cu_seqlens, initial_state, o, final_state):
         H,
         D,
         N,
-        q.device,
+        ws,
         torch.cuda.current_stream().cuda_stream,
     )
 
 
-def run_cute(mQ, mK, mV, mG, mB, mCu, mIS, mO, mFS, T, H, D, N, device, stream_ptr):
+def run_cute(mQ, mK, mV, mG, mB, mCu, mIS, mO, mFS, T, H, D, N, ws, stream_ptr):
     """Launch from already-converted CuTe tensors on an explicit stream.
 
-    ``stream_ptr`` is a raw CUDA stream handle, so the caller does not have to
-    push a torch stream context just so this function can read it back out of
-    thread-local state.
+    ``ws`` is the twelve-tuple from :func:`scratch_tensors` for
+    ``workspace_layout(T, H, N)``; ``stream_ptr`` is a raw CUDA stream handle, so
+    the caller does not have to push a torch stream context just so this
+    function can read it back out of thread-local state. The compiled launch is
+    keyed on (T, H, N, D): the carve shapes and strides are fixed per shape and
+    only the pointers change between calls.
     """
     nch = T // 16 + N + 1
     prep_nch = (T + 15) // 16 + N - 1
     nseg = _pick_nseg(T, N, H)
-
-    # Already CuTe tensors, converted once per shape (see _ws).
-    ws = _ws(nch, H, N, nseg, device)
 
     key = (T, H, N, D)
     fn = _CACHE.get(key)
