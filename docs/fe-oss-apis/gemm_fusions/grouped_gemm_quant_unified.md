@@ -299,7 +299,7 @@ prepared configuration. A D supplied during preparation must be passed again
 at execution. `reuse_row_outputs` applies only to GLU.
 
 The shared [prepared execution contract](grouped_gemm_glu.md#prepared-execution)
-requires fixed metadata/configuration, a separate plan per stream, and the
+requires fixed metadata/configuration apart from M, a separate plan per stream, and the
 preparation stream current during every call. `check=False` is only for callers
 that enforce those invariants themselves.
 
