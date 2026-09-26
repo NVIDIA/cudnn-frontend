@@ -2571,6 +2571,89 @@ def test_sdpa_fwd_paged_decode_d256_qwen35_frost_L0(env_info, h_q, s_q, diag_ali
     _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, template=expect_template)
 
 
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("binder", ["native", "python"])
+def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
+    """Every half THD arch/flavor preserves wide strides through device descriptor setup."""
+    import math
+    from sdpa.frost.frost_test_utils import _dsl_usable
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    if not 100 <= sm < 120:
+        pytest.skip("requires an SM100 or SM107 attention engine")
+    usable, reason = _dsl_usable()
+    if not usable:
+        pytest.skip(reason)
+    from cudnn.sdpa.fwd.engines import engine_name
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    b, hq, hk, ql, kl = 2, 4, 2, 1, 64
+    row_stride = 2**32 + hq * d_v
+    if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
+        pytest.skip("wide physical row-stride regression needs 9 GiB free")
+    bf16, i32 = cudnn.data_type.BFLOAT16, cudnn.data_type.INT32
+    graph = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=cudnn.data_type.FLOAT,
+                          compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
+    def lengths(name):
+        return graph.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32, name=name)
+    cu_q, cu_kv = lengths("cu_q"), lengths("cu_kv")
+    off_q, off_k, off_v, off_o, off_lse = [lengths(n) for n in ("off_q", "off_k", "off_v", "off_o", "off_lse")]
+    def operand(name, h, s, d, offset):
+        return graph.tensor(dim=[b, h, s, d], stride=[s * h * d, d, h * d, 1], data_type=bf16,
+                            name=name).set_ragged_offset(offset)
+    q, k, v = operand("q", hq, ql, d_qk, off_q), operand("k", hk, kl, d_qk, off_k), operand("v", hk, kl, d_v, off_v)
+    o, stats = graph.sdpa(q=q, k=k, v=v, generate_stats=True, attn_scale=1 / math.sqrt(d_qk),
+                         use_padding_mask=True, cu_seq_len_q=cu_q, cu_seq_len_kv=cu_kv,
+                         max_total_seq_len_q=b * ql, max_total_seq_len_kv=b * kl)
+    o.set_output(True).set_dim([b, hq, ql, d_v]).set_stride([ql * hq * d_v, d_v, hq * d_v, 1]).set_ragged_offset(off_o)
+    stats.set_output(True).set_dim([b, hq, ql, 1]).set_stride([ql * hq, 1, hq, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(off_lse)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    want = engine_name(arch="sm107" if sm >= 107 else "sm100")
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
+    graph.check_support()
+    graph.build_plans()
+    spec = graph._compiled_plans[graph._plan_index]._prepared.spec
+    if binder == "native":
+        assert spec.native is not None
+    elif hasattr(spec, "native"):
+        spec.native = None  # Compare the independent Python binder with the same compiled host.
+    q_buf = torch.zeros((b * ql, hq, d_qk), device="cuda", dtype=torch.bfloat16)
+    k_buf = torch.zeros((b * kl, hk, d_qk), device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.ones((b * kl, hk, d_v), device="cuda", dtype=torch.bfloat16)
+    v_buf[kl:] *= 2
+    o_buf = torch.empty_strided((b * ql, hq, d_v), (row_stride, d_v, 1), device="cuda", dtype=torch.bfloat16)
+    lse_buf = torch.empty((b * ql, hq), device="cuda", dtype=torch.float32)
+    cq = torch.arange(b + 1, device="cuda", dtype=torch.int32) * ql
+    ck = torch.arange(b + 1, device="cuda", dtype=torch.int32) * kl
+    pack = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: lse_buf, cu_q: cq, cu_kv: ck,
+            off_q: cq * hq * d_qk, off_k: ck * hk * d_qk, off_v: ck * hk * d_v,
+            off_o: cq * hq * d_v, off_lse: cq * hq}
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    overrides = dict(override_uids=[o.get_uid()], override_shapes=[[b, hq, ql, d_v]],
+                     override_strides=[[hq * d_v, d_v, row_stride, 1]])
+    expected = torch.ones((b * ql, hq, d_v), device="cuda", dtype=torch.bfloat16)
+    expected[ql:] *= 2
+    for replay in (False, True):
+        if replay:
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured):
+                graph.execute(pack, workspace, **overrides)
+            v_buf.mul_(0.5)
+            expected.mul_(0.5)
+        o_buf.fill_(float("nan"))
+        lse_buf.fill_(float("nan"))
+        if replay:
+            captured.replay()
+        else:
+            graph.execute(pack, workspace, **overrides)
+        torch.testing.assert_close(o_buf, expected, atol=0, rtol=0)
+        torch.testing.assert_close(lse_buf, torch.full_like(lse_buf, math.log(kl)), atol=2e-6, rtol=0)
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1
