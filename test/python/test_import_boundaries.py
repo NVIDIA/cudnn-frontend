@@ -263,6 +263,25 @@ def test_support_check_pulls_no_framework(module):
     _assert_absent(_imported_by(f"import cudnn\nimport {module}"), module)
 
 
+@pytest.mark.parametrize("name", ["ops", "experimental", "wrapper", "Graph"])
+def test_lazy_top_level_attribute_resolves(name):
+    """Every name cudnn.__getattr__ special-cases must actually resolve.
+
+    Regression: `experimental` was fetched with `from . import experimental`,
+    the one form the comment six lines above it documents as recursive —
+    _handle_fromlist calls hasattr(cudnn, "experimental"), which re-enters
+    __getattr__ because the name is not in __dict__ yet. `cudnn.experimental`
+    raised RecursionError, so the documented experimental namespace was
+    unreachable by attribute access.
+    """
+    out = subprocess.run(
+        [sys.executable, "-c", f"import cudnn; x = cudnn.{name}; print(type(x).__name__)"],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, f"cudnn.{name} failed:\n{out.stderr[-1500:]}"
+
+
 @pytest.mark.parametrize("symbol", ["causal_conv1d", "fft_causal_conv1d"])
 @pytest.mark.parametrize("import_order", ["submodule_first", "sibling_first", "symbol_first"])
 def test_ops_callable_exports_survive_import_order(symbol, import_order):
@@ -281,6 +300,25 @@ export = getattr(cudnn.ops, symbol)
 assert callable(export), type(export)
 assert export is getattr(module, symbol)
 assert getattr(cudnn.ops, symbol) is export
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+def test_nvfp4_conversion_declines_old_dsl_before_kernel_import():
+    """The supported package floor must produce an operation-specific decline."""
+    probe = """
+import importlib
+import sys
+from cudnn.frost import buffers
+buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.6.2"))
+try:
+    importlib.import_module("cudnn.ops.nvfp4")
+except ImportError as exc:
+    assert "4.7.0" in str(exc) and "4.6.2" in str(exc), str(exc)
+else:
+    raise AssertionError("NVFP4 conversion accepted unsupported DSL 4.6.2")
+assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr

@@ -792,6 +792,9 @@ class PyGraph {
                           std::intptr_t exec_handle,
                           int64_t plan_index);
 
+    void
+    execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
+
     std::vector<BehaviorNote_t>
     get_behavior_notes();
 
