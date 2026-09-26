@@ -17,8 +17,11 @@ Three owners, one implementation each:
   independent argument frame (or None when no Q token is addressable). Lookups, integer
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
-The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` both go through
-``bind_thd`` and the artifact's positional tvm-ffi entry.
+The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
+binder selected at prepare time. Nonpaged f16 THD without sinks/padded Stats binds
+normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
+``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
+binder remains a differential reference for the migrated domain in tests.
 
 Dense launches use :class:`DenseLaunchSpec` and :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
@@ -172,6 +175,7 @@ class ThdLaunchSpec:
         "order",
         "index",
         "template",
+        "native",
         "quant",
         "b",
         "qh",
@@ -325,7 +329,59 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
+    # Eligibility is a PLAN-TIME decision, independent of runtime buffers. The
+    # native binder owns this whole contract for both graph and standalone calls;
+    # invalid runtime metadata must raise, never retry another executor.
+    s.native = None
+    if (
+        not s.paged
+        and not s.has_sink
+        and not s.lse_padded
+        and api.split_kv == 1
+        and not getattr(api, "_prepared_fp8", False)
+        and getattr(api, "gate_desc", None) is None
+        and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
+    ):
+        from cudnn import _pybind_module
+
+        s.native = _pybind_module._SdpaThdBinder(s)
     return s
+
+
+_NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
+_NATIVE_THD_INDICES = tuple(range(len(_NATIVE_THD_ROLES)))
+
+
+def _set_native_fact(pack, index, fact):
+    """Observation fallback only; the native evaluator still owns admission."""
+    if fact is None:
+        return
+    code, bits = _buffers.DTYPES.get(fact.dtype, (0, 0))
+    width = _buffers.DTYPE_ITEMSIZE.get(fact.dtype, 1)
+    pack.set_operand(index, fact.ptr, fact.shape, fact.strides, code, bits, 1, fact.span * width if fact.span >= 0 else -1, *fact.device)
+
+
+def _native_pack_from_facts(facts):
+    from cudnn import _pybind_module
+
+    pack = _pybind_module.VariantPackNative(len(_NATIVE_THD_ROLES))
+    for i, role in enumerate(_NATIVE_THD_ROLES):
+        _set_native_fact(pack, i, facts.get(role))
+    return pack
+
+
+def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softmax_log2):
+    """Standalone observation, shared native validation/launch with graph.execute.
+
+    Each invocation owns its pack and frame. Frameworks without the DLPack
+    exchange API use the existing tensor observer only for the unread buffers.
+    """
+    from cudnn import _pybind_module
+
+    pack, unread = _pybind_module._read_buffer_sequence(buffers)
+    for index in unread:
+        _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
+    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale_softmax_log2)
 
 
 def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
@@ -515,7 +571,23 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
-    """This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
+    """Bind through the contract chosen at prepare time, including direct callers.
+
+    Graph and standalone execution feed native metadata directly. This facts
+    entry remains useful to adapters and tests; it never selects an executor
+    based on whether runtime validation succeeds.
+    """
+    native = getattr(spec, "native", None)
+    if native is not None:
+        frame = native.bind(_native_pack_from_facts(facts), _NATIVE_THD_INDICES, workspace_ptr, stream)
+        return None if frame is None else list(frame)
+    return _bind_thd_python(spec, facts, workspace_ptr, stream, stream_int)
+
+
+def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
+    """Unmigrated plan domains, plus an explicit differential reference in tests.
+
+    This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
     addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``."""
     ix = spec.index
@@ -549,6 +621,10 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             raise ValueError(f"cudnn.sdpa: " + (f"{name} must have {n} elements; got {f.numel}"))
         if not f.contiguous:
             raise ValueError(f"cudnn.sdpa: " + (f"{name} must be contiguous (read as a flat ({n},) operand)"))
+        if f.ptr % _ALIGN_F32:
+            raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
+        if 0 <= f.span < n:
+            raise ValueError(f"cudnn.sdpa: {name} observed storage is too small for its effective length")
         return f.ptr
 
     q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
@@ -575,6 +651,8 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
             if lse.numel != expected:
                 raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
         elif spec.lse_head_major and spec.lse_head_stride:
+            if 0 <= lse.span < spec.qh * spec.lse_head_stride:
+                raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
             if lse.numel < spec.qh * spec.lse_head_stride:
                 raise ValueError(
                     f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * spec.lse_head_stride} elements; got {lse.numel}")
@@ -677,6 +755,7 @@ class PreparedThdLaunch:
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
+        self._native_indices = None
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
@@ -685,6 +764,12 @@ class PreparedThdLaunch:
                 indices = self._indices = [pack.index_of(u) for u in self._uids]
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        if self.spec.native is not None:
+            if self._native_indices is None:
+                roles = dict(zip(self._roles, indices))
+                self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_THD_ROLES)
+            self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
