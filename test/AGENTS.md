@@ -165,6 +165,10 @@ can still compile a prepared artifact inside the adapter and fail at execution.
 K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
 checks the retained tensor path numerically and under CUDA Graph replay.
 
+The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
+FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
+with a move; a new sibling file alone is not exercised by that lane.
+
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales
 in place after CUDA Graph capture and check outputs after replay.
