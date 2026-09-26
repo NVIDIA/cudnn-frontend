@@ -14,6 +14,27 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import record_streams, stream_context
+
+
+def _lse_stride_mismatch(shape, stride) -> bool:
+    """True when a (B,H_q,S_q) LSE view is not row-major; extent-1 axes are never stepped and are ignored."""
+    b, h_q, s_q = shape
+    expected = (h_q * s_q, s_q, 1)
+    return any(n > 1 and st != e for n, st, e in zip(shape, stride, expected))
+
+
+def _stage_lse(lse: torch.Tensor, is_thd: bool, stream, device) -> torch.Tensor:
+    """``lse`` itself when ``TopKReduction`` accepts its layout, else a copy in the accepted layout
+    (``(B,H_q,S_q)`` row-major; ``T,H,D``: ``(T,H_q[,1])`` with T at unit stride). Call inside the
+    launch-stream context; the original is record_stream'ed on ``stream`` before the copy reads it (R1)."""
+    view = lse.unsqueeze(0).transpose(1, 2) if is_thd else lse
+    while view.ndim > 3:
+        view = view.squeeze(-1)
+    if not _lse_stride_mismatch(tuple(view.shape), tuple(view.stride())):
+        return lse
+    record_streams((lse,), stream, device)
+    return lse.transpose(0, 1).contiguous().transpose(0, 1) if is_thd else lse.contiguous()
 
 
 class TopKReduction(APIBase):
@@ -26,6 +47,14 @@ class TopKReduction(APIBase):
     Note:
         The returned values calculated by the kernel exclude the first block and neighboring blocks from the reduction.
         As a result, it is expected to see rows of all -inf values and -1 values in the final topk_scores and topk_indices output tensors, respectively.
+
+    Contract (Rule 8: no device read at build, no hidden copy at execute):
+        * ``T,H,D`` layout: ``max_s_q`` and ``max_s_k`` are REQUIRED plan-time ints (the launch envelope);
+          they are never inferred from ``cum_seqlen_q`` / ``cum_seqlen_k``.
+        * ``sample_lse`` must be ``(B, H_q, S_q)`` row-major (``T,H,D``: ``(T, H_q)`` with T at unit stride, i.e. the
+          transposed view of a contiguous ``(H_q, T)`` buffer). The kernel reads LSE through a fixed ``(1, S_q)``
+          stride, so any other layout is declined in ``check_support()`` and rejected at ``execute()`` -- it is
+          not made contiguous on the caller's behalf.
     """
 
     def __init__(
@@ -61,14 +90,13 @@ class TopKReduction(APIBase):
         self.cum_seqlen_q_desc = self._make_tensor_desc(sample_cum_seqlen_q, name="sample_cum_seqlen_q")
         self.cum_seqlen_k_desc = self._make_tensor_desc(sample_cum_seqlen_k, name="sample_cum_seqlen_k")
 
-        self.max_s_q = max_s_q
-        if self.max_s_q is None and sample_cum_seqlen_q is not None:
-            self._logger.warning("max_s_q not provided, inferring from cum_seqlen_q")
-            self.max_s_q = (sample_cum_seqlen_q[1:] - sample_cum_seqlen_q[:-1]).max().item()
-        self.max_s_k = max_s_k
-        if self.max_s_k is None and sample_cum_seqlen_k is not None:
-            self._logger.warning("max_s_k not provided, inferring from cum_seqlen_k")
-            self.max_s_k = (sample_cum_seqlen_k[1:] - sample_cum_seqlen_k[:-1]).max().item()
+        if (sample_cum_seqlen_q is not None or sample_cum_seqlen_k is not None) and (max_s_q is None or max_s_k is None):
+            raise ValueError(
+                "TopKReduction: max_s_q and max_s_k are required for the T,H,D layout (plan-time launch envelope); "
+                f"they are not inferred from cum_seqlen (a device read at build, Rule 8). Got max_s_q={max_s_q}, max_s_k={max_s_k}"
+            )
+        self.max_s_q = None if max_s_q is None else int(max_s_q)
+        self.max_s_k = None if max_s_k is None else int(max_s_k)
         self.acc_dtype = acc_dtype
         self.k_value = k_value
         self.selection_block_size = selection_block_size
@@ -105,9 +133,14 @@ class TopKReduction(APIBase):
         self._check_tensor_shape(self.k_desc, (b, h_k, s_k, d), name="K")
         self.lse_desc = self._unpad_tensor_to_ndim(self.lse_desc, 3, "sample_lse")
         self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
-        if self.lse_desc.stride[-1] != 1:
-            self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
-            self.lse_desc = self.lse_desc.contiguous()
+        # The kernel hard-codes the LSE layout as (s_q, h_r, h_k, b) with stride (1, s_q*h_k, s_q, s_q*h_q), i.e. a
+        # row-major (b, h_q, s_q) view. Any other layout is declined (R5), never repacked.
+        self._not_implemented_error_if(
+            _lse_stride_mismatch(self.lse_desc.shape, self.lse_desc.stride),
+            "TopKReduction: sample_lse must be laid out (B,H_q,S_q) / (T,H_q) with the S axis at unit stride and heads "
+            f"S_q apart (kernel reads LSE through a fixed (1, S_q) stride); got shape {tuple(self.lse_desc.shape)} "
+            f"stride {tuple(self.lse_desc.stride)} after normalisation to (B,H_q,S_q)",
+        )
         self._check_tensor_shape(self.topk_scores_desc, (b, h_k, s_q, self.k_value), name="TopK Scores")
         self._check_tensor_shape(self.topk_indices_desc, (b, h_k, s_q, self.k_value), name="TopK Indices")
 
@@ -214,9 +247,11 @@ class TopKReduction(APIBase):
                     topk_scores_tensor = topk_scores_tensor.unsqueeze(0).transpose(1, 2)
                     topk_indices_tensor = topk_indices_tensor.unsqueeze(0).transpose(1, 2)
             lse_tensor = self._unpad_tensor_to_ndim(lse_tensor, 3, "lse_tensor")
-            if lse_tensor.stride(-1) != 1:
-                self._logger.warning("lse_tensor is expected to have leading stride in last dimension of shape (b, h_q, s_q), copying lse_tensor to contiguous")
-                lse_tensor = lse_tensor.contiguous()
+            if _lse_stride_mismatch(tuple(lse_tensor.shape), tuple(lse_tensor.stride())):
+                raise ValueError(
+                    "TopKReduction.execute: lse_tensor layout differs from the plan's sample_lse (S axis must be unit-stride, "
+                    f"heads S_q apart); got shape {tuple(lse_tensor.shape)} stride {tuple(lse_tensor.stride())} after normalisation to (B,H_q,S_q)"
+                )
 
             return _compiled_kernel(
                 problem_size,
@@ -304,23 +339,45 @@ def topk_reduction_wrapper(
     scale_softmax: Optional[float] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    """Allocate ``topk_scores`` / ``topk_indices`` and run ``TopKReduction``; objects are memoized per shape.
+
+    This is the eager torch-op layer over the strict class. ``T,H,D`` (``cum_seqlen_*`` given): ``max_s_q`` /
+    ``max_s_k`` are inferred from ``cum_seqlen_*`` (``.max().item()``, a device sync) when not passed, and the
+    outputs are sized ``(q_tensor.shape[0], H_k, k_value)`` -- q's token extent, equal to ``cum_seqlen_q[-1]`` for
+    a fully packed batch; a slack tail is never written. An ``lse_tensor`` whose layout the class would decline is
+    staged into the accepted layout (``(B,H_q,S_q)`` row-major / ``(T,H_q)`` with T at unit stride) on the launch
+    stream. Pass the host ints and an accepted LSE layout to avoid both.
+    """
 
     _logger.debug("topk_reduction_wrapper: Entering topk_reduction_wrapper")
-    topk_scores_tensor, topk_indices_tensor = None, None
-    if cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None:  # T,H,D
-        total_seq_len_q = cum_seqlen_q_tensor[-1].item()
-        h_k = k_tensor.shape[1]
-        topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
-        topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
-    elif cum_seqlen_q_tensor is None and cum_seqlen_k_tensor is None:  # B,H,S,D
-        b, _, s_q, _ = q_tensor.shape
-        _, h_k, _, _ = k_tensor.shape
-        topk_scores_tensor = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device).transpose(1, 2)
-        topk_indices_tensor = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device).transpose(1, 2)
-    else:
+    is_thd = cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None
+    if not is_thd and not (cum_seqlen_q_tensor is None and cum_seqlen_k_tensor is None):
         raise ValueError(
             f"cum_seqlen_q_tensor and cum_seqlen_k_tensor must either both be None (B,H,S,D) or both not None (T,H,D), got {cum_seqlen_q_tensor} and {cum_seqlen_k_tensor}"
         )
+    # Launch stream (R1): `current_stream`, or torch's current stream when None (stream_context is then a no-op).
+    with torch.cuda.device(q_tensor.device), stream_context(current_stream, q_tensor.device):
+        if is_thd:
+            if max_s_q is None:
+                _logger.warning("topk_reduction_wrapper: max_s_q not provided, inferring from cum_seqlen_q (device sync)")
+                cum = cum_seqlen_q_tensor.reshape(-1)
+                max_s_q = int((cum[1:] - cum[:-1]).max().item())
+            if max_s_k is None:
+                _logger.warning("topk_reduction_wrapper: max_s_k not provided, inferring from cum_seqlen_k (device sync)")
+                cum = cum_seqlen_k_tensor.reshape(-1)
+                max_s_k = int((cum[1:] - cum[:-1]).max().item())
+        lse_tensor = _stage_lse(lse_tensor, is_thd, current_stream, q_tensor.device)
+
+        if is_thd:
+            total_seq_len_q = q_tensor.shape[0]
+            h_k = k_tensor.shape[1]
+            topk_scores_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device)
+            topk_indices_tensor = torch.empty(total_seq_len_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device)
+        else:
+            b, _, s_q, _ = q_tensor.shape
+            _, h_k, _, _ = k_tensor.shape
+            topk_scores_tensor = torch.empty(b, s_q, h_k, k_value, dtype=acc_dtype, device=q_tensor.device).transpose(1, 2)
+            topk_indices_tensor = torch.empty(b, s_q, h_k, k_value, dtype=torch.int32, device=q_tensor.device).transpose(1, 2)
 
     cache_key = (
         q_tensor.shape,

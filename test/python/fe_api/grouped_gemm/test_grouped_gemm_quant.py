@@ -12,6 +12,7 @@ Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from fe_api.grouped_gemm._workspace import ws
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors,
@@ -1192,6 +1193,7 @@ def _test_grouped_gemm_quant_compile_execute(
         row_scale_tensor=inputs.get("row_scale_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     check_ref_grouped_gemm_quant(
@@ -1439,6 +1441,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         prob_tensor=inputs["prob_tensor"],
         row_scale_tensor=inputs.get("row_scale_tensor"),
         current_stream=stream,
+        workspace=ws(api),
     )
 
     _check_ref_grouped_gemm_quant_discrete(

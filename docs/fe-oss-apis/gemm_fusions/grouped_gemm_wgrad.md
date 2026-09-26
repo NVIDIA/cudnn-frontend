@@ -15,7 +15,7 @@ pip install nvidia-cudnn-frontend
 
 Supports **JAX arrays** on the BF16 backend: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The block-scaled backend's layouts are not expressible as JAX arrays and raise a clear error. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). Under tracing the per-group offsets *values* cannot be host-validated; the external buffers must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). The per-group offsets values follow the device-data contract in the BF16 section; the external buffers must stay alive and unmoved across every execution of the traced computation.
 
 ## Operation
 
@@ -49,6 +49,16 @@ The BF16 backend accepts:
 must equal `tokens_sum`. Inputs, metadata, and outputs must reside on the same
 CUDA device and satisfy the API's alignment checks.
 
+`offsets_tensor` values and `wgrad_ptrs` entries are a **device-data contract**: the kernel
+reads them on device, and neither `check_support()` nor `execute()` copies them to
+the host (a blocking read would serialize the launch stream and is illegal under
+CUDA-graph capture). Malformed values (a decreasing offset, a group that is not a
+multiple of 256, a last offset other than `tokens_sum`, a null or misaligned pointer) are
+undefined behaviour, as for any raw-pointer interface. Set
+`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
+blocking debug checks of those values at `execute()`; that mode raises
+`RuntimeError` when the launch stream is capturing instead of syncing.
+
 BF16 uses FP32 accumulation and requires `sf_vec_size=16`. Pass `None` for
 `sfa_tensor`, `sfb_tensor`, `global_scale_a`, and `global_scale_b`. BF16 rejects
 every non-`None` scale or global-scale control with `ValueError`; it never falls
@@ -71,7 +81,7 @@ stacked `wgrad_tensor`. `wgrad_ptrs` is forbidden.
 With `output_mode="discrete"`, either:
 
 - omit both output arguments and let the wrapper allocate a stacked tensor and
-  construct an internal pointer array; or
+  derive its pointer table with `wgrad_expert_ptrs` (below); or
 - provide a CUDA `torch.int64` `wgrad_ptrs` array containing one non-null,
   16-byte-aligned output address per expert.
 
@@ -84,6 +94,26 @@ lifetime of allocations represented only by integer addresses.
 The wrapper always returns `TupleDict(wgrad_tensor=...)`; it contains exactly
 one item and supports either keyed access or tuple unpacking.
 
+### `wgrad_expert_ptrs`
+
+The class API's discrete `execute()` **requires** `wgrad_ptrs`; it never derives
+the table from `wgrad_tensor` itself. `cudnn.wgrad_expert_ptrs(wgrad_tensor,
+current_stream=None)` builds it once per stacked `(num_experts, hidden,
+intermediate)` output: for torch it is one `arange` fill on the launch stream
+(no host list, no host-to-device copy, no synchronization, CUDA-graph
+capturable), for JAX (eager wrapper only) the packed little-endian uint8 form.
+Reuse the table across executes while the output buffer stays put; a
+`num_experts` of 0 or 1 yields an empty or single-entry table.
+
+### Workspace
+
+Class-API `execute()` also requires `workspace=`, a caller-owned, contiguous,
+128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
+(a multiple of 128, never 0) for the per-expert TMA-descriptor slots; the API
+allocates nothing and the wrapper allocates it per call on the launch stream.
+See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
+`sample_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
+
 ## Block-scaled contract
 
 The legacy block-scaled backend is selected only by a supported matching FP4/FP8
@@ -92,16 +122,21 @@ operand pair. It preserves the pre-existing scale-factor contract: provide
 `global_scale_b` where the selected low-precision format requires them. BF16
 does not reinterpret these controls; it rejects them instead.
 
-Torch block-scaled callers in dense or discrete output mode that retain
-operations for CUDA Graph replay may provide a caller-owned
-`descriptor_workspace`; pass this extension by keyword. Allocate its size with
-`get_grouped_gemm_wgrad_workspace_size_sm100`, keep it alive for as long as the
-captured call site may replay, and do not share it between call sites that may
-overlap. This lets multiple same-signature calls share one compiled kernel
-without sharing mutable runtime TMA descriptors. Callers that omit this
-argument retain the compatibility behavior that isolates cached API instances
-by explicit dense output address; discrete callers retain the compiled
-operation's internal workspace.
+The block-scaled backend's per-expert TMA-descriptor scratch is the same
+caller-owned `workspace` described above; the plan never allocates one. Torch
+block-scaled callers may pass it under the keyword-only name
+`descriptor_workspace` on `grouped_gemm_wgrad_wrapper_sm100` and on the class
+`execute()` -- an alias of `workspace`, accepted only for this backend, so a
+retained plan can be replayed (CUDA Graph capture included) over a buffer the
+caller controls. It must be a contiguous `torch.uint8` CUDA tensor on the
+operands' device of at least `get_grouped_gemm_wgrad_workspace_size_sm100(
+num_experts, output_mode=..., input_order=...)` bytes, which equals the plan's
+`scratch_workspace_bytes()`; keep it alive for as long as the call site may
+replay, and do not share it between call sites that may overlap. Passing both
+`workspace` and `descriptor_workspace` requires the same object. When neither is
+given, the wrapper allocates the scratch per call on the launch stream and the
+class `execute()` raises. One compiled plan serves every output buffer either
+way; nothing is cached per output address.
 
 ```python
 workspace = torch.empty(
@@ -195,6 +230,7 @@ op = cudnn.GroupedGemmWgradSm100(
 )
 op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a_tensor.device)
 op.execute(
     a_tensor=a_tensor,
     b_tensor=b_tensor,
@@ -202,12 +238,14 @@ op.execute(
     sfb_tensor=None,
     offsets_tensor=offsets_tensor,
     wgrad_tensor=wgrad_tensor,
+    workspace=workspace,
 )
 ```
 
 For a discrete class instance, replace `sample_wgrad` with
 `sample_wgrad_expert=expert_outputs[0]`, `num_experts`, `wgrad_shape`, and
-`wgrad_dtype`, then pass `wgrad_ptrs` to `execute`.
+`wgrad_dtype`, then pass `wgrad_ptrs` to `execute` -- your own table, or
+`cudnn.wgrad_expert_ptrs(stacked_wgrad_tensor)` for a stacked output.
 
 ### Block-scaled
 
@@ -240,6 +278,7 @@ op = cudnn.GroupedGemmWgradSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a_tensor.device)
 op.execute(
     a_tensor=a_tensor,
     b_tensor=b_tensor,
@@ -247,6 +286,7 @@ op.execute(
     sfb_tensor=sfb_tensor,
     offsets_tensor=offsets_tensor,
     wgrad_tensor=wgrad_tensor,
+    workspace=workspace,
 )
 ```
 
@@ -258,8 +298,10 @@ and B while retaining static dimensions, layouts, dtypes, output descriptors,
 tiling, cluster shape, input order, and accumulation mode in its key. A changed
 static contract creates a different cached operator or fails validation.
 
-The APIs reject unsupported dtypes or layouts, malformed/unaligned offsets or
-pointers, mixed devices, forbidden BF16 scale controls, unsupported tiling, use
-before `compile()`, unavailable CUDA, and devices below SM100. Support and
-validation errors are reported as `ValueError` or `RuntimeError`; callers should
-not rely on this experimental API remaining source-compatible across releases.
+The APIs reject unsupported dtypes or layouts, mis-shaped or misaligned offset
+and pointer tensors, mixed devices, forbidden BF16 scale controls, unsupported
+tiling, use before `compile()`, unavailable CUDA, and devices below SM100. Offset
+and pointer *values* are the device-data contract above and are not host-checked.
+Support and validation errors are reported as `ValueError` or `RuntimeError`;
+callers should not rely on this experimental API remaining source-compatible
+across releases.

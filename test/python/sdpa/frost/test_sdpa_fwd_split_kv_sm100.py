@@ -1192,13 +1192,22 @@ def test_api_does_not_split_a_full_chip():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
-def test_api_split_with_and_without_workspace(workspace):
-    """With a workspace the partials are carved from it; without one they are
-    torch-allocated (standalone use). Same answer either way."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
-    assert result.split > 1
+def test_api_split_carves_the_partials_from_the_workspace():
+    """The split-major partials live in the caller's workspace (R2), and the
+    recombined answer matches fp32."""
+    result = _api_case(1, 8, 1, 512, 16384, workspace=True, split_kv=2)
+    assert result.split == 2 and result.workspace_bytes > 0
     assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.no_workspace_shim
+def test_api_split_requires_a_workspace():
+    """A direct caller that passes no workspace gets the R2 contract error --
+    the adapter never allocates the partials itself (the suite's autouse shim
+    is off here)."""
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        _api_case(1, 8, 1, 512, 16384, workspace=False, split_kv=2)
 
 
 @pytest.mark.L0

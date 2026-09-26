@@ -175,6 +175,7 @@ op = GroupedGemmGluHadamardSm100(
 )
 assert op.check_support()
 op.compile()
+workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 op.execute(
     a_tensor=a,
     b_tensor=b,
@@ -191,8 +192,11 @@ op.execute(
     situ_beta1=4.0,
     situ_beta2=25.0,
     current_stream=None,
+    workspace=workspace,
 )
 ```
+
+`execute()` requires `workspace=`: a contiguous device buffer (a torch tensor, a JAX array, or any object exposing `__cuda_array_interface__` / `__dlpack__`) on the API's device, at least `scratch_workspace_bytes()` bytes long and 128-byte aligned. The API never allocates it -- the `*_wrapper_sm100` functions allocate one per call on the launch stream -- and `None`, an undersized buffer, or a misaligned one raises `ValueError` before the launch. The buffer is per-execute scratch (the per-expert TMA descriptor slots and the dynamic-scheduler counter, rewritten on every launch); its contents are not preserved between calls, and executions sharing one buffer must not overlap.
 
 You may optionally pass a custom `sample_hadamard` / `hadamard_tensor`, but the API normalizes it to the fixed `16 x 16` bf16 contiguous layout expected by the kernel. If you do not provide one, the default is the fixed kernel matrix.
 

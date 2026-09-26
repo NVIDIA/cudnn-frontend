@@ -6,6 +6,7 @@ from .compression import CompressionAttention, compression_attention_wrapper
 from .sliding_window_attention import (
     SlidingWindowAttention,
     sliding_window_attention_wrapper,
+    packed_thd_ragged_offsets,
 )
 from .top_k import TopKReduction, topk_reduction_wrapper
 
@@ -16,6 +17,7 @@ class NSANamespace:
 
     SlidingWindowAttention = staticmethod(SlidingWindowAttention)
     sliding_window_attention_wrapper = staticmethod(sliding_window_attention_wrapper)
+    packed_thd_ragged_offsets = staticmethod(packed_thd_ragged_offsets)
 
     CompressionAttention = staticmethod(CompressionAttention)
     compression_attention_wrapper = staticmethod(compression_attention_wrapper)
