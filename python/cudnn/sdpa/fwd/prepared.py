@@ -131,7 +131,7 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             ptr = f.ptr
         patches[name + "_ptr"] = ptr
     # Scalar output must not overwrite any input or caller output. Workspace alias
-    # detection is kept byte-based: Q/K/V are one byte, O is two, scales are four.
+    # detection uses each operand's declared element width, including FP8 O.
     amax = patches["amax_o_ptr"]
     if facts.get("amax_o") is not None and workspace_ptr < amax + 4 and amax < workspace_ptr + quant.scratch_offset + 8:
         raise ValueError("cudnn.sdpa: prepared FP8 workspace overlaps amax_o")

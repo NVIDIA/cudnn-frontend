@@ -223,22 +223,22 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
-@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
-@pytest.mark.parametrize("feature", ["supported", "head_dim", "fp8_output", "paged", "split", "block_scaled_output", "gate", "sm107"])
-def test_prepared_fp8_override_capability_envelope(dtype_o, feature):
-    """D128 FP8-to-half is eligible; the other quantized routes retain their tensor entry."""
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v):
+    """Native FP8 dimensions with scalar-scaled outputs use the prepared entry."""
     from dataclasses import replace
 
     graph = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(graph, d=128)
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
-    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o)
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o, d_qk=d_qk, d_v=d_v)
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
     changed = dict(
         supported={},
-        head_dim=dict(d_qk=256, d_v=256),
-        fp8_output=dict(dtype_o=cudnn.data_type.FP8_E4M3),
+        head_dim=dict(d_qk=112, d_v=112),
         paged=dict(has_paged_kv=True),
         split={},
         block_scaled_output=dict(o_block_scale=32),
