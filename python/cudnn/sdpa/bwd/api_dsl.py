@@ -2821,7 +2821,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             TemplateParams,
             vec_bytes_epi_for,
         )
-        from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host
+        from cudnn.sdpa.bwd.kernels.bprop_chain_common import dot_do_o_host
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
         stage2_mod = load_template(
@@ -3171,10 +3171,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     )
 
             if gqa:
-                # Fold the Q-head partials onto the KV heads. Reused verbatim
-                # from the SM120 chain: arch-neutral, one thread per 16 B output
-                # vector, fixed-order fp32 accumulation (so it is deterministic).
-                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
+                # Fold the Q-head partials onto the KV heads. The shared chain
+                # kernel (written for SM120): arch-neutral, one thread per 16 B
+                # output vector, fixed-order fp32 accumulation (so it is
+                # deterministic).
+                from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host
 
                 io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
                 if self._reduce_fn is None:
@@ -3454,7 +3455,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 # elementwise over rows and sizes its grid from the OUTPUT's
                 # (batch, seq, head), so a packed batch of 1 needs nothing
                 # special.
-                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
+                from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host
 
                 io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
                 if self._reduce_fn is None:

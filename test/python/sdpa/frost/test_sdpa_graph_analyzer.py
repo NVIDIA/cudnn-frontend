@@ -2305,3 +2305,215 @@ def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
     for split in (1, 2):
         knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
         assert engines.mismatch(spec.capabilities, facts, knobs) is None
+
+
+# ---------------------------------------------------------------------------
+# The per-tensor FP8 backward node (sdpa_fp8_backward, NodeType.SDPA_FP8_BWD):
+# the facts of cuDNN's fp8-backward contract, the manifest anchor, and the C++
+# node's d_qk == d_v == 256 admission on Rubin -- the graph prerequisites of a
+# per-tensor FP8 d256 backward row.  No row claims the node yet, so every
+# probe must DECLINE it by message (never raise, never return None).
+# ---------------------------------------------------------------------------
+
+_FP8 = cudnn.data_type.FP8_E4M3
+_FP8_BWD_D = 256
+# Every scalar of cuDNN's sdpa_fp8_backward, in the op's positional order, and
+# the analyzer fact each one lands on.
+_FP8_BWD_SCALAR_FACTS = {
+    "descale_q": "descale_q_t",
+    "descale_k": "descale_k_t",
+    "descale_v": "descale_v_t",
+    "descale_o": "descale_o_t",
+    "descale_dO": "descale_do_t",
+    "descale_s": "descale_s_t",
+    "descale_dP": "descale_dp_t",
+    "scale_s": "scale_s_t",
+    "scale_dQ": "scale_dq_t",
+    "scale_dK": "scale_dk_t",
+    "scale_dV": "scale_dv_t",
+    "scale_dP": "scale_dp_t",
+}
+_FP8_BWD_SCALARS = tuple(_FP8_BWD_SCALAR_FACTS)
+_FP8_BWD_AMAX_FACTS = {"amax_dQ": "amax_dq_t", "amax_dK": "amax_dk_t", "amax_dV": "amax_dv_t", "amax_dP": "amax_dp_t"}
+_FP8_BWD_AMAX = tuple(_FP8_BWD_AMAX_FACTS)
+
+
+def _mk_fp8_bwd_graph(d=_FP8_BWD_D, *, h_kv=H, o_dtype=_FP8, grad_dtypes=(_FP8, _FP8, _FP8), request_amax=(), drop=(), sm_version=None, **bwd_kwargs):
+    """cuDNN's ``sdpa_fp8_backward`` at head dim ``d``: FP8 Q/K/V/O/dO, fp32
+    Stats, the twelve (1, 1, 1, 1) fp32 descales / scales, dQ/dK/dV in
+    ``grad_dtypes``.  ``request_amax`` names the amax outputs declared real,
+    ``drop`` the scalars passed as None.  ``sm_version`` is forwarded to the
+    C++ graph, whose pre_validate then skips the device query -- a host-side
+    fake device.  Returns ``(graph, {port: tensor})``."""
+    g = cudnn.pygraph(io_data_type=_FP8, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, sm_version=sm_version)
+    q_dims, q_strides = (B, H, S, d), _bshd_strides(H, S, d)
+    kv_dims, kv_strides = (B, h_kv, S, d), _bshd_strides(h_kv, S, d)
+    ts = dict(
+        q=g.tensor(dim=q_dims, stride=q_strides, data_type=_FP8, name="q"),
+        k=g.tensor(dim=kv_dims, stride=kv_strides, data_type=_FP8, name="k"),
+        v=g.tensor(dim=kv_dims, stride=kv_strides, data_type=_FP8, name="v"),
+        o=g.tensor(dim=q_dims, stride=q_strides, data_type=o_dtype, name="o"),
+        dO=g.tensor(dim=q_dims, stride=q_strides, data_type=_FP8, name="dO"),
+        stats=g.tensor(dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT, name="stats"),
+    )
+    for name in _FP8_BWD_SCALARS:
+        ts[name] = None if name in drop else g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name=name)
+    outs = g.sdpa_fp8_backward(name="fb", attn_scale=1.0 / math.sqrt(d), **ts, **bwd_kwargs)
+    ts.update(zip(("dQ", "dK", "dV") + _FP8_BWD_AMAX, outs))
+    for name, dims, strides, dt in (
+        ("dQ", q_dims, q_strides, grad_dtypes[0]),
+        ("dK", kv_dims, kv_strides, grad_dtypes[1]),
+        ("dV", kv_dims, kv_strides, grad_dtypes[2]),
+    ):
+        _finish_output(ts[name], dims, strides, dtype=dt)
+    for name in request_amax:
+        _finish_output(ts[name], (1, 1, 1, 1), (1, 1, 1, 1), dtype=cudnn.data_type.FLOAT)
+    return g, ts
+
+
+def test_fp8_bwd_node_is_an_sdpa_backward_graph():
+    """SDPA_FP8_BWD is one of the analyzer's node types and names the backward
+    family in the manifest.  Both were missing: ``analyze`` returned None and
+    ``family_for`` classified the graph as nobody's, so no backward row could
+    ever have been probed against it."""
+    from cudnn.engines import manifest
+
+    g, _ = _mk_fp8_bwd_graph()
+    assert ga._single_sdpa_node(g) is not None
+    assert cudnn.NodeType.SDPA_FP8_BWD in ga._SDPA_NODE_TYPES
+    assert manifest._ANCHOR_NODE_TO_FAMILY["SDPA_FP8_BWD"] == "frost_sdpa_bwd"
+    assert manifest.family_for(g).name == "frost_sdpa_bwd"
+
+
+def test_fp8_bwd_facts_extracted():
+    g, ts = _mk_fp8_bwd_graph(use_causal_mask=True)
+    facts = _facts(g)
+    assert facts.is_backward and facts.is_fp8 and not facts.is_mxfp8
+    assert (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.d_qk, facts.d_v) == (B, H, H, S, S, _FP8_BWD_D, _FP8_BWD_D)
+    assert facts.dtype == _FP8 and facts.uniform_dtype
+    assert facts.dtype_o == _FP8 and facts.uniform_out_dtype, "dtype_o is the GRADIENT dtype on the fp8 backward"
+    assert facts.causal and facts.right_bound == 0 and not facts.bottom_right
+    assert facts.bshd_layout and facts.dense_layout
+    assert facts.scale == pytest.approx(1.0 / math.sqrt(_FP8_BWD_D))
+    for port, fact in (
+        ("q", "q_t"),
+        ("k", "k_t"),
+        ("v", "v_t"),
+        ("o", "o_t"),
+        ("dO", "do_t"),
+        ("stats", "stats_t"),
+        ("dQ", "dq_t"),
+        ("dK", "dk_t"),
+        ("dV", "dv_t"),
+    ):
+        assert getattr(facts, fact) is ts[port], port
+    # Every scalar of the contract is a fact, by identity.
+    for port, fact in _FP8_BWD_SCALAR_FACTS.items():
+        assert getattr(facts, fact) is ts[port], port
+    # The op RETURNS its amax ports unconditionally; undeclared ones are not facts.
+    for fact in _FP8_BWD_AMAX_FACTS.values():
+        assert getattr(facts, fact) is None, fact
+    assert not facts.has_amax_dgrad
+    # Forward-only per-tensor FP8 refs stay unset.
+    assert facts.scale_o_t is None and facts.amax_s_t is None and facts.amax_o_t is None and facts.sf_o_t is None and facts.o_block_scale == 0
+    assert (facts.sf_q_t, facts.sf_k_t, facts.sf_v_t) == (None, None, None), "scalar descales are not block-scale SF tensors"
+
+
+@pytest.mark.parametrize("requested", [_FP8_BWD_AMAX, ("amax_dP",), ("amax_dV",)], ids=["all-four", "dP-only", "dV-only"])
+def test_fp8_bwd_requested_amax_outputs_are_facts(requested):
+    """Only a set_output(True) amax is a requested output (the Amax_S / Amax_O
+    convention); ``has_amax_dgrad`` folds all four, amax_dP included."""
+    g, ts = _mk_fp8_bwd_graph(request_amax=requested)
+    facts = _facts(g)
+    for port, fact in _FP8_BWD_AMAX_FACTS.items():
+        assert getattr(facts, fact) is (ts[port] if port in requested else None), port
+    assert facts.has_amax_dgrad
+
+
+@pytest.mark.parametrize("missing", _FP8_BWD_SCALARS)
+def test_fp8_bwd_missing_scalar_is_invalid(missing):
+    """Every one of the twelve is a REQUIRED positional of the op (C++ builder and
+    pybind alike), so a graph without one is malformed for every engine --
+    ``invalid``, naming the op and the port."""
+    g, _ = _mk_fp8_bwd_graph(drop=(missing,))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None
+    assert "sdpa_fp8_backward" in facts.invalid and missing in facts.invalid
+
+
+def test_fp8_bwd_dtype_facts():
+    bf16 = cudnn.data_type.BFLOAT16
+    # Half gradients (what the backend allows on Blackwell): dtype_o follows dQ.
+    facts = _facts(_mk_fp8_bwd_graph(grad_dtypes=(bf16, bf16, bf16))[0])
+    assert facts.dtype == _FP8 and facts.uniform_dtype and facts.dtype_o == bf16 and facts.uniform_out_dtype
+    # One gradient off: the triple is not uniform.
+    facts = _facts(_mk_fp8_bwd_graph(grad_dtypes=(_FP8, bf16, _FP8))[0])
+    assert facts.dtype_o == _FP8 and not facts.uniform_out_dtype
+    # O is an FP8 PAYLOAD (it carries descale_o): a half O breaks payload
+    # uniformity, not the gradient side.
+    facts = _facts(_mk_fp8_bwd_graph(o_dtype=bf16)[0])
+    assert not facts.uniform_dtype and facts.dtype_o == _FP8 and facts.uniform_out_dtype
+    # GQA is geometry, as on every backward.
+    facts = _facts(_mk_fp8_bwd_graph(h_kv=H // 4)[0])
+    assert (facts.h_q, facts.h_kv) == (H, H // 4)
+
+
+@pytest.mark.parametrize("cc", [(10, 7), (10, 0), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm120", "sm80"])
+def test_fp8_bwd_every_other_row_declines_by_message(monkeypatch, cc):
+    """Exactly ONE backward row serves sdpa_fp8_backward -- ``sdpa_bwd_sm107_fp8``
+    (d = 256 E4M3) on the Rubin line -- and every OTHER backward row (and every
+    forward row) declines it with a REASON on every arch.  A row in the device's
+    SM range must fall through to the quantization-family gate, not raise.
+    (Written as "no row serves it yet" in 3a816a02; the sm107 arm inverted when
+    the row registered in 54ad0710.)"""
+    monkeypatch.setattr(ga, "_device_cc", lambda: cc)
+    g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
+    facts = _facts(g)
+    served = {"sdpa_bwd_sm107_fp8"} if cc == (10, 7) else set()
+    assert _bwd_eligible(g) == served and not _eligible(g)
+    sm = cc[0] * 10 + cc[1]
+    for spec in bwd_engines.ENGINE_SPECS:
+        reason = bwd_engines.mismatch(spec.capabilities, facts)
+        if spec.name in served:
+            assert reason is None, (spec.name, reason)
+            continue
+        assert isinstance(reason, str) and reason, spec.name
+        if spec.capabilities.sm_lo <= sm <= spec.capabilities.sm_hi and not spec.capabilities.is_fp8:
+            assert "serves only" in reason, (spec.name, reason)
+    for spec in engines.ENGINE_SPECS:
+        assert "forward" in (engines.mismatch(spec.capabilities, facts) or ""), spec.name
+
+
+def test_fp8_bwd_graph_validates_natively_with_a_frost_candidate():
+    """With FROST on (the suite's autouse opt-in), the family anchor is what
+    routes validate() to the python-native validator -- which already covered
+    SDPA_FP8_BWD -- and defers the backend's verdict to planning.  That deferral
+    is the mechanism by which a frontend-only row can serve a graph the installed
+    backend has no plan for."""
+    g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
+    g.validate()
+    assert g._lowered_graph is None
+
+
+@pytest.mark.parametrize(
+    "d, sm_version, admitted",
+    [(256, 107, True), (256, 110, True), (256, 100, False), (256, 103, False), (128, 107, True), (128, 100, True)],
+    ids=["d256-sm107", "d256-sm110", "d256-sm100", "d256-sm103", "d128-sm107", "d128-sm100"],
+)
+def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_version, admitted):
+    """The C++ node (``sdpa_fp8_bwd.h`` pre_validate_node) admits per-tensor FP8
+    d_qk == d_v == 256 on SM 10.7 and newer for the frontend engines, spelled
+    like the MXFP8 d256 exemption; below Rubin the classic ``hidden_dim``
+    decline stands and d <= 128 is unchanged everywhere.  Host-side: the
+    pygraph's ``sm_version`` pre-sets the C++ context, so
+    populate_sm_version_from_device() never queries a device.  FROST is switched
+    OFF so validate() takes the classic eager C++ path -- with a python candidate
+    it would defer the backend's verdict to planning (previous test)."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, _ = _mk_fp8_bwd_graph(d=d, sm_version=sm_version, request_amax=_FP8_BWD_AMAX, use_causal_mask=True)
+    if admitted:
+        g.validate()
+        assert g._lowered_graph is not None, "classic path: the C++ graph validated the node"
+    else:
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="hidden_dim"):
+            g.validate()

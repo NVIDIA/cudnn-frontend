@@ -214,9 +214,15 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          torch_otype,
                          padding=None, bias=None,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None, return_intermediates=False):
+                         stats=None, return_intermediates=False, quantize_ds=True):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax).
+
+    ``quantize_ds`` (default True: the cuDNN backend's recipe -- dS rounded to ``torch_itype`` with ``dP_scale`` before
+    the dQ / dK products) set False holds dS in fp32 for those products: the reference for an engine whose dQ / dK
+    consume dS in a wider dtype (the FROST sm107 d256 fp8 chain writes dS as bf16), which an e4m3-dS reference would
+    misreport by the dS rounding noise alone (0.56 % of dQ / 0.54 % of dK outside atol 0.08 at B1 H2 S512, max |diff|
+    0.17, dV untouched).  P is quantized either way.
 
     ``return_intermediates`` (default False: nothing changes) APPENDS a dict, as ``compute_ref`` does:
     ``p_scaled`` (``p * s_scale``, quantized into dV), ``ds_scaled`` (``dS * dP_scale``, quantized into
@@ -284,7 +290,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
         dS = p * (dP_block(start, end) - D) * attn_scale
         # dS (FP32) -> dS (FP8)
         ds_scaled = dS * dP_scale
-        dS_quant = (ds_scaled.to(torch_itype)).float()
+        dS_quant = (ds_scaled.to(torch_itype)).float() if quantize_ds else ds_scaled
         if collect is not None:
             collect.add("p_scaled", start, end, p_scaled)
             collect.add("ds_scaled", start, end, ds_scaled)

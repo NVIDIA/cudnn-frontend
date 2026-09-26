@@ -83,13 +83,15 @@ from cudnn.sdpa.bwd.kernels.sm120._common import (
     pack_half2,
     tile_ptr,
 )
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import (
+    dkv_reduce_host,
+    dot_do_o_host,
+    dsink_host,
+)
 from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import (
     SM120DetDqGemmKernel,
     convert_dbias_host,
     convert_dq_host,
-    dkv_reduce_host,
-    dot_do_o_host,
-    dsink_host,
 )
 
 # The FROST loader injects one immutable specialization before executing this

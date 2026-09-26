@@ -3,9 +3,11 @@
 
 """FROST SDPA-backward engine registry: capability declarations + spec table.
 
-One registered engine per architecture, named ``sdpa_bwd_sm<arch>`` (dtype is
-NOT part of the identity: a cell's engine serves every dtype its kernel
-handles — fp16 and bf16 today — via ``Capabilities.dtypes``).
+One registered engine per architecture x quantization family, named
+``sdpa_bwd_sm<arch>`` for the half rows (dtype is NOT part of the identity: a
+cell's engine serves every dtype its kernel handles — fp16 and bf16 — via
+``Capabilities.dtypes``) with a ``_mxfp8`` / ``_fp8`` suffix for the quantized
+graphs (``engine_name``), mirroring ``fwd/engines.py``.
 
 The backward opset keeps its own :class:`Capabilities` record rather than
 reusing the forward one: the feature model differs (gradient side outputs,
@@ -33,6 +35,8 @@ _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
 _SM100 = "SdpaBwdDslSm100"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
+_SM107 = "SdpaBwdDslSm107"
+_SM107_FP8 = "SdpaBwdDslSm107Fp8"
 
 
 def _adapter(name: str):
@@ -42,6 +46,11 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
+    if name in (_SM107, _SM107_FP8):
+        # The Rubin d=256 chains (half + per-tensor FP8) share one module.
+        from cudnn.sdpa.bwd import api_dsl_sm107
+
+        return getattr(api_dsl_sm107, name)
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -66,6 +75,10 @@ _LOG = logging.getLogger(__name__)
 # an sm120 kernel runs on the sm120 line, and enumerating members silently
 # declines whatever ships next.
 _BLACKWELL_GEFORCE = (120, 129)
+# The SM100 line as fwd/engines.py spells it, and the Rubin (sm107) rows' tile
+# of it: 107 up to the line's end, so the part that ships next is not declined.
+_BLACKWELL = (100, 119)
+_RUBIN = (107, _BLACKWELL[1])
 
 
 @dataclass(frozen=True)
@@ -219,6 +232,15 @@ class Capabilities:
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
+    # Bottom-right causal is served only when S_q is a multiple of this (1 = any
+    # S_q, the default).  A body that derives the bottom-right diagonal S_kv - S_q
+    # (and the q-tile trim behind it) from its PADDED q extent is wrong by
+    # (pad - S_q) rows on a ragged S_q -- finite, no crash -- so its row declines
+    # the shape at eligibility instead of serving it.  Set to the body's q pad
+    # (sdpa_bwd_sm107_fp8: 128, no seqlen_q_real in its ABI); a body that
+    # threads the real length keeps 1.  Appended last: Capabilities is
+    # positional-append-only.
+    bottom_right_s_q_multiple: int = 1
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -381,6 +403,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
     if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
+    m = capabilities.bottom_right_s_q_multiple
+    if facts.bottom_right and m > 1 and facts.s_q % m != 0:
+        return (
+            f"bottom-right causal on this engine needs S_q % {m} == 0 (the body derives the diagonal S_kv - S_q "
+            f"from its padded S_q; follow-up: thread seqlen_q_real like the f16 body); graph has S_q={facts.s_q}"
+        )
 
     if facts.stats_t is not None:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
@@ -896,10 +924,15 @@ def _sm100_spec() -> EngineSpec:
     )
 
 
-def engine_name(arch: str = "sm120") -> str:
-    """The shipped engine name for a coverage cell (test/user convenience)."""
+def engine_name(arch: str = "sm120", fp8: bool = False, mxfp8: bool = False) -> str:
+    """The shipped engine name for a coverage cell (test/user convenience).
 
-    return f"sdpa_bwd_{arch}"
+    One engine per arch x quantization family, like ``fwd.engines.engine_name``:
+    the half row is ``sdpa_bwd_<arch>``, the block-scale MXFP8 row
+    ``sdpa_bwd_<arch>_mxfp8`` and the per-tensor FP8 row ``sdpa_bwd_<arch>_fp8``."""
+
+    suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""
+    return f"sdpa_bwd_{arch}" + suffix
 
 
 # Preference order: the ranked plan list offers these in this order (see
@@ -1096,7 +1129,226 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     )
 
 
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec())
+def _sm107_spec() -> EngineSpec:
+    """SM107 (Rubin) d=256 bf16 / fp16 backward row (``api_dsl_sm107.SdpaBwdDslSm107``).
+
+    A TWO-kernel chain: the main kernel computes dV in TMEM (stored per Q head)
+    and writes dS to a kv-major ``[B, H, S_kv, S_q]`` GMEM workspace; dK = dS.Q and
+    dQ = dS^T.K are the ``bprop_matmul_blackwell`` GEMMs over it; GQA folds the
+    per-Q-head partials with the shared ``dkv_reduce`` (fixed order).  Rubin's
+    327 KiB SMEM carveout and 576 TMEM columns are what let the d=256 backward
+    keep dV resident -- the SM100 d=512 three-stage split is a different shape.
+
+    Exact ``d_qk == d_v == 256`` (the bodies hardcode the tile).  Any S_q / S_kv
+    (a non-multiple of the 128-row q tile / 256-row kv block is padded and the
+    tail masked).  Dense, top-left and bottom-right causal, sliding window (left),
+    MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats.
+
+    Declined for now, each asserted by a test: dense padding masks (the kernel
+    threads a uniform length), sink / dSink, bias / dBias, right-band widening,
+    THD, decode shapes, ``dense_flex`` layouts, and ``deterministic`` -- the
+    chain has no atomics and a two-run bitwise test exists, but the claim waits
+    on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
+    competitor (engine 17, which forces its own deterministic flag): pin the
+    engine when validating or measuring this row.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107",
+        capabilities=Capabilities(
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            decode=False,  # prefill bodies: a 128-row q tile per iteration
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107),
+    )
+
+
+def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None, api_type: str = _SM107_FP8):
+    """Lower the per-tensor FP8 backward row (``sdpa_fp8_backward``) through its adapter.
+
+    A sibling of :func:`lower_dsl_bwd` like :func:`lower_dsl_bwd_mxfp8`: the FP8
+    node binds twelve scalar descales / scales and up to four amax outputs on
+    top of the half node's operands, and its gradient dtype (``facts.dtype_o``)
+    is independent of the FP8 payloads.
+    """
+    import torch
+
+    from cudnn.api_base import TensorDesc
+
+    ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+
+    def _desc(geom, dtype_hint, name: str):
+        dim, stride = geom
+        dtype = ga.to_torch_dtype(dtype_hint) if dtype_hint in ga._KNOWN_DTYPES else dtype_hint
+        return TensorDesc(
+            dtype=dtype,
+            shape=dim,
+            stride=stride,
+            stride_order=TensorDesc._compute_stride_order(dim, stride),
+            device=torch.device("cuda", torch.cuda.current_device()),
+            name=name,
+        )
+
+    fp8, grad = facts.dtype, facts.dtype_o
+    stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
+    api = _adapter(api_type)(
+        sample_q=_desc(ports["q"], fp8, "q"),
+        sample_k=_desc(ports["k"], fp8, "k"),
+        sample_v=_desc(ports["v"], fp8, "v"),
+        sample_o=_desc(ports["o"], fp8, "o"),
+        sample_do=_desc(ports["dO"], fp8, "dO"),
+        sample_stats=_desc(stats_geom, torch.float32, "stats"),
+        sample_dq=_desc(ports["dQ"], grad, "dQ"),
+        sample_dk=_desc(ports["dK"], grad, "dK"),
+        sample_dv=_desc(ports["dV"], grad, "dV"),
+        is_causal=facts.causal or facts.right_band_widening,
+        causal_bottom_right=facts.bottom_right,
+        window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
+        deterministic=facts.deterministic,
+        scale_softmax=facts.scale,
+        tile_m=requested.tile_m if requested is not None else None,
+        tile_n=requested.tile_n if requested is not None else None,
+        seq_kv_lens_present=facts.padded,
+        seq_q_lens_present=facts.padded,
+    )
+    api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    api.compile()
+    total_workspace_bytes = api.scratch_workspace_bytes()
+
+    # The scalar set of sdpa_fp8_backward, by the binding's field name; the
+    # analyzer's shared-with-forward slots (descale_q/k/v/s, scale_s) and its
+    # backward-only ones.  amax outputs bind only when the graph made them real.
+    scalars = dict(
+        descale_q=facts.descale_q_t,
+        descale_k=facts.descale_k_t,
+        descale_v=facts.descale_v_t,
+        descale_s=facts.descale_s_t,
+        scale_s=facts.scale_s_t,
+        descale_o=facts.descale_o_t,
+        descale_dO=facts.descale_do_t,
+        descale_dP=facts.descale_dp_t,
+        scale_dQ=facts.scale_dq_t,
+        scale_dK=facts.scale_dk_t,
+        scale_dV=facts.scale_dv_t,
+        scale_dP=facts.scale_dp_t,
+    )
+    amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t, amax_dP=facts.amax_dp_t)
+    binding = ga.SdpaBinding(
+        q=facts.q_t,
+        k=facts.k_t,
+        v=facts.v_t,
+        o=facts.o_t,
+        stats=facts.stats_t,
+        do=facts.do_t,
+        dq=facts.dq_t,
+        dk=facts.dk_t,
+        dv=facts.dv_t,
+        **scalars,
+        **{name: t for name, t in amaxes.items() if t is not None},
+    )
+
+    def _view(buf, name):
+        """Reinterpret a variant-pack buffer through the port's geometry (see
+        lower_dsl_bwd._canonical_view); scalars are consumed as they come."""
+        if name not in ports:
+            return buf
+        dim, stride = ports[name]
+        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
+            return buf
+        return buf.as_strided(dim, stride)
+
+    def _need(resolved, t, label):
+        buf = resolved.get(id(t))
+        if buf is None:
+            raise ValueError(f"cudnn.sdpa: {spec.name}: {label} is an input of sdpa_fp8_backward but no buffer was provided")
+        return buf
+
+    def _execute(variant_pack, workspace=None, stream=None):
+        r = ga.resolve_variant_pack(variant_pack, binding)
+        stats_buf = r[id(binding.stats)]
+        if tuple(stats_buf.shape) != stats_geom[0] or tuple(stats_buf.stride()) != stats_geom[1]:
+            stats_buf = stats_buf.as_strided(stats_geom[0], stats_geom[1])
+        api.execute(
+            q_tensor=_view(r[id(binding.q)], "q"),
+            k_tensor=_view(r[id(binding.k)], "k"),
+            v_tensor=_view(r[id(binding.v)], "v"),
+            o_tensor=_view(r[id(binding.o)], "o"),
+            do_tensor=_view(r[id(binding.do)], "dO"),
+            stats_tensor=stats_buf,
+            dq_tensor=_view(r[id(binding.dq)], "dQ"),
+            dk_tensor=_view(r[id(binding.dk)], "dK"),
+            dv_tensor=_view(r[id(binding.dv)], "dV"),
+            scale_softmax=facts.scale,
+            workspace=workspace,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            **{name: _need(r, t, name) for name, t in scalars.items()},
+            **{name: (r.get(id(t)) if t is not None else None) for name, t in amaxes.items()},
+        )
+        return None
+
+    _execute.workspace_bytes = total_workspace_bytes
+    _execute.binding = binding
+    return _execute
+
+
+def _sm107_fp8_spec() -> EngineSpec:
+    """SM107 (Rubin) d=256 per-tensor FP8 E4M3 backward row (``sdpa_fp8_backward``;
+    ``api_dsl_sm107.SdpaBwdDslSm107Fp8``).
+
+    The same two-kernel chain as :func:`_sm107_spec` with the cuDNN FP8 contract:
+    FP8 Q / K / V / O / dO with the twelve scalar descales / scales (1-element fp32
+    device tensors, read in-kernel), fp32 Stats, dQ / dK / dV in the graph's
+    gradient dtype -- E4M3 scaled by ``scale_dQ / dK / dV`` (the contract) or
+    bf16 / fp16 (the pre-quantization value) -- and the four ``amax_dQ / dK / dV
+    / dP`` outputs when requested (``amax_dP`` reduces the fp32 ``dS`` right
+    before its cast, as the C++ node does).  dS travels through a bf16
+    workspace and the gradient GEMMs run at bf16 over exactly-upcast Q / K, so
+    ``descale_dP`` / ``scale_dP`` are accepted and never applied.
+
+    E4M3 payloads only (no E5M2 body); otherwise the half row's envelope and
+    declines, plus: O must be an FP8 payload of Q's dtype and the gradient triple
+    must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``),
+    and **bottom-right causal needs ``S_q % 128 == 0``** -- the fp8 body's ABI has
+    no ``seqlen_q_real`` (the f16 body's has), so it derives the bottom-right
+    diagonal and the q-tile trim from the PADDED q extent; a ragged S_q would be
+    served silently wrong by ``pad - S_q`` rows, so the row declines it
+    (``bottom_right_s_q_multiple=128``; the adapter backstops).  A ragged S_kv is
+    fine (the kernel's kv term is the runtime real length).
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_fp8",
+        capabilities=Capabilities(
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_fp8=True,
+            out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            amax_dgrad=True,
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            decode=False,
+            layouts=frozenset({"bshd"}),
+            # == api_dsl_sm107._SM107_Q_PAD (the body's q tile); pinned equal by test_sdpa_bwd_fp8_sm107.py.
+            bottom_right_s_q_multiple=128,
+        ),
+        lower=partial(lower_dsl_bwd_fp8, api_type=_SM107_FP8),
+    )
+
+
+ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec(), _sm107_spec(), _sm107_fp8_spec())
 
 __all__ = [
     "ENGINE_SPECS",
