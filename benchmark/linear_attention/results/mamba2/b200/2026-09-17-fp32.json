@@ -1,0 +1,293 @@
+{
+  "shape": {
+    "B": 2,
+    "L": 2048,
+    "H": 64,
+    "P": 64,
+    "G": 1,
+    "N": 64,
+    "chunk_size": 32,
+    "dtype": "bfloat16"
+  },
+  "intermediate_dtype": "float32",
+  "reuse_forward_states": false,
+  "environment": {
+    "gpu": "NVIDIA B200",
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "cudnn": 92600,
+    "mamba_commit": "e9594ce1c732d97440f0332fdc43170a2294dbfa",
+    "mamba_dirty": false
+  },
+  "source_sha256": {
+    "linear_attention/frost/mamba2_engine.py": "d98937305a527d3fa8758fc7d1a5295741ba04c050a8cf0a39f7e1872b63ab72",
+    "linear_attention/ops/mamba2.py": "cbf8367ab6983b6e10842d08668fddb5baeffd79d721c3abd131cdab04073101",
+    "linear_attention/frost/kernel/mamba2_bprop_f16.py": "7a7e44e31146d88a4c7e94146f7cbb6b27bf200b088801a39e38a7fe5e9d028e",
+    "linear_attention/frost/kernel/mamba2_gate_bwd.py": "9cfb8ba6ed6df72db0a5ca5f9d23a98cf6087a999e661e413bb6a225be31f5e7",
+    "linear_attention/frost/kernel/mamba2_gate_fwd.py": "c8d520305105eec0cc8c3e5969d1177a346de1c9cc819f5b165878b50babb313",
+    "linear_attention/frost/kernel/mamba2_math.py": "773532f8d9bb626b0f55afe22365ef435bf56fb4a081aef9d5cf6e7ed76607d6",
+    "linear_attention/frost/kernel/mamba2_prefill_f16.py": "baf60f6016480aaab75847c5a615cc36c9eec0a3fe66e429e00409cffcf010f8",
+    "linear_attention/frost/kernel/mamba2_reduce.py": "466907b6b9c60d6aabccb89fceace9c4ce52aa0f1f22028153666bffa478449f",
+    "linear_attention/frost/kernel/mamba2_state_scan_f16.py": "7045dc30e802127cd1c6ef154bfcb4f684fa7b7e933a72558891c7201522a2c6"
+  },
+  "modes": [
+    {
+      "gate": false,
+      "workspace_bytes": {
+        "forward": 128,
+        "backward": 404848640
+      },
+      "output": {
+        "relative_rms": 0.0010384290168781428,
+        "relative_peak": 0.001445086705202312
+      },
+      "final_state": {
+        "relative_rms": 0.0024110991020246655,
+        "relative_peak": 0.004531539804643
+      },
+      "gradients": {
+        "dX": {
+          "relative_rms": 0.002251580131123863,
+          "relative_peak": 0.0035971223021582736
+        },
+        "dDt": {
+          "relative_rms": 0.0024615600213662068,
+          "relative_peak": 0.004149377593360996
+        },
+        "dA": {
+          "relative_rms": 0.0009958300632079877,
+          "relative_peak": 0.001095004158324744
+        },
+        "dB": {
+          "relative_rms": 0.0031094196105938485,
+          "relative_peak": 0.005128205128205128
+        },
+        "dC": {
+          "relative_rms": 0.0032775558329105887,
+          "relative_peak": 0.006060606060606061
+        },
+        "dD": {
+          "relative_rms": 1.5273843889372323e-07,
+          "relative_peak": 1.1701540507807852e-07
+        },
+        "d_dt_bias": {
+          "relative_rms": 0.002163108724922793,
+          "relative_peak": 0.0025720096195245394
+        }
+      },
+      "timing": {
+        "triton_forward": {
+          "median_us": 140.94868977864584,
+          "samples_us": [
+            141.00011189778647,
+            141.17844899495444,
+            140.94868977864584,
+            140.9318415323893,
+            141.00245157877603,
+            140.83904266357422,
+            140.94868977864584
+          ]
+        },
+        "native_forward": {
+          "median_us": 54.48554356892904,
+          "samples_us": [
+            54.52650705973307,
+            54.49557622273763,
+            54.46912129720052,
+            54.47338740030924,
+            54.50026830037435,
+            54.469547271728516,
+            54.48554356892904
+          ]
+        },
+        "triton_backward": {
+          "median_us": 672.3978678385416,
+          "samples_us": [
+            672.5593566894531,
+            672.3978678385416,
+            672.5118001302084,
+            672.3392232259115,
+            672.3812357584635,
+            672.5525410970052,
+            672.2799173990885
+          ]
+        },
+        "native_backward": {
+          "median_us": 362.7816518147786,
+          "samples_us": [
+            362.7816518147786,
+            362.97686258951825,
+            363.00160725911456,
+            362.7669270833333,
+            362.76585896809894,
+            362.75433858235675,
+            362.8061930338542
+          ]
+        },
+        "triton_pair": {
+          "median_us": 813.1261698404948,
+          "samples_us": [
+            813.3661905924479,
+            813.0860900878906,
+            813.2243347167969,
+            813.2433064778646,
+            813.1261698404948,
+            813.0353291829427,
+            812.857411702474
+          ]
+        },
+        "native_pair": {
+          "median_us": 426.05397542317706,
+          "samples_us": [
+            426.16917928059894,
+            426.04225158691406,
+            425.9601084391276,
+            426.05504353841144,
+            426.189448038737,
+            426.05397542317706,
+            426.0004170735677
+          ]
+        }
+      },
+      "speedup": {
+        "forward": 2.5869006812849955,
+        "backward": 1.8534505934215226,
+        "pair": 1.908505064488271
+      }
+    },
+    {
+      "gate": true,
+      "workspace_bytes": {
+        "forward": 67108864,
+        "backward": 438403072
+      },
+      "output": {
+        "relative_rms": 0.0010483941278516076,
+        "relative_peak": 0.0024390243902439024
+      },
+      "final_state": {
+        "relative_rms": 0.0024110991020246655,
+        "relative_peak": 0.004531539804643
+      },
+      "gradients": {
+        "dX": {
+          "relative_rms": 0.002232062984689324,
+          "relative_peak": 0.004366812227074236
+        },
+        "dDt": {
+          "relative_rms": 0.002428176702350375,
+          "relative_peak": 0.001976284584980237
+        },
+        "dA": {
+          "relative_rms": 0.0007434245518341791,
+          "relative_peak": 0.0007954159221631265
+        },
+        "dB": {
+          "relative_rms": 0.0031047068083934746,
+          "relative_peak": 0.0040650406504065045
+        },
+        "dC": {
+          "relative_rms": 0.003273520446791711,
+          "relative_peak": 0.005128205128205128
+        },
+        "dD": {
+          "relative_rms": 1.3894342430244966e-07,
+          "relative_peak": 1.458073609298364e-07
+        },
+        "d_dt_bias": {
+          "relative_rms": 0.0016001780729262027,
+          "relative_peak": 0.0012317054094592018
+        },
+        "dZ": {
+          "relative_rms": 0.0011096559808603812,
+          "relative_peak": 0.0017482517482517483
+        }
+      },
+      "timing": {
+        "triton_forward": {
+          "median_us": 158.70399475097656,
+          "samples_us": [
+            158.6941909790039,
+            158.70826721191406,
+            158.7722651163737,
+            158.7176513671875,
+            158.70165506998697,
+            158.66474151611328,
+            158.70399475097656
+          ]
+        },
+        "native_forward": {
+          "median_us": 90.19946416219075,
+          "samples_us": [
+            90.2621841430664,
+            90.19946416219075,
+            90.2082125345866,
+            90.19733428955078,
+            90.19840240478516,
+            90.2082125345866,
+            90.19882837931316
+          ]
+        },
+        "triton_backward": {
+          "median_us": 717.9065450032552,
+          "samples_us": [
+            717.7725728352865,
+            717.7655537923177,
+            717.8003438313802,
+            717.9818725585938,
+            717.9880777994791,
+            718.028818766276,
+            717.9065450032552
+          ]
+        },
+        "native_backward": {
+          "median_us": 391.1498769124349,
+          "samples_us": [
+            391.23499552408856,
+            391.0909779866536,
+            391.1797332763672,
+            391.2870279947917,
+            391.060053507487,
+            391.1082712809245,
+            391.1498769124349
+          ]
+        },
+        "triton_pair": {
+          "median_us": 876.1685180664062,
+          "samples_us": [
+            876.1685180664062,
+            876.1037190755209,
+            876.1617024739584,
+            876.2378946940104,
+            876.0911051432291,
+            876.3483683268229,
+            876.1958821614584
+          ]
+        },
+        "native_pair": {
+          "median_us": 482.5081380208333,
+          "samples_us": [
+            482.5740559895833,
+            482.4998474121094,
+            482.50391642252606,
+            482.5081380208333,
+            482.630615234375,
+            482.4324035644531,
+            482.5124104817708
+          ]
+        }
+      },
+      "speedup": {
+        "forward": 1.7594782433031473,
+        "backward": 1.8353745900934286,
+        "pair": 1.8158626746904232
+      }
+    }
+  ],
+  "provenance": {
+    "frontend_path_sanitized": true,
+    "benchmark_driver_sha256": null,
+    "note": "The original measurement did not record the benchmark driver hash. The absolute environment.frontend_path was removed for publication. Kernel hashes and measured values are unchanged; no driver hash is inferred retroactively."
+  }
+}

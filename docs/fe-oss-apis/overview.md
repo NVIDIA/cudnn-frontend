@@ -11,6 +11,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
+- [Mamba-2 SSD](mamba2.md) — graph engine and PyTorch training on SM100
 - [Kimi Delta Attention in JAX](kda_jax.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)

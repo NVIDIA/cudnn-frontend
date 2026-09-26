@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .engine_ids import (
+    MAMBA2_ID_BASE,
     FAMILY_BLOCK,
     FROST_GEMM_ID_BASE,
     FROST_SDPA_BWD_ID_BASE,
@@ -132,6 +133,8 @@ class EngineFamily:
 # ignored when classifying, so `matmul + pointwise` is a gemm graph. Names, not
 # enum members, so this file imports no engine code.
 _ANCHOR_NODE_TO_FAMILY = {
+    "MAMBA2": "mamba2",
+    "MAMBA2_BWD": "mamba2",
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
@@ -165,6 +168,14 @@ _ANCHOR_NODE_TO_FAMILY = {
 # autotune result is (engine_id, knobs).
 # ---------------------------------------------------------------------------
 MANIFEST: Tuple[EngineFamily, ...] = (
+    EngineFamily(
+        MAMBA2_ID_BASE,
+        "mamba2",
+        "cudnn.linear_attention",
+        "Mamba2Engines",
+        slots={"mamba2_frost": EngineSlot(0)},
+        analyzer=("cudnn.linear_attention.mamba2_graph_analyzer", "analyze"),
+    ),
     EngineFamily(
         GDN_ID_BASE,
         "gdn",

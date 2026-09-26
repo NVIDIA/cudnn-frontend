@@ -65,6 +65,14 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
+### FROST test selection
+
+The internal FROST linear-attention lane selects with `-m L0 -k frost`. A new
+file under `linear_attention/` also needs `frost` in its collected node names
+(for example, `test_mamba2_frost.py`). Verify the actual selector with
+`pytest --collect-only -q linear_attention/test_mamba2_frost.py -m L0 -k frost`;
+running the file without the selector does not prove CI coverage.
+
 ### Confirm you are testing the code you edited
 
 `pip install -e .` does **not** put the package on `sys.path`. It installs a
@@ -151,3 +159,28 @@ padding-dependent tail rule. A shared binder must preserve that distinction.
 `test_sm120_prepared_bounded_geometry_override` shrinks an unpadded plan to
 S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
 dimensions as compile-time constants: the same binder fixes those per plan.
+
+
+### Mamba-2 state-size and gated-gradient regressions
+
+Check N=128 with both 64 and 128 heads and 8 B/C groups, not just the small
+four-head fixture; reject unsupported state sizes explicitly. Keep the
+length-128 gated FP32 case in `linear_attention/test_mamba2_frost.py`: rounding
+the gate cotangent to BF16 before the scan and state contractions amplifies
+cancellation in `dt_bias`. Its independent FP64 gradient check must pass
+without relaxing the shared RMS/peak thresholds. The explicit BF16-intermediate
+mode declines the optional SSD gate because BF16 state rounding itself can
+amplify this cancellation; test the decline at both graph and torch entry points.
+Component benchmarks should
+use the model's Triton chunk size (128 for these Nemotron configurations) and
+validate captured output/gradient buffers after replay, as well as before it.
+
+
+The Nemotron merged backward uses 64-token work units over a 32-token state
+scan. Test both 32- and 64-token boundaries, including odd final scan chunks
+(e.g. L=33 and L=129), against FP64 gradients. The final reverse checkpoint
+must be stored even when a pair has only one scan chunk. Verify the merged
+route is reached with no final-state loss and no forward checkpoint reuse;
+those optional contracts deliberately select the general backward. The
+`test_nemotron_merged_backward` and `test_nemotron_backward_rebind_capture`
+cases cover dispatch, tails and the actual captured destination buffers.

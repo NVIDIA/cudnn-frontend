@@ -53,6 +53,8 @@ cudnn.NodeType.KDA_SUMMARY
 cudnn.NodeType.KDA_SUMMARY_BWD
 cudnn.NodeType.LAYERNORM
 cudnn.NodeType.LAYERNORM_BWD
+cudnn.NodeType.MAMBA2
+cudnn.NodeType.MAMBA2_BWD
 cudnn.NodeType.MATMUL
 cudnn.NodeType.MATMUL_FP8
 cudnn.NodeType.MOE_GROUPED_MATMUL
@@ -457,6 +459,7 @@ cudnn.linear_attention.gated_delta_product_summary_bwd
 cudnn.linear_attention.kimi_delta_attention
 cudnn.linear_attention.kimi_delta_attention_summary
 cudnn.linear_attention.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.mamba2
 cudnn.linear_attention.ops
 cudnn.linear_attention.ops.gated_delta_net
 cudnn.linear_attention.ops.gated_delta_net_summary
@@ -470,6 +473,7 @@ cudnn.linear_attention.ops.gated_delta_product_summary_bwd
 cudnn.linear_attention.ops.kimi_delta_attention
 cudnn.linear_attention.ops.kimi_delta_attention_summary
 cudnn.linear_attention.ops.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.ops.mamba2
 cudnn.moe_grouped_matmul_mode
 cudnn.moe_grouped_matmul_mode.GATHER
 cudnn.moe_grouped_matmul_mode.NONE
@@ -596,6 +600,8 @@ cudnn.pygraph.log
 cudnn.pygraph.logical_and
 cudnn.pygraph.logical_not
 cudnn.pygraph.logical_or
+cudnn.pygraph.mamba2
+cudnn.pygraph.mamba2_bwd
 cudnn.pygraph.matmul
 cudnn.pygraph.max
 cudnn.pygraph.min
