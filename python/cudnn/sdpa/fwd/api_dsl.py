@@ -3401,11 +3401,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        from cudnn.sdpa.fwd.prepared import bind_thd, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
 
         spec = self._thd_spec
         if spec is None:
             raise NotImplementedError("SdpaFwdDslSm100 (THD): this plan has no prepared launch (see _build_thd_spec)")
+        stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
+        _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes, align=_WS_ALIGN)  # TMA descriptors live here
+        if spec.native is not None:
+            launched = execute_native_thd_tensors(
+                spec, (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks), ws_ptr, current_stream, scale_softmax_log2
+            )
+            if not launched:
+                self._logger.debug("execute (THD): no addressable Q token, nothing to do")
+                return
+            self._logger.debug("execute (THD) completed")
+            return
         facts = dict(
             q=facts_of_tensor(q_buf),
             k=facts_of_tensor(k_buf),
@@ -3418,9 +3430,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
         )
-        stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
-        _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
-        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes, align=_WS_ALIGN)  # TMA descriptors live here
         frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
         if frame is None:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
