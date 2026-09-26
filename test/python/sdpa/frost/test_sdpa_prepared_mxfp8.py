@@ -284,6 +284,9 @@ def test_prepared_mxfp8_thd_output_stride_above_int32(dtype, d, dv):
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_prepared_mxfp8_sf_head_stride_above_int32_units(d, dv):
     """SF descriptor strides are in 16-byte units: multiply in Int64 first."""
+    # Release the preceding parametrization's cached 128-GiB allocation before
+    # checking physical free memory; only live allocations should cause a skip.
+    torch.cuda.empty_cache()
     if torch.cuda.mem_get_info()[0] < 130 * 2**30:
         pytest.skip("physical SF head-stride regression needs 130 GiB free")
     g, vp, ws, bufs, ts = _case(thd=True, d=d, dv=dv, hq=2, hk=1)
