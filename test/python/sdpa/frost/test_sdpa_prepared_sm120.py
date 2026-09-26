@@ -355,7 +355,12 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     k_buf = torch.zeros((b * kl, hk, d_qk), device="cuda", dtype=torch.bfloat16)
     v_buf = torch.ones((b * kl, hk, d_v), device="cuda", dtype=torch.bfloat16)
     v_buf[kl:] *= 2
-    o_buf = torch.empty_strided((b * ql, hq, d_v), (row_stride, d_v, 1), device="cuda", dtype=torch.bfloat16)
+    try:
+        o_buf = torch.empty_strided((b * ql, hq, d_v), (row_stride, d_v, 1), device="cuda", dtype=torch.bfloat16)
+    except torch.OutOfMemoryError:
+        # Other xdist workers can allocate after the free-memory check above.
+        # Catch only this storage reservation, never a kernel or comparison.
+        pytest.skip("wide physical row-stride storage unavailable under current GPU memory pressure")
     lse_buf = torch.empty((b * ql, hq), device="cuda", dtype=torch.float32)
     cq = torch.arange(b + 1, device="cuda", dtype=torch.int32) * ql
     ck = torch.arange(b + 1, device="cuda", dtype=torch.int32) * kl
