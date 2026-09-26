@@ -250,3 +250,118 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_le
                     softmax_scale=softmax_scale,
                     topk_length=topk_length,
                 )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("topk", [384, 1152])
+def test_DSA_sparse_indexer_score_recompute_resets_partial_tmem_ring(topk):
+    """A second launch must not consume stale scores from a partial TMEM ring."""
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+
+    torch.manual_seed(20260907)
+    device = torch.device("cuda")
+    s_q, s_kv, heads, head_dim = 1, topk, 32, 128
+    q = torch.randn((1, s_q, heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((1, s_kv, head_dim), dtype=torch.bfloat16, device=device)
+    weights = torch.ones((1, s_q, heads), dtype=torch.bfloat16, device=device)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).view(1, 1, topk)
+
+    DSA.sparse_indexer_score_recompute_wrapper(q, k, weights, indices)
+    torch.cuda.synchronize()
+    q.zero_()
+    k.zero_()
+
+    result = DSA.sparse_indexer_score_recompute_wrapper(q, k, weights, indices)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        result["predict"],
+        torch.full_like(result["predict"], 1.0 / topk),
+        atol=1e-6,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_score_recompute_tracks_partial_ring_across_tiles():
+    """Keep per-slot TMEM phases across persistent tiles, including skipped blocks."""
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+
+    torch.manual_seed(20260907)
+    device = torch.device("cuda")
+    s_q, s_kv, heads, head_dim, topk = 512, 1152, 128, 512, 1152
+    q = torch.randn((1, s_q, heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((1, s_kv, head_dim), dtype=torch.bfloat16, device=device)
+    lse = torch.zeros((1, s_q, heads), dtype=torch.float32, device=device)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).view(1, 1, topk).expand(1, s_q, topk).contiguous()
+    topk_length = torch.full((1, s_q), topk, dtype=torch.int32, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    # More query tiles than can be resident at once force persistent CTAs to
+    # carry ring state into later work.  The first launch leaves non-uniform
+    # values in a 9-block / 4-slot ring.
+    DSA.sparse_attn_score_recompute_wrapper(
+        q,
+        k,
+        lse,
+        indices,
+        softmax_scale,
+        qhead_per_kv_head=heads,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    # A compact second traversal exercises synthetic full-barrier arrivals for
+    # the skipped blocks.  Zero Q/K makes every active slot exactly uniform.
+    q.zero_()
+    k.zero_()
+    active_topk = 257
+    topk_length.fill_(active_topk)
+    result = DSA.sparse_attn_score_recompute_wrapper(
+        q,
+        k,
+        lse,
+        indices,
+        softmax_scale,
+        qhead_per_kv_head=heads,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    target = result["target"]
+    torch.testing.assert_close(
+        target[..., :active_topk],
+        torch.full_like(target[..., :active_topk], 1.0 / active_topk),
+        atol=1e-6,
+        rtol=1e-4,
+    )
+    assert torch.count_nonzero(target[..., active_topk:]) == 0
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_score_recompute_uses_launchable_smem_budget():
+    """A legal Top-K boundary must not plan more than usable dynamic SMEM."""
+    from cudnn import DSA
+
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    heads, head_dim, topk = 128, 512, 4224
+    q = torch.zeros((1, 1, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, topk, head_dim), dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros((1, 1, heads), dtype=torch.float32, device="cuda")
+    indices = torch.arange(topk, dtype=torch.int32, device="cuda").view(1, 1, topk)
+    result = DSA.sparse_attn_score_recompute_wrapper(q, k, lse, indices, 1.0 / math.sqrt(head_dim), qhead_per_kv_head=heads)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result["target"], torch.full_like(result["target"], 1.0 / topk), atol=1e-6, rtol=1e-4)

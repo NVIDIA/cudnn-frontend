@@ -220,6 +220,11 @@ class Graph:
     """
 
     __handle: Optional[CudnnHandle] = None  # holding the cudnn handle pointer
+    # None: allocate one on __exit__. False: the caller owns it (workspace_alloc=False),
+    # and execute() demands a workspace= kwarg. A class attribute, not a hasattr()
+    # probe: "__workspace" inside hasattr is a plain string, so it is NOT name-mangled
+    # and never matched the _Graph__workspace the assignments below produce.
+    __workspace: Any = None
 
     def __init__(
         self,
@@ -305,7 +310,7 @@ class Graph:
         self.__graph.check_support()
         self.__graph.build_plans()
         # Set up workspace if not forbidden by user, then set up I/O tensor orders
-        if not hasattr(self, "__workspace"):
+        if self.__workspace is None:
             self.__workspace = torch.empty(
                 self.__graph.get_workspace_size(),
                 device="cuda",
