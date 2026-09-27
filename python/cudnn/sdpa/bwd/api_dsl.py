@@ -274,8 +274,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             f"stats must be (B, H_q, S_q, 1); got {tuple(self.stats_desc.shape)}",
         )
         self._value_error_if(
-            any(st == 0 and d > 1 for d, st in zip(self.stats_desc.shape, self.stats_desc.stride)),
-            f"stats must not broadcast (stride 0 on a size > 1 dim); got stride {self.stats_desc.stride}",
+            any(st < 0 or (st == 0 and d > 1) for d, st in zip(self.stats_desc.shape, self.stats_desc.stride)),
+            f"stats must not broadcast (stride 0 on a size > 1 dim) or have negative strides; got stride {self.stats_desc.stride}",
         )
         self._check_dtype(self.stats_desc, torch.float32, name="stats")
         self._lse_strides = None if self.stats_desc.is_contiguous() else tuple(int(st) for st in self.stats_desc.stride[:3])
@@ -492,6 +492,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             dk_strides=self._io_strides.get("dK"),
             dv_strides=self._io_strides.get("dV"),
         )
+        from .prepared import build_sm120_spec
+
+        self._prepared = build_sm120_spec(self)
         self._logger.debug("compile completed")
 
     def _dq_sem_len(self) -> int:
@@ -515,84 +518,6 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         if self.dbias_desc is None or self.dbias_desc.dtype == torch.float32:
             return 0
         return int(self.dbias_desc.shape[0]) * self.h_q * self.s_q_max * self.s_k_max
-
-    def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
-        """Validate per-batch lengths and return a (B,) int32 view (never a copy/cast)."""
-        self._value_error_if(
-            seq_lens.device != self.q_desc.device,
-            f"{name} must be on {self.q_desc.device} (with Q); got {seq_lens.device}",
-        )
-        self._value_error_if(
-            seq_lens.dtype != torch.int32,
-            f"{name} must be int32; got {seq_lens.dtype}",
-        )
-        self._value_error_if(
-            seq_lens.numel() != self.batch_size,
-            f"{name} must have B = {self.batch_size} elements; got {seq_lens.numel()}",
-        )
-        self._value_error_if(
-            not seq_lens.is_contiguous(),
-            f"{name} must be contiguous (bound to the kernel as a flat (B,) view)",
-        )
-        return seq_lens.reshape(-1)
-
-    def _checked_bias_view(self, tensor: torch.Tensor, desc: TensorDesc, name: str) -> torch.Tensor:
-        """Validate a bias/dBias buffer and return the declared (1|B, H_q, S_q, S_kv) view."""
-        shape = tuple(int(x) for x in desc.shape)
-        self._value_error_if(
-            tensor.dtype != desc.dtype,
-            f"{name} must be {desc.dtype} (as declared at build); got {tensor.dtype}",
-        )
-        self._value_error_if(
-            tensor.numel() != math.prod(shape),
-            f"{name} must have {math.prod(shape)} elements {shape}; got {tensor.numel()}",
-        )
-        self._value_error_if(
-            not tensor.is_contiguous(),
-            f"{name} must be contiguous (the kernel accesses it as the declared {shape} view)",
-        )
-        return tensor.view(shape)
-
-    def _checked_sinks_1d(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
-        """Validate a sink/dSink buffer and return the kernel's (H_q,) fp32 view."""
-        self._value_error_if(
-            tensor.dtype != torch.float32,
-            f"{name} must be float32; got {tensor.dtype}",
-        )
-        self._value_error_if(
-            tensor.numel() != self.h_q,
-            f"{name} must have H_q = {self.h_q} elements; got {tensor.numel()}",
-        )
-        self._value_error_if(
-            not tensor.is_contiguous(),
-            f"{name} must be contiguous (bound to the kernel as a flat (H_q,) view)",
-        )
-        return tensor.view(-1)
-
-    def _checked_lse_view(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Validate the Stats buffer and return the kernel's (B, H_q, S_q) LSE view."""
-        shape = (self.batch_size, self.h_q, self.s_q_max)
-        self._value_error_if(
-            tensor.dtype != torch.float32,
-            f"stats_tensor must be float32; got {tensor.dtype}",
-        )
-        self._value_error_if(
-            tensor.numel() != math.prod(shape),
-            f"stats_tensor must have B*H_q*S_q = {math.prod(shape)} elements; got {tensor.numel()}",
-        )
-        if self._lse_strides is None:
-            self._value_error_if(
-                not tensor.is_contiguous(),
-                "stats_tensor must be contiguous (the kernel was compiled for a contiguous LSE layout)",
-            )
-            return tensor.view(shape)
-        try:
-            return tensor.as_strided(shape, self._lse_strides, tensor.storage_offset())
-        except RuntimeError as exc:
-            raise ValueError(
-                f"stats_tensor backing storage is too small for declared shape {shape}, stride {self._lse_strides}, "
-                f"and storage_offset {tensor.storage_offset()}"
-            ) from exc
 
     def scratch_workspace_bytes(self) -> int:
         """delta (fp32 [B, H, SQ_r128]) + the dQ scratch — relay path:
@@ -639,160 +564,49 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm120 kernel is not compiled")
 
-        self._value_error_if(
-            self.seq_kv_lens_present and seq_kv_lens is None,
-            "seq_kv_lens is required by this compiled specialization",
-        )
-        self._value_error_if(
-            not self.seq_kv_lens_present and seq_kv_lens is not None,
-            "this specialization was compiled without per-batch KV lengths; construct the API with seq_kv_lens_present=True",
-        )
-        self._value_error_if(
-            self.seq_q_lens_present and seq_q_lens is None,
-            "seq_q_lens is required by this compiled specialization",
-        )
-        self._value_error_if(
-            not self.seq_q_lens_present and seq_q_lens is not None,
-            "this specialization was compiled without per-batch Q lengths; construct the API with seq_q_lens_present=True",
-        )
-        self._value_error_if(
-            self.dsink_desc is not None and (sink_tensor is None or dsink_tensor is None),
-            "sink_tensor and dsink_tensor are required by this compiled specialization",
-        )
-        self._value_error_if(
-            self.dsink_desc is None and dsink_tensor is not None,
-            "this specialization was compiled without a dSink output; construct the API with sample_dsink",
-        )
-        self._value_error_if(
-            self.bias_desc is not None and bias_tensor is None,
-            "bias_tensor is required by this compiled specialization",
-        )
-        self._value_error_if(
-            self.bias_desc is None and bias_tensor is not None,
-            "this specialization was compiled without a bias input; construct the API with sample_bias",
-        )
-        self._value_error_if(
-            self.dbias_desc is not None and dbias_tensor is None,
-            "dbias_tensor is required by this compiled specialization",
-        )
-        self._value_error_if(
-            self.dbias_desc is None and dbias_tensor is not None,
-            "this specialization was compiled without a dBias output; construct the API with sample_dbias",
-        )
+        from cudnn.sdpa.fwd.prepared import facts_of_tensor
+        from .prepared import ROLES, execute
 
-        scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
-        scale_log2 = scale_val * math.log2(math.e)
-
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm120")
-        delta = carver.take(self.batch_size * self.h_q * self._sq_rounded, torch.float32).reshape(self.batch_size, self.h_q, self._sq_rounded)
-        dq_accum = None
-        dq_sem = None
-        ds_ws = None
-        if self.det_2k:
-            ds_ws = carver.take(self._ds_ws_elems(), self.dtype).view(self.batch_size, self.h_q, self.s_q_max, self._skv_rounded)
-        else:
-            dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded, torch.float32)
-            dq_sem = carver.take(self._dq_sem_len(), torch.int32)
-        dbias_accum_elems = self._dbias_accum_elems()
-        dbias_accum = carver.take(dbias_accum_elems, torch.float32) if dbias_accum_elems else None
-
+        spec = self._prepared
+        ws = facts_of_tensor(workspace)
+        if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < spec.workspace_bytes or ws.device != (2, spec.device_index):
+            raise ValueError(f"sdpa_bwd_sm120 requires {spec.workspace_bytes} bytes of contiguous uint8 workspace on CUDA device {spec.device_index}")
         if current_stream is None:
-            # Direct call (no dispatch-forwarded stream): fall back to torch's
-            # current stream. A stream forwarded from the execute-time handle
-            # is respected rather than clobbered.
-            current_stream = cuda.CUstream(torch.cuda.current_stream(q_tensor.device).cuda_stream)
-
-        import cutlass
-
-        def _native_view(view: torch.Tensor, name: str) -> torch.Tensor:
-            """Rebind the buffer to the compiled strides: execute-time tensors
-            are raw storage laid out as declared at build."""
+            current_stream = torch.cuda.current_stream(q_tensor.device).cuda_stream
+        facts = dict(
+            zip(
+                ROLES,
+                map(
+                    facts_of_tensor,
+                    (
+                        q_tensor,
+                        k_tensor,
+                        v_tensor,
+                        o_tensor,
+                        do_tensor,
+                        stats_tensor,
+                        dq_tensor,
+                        dk_tensor,
+                        dv_tensor,
+                        seq_q_lens,
+                        seq_kv_lens,
+                        sink_tensor,
+                        dsink_tensor,
+                        bias_tensor,
+                        dbias_tensor,
+                    ),
+                ),
+            )
+        )
+        stats = facts["stats"]
+        if stats is not None:
+            elements = self.batch_size * self.h_q * self.s_q_max
+            self._value_error_if(stats.numel != elements, f"stats_tensor must have B*H_q*S_q = {elements} elements; got {stats.numel}")
             self._value_error_if(
-                view.data_ptr() % 16 != 0,
-                f"{name} base address must be 16-byte aligned (TMA global-address requirement)",
+                self._lse_strides is None and not stats.contiguous,
+                "stats_tensor must be contiguous (the kernel was compiled for a contiguous LSE layout)",
             )
-            strides = self._io_strides.get(name)
-            if strides is None:
-                return view
-            b, s, h, d = view.shape
-            batch_stride, seq_stride, head_stride = strides
-            return view.as_strided((b, s, h, d), (batch_stride, seq_stride, head_stride, 1))
-
-        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None
-        seq_kv_t = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
-
-        with _torch_stream_context(current_stream, q_tensor.device):
-            q = _native_view(q_tensor.transpose(1, 2), "q")
-            k = _native_view(k_tensor.transpose(1, 2), "k")
-            v = _native_view(v_tensor.transpose(1, 2), "v")
-            o = _native_view(o_tensor.transpose(1, 2), "o")
-            do = _native_view(do_tensor.transpose(1, 2), "dO")
-            dq = _native_view(dq_tensor.transpose(1, 2), "dQ")
-            dk = _native_view(dk_tensor.transpose(1, 2), "dK")
-            dv = _native_view(dv_tensor.transpose(1, 2), "dV")
-            lse = self._checked_lse_view(stats_tensor)
-
-            kernels = self._compiled_kernel
-            # dK/dV destinations for the main kernel: MHA writes the user
-            # outputs directly; GQA reduces per-q-head workspace partials.
-            if self.h_q == self.h_kv:
-                dk_ws, dv_ws = dk, dv
-            else:
-                dkw_elems, dvw_elems = self._dkv_ws_elems()
-                dk_ws = carver.take(dkw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_qk_padded)
-                dv_ws = carver.take(dvw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_v_padded)
-
-            bias_view = None
-            dbias_view = None
-            dbias_dst = None
-            if self.bias_desc is not None:
-                bias_view = self._checked_bias_view(bias_tensor, self.bias_desc, "bias_tensor")
-            if self.dbias_desc is not None:
-                dbias_view = self._checked_bias_view(dbias_tensor, self.dbias_desc, "dbias_tensor")
-                if dbias_accum is None:
-                    # fp32 output: the kernel red.adds into it directly.
-                    dbias_view.zero_()
-                    dbias_dst = dbias_view
-                else:
-                    dbias_accum.zero_()
-                    dbias_dst = dbias_accum.view(dbias_view.shape)
-
-            # Kernel chain: dot -> main -> [reduce] -> cvt -> [dbias_cvt], or on
-            # the det_2kernel route dot -> main -> dq2k -> [reduce] -> [dbias_cvt].
-            kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
-            kernels.main(
-                q,
-                k,
-                v,
-                do,
-                lse,
-                delta,
-                dq_accum,
-                dq_sem,
-                ds_ws,
-                dk_ws,
-                dv_ws,
-                seq_q_t,
-                seq_kv_t,
-                bias_view,
-                dbias_dst,
-                cutlass.Float32(scale_log2),
-                cutlass.Float32(scale_val),
-                current_stream,
-            )
-            if self.det_2k:
-                kernels.dq2k(k, ds_ws, dq, cutlass.Float32(scale_val), current_stream)
-            # GQA only
-            if kernels.reduce is not None:
-                kernels.reduce(dk_ws, dv_ws, dk, dv, current_stream)
-            if not self.det_2k:
-                kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
-            if kernels.dbias_cvt is not None:
-                kernels.dbias_cvt(dbias_accum, dbias_view.view(-1), current_stream)
-            if kernels.dsink is not None:
-                sink_1d = self._checked_sinks_1d(sink_tensor, "sink_tensor")
-                dsink_1d = self._checked_sinks_1d(dsink_tensor, "dsink_tensor")
-                kernels.dsink(lse, delta, sink_1d, dsink_1d, seq_q_t, current_stream)
+        execute(spec, facts, ws.ptr, int(current_stream), scale=scale_softmax)
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:

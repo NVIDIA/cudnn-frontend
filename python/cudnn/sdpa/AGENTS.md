@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Stride-width detector: a stride can fit in Int32 while `index * stride` does
+not. Promote the index **before** multiplication when the addressed span
+requires Int64; casting the completed product preserves an overflow. Exercise
+both a physical stride above `2**32` and a smaller stride whose last batch
+offset exceeds `2**32`, including input, Stats and gradient ports. Seed the
+wrapped addresses inside allocated guard storage, so a deliberately narrowed
+control fails numerically without an out-of-bounds access. See
+`TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
+
 **Rule S1 — THD/packed Stats (LSE) must stay packed: token-major or
 head-major, never dense-padded.**
 
