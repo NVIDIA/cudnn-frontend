@@ -22,6 +22,14 @@ _COPY_ELEMS = 8  # 16-byte gmem<->smem chunk (8 fp16/bf16)
 
 
 @cute.jit
+def wide_index(index, tensor: cute.Tensor):
+    """Promote before stride products whenever the declared span exceeds Int32."""
+    if cutlass.const_expr(1 + sum((n - 1) * st for n, st in zip(tensor.shape, tensor.stride)) > 2**31 - 1):
+        return cutlass.Int64(index)
+    return index
+
+
+@cute.jit
 def tile_ptr(
     sbuf,
     row: cutlass.Int32,

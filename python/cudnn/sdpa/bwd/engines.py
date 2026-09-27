@@ -656,6 +656,17 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
+    if api_type == _SM120:
+        from types import SimpleNamespace
+        from .prepared import PreparedBwdLaunch
+
+        return SimpleNamespace(
+            binding=binding,
+            workspace_bytes=total_workspace_bytes,
+            prepared=PreparedBwdLaunch(api._prepared, binding),
+            default_stream=lambda: _cuda_driver().CUstream(torch.cuda.current_stream(api.q_desc.device).cuda_stream),
+        )
+
     def _canonical_view(buf, geom):
         """Reinterpret a variant-pack buffer through the port's geometry.
 
