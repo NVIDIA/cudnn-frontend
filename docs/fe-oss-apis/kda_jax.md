@@ -178,8 +178,8 @@ Run JAX coverage without the torch-based parent fixtures:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  python -m pytest test/python/fe_api/jax/test_call_jax.py test/python/fe_api/jax/test_kda_jax.py \
-  --confcutdir=test/python/fe_api/jax
+  python -m pytest test/python/core/jax/test_call_jax.py test/python/linear_attention/jax/test_kda_jax.py \
+  --confcutdir=test/python/block_sparse_attention/jax
 ```
 
 The suite covers forward/backward parity, state and gate gradients, repeated
@@ -190,5 +190,5 @@ CuTeDSL >=4.7.0 is unavailable.
 Run native cache and output-stride regressions from `test/python`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m pytest -s -q linear_attention/test_kda_execution.py
+CUDA_VISIBLE_DEVICES=0 python -m pytest -s -q linear_attention/frost/test_kda_execution.py
 ```

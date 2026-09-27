@@ -592,4 +592,4 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_swiglu.py` (discrete mode).
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_swiglu.py` (discrete mode).

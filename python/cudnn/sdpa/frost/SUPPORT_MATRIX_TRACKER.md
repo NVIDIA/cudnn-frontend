@@ -107,6 +107,10 @@ both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
 `fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
 online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
 documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
+The existing chain is prepared as one pointer host: tensor views, workspace
+offsets and SF layouts are fixed at plan time; execution binds current payload,
+SF and gradient buffers, caller workspace and stream. This does not remove the
+eleven device repacks or add new layouts or shapes.
 
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
@@ -322,7 +326,7 @@ Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink
 lifts the running max, `exp(sink − max)` joins the denominator, `LSE = max + log(sum)`)
 that is independent of `S_q`, of the mask and of the paged loader. Hardware-validated
 on B200 (SM100) — `test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py`,
-`test_sdpa_fwd_dsl_sm100.py`, the `test/python/test_mhas_v2.py` `S_q = 1` sweeps
+`test_sdpa_fwd_dsl_sm100.py`, the `test/python/sdpa/graph/test_mhas_v2.py` `S_q = 1` sweeps
 (`test_sdpa_random_sq1_L0`, `test_sdpa_random_sq1_unified_L1`,
 `test_sdpa_random_lean_attn_L0`, `test_sdpa_random_lean_attn_unified_L1` draw
 `with_sink_token` 1:3 when FROST engines are enabled, sink-free otherwise) and the
@@ -1009,6 +1013,17 @@ RoPE and THD callers. Those remaining callers still require the tensor compiler.
 | Deterministic | — / ✅ | — / ✅ | — / ✅ | — / ✅ |
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
+
+Native SM80 backward flavor widths with 16-byte-aligned Q/K/V/O/dO and
+D-gradient bases and stepped outer strides divisible by eight elements use
+one prepared pointer host. The host includes workspace initialization,
+do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
+reductions and auxiliary output copies. All stages use the current caller
+stream; graph and standalone execution share the binding validator. Native
+plans require caller workspace and do not build tensor views at execute.
+Off-flavor widths, unaligned strides, RoPE, THD and older direct adapters
+without complete optional-output declarations retain the tensor entry and
+its reachable compiler/fake construction. This does not change eligibility.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a

@@ -363,4 +363,4 @@ Additional constraints:
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_swiglu.py`
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_gemm_swiglu.py`

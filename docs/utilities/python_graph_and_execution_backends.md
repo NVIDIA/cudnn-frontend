@@ -332,7 +332,7 @@ are close.
   optional dependency can only surface at build time — without it, a host
   lacking the `cutedsl` extra would lose graphs the backend could have served.
 - The contract is proven end to end without a GPU in
-  `test/python/test_dispatch.py`, with stand-in engines injected through the
+  `test/python/core/test_dispatch.py`, with stand-in engines injected through the
   manifest — the same path production uses. Those engines do no arithmetic:
   what dispatch is responsible for is reaching the engine and resolving the
   caller's buffers, and checking a result against `torch.matmul` would put a
@@ -641,7 +641,7 @@ only to decline is why `closed_under` existed.
   `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
   since pinning that high would make cudnn-frontend incompatible with anything
   holding the DSL back.
-- `test/python/test_import_boundaries.py` holds all of this, in a fresh
+- `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
 ### Ranking and the one plan list

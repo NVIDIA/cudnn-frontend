@@ -37,17 +37,19 @@ def host(
     bias: Optional[cute.Pointer],
     scale_log2: cutlass.Float32,
     inv_scale: cutlass.Float32,
-    kernel_host: cutlass.Constexpr,
-    params: cutlass.Constexpr,
+    module: cutlass.Constexpr,
     geometry: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
     swa_window: cutlass.Constexpr[int],
     right_bound: cutlass.Constexpr[int],
     stream: driver.CUstream,
 ):
+    # Reuse the template configuration without a redundant dataclass argument;
+    # compiled_cache can then export and reload the pointer-only call ABI.
+    params = module.PARAMS
     sq, skv, d = geometry[0][0][1], geometry[1][0][1], geometry[0][0][3]
     mask = (MASK_CAUSAL if params.is_causal else MASK_NONE) | (MASK_SWA if params.has_swa else 0)
-    kernel_host(
+    module._sdpa_host(
         _view(q, geometry[0]),
         _view(k, geometry[1]),
         _view(v, geometry[2]),
@@ -109,8 +111,7 @@ def compile_host(module, params, geometry, swa_window, right_bound, cache_key):
         *args,
         cutlass.Float32(0),
         cutlass.Float32(0),
-        module._sdpa_host,
-        params,
+        module,
         geometry,
         dtype,
         swa_window,

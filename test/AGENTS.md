@@ -16,11 +16,11 @@ cd test/python
 pytest                       # pytest.ini addopts default to -m L0 (smoke) --tb=short --no-header
 pytest -m L1                 # levels L0..L4; higher = larger sweeps
 pytest -n 4                  # pytest-xdist; mind marker gpu_exclusive for tests that need the GPU alone
-pytest test_conv_fprop.py    # one file — note the default -m L0 filter still applies
-pytest fe_api/gemm/          # OSS kernel tests
+pytest conv/graph/test_conv_fprop.py  # one file — note the default -m L0 filter still applies
+pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 ```
 
-**Read pytest's own summary line; do not post-process the output.** `... | grep -c "passed"` counts a collection error as a pass, and `cmd | tail` reports *tail's* exit status, so a failed build or a failed suite behind a pipe looks like success. Both have produced confidently wrong "all green" reports here. Requirements: `pip install -e .` plus `pytest pytest-xdist looseversion`. `fe_api/` additionally requires an SM90/SM100-class GPU; tests skip (or should skip) on unsupported arch/dtype/backend-version combos rather than fail.
+**Read pytest's own summary line; do not post-process the output.** `... | grep -c "passed"` counts a collection error as a pass, and `cmd | tail` reports *tail's* exit status, so a failed build or a failed suite behind a pipe looks like success. Both have produced confidently wrong "all green" reports here. Requirements: `pip install -e .` plus `pytest pytest-xdist looseversion`. The `cutedsl/` directories additionally require an SM90/SM100-class GPU; tests skip (or should skip) on unsupported arch/dtype/backend-version combos rather than fail.
 
 ### conftest.py landmines — read before editing
 
@@ -33,13 +33,14 @@ pytest fe_api/gemm/          # OSS kernel tests
 
 ### Layout
 
-- `test/python/test_*.py` — core graph-API tests (conv, matmul, norms, SDPA `test_mhas*.py`, rope, kernel cache, OSS engine `test_sm100_rms_norm_silu_graph_api.py`, ...). Shared SDPA references in `test/python/sdpa/`.
+- `test/python/<operation>/<backend>/` — tests grouped by operation (`sdpa`, `gemm`, `conv`, `norm`, `rope`, `linear_attention`, ...), then by the backend or framework they exercise: `graph` (native cuDNN through `cudnn.pygraph`), `frost` (FROST engines), `cutedsl` (CuTe DSL frontend-only APIs), `torch` and `jax` (framework integrations), and engine names such as `linear_attention/cake`. Tests that span backends sit at the operation root (e.g. `linear_attention/test_la.py`).
+- `test/python/core/<backend>/` — infrastructure tests not tied to one operation (dispatch, import boundaries, graph execution, FROST buffers, ...).
+- `test/python/test_utils.py` holds shared helpers; shared SDPA references are in `test/python/sdpa/`.
 - **`test/python/sdpa/` is a mixed directory and the `test_` prefix is load-bearing.** `fp16.py`, `helpers.py`, `random_config.py` are harness modules the tests import; `sdpa/test_*.py` (and `sdpa/frost/test_*.py`) are collected tests. `pytest.ini` sets no `python_files` override, so a test file dropped there **without** the prefix is silently treated as a helper — it is never collected, and the suite stays green while asserting nothing. After moving or adding a test, confirm it is picked up by the *default* sweep, not just when named directly:
 
   ```bash
-  pytest --collect-only -q | grep -c sdpa/test_torch_ops.py
+  pytest --collect-only -q | grep -c sdpa/torch/test_torch_ops.py
   ```
-- `test/python/fe_api/<family>/` — one subdir per OSS kernel family (`gemm/`, `grouped_gemm/`, `bsa/`, `dsa/`, `nsa/`, `norm/`, `sdpa/`), each with `test_<op>.py` + utils/reference modules.
 
 ### Conventions for new tests
 
@@ -193,7 +194,7 @@ dimensions as compile-time constants: the same binder fixes those per plan.
 Exercise non-power-of-two TMEM slot counts and partial ring wraps across
 persistent query tiles; a full-ring single-tile case misses slot aliasing and
 per-slot barrier-phase drift. Keep the focused regressions in
-`fe_api/dsa/test_DSA_sparse_score_recompute.py`. For SM100 SMEM planning, test
+`deepseek_sparse_attention/cutedsl/test_DSA_sparse_score_recompute.py`. For SM100 SMEM planning, test
 a boundary that distinguishes the usable 227 KiB from the nominal 228 KiB;
 `test_DSA_sparse_attention_score_recompute_uses_launchable_smem_budget` must
 fail against the old planner before accepting the fix.
@@ -240,3 +241,10 @@ covers every native flavor with requested Amax. Physical SF stride units are
 16 bytes; widen tile-count products before multiplication. The L1
 `test_prepared_mxfp8_sf_head_stride_above_int32_units` steps a physical 64-GiB
 head stride and checks numerical output, with resource-only OOM skips.
+
+Linear SF repacks need the same width audit: an Int32 block index can wrap
+before the byte address is formed even without a wide declared stride.
+`test_sf_repack_steps_past_int32_with_allocated_guards` crosses the signed
+Int32 boundary for both backward SF layouts. Its source and destination
+prefixes keep the old negative offsets inside allocated storage, so the old
+implementation fails numerically rather than through an invalid access.

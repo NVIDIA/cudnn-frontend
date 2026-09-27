@@ -228,14 +228,14 @@ def _bprop_kernel(
     dV: cute.Tensor,  # [B, SKV, H, D_V]   io_dtype (output)
     LSE: cute.Tensor,  # [B, H, SQ] fp32 (natural-log)
     DO_DOT: cute.Tensor,  # [B, H, SQ] fp32 (sum_d O*dO, "delta")
-    SEQ_KV_LENS: cute.Tensor,  # [B] int32 (per-batch KV length; dummy if unused)
-    BIAS: cute.Tensor,  # [1|B, H, SQ, SKV] additive bias (dummy if unused)
-    DBIAS: cute.Tensor,  # [1|B, H, SQ, SKV] fp32 bias-grad accumulator (atomicAdd)
-    ROPE_CS: cute.Tensor,  # [max_s, d_qk//2, 2] fp32 (cos,sin); dummy if unused
-    CU_Q: cute.Tensor,  # [B+1] int32 cumulative Q seqlens (THD/varlen); dummy otherwise.
-    CU_K: cute.Tensor,  # [B+1] int32 cumulative KV seqlens (THD/varlen); dummy otherwise.
-    SEQ_LEN_Q: cute.Tensor,  # [B] int32 (per-batch Q length; PADDED dense — dummy if unused)
-    DQ_SEM: cute.Tensor,  # [n_seq*H*sem_q_stride] int32 deterministic-dQ relay counter; dummy (1-elem) if !deterministic
+    SEQ_KV_LENS: Optional[cute.Tensor],  # [B] int32 (per-batch KV length; dummy if unused)
+    BIAS: Optional[cute.Tensor],  # [1|B, H, SQ, SKV] additive bias (dummy if unused)
+    DBIAS: Optional[cute.Tensor],  # [1|B, H, SQ, SKV] fp32 bias-grad accumulator (atomicAdd)
+    ROPE_CS: Optional[cute.Tensor],  # [max_s, d_qk//2, 2] fp32 (cos,sin); dummy if unused
+    CU_Q: Optional[cute.Tensor],  # [B+1] int32 cumulative Q seqlens (THD/varlen); dummy otherwise.
+    CU_K: Optional[cute.Tensor],  # [B+1] int32 cumulative KV seqlens (THD/varlen); dummy otherwise.
+    SEQ_LEN_Q: Optional[cute.Tensor],  # [B] int32 (per-batch Q length; PADDED dense — dummy if unused)
+    DQ_SEM: Optional[cute.Tensor],  # [n_seq*H*sem_q_stride] int32 deterministic-dQ relay counter; dummy (1-elem) if !deterministic
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     tile_kv: cutlass.Constexpr[int],
@@ -262,7 +262,7 @@ def _bprop_kernel(
     attn_scale: cutlass.Float32,  # linear scale (for dS)
     right_bound: cutlass.Int32,  # causal right-band widening (k <= q+rb)
     inv_softmax_scale: cutlass.Float32,  # 1/scale (fold bias into UNSCALED acc1)
-    bias_bstride: cutlass.Int32,  # bias batch stride (0 = broadcast over B)
+    bias_bstride: cutlass.Int64,  # bias batch stride (0 = broadcast over B)
     sem_q_stride: cutlass.Int32,  # DQ_SEM per-(seq,head) stride = ceil(max_SQ/tile_q) (deterministic only)
 ):
     # ---- compile-time derived counts --------------------------------------
@@ -363,14 +363,14 @@ def _bprop_kernel(
         cu_k_b = _cuk[batch]
         s_q_b = _cuq[batch + cutlass.Int32(1)] - cu_q_b
         s_kv_b = _cuk[batch + cutlass.Int32(1)] - cu_k_b
-        q_row_origin = cu_q_b
-        kv_row_origin = cu_k_b
+        q_row_origin = cutlass.Int64(cu_q_b)
+        kv_row_origin = cutlass.Int64(cu_k_b)
         q_bound = s_q_b
         kv_bound = s_kv_b
         n_q_tiles_eff = (s_q_b + cutlass.Int32(tile_q - 1)) // cutlass.Int32(tile_q)
     else:
-        q_row_origin = batch * cutlass.Int32(SQ)
-        kv_row_origin = batch * cutlass.Int32(SKV)
+        q_row_origin = cutlass.Int64(batch) * cutlass.Int64(SQ)
+        kv_row_origin = cutlass.Int64(batch) * cutlass.Int64(SKV)
         # PADDED dense: per-batch live Q length (mirrors eff_skv on the kv side).
         # rows q >= q_bound get P zeroed (→ dQ/dK/dV all 0 for padded q) and the
         # dQ store gated.  Dense full (has_seq_len_q=False) → q_bound = SQ.
@@ -404,7 +404,7 @@ def _bprop_kernel(
     # bias_bstride == 0 ⇒ bias broadcast over batch (all batches share the same
     # [1,H,SQ,SKV] slice → dBias atomicAdd reduces over batch for free).
     if cutlass.const_expr(has_bias):
-        bias_base = batch * bias_bstride + head * cutlass.Int32(SQ * SKV)
+        bias_base = cutlass.Int64(batch) * cutlass.Int64(bias_bstride) + cutlass.Int64(head) * cutlass.Int64(SQ * SKV)
         _bias_ptr = cutlass.make_array_view(BIAS).data_ptr()
         _dbias_ptr = cutlass.make_array_view(DBIAS).data_ptr()
 
@@ -428,19 +428,28 @@ def _bprop_kernel(
     LSE_view = cutlass.make_array_view(LSE)
     DOT_view = cutlass.make_array_view(DO_DOT)
 
-    # Token (row) strides are the operands' COMPILE-TIME token strides: a
-    # compact operand folds to H*D (the dense path's staged operands and the
-    # internal dQ accumulator always are), a packed THD port declared as a view
-    # into a wider per-token record (a K/V slice of an interleaved [T, 2, H, D]
-    # buffer) walks its own stride.  Every row is addressed as
-    # ``row * token_stride + head * D + col`` -- the head stride is D on every
-    # port (the adapters admit nothing else), so no head stride is read here.
-    QK_RS = cutlass.Int32(Q.stride[1])  # Q read row stride
-    V_RS = cutlass.Int32(dO.stride[1])  # dO read row stride
-    K_RS = cutlass.Int32(K.stride[1])  # K read row stride (H_kv heads)
-    VV_RS = cutlass.Int32(V.stride[1])  # V read row stride (H_kv heads)
-    DK_RS = cutlass.Int32(dK.stride[1])  # dK write row stride (per-query-head partials or the caller's dK)
-    DV_RS = cutlass.Int32(dV.stride[1])  # dV write row stride
+    # Declared element strides, widened before multiplication. Dense layouts
+    # carry independent batch/head strides; packed THD uses sequence origins.
+    QK_RS = cutlass.Int64(Q.stride[1])
+    V_RS = cutlass.Int64(dO.stride[1])
+    K_RS = cutlass.Int64(K.stride[1])
+    VV_RS = cutlass.Int64(V.stride[1])
+    DK_RS = cutlass.Int64(dK.stride[1])
+    DV_RS = cutlass.Int64(dV.stride[1])
+    if cutlass.const_expr(THD_VARLEN):
+        Q_BATCH = q_row_origin * QK_RS
+        DO_BATCH = q_row_origin * V_RS
+        K_BATCH = kv_row_origin * K_RS
+        V_BATCH = kv_row_origin * VV_RS
+        DK_BATCH = kv_row_origin * DK_RS
+        DV_BATCH = kv_row_origin * DV_RS
+    else:
+        Q_BATCH = cutlass.Int64(batch) * cutlass.Int64(Q.stride[0])
+        DO_BATCH = cutlass.Int64(batch) * cutlass.Int64(dO.stride[0])
+        K_BATCH = cutlass.Int64(batch) * cutlass.Int64(K.stride[0])
+        V_BATCH = cutlass.Int64(batch) * cutlass.Int64(V.stride[0])
+        DK_BATCH = cutlass.Int64(batch) * cutlass.Int64(dK.stride[0])
+        DV_BATCH = cutlass.Int64(batch) * cutlass.Int64(dV.stride[0])
     kv_base = kv_tile * cutlass.Int32(tile_kv)
 
     # ---- Q-loop bounds (shared tile_dsl arithmetic, the KV-major dual of the
@@ -477,8 +486,8 @@ def _bprop_kernel(
 
     # K/V tile (row 0) GMEM element pointers — at the KV head (GQA-mapped).
     # kv_row_origin = batch*SKV (dense) or cu_k[b] (THD packed).
-    k_tile_base = (kv_row_origin + kv_base) * K_RS + kv_head * cutlass.Int32(d_qk)
-    v_tile_base = (kv_row_origin + kv_base) * VV_RS + kv_head * cutlass.Int32(d_v)
+    k_tile_base = K_BATCH + cutlass.Int64(kv_base) * K_RS + cutlass.Int64(kv_head) * cutlass.Int64(K.stride[2])
+    v_tile_base = V_BATCH + cutlass.Int64(kv_base) * VV_RS + cutlass.Int64(kv_head) * cutlass.Int64(V.stride[2])
     k_tile_gmem = K_view.data_ptr() + k_tile_base
     v_tile_gmem = V_view.data_ptr() + v_tile_base
 
@@ -495,16 +504,16 @@ def _bprop_kernel(
     # dim.  do_dot is an internal packed buffer → packed math always.
     if cutlass.const_expr(THD_VARLEN):
         if cutlass.const_expr(LSE_TOKEN_MAJOR):
-            lse_head_base = cutlass.Int64(cu_q_b * cutlass.Int32(LSE.stride[0]) + head)
+            lse_head_base = cutlass.Int64(cu_q_b) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head)
             LSE_Q_STRIDE = cutlass.Int64(LSE.stride[0])
         else:
-            lse_head_base = cutlass.Int64(head * cutlass.Int32(LSE.stride[1]) + cu_q_b)
+            lse_head_base = cutlass.Int64(head) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(cu_q_b)
             LSE_Q_STRIDE = cutlass.Int64(1)
-        dot_head_base = head * cutlass.Int32(SQ) + cu_q_b
+        dot_head_base = cutlass.Int64(head) * cutlass.Int64(SQ) + cutlass.Int64(cu_q_b)
     else:
         lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
         LSE_Q_STRIDE = cutlass.Int64(LSE.stride[2])
-        dot_head_base = (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
+        dot_head_base = (cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ)
 
     # ---- SMEM tiles -------------------------------------------------------
     # Q∪dO is MERGED into one array so BMM1/dV/dK's per-sub-group B operand is a
@@ -652,8 +661,8 @@ def _bprop_kernel(
     # Q/dO row-gate bound (per-seq under THD) + packed seq origin for the GMEM
     # base (q_row_origin = batch*SQ dense / cu_q[b] THD).
     SQ_rt = q_bound
-    bhead_qk = q_row_origin * QK_RS + head * cutlass.Int32(d_qk)
-    bhead_v = q_row_origin * V_RS + head * cutlass.Int32(d_v)
+    bhead_qk = Q_BATCH + cutlass.Int64(head) * cutlass.Int64(Q.stride[2])
+    bhead_v = DO_BATCH + cutlass.Int64(head) * cutlass.Int64(dO.stride[2])
 
     # Prologue: prefetch Q/dO tile 0 into ring stage 0.  Predicated row-gate
     # (rows >= SQ → zero-size cp.async) keeps the per-iter group count uniform
@@ -793,10 +802,10 @@ def _bprop_kernel(
                 # matching the forward.  Cells: (kv_a,qc0)(kv_a,qc1)(kv_a8,qc0)(kv_a8,qc1).
                 if cutlass.const_expr(has_bias):
                     _bdt = cutlass.Float32 if cutlass.const_expr(bias_is_fp32) else io_dtype
-                    b00 = Pointer(_bias_ptr + bias_base + qr0 * cutlass.Int32(SKV) + ka, dtype=_bdt).load()
-                    b01 = Pointer(_bias_ptr + bias_base + qr1 * cutlass.Int32(SKV) + ka, dtype=_bdt).load()
-                    b10 = Pointer(_bias_ptr + bias_base + qr0 * cutlass.Int32(SKV) + ka8, dtype=_bdt).load()
-                    b11 = Pointer(_bias_ptr + bias_base + qr1 * cutlass.Int32(SKV) + ka8, dtype=_bdt).load()
+                    b00 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr0) * cutlass.Int64(SKV) + ka, dtype=_bdt).load()
+                    b01 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr1) * cutlass.Int64(SKV) + ka, dtype=_bdt).load()
+                    b10 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr0) * cutlass.Int64(SKV) + ka8, dtype=_bdt).load()
+                    b11 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr1) * cutlass.Int64(SKV) + ka8, dtype=_bdt).load()
                     acc1[off + 0] = acc1[off + 0] + b00.to(cutlass.Float32) * inv_softmax_scale
                     acc1[off + 1] = acc1[off + 1] + b01.to(cutlass.Float32) * inv_softmax_scale
                     acc1[off + 2] = acc1[off + 2] + b10.to(cutlass.Float32) * inv_softmax_scale
@@ -909,18 +918,18 @@ def _bprop_kernel(
                         _k0 = kv_a < cutlass.Int32(SKV)
                         _k8 = kv_a8 < cutlass.Int32(SKV)
                         if _q0 & _k0:
-                            _atomic_add_f32(_dbias_ptr + bias_base + qc0 * cutlass.Int32(SKV) + kv_a, db0)
+                            _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a, db0)
                         if _q1 & _k0:
-                            _atomic_add_f32(_dbias_ptr + bias_base + qc1 * cutlass.Int32(SKV) + kv_a, db1)
+                            _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a, db1)
                         if _q0 & _k8:
-                            _atomic_add_f32(_dbias_ptr + bias_base + qc0 * cutlass.Int32(SKV) + kv_a8, db2)
+                            _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a8, db2)
                         if _q1 & _k8:
-                            _atomic_add_f32(_dbias_ptr + bias_base + qc1 * cutlass.Int32(SKV) + kv_a8, db3)
+                            _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a8, db3)
                     else:
-                        _atomic_add_f32(_dbias_ptr + bias_base + qc0 * cutlass.Int32(SKV) + kv_a, db0)
-                        _atomic_add_f32(_dbias_ptr + bias_base + qc1 * cutlass.Int32(SKV) + kv_a, db1)
-                        _atomic_add_f32(_dbias_ptr + bias_base + qc0 * cutlass.Int32(SKV) + kv_a8, db2)
-                        _atomic_add_f32(_dbias_ptr + bias_base + qc1 * cutlass.Int32(SKV) + kv_a8, db3)
+                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a, db0)
+                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a, db1)
+                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a8, db2)
+                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a8, db3)
                 ds0 = attn_scale * db0
                 ds1 = attn_scale * db1
                 ds2 = attn_scale * db2
@@ -1172,8 +1181,8 @@ def _bprop_kernel(
         for nf in cutlass.range_constexpr(d_v // 8):
             d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
-            base_top = (kv_row_origin + kv_base + kv_row_g) * DV_RS + head * cutlass.Int32(d_v) + d0
-            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DV_RS + head * cutlass.Int32(d_v) + d0
+            base_top = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
+            base_bot = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
             _vt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
             _vb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
             if cutlass.const_expr(GATE_KV):
@@ -1215,8 +1224,8 @@ def _bprop_kernel(
         for nf in cutlass.range_constexpr(d_qk // 8):
             d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
-            base_top = (kv_row_origin + kv_base + kv_row_g) * DK_RS + head * cutlass.Int32(d_qk) + d0
-            base_bot = (kv_row_origin + kv_base + kv_row_g8) * DK_RS + head * cutlass.Int32(d_qk) + d0
+            base_top = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
+            base_bot = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
             _kt = fp32_to_fp16(acc_grad[off + 0], acc_grad[off + 1], dtype=io_dtype)
             _kb = fp32_to_fp16(acc_grad[off + 2], acc_grad[off + 3], dtype=io_dtype)
             if cutlass.const_expr(GATE_KV):
@@ -1313,11 +1322,10 @@ def _do_dot_kernel(
         r = row % HSQ
         h = r // cutlass.Int32(SQ)
         q = r % cutlass.Int32(SQ)
-        # Row = token: each operand at ITS compile-time token stride (compact
-        # folds to H*d_v; a packed port may carry a wider per-token record).
-        tok = b * cutlass.Int32(SQ) + q
-        o_base = tok * cutlass.Int32(O.stride[1]) + h * cutlass.Int32(d_v)
-        do_base = tok * cutlass.Int32(dO.stride[1]) + h * cutlass.Int32(d_v)
+        o_base = cutlass.Int64(b) * cutlass.Int64(O.stride[0]) + cutlass.Int64(q) * cutlass.Int64(O.stride[1]) + cutlass.Int64(h) * cutlass.Int64(O.stride[2])
+        do_base = (
+            cutlass.Int64(b) * cutlass.Int64(dO.stride[0]) + cutlass.Int64(q) * cutlass.Int64(dO.stride[1]) + cutlass.Int64(h) * cutlass.Int64(dO.stride[2])
+        )
         Ob = cutlass.make_array_view(O).data_ptr()
         dOb = cutlass.make_array_view(dO).data_ptr()
         acc = cutlass.Float32(0.0)
@@ -1348,7 +1356,7 @@ def _dsink_kernel(
     DO_DOT: cute.Tensor,  # same shape, packed
     SINKS: cute.Tensor,  # [H] fp32 (natural-log sink logits)
     DSINK: cute.Tensor,  # [H] fp32 (atomicAdd target; zero-init)
-    CU_Q: cute.Tensor,  # THD: [n_seq + 1] int32 cumulative q seqlens; dense: 1-elem dummy
+    CU_Q: Optional[cute.Tensor],  # THD: [n_seq + 1] int32 cumulative q seqlens; dense: 1-elem dummy
     thd: cutlass.Constexpr[bool],
     lse_token_major: cutlass.Constexpr[bool],  # THD Stats packing (see _bprop_kernel's LSE_TOKEN_MAJOR)
     n_rows: cutlass.Int32,  # (B or n_seq) * H
@@ -1429,8 +1437,17 @@ def _cast_kernel(
     if gid < n_vecs:
         src = cutlass.make_array_view(dQ_acc).data_ptr()
         dst = cutlass.make_array_view(dQ_out).data_ptr()
-        v = Pointer(src + gid * cutlass.Int32(2), dtype=cutlass.Float32).load(count=2)
-        Pointer(dst + gid * cutlass.Int32(2), dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
+        d = dQ_out.shape[3]
+        hq = dQ_out.shape[2]
+        sq = dQ_out.shape[1]
+        pair = cutlass.Int64(gid) * cutlass.Int64(2)
+        col = pair % d
+        head = (pair // d) % hq
+        row = (pair // (d * hq)) % sq
+        batch = pair // (d * hq * sq)
+        out_off = batch * cutlass.Int64(dQ_out.stride[0]) + row * cutlass.Int64(dQ_out.stride[1]) + head * cutlass.Int64(dQ_out.stride[2]) + col
+        v = Pointer(src + pair, dtype=cutlass.Float32).load(count=2)
+        Pointer(dst + out_off, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
 
 
 _cast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1446,7 +1463,7 @@ _cast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def _cast_thd_kernel(
     dQ_acc: cute.Tensor,  # [1, T_cap, H, fd] fp32
     dQ_out: cute.Tensor,  # [1, T_cap, H, d_out] io_dtype (the caller's packed dQ)
-    CU_Q: cute.Tensor,  # [n_seq + 1] int32
+    CU_Q: Optional[cute.Tensor],  # [n_seq + 1] int32
     io_dtype: cutlass.Constexpr,
     H: cutlass.Constexpr[int],
     fd: cutlass.Constexpr[int],
@@ -1465,9 +1482,11 @@ def _cast_thd_kernel(
         c = (r % cutlass.Int32(d_out // 2)) * cutlass.Int32(2)
         t_live = Pointer(cutlass.make_array_view(CU_Q).data_ptr() + n_seq, dtype=cutlass.Int32).load()
         if row < t_live:
-            src = cutlass.make_array_view(dQ_acc).data_ptr() + (row * cutlass.Int32(H) + h) * cutlass.Int32(fd) + c
+            src = cutlass.make_array_view(dQ_acc).data_ptr() + (cutlass.Int64(row) * cutlass.Int64(H) + cutlass.Int64(h)) * cutlass.Int64(fd) + c
             # The caller's dQ at ITS token stride (compact folds to H*d_out).
-            dst = cutlass.make_array_view(dQ_out).data_ptr() + row * cutlass.Int32(dQ_out.stride[1]) + h * cutlass.Int32(d_out) + c
+            dst = (
+                cutlass.make_array_view(dQ_out).data_ptr() + cutlass.Int64(row) * cutlass.Int64(dQ_out.stride[1]) + cutlass.Int64(h) * cutlass.Int64(d_out) + c
+            )
             v = Pointer(src, dtype=cutlass.Float32).load(count=2)
             Pointer(dst, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
 
@@ -1500,12 +1519,25 @@ def _dkv_reduce_kernel(
         rest = e // cutlass.Int32(d)
         hk = rest % cutlass.Int32(Hk)
         rest2 = rest // cutlass.Int32(Hk)  # = b*SKV + s
-        in_base = (rest2 * cutlass.Int32(H) + hk * cutlass.Int32(ratio)) * cutlass.Int32(d) + di
+        b = rest2 // cutlass.Int32(OUT.shape[1])
+        row = rest2 % cutlass.Int32(OUT.shape[1])
+        in_base = (
+            cutlass.Int64(b) * cutlass.Int64(IN.stride[0])
+            + cutlass.Int64(row) * cutlass.Int64(IN.stride[1])
+            + cutlass.Int64(hk) * cutlass.Int64(ratio) * cutlass.Int64(IN.stride[2])
+            + di
+        )
+        out_off = (
+            cutlass.Int64(b) * cutlass.Int64(OUT.stride[0])
+            + cutlass.Int64(row) * cutlass.Int64(OUT.stride[1])
+            + cutlass.Int64(hk) * cutlass.Int64(OUT.stride[2])
+            + di
+        )
         src = cutlass.make_array_view(IN).data_ptr()
         acc = cutlass.Float32(0.0)
         for g in cutlass.range_constexpr(ratio):
-            acc = acc + Pointer(src + in_base + cutlass.Int32(g * d), dtype=io_dtype).load().to(cutlass.Float32)
-        Pointer(cutlass.make_array_view(OUT).data_ptr() + e, dtype=io_dtype).store(acc.to(io_dtype))
+            acc = acc + Pointer(src + in_base + cutlass.Int64(g) * cutlass.Int64(IN.stride[2]), dtype=io_dtype).load().to(cutlass.Float32)
+        Pointer(cutlass.make_array_view(OUT).data_ptr() + out_off, dtype=io_dtype).store(acc.to(io_dtype))
 
 
 _dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1519,7 +1551,7 @@ _dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def _dkv_reduce_thd_kernel(
     IN: cute.Tensor,  # [1, T_cap, H, d_in] io_dtype (per-query-head dK/dV)
     OUT: cute.Tensor,  # [1, T_cap, Hk, d_out] io_dtype (the caller's packed dK/dV)
-    CU_K: cute.Tensor,  # [n_seq + 1] int32
+    CU_K: Optional[cute.Tensor],  # [n_seq + 1] int32
     d_in: cutlass.Constexpr[int],
     d_out: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
@@ -1539,13 +1571,13 @@ def _dkv_reduce_thd_kernel(
         row = rest // cutlass.Int32(Hk)
         t_live = Pointer(cutlass.make_array_view(CU_K).data_ptr() + n_seq, dtype=cutlass.Int32).load()
         if row < t_live:
-            in_base = (row * cutlass.Int32(H) + hk * cutlass.Int32(ratio)) * cutlass.Int32(d_in) + di
+            in_base = (cutlass.Int64(row) * cutlass.Int64(H) + cutlass.Int64(hk) * cutlass.Int64(ratio)) * cutlass.Int64(d_in) + di
             src = cutlass.make_array_view(IN).data_ptr()
             acc = cutlass.Float32(0.0)
             for g in cutlass.range_constexpr(ratio):
                 acc = acc + Pointer(src + in_base + cutlass.Int32(g * d_in), dtype=io_dtype).load().to(cutlass.Float32)
             # The caller's dK/dV at ITS token stride (compact folds to Hk*d_out).
-            out_off = row * cutlass.Int32(OUT.stride[1]) + hk * cutlass.Int32(d_out) + di
+            out_off = cutlass.Int64(row) * cutlass.Int64(OUT.stride[1]) + cutlass.Int64(hk) * cutlass.Int64(d_out) + di
             Pointer(cutlass.make_array_view(OUT).data_ptr() + out_off, dtype=io_dtype).store(acc.to(io_dtype))
 
 
@@ -1566,14 +1598,14 @@ def _bprop_host(
     dV: cute.Tensor,
     LSE: cute.Tensor,
     DO_DOT: cute.Tensor,
-    SEQ_KV_LENS: cute.Tensor,
-    BIAS: cute.Tensor,
-    DBIAS: cute.Tensor,
-    ROPE_CS: cute.Tensor,
-    CU_Q: cute.Tensor,
-    CU_K: cute.Tensor,
-    SEQ_LEN_Q: cute.Tensor,
-    DQ_SEM: cute.Tensor,
+    SEQ_KV_LENS: Optional[cute.Tensor],
+    BIAS: Optional[cute.Tensor],
+    DBIAS: Optional[cute.Tensor],
+    ROPE_CS: Optional[cute.Tensor],
+    CU_Q: Optional[cute.Tensor],
+    CU_K: Optional[cute.Tensor],
+    SEQ_LEN_Q: Optional[cute.Tensor],
+    DQ_SEM: Optional[cute.Tensor],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     tile_kv: cutlass.Constexpr[int],
@@ -1600,7 +1632,7 @@ def _bprop_host(
     attn_scale: cutlass.Float32,
     right_bound: cutlass.Int32,
     inv_softmax_scale: cutlass.Float32,
-    bias_bstride: cutlass.Int32,
+    bias_bstride: cutlass.Int64,
     sem_q_stride: cutlass.Int32,
     grid_kv_tiles: cutlass.Int32,
     grid_batch: cutlass.Int32,
@@ -1700,7 +1732,7 @@ def _cast_host(
 def _cast_thd_host(
     dQ_acc: cute.Tensor,
     dQ_out: cute.Tensor,
-    CU_Q: cute.Tensor,
+    CU_Q: Optional[cute.Tensor],
     io_dtype: cutlass.Constexpr,
     H: cutlass.Constexpr[int],
     fd: cutlass.Constexpr[int],
@@ -1717,7 +1749,7 @@ def _cast_thd_host(
 def _dkv_reduce_thd_host(
     IN: cute.Tensor,
     OUT: cute.Tensor,
-    CU_K: cute.Tensor,
+    CU_K: Optional[cute.Tensor],
     d_in: cutlass.Constexpr[int],
     d_out: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
@@ -1752,7 +1784,7 @@ def _dsink_host(
     DO_DOT: cute.Tensor,
     SINKS: cute.Tensor,
     DSINK: cute.Tensor,
-    CU_Q: cute.Tensor,
+    CU_Q: Optional[cute.Tensor],
     thd: cutlass.Constexpr[bool],
     lse_token_major: cutlass.Constexpr[bool],
     n_rows: cutlass.Int32,
@@ -2074,7 +2106,7 @@ def compile(  # noqa: A001 — the template contract's entry point
         cutlass.Float32(0.0),
         cutlass.Int32(0),
         cutlass.Float32(0.0),
-        cutlass.Int32(0),
+        cutlass.Int64(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),

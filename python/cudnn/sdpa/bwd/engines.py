@@ -656,7 +656,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
-    if api_type in (_SM120, _SM100) and getattr(api, "_prepared", None) is not None:
+    if api_type in (_SM120, _SM100, _SM80) and getattr(api, "_prepared", None) is not None:
         from types import SimpleNamespace
         from .prepared import PreparedBwdLaunch
 
@@ -1019,52 +1019,15 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         sf_dO_T=facts.sf_dO_T_t,
     )
 
-    def _view(buf, name):
-        """Reinterpret a variant-pack buffer through the port's geometry (see
-        lower_dsl_bwd._canonical_view); SF buffers are consumed flat."""
-        if name not in ports:
-            return buf
-        dim, stride = ports[name]
-        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
-            return buf
-        return buf.as_strided(dim, stride)
+    from types import SimpleNamespace
+    from .prepared import PreparedBwdLaunch
 
-    def _execute(variant_pack, workspace=None, stream=None):
-        r = ga.resolve_variant_pack(variant_pack, binding)
-        stats_dim, stats_stride = tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride())
-        stats_buf = r[id(binding.stats)]
-        if tuple(stats_buf.shape) != stats_dim or tuple(stats_buf.stride()) != stats_stride:
-            stats_buf = stats_buf.as_strided(stats_dim, stats_stride)
-        api.execute(
-            q_tensor=_view(r[id(binding.q)], "q"),
-            k_tensor=_view(r[id(binding.k)], "k"),
-            v_tensor=_view(r[id(binding.v)], "v"),
-            o_tensor=_view(r[id(binding.o)], "o"),
-            do_tensor=_view(r[id(binding.do)], "dO"),
-            stats_tensor=stats_buf,
-            dq_tensor=_view(r[id(binding.dq)], "dQ"),
-            dk_tensor=_view(r[id(binding.dk)], "dK"),
-            dv_tensor=_view(r[id(binding.dv)], "dV"),
-            q_T_tensor=_view(r[id(binding.q_T)], "q_T"),
-            k_T_tensor=_view(r[id(binding.k_T)], "k_T"),
-            do_T_tensor=_view(r[id(binding.dO_T)], "dO_T"),
-            do_f16_tensor=_view(r[id(binding.dO_f16)], "dO_f16"),
-            sf_q=r[id(binding.sf_q)],
-            sf_q_T=r[id(binding.sf_q_T)],
-            sf_k=r[id(binding.sf_k)],
-            sf_k_T=r[id(binding.sf_k_T)],
-            sf_v=r[id(binding.sf_v)],
-            sf_do=r[id(binding.sf_dO)],
-            sf_do_T=r[id(binding.sf_dO_T)],
-            scale_softmax=facts.scale,
-            workspace=workspace,
-            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
-        )
-        return None
-
-    _execute.workspace_bytes = total_workspace_bytes
-    _execute.binding = binding
-    return _execute
+    return SimpleNamespace(
+        binding=binding,
+        workspace_bytes=total_workspace_bytes,
+        prepared=PreparedBwdLaunch(api._prepared, binding),
+        default_stream=lambda: _cuda_driver().CUstream(torch.cuda.current_stream(api.q_desc.device).cuda_stream),
+    )
 
 
 def _sm100_mxfp8_spec() -> EngineSpec:
