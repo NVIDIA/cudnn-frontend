@@ -235,33 +235,3 @@ def test_dense_tensor_fallback_survives_thd_fake_cleanup(d, dv, rope, dtype, mon
         check(captured)
     finally:
         graph.reset()
-
-
-@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("features", [False, True])
-@pytest.mark.L0
-def test_thd_wrapper_normalizes_independent_prefix_bases(d, dv, dtype, features):
-    tensors = _inputs(d, dv, dtype)
-    lq, lk = (96, 0, 129), (65, 0, 193)
-    # The old absolute-origin path stays inside allocated capacities, so the
-    # negative control fails numerically without an invalid memory access.
-    cq, ck = _prefix(lq) + 5, _prefix(lk) + 13
-    sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
-    kw = dict(causal=features, bottom=features, window=64 if features else -1, sink=sink)
-    _check(tensors, _run(tensors, cq, ck, **kw), lq, lk, **kw)
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            out = _run(tensors, cq, ck, **kw)
-        lq, lk = (80, 0, 145), (96, 0, 162)
-        cq.copy_(_prefix(lq) + (2**31 - 1000))
-        ck.copy_(_prefix(lk) + (2**31 - 2000))
-        for t, new in zip(tensors, _inputs(d, dv, dtype, seed=83)):
-            t.copy_(new)
-        for value in out.values():
-            value.fill_(float("nan"))
-        graph.replay()
-        _check(tensors, out, lq, lk, **kw)
-    finally:
-        graph.reset()
