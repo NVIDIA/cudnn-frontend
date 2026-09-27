@@ -606,7 +606,12 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 self._lse_strides is None and not stats.contiguous,
                 "stats_tensor must be contiguous (the kernel was compiled for a contiguous LSE layout)",
             )
-        execute(spec, facts, ws.ptr, int(current_stream), scale=scale_softmax)
+        geometry = tuple((op.shape, op.strides) if op is not None and i < 9 else None for i, op in enumerate(spec.operands))
+        if self._lse_strides is None:
+            # The established standalone contract accepts any contiguous Stats
+            # view with the right element count, checked above.
+            geometry = (*geometry[:5], None, *geometry[6:])
+        execute(spec, facts, ws.ptr, int(current_stream), scale=scale_softmax, geometry=geometry)
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:

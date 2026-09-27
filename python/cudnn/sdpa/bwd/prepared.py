@@ -56,7 +56,13 @@ def build_sm120_spec(api):
     return BwdLaunchSpec(owner, fn, tuple(operands), owner.workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax)
 
 
-def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None):
+def _same_geometry(actual, expected):
+    # Singleton strides do not address any second element. In particular Stats
+    # may add or remove its trailing singleton dimension without changing layout.
+    return tuple((n, st) for n, st in zip(*actual) if n != 1) == tuple((n, st) for n, st in zip(*expected) if n != 1)
+
+
+def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
     if not workspace_ptr or workspace_ptr % 16:
         raise ValueError("sdpa_bwd_sm120 needs an aligned caller workspace")
@@ -79,9 +85,14 @@ def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None
             raise ValueError(f"sdpa_bwd_sm120: {name} base address must be {op.alignment}-byte aligned")
         if f.span >= 0 and f.span < op.span:
             raise ValueError(f"sdpa_bwd_sm120: {name} backing storage is too small for the declared strides")
-        if name in ("seq_q", "seq_kv", "sink", "dsink", "bias", "dbias") and f.shape and (not f.contiguous or f.numel != math.prod(op.shape)):
+        if (
+            not raw_storage
+            and name in ("seq_q", "seq_kv", "sink", "dsink", "bias", "dbias")
+            and f.shape
+            and (not f.contiguous or f.numel != math.prod(op.shape))
+        ):
             raise ValueError(f"sdpa_bwd_sm120: {label} must be contiguous with {math.prod(op.shape)} elements")
-        if geometry is not None and f.shape and (f.shape, f.strides) != geometry[i]:
+        if geometry is not None and geometry[i] is not None and f.shape and not _same_geometry((f.shape, f.strides), geometry[i]):
             raise ValueError(f"sdpa_bwd_sm120: {name} runtime geometry must match this fixed backward plan")
         if workspace_ptr < f.ptr + op.span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"sdpa_bwd_sm120: caller workspace overlaps {name}")
@@ -105,4 +116,11 @@ class PreparedBwdLaunch:
         if self._indices is None:
             self._indices = [pack.index_of(uid) for uid in self._uids]
         facts = dict(zip(self._roles, facts_of_roles(pack, self._indices)))
-        execute(self.spec, facts, workspace_ptr, stream_int, geometry=self._geometry)
+        # Graph bindings are raw storage under the declared layout, including
+        # strided producer views. Explicit overrides are different: they change
+        # the requested operation, which this fixed backward artifact cannot do.
+        geometry = None
+        if pack.overridden:
+            overridden = {role for role, index in zip(self._roles, self._indices) if index in pack.overridden}
+            geometry = tuple(g if role in overridden else None for role, g in zip(ROLES, self._geometry))
+        execute(self.spec, facts, workspace_ptr, stream_int, geometry=geometry, raw_storage=True)

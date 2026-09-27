@@ -1952,6 +1952,74 @@ class TestPreparedSm120Bwd:
         _check_prepared_bwd(case)
 
     @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+    def test_standalone_rejects_changed_layout_before_launch(self, role):
+        from dataclasses import replace
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case()
+        api = SdpaBwdDslSm120(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=case.scale)
+        api.check_support()
+        api.compile()
+        launches = []
+        api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+        args = {name + "_tensor": value for name, value in case.tensors.items()}
+        args[role + "_tensor"] = case.tensors[role].contiguous()
+        assert args[role + "_tensor"].stride() != case.tensors[role].stride()
+        with pytest.raises(ValueError, match="runtime geometry"):
+            api.execute(**args, workspace=case.workspace)
+        assert not launches
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"])
+    def test_graph_accepts_strided_raw_storage(self, role):
+        case = _prepared_bwd_case()
+        tensor = case.tensors[role]
+        backing = torch.empty(tensor.numel() + 2, device="cuda", dtype=tensor.dtype)
+        declared = backing.as_strided(tensor.shape, tensor.stride()).copy_(tensor)
+        raw = backing[::2]
+        assert not raw.is_contiguous()
+        case.pack[case.refs[role]] = raw
+        case.tensors[role] = declared
+        for name in ("dq", "dk", "dv"):
+            case.tensors[name].fill_(float("nan"))
+        case.graph.execute(case.pack, case.workspace)
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "stats", "dq"])
+    def test_graph_fixed_plan_override_validation(self, role, monkeypatch):
+        from dataclasses import replace
+
+        case = _prepared_bwd_case()
+        ref = case.refs[role]
+        kwargs = dict(override_uids=[ref.get_uid()], override_shapes=[list(ref.get_dim())], override_strides=[list(ref.get_stride())])
+        case.graph.execute(case.pack, case.workspace, **kwargs)
+        _check_prepared_bwd(case)
+        plan = case.graph._compiled_plans[case.graph._plan_index]
+        launches = []
+        monkeypatch.setattr(plan._prepared, "spec", replace(plan._prepared.spec, fn=lambda *args: launches.append(args)))
+        kwargs["override_shapes"][0][2] //= 2
+        with pytest.raises(ValueError, match="runtime geometry"):
+            case.graph.execute(case.pack, case.workspace, **kwargs)
+        assert not launches
+
+    @pytest.mark.L0
+    def test_standalone_accepts_flat_contiguous_stats(self):
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case()
+        api = SdpaBwdDslSm120(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=case.scale)
+        api.check_support()
+        api.compile()
+        args = {name + "_tensor": value for name, value in case.tensors.items()}
+        args["stats_tensor"] = case.tensors["stats"].view(-1)
+        for name in ("dq", "dk", "dv"):
+            case.tensors[name].fill_(float("nan"))
+        api.execute(**args, workspace=case.workspace)
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L0
     @pytest.mark.parametrize("failure", ["stats_numel", "stats_contiguity"])
     def test_standalone_retains_stats_validation(self, failure):
         from dataclasses import replace

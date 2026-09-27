@@ -2249,7 +2249,7 @@ class pygraph:
                 workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
         """The storage-slot geometry each slot of ``order`` was declared with,
