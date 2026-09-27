@@ -901,6 +901,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,
