@@ -124,6 +124,15 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _bshd_tma_compatible(t: torch.Tensor) -> bool:
+    """Check pointer and active outer-stride alignment before avoiding staging."""
+    return (
+        t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(size <= 1 or (stride > 0 and stride * t.element_size() % 16 == 0) for size, stride in zip(t.shape[:-1], t.stride()[:-1]))
+    )
+
+
 def _to_cute_tensor(
     t: torch.Tensor,
     assumed_align: Optional[int] = 16,
@@ -1499,7 +1508,9 @@ def bsa_attn_fwd_blk64_cutedsl(
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
     else:
         assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t).transpose(1, 2) for t in (q, k, v)]
+        q_bhsd = q.transpose(1, 2) if _bshd_tma_compatible(q) else q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2) if _bshd_tma_compatible(k) else k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2) if _bshd_tma_compatible(v) else v.transpose(1, 2).contiguous()
 
     batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
     seqlen_k = k_bhsd.shape[2]
