@@ -1361,6 +1361,9 @@ def _kernel(
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ---------------------------------------------------------------------------
 # Host wrapper + per-shape compile cache
 # ---------------------------------------------------------------------------
@@ -1402,6 +1405,9 @@ def _clamp_thd_input_descs_kernel(
             _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch)
 
 
+_clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch):
     """Body of the clamp; the caller elects."""
@@ -1417,9 +1423,6 @@ def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, 
         from_proxy=nvvm.Proxy.GENERIC,
         to_proxy=nvvm.Proxy.TENSORMAP,
     )
-
-
-_clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
