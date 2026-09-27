@@ -3009,6 +3009,8 @@ def compile_prepared(
         raise NotImplementedError("prepared block outputs require dense unsplit, unpacked plans")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError("prepared FP8 head dimensions exceed the kernel envelope")
+    if sfo_geometry is not None and d_v != CFG.TILE_O:
+        raise ValueError("prepared block outputs require d_v == CFG.TILE_O")
     if d_qk * CFG.BPE % 16 or d_v * CFG.BPE % 16 or d_v * CFG.BPE_O % 16:
         raise ValueError("prepared FP8 head strides must be 16-byte multiples")
     if lse_kind not in LSE_KINDS:

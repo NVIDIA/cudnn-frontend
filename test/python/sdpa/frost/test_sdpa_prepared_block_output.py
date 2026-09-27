@@ -278,3 +278,59 @@ def test_block_scaled_mxfp8_scale_presence_matches_compilation(has_scale, monkey
     monkeypatch.setattr(spec, "fn", lambda *args: pytest.fail("mismatched scale presence must not launch"))
     with pytest.raises(ValueError, match="scale_o presence"):
         execute_quantized(spec, facts, ws.data_ptr(), None, 0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("arch", ["sm100", "sm107"])
+@pytest.mark.parametrize("block", [16, 32])
+@pytest.mark.parametrize("d_v", [32, 64, 96])
+def test_block_output_compiler_rejects_narrow_v(arch, block, d_v, monkeypatch):
+    """The block epilogue writes a full tile of SF groups, even for narrow V."""
+    from importlib import import_module
+    from pathlib import Path
+
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_O_MXFP8, DTYPE_O_NVFP4
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.kernels import _fp8_host
+
+    params_type = import_module(f"cudnn.sdpa.fwd.config_{arch}").TemplateParams
+    path = Path(api_dsl.__file__).parent / "kernels" / arch / "prefill_d128_fp8.py"
+    params = params_type(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_O_NVFP4 if block == 16 else DTYPE_O_MXFP8)
+    mod = load_template(str(path), params, tag=f"block_width_{arch}_{block}")
+    marker = object()
+    monkeypatch.setattr(_fp8_host, "compile_host", lambda *a, **kw: marker)
+    geometry = (128 * (128 // block), 0, 0, 128 // block)
+    # Spy only at the code-generation boundary: execute real compiler admission.
+    # A full tile remains admitted; the invalid case must never reach codegen.
+    assert mod.compile_prepared.__wrapped__(d_v=128, sfo_geometry=geometry) is marker
+    with pytest.raises(ValueError, match="block outputs require"):
+        mod.compile_prepared.__wrapped__(d_v=d_v, sfo_geometry=geometry)
+    ordinary = load_template(str(path), params_type(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_E4M3), tag=f"ordinary_width_{arch}")
+    assert ordinary.compile_prepared.__wrapped__(d_v=d_v) is marker
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("span", [-1, 3072])
+@pytest.mark.parametrize("offset", [2400, 2560, 3072])
+def test_block_output_workspace_rejects_sf_atom_padding_overlap(span, offset, monkeypatch):
+    """A raw address still promises the full atom, beyond logical SF_O numel."""
+    from cudnn.sdpa.fwd import prepared
+
+    spec, facts = _sf_output_facts()
+    spec.combine = None
+    facts["sf_o"] = facts["sf_o"]._replace(span=span)
+
+    class ReachedBinding(Exception):
+        pass
+
+    def bind(*args, **kwargs):
+        raise ReachedBinding
+
+    monkeypatch.setattr(prepared, "bind_dense", bind)
+    # Adjacent workspace reaches binding; padded-region overlap is rejected
+    # before any kernel/initialization is possible, for both raw and known spans.
+    error = ReachedBinding if offset == 3072 else ValueError
+    match = None if offset == 3072 else "workspace overlaps sf_o"
+    with pytest.raises(error, match=match):
+        prepared.execute_quantized(spec, facts, facts["sf_o"].ptr + offset, None, 0)

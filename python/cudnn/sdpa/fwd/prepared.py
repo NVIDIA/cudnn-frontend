@@ -288,6 +288,10 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         if span <= 0:
             continue
         width = _buffers.DTYPE_ITEMSIZE[f.dtype]
+        # Token-major declarations omit trailing atom padding. Even a bare
+        # address promises that compiled extent, so it cannot alias scratch.
+        if name == "sf_o" and quant.block_output is not None:
+            span = max(span, quant.block_output.nbytes)
         scratch_end = workspace_ptr + quant.scratch_offset + 8
         if workspace_ptr < f.ptr + span * width and f.ptr < scratch_end:
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace overlaps {name}")
