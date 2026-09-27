@@ -56,7 +56,8 @@ for its four existing flavors, plus its existing D128 split-KV path. Int64
 strides reach descriptor setup; D256 keeps its optional Amax specialization.
 The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
-Epilogue-gate, block-scaled-output and conversion routes retain tensor execution.
+Epilogue-gate and conversion routes retain tensor execution. Fixed dense D128
+block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
@@ -66,7 +67,7 @@ SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or 
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
-Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
+MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
 and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
@@ -1117,7 +1118,20 @@ plan-specific. SF storage may be any dense physical-axis permutation and is
 validated against the producer's observed byte span. Packed SF tile totals are
 runtime metadata, never read from device lengths or used as compile keys.
 D512 retains half split partials; the other three flavors use FP32 partials.
-Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
+Gate and standalone PV-BF16 keep their tensor entries. D128 block-scaled O
+uses the prepared contract below. SM107
 MXFP8 also prepares its existing dense scalar-output paths as described above.
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
+
+### Prepared block-scaled output launch contract
+
+Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
+SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
+MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
+current O, SF_O, optional Amax and device scales with observed storage checks.
+FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
+SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
+their existing admission boundaries. PV-BF16 and remaining legacy layouts retain
+their tensor entries. Standalone prepared calls require caller-owned workspace.

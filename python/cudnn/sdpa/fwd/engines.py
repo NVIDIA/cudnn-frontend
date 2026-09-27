@@ -521,20 +521,22 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "this engine has no prepared shape/stride override executor"
     if (facts.is_fp8 or facts.is_mxfp8) and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
         return "prepared SM107 FP8/MXFP8 requires device cc 10.7"
+    if facts.o_block_scale and (facts.sf_o_t is None or facts.dtype_o != {16: cudnn.data_type.FP4_E2M1, 32: cudnn.data_type.FP8_E4M3}.get(facts.o_block_scale)):
+        return "prepared block-scaled output requires the matching O and SF_O declarations"
+    if facts.o_block_scale and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1 or facts.shape_overrides or facts.has_epilogue_gate):
+        return "prepared block-scaled outputs require fixed dense unsplit plans"
     if facts.is_mxfp8 and (
         capabilities.sm_lo not in (100, 107)
         or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
         or not capabilities.is_mxfp8
-        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
-        or facts.o_block_scale
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or facts.has_epilogue_gate
         or (facts.shape_overrides and not facts.thd)
     ):
         return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense scalar outputs"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
-        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
-        or facts.o_block_scale
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or facts.has_epilogue_gate
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
@@ -562,15 +564,13 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if split_kv is not None and split_kv <= 1:
         tensors.append(facts.o_t)
     for tensor in tensors:
-        if (
-            tensor is None
-            or dense_bind_strides(
-                tuple(tensor.get_dim()),
-                tuple(tensor.get_stride()),
-                1 if tensor.get_data_type() in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2) else 2,
-            )
-            is None
-        ):
+        if tensor is None:
+            return "prepared overrides require declared operands"
+        from cudnn.graph_types import storage_geometry
+
+        geometry = storage_geometry(tensor.get_dim(), tensor.get_stride(), tensor.get_data_type())
+        width = 1 if tensor.get_data_type() in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1) else 2
+        if geometry is None or dense_bind_strides(*geometry, width) is None:
             return "prepared overrides require input and unsplit-output layouts that bind without a copy"
     if facts.o_t is None or not ga.dense_layout_ok(tuple(facts.o_t.get_dim()), tuple(facts.o_t.get_stride())):
         return "prepared overrides require a non-overlapping dense output layout"

@@ -140,6 +140,13 @@ can otherwise leave half the rows unwritten while corrupting padding. The
 SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
 rebound padded and batch-inner layouts under CUDA Graph replay.
 
+Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
+arguments, device parameters, and every intermediate offset product must all
+stay Int64. Widen operands before multiplication. The physical detector is
+`test_block_scaled_sf_plane_stride_above_int32`: it writes two live SF planes
+separated above 2**32 and checks capture/replay. A wide fake extent alone only
+fixes binding; deliberately narrowing the plane stride must fail numerically.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 

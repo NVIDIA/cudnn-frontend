@@ -491,18 +491,27 @@ def _kernel(
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
     scale_o_t: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
     # Block-scaled O (CFG.O_BLOCK_SCALE > 0): SF_O byte buffer + its 128x4-atom
     # geometry (see _correction_warp_group). None / 0 when the mode is off.
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
-    if cutlass.const_expr(SPLIT_KV > 1):
+    # The prepared plan fixes this byte geometry; retain Int64 while allowing
+    # constant folding of the SF atom's offset arithmetic.
+    if cutlass.const_expr(prepared_sfo_geometry is not None):
+        sfo_plane_stride = cutlass.Int64(prepared_sfo_geometry[0])
+        sfo_row_off_b = cutlass.Int64(prepared_sfo_geometry[1])
+        sfo_col_off_h = cutlass.Int64(prepared_sfo_geometry[2])
+        sfo_cols = cutlass.Int64(prepared_sfo_geometry[3])
+
+    if cutlass.const_expr(SPLIT_KV > 1 and amax_o_tensor is not None):
         _initialize_split_amax(amax_o_tensor)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -2394,8 +2403,9 @@ def _correction_warp_group(
 
             # amax_o = max over valid rows of |o_scaled| (the fp32 pre-cast output). Divided
             # by scale_o in api to give the pre-quant output amax (cuDNN FP8 ref, in-kernel).
-            _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-            _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
+            if cutlass.const_expr(amax_o_tensor is not None):
+                _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
+                _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx
 
             sO_sub_base = sO[qs].base
 
@@ -2448,7 +2458,8 @@ def _correction_warp_group(
 
                         for _i in cutlass.range_constexpr(O_CHUNK):
                             _e = o_elems[_i]
-                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
+                            if cutlass.const_expr(amax_o_tensor is not None):
+                                _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
 
                         # Plain range (not range_constexpr) — extraction at Python trace time.
                         o_packed_v = fp32_to_fp8_pack(
@@ -2492,7 +2503,7 @@ def _correction_warp_group(
 
                     _sfo_r = q_row_global + batch_idx * sfo_row_off_b
                     _sfo_c0 = row_head_idx * sfo_col_off_h
-                    _sfo_plane = (batch_idx * (n_qh * cutlass.Int32(HEADS_PER_TILE)) + row_head_idx) * sfo_plane_stride
+                    _sfo_plane = (cutlass.Int64(batch_idx) * (cutlass.Int64(n_qh) * HEADS_PER_TILE) + row_head_idx) * sfo_plane_stride
                     _sfo_row_part = (
                         _sfo_plane
                         + (_sfo_r >> cutlass.Int32(7)) * (sfo_cols << cutlass.Int32(7))
@@ -2526,7 +2537,8 @@ def _correction_warp_group(
                         for _i in cutlass.range_constexpr(_GROUP):
                             _e = o_elems[_i]
                             g_amax = cute.math.max(g_amax, cute.math.max(_e, -_e))
-                        _amax_o_local = cute.math.max(_amax_o_local, g_amax)
+                        if cutlass.const_expr(amax_o_tensor is not None):
+                            _amax_o_local = cute.math.max(_amax_o_local, g_amax)
 
                         if cutlass.const_expr(CFG.DTYPE_O == 4):
                             sf_byte, inv_sf = e4m3_scale_rcp(g_amax * cutlass.Float32(1.0 / 6.0))
@@ -2590,7 +2602,8 @@ def _correction_warp_group(
                         )
                         for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                             _e = o_scaled_h[_i]
-                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
+                            if cutlass.const_expr(amax_o_tensor is not None):
+                                _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
                         o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
 
                         col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
@@ -2607,7 +2620,7 @@ def _correction_warp_group(
                 # over partials over-reports the output amax (~2.9x at 8 splits).
                 # sm100/split_combine computes it over the recombined O instead;
                 # this write has to stay out of the way, since atomicMax only grows.
-                if cutlass.const_expr(SPLIT_KV == 1):
+                if cutlass.const_expr(SPLIT_KV == 1 and amax_o_tensor is not None):
                     if _row_valid:
                         nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
@@ -2671,7 +2684,7 @@ def _host(
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
     scale_o_t: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths, passed
     # POSITIONALLY by the adapter right here; None folds the parameter and
     # every consumer out when the specialization is off.
@@ -2688,12 +2701,13 @@ def _host(
     o_partial_f32: Optional[cute.Tensor] = None,
     # Block-scaled O: SF_O byte buffer + 128x4-atom geometry (None / 0 when off).
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
     stream: _cuda_driver.CUstream = None,
     prepared: cutlass.Constexpr[bool] = False,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2838,6 +2852,7 @@ def _host(
         sfo_row_off_b,
         sfo_col_off_h,
         sfo_cols,
+        prepared_sfo_geometry=prepared_sfo_geometry,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2925,11 +2940,11 @@ def compile(
             if CFG.O_BLOCK_SCALE == 0
             else (
                 None,
-                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
+                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(64, divisibility=1),), stride_order=(0,), assumed_align=16),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
             )
         ),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
@@ -2953,14 +2968,21 @@ def compile_prepared(
     paged_hnd: bool = False,
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
+    sfo_geometry: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
-    if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
-        raise NotImplementedError("prepared FP8 serves scalar-scaled outputs")
+    if bool(getattr(CFG, "O_BLOCK_SCALE", 0)) != (sfo_geometry is not None):
+        raise ValueError("prepared block-output geometry must match the specialization")
+    if sfo_geometry is not None and (CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA or PARAMS.paged_kv):
+        raise NotImplementedError("prepared block outputs require dense unsplit, unpacked plans")
+    if PARAMS.paged_kv:
+        raise NotImplementedError("prepared SM107 does not serve paged KV")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError("prepared FP8 head dimensions exceed the kernel envelope")
+    if sfo_geometry is not None and d_v != CFG.TILE_O:
+        raise ValueError("prepared block outputs require d_v == CFG.TILE_O")
     if d_qk * CFG.BPE % 16 or d_v * CFG.BPE % 16 or d_v * CFG.BPE_O % 16:
         raise ValueError("prepared FP8 head strides must be 16-byte multiples")
     if lse_kind not in LSE_KINDS:
@@ -2969,4 +2991,20 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
-    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine, paged_hnd)
+    return compile_host(
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        OUT_STORAGE_DTYPE,
+        False,
+        cache_key,
+        d_qk,
+        d_v,
+        has_lse,
+        lse_kind,
+        has_amax,
+        scale_o_in_combine,
+        paged_hnd,
+        sfo_geometry=sfo_geometry,
+        optional_amax=True,
+    )
