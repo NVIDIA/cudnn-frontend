@@ -960,9 +960,18 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-Head dims below a flavor's native shape are zero-padded **host-side**, so there
-is no alignment rule. The backward serves packed THD graphs (ᵏ); the forward
-does not yet.
+The backward serves packed THD graphs (ᵏ); the forward does not yet.
+
+Dense forward uses a prepared pointer host when V matches its flavor width,
+Q/K head dimensions are multiples of eight, and every stepped Q/K/V/O outer
+stride is a multiple of eight elements. These plans require 16-byte-aligned
+Q/K/V/O base addresses and reject misaligned runtime bindings. They address
+declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
+with no layout staging or GQA expansion. Sink logits are converted to log2
+units inside the attention kernel. Address strides and products retain Int64
+width. The served capability envelope is unchanged: other head dimensions and
+layouts retain their existing tensor-entry staging, as do the standalone
+RoPE and THD callers. Those remaining callers still require the tensor compiler.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|

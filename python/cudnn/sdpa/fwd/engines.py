@@ -2174,6 +2174,11 @@ def lower_dsl_prefill(
     _execute.kernel_template = kernel_template
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
+    if getattr(api, "_sm80_spec", None) is not None:
+        from cudnn.sdpa.fwd.prepared_sm80 import PreparedSm80Launch
+
+        _execute.prepared = PreparedSm80Launch(api._sm80_spec, binding)
+        _execute.default_stream = lambda: api._get_default_stream(None)
     if _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1)) is None:
         # The prepared launch (cudnn.sdpa.fwd.prepared): the plan binds the normalized VariantPack itself.
         # THD: the f16 ragged plan without a gate. Dense: the f16 plan whose declared Q/K/V/O layouts TMA
