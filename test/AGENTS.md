@@ -268,6 +268,15 @@ wrapped addresses poisoned inside allocated guard storage.
 THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
 
 
+### SM80 staged pointer launches
+
+A pointer host can follow existing layout staging without changing that
+staging's numerical contract. Keep off-flavor and RoPE references, mutate
+angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
+after warmup so a return to tensor launch plumbing fails independently of
+numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
+RED on the old tensor launcher for both dtypes and both template families.
+
 SM80's standalone packed wrapper preserves cumulative tensors as row offsets
 into the supplied storage. Do not substitute graph API cumulative-length
 normalization: that changes which Q/K/V rows the standalone call addresses.
