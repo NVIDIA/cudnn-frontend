@@ -214,6 +214,19 @@ Prepared admission must respect the adapter's exact device support even when
 the row spans later compute capabilities. Include future-cc rejection controls
 alongside the supported device in `test_prepared_fp8_override_capability_envelope`.
 
+### Concurrent prepared frames versus SDK initialization
+
+CuTe DSL 4.7.0/4.7.1 can leak the runtime's process-global initialization lock
+when two threads first call the same cold artifact; a later test then hangs in
+`cuda_dialect_init_library_once` before its kernel launches (see the independent
+[runtime reproduction](https://github.com/NVIDIA/cudnn-frontend/pull/1236#issuecomment-5854182558)).
+For a test of concurrent per-call bindings, initialize the artifact serially,
+retain that warm call's owners, then use distinct buffers, poisoned outputs,
+fresh workspace and independent streams for the concurrent calls.
+`test_native_thd_concurrent_streams_use_independent_frames` follows this recipe.
+This tests frame independence; it does not establish that cold concurrent SDK
+initialization is fixed. Keep that runtime reproduction and its result separate.
+
 ### MXFP8 prepared scale-factor bindings
 
 Dense V scale factors for D > 128 are plane-major; THD factors are packed
