@@ -30,6 +30,8 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
      twice B200's rate and the same split loses (``_E2E_ENABLED``).
 """
 
+from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax
+
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
@@ -565,6 +567,8 @@ def _kernel(
     sfo_cols: cutlass.Int32 = 0,
 ) -> None:
 
+    if cutlass.const_expr(SPLIT_KV > 1):
+        _initialize_split_amax(amax_o_tensor)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
     # Rule 3: the O scale is a 1-element DEVICE tensor read in-kernel (no host readback).
@@ -2877,6 +2881,7 @@ def _host(
     sfo_col_off_h: cutlass.Int32 = 0,
     sfo_cols: cutlass.Int32 = 0,
     stream: _cuda_driver.CUstream = None,
+    prepared: cutlass.Constexpr[bool] = False,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
 
@@ -2976,8 +2981,8 @@ def _host(
             global_strides=[
                 SF_TMA_ROW_BYTES // 16,
                 tile_stride_16,
-                num_tiles * tile_stride_16,
-                num_heads * num_tiles * tile_stride_16,
+                cutlass.Int64(num_tiles) * tile_stride_16,
+                cutlass.Int64(num_heads) * cutlass.Int64(num_tiles) * tile_stride_16,
             ],
             box_dims=[SF_TMA_ROW_BYTES, num_rows_box, 1, 1, 1],
             swizzle=tmap.TensorMapSwizzle.none,
@@ -3023,7 +3028,7 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CGA_TILE_M),
             n_thd_units,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
@@ -3089,209 +3094,84 @@ def compile(  # noqa: A001
     # it and the kernel folds an identity (no device constant anywhere).
     has_scale_o: bool = True,
 ) -> Callable:
-    """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
+    "Legacy dense tensor entry for layouts and fused outputs outside the prepared contract. THD uses compile_prepared."
 
-    THD/varlen: q/k/v/o/lse + SF tensors are PACKED with batch dim 1; ``b`` is
-    the LOGICAL batch (sequence count).  ``sq``/``skv`` are IGNORED under THD —
-    the packed token totals AND the packed SF tile extents (Σ_b ceil(S/TILE),
-    per-sequence-TILE-padded) are runtime values, so they compile DYNAMIC
-    (``cute.sym_int``) and the cache key stays plan-time-only (issue #552).
-    THD Stats layouts: token-major packed rank-2 (T, H) by default;
-    ``lse_head_major=True`` = rank-3 [1, QH, head_stride] (0 → compact).
-    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
-    ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
-    at all; the amax_o atomicMax write is independent and unchanged."""
+    if CFG.THD_VARLEN or dynamic_bhk:
+        raise NotImplementedError("THD MXFP8 uses compile_prepared and pointer bindings")
+
     _cache_key = _template_key(globals(), locals(), "compile")
-    _b0, _qh0, _kh0 = b, qh, kh  # the problem_size fake: runtime scalars, values immaterial
-    if dynamic_bhk:
-        # Batch and head extents compile DYNAMIC: one artifact per layout class,
-        # not per (b, qh, kh) -- serving shapes vary in all three. The kernel
-        # already reads B / QH / KH from problem_size at run time; only the fakes
-        # pinned them. A packed stride (None) derives from the dynamic extents;
-        # a declared stride stays the fixed number it is.
-        if not CFG.THD_VARLEN:
-            raise ValueError("dynamic_bhk is THD-only (dense shapes still pin the fakes)")
-        b = cute.sym_int(divisibility=1)
-        qh = cute.sym_int(divisibility=1)
-        kh = cute.sym_int(divisibility=1)
-        if lse_padded_rows:
-            lse_padded_rows = cute.sym_int(divisibility=1)
-    if SPLIT_KV > 1 and not has_lse:
-        # Each split's LSE is not optional under KV split — it IS the weight
-        # the combine reduces with.  Without it the partials cannot be recombined.
+
+    _b0, _qh0, _kh0 = (b, qh, kh)
+
+    if SPLIT_KV > 1 and (not has_lse):
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if lse_padded_rows and not CFG.THD_VARLEN:
+
+    if lse_padded_rows:
         raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
-    if lse_stride is not None and CFG.THD_VARLEN and not lse_padded_rows:
-        raise ValueError("THD LSE is packed (token-major (T, H) or head-major (1, QH, head_stride)); declared strides serve the padded form only")
-    _fake_batch = 1 if CFG.THD_VARLEN else b
-    # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on
-    # the batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.  THD packs the
-    # batch away (dim 1) and split_kv is dense-only (config backstop), so the
-    # THD fakes see SPLIT_KV == 1.
+
+    _fake_batch = b
+
     _o_batch = _fake_batch * SPLIT_KV
+
     _lse_batch = b * SPLIT_KV
-    if CFG.THD_VARLEN:
-        # Dynamic packed extents: one symbol per ragged group (Q/O and a
-        # token-major LSE share t_q; K/V share t_kv; the Q and K/V SF packed
-        # tile totals carry their own), so a new packed partition re-binds the
-        # same compiled artifact instead of minting a new one (issue #552).
-        sq = cute.sym_int(divisibility=1)
-        skv = cute.sym_int(divisibility=1)
-        _q_sf_tiles = cute.sym_int(divisibility=1)
-        _kv_sf_tiles = cute.sym_int(divisibility=1)
-    else:
-        # Q SF tiles TILE_M-row wide → num_tiles = SQ/TILE_M; K/V SF TILE_N-row wide → num_tiles = SKV/TILE_N.
-        _q_sf_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
-        _kv_sf_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
 
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_K),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_K),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        V_STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_O),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
+    _q_sf_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
+
+    _kv_sf_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
+
+    fake_q = cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, (_fake_batch, sq, qh, CFG.TILE_K), stride_order=(3, 2, 1, 0), assumed_align=16)
+
+    fake_k = cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, (_fake_batch, skv, kh, CFG.TILE_K), stride_order=(3, 2, 1, 0), assumed_align=16)
+
+    fake_v = cute.runtime.make_fake_compact_tensor(V_STORAGE_DTYPE, (_fake_batch, skv, kh, CFG.TILE_O), stride_order=(3, 2, 1, 0), assumed_align=16)
+
     fake_o = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
-        # E2M1 O is bound as its byte container: d_v / 2 storage elements.
-        (_o_batch, sq, qh, CFG.TILE_O // CFG.O_PACK_DIV),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
+        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE, (_o_batch, sq, qh, CFG.TILE_O // CFG.O_PACK_DIV), stride_order=(3, 2, 1, 0), assumed_align=16
     )
 
-    fake_sf_q = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, qh, _q_sf_tiles, SF_SMEM_SIZE_Q),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
+    fake_sf_q = cute.runtime.make_fake_compact_tensor(cutlass.Int8, (_fake_batch, qh, _q_sf_tiles, SF_SMEM_SIZE_Q), stride_order=(3, 2, 1, 0), assumed_align=16)
+
     fake_sf_k = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
+        cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K), stride_order=(3, 2, 1, 0), assumed_align=16
     )
+
     fake_sf_v = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
+        cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V), stride_order=(3, 2, 1, 0), assumed_align=16
     )
 
     if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
         if lse_head_major or lse_head_stride:
             raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
         fake_lse = None
-    elif CFG.THD_VARLEN:
-        # Packed ragged-Stats LSE in the caller's declared layout (align 4:
-        # the store is scalar f32 and the caller's Stats buffer only
-        # guarantees element alignment). The epilogue store branches on the
-        # STATIC rank, so the layout is fully encoded in this fake tensor.
-        if lse_padded_rows:
-            # Per-batch padded Stats without ragged offsets (FlashInfer's (b, s_max, h)
-            # buffer): rank-4 (B, QH, s_max, 1) in the caller's strides -- the RANK is
-            # what selects the per-batch store, so nothing about the extents or
-            # strides has to be static. Rows past a sequence's length are the
-            # adapter's to fill (-inf), as the backend does.
-            if lse_head_major or lse_head_stride:
-                raise ValueError("lse_padded_rows excludes lse_head_major / lse_head_stride")
-            fake_lse = (
-                cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), (*lse_stride, 1), assumed_align=4)
-                if lse_stride
-                else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, lse_padded_rows, 1), stride_order=lse_padded_order, assumed_align=4)
-            )
-        elif lse_head_major:
-            _lse_hs = lse_head_stride if lse_head_stride else sq
-            fake_lse = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (1, qh, _lse_hs),
-                stride_order=(2, 1, 0),
-                assumed_align=4,
-            )
-        else:
-            if lse_head_stride:
-                raise ValueError("lse_head_stride is head-major-only (token-major (T, H) is compact)")
-            fake_lse = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (sq, qh),
-                stride_order=(1, 0),
-                assumed_align=4,
-            )
     else:
         if lse_head_major or lse_head_stride:
             raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
         fake_lse = (
             cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
             if lse_stride is not None and SPLIT_KV == 1
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (_lse_batch, qh, sq),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
+            else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_lse_batch, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
         )
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
 
-    fake_seq_q_lens = cutlass.Int64(0)  # device address of the (B,) int32 Q lengths; 0 (unread) when the flag is off
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (qh,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # seq_kv_lens always part of the ABI; unread when CFG.SEQ_KV_LENS_PRESENT
-    # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|
-    # batch_remap(B)|live|ctr] (len 4B+4).
-    _skv_len = cute.sym_int(divisibility=1) if dynamic_bhk else ((4 * b + 4) if CFG.THD_VARLEN else b)
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (_skv_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # Per-batch O TMA-descriptor array (16 int64 = 128 B each) + 1 pad slot;
-    # dummy 1-elem when THD off (kernel never reads it).
-    # +2 slots after the pad slot: the packed-total-clamped K and V runtime
-    # descriptors (see the THD tma_k/tma_v closures).
-    _odesc_len = cute.sym_int(divisibility=1) if dynamic_bhk else (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1)
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (_odesc_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
-    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
-    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
-    # thd_lens_form bitmask, so no compile key grows (Rule 4). align 4: bound
-    # directly, only natural int32 alignment is guaranteed.
-    if CFG.THD_VARLEN:
-        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_lens_form = cutlass.Int32(0)
-    else:
-        fake_thd_q_lens = None
-        fake_thd_kv_lens = None
-        fake_thd_lens_form = None
+    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+
+    fake_seq_q_lens = cutlass.Int64(0)
+
+    fake_sinks = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (qh,), stride_order=(0,), assumed_align=16)
+
+    _skv_len = b
+
+    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_skv_len,), stride_order=(0,), assumed_align=16)
+
+    _odesc_len = 1
+
+    fake_o_desc = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (_odesc_len,), stride_order=(0,), assumed_align=16)
+
+    fake_thd_q_lens = None
+
+    fake_thd_kv_lens = None
+
+    fake_thd_lens_form = None
+
     return _compile_cached(
         _host,
         fake_q,
@@ -3306,25 +3186,19 @@ def compile(  # noqa: A001
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,
-        # THD: the packed totals are runtime values carried by the (dynamic)
-        # tensor extents — _host reads them from the views' shapes.
-        (_b0, _qh0, _kh0, 0, 0, 0) if CFG.THD_VARLEN else (_b0, _qh0, _kh0, sq, skv, 0),
+        (_b0, _qh0, _kh0, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
         fake_seq_q_lens,
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
-        # o_partial_f32 is LAST so the THD tensors keep their slots when the
-        # mode is off.  Block-scaled O (never combined with a split) fills that
-        # slot with None and appends the 1-element O scale, the SF_O buffer
-        # (dynamic byte length) and its four geometry scalars.
         *(
             ((fake_o,) if _FP32_PARTIALS else ())
             if CFG.O_BLOCK_SCALE == 0
             else (
                 None,
-                (cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None),
+                cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None,
                 cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
                 cutlass.Int32(0),
                 cutlass.Int32(0),
@@ -3336,4 +3210,48 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
+    )
+
+
+from cudnn.sdpa.fwd.kernels._mxfp8_host import host as _host_prepared
+
+
+@lru_cache(maxsize=None)
+def compile_prepared(
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_kind: str = "dense",
+    has_amax: bool = True,
+    scale_o_in_combine: bool = False,
+    static_lse_strides: Optional[tuple[int, int, int]] = None,
+) -> Callable:
+    """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
+
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
+    if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False):
+        raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
+    if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
+        raise ValueError("prepared MXFP8 keeps the native head-dimension contract")
+    if scale_o_in_combine:
+        raise ValueError("MXFP8 has no per-tensor output scale")
+    if lse_kind not in LSE_KINDS:
+        raise ValueError(f"invalid prepared MXFP8 Stats layout: {lse_kind}")
+    if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
+        raise ValueError("prepared MXFP8 Stats layout must match dense or THD")
+    return compile_host(
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        OUT_STORAGE_DTYPE,
+        (SF_SMEM_SIZE_Q, SF_SMEM_SIZE_K, SF_SMEM_SIZE_V),
+        cache_key,
+        d_qk,
+        d_v,
+        has_lse,
+        lse_kind,
+        has_amax=has_amax,
+        static_lse_strides=static_lse_strides,
+        partial_slot=True,
     )

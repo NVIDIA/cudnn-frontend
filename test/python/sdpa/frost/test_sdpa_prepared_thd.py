@@ -1230,8 +1230,20 @@ def test_native_thd_concurrent_streams_use_independent_frames():
     b, ql, kl, hq, hk, d = 2, 8, 64, 8, 2, 128
     g, t = _thd_graph(b, ql, kl, hq, hk, d)
     assert _plan(g)._prepared.spec.native is not None
+    # This checks concurrent per-call frames after preparation. CuTe DSL
+    # 4.7.0/4.7.1 can leak its process-global initialization lock when two
+    # threads first enter the same cold module, hanging a later cold launch.
+    # Load it serially, retaining these owners so the parallel calls below
+    # must bind genuinely different storage (including fresh workspace).
+    warm_buffers = _buffers(b, ql, kl, hq, hk, d, seed=0)
+    warm_workspace = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    g.execute(_pack(t, warm_buffers), warm_workspace)
     buffers = [_buffers(b, ql, kl, hq, hk, d, seed=i + 1) for i in range(2)]
     workspaces = [torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8) for _ in range(2)]
+    for bufs, workspace in zip(buffers, workspaces):
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        workspace.fill_(0xBD)
     streams = [torch.cuda.Stream() for _ in range(2)]
     handles = [cudnn.create_handle() for _ in range(2)]
     for handle, stream in zip(handles, streams):

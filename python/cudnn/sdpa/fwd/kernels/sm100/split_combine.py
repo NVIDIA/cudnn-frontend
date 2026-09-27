@@ -313,7 +313,7 @@ def _host_ptr_quantized(
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     amax_o_ptr: Optional[cute.Pointer],
-    scale_o_ptr: cute.Pointer,
+    scale_o_ptr: Optional[cute.Pointer],
     has_scale_o: cutlass.Constexpr[bool],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
@@ -323,7 +323,8 @@ def _host_ptr_quantized(
     Quantized outputs keep unscaled partials and apply scale_o here. Half outputs
     retain their existing scaled partials; normalize their requested Amax after
     reduction. The preceding split-attention kernel initializes Amax, ordered
-    before this reduction on the same stream.
+    before this reduction on the same stream. MXFP8 has no scalar output
+    scale: its None-specialized pointer also removes Amax unscaling.
     """
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
@@ -335,7 +336,7 @@ def _host_ptr_quantized(
     if cutlass.const_expr(has_scale_o):
         scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
     _launch_combine(o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
-    if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o):
+    if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o and scale_o_ptr is not None):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
@@ -404,6 +405,7 @@ def compile_ptr(
     quantized: bool = False,
     has_amax: bool = False,
     has_scale_o: bool = False,
+    has_scale_o_input: bool = True,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -415,11 +417,15 @@ def compile_ptr(
     including singleton dimensions. This entry shares the reduction and launch
     with :func:`compile`. The quantized dense entry appends Amax/scale
     pointers; half and ragged entries keep their existing positional ABI.
+    ``has_scale_o_input=False`` removes the scalar input and Amax unscale
+    launch for MXFP8. Per-tensor FP8 retains both by default.
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
     if (has_amax or has_scale_o or dtype_o in ("e4m3", "e5m2")) and not quantized:
         raise ValueError("FP8 outputs and scalar operands require the quantized pointer entry")
+    if has_scale_o and not has_scale_o_input:
+        raise ValueError("scaled combine requires a scale_o input")
     if quantized and ragged:
         raise ValueError("the quantized pointer entry serves dense split launches")
     if ragged_i64 and not ragged:
@@ -441,7 +447,7 @@ def compile_ptr(
         (cutlass.Int64(0),) * 3,
     )
     if quantized:
-        entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32), bool(has_scale_o))
+        entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o))
     elif ragged:
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
