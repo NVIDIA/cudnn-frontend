@@ -26,7 +26,9 @@ pytestmark = [pytest.mark.L0]
 DEV = torch.device("cuda")
 
 
-def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100"):
+def _thd_graph(
+    b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100", stats_head_stride=0
+):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
     stride (the declaration's span is then far below the buffer's)."""
@@ -66,6 +68,8 @@ def _thd_graph(b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, o
     )
     to.set_output(True).set_dim([b, hq, ql, d]).set_stride([q_bs, d, hq * d, 1]).set_ragged_offset(off_q)
     ts.set_output(True).set_dim([b, hq, ql, 1]).set_stride([ql * hq, 1, hq, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(off_lse)
+    if stats_head_stride:
+        ts.set_stride([hq * stats_head_stride, stats_head_stride, 1, 1])
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -1752,3 +1756,58 @@ def test_d192_thd_policies_capture_strided_value_and_stats(dtype, hk, cga):
     finally:
         for graph in graphs:
             graph.reset()
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("python_binding", [False, True], ids=["native", "python"])
+def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
+    """Vary compact HN stride, then replay older independent captures with no compile or adaptation."""
+    b, qmax, kl, hq, hk, d = 2, 16, 64, 8, 2, 128
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax)
+    prepared = _plan(g)._prepared
+    assert prepared.spec.native is not None
+    if python_binding:
+        prepared.spec.native = None
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    retained = []
+    for i, ql in enumerate((16, 9, 13, 16)):
+        bufs = _buffers(b, ql, kl, hq, hk, d, seed=17 + i, dtype=dtype)
+        bufs["lse"] = torch.full((hq, b * ql), float("nan"), device=DEV)
+        bufs["off_lse"] = bufs["cu_q"]
+        kwargs = dict(
+            override_uids=[t["stats"].get_uid()],
+            override_shapes=[[b, hq, ql, 1]],
+            override_strides=[[hq * b * ql, b * ql, 1, 1]],
+        )
+        with _Tripwire():
+            g.execute(_pack(t, bufs), ws, **kwargs)
+            cg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cg):
+                g.execute(_pack(t, bufs), ws, **kwargs)
+        torch.cuda.synchronize()
+        expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
+        torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+        assert _plan(g)._prepared is prepared
+        retained.append((cg, bufs, ql))
+    for cg, bufs, ql in reversed(retained):
+        bufs["q"].mul_(0.75)
+        bufs["v"].add_(0.1)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        cg.replay()
+        torch.cuda.synchronize()
+        expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
+        torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+    # An HN artifact cannot become NH, nor may override geometry enlarge storage.
+    before = bufs["lse"].clone()
+    with pytest.raises(ValueError, match="token axis contiguous"):
+        g.execute(_pack(t, bufs), ws, override_uids=[t["stats"].get_uid()], override_shapes=[[b, hq, ql, 1]], override_strides=[[hq * ql, 1, hq, 1]])
+    with pytest.raises(ValueError, match="storage"):
+        g.execute(_pack(t, bufs), ws, override_uids=[t["stats"].get_uid()], override_shapes=[[b, hq, qmax, 1]], override_strides=[[hq * 1024, 1024, 1, 1]])
+    torch.testing.assert_close(bufs["lse"], before)

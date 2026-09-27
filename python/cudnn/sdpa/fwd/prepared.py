@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from copy import copy
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
@@ -284,6 +285,7 @@ class ThdLaunchSpec:
         "lse_padded",
         "lse_head_major",
         "lse_head_stride",
+        "lse_stride_override",
         "lse_stride",
         "s_q_max",
         "cga_tile_m",
@@ -378,6 +380,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.has_lse, s.has_sink = api.lse_desc is not None, bool(api.has_sink)
     s.lse_padded, s.lse_head_major = bool(api.thd_stats_padded), bool(api.thd_stats_head_major)
     s.lse_head_stride = int(api.thd_stats_head_stride or 0)
+    s.lse_stride_override = False
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
     s.cga_tile_m = int(km.CGA_TILE_M)
@@ -560,13 +563,15 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     return geometry
 
 
-def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> None:
+def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> int:
     """The host builds the Stats tensor from the compiled layout kind (token-major (T, H), head-major
-    (1, H, ext), or the declared padded strides), never from the effective strides. Compact storage of
+    (1, H, ext), or the declared padded strides). Override-enabled half graph plans also bind the effective HN
+    head stride; the layout kind remains fixed. Compact storage of
     rank <= 2 carries no layout that could contradict the kind (the kind is how that storage is written;
     this is what the tensor path bound too); a described rank-3 / rank-4 geometry must be the kind."""
+    head_stride = spec.lse_head_stride
     if lse.numel == 0:
-        return
+        return head_stride
     st, sh = lse.strides, lse.shape
     qh = spec.qh
     if spec.lse_padded:
@@ -574,12 +579,12 @@ def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) ->
         # contiguous allocation of the right size is that storage, whatever its own dim order; a
         # strided view is accepted only when it IS the declared (B, H, S) layout.
         if len(sh) in (3, 4) and (int(st[0]), int(st[1]), int(st[2])) == tuple(spec.lse_stride):
-            return
+            return head_stride
         if not lse.contiguous:
             raise ValueError(f"cudnn.sdpa: padded lse_tensor strides {tuple(st)} must be the declared {tuple(spec.lse_stride)} or contiguous storage")
-        return
+        return head_stride
     if len(sh) <= 2 and lse.contiguous:
-        return  # flat (T*H) or (T, H) / (H, ext) storage: written in the compiled kind
+        return head_stride  # flat (T*H) or (T, H) / (H, ext) storage: written in the compiled kind
     if len(sh) == 4:  # the graph's (B, H, S, 1)
         h_st, t_st = int(st[1]), int(st[2])
     elif len(sh) == 3 and spec.lse_head_major:  # (1, H, ext)
@@ -593,10 +598,16 @@ def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) ->
     if spec.lse_head_major:
         if t_st != 1:
             raise ValueError(f"cudnn.sdpa: head-major lse_tensor must have the token axis contiguous; got stride {t_st}")
-        if spec.lse_head_stride and h_st != spec.lse_head_stride:
+        if h_st <= 0:
+            raise ValueError("cudnn.sdpa: head-major lse_tensor head stride must be positive")
+        if getattr(spec, "lse_stride_override", False):
+            head_stride = h_st
+        elif spec.lse_head_stride and h_st != spec.lse_head_stride:
             raise ValueError(f"cudnn.sdpa: head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}")
     elif h_st != 1 or t_st != qh:
         raise ValueError(f"cudnn.sdpa: token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
+
+    return head_stride
 
 
 def _on_plan_device(spec, name: str, f: BufferFacts) -> None:
@@ -767,6 +778,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     lse = facts.get("lse")
     lse_cap = None
+    lse_head_stride = spec.lse_head_stride
     if spec.has_lse:
         if lse is None:
             raise ValueError(f"cudnn.sdpa: " + ("lse_tensor is required by this compiled specialization"))
@@ -775,22 +787,20 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             raise ValueError(f"cudnn.sdpa: " + (f"lse_tensor must be float32; got {lse.dtype}"))
         if lse.ptr % _ALIGN_F32 != 0:
             raise ValueError(f"cudnn.sdpa: " + ("lse_tensor must be 4-byte aligned"))
+        lse_head_stride = _stats_layout_is_the_compiled_kind(spec, lse)
         if spec.lse_padded:
             expected = spec.b * spec.qh * spec.s_q_max
             if lse.numel != expected:
                 raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
-        elif spec.lse_head_major and spec.lse_head_stride:
-            if 0 <= lse.span < spec.qh * spec.lse_head_stride:
+        elif spec.lse_head_major and lse_head_stride:
+            if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
-            if lse.numel < spec.qh * spec.lse_head_stride:
-                raise ValueError(
-                    f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * spec.lse_head_stride} elements; got {lse.numel}")
-                )
+            if lse.numel < spec.qh * lse_head_stride:
+                raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * lse_head_stride} elements; got {lse.numel}"))
         else:
             if lse.span < 0:
                 raise ValueError(f"cudnn.sdpa: " + ("lse_tensor: a ragged Stats operand needs a sized buffer, not a bare address"))
             lse_cap = lse.span // spec.qh
-        _stats_layout_is_the_compiled_kind(spec, lse)  # after the size checks: a mis-sized buffer reports its size, not its layout
         frame[ix["lse_ptr"]] = lse.ptr
     else:
         if lse is not None:
@@ -829,8 +839,8 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
             frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
-    if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
-        frame[ix["lse_ext"]] = t_q
+    if spec.has_lse and spec.lse_head_major:
+        frame[ix["lse_ext"]] = lse_head_stride or t_q
     frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
     # For B nonnegative lengths with sum <= T, sum(ceil(length / tile)) is
     # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
@@ -865,7 +875,16 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 class PreparedThdLaunch:
     """The graph plan's THD f16 launch: the spec plus this graph's operand uids."""
 
-    def __init__(self, spec: ThdLaunchSpec, binding):
+    def __init__(self, spec: ThdLaunchSpec, binding, *, stats_stride_override=False):
+        if stats_stride_override and spec.has_lse and spec.lse_head_major and not spec.lse_padded and spec.quant is None:
+            # Keep the standalone adapter's declared-stride contract immutable.
+            # Only override-enabled graph plans bind an effective HN stride.
+            spec = copy(spec)
+            spec.lse_stride_override = True
+            if spec.native is not None:
+                from cudnn import _pybind_module
+
+                spec.native = _pybind_module._SdpaThdBinder(spec)
         self.spec = spec
         uids = {
             "q": binding.q.get_uid(),

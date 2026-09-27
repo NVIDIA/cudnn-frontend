@@ -30,6 +30,14 @@ head-major, never dense-padded.**
   stride_s, h_q)` — the one classifier the fwd adapters, the bwd probe and the
   bwd lowering share; never re-implement the stride test inline (Rule 3's
   "suspect duplicated logic first").
+- For override-enabled prepared half plans, HN remains the compiled layout
+  kind but its head stride is an execution binding. A changing packed token
+  total must not become a new graph or compile key. Validate the effective
+  stride against observed storage, retain independent invocation frames,
+  and replay an older capture after binding a different stride. The detector
+  is `test_hn_stride_override_reuses_plan_and_old_capture`; the native/Python
+  differential detector also checks concurrent frames. Standalone and
+  non-override graph plans retain the declared-stride contract.
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.

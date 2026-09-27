@@ -2211,7 +2211,7 @@ def lower_dsl_prefill(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
-            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=facts.shape_overrides)
         elif getattr(api, "_dense_spec", None) is not None:
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).

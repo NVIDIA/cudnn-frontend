@@ -157,6 +157,8 @@ class SdpaThdBinder {
         has_lse_         = spec.attr("has_lse").cast<bool>();
         lse_head_major_  = spec.attr("lse_head_major").cast<bool>();
         lse_head_stride_ = integer(spec, "lse_head_stride");
+        lse_stride_override_ =
+            py::hasattr(spec, "lse_stride_override") && spec.attr("lse_stride_override").cast<bool>();
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
             lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
@@ -214,24 +216,25 @@ class SdpaThdBinder {
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
 
-        const auto &lse      = facts[LSE];
-        int64_t lse_capacity = -1;
+        const auto &lse         = facts[LSE];
+        int64_t lse_capacity    = -1;
+        int64_t lse_head_stride = lse_head_stride_;
         if (has_lse_) {
             if (!lse.filled) invalid("lse_tensor is required by this compiled specialization");
             on_device(lse, "lse_tensor");
             if (!dtype_is(lse, kDLFloat, 32)) invalid("lse_tensor must be float32");
             if (lse.pointer % 4 != 0) invalid("lse_tensor must be 4-byte aligned");
-            if (lse_head_major_ && lse_head_stride_) {
-                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride_))
+            lse_head_stride = check_stats_layout(lse);
+            if (lse_head_major_ && lse_head_stride) {
+                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
-                if (numel(lse) < multiply(qh_, lse_head_stride_))
+                if (numel(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor must hold H_q*head_stride elements");
             } else {
                 if (span(lse) < 0)
                     invalid("lse_tensor: a ragged Stats operand needs a sized buffer, not a bare address");
                 lse_capacity = span(lse) / qh_;
             }
-            check_stats_layout(lse);
         } else if (lse.filled) {
             invalid("this specialization was compiled without a Stats output; construct the API without sample_lse");
         }
@@ -266,7 +269,7 @@ class SdpaThdBinder {
             put(frame, KStrides, py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
             put(frame, VStrides, py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
         }
-        if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, LSEExtent, py::int_(tq));
+        if (has_lse_ && lse_head_major_) put(frame, LSEExtent, py::int_(lse_head_stride ? lse_head_stride : tq));
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
         // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
         // Rebind a safe grid without reading device lengths or mutating the plan.
@@ -369,9 +372,9 @@ class SdpaThdBinder {
         if (n < 0) invalid(std::string(name) + " was passed as a bare address; a ragged operand needs a sized buffer");
         return n < g.row ? 0 : (n - g.row) / g.token + 1;
     }
-    void
+    int64_t
     check_stats_layout(const NativeOperandView &f) const {
-        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return;
+        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return lse_head_stride_;
         int64_t hs, ts;
         if (f.shape.size() == 4 || (f.shape.size() == 3 && lse_head_major_)) {
             hs = stride(f, 1);
@@ -387,11 +390,14 @@ class SdpaThdBinder {
         }
         if (lse_head_major_) {
             if (ts != 1) invalid("head-major lse_tensor must have the token axis contiguous");
+            if (hs <= 0) invalid("head-major lse_tensor head stride must be positive");
+            if (lse_stride_override_) return hs;
             if (lse_head_stride_ && hs != lse_head_stride_)
                 invalid("head-major lse_tensor head stride must be the declared head stride");
         } else if (hs != 1 || ts != qh_) {
             invalid("token-major lse_tensor must be packed (T, H): head stride 1, token stride H_q");
         }
+        return lse_head_stride_;
     }
     void
     put(py::tuple &frame, HostSlot slot, py::object value) const {
@@ -405,7 +411,7 @@ class SdpaThdBinder {
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_;
-    bool has_lse_, lse_head_major_;
+    bool has_lse_, lse_head_major_, lse_stride_override_;
 };
 
 }  // namespace
@@ -414,6 +420,7 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),

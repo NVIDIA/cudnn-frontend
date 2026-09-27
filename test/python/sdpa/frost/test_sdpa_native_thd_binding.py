@@ -288,3 +288,32 @@ def test_native_thd_launch_bound_retains_persistent_cap():
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     assert _equal(s, facts)[s.index["n_thd_units"]] == 7
     assert s.template[s.index["n_thd_units"]] == 7
+
+
+def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
+    s, facts, recorded = _fixture(layout="HN")
+    s.lse_stride_override = True
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+
+    def run(i):
+        stride = 16 + i
+        changed = dict(facts)
+        changed["lse"] = facts["lse"]._replace(ptr=0x20000 + 0x1000 * i, shape=(1, 8, stride), strides=(8 * stride, stride, 1), span=8 * stride)
+        frame = _equal(s, changed, stream=17 + i)
+        assert frame[s.index["lse_ext"]] == stride
+        assert s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x30000, 17 + i)
+        return frame
+
+    with ThreadPoolExecutor(2) as pool:
+        frames = list(pool.map(run, range(8)))
+    assert len(recorded) == 8
+    for i, frame in enumerate(frames):
+        assert frame[s.index["lse_ext"]] == 16 + i
+        assert frame[s.index["lse_ptr"]] == 0x20000 + 0x1000 * i
+    assert s.template[s.index["lse_ext"]] == s.lse_head_stride == 16
+    for updates in ({"span": 127}, {"strides": (128, 17, 1)}, {"strides": (128, 0, 1)}, {"strides": (128, 16, 2)}):
+        changed = dict(facts, lse=facts["lse"]._replace(**updates))
+        with pytest.raises(ValueError):
+            _native(s, changed)
+        with pytest.raises(ValueError):
+            _reference(s, changed)
