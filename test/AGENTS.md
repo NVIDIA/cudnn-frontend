@@ -330,3 +330,9 @@ and tensor-operand elision must use the same effective presence decision.
 `test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
+
+For a GEMM+GLU failure, compare the final output with both the stored GEMM
+intermediate and an independent dot product before attributing it to GEMM.
+SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
+halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
+bounded failure output, and preservation of the original assertion.

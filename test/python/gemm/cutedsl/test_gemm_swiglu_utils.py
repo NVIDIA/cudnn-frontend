@@ -380,6 +380,50 @@ def run_gemm_swiglu_ref(a_ref, b_ref, alpha):
     return ab12_ref, c_ref
 
 
+def _swiglu_failure_details(a, b, ab12, c, expected, alpha, *, atol, rtol, limit=8):
+    """Small CPU snapshot separating GEMM intermediates from the GLU epilogue.
+
+    Columns are interleaved in 32-element input/gate blocks, not two halves.
+    This runs only after the existing output assertion has failed.
+    """
+    actual = c.detach().cpu().double()
+    expected = expected.to(torch.float32 if c.dtype in {torch.float8_e4m3fn, torch.float8_e5m2} else c.dtype).cpu().double()
+    bad = ~torch.isclose(actual, expected, atol=atol, rtol=rtol)
+    indices = bad.nonzero()[:limit].tolist()
+    aa, bb, intermediate = (t.detach().cpu().double() for t in (a, b, ab12))
+    rows = []
+    for m, n, batch in indices:
+        input_col = (n // 32) * 64 + n % 32
+        gate_col = input_col + 32
+        inp, gate = intermediate[m, input_col, batch], intermediate[m, gate_col, batch]
+        exact_inp = alpha * (aa[m, :, batch] * bb[input_col, :, batch]).sum()
+        exact_gate = alpha * (aa[m, :, batch] * bb[gate_col, :, batch]).sum()
+        rows.append(
+            dict(
+                index=[m, n, batch],
+                input_col=input_col,
+                gate_col=gate_col,
+                actual=float(actual[m, n, batch]),
+                expected=float(expected[m, n, batch]),
+                stored_input=float(inp),
+                stored_gate=float(gate),
+                from_stored_ab12=float(inp * gate * torch.sigmoid(gate)),
+                fp64_input=float(exact_inp),
+                fp64_gate=float(exact_gate),
+                from_fp64_dot=float(exact_inp * exact_gate * torch.sigmoid(exact_gate)),
+            )
+        )
+    return dict(
+        mismatches=int(bad.sum()),
+        alpha=alpha,
+        operands={
+            name: dict(shape=list(t.shape), strides=list(t.stride()), dtype=str(t.dtype), device=str(t.device))
+            for name, t in (("a", a), ("b", b), ("ab12", ab12), ("c", c))
+        },
+        points=rows,
+    )
+
+
 def check_ref_gemm_swiglu(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -405,15 +449,26 @@ def check_ref_gemm_swiglu(
             torch.testing.assert_close(ab12.cpu(), ab12_ref.to(ab12.dtype), atol=0.01, rtol=9e-03)
 
         is_c_fp8 = c.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
-        if is_c_fp8:
-            torch.testing.assert_close(
-                c.cpu().to(torch.float32),
-                c_ref.to(torch.float32),
-                atol=0.1,
-                rtol=0.1,
-            )
-        else:
-            torch.testing.assert_close(c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=9e-03)
+        try:
+            if is_c_fp8:
+                torch.testing.assert_close(
+                    c.cpu().to(torch.float32),
+                    c_ref.to(torch.float32),
+                    atol=0.1,
+                    rtol=0.1,
+                )
+            else:
+                torch.testing.assert_close(c.cpu(), c_ref.to(c.dtype), atol=0.01, rtol=9e-03)
+        except AssertionError:
+            import json
+
+            try:
+                details = _swiglu_failure_details(a, b, ab12, c, c_ref, alpha, atol=0.1 if is_c_fp8 else 0.01, rtol=0.1 if is_c_fp8 else 9e-03)
+                print("SwiGLU output diagnostic: " + json.dumps(details), flush=True)
+            except Exception as diagnostic_error:
+                # A diagnostic must never replace the original failing assertion.
+                print(f"SwiGLU output diagnostic unavailable: {diagnostic_error}", flush=True)
+            raise
     else:
         print("Skipping reference check")
 
