@@ -1257,3 +1257,85 @@ class TestPreparedSm107Fp8:
         assert g._compiled_plans[g._plan_index]._prepared is not None
         g.execute(vp, ws)
         _prepared_fp8_checks._check(bufs, thd=False, sq=16, skv=256)
+
+
+# MXFP8 probes share fixtures but are collected by the SM107 CI entry point.
+import test_sdpa_prepared_mxfp8 as _prepared_mxfp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestPreparedSm107Mxfp8:
+    @pytest.fixture(autouse=True)
+    def _sm107_mxfp8_case(self, monkeypatch):
+        original = _prepared_mxfp8_checks._case
+
+        def case(**kwargs):
+            kwargs.setdefault("arch", "sm107")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_prepared_mxfp8_checks, "_case", case)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_mxfp8_rebind(self, stats, amax, dtype, d, dv, output_dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_rebind_scales_and_buffers(False, stats, amax, dtype, d, dv, output_dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_capture(self, d, dv, dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_capture_reads_current_scales(False, 1, d, dv, dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("carrier", [torch.uint8, torch.int32])
+    def test_sm107_mxfp8_sf_storage(self, d, dv, carrier):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_sf_physical_permutation(False, d, dv, carrier)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_mxfp8_strides_and_adapter(self, d, dv, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_strided_dense_inputs(d, dv)
+        _prepared_mxfp8_checks.test_prepared_mxfp8_graph_and_adapter_bind_same_frame(False, d, dv, monkeypatch)
+
+    def test_sm107_mxfp8_no_allocation_or_sync(self, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_execute_has_no_allocation_or_sync(False, 1, monkeypatch)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("layout", ["padded", "batch_inner"])
+    def test_sm107_mxfp8_runtime_stats_layout(self, d, dv, layout):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_runtime_stats_layout_keeps_generic_branch(d, dv, layout)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_physical_output_stride_int64(self, d, dv, dtype):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < 18 * 2**30:
+            pytest.skip("physical output-stride regression needs 18 GiB free")
+        try:
+            g, vp, ws, bufs, _ = _prepared_mxfp8_checks._case(
+                d=d,
+                dv=dv,
+                b=1,
+                hq=1,
+                hk=1,
+                sq=2,
+                skv=128,
+                output_dtype=dtype,
+                output_padding=2**32,
+                explicit_plan=True,
+            )
+        except torch.OutOfMemoryError:
+            pytest.skip("physical output-stride storage unavailable")
+        assert bufs["o"].stride(2) > 2**32
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        bufs["o"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)
+        with _prepared_mxfp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            _prepared_mxfp8_checks._change_scales(bufs)
+            bufs["o"].fill_(float("nan"))
+            graph.replay()
+            _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)

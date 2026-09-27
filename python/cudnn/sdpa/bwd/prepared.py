@@ -19,6 +19,7 @@ class Operand:
     span: int
     alignment: int
     itemsize: int
+    allowed_numels: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class BwdLaunchSpec:
     device_index: int
     scale: float
     name: str = "sdpa_bwd_sm120"
+    length_form: bool = False
 
 
 def build_sm120_spec(api):
@@ -90,16 +92,28 @@ def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None
             not raw_storage
             and name in ("seq_q", "seq_kv", "sink", "dsink", "bias", "dbias")
             and f.shape
-            and (not f.contiguous or f.numel != math.prod(op.shape))
+            and (not f.contiguous or f.numel not in (op.allowed_numels or (math.prod(op.shape),)))
         ):
             raise ValueError(f"{spec.name}: {label} must be contiguous with {math.prod(op.shape)} elements")
         if geometry is not None and geometry[i] is not None and f.shape and not _same_geometry((f.shape, f.strides), geometry[i]):
             raise ValueError(f"{spec.name}: {name} runtime geometry must match this fixed backward plan")
-        if workspace_ptr < f.ptr + op.span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
+        span = f.numel if op.allowed_numels and f.shape and not raw_storage else op.span
+        if workspace_ptr < f.ptr + span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
     scale = spec.scale if scale is None or scale == 0 else float(scale)
-    frame.extend((workspace_ptr, scale * math.log2(math.e), scale, stream_int))
+    frame.extend((workspace_ptr, scale * math.log2(math.e), scale))
+    if spec.length_form:
+        # Graph THD declarations carry B lengths. Standalone also accepts B+1
+        # prefixes; their form is host metadata, never a device read.
+        form = 0
+        if not raw_storage:
+            for bit, name in enumerate(("seq_q", "seq_kv")):
+                f = facts.get(name)
+                if f is not None and f.numel == spec.operands[9 + bit].shape[0] + 1:
+                    form |= 1 << bit
+        frame.append(form)
+    frame.append(stream_int)
     spec.fn(*frame)
 
 

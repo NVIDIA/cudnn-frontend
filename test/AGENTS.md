@@ -165,6 +165,11 @@ can still compile a prepared artifact inside the adapter and fail at execution.
 K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
 checks the retained tensor path numerically and under CUDA Graph replay.
 
+For descriptor stride products, inspect the traced multiplication intermediates,
+not just the final cast or Python annotation. MXFP8 V scales use a separate
+plane stride: `test_mxfp8_v_scale_plane_stride_multiplies_in_int64` checks the
+real host expression before descriptor encoding and must fail before widening.
+
 The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
 FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
 with a move; a new sibling file alone is not exercised by that lane.
@@ -208,3 +213,30 @@ A capability row's `sm_lo` names its lower bound, not the actual device.
 Prepared admission must respect the adapter's exact device support even when
 the row spans later compute capabilities. Include future-cc rejection controls
 alongside the supported device in `test_prepared_fp8_override_capability_envelope`.
+
+### Concurrent prepared frames versus SDK initialization
+
+CuTe DSL 4.7.0/4.7.1 can leak the runtime's process-global initialization lock
+when two threads first call the same cold artifact; a later test then hangs in
+`cuda_dialect_init_library_once` before its kernel launches (see the independent
+[runtime reproduction](https://github.com/NVIDIA/cudnn-frontend/pull/1236#issuecomment-5854182558)).
+For a test of concurrent per-call bindings, initialize the artifact serially,
+retain that warm call's owners, then use distinct buffers, poisoned outputs,
+fresh workspace and independent streams for the concurrent calls.
+`test_native_thd_concurrent_streams_use_independent_frames` follows this recipe.
+This tests frame independence; it does not establish that cold concurrent SDK
+initialization is fixed. Keep that runtime reproduction and its result separate.
+
+### MXFP8 prepared scale-factor bindings
+
+Dense V scale factors for D > 128 are plane-major; THD factors are packed
+per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
+inputs; reshaping a dense buffer does not produce the THD contract. Rebind
+E8M0 exponent values as well as pointers and validate after graph replay.
+The MXFP8 split combine has no per-tensor output scalar: specialize its
+scale pointer to None and remove Amax unscaling, rather than handing a NULL
+runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
+covers every native flavor with requested Amax. Physical SF stride units are
+16 bytes; widen tile-count products before multiplication. The L1
+`test_prepared_mxfp8_sf_head_stride_above_int32_units` steps a physical 64-GiB
+head stride and checks numerical output, with resource-only OOM skips.

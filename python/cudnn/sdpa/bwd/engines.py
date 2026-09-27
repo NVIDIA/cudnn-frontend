@@ -571,7 +571,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     # flow to execute.
     thd = facts.thd
     # Packed Stats packing, read off the ragged declaration exactly as the
-    # forward reads it (fwd/api_dsl.py, `_thd_lse_view`): token-major (T, H)
+    # forward reads it (fwd/prepared.py, `bind_thd`): token-major (T, H)
     # -- cuDNN's ragged-Stats recipe -- or head-major (1, QH, head_stride),
     # which is what the FROST forward emits natively. mismatch() has already
     # rejected anything that is neither.
@@ -656,7 +656,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
-    if api_type == _SM120 or (api_type == _SM80 and api._prepared is not None):
+    if api_type in (_SM120, _SM100, _SM80) and getattr(api, "_prepared", None) is not None:
         from types import SimpleNamespace
         from .prepared import PreparedBwdLaunch
 

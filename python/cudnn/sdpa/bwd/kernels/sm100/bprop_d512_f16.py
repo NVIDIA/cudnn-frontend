@@ -1547,8 +1547,6 @@ def compile(  # noqa: A001
     qh_kv: Optional[int] = None,
     sq_real: Optional[int] = None,
     skv_real: Optional[int] = None,
-    lse_token_major: bool = False,
-    lse_head_stride: int = 0,
 ) -> Callable:
     """Per-shape compile cache.
 
@@ -1560,19 +1558,11 @@ def compile(  # noqa: A001
     """
     _cache_key = _template_key(globals(), locals(), "compile")
     if CFG.THD_VARLEN:
-        # Packed token totals are RUNTIME values (they change every step under
-        # continuous batching), so the token extents compile DYNAMIC and the
-        # cache key stays plan-time-only. `sq` becomes the workspace's blocked
-        # ROW total and `skv` its uniform column count -- both dynamic too, the
-        # first because it depends on the lengths and the second because the
-        # host sizes it from the declared S_kv_max.
-        if lse_token_major:
-            pass  # rank-2 (T, H) Stats; the kernel branches on the static rank
-    else:
-        if sq % (CFG.TILE_M * CFG.CTA_MMA) != 0:
-            raise ValueError(f"bwd d512: S_q must be a multiple of TILE_M*CTA_MMA ({CFG.TILE_M * CFG.CTA_MMA}); got {sq}")
-        if skv % CFG.TILE_N != 0:
-            raise ValueError(f"bwd d512: S_kv must be a multiple of TILE_N ({CFG.TILE_N}); got {skv}")
+        raise ValueError("bwd d512: THD is compiled by the prepared pointer host")
+    if sq % (CFG.TILE_M * CFG.CTA_MMA) != 0:
+        raise ValueError(f"bwd d512: S_q must be a multiple of TILE_M*CTA_MMA ({CFG.TILE_M * CFG.CTA_MMA}); got {sq}")
+    if skv % CFG.TILE_N != 0:
+        raise ValueError(f"bwd d512: S_kv must be a multiple of TILE_N ({CFG.TILE_N}); got {skv}")
     if qh % qh_chunk != 0:
         raise ValueError(f"bwd d512: qh_chunk ({qh_chunk}) must divide qh ({qh}) -- even chunks keep one compiled artifact")
     # Head dims below TILE_K need NO kernel change: the TMA descriptors are built
@@ -1596,80 +1586,23 @@ def compile(  # noqa: A001
     def _fake_bshd(shape, dtype=STORAGE_DTYPE):
         return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
 
-    # Q/K/V/dO carry the REAL sequence length: a tile reading past it is TMA
-    # zero-filled, which is exactly what the tail mask expects to see.
-    if CFG.THD_VARLEN:
-        # One symbol per ragged group: Q/dO (and the Stats/delta rows) share the
-        # packed q total, K/V share the kv total, and the workspace's blocked
-        # row total is its own -- so a new packing re-binds the SAME compiled
-        # artifact instead of minting one per step.
-        _t_q = cute.sym_int(divisibility=1)
-        _t_kv = cute.sym_int(divisibility=1)
-        _ws_rows = cute.sym_int(divisibility=CFG.WS_BLOCK_ROWS)
-        _fake_b = 1
-    else:
-        _t_q, _t_kv, _ws_rows, _fake_b = sq_real, skv_real, sq, b
-
-    fake_q = _fake_bshd((_fake_b, _t_q, qh, d))
-    # K/V are indexed by the KV head, so their head extent is qh_kv.
-    fake_k = _fake_bshd((_fake_b, _t_kv, qh_kv, d))
-    fake_v = _fake_bshd((_fake_b, _t_kv, qh_kv, d))
-    fake_do = _fake_bshd((_fake_b, _t_q, qh, d))
-    # Chunk-local workspaces, [B, H_chunk, S_q, S_kv] at the io dtype -- and
-    # under THD [1, H_chunk, R_total, N], the BLOCKED form: the batch axis
-    # collapses to 1 and the q axis becomes the packed, per-sequence
-    # TILE_M-padded row total that row_off[b] indexes into.
-    fake_s = _fake_bshd((_fake_b, qh_chunk, _ws_rows, skv), dtype=WORKSPACE_DTYPE)
-    fake_ds = _fake_bshd((_fake_b, qh_chunk, _ws_rows, skv), dtype=WORKSPACE_DTYPE)
-    # Plain per-lane reads, one q-row per lane -- no TMA, no barriers.  THD
-    # Stats is the CALLER's, in either packing the forward emits; the kernel
-    # branches on the static rank, so the layout is fully encoded here.
-    if CFG.THD_VARLEN:
-        if lse_token_major:
-            if lse_head_stride:
-                raise ValueError("bwd d512: lse_head_stride is head-major-only (token-major (T, H) is compact)")
-            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_t_q, qh), stride_order=(1, 0), assumed_align=4)
-        else:
-            # Head-major (1, QH, head_stride).  head_stride is the CALLER's --
-            # the forward emits a token capacity rounded up to 64, so it is
-            # routinely WIDER than the packed total -- and it enters as the
-            # tensor's third EXTENT, exactly as the forward's own epilogue
-            # builds this fake (prefill_d512_f16_sm100.py, `_lse_hs`).  It has
-            # to be the extent and not a stride: the fake is compact, and a
-            # symbolic stride crashes the DSL.  0 = compact = the packed token
-            # symbol itself.  Reads are all `[0, head_g, row]` with
-            # row < t_q <= head_stride, so a wider extent is only ever slack.
-            _lse_hs = int(lse_head_stride) if lse_head_stride else _t_q
-            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _lse_hs), stride_order=(2, 1, 0), assumed_align=4)
-    else:
-        if lse_head_stride:
-            raise ValueError("bwd d512: lse_head_stride is THD-only")
-        fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_real), stride_order=(2, 1, 0), assumed_align=16)
+    # Dense conversion fallback only; native dense and packed THD compile the
+    # pointer host directly and never build this tensor-ABI fake family.
+    fake_q = _fake_bshd((b, sq_real, qh, d))
+    fake_k = _fake_bshd((b, skv_real, qh_kv, d))
+    fake_v = _fake_bshd((b, skv_real, qh_kv, d))
+    fake_do = _fake_bshd((b, sq_real, qh, d))
+    fake_s = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
+    fake_ds = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
+    fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_real), stride_order=(2, 1, 0), assumed_align=16)
     # do_dot's producer (dot_do_o_kernel) indexes delta with a row stride of
     # ceil(S_q / 128) * 128, NOT S_q -- so the buffer, and this view of it, must
     # use the same rounding. They coincide whenever S_q is a multiple of 128,
     # which is why a non-multiple was the only shape that exposed it.
     sq_dot = -(-sq_real // 128) * 128
-    if CFG.THD_VARLEN:
-        # delta is OURS, so it stays head-major packed [1, QH, T_q]: stage 1
-        # produces it from the packed O/dO with a batch extent of 1.
-        # delta's extent is STATIC even under THD: the adapter binds the packed
-        # tensors at the capacity bound it passes as `sq_real`, so the producer's
-        # ceil(rows / 128) * 128 rounding is a compile-time number.  Both the
-        # symbolic alternatives fail -- a second shape symbol gets unified with
-        # Q's (and then rejects any packing that is not a multiple of 128), and
-        # a symbolic STRIDE crashes the DSL outright.
-        fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
-        # The metadata buffer (THD_BWD_META_WORDS(B)) and the descriptor array
-        # (THD_BWD_DESC_SLOTS(B) tensor maps), both written by the setup launch.
-        fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (5 * b + 5,), stride_order=(0,), assumed_align=16)
-        fake_desc_words = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int64, (THD_STAGE2_DESC_SLOTS * _TENSOR_MAP_QWORDS,), stride_order=(0,), assumed_align=16
-        )
-    else:
-        fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
-        fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
-        fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
+    fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
+    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
+    fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
 
     return _compile_cached(
         _host,
@@ -1683,10 +1616,7 @@ def compile(  # noqa: A001
         fake_do_dot,
         fake_seq_kv_lens,
         fake_desc_words,
-        # N_THD_UNITS: the persistent grid's cluster count, a RUNTIME value --
-        # the host sizes it for occupancy, and the device bound in the metadata
-        # is what actually stops the claim loop.
-        (b, qh, sq, skv, qh_chunk, qh_kv, sq_real, skv_real, cute.sym_int(divisibility=1) if CFG.THD_VARLEN else 0),
+        (b, qh, sq, skv, qh_chunk, qh_kv, sq_real, skv_real, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),

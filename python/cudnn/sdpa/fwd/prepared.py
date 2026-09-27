@@ -100,6 +100,79 @@ _QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
 class QuantizedLaunchSpec(NamedTuple):
     has_amax: bool
     scratch_offset: int  # unused amax and an identity scale, in caller-owned workspace
+    sf_sizes: Tuple[int, ...] = ()  # opaque F8_128x4 tile byte sizes; empty for per-tensor FP8
+
+
+def _quant_spec(api):
+    if getattr(api, "_prepared_mxfp8", False):
+        km = api._k_mod
+        return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K, km.SF_SMEM_SIZE_V))
+    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+
+
+def _quant_roles(quant):
+    return ("sf_q", "sf_k", "sf_v", "amax_o") if quant.sf_sizes else _QUANT_ROLES
+
+
+def _quant_slots(quant):
+    if quant is None:
+        return frozenset()
+    return frozenset(("sf_q_ptr", "sf_k_ptr", "sf_v_ptr", "sf_tiles", "amax_o_ptr")) if quant.sf_sizes else _QUANT_SLOTS
+
+
+@lru_cache(maxsize=256)
+def _sf_byte_count(shape, strides, dtype):
+    """Opaque reordered SF must be gap-free storage, in any axis permutation."""
+    if len(shape) != len(strides) or any(n < 0 or st < 0 for n, st in zip(shape, strides)):
+        raise ValueError("cudnn.sdpa: MXFP8 SF geometry must have matching nonnegative extents and strides")
+    width = _buffers.DTYPE_ITEMSIZE.get(dtype)
+    if width is None:
+        raise ValueError(f"cudnn.sdpa: unsupported MXFP8 SF storage dtype {dtype}")
+    if 0 in shape:
+        return 0
+    extent = 1
+    for stride, size in sorted((st, n) for n, st in zip(shape, strides) if n > 1):
+        if stride != extent:
+            raise ValueError("cudnn.sdpa: MXFP8 SF requires dense non-overlapping storage in physical order")
+        extent *= size
+    return extent * width
+
+
+def _bind_mxfp8_scales(spec, facts):
+    patches, tiles = {}, []
+    thd = isinstance(spec, ThdLaunchSpec)
+    for name, heads, size in zip(("sf_q", "sf_k", "sf_v"), (spec.qh, spec.kh, spec.kh), spec.quant.sf_sizes):
+        f = facts.get(name)
+        if f is None:
+            raise ValueError(f"cudnn.sdpa: MXFP8 requires {name}")
+        _on_plan_device(spec, name, f)
+        nbytes = _sf_byte_count(f.shape, f.strides, f.dtype)
+        if 0 <= f.span * _buffers.DTYPE_ITEMSIZE[f.dtype] < nbytes:
+            raise ValueError(f"cudnn.sdpa: {name} observed storage is too small")
+        if nbytes and (not f.ptr or f.ptr % _ALIGN_TMA):
+            raise ValueError(f"cudnn.sdpa: {name} must be 16-byte aligned")
+        row = heads * size
+        if thd:
+            if nbytes % row:
+                raise ValueError(f"cudnn.sdpa: {name} must hold whole packed SF tile rows")
+            count = nbytes // row
+            # Zero storage is legal only for a zero-capacity operand. Its SF
+            # descriptor binds NULL with one dead tile, never an owned dummy.
+            operand = facts[name[-1]]
+            if count == 0 and operand.numel and operand.span != 0:
+                raise ValueError(f"cudnn.sdpa: empty {name} requires zero-capacity {name[-1]}")
+        else:
+            count = ((spec.s_q_max if name == "sf_q" else spec.s_k_max) + 127) // 128
+            if nbytes != spec.b * row * count:
+                raise ValueError(f"cudnn.sdpa: {name} size does not match the compiled dense geometry")
+        if count > _I32_MAX:
+            raise ValueError(f"cudnn.sdpa: {name} tile count exceeds Int32")
+        patches[name + "_ptr"] = f.ptr if nbytes else 0
+        tiles.append(max(1, count))
+    if tiles[1] != tiles[2]:
+        raise ValueError("cudnn.sdpa: sf_k and sf_v must have the same packed tile count")
+    patches["sf_tiles"] = tuple(tiles)
+    return patches
 
 
 def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None):
@@ -113,10 +186,10 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
     quant = spec.quant
     if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
         raise ValueError("cudnn.sdpa: prepared FP8 requires an aligned caller workspace")
-    patches = {}
+    patches = _bind_mxfp8_scales(spec, facts) if quant.sf_sizes else {}
     identity = workspace_ptr + quant.scratch_offset + 4
     needs_identity = False
-    for name in _QUANT_ROLES:
+    for name in (("amax_o",) if quant.sf_sizes else _QUANT_ROLES):
         f = facts.get(name)
         if f is None:
             if name == "amax_o":
@@ -159,8 +232,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         frame, combine_args = bind_dense_split(spec, facts, workspace_ptr, stream, stream_int)
         # The quantized combine appends its scalar pointers before the stream;
         # the half and ragged pointer ABIs remain unchanged.
-        combine_args = (*combine_args[:-1], amax if quant.has_amax else None, patches["scale_o_ptr"], stream)
-        if spec.combine.output_dtype in ("float8_e4m3fn", "float8_e5m2"):
+        combine_args = (*combine_args[:-1], amax if quant.has_amax else None, patches.get("scale_o_ptr"), stream)
+        if not quant.sf_sizes and spec.combine.output_dtype in ("float8_e4m3fn", "float8_e5m2"):
             # FP8 rounding and scale_o belong to the final combine, once.
             # The main host None-specializes its scale to one. Avoid an
             # identity memset (and its captured engine dependency) per call.
@@ -272,7 +345,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    host = km._host_prepared if getattr(api, "_prepared_fp8", False) else km._host
+    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
     order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
@@ -295,7 +368,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
-    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+    s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
@@ -344,7 +417,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - (_QUANT_SLOTS if s.quant is not None else frozenset()))
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
@@ -802,7 +875,7 @@ class PreparedThdLaunch:
             uids["block_table"] = binding.paged_k_table.get_uid()
             uids["block_table_v"] = binding.paged_v_table.get_uid()
         if spec.quant is not None:
-            for name in _QUANT_ROLES:
+            for name in _quant_roles(spec.quant):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
@@ -933,7 +1006,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s = DenseLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
-    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+    s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
@@ -969,6 +1042,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # compile neither (both fields are the FP8 flavors'), so this pins nothing today and guards their joining.
     params = getattr(km, "PARAMS", None)
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
+    if s.quant is not None and s.quant.sf_sizes:
+        s.shape_fixed = s.lpt_grid_fixed = True  # dense SF batch/head pitches are plan-fixed
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
@@ -992,6 +1067,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             quantized=s.quant is not None,
             has_amax=s.quant.has_amax if s.quant is not None else False,
             has_scale_o=api._split_scale_o() if s.quant is not None else False,
+            has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
         )
         fn = positional_entry(owner)
         if fn is None:
@@ -1035,7 +1111,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("ragged_q_div", s.ragged_divs[0] if s.ragged else 1)
     if s.ragged and "ragged_q_addr" not in s.index:
         raise NotImplementedError(f"{km.__name__}: the ragged-Q decode leg needs the ragged_q_addr host slot")
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE - (_QUANT_SLOTS if s.quant is not None else frozenset()))
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE - _quant_slots(s.quant))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
@@ -1453,7 +1529,7 @@ class PreparedDenseLaunch:
             if spec.combine is not None and spec.combine.has_stats:
                 uids["ragged_lse"] = binding.ragged_stats.get_uid()
         if spec.quant is not None:
-            for name in _QUANT_ROLES:
+            for name in _quant_roles(spec.quant):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
