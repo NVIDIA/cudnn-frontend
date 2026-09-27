@@ -744,6 +744,9 @@ def _kernel(
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === TMA-LDG warp group ===
 
 
