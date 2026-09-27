@@ -239,7 +239,7 @@ def test_sdpa_fwd_sm80_thd_off_flavor_head_dim():
 def test_sm80_thd_compile_key_plan_time_only():
     """Issue #604 regression: the packed THD token totals are RUNTIME values,
     so two varlen calls with different totals must re-bind ONE compiled
-    artifact (the template module's per-shape lru sees a single miss) —
+    artifact (the prepared host's metadata-only LRU sees a single miss) —
     never mint a compile per step, which is the continuous-batching
     pathology no correctness test catches."""
     from cudnn.frost import template_loader
@@ -266,11 +266,10 @@ def test_sm80_thd_compile_key_plan_time_only():
         )
 
     def cache_totals():
-        # The lru counters are session-global (earlier tests in a full run
-        # accumulate misses), so assert on DELTAS across our calls only.
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "sm80" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+        from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+
+        info = compile_thd_host.cache_info()
+        return info.misses, info.hits
 
     varlen([96, 160])  # first call: one compile
     n_modules_before = len(template_loader._MODULES)
