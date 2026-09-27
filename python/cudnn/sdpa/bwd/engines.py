@@ -656,7 +656,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
-    if api_type == _SM120:
+    if api_type == _SM120 or (api_type == _SM80 and api._prepared is not None):
         from types import SimpleNamespace
         from .prepared import PreparedBwdLaunch
 

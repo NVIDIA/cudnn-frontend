@@ -149,18 +149,23 @@ def _bprop_kernel(
     LSE_view = cutlass.make_array_view(LSE)
     DOT_view = cutlass.make_array_view(DO_DOT)
 
-    QK_RS = cutlass.Int32(H) * cutlass.Int32(d)  # GMEM row stride for Q/K/dO/V (BSHD)
+    Q_RS = cutlass.Int64(Q.stride[1])
+    K_RS = cutlass.Int64(K.stride[1])
+    V_RS = cutlass.Int64(V.stride[1])
+    DO_RS = cutlass.Int64(dO.stride[1])
     kv_base = kv_tile * cutlass.Int32(N_BLOCK)
 
     # K/V tile base GMEM element pointers for this (batch, head).
-    kv_row0_base = ((batch * cutlass.Int32(SKV) + kv_base) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    k_tile_gmem = K_view.data_ptr() + kv_row0_base
-    v_tile_gmem = V_view.data_ptr() + kv_row0_base
+    k_base = cutlass.Int64(batch) * cutlass.Int64(K.stride[0]) + cutlass.Int64(kv_base) * K_RS + cutlass.Int64(head) * cutlass.Int64(K.stride[2])
+    v_base = cutlass.Int64(batch) * cutlass.Int64(V.stride[0]) + cutlass.Int64(kv_base) * V_RS + cutlass.Int64(head) * cutlass.Int64(V.stride[2])
+    k_tile_gmem = K_view.data_ptr() + k_base
+    v_tile_gmem = V_view.data_ptr() + v_base
 
-    lse_head_base = (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
-    dot_head_base = lse_head_base
+    lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
+    dot_head_base = (cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ)
 
-    bhead_q = (batch * cutlass.Int32(SQ) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    bhead_q = cutlass.Int64(batch) * cutlass.Int64(Q.stride[0]) + cutlass.Int64(head) * cutlass.Int64(Q.stride[2])
+    bhead_do = cutlass.Int64(batch) * cutlass.Int64(dO.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dO.stride[2])
 
     # ---- SMEM tiles -------------------------------------------------------
     QSTAGE = M_BLOCK * d
@@ -179,7 +184,7 @@ def _bprop_kernel(
         k_tile_gmem,
         rows=N_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=K_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -191,7 +196,7 @@ def _bprop_kernel(
         v_tile_gmem,
         rows=N_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=V_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -201,7 +206,6 @@ def _bprop_kernel(
     cp_async_commit()  # group: K / V
 
     SQ_rt = cutlass.Int32(SQ)
-    HD = cutlass.Int32(H) * cutlass.Int32(d)
     # Pipeline fill: Q is 1-deep (tile 0), dO is 2-deep (tiles 0 AND 1).  Each
     # tensor load is its OWN cp.async commit group so the mainloop's
     # ``cp_async_wait(1)`` drains them in order ([K/V],[Q0],[dO0],[dO1]); the
@@ -211,7 +215,7 @@ def _bprop_kernel(
         Q_view.data_ptr() + bhead_q,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=Q_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -223,10 +227,10 @@ def _bprop_kernel(
     cp_async_commit()  # group: Q tile 0 → slot 0
     load_tile_2d(
         sdO,
-        dO_view.data_ptr() + bhead_q,
+        dO_view.data_ptr() + bhead_do,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=DO_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -238,10 +242,10 @@ def _bprop_kernel(
     cp_async_commit()  # group: dO tile 0 → slot 0
     load_tile_2d(
         sdO.subview(cutlass.Int32(QSTAGE)),
-        dO_view.data_ptr() + bhead_q + cutlass.Int32(M_BLOCK) * HD,
+        dO_view.data_ptr() + bhead_do + cutlass.Int64(M_BLOCK) * DO_RS,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=DO_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -319,8 +323,12 @@ def _bprop_kernel(
 
         # ---- softmax: P = exp2(scale·S − lse_q) → p_f (regs; written to sP after dP)
         p_f = cutlass.Array(cutlass.Float32, SDP_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-        lse_t = Pointer(LSE_view.data_ptr() + lse_head_base + q_base + q_row_t, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
-        lse_b = Pointer(LSE_view.data_ptr() + lse_head_base + q_base + q_row_b, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+        lse_t = Pointer(
+            LSE_view.data_ptr() + lse_head_base + (cutlass.Int64(q_base) + cutlass.Int64(q_row_t)) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32
+        ).load() * cutlass.Float32(_LOG2E)
+        lse_b = Pointer(
+            LSE_view.data_ptr() + lse_head_base + (cutlass.Int64(q_base) + cutlass.Int64(q_row_b)) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32
+        ).load() * cutlass.Float32(_LOG2E)
         for nf in cutlass.range_constexpr(SDP_N_FRAGS):
             off = nf * 4
             p_f[off + 0] = cute.math.exp2(acc_S[off + 0] * softmax_scale_log2 - lse_t, fastmath=True)
@@ -355,10 +363,10 @@ def _bprop_kernel(
                 # prefetch Q tile i+1 → slot stage_nxt (1-deep), overlapped with the dP MMA.
                 load_tile_2d(
                     sQ.subview(stage_nxt * cutlass.Int32(QSTAGE)),
-                    Q_view.data_ptr() + bhead_q + q_next_base * HD,
+                    Q_view.data_ptr() + bhead_q + cutlass.Int64(q_next_base) * Q_RS,
                     rows=M_BLOCK,
                     elems_per_row=d,
-                    gmem_row_stride_elems=QK_RS,
+                    gmem_row_stride_elems=Q_RS,
                     tidx=tidx,
                     num_threads=NUM_THREADS,
                     elems_per_copy=_COPY_ELEMS,
@@ -472,10 +480,10 @@ def _bprop_kernel(
                 # from stage_cur, and dK (below) reads sQ_cur, not sdO.
                 load_tile_2d(
                     sdO.subview(stage_cur * cutlass.Int32(QSTAGE)),
-                    dO_view.data_ptr() + bhead_q + do_next_base * HD,
+                    dO_view.data_ptr() + bhead_do + cutlass.Int64(do_next_base) * DO_RS,
                     rows=M_BLOCK,
                     elems_per_row=d,
-                    gmem_row_stride_elems=QK_RS,
+                    gmem_row_stride_elems=DO_RS,
                     tidx=tidx,
                     num_threads=NUM_THREADS,
                     elems_per_copy=_COPY_ELEMS,
@@ -510,7 +518,7 @@ def _bprop_kernel(
         # staging, no barrier).  kv-tiles add to the same slot for the same (tidx,j)
         # → cross-tile accumulation is exact; the (tidx,j)→(q-row,d-col) permutation
         # is undone by the _unpermute postprocess kernel.
-        dq_perm_base = ((batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ) + q_base) * cutlass.Int32(d) + tidx
+        dq_perm_base = ((cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ) + cutlass.Int64(q_base)) * cutlass.Int64(d) + tidx
         for nf in cutlass.range_constexpr(DQ_N_FRAGS):
             off = nf * 4
             for s in cutlass.range_constexpr(4):
@@ -540,15 +548,19 @@ def _bprop_kernel(
     # =======================================================================
     kv_r_t = warp_idx * cutlass.Int32(16) + g_lane
     kv_r_b = kv_r_t + cutlass.Int32(8)
-    base_t = ((batch * cutlass.Int32(SKV) + kv_base + kv_r_t) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    base_b = ((batch * cutlass.Int32(SKV) + kv_base + kv_r_b) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    dk_head = cutlass.Int64(batch) * cutlass.Int64(dK.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dK.stride[2])
+    dv_head = cutlass.Int64(batch) * cutlass.Int64(dV.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dV.stride[2])
+    dk_base_t = dk_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_t)) * cutlass.Int64(dK.stride[1])
+    dk_base_b = dk_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_b)) * cutlass.Int64(dK.stride[1])
+    dv_base_t = dv_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_t)) * cutlass.Int64(dV.stride[1])
+    dv_base_b = dv_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_b)) * cutlass.Int64(dV.stride[1])
     for nf in cutlass.range_constexpr(DKV_N_FRAGS):
         off = nf * 4
         dcol = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-        Pointer((dV_view.data_ptr() + base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 0], acc_dV[off + 1], dtype=io_dtype), alignment=4)
-        Pointer((dV_view.data_ptr() + base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 2], acc_dV[off + 3], dtype=io_dtype), alignment=4)
-        Pointer((dK_view.data_ptr() + base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 0], acc_dK[off + 1], dtype=io_dtype), alignment=4)
-        Pointer((dK_view.data_ptr() + base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 2], acc_dK[off + 3], dtype=io_dtype), alignment=4)
+        Pointer((dV_view.data_ptr() + dv_base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 0], acc_dV[off + 1], dtype=io_dtype), alignment=4)
+        Pointer((dV_view.data_ptr() + dv_base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 2], acc_dV[off + 3], dtype=io_dtype), alignment=4)
+        Pointer((dK_view.data_ptr() + dk_base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 0], acc_dK[off + 1], dtype=io_dtype), alignment=4)
+        Pointer((dK_view.data_ptr() + dk_base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 2], acc_dK[off + 3], dtype=io_dtype), alignment=4)
 
 
 _bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -582,11 +594,21 @@ def _unpermute_dq_kernel(
     acc_view = cutlass.make_array_view(dQ_acc)
     out_view = cutlass.make_array_view(dQ_out)
     # Permuted-flat read base for this (batch, head, q-tile): flat = base + j*256 + tidx.
-    perm_base = ((batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ) + qt * cutlass.Int32(M_BLOCK)) * cutlass.Int32(d) + tidx
+    perm_base = (
+        (cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ) + cutlass.Int64(qt) * cutlass.Int64(M_BLOCK)
+    ) * cutlass.Int64(d) + tidx
     q_abs_t = qt * cutlass.Int32(M_BLOCK) + dq_wr * cutlass.Int32(16) + g_lane
     q_abs_b = q_abs_t + cutlass.Int32(8)
-    out_t = ((batch * cutlass.Int32(SQ) + q_abs_t) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    out_b = ((batch * cutlass.Int32(SQ) + q_abs_b) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    out_t = (
+        cutlass.Int64(batch) * cutlass.Int64(dQ_out.stride[0])
+        + cutlass.Int64(q_abs_t) * cutlass.Int64(dQ_out.stride[1])
+        + cutlass.Int64(head) * cutlass.Int64(dQ_out.stride[2])
+    )
+    out_b = (
+        cutlass.Int64(batch) * cutlass.Int64(dQ_out.stride[0])
+        + cutlass.Int64(q_abs_b) * cutlass.Int64(dQ_out.stride[1])
+        + cutlass.Int64(head) * cutlass.Int64(dQ_out.stride[2])
+    )
     for nf in cutlass.range_constexpr(DQ_N_FRAGS):
         v0 = Pointer((acc_view.data_ptr() + perm_base + cutlass.Int32((nf * 4 + 0) * NUM_THREADS)), dtype=cutlass.Float32).load()
         v1 = Pointer((acc_view.data_ptr() + perm_base + cutlass.Int32((nf * 4 + 1) * NUM_THREADS)), dtype=cutlass.Float32).load()

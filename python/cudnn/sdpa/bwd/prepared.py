@@ -29,6 +29,7 @@ class BwdLaunchSpec:
     workspace_bytes: int
     device_index: int
     scale: float
+    name: str = "sdpa_bwd_sm120"
 
 
 def build_sm120_spec(api):
@@ -65,37 +66,37 @@ def _same_geometry(actual, expected):
 def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
     if not workspace_ptr or workspace_ptr % 16:
-        raise ValueError("sdpa_bwd_sm120 needs an aligned caller workspace")
+        raise ValueError(f"{spec.name} needs an aligned caller workspace")
     frame = []
     for i, (name, op) in enumerate(zip(ROLES, spec.operands)):
         f = facts.get(name)
         label = name + "_lens" if name in ("seq_q", "seq_kv") else name
         if op is None:
             if f is not None:
-                raise ValueError(f"sdpa_bwd_sm120: {name} was not compiled into this specialization")
+                raise ValueError(f"{spec.name}: {name} was not compiled into this specialization")
             frame.append(None)
             continue
         if f is None:
-            raise ValueError(f"sdpa_bwd_sm120: {name} is required by this specialization")
+            raise ValueError(f"{spec.name}: {name} is required by this specialization")
         if f.device not in ((2, spec.device_index), (-1, -1)):
-            raise ValueError(f"sdpa_bwd_sm120: {label} must be on CUDA device {spec.device_index}")
+            raise ValueError(f"{spec.name}: {label} must be on CUDA device {spec.device_index}")
         if f.dtype and f.dtype != op.dtype:
-            raise ValueError(f"sdpa_bwd_sm120: {name} must be {op.dtype}; got {f.dtype}")
+            raise ValueError(f"{spec.name}: {name} must be {op.dtype}; got {f.dtype}")
         if not f.ptr or f.ptr % op.alignment:
-            raise ValueError(f"sdpa_bwd_sm120: {name} base address must be {op.alignment}-byte aligned")
+            raise ValueError(f"{spec.name}: {name} base address must be {op.alignment}-byte aligned")
         if f.span >= 0 and f.span < op.span:
-            raise ValueError(f"sdpa_bwd_sm120: {name} backing storage is too small for the declared strides")
+            raise ValueError(f"{spec.name}: {name} backing storage is too small for the declared strides")
         if (
             not raw_storage
             and name in ("seq_q", "seq_kv", "sink", "dsink", "bias", "dbias")
             and f.shape
             and (not f.contiguous or f.numel != math.prod(op.shape))
         ):
-            raise ValueError(f"sdpa_bwd_sm120: {label} must be contiguous with {math.prod(op.shape)} elements")
+            raise ValueError(f"{spec.name}: {label} must be contiguous with {math.prod(op.shape)} elements")
         if geometry is not None and geometry[i] is not None and f.shape and not _same_geometry((f.shape, f.strides), geometry[i]):
-            raise ValueError(f"sdpa_bwd_sm120: {name} runtime geometry must match this fixed backward plan")
+            raise ValueError(f"{spec.name}: {name} runtime geometry must match this fixed backward plan")
         if workspace_ptr < f.ptr + op.span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
-            raise ValueError(f"sdpa_bwd_sm120: caller workspace overlaps {name}")
+            raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
     scale = spec.scale if scale is None or scale == 0 else float(scale)
     frame.extend((workspace_ptr, scale * math.log2(math.e), scale, stream_int))

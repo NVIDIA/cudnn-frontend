@@ -989,6 +989,17 @@ does not yet.
 | Ragged `S_kv` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Decode-shaped (`S_q == 1`) | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 
+Native SM80 backward flavor widths with 16-byte-aligned Q/K/V/O/dO and
+D-gradient bases and stepped outer strides divisible by eight elements use
+one prepared pointer host. The host includes workspace initialization,
+do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
+reductions and auxiliary output copies. All stages use the current caller
+stream; graph and standalone execution share the binding validator. Native
+plans require caller workspace and do not build tensor views at execute.
+Off-flavor widths, unaligned strides, RoPE, THD and older direct adapters
+without complete optional-output declarations retain the tensor entry and
+its reachable compiler/fake construction. This does not change eligibility.
+
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a
 feature-free d=64 graph.
