@@ -220,6 +220,60 @@ def test_gqa_mqa(hq, hkv):
     _run(hq=hq, hkv=hkv, sq=256, skv=256)
 
 
+@pytest.mark.parametrize(
+    "hq,hkv,chunk,causal",
+    [(16, 2, 4, False), (16, 2, 1, False), (12, 3, 6, False), (16, 2, 1, True)],
+    ids=(
+        "gemma-half-group",
+        "gemma-single-head",
+        "cross-group-boundary",
+        "gemma-single-head-causal",
+    ),
+)
+def test_gqa_non_group_aligned_head_chunks(monkeypatch, hq, hkv, chunk, causal):
+    """The workspace budget may split or cross GQA-group boundaries.
+
+    Gemma 4 has Hq=16/Hkv=2.  At long sequence lengths a whole eight-head
+    group cannot fit the stated 4 GiB S+dS budget, so the dense adapter must
+    process four- and one-head chunks without losing the Q-head -> KV-head
+    mapping in dQ.  The single-head causal case also covers the masking used by
+    Gemma's full-attention layer.  Hq=12/Hkv=3 additionally covers a six-head
+    chunk that crosses a four-head group boundary.
+    """
+    import cudnn.sdpa.bwd.api_dsl as bwd_dsl
+
+    choose = bwd_dsl._sm100_head_chunk
+    seen = []
+
+    def force_chunk(b, h_q, s_q, s_kv, bpe, budget=bwd_dsl._SM100_WS_BUDGET_BYTES, group=1):
+        per_head = 2 * b * s_q * s_kv * bpe
+        selected = choose(b, h_q, s_q, s_kv, bpe, budget=chunk * per_head, group=group)
+        assert selected == chunk
+        seen.append((selected, group))
+        return selected
+
+    monkeypatch.setattr(bwd_dsl, "_sm100_head_chunk", force_chunk)
+    keep = _causal_keep(256, 256) if causal else None
+    _run(
+        b=1,
+        hq=hq,
+        hkv=hkv,
+        sq=256,
+        skv=256,
+        keep=keep,
+        use_causal_mask=causal,
+    )
+    assert seen
+    assert all(item == (chunk, hq // hkv) for item in seen)
+
+
+@pytest.mark.parametrize("s,want", [(8192, 16), (16384, 4), (32768, 1)])
+def test_gemma4_head_chunk_respects_workspace_budget(s, want):
+    from cudnn.sdpa.bwd.api_dsl import _sm100_head_chunk
+
+    assert _sm100_head_chunk(1, 16, s, s, 2, group=8) == want
+
+
 def test_causal_top_left():
     _run(keep=_causal_keep(512, 512), use_causal_mask=True)
 
