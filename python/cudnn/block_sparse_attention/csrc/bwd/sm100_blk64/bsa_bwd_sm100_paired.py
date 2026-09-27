@@ -23,9 +23,12 @@ class MixedKvBackwardSm100:
     def __init__(self, sparse_block_size, has_block_sizes, bucket_size_blocks):
         from ..local_pair import PairedKvNeighborhoods, LocalPairMatch8, LocalPairPartition8
 
+        from ..local_pair_refine_batch_wide import LocalPairRefineBatchWide
+
         self.bucket_size = bucket_size_blocks
         self.classifier = PairedKvNeighborhoods()
         self.matcher = LocalPairMatch8()
+        self.refiner = LocalPairRefineBatchWide(32, 32, 128)
         self.partition = LocalPairPartition8()
         self.regular = BlockSparseAttnBackwardSm100Blk64(sparse_block_size, has_block_sizes, skip_convert=True)
         self.paired = LocalPairedBackwardSm100(
@@ -68,6 +71,8 @@ class MixedKvBackwardSm100:
             cute.make_layout((b, h, cute.ceil_div(bits.shape[2], 2)), stride=flags.stride),
         )
         self.matcher(bits, duplicates, flags, owners, residuals[None, None, 0, None], stream)
+        # The fixed shared tile and device-side word limit permit compile reuse.
+        self.refiner(bits, duplicates, flags, owners, residuals[None, None, 0, None], stream)
         self.partition(bits, flags, offsets, indices, residuals, self.bucket_size, stream)
         self.regular(
             problem_shape,
