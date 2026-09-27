@@ -39,6 +39,10 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Pure capability tests also construct Rubin facts on non-Rubin DSL builds.
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
 
 
 def _mk_graph(**kwargs) -> cudnn.pygraph:
@@ -228,7 +232,7 @@ def test_prepared_override_capability_declines_legacy_features(feature):
 
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
-@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107"])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107", "sm108", "sm119"])
 @pytest.mark.parametrize("arch", ["sm100", "sm120"])
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, arch):
@@ -248,15 +252,17 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
         split={},
         block_scaled_output=dict(o_block_scale=32),
         gate=dict(has_epilogue_gate=True),
-        sm107={},
+        sm107=dict(device_cc=(10, 7)),
+        sm108=dict(device_cc=(10, 8)),
+        sm119=dict(device_cc=(11, 9)),
     )[feature]
-    if feature == "sm107":
+    if feature in ("sm107", "sm108", "sm119"):
         caps = replace(caps, sm_lo=107, sm_hi=119)
     if feature == "paged":
         table = graph.tensor(dim=(B, 1, 8, 1), stride=(8, 8, 1, 1), data_type=cudnn.data_type.INT32)
         changed.update(paged_k_table_t=table, paged_v_table_t=table)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature in ("supported", "split", "head_dim") or (arch == "sm100" and feature == "paged"):
+    if feature in ("supported", "split", "head_dim", "sm107") or (arch == "sm100" and feature == "paged"):
         assert reason is None
     else:
         assert reason is not None

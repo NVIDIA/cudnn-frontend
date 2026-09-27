@@ -47,6 +47,13 @@ KV-tail masking and bounded runtime geometry. Split partials retain the input
 half dtype; final Stats conversion runs in the common combine. Split plans keep
 the declared batch and Q length, while KV may shrink within its envelope. THD lengths and
 metadata stay on device, including mixed length forms and padded Stats.
+SM107 per-tensor FP8 at exact device cc 10.7 also uses prepared dense and native-shape THD launches
+for its four existing flavors, plus its existing D128 split-KV path. Int64
+strides reach descriptor setup; D256 keeps its optional Amax specialization.
+The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
+the standalone adapter does not support those devices.
+Epilogue-gate, block-scaled-output and conversion routes retain tensor execution.
+
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
@@ -563,6 +570,11 @@ backward) and its workspace (about one payload-equivalent of bytes).
 ---
 
 ## SM107 (Rubin, cc 10.7–11.9)
+
+These engines require a CuTe DSL build with the `sm_107a` target. Public
+4.7.0 meets the shared DSL floor but lacks this target; graph admission and
+standalone support checks decline it with the installed version before compile.
+SM100/SM120 keep their existing 4.7.0 floor.
 
 Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
 (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale). **No

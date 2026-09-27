@@ -165,6 +165,10 @@ can still compile a prepared artifact inside the adapter and fail at execution.
 K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
 checks the retained tensor path numerically and under CUDA Graph replay.
 
+The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
+FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
+with a move; a new sibling file alone is not exercised by that lane.
+
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales
 in place after CUDA Graph capture and check outputs after replay.
@@ -193,3 +197,14 @@ Sparse metadata and cross-warp reduction scratch also need explicit reader
 completion before reuse. Run racecheck on both indexer and attention cases:
 ordering Q/K MMA alone does not publish every metadata lane's stores, and a
 max-to-sum reduction can overwrite shared scratch before all warps read it.
+
+SM107 metadata/heuristic tests run on non-SM107 CI lanes too. Model compiler
+target availability explicitly when testing a synthetic Rubin capability row;
+do not require the worker's DSL wheel to expose `sm_107a`. Keep real installed
+compiler-target decline tests separate, and retain the live target check for
+actual SM107 kernel execution. The release-DSL SM80 lane exposed this split.
+
+A capability row's `sm_lo` names its lower bound, not the actual device.
+Prepared admission must respect the adapter's exact device support even when
+the row spans later compute capabilities. Include future-cc rejection controls
+alongside the supported device in `test_prepared_fp8_override_capability_envelope`.

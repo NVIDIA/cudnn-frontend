@@ -34,7 +34,7 @@ from typing import Any, Callable, Optional
 import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
@@ -44,7 +44,8 @@ from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
 # modules) into every process that merely asks whether an engine could serve a
 # graph. ENGINE_SPECS therefore names its adapter, and _adapter() resolves it
-# at build time. Capabilities/mismatch below stay import-free.
+# at build time. The SM107 target gate lazily probes the DSL once; other
+# capability checks stay import-free.
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
 _SM80 = "SdpaFwdDslSm80"
@@ -518,13 +519,15 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     """
     if capabilities.sm_lo not in (100, 107, 120) or facts.is_mxfp8:
         return "this engine has no prepared shape/stride override executor"
+    if facts.is_fp8 and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
+        return "prepared SM107 FP8 requires device cc 10.7"
     if facts.is_fp8 and (
-        capabilities.sm_lo not in (100, 120)
+        capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
         or facts.o_block_scale
         or facts.has_epilogue_gate
     ):
-        return "prepared FP8 serves SM100 or SM120 scalar-scaled outputs"
+        return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
@@ -726,6 +729,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if cutedsl_too_old(version):
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
+    arch_error = cutedsl_arch_requirement_error(cc)
+    if arch_error is not None:
+        return arch_error
     shapes = sorted(capabilities.d_shapes)
     if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         # Envelope family: native flavor shapes are upper bounds (TMA

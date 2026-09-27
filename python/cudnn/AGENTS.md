@@ -288,6 +288,10 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- A version floor does not guarantee target-architecture support. For example,
+  public 4.7.0 lacks `sm_107a`; check the actual target capability before
+  admitting SM107 plans. Test graph and standalone declines with the real
+  unsupported wheel as well as a controlled missing-target probe.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
