@@ -2420,4 +2420,4 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted):
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
         rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
-        assert engines._prepared_decline_reason(rubin, facts, split) is not None
+        assert (engines._prepared_decline_reason(rubin, facts, split) is None) == (not thd and not override and split == 1)

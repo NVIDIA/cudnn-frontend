@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Pointer host for SM100 MXFP8 scalar-output forward launches."""
+"""Pointer host for MXFP8 scalar-output forward launches."""
 
 from typing import Optional, Tuple
 
@@ -51,6 +51,9 @@ def _launch(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     partial_slot: cutlass.Constexpr[bool],
+    thd_slots: cutlass.Constexpr[bool],
+    has_amax: cutlass.Constexpr[bool],
+    optional_amax: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     operands = sdpa_operand_tensors(
@@ -98,13 +101,15 @@ def _launch(
     sf_q = scale_tensor(sf_q_ptr, qh, sf_tiles[0], sf_smem_sizes[0])
     sf_k = scale_tensor(sf_k_ptr, kh, sf_tiles[1], sf_smem_sizes[1])
     sf_v = scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
-    amax = cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
-    if cutlass.const_expr(cfg.SPLIT_KV == 1):
+    amax = None if cutlass.const_expr(optional_amax and not has_amax) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
+    if cutlass.const_expr(cfg.SPLIT_KV == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    kwargs = dict(prepared=True)
+    kwargs = dict()
+    if cutlass.const_expr(thd_slots):
+        kwargs.update(prepared=True)
     if cutlass.const_expr(partial_slot):
         kwargs.update(o_partial_f32=operands.o_partial)
-    kernel_host(
+    args = (
         operands.q,
         operands.k,
         operands.v,
@@ -121,12 +126,10 @@ def _launch(
         scale_softmax_log2,
         n_thd_units,
         seq_q_lens_addr,
-        operands.thd_q_lens,
-        operands.thd_kv_lens,
-        thd_lens_form,
-        stream=stream,
-        **kwargs,
     )
+    if cutlass.const_expr(thd_slots):
+        args += (operands.thd_q_lens, operands.thd_kv_lens, thd_lens_form)
+    kernel_host(*args, stream=stream, **kwargs)
 
 
 @cute.jit
@@ -165,6 +168,9 @@ def host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     partial_slot: cutlass.Constexpr[bool],
+    thd_slots: cutlass.Constexpr[bool],
+    has_amax: cutlass.Constexpr[bool],
+    optional_amax: cutlass.Constexpr[bool],
     static_lse_strides: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -204,6 +210,9 @@ def host(
         d_v,
         lse_kind,
         partial_slot,
+        thd_slots,
+        has_amax,
+        optional_amax,
     )
     if cutlass.const_expr(static_lse_strides is None):
         _launch(*leading, lse_strides, *trailing, stream=stream)
@@ -217,7 +226,22 @@ def host(
 
 
 def compile_host(
-    kernel_host, cfg, storage_dtype, output_dtype, sf_smem_sizes, cache_key, d_qk, d_v, has_lse, lse_kind, *, partial_slot=True, static_lse_strides=None
+    kernel_host,
+    cfg,
+    storage_dtype,
+    output_dtype,
+    sf_smem_sizes,
+    cache_key,
+    d_qk,
+    d_v,
+    has_lse,
+    lse_kind,
+    *,
+    partial_slot=True,
+    thd_slots=True,
+    has_amax=True,
+    optional_amax=False,
+    static_lse_strides=None,
 ):
     if static_lse_strides is not None:
         if not has_lse or cfg.THD_VARLEN or cfg.SPLIT_KV != 1:
@@ -271,6 +295,9 @@ def compile_host(
         d_v,
         lse_kind,
         partial_slot,
+        thd_slots,
+        has_amax,
+        optional_amax,
         static_lse_strides,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

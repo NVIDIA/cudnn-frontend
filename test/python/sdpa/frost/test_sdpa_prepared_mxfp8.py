@@ -34,6 +34,7 @@ def _case(
     split_kv=1,
     hq=4,
     hk=2,
+    explicit_plan=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -140,7 +141,7 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    if override:
+    if override or explicit_plan:
         # Pin the executor under test. Unrelated backend heuristics can fail
         # before the physical-stride fixture reaches a FROST launch.
         from cudnn.engines import MANIFEST

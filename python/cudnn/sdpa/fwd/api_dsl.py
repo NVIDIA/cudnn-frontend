@@ -2492,12 +2492,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8
             and not self._pertensor
             and self._device_cc[0] == 10
-            and self._device_cc != (10, 7)
             and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.o_block_scale
             and not self.pv_bf16
             and self.gate_desc is None
         ):
+            return False
+        if self._device_cc == (10, 7) and (self.thd or self.split_kv > 1 or self.pack_gqa):
             return False
         from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 

@@ -604,6 +604,12 @@ def test_mxfp8_d192_split_kv_publishes_amax_from_combined_output():
         split_kv=2,
     )
 
+    if torch.cuda.get_device_capability() == (10, 7):
+        # This SM100 split algorithm is deliberately absent on SM107.
+        with pytest.raises(NotImplementedError, match=r"split_kv > 1 on cc10.7"):
+            api.check_support()
+        return
+
     assert api.check_support()
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device=dev, dtype=torch.uint8)

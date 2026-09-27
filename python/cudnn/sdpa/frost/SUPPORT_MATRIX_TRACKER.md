@@ -62,11 +62,12 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
-SM100/SM103 MXFP8 scalar outputs also use prepared launches for fixed dense
-and bounded THD geometry; dense MXFP8 overrides remain declined because SF
-batch/head pitches are plan-fixed. SM107 MXFP8, block-scaled outputs,
-MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding and bias retain their
-tensor executor and decline overrides;
+SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
+SM107 MXFP8 uses prepared launches for its four existing dense, unsplit native
+head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
+shape overrides remain declined because SF batch/head pitches are plan-fixed.
+Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
+and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -1082,5 +1083,6 @@ validated against the producer's observed byte span. Packed SF tile totals are
 runtime metadata, never read from device lengths or used as compile keys.
 D512 retains half split partials; the other three flavors use FP32 partials.
 Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
-MXFP8 coverage is unchanged. Standalone prepared calls require the declared
+MXFP8 also prepares its existing dense scalar-output paths as described above.
+Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
