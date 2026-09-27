@@ -5638,6 +5638,15 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
 
     if bias_tensor is not None:
         raise NotImplementedError("SM80 SDPA THD does not support bias (varlen has no single [1,H,SQ,SKV] bias shape)")
+    if q.dtype not in (torch.float16, torch.bfloat16) or q.device.type != "cuda":
+        raise ValueError("SM80 THD requires CUDA FP16/BF16 inputs")
+    for name, tensor in (("Q", q), ("K", k), ("V", v)):
+        if tensor.ndim != 4 or tensor.shape[0] != 1 or tensor.dtype != q.dtype or tensor.device != q.device:
+            raise ValueError(f"SM80 THD {name} must be [1,T,H,D] on Q's device and dtype")
+    if k.shape[2] < 1 or q.shape[2] < 1 or q.shape[2] % k.shape[2] or k.shape[1:3] != v.shape[1:3] or q.shape[-1] != k.shape[-1]:
+        raise ValueError("SM80 THD requires matching K/V token and head counts, Q/K widths, and integral GQA")
+    if int(max_s_q) < 1:
+        raise ValueError("SM80 THD max_s_q must be positive")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
@@ -5660,6 +5669,8 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     n_seqs = int(cu_q.numel()) - 1
     if n_seqs < 1:
         raise ValueError("cu_seqlens_q must have >= 2 entries")
+    if cu_k is None or cu_k.numel() != n_seqs + 1:
+        raise ValueError("cu_seqlens_q / cu_seqlens_k length mismatch")
     cu_q_t = cu_q.to(dtype=torch.int32, device=device).contiguous()
     cu_k_t = cu_k.to(dtype=torch.int32, device=device).contiguous()
 
@@ -5676,60 +5687,43 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         has_sink=sinks is not None,
         thd_varlen=True,
         has_lse=True,
+        sink_natural=True,
     )
     mod = _sm80_load_kernel_module(flavor, params)
-    # Off-flavor d_qk was HOST-PADDED to fdqk above, so the compiled fakes and
-    # the runtime d must both be the padded width: the kernel derives its Q/K
-    # row strides from d_runtime (Q_ROW_STRIDE_E = H * d_runtime), and the
-    # zero columns are exact for the QK dot products.  (Same contract as the
-    # pre-template forward(), which read d_runtime off the padded shape.)
-    fn = mod.compile(
-        b=1,
-        h=h_q,
-        h_kv=h_kv,
-        sq=0,
-        skv=0,
-        d=int(fdqk),
-        swa_window=int(max(0, wl)) if wl is not None and wl >= 0 else 0,
-        n_batch_logical=n_seqs,
-    )
+    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+
+    _artifact, fn = compile_thd_host(mod, h_q, h_kv, n_seqs, int(max(0, wl)) if wl is not None else 0)
 
     t_q = q.shape[1]
     o_buf = torch.zeros(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
     lse_buf = torch.zeros(1, h_q, t_q, dtype=torch.float32, device=device)
-    sinks_b = (
-        (sinks.to(dtype=torch.float32, device=device).reshape(h_q) * _LOG2E).contiguous()
-        if sinks is not None
-        else torch.ones(1, dtype=torch.float32, device=device)
-    )
-    dummy_i32 = torch.ones(1, dtype=torch.int32, device=device)
-    dummy_f32 = torch.ones(1, dtype=torch.float32, device=device)
-    dummy_io = torch.ones(1, dtype=q.dtype, device=device)
-
-    _sm80_call(
-        fn,
-        q=q,
-        k=k,
-        v=v,
-        o=o_buf,
-        lse=lse_buf,
-        seq_kv=dummy_i32,
-        seq_q=dummy_i32,
-        sinks_log2=sinks_b,
-        bias=dummy_io,
-        cu_q=cu_q_t,
-        cu_k=cu_k_t,
-        rope_cs=dummy_f32,
-        n_kv_tiles=(int(k.shape[1]) + tile_n - 1) // tile_n,
-        scale_log2=float(scale_softmax) * _LOG2E,
-        sq=int(t_q),
-        skv=int(k.shape[1]),
-        d=int(fdqk),
-        right_bound=int(right_bound),
-        inv_scale=1.0 / float(scale_softmax),
-        thd_q_tiles=(int(max_s_q) + tile_m - 1) // tile_m,
-        n_batch_logical=n_seqs,
-        stream=current_stream if current_stream is not None else cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    sinks_b = sinks.to(dtype=torch.float32, device=device).reshape(h_q).contiguous() if sinks is not None else None
+    for name, tensor in (("Q", q), ("K", k), ("V", v)):
+        if tensor.stride(-1) != 1 or tensor.data_ptr() % 16 or any(n > 1 and st % 8 for n, st in zip(tensor.shape[1:3], tensor.stride()[1:3])):
+            raise ValueError(f"SM80 THD {name} requires D-contiguous, 16-byte aligned rows and heads")
+    stream = current_stream if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
+    fn(
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        o_buf.data_ptr(),
+        lse_buf.data_ptr(),
+        cu_q_t.data_ptr(),
+        cu_k_t.data_ptr(),
+        sinks_b.data_ptr() if sinks_b is not None else None,
+        int(t_q),
+        int(k.shape[1]),
+        int(max_s_q),
+        int(q.stride(1)),
+        int(q.stride(2)),
+        int(k.stride(1)),
+        int(k.stride(2)),
+        int(v.stride(1)),
+        int(v.stride(2)),
+        float(scale_softmax) * _LOG2E,
+        1.0 / float(scale_softmax),
+        int(right_bound),
+        int(stream),
     )
     if pad_v:
         o_buf = o_buf[..., :d_v].contiguous()

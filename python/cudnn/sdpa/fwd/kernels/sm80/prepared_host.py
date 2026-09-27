@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pointer-only dense host shared by the four SM80 forward flavors."""
 
+from functools import lru_cache
 from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver
 
-from cudnn.frost.compiled_cache import compile_cached
+from cudnn.frost.compiled_cache import compile_cached, positional_entry, template_key
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_SWA
 
 
@@ -121,3 +122,116 @@ def compile_host(module, params, geometry, swa_window, right_bound, cache_key):
         cache_key=cache_key,
         symbol="frost_sdpa_fwd",
     )
+
+
+@cute.jit
+def thd_host(
+    q: cute.Pointer,
+    k: cute.Pointer,
+    v: cute.Pointer,
+    o: cute.Pointer,
+    stats: cute.Pointer,
+    cu_q: cute.Pointer,
+    cu_k: cute.Pointer,
+    sink: Optional[cute.Pointer],
+    t_q: cutlass.Int64,
+    t_kv: cutlass.Int64,
+    max_sq: cutlass.Int64,
+    q_s: cutlass.Int64,
+    q_h: cutlass.Int64,
+    k_s: cutlass.Int64,
+    k_h: cutlass.Int64,
+    v_s: cutlass.Int64,
+    v_h: cutlass.Int64,
+    scale_log2: cutlass.Float32,
+    inv_scale: cutlass.Float32,
+    right_bound: cutlass.Int32,
+    module: cutlass.Constexpr,
+    h: cutlass.Constexpr,
+    h_kv: cutlass.Constexpr,
+    n_seq: cutlass.Constexpr,
+    swa_window: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    p = module.PARAMS
+    dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
+    mask = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
+    # Packed capacity and Stats head pitch remain dynamic Int64 values. The
+    # never-stepped batch stride is zero, so it cannot specialize on capacity.
+    module._sdpa_host(
+        _view(q, ((1, t_q, h, p.d_qk), (0, q_s, q_h, 1))),
+        _view(k, ((1, t_kv, h_kv, p.d_qk), (0, k_s, k_h, 1))),
+        _view(v, ((1, t_kv, h_kv, p.d_v), (0, v_s, v_h, 1))),
+        _view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))),
+        _view(stats, ((1, h, t_q), (0, t_q, 1))),
+        None,
+        None,
+        _view(sink, ((h,), (1,))),
+        None,
+        _view(cu_q, ((n_seq + 1,), (1,))),
+        _view(cu_k, ((n_seq + 1,), (1,))),
+        None,
+        p.tile_m,
+        p.num_warps,
+        p.tile_n,
+        p.d_qk,
+        p.d_v,
+        dtype,
+        False,
+        True,
+        mask,
+        swa_window,
+        p.causal_bottom_right,
+        False,
+        False,
+        p.has_sink,
+        False,
+        False,
+        True,
+        False,
+        p.sched_policy,
+        p.sched_l2_mib * 1024 * 1024,
+        cutlass.Int32((t_kv + p.tile_n - 1) // p.tile_n),
+        scale_log2,
+        cutlass.Int32(t_q),
+        cutlass.Int32(t_kv),
+        cutlass.Int32(p.d_qk),
+        right_bound,
+        inv_scale,
+        cutlass.Int32((max_sq + p.tile_m - 1) // p.tile_m),
+        cutlass.Int32(n_seq),
+        stream,
+    )
+
+
+@lru_cache(maxsize=128)
+def compile_thd_host(module, h, h_kv, n_seq, swa_window):
+    """One pointer artifact per immutable flavor/head/mask contract."""
+    p = module.PARAMS
+    dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
+    types = [dtype] * 4 + [cutlass.Float32, cutlass.Int32, cutlass.Int32, cutlass.Float32]
+    pointers = [
+        cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else 4) if i != 7 or p.has_sink else None for i, t in enumerate(types)
+    ]
+    key = template_key(vars(module), dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window), "prepared_thd")
+    artifact = compile_cached(
+        thd_host,
+        *pointers,
+        *(cutlass.Int64(0) for _ in range(9)),
+        cutlass.Float32(0),
+        cutlass.Float32(0),
+        cutlass.Int32(0),
+        module,
+        h,
+        h_kv,
+        n_seq,
+        swa_window,
+        driver.CUstream(0),
+        options="--enable-tvm-ffi",
+        cache_key=key,
+        symbol="frost_sdpa_fwd_thd",
+    )
+    fn = positional_entry(artifact)
+    if fn is None:
+        raise NotImplementedError("SM80 prepared THD forward requires a positional tvm-ffi entry")
+    return artifact, fn
