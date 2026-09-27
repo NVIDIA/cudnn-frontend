@@ -480,10 +480,13 @@ cuDNN backend. The whole band is **envelope-served** on 512-wide tiles, so d=264
 pays d=512's MMA cost. Multiples of 8 rather than the forward's 16: the stage-3
 epilogue narrows its store vector from 32 B to 16 B when d is not also a
 multiple of 16.
-ᶜ A non-BSHD io tensor is staged through the workspace (one copy in, and one
-back out for a gradient); a BSHD-physical one is used in place. This is not
-hypothetical — building dO as `torch.randn(o.shape)` instead of
-`torch.empty_like(o)` loses o's memory format and yields a BHSD-contiguous dO.
+ᶜ Dense I/O with legal native TMA strides, including BHSD-contiguous dO, is
+addressed directly by the prepared SM100 path. Each operand must have unit D
+stride and positive outer strides aligned to eight half-precision elements.
+Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
+bindings are rejected before launch. Dense layouts outside the native stride
+requirements retain workspace staging (one copy in, and one back out for a
+gradient).
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
