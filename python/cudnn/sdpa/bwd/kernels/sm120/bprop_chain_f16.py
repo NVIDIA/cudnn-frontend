@@ -20,6 +20,7 @@ from cutlass.experimental import primitives as prims
 
 from cudnn.sdpa.bwd.config_sm120 import ROW_ROUND
 from cudnn.sdpa.bwd.kernels.sm120._common import (
+    wide_index,
     _COPY_ELEMS,
     _LOG2E,
     ceil_div,
@@ -335,8 +336,8 @@ def dot_do_o_kernel(
     compact = (S_Q * H * D_V, H * D_V, D_V)
     io_strided = o.shape[3] != D_V or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
     if cutlass.const_expr(io_strided):
-        o_base = batch * o_batch_stride + (q_block * Q_TILE) * o_seq_stride + head * o_head_stride
-        do_base = batch * do_batch_stride + (q_block * Q_TILE) * do_seq_stride + head * do_head_stride
+        o_base = wide_index(batch, o) * o_batch_stride + wide_index(q_block, o) * Q_TILE * o_seq_stride + wide_index(head, o) * o_head_stride
+        do_base = wide_index(batch, do) * do_batch_stride + wide_index(q_block, do) * Q_TILE * do_seq_stride + wide_index(head, do) * do_head_stride
     else:
         row_stride = H * D_V
         base = ((batch * S_Q + q_block * Q_TILE) * H + head) * D_V
@@ -353,8 +354,8 @@ def dot_do_o_kernel(
         acc = cutlass.Float32(0.0)
         if row < q_left:
             if cutlass.const_expr(io_strided):
-                o_off = o_base + row * o_seq_stride + col0
-                do_off = do_base + row * do_seq_stride + col0
+                o_off = o_base + wide_index(row, o) * o_seq_stride + col0
+                do_off = do_base + wide_index(row, do) * do_seq_stride + col0
                 for chunk in cutlass.range_constexpr(n_chunks):
                     if cutlass.const_expr(o.shape[3] != D_V):
                         # Head dim is padded: gmem rows are only o.shape[3] wide.
@@ -515,7 +516,7 @@ def convert_dq_kernel(
 
     q_left = S_Q - q_block * Q_TILE
     dq_batch_stride, dq_seq_stride, dq_head_stride, _ = dq.stride
-    g_base = batch * dq_batch_stride + (q_block * Q_TILE) * dq_seq_stride + head * dq_head_stride
+    g_base = wide_index(batch, dq) * dq_batch_stride + wide_index(q_block, dq) * Q_TILE * dq_seq_stride + wide_index(head, dq) * dq_head_stride
     chunks_per_row = D_QK // _COPY_ELEMS
     for i in cutlass.range_constexpr(Q_TILE * chunks_per_row // 256):
         chunk = i * 256 + tidx
@@ -527,12 +528,12 @@ def convert_dq_kernel(
                 if col < dq.shape[3]:
                     copy16_smem_to_gmem(
                         tile_ptr(sdQ, row, col, chunk_elems=chunk_elems, rows=Q_TILE),
-                        dq_ptr + g_base + row * dq_seq_stride + col,
+                        dq_ptr + g_base + wide_index(row, dq) * dq_seq_stride + col,
                     )
             else:
                 copy16_smem_to_gmem(
                     tile_ptr(sdQ, row, col, chunk_elems=chunk_elems, rows=Q_TILE),
-                    dq_ptr + g_base + row * dq_seq_stride + col,
+                    dq_ptr + g_base + wide_index(row, dq) * dq_seq_stride + col,
                 )
 
 
@@ -647,7 +648,9 @@ def _reduce_group_vec(
     if cutlass.const_expr(out_strided):
         s_row = b_seq % skv
         b_idx = b_seq // skv
-        (out_ptr + b_idx * out_batch_stride + s_row * out_seq_stride + kv_head * out_head_stride + col).store(vec, alignment=16)
+        (out_ptr + cutlass.Int64(b_idx) * out_batch_stride + cutlass.Int64(s_row) * out_seq_stride + cutlass.Int64(kv_head) * out_head_stride + col).store(
+            vec, alignment=16
+        )
     else:
         (out_ptr + pos).store(vec, alignment=16)
 
@@ -876,14 +879,14 @@ def dsink_kernel(
     acc = cutlass.Float32(0.0)
     batch = cutlass.Int32(0)
     while batch < B:
-        lse_base = batch * lse_batch_stride + head * lse_head_stride
+        lse_base = wide_index(batch, lse) * lse_batch_stride + wide_index(head, lse) * lse_head_stride
         delta_base = (batch * H_Q + head) * S_Q_R
         q_bound = S_Q
         if cutlass.const_expr(seq_q_lens is not None):
             q_bound = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(S_Q)))
         q = cutlass.Int32(tidx)
         while q < q_bound:
-            lv = (lse_ptr + lse_base + q * lse_seq_stride).load()
+            lv = (lse_ptr + lse_base + wide_index(q, lse) * lse_seq_stride).load()
             # Padded / trimmed rows carry LSE = -inf: skip them (exp(sink - lse) overflows and inf * 0 = NaN).
             if lv > -inf and lv < inf:
                 dd = (delta_ptr + delta_base + q).load()
