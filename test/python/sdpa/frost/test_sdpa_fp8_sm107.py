@@ -1131,7 +1131,7 @@ import torch
 import test_sdpa_prepared_fp8 as _prepared_fp8_checks
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
 class TestPreparedSm107Fp8:
     @pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (192, 128, 1), (256, 256, 1), (512, 512, 1), (128, 128, 4)])
     @pytest.mark.parametrize("thd", [False, True])
