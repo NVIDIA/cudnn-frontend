@@ -18,7 +18,7 @@ Three owners, one implementation each:
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. Nonpaged f16 THD without sinks/padded Stats binds
+binder selected at prepare time. F16 THD without sinks/padded Stats binds
 normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
@@ -507,8 +507,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
     if (
-        not s.paged
-        and not s.has_sink
+        not s.has_sink
         and not s.lse_padded
         and api.split_kv == 1
         and not getattr(api, "_prepared_fp8", False)
@@ -521,7 +520,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     return s
 
 
-_NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
+_NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks", "block_table", "block_table_v")
 _NATIVE_THD_INDICES = tuple(range(len(_NATIVE_THD_ROLES)))
 
 
@@ -551,6 +550,7 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softm
     """
     from cudnn import _pybind_module
 
+    buffers = tuple(buffers) + (None,) * (len(_NATIVE_THD_ROLES) - len(buffers))
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
