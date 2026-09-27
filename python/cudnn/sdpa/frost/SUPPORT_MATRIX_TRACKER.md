@@ -986,7 +986,7 @@ with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
 width. The served capability envelope is unchanged: other head dimensions and
 layouts retain their existing tensor-entry staging, as do the standalone
-RoPE and THD callers. Those remaining callers still require the tensor compiler.
+RoPE callers. Those remaining callers still require the tensor compiler.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
@@ -1020,7 +1020,7 @@ do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
 reductions and auxiliary output copies. All stages use the current caller
 stream; graph and standalone execution share the binding validator. Native
 plans require caller workspace and do not build tensor views at execute.
-Off-flavor widths, unaligned strides, RoPE, THD and older direct adapters
+Off-flavor widths, unaligned strides, RoPE and older direct adapters
 without complete optional-output declarations retain the tensor entry and
 its reachable compiler/fake construction. This does not change eligibility.
 
