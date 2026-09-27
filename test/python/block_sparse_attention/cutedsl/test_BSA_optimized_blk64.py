@@ -19,6 +19,13 @@ def _bsa():
     return BSA
 
 
+@pytest.mark.parametrize("num_q_blocks,expected", [(2999, None), (3000, 4096), (4096, 4096), (4097, 4096), (8192, 4096)])
+def test_large_bucket_policy(num_q_blocks, expected):
+    from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import sm100_bwd_auto_bucketed_k2q_size_blocks
+
+    assert sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks) == expected
+
+
 @pytest.mark.parametrize("misalignment", ["stride", "address", "aligned_stride"])
 @pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
 @pytest.mark.parametrize("splits", [1, 2])
