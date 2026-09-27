@@ -235,3 +235,43 @@ def test_dense_tensor_fallback_survives_thd_fake_cleanup(d, dv, rope, dtype, mon
         check(captured)
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("features", [False, True])
+@pytest.mark.L0
+def test_thd_wrapper_preserves_packed_row_origins(d, dv, dtype, features):
+    tensors = _inputs(d, dv, dtype)
+    lq, lk = (96, 0, 129), (65, 0, 193)
+    base_q, base_k = 5, 13
+    cq, ck = _prefix(lq) + base_q, _prefix(lk) + base_k
+    sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
+    kw = dict(causal=features, bottom=features, window=64 if features else -1, sink=sink)
+
+    def check(out):
+        # This standalone API accepts packed row offsets into the supplied
+        # storage. Graph API cumulative-length normalization is a different path.
+        q, k, v = tensors
+        sliced = dict(o_tensor=out["o_tensor"][:, base_q:], lse_tensor=out["lse_tensor"][..., base_q:])
+        _check((q[:, base_q:], k[:, base_k:], v[:, base_k:]), sliced, lq, lk, **kw)
+        assert torch.count_nonzero(out["o_tensor"][:, :base_q]) == 0
+        assert torch.count_nonzero(out["lse_tensor"][..., :base_q]) == 0
+
+    check(_run(tensors, cq, ck, **kw))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            out = _run(tensors, cq, ck, **kw)
+        lq, lk = (80, 0, 145), (96, 0, 162)
+        base_q, base_k = 9, 27
+        cq.copy_(_prefix(lq) + base_q)
+        ck.copy_(_prefix(lk) + base_k)
+        for t, new in zip(tensors, _inputs(d, dv, dtype, seed=83)):
+            t.copy_(new)
+        for value in out.values():
+            value.fill_(float("nan"))
+        graph.replay()
+        check(out)
+    finally:
+        graph.reset()

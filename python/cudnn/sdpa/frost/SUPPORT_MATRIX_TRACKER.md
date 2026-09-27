@@ -1020,7 +1020,7 @@ do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
 reductions and auxiliary output copies. All stages use the current caller
 stream; graph and standalone execution share the binding validator. Native
 plans require caller workspace and do not build tensor views at execute.
-Off-flavor widths, unaligned strides, RoPE and older direct adapters
+Off-flavor widths, unaligned strides, RoPE, THD and older direct adapters
 without complete optional-output declarations retain the tensor entry and
 its reachable compiler/fake construction. This does not change eligibility.
 

@@ -257,3 +257,11 @@ physical stride and product-overflow probes on every native flavor, with
 wrapped addresses poisoned inside allocated guard storage.
 `test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
 THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+
+
+SM80's standalone packed wrapper preserves cumulative tensors as row offsets
+into the supplied storage. Do not substitute graph API cumulative-length
+normalization: that changes which Q/K/V rows the standalone call addresses.
+`test_thd_wrapper_preserves_packed_row_origins` checks different Q/KV origins,
+empty sequences and changed origins after capture, including zeroed output
+capacity outside those origins. Keep baseline compatibility evidence.
