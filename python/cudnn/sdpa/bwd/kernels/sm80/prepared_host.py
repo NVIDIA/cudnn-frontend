@@ -3,6 +3,7 @@
 """Plan-time pointer host for native dense and packed SM80 backward chains."""
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import cutlass
@@ -338,13 +339,42 @@ def host(
 def compile_host(api, geometry, d64_module, cache_key):
     dtype = cutlass.BFloat16 if api._params.io_bf16 else cutlass.Float16
     dbias_dtype = cutlass.Float32 if api.dbias_desc is None or str(api.dbias_desc.dtype).endswith("float32") else dtype
+    regions, workspace_bytes = workspace_regions(api)
+    zeros = tuple((regions[i][0], math.prod(regions[i][1])) if regions[i] is not None else (0, 0) for i in (0, 4, 5, 6))
+    if api.thd:
+        regions, _ = workspace_regions(api, symbolic=True)
+        zeros = ((0, 0),) * 4
+    # Only immutable specialization metadata enters the memo. Each plan still
+    # sizes workspace and binds packed capacities, bounds and pointers itself.
+    compiler = _compile_thd_artifact if api.thd else _compile_artifact
+    artifact = compiler(
+        api._kmod,
+        d64_module,
+        geometry,
+        regions,
+        zeros,
+        dtype,
+        dbias_dtype,
+        api.swa_window_runtime,
+        api.right_bound_runtime,
+        api.batch_size,
+        api._thd_lse_token_major if api.thd else False,
+        cache_key,
+        int(api.q_desc.device.index or 0),
+    )
+    return artifact, workspace_bytes
+
+
+def _compile_artifact(
+    module, d64_module, geometry, regions, zeros, dtype, dbias_dtype, swa_window, right_bound, n_seq, thd_lse_token_major, cache_key, device_index
+):
     types = (
         [dtype] * 5
         + [cutlass.Float32]
         + [dtype] * 3
         + [cutlass.Int32] * 2
         + [cutlass.Float32] * 2
-        + [cutlass.Float32 if api._bias_is_fp32 else dtype, dbias_dtype]
+        + [cutlass.Float32 if module.PARAMS.bias_is_fp32 else dtype, dbias_dtype]
     )
     args = [
         (
@@ -354,11 +384,6 @@ def compile_host(api, geometry, d64_module, cache_key):
         )
         for i, (t, g) in enumerate(zip(types, geometry))
     ]
-    regions, workspace_bytes = workspace_regions(api)
-    zeros = tuple((regions[i][0], math.prod(regions[i][1])) if regions[i] is not None else (0, 0) for i in (0, 4, 5, 6))
-    if api.thd:
-        regions, _ = workspace_regions(api, symbolic=True)
-        zeros = ((0, 0),) * 4
     artifact = compile_cached(
         host,
         cutlass.Int64(0),
@@ -370,7 +395,7 @@ def compile_host(api, geometry, d64_module, cache_key):
         cutlass.Float32(0),
         cutlass.Float32(0),
         cutlass.Int32(0),
-        api._kmod,
+        module,
         d64_module,
         geometry,
         regions,
@@ -378,13 +403,16 @@ def compile_host(api, geometry, d64_module, cache_key):
         max(n for _, n in zeros),
         dtype,
         dbias_dtype,
-        api.swa_window_runtime,
-        api.right_bound_runtime,
-        api.batch_size,
-        api._thd_lse_token_major if api.thd else False,
+        swa_window,
+        right_bound,
+        n_seq,
+        thd_lse_token_major,
         driver.CUstream(0),
         options="--enable-tvm-ffi",
         cache_key=cache_key,
         symbol="frost_sdpa_bwd",
     )
-    return artifact, workspace_bytes
+    return artifact
+
+
+_compile_thd_artifact = lru_cache(maxsize=128)(_compile_artifact)

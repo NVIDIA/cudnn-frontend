@@ -99,11 +99,15 @@ def test_wrapper_capacity_and_hint_changes_reload_artifact(tmp_path, monkeypatch
     from cudnn.frost import compiled_cache
     from cudnn.sdpa.bwd.api_dsl import _sm80_thd_plan
 
+    from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
+
     _sm80_thd_plan.cache_clear()
+    _compile_thd_artifact.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     first = _thd_case((96, 160), (128, 96), 4, 128, torch.float16, hkv=2)
     _wrapper(first, _prefix(first.cu_q), _prefix(first.cu_k), deterministic=True, max_s_q=160, max_s_kv=128)
     before = compiled_cache.stats()
+    _compile_thd_artifact.cache_clear()
     monkeypatch.setattr(cute, "compile", lambda *a, **kw: pytest.fail("packed capacity/hint change triggered a fresh JIT"))
     second = _thd_case((128, 64), (64, 128), 4, 128, torch.float16, hkv=2, cap_q=512, cap_kv=768)
     out = _wrapper(second, _prefix(second.cu_q), _prefix(second.cu_k), deterministic=True)
@@ -149,3 +153,41 @@ def test_wrapper_zero_capacity(empty, hkv):
     for name, inp in (("dq_tensor", case.q), ("dk_tensor", case.k), ("dv_tensor", case.v)):
         assert result[name].shape == inp.shape
         assert torch.count_nonzero(result[name]) == 0
+
+
+@pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+def test_wrapper_capacity_reuses_artifact_without_disk_cache(d, dv, cache_mode, tmp_path, monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa.bwd.api_dsl import _sm80_thd_plan
+    from cudnn.sdpa.bwd.kernels.sm80 import prepared_host
+
+    _sm80_thd_plan.cache_clear()
+    memo = getattr(prepared_host, "_compile_thd_artifact", None)
+    if memo is not None:
+        memo.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    if cache_mode == "disabled":
+        monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    else:
+        monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: {"cuda_driver": "unknown"})
+    first = _thd_case((96, 160), (128, 96), 4, d, torch.float16, hkv=2, d_v=dv)
+    out = _wrapper(first, _prefix(first.cu_q), _prefix(first.cu_k), deterministic=True, max_s_q=160, max_s_kv=128)
+    _check(first, *(out[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    monkeypatch.setattr(cute, "compile", lambda *a, **kw: pytest.fail("new capacity plan recompiled without disk cache"))
+    second = _thd_case((128, 64), (64, 128), 4, d, torch.float16, hkv=2, d_v=dv, cap_q=512, cap_kv=768)
+    # Force another plan, including its different workspace and launch bounds.
+    cq, ck = _prefix(second.cu_q), _prefix(second.cu_k)
+    out = _wrapper(second, cq, ck, deterministic=True)
+    _check(second, *(out[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = _wrapper(second, cq, ck, deterministic=True)
+        for value in captured.values():
+            value.fill_(float("nan"))
+        graph.replay()
+        _check(second, *(captured[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    finally:
+        graph.reset()

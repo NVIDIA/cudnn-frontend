@@ -248,3 +248,11 @@ before the byte address is formed even without a wide declared stride.
 Int32 boundary for both backward SF layouts. Its source and destination
 prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
+
+
+Prepared THD artifact reuse must survive a disabled persistent cache and an
+unknown environment manifest. Change packed capacities and launch bounds with
+JIT forbidden, then check numerical output and graph replay. Keep workspace
+sizing per plan and exclude tensors, pointers and streams from the artifact
+memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
+SM80 detector; clear that memo separately when testing disk-artifact reload.

@@ -1024,9 +1024,10 @@ Native-flavor THD graph/direct-adapter plans use the same binder and a packed
 host chain, including device length-to-prefix setup. Packed capacities are
 runtime host arguments; workspace views and offsets are formed from those
 capacities without specializing the artifact on them. A fresh plan with the
-same envelope and stepped strides can reload the artifact for different totals.
-Off-flavor widths, unaligned strides, RoPE, the standalone THD convenience
-wrapper and older direct adapters
+same specialization and stepped strides reuses the process-local artifact for
+different totals and bounds, even without persistent caching. The standalone
+THD wrapper pads to the native flavor width and uses this prepared packed chain.
+Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
 without complete optional-output declarations retain the tensor entry and
 its reachable compiler/fake construction. This does not change eligibility.
 
