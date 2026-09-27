@@ -1457,7 +1457,8 @@ class BlockSparseAttnForwardSm100Blk128:
         # Notify correction wg that row_max is ready
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        # Here the guarded FFMA's branch costs more than the extra packed op
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max, always_center=True)
         tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32)
         tSrP_r2t = cute.make_tensor(cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout)
         softmax.apply_exp2_convert(
