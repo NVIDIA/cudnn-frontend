@@ -257,3 +257,10 @@ physical stride and product-overflow probes on every native flavor, with
 wrapped addresses poisoned inside allocated guard storage.
 `test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
 THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+
+
+Packed-prefix slices can have different nonzero Q/KV bases. Normalize each
+origin against its own first entry on device, and change both bases after
+capture. `test_thd_wrapper_normalizes_independent_prefix_bases` covers both
+SM80 template families, empty sequences, features and near-Int32-limit bases;
+its old-origin control fails numerically inside allocated capacity.

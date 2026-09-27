@@ -442,8 +442,10 @@ def _sdpa_kernel(
         s_q_b = _cuq[batch_idx + cutlass.Int32(1)] - cu_q_b
         cu_k_b = _cuk[batch_idx]
         s_kv_b = _cuk[batch_idx + cutlass.Int32(1)] - cu_k_b
-        q_seq_origin = cutlass.Int64(cu_q_b)
-        kv_seq_origin = cutlass.Int64(cu_k_b)
+        # Prefix slices describe lengths relative to their independent first
+        # entries. Normalize on device so replay observes changed bases too.
+        q_seq_origin = cutlass.Int64(cu_q_b) - cutlass.Int64(_cuq[0])
+        kv_seq_origin = cutlass.Int64(cu_k_b) - cutlass.Int64(_cuk[0])
     else:
         s_q_b = cutlass.Int32(sq_runtime)
         s_kv_b = cutlass.Int32(skv_runtime)
