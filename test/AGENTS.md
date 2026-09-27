@@ -324,3 +324,10 @@ and tensor-operand elision must use the same effective presence decision.
 `test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
+
+For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
+and all auxiliary bindings before workspace carving or any copy/fill. A tensor
+compiler previously checked some of these at dispatch; raw addresses cannot.
+The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
+replaces the workspace carver with a tripwire so an invalid short buffer fails
+safely before it can reach a GPU launch.

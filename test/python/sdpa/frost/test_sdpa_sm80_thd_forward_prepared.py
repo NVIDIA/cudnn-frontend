@@ -363,3 +363,52 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
             if reload:
                 patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("staged forward lost process-local artifact reuse"))
             test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, torch.float16, patch)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "role,invalid",
+    [(role, invalid) for role in ("q", "k", "v", "o") for invalid in ("shape", "dtype", "device")]
+    + [(role, invalid) for role in ("lse", "sinks", "seq_q_lens", "seq_kv_lens", "bias_tensor") for invalid in ("dtype", "device")],
+)
+def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, monkeypatch):
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd import api_dsl
+
+    q = torch.empty((2, 17, 4, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
+    kv = torch.empty((2, 33, 2, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
+    values = dict(q=q, k=kv, v=kv, o=torch.empty_like(q), lse=torch.empty((2, 4, 17), device="cuda"))
+    values.update(
+        sinks=torch.ones(4, device="cuda"),
+        seq_q_lens=torch.ones(2, device="cuda", dtype=torch.int32),
+        seq_kv_lens=torch.ones(2, device="cuda", dtype=torch.int32),
+        bias_tensor=torch.zeros((1, 4, 17, 33), device="cuda"),
+    )
+    api = api_dsl.SdpaFwdDslSm80(
+        **{"sample_" + n: values[n] for n in ("q", "k", "v", "o", "lse")},
+        has_sink=True,
+        seq_q_lens_present=True,
+        seq_kv_lens_present=True,
+        bias_present=True,
+        bias_fp32=True,
+    )
+    api.check_support()
+    # No device launch is needed to test rejection. In particular the baseline
+    # must fail at this tripwire instead of launching an unsafe short buffer.
+    api._compiled_kernel = object()
+    api._sm80_spec = None
+    api._params = SimpleNamespace(has_lse=True, has_bias=True, has_rope=False, has_sink=True, has_seq_kv_lens=True, has_seq_q_lens=True, bias_is_fp32=True)
+    monkeypatch.setattr(api_dsl, "WorkspaceCarver", lambda *a, **k: pytest.fail("invalid operand reached workspace staging"))
+    tensor = values[role]
+    if invalid == "shape":
+        values[role] = tensor[:, :, :-1]
+    elif invalid == "dtype":
+        values[role] = torch.empty_like(tensor, dtype=torch.float64)
+    else:
+        values[role] = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+    with pytest.raises(ValueError):
+        api.execute(
+            **{n + "_tensor": values[n] for n in ("q", "k", "v", "o", "lse")},
+            **{n: v for n, v in values.items() if n not in ("q", "k", "v", "o", "lse")},
+            workspace=torch.empty(1024, device="cuda", dtype=torch.uint8),
+        )

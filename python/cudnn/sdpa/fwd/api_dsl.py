@@ -5409,6 +5409,43 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
         self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
         self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
+        # The staged host specializes compact geometry and binds raw pointers.
+        # Reject incompatible storage before any gather, fill or copy-back.
+        for name, tensor, desc in (("q", q_tensor, self.q_desc), ("k", k_tensor, self.k_desc), ("v", v_tensor, self.v_desc), ("o", o_tensor, self.o_desc)):
+            self._value_error_if(
+                tensor is None or tuple(tensor.shape) != tuple(desc.shape) or tensor.dtype != desc.dtype or tensor.device != desc.device,
+                f"{name} must match compiled shape {tuple(desc.shape)}, dtype {desc.dtype}, device {desc.device}",
+            )
+        for name, tensor in (
+            ("lse_tensor", lse_tensor),
+            ("sinks", sinks),
+            ("seq_q_lens", seq_q_lens),
+            ("seq_kv_lens", seq_kv_lens),
+            ("bias_tensor", bias_tensor),
+        ):
+            self._value_error_if(tensor is not None and tensor.device != self.q_desc.device, f"{name} must be on {self.q_desc.device}")
+        self._value_error_if(lse_tensor is not None and lse_tensor.dtype != torch.float32, "lse_tensor must be float32")
+        self._value_error_if(
+            workspace is not None and (workspace.device != self.q_desc.device or not workspace.is_contiguous()),
+            "SM80 staged workspace must be contiguous and on the Q device",
+        )
+        seq_kv_b = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
+        seq_q_b = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None
+        checked_sinks = self._checked_sinks_1d(sinks) if sinks is not None else None
+        if bias_tensor is not None:
+            self._value_error_if(
+                bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else self.dtype),
+                f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
+            )
+            self._value_error_if(
+                tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
+                f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
+            )
+            bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
+            self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
+        else:
+            bias_b = None
+
         # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
         # [B, H, SQ] through the exact declared strides.
         if lse_tensor is not None:
@@ -5496,12 +5533,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 if lse_tensor is not None:
                     lse_tensor.zero_()
 
-            seq_kv_b = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
-            seq_q_b = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
                 # (the kernels consume log2 units), into carved scratch.
-                checked_sinks = self._checked_sinks_1d(sinks)
                 if carver is not None:
                     sinks_b = carver.take(self.h_q, torch.float32)
                     torch.mul(checked_sinks, _LOG2E, out=sinks_b)
@@ -5509,19 +5543,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                     sinks_b = (checked_sinks * _LOG2E).contiguous()
             else:
                 sinks_b = None
-            if bias_tensor is not None:
-                self._value_error_if(
-                    bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
-                    f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
-                )
-                self._value_error_if(
-                    tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
-                    f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
-                )
-                bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
-                self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
-            else:
-                bias_b = None
             if rope_freqs is not None:
                 # (cos, sin) table build — wrapper-only fusion (the engine row
                 # never admits RoPE); per-execute by contract, like the caller
