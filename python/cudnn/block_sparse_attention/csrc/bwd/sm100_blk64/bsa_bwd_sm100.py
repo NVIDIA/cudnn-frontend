@@ -63,7 +63,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         kv_group_size: int = 1,
     ):
         assert kv_group_size in (1, 2)
-        self.interleave_heads = False
+        self.interleave_heads = True
         self.local_pairs = False
         self.kv_group_size = kv_group_size
         self.alias_ps = True
