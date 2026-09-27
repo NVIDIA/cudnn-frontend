@@ -439,5 +439,5 @@ API directly owns both of these itself.
 
 For end-to-end usage and regression coverage, see:
 
-- `test/python/fe_api/grouped_gemm/test_grouped_gemm_dsrelu.py`
-- `test/python/fe_api/grouped_gemm/test_grouped_gemm_dsrelu_utils.py`
+- `test/python/gemm/cutedsl/test_grouped_gemm_dsrelu.py`
+- `test/python/gemm/cutedsl/test_grouped_gemm_dsrelu_utils.py`

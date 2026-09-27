@@ -741,9 +741,9 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
 Rubin MXFP8 activation-parameter coverage is in
-`test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py`
+`test/python/gemm/cutedsl/test_grouped_gemm_dglu.py`
 (`test_rubin_mxfp8_clamped_dgeglu_*`).
 
 The eager JAX wrapper allocates its internal scratch with the CUDA stream-ordered

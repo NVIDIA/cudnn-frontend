@@ -248,4 +248,4 @@ Returns `TupleDict`: `d_tensor`, `d_col_tensor` (optional; `None` for `bfloat16`
 
 ## Usage Examples
 
-For usage examples, see `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant.py` + `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant_utils.py` (dense and discrete unified API coverage)
+For usage examples, see `test/python/gemm/cutedsl/test_grouped_gemm_quant.py` + `test/python/gemm/cutedsl/test_grouped_gemm_quant_utils.py` (dense and discrete unified API coverage)

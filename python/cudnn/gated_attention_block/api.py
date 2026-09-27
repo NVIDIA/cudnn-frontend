@@ -221,7 +221,7 @@ protocol): ``frost_dev/plans/qwen_gated_attention_block_plan.md``.
 Backward: :mod:`cudnn.gated_attention_block.api_bwd` — read this file first, the
 backward is defined against the :class:`SavedForBackward` contract below.
 PyTorch oracle and perf baseline:
-``test/python/fe_api/gated_attention_block/reference.py``.
+``test/python/gated_attention_block/cutedsl/reference.py``.
 
 Not in scope for v1, in the order they are likely to land: THD / varlen packing;
 an MXFP8 (e4m3 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the

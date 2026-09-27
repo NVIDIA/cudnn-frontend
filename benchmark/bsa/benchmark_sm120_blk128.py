@@ -3,7 +3,7 @@
 
 """Benchmark the native SM120 blk128 BF16 block-sparse attention kernel.
 
-Usage and requirements: test/python/fe_api/bsa/test_BSA_attention_forward.py.
+Usage and requirements: test/python/block_sparse_attention/cutedsl/test_BSA_attention_forward.py.
 """
 
 from __future__ import annotations

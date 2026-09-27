@@ -5,7 +5,7 @@
 import cudnn
 import pytest
 
-import test_execute_overload as ordered_cases
+import core.graph.test_execute_overload as ordered_cases
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
