@@ -1755,6 +1755,7 @@ def _check_prepared_bwd(case, tensors=None, expected=None):
         torch.testing.assert_close(tensors[name], expected[name], **_tolerances(case.dtype))
 
 
+@requires_dsl
 class TestPreparedSm120Bwd:
     @pytest.mark.L0
     @pytest.mark.parametrize("dbias_dtype", [torch.float32, torch.bfloat16])
@@ -1904,6 +1905,7 @@ class TestPreparedSm120Bwd:
         _check_prepared_bwd(case)
 
     @pytest.mark.L1
+    @pytest.mark.gpu_exclusive
     @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"])
     @pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
     @pytest.mark.parametrize("wide_span", [False, True], ids=["wide_stride", "wide_product"])
