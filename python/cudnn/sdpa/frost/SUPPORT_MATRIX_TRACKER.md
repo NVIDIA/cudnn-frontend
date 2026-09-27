@@ -56,8 +56,10 @@ for its four existing flavors, plus its existing D128 split-KV path. Int64
 strides reach descriptor setup; D256 keeps its optional Amax specialization.
 The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
-Epilogue-gate and conversion routes retain tensor execution. Fixed dense D128
-block-scaled outputs use the prepared hosts described below.
+The existing D256 quantized epilogue gate also uses prepared launches, with
+runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
+output's maximum. Conversion routes retain tensor execution.
+Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
@@ -67,8 +69,10 @@ SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or 
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
-MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
-and bias retain their tensor executor and decline overrides;
+SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
+D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
+operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
+layouts and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -1110,9 +1114,9 @@ plan-specific. SF storage may be any dense physical-axis permutation and is
 validated against the producer's observed byte span. Packed SF tile totals are
 runtime metadata, never read from device lengths or used as compile keys.
 D512 retains half split partials; the other three flavors use FP32 partials.
-Gate and standalone PV-BF16 keep their tensor entries. D128 block-scaled O
-uses the prepared contract below. SM107
-MXFP8 also prepares its existing dense scalar-output paths as described above.
+D128 block-scaled O and the existing direct-only D128/D192 PV-BF16
+specializations also use prepared launches for native layouts. SM107 MXFP8
+prepares its existing dense scalar-output and D256 gate paths as described above.
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
 
@@ -1125,5 +1129,5 @@ current O, SF_O, optional Amax and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
 SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
-their existing admission boundaries. PV-BF16 and remaining legacy layouts retain
-their tensor entries. Standalone prepared calls require caller-owned workspace.
+their existing admission boundaries. Remaining conversion layouts retain their
+tensor entries. Standalone prepared calls require caller-owned workspace.

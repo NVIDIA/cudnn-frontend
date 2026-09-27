@@ -263,3 +263,20 @@ Compute `template_key(globals(), locals(), ...)` before local imports or other
 local assignments. Including a helper function in `locals()` makes the key
 uncacheable even when the graph's specialization is fully static; all eight
 SM100/SM107 MXFP8 prepared entries must obey this ordering.
+
+### Prepared gate pointer regressions
+
+Auxiliary TMA inputs need the same physical Int64 stride coverage as Q/O.
+`test_quantized_gate_batch_stride_above_int32` steps two live BF16 gate batches
+across an 8-GiB gap. A valid decoy island at the truncated offset makes its
+Int32 negative control fail numerically without launching an invalid access.
+After graph capture, swap the gates between sigmoid saturation at zero and one:
+O must change, while Stats and requested Amax still describe ungated SDPA.
+
+Optional-output flags and sample descriptors must agree at every host boundary.
+Cover an explicit disabled flag with a retained sample descriptor as well as
+an absent descriptor: compilation, argument validation, scratch initialization
+and tensor-operand elision must use the same effective presence decision.
+`test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
+tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
+failure and an output that was simultaneously required and forbidden.

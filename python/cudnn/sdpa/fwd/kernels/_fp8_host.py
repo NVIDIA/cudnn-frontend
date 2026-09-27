@@ -50,6 +50,8 @@ def host(
     scale_o_ptr: Optional[cute.Pointer],
     amax_o_ptr: cute.Pointer,
     sf_o_ptr: Optional[cute.Pointer],
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     has_amax: cutlass.Constexpr[bool],
     kernel_host: cutlass.Constexpr,
     config: cutlass.Constexpr,
@@ -70,7 +72,7 @@ def host(
     The legacy kernel reduces amax after scale_o, so a requested amax is
     normalized on the same stream without constructing a framework tensor.
     """
-    thd, split_kv, paged, page_size, o_block_scale = config
+    thd, split_kv, paged, page_size, o_block_scale, epilogue_gate = config
     (
         q_tensor,
         k_tensor,
@@ -133,6 +135,9 @@ def host(
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_kwargs = dict(prepared=True)
+    if cutlass.const_expr(epilogue_gate):
+        b, qh, _, sq, _, _ = problem_size
+        kernel_kwargs.update(gate_tensor=cute.make_tensor(gate_ptr, cute.make_layout((b, sq, qh, d_v), stride=(*gate_strides, 1))))
     if cutlass.const_expr(sfo_geometry is not None):
         kernel_kwargs.update(
             sf_o_tensor=scalar(sf_o_ptr),
@@ -232,6 +237,8 @@ def compile_host(
         None if scale_o_in_combine else P(cutlass.Float32, 4),
         P(cutlass.Float32, 4),
         P(cutlass.Int8) if sfo_geometry is not None else None,
+        P(cutlass.BFloat16) if getattr(cfg, "EPILOGUE_GATE", False) else None,
+        i64_3,
         has_amax,
         kernel_host,
         (
@@ -240,6 +247,7 @@ def compile_host(
             bool(getattr(cfg, "PAGED_KV", False)),
             int(getattr(cfg, "PAGE_SIZE", 0)),
             int(getattr(cfg, "O_BLOCK_SCALE", 0)),
+            bool(getattr(cfg, "EPILOGUE_GATE", False)),
         ),
         d256,
         d_qk,

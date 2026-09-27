@@ -530,14 +530,14 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
         or not capabilities.is_mxfp8
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
-        or facts.has_epilogue_gate
+        or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
         or (facts.shape_overrides and not facts.thd)
     ):
         return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense scalar outputs"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
-        or facts.has_epilogue_gate
+        or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:

@@ -625,11 +625,10 @@ class SdpaFwdDsl(APIBase):
         Rubin FP8 and MXFP8 kernels), and ``execute(amax_o=...)`` is then a
         :class:`ValueError`. Kernels without the knob keep the legacy dummy
         slot, so the flag is honoured where it can be and harmless elsewhere.
-        Distinct from ``sample_amax_o`` / ``pv_bf16`` (#983): those select the
-        SM100 MXFP8 BF16-PV template axis (``TemplateParams.emit_amax_o``),
-        which emits Amax_O only when its plan declares the buffer; this flag is
-        the compile-knob fold-out on kernels that carry ``has_amax``. The graph
-        path derives both from the same fact (an ``Amax_O`` output or not).
+        On SM100 MXFP8 BF16-PV, ``TemplateParams.emit_amax_o`` emits Amax_O
+        only when ``sample_amax_o`` declares the buffer AND ``has_amax_o`` is
+        true. Both host entry points specialize away the omitted operand.
+        The graph path derives both from the same output declaration.
 
         Paged KV (``paged_page_size > 0``): ``sample_k`` / ``sample_v`` are the
         page POOLS ``[num_pages, H_kv, page_size, D]`` — HND compact, or NHD
@@ -655,7 +654,9 @@ class SdpaFwdDsl(APIBase):
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
-        self.has_amax_o = bool(has_amax_o)
+        # The direct hybrid specialization already derives EMIT_AMAX_O from
+        # sample_amax_o. Keep its prepared reset/argument contract identical.
+        self.has_amax_o = bool(has_amax_o and (not pv_bf16 or sample_amax_o is not None))
         # The gate's BSHD strides the artifact is COMPILED at (None = compact),
         # decided by check_support exactly like the Q/K/V/O zero-copy strides.
         self._gate_declared: Optional[tuple] = None
@@ -1094,6 +1095,11 @@ class SdpaFwdDsl(APIBase):
         Dense adapters therefore record ``_lse_stride`` and rebuild that
         declared view directly over the caller's storage.
         """
+        shape = (self.batch_size, self.h_q, self.s_q_max)
+        stride = getattr(self, "_lse_stride", None)
+        if lse_tensor.dtype == torch.float32 and tuple(lse_tensor.shape) == shape:
+            if (stride is None and lse_tensor.is_contiguous()) or (stride is not None and tuple(lse_tensor.stride()) == stride):
+                return lse_tensor
         self._value_error_if(
             dtype_name(lse_tensor) != "float32",
             f"lse_tensor must be float32; got {lse_tensor.dtype}",
@@ -1103,8 +1109,6 @@ class SdpaFwdDsl(APIBase):
             lse_tensor.numel() != expected,
             f"lse_tensor must have B*H_q*S_q = {expected} elements; got {lse_tensor.numel()}",
         )
-        shape = (self.batch_size, self.h_q, self.s_q_max)
-        stride = getattr(self, "_lse_stride", None)
         if stride is None:
             self._value_error_if(
                 not lse_tensor.is_contiguous(),
@@ -1250,7 +1254,8 @@ class SdpaFwdDsl(APIBase):
         """
         from cudnn.sdpa.fwd.prepared import execute_quantized, facts_of_tensor
 
-        required = self.scratch_workspace_bytes()
+        spec = self._thd_spec if self.thd else self._dense_spec
+        required = spec.quant.scratch_offset + ws_align(8)
         if workspace is None:
             raise ValueError(f"cudnn.sdpa prepared FP8 requires a {required}-byte workspace; pass scratch_workspace_bytes() bytes")
         ws = facts_of_tensor(workspace)
@@ -1262,7 +1267,6 @@ class SdpaFwdDsl(APIBase):
         facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
         if self.thd:
             facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
-            spec = self._thd_spec
         else:
             facts.update(
                 seq_q_lens=facts_of_tensor(q_lens),
@@ -1270,7 +1274,6 @@ class SdpaFwdDsl(APIBase):
                 block_table=facts_of_tensor(block_table),
                 block_table_v=facts_of_tensor(block_table_v),
             )
-            spec = self._dense_spec
         launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
@@ -2253,7 +2256,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # compiles the atomic reduction only when its plan declares the
             # output, so a runtime execute() argument cannot silently change
             # the launched kernel.
-            emit_amax_o=(not self.pv_bf16) or self.amax_o_desc is not None,
+            emit_amax_o=(not self.pv_bf16) or self.has_amax_o,
             epilogue_gate=self.gate_desc is not None,
         )
         if self.flavor == (192, 128):
@@ -2491,7 +2494,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self._device_cc[0] == 10
             and (self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2) or self._can_prepare_block_output())
             and (not self.o_block_scale or self._can_prepare_block_output())
-            and self.gate_desc is None
         ):
             return False
         if self.paged and self.paged_table_stride != self.paged_table_v_stride:
@@ -2502,7 +2504,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None
-            for desc in (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
+            for desc in (self.q_desc,)
+            + (() if self.paged else (self.k_desc, self.v_desc))
+            + (() if self.split_kv > 1 else (self.o_desc,))
+            + (() if self.gate_desc is None else (self.gate_desc,))
         )
 
     def _can_prepare_mxfp8(self):
@@ -2512,14 +2517,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self._device_cc[0] == 10
             and (self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2) or self._can_prepare_block_output())
             and (not self.o_block_scale or self._can_prepare_block_output())
-            and not self.pv_bf16
-            and self.gate_desc is None
         ):
             return False
         if self._device_cc == (10, 7) and (self.thd or self.split_kv > 1 or self.pack_gqa):
             return False
         return self.thd or all(
-            self._prepared_operand_layout(desc) is not None for desc in (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+            self._prepared_operand_layout(desc) is not None
+            for desc in (self.q_desc, self.k_desc, self.v_desc)
+            + (() if self.split_kv > 1 else (self.o_desc,))
+            + (() if self.gate_desc is None else (self.gate_desc,))
         )
 
     def _prepared_quant_offset(self):
@@ -2911,13 +2917,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
         self._value_error_if(
-            self.amax_o_desc is not None and amax_o is None,
+            self.has_amax_o and self.amax_o_desc is not None and amax_o is None,
             "amax_o is required by this compiled specialization",
         )
         self._value_error_if(
             self.amax_o_desc is None and self.pv_bf16 and amax_o is not None,
             "this hybrid specialization was compiled without Amax_O; construct the API with sample_amax_o",
         )
+        self._value_error_if(self.pv_bf16 and sf_v is not None, "this PV-BF16 specialization does not consume sf_v")
         # The same strict presence contract for the epilogue gate: the gated
         # module reads a gate tile every tile (no gate -> stale SMEM), and the
         # ungated module has no gate slot at all.
@@ -2956,7 +2963,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o),
+                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o, gate=gate),
                 scale_val,
                 workspace,
                 current_stream,
@@ -2974,7 +2981,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o, sf_o=sf_o, scale_o=scale_o),
+                dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o, sf_o=sf_o, scale_o=scale_o, gate=gate),
                 scale_val,
                 workspace,
                 current_stream,
@@ -3358,22 +3365,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
         sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
         sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
-        # The BF16 PV specialization keeps the common FP8-family SF_V ABI, but
-        # BMM2 does not consume it. Bind a cached correctly shaped dummy rather
-        # than materializing a sliced contiguous tensor on every launch.
-        sf_v_v = (
-            self._dummy(
-                f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}",
-                device,
-                lambda: torch.zeros(
-                    (b, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V),
-                    dtype=torch.int8,
-                    device=device,
-                ),
-            )
-            if self.pv_bf16
-            else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
-        )
+        # BF16 V has no scale factors. Specialize the unused tensor slot away.
+        sf_v_v = None if self.pv_bf16 else self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -3387,9 +3380,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
 
-        if self.pv_bf16 and self.amax_o_desc is None:
+        if self.pv_bf16 and not self.has_amax_o:
             # This unused ABI slot is compiled out of the hybrid kernel.
-            amax_o_buf = self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+            amax_o_buf = None
         else:
             # Folded out (has_amax_o=False + a kernel with the knob): bind None.
             # Otherwise the caller's slot (or the cached dummy), which the kernel
