@@ -102,12 +102,13 @@ def host(
     stage2: cutlass.Constexpr,
     mm_lo: cutlass.Constexpr,
     mm_hi: cutlass.Constexpr,
-    params: cutlass.Constexpr,
+    config: cutlass.Constexpr,
     geometry: cutlass.Constexpr,
     regions: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
+    batch, heads, kv_heads, dim, q_max, kv_max, q_rows, kv_rows, chunk, thd, zero_workspace, units, granularity = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -123,47 +124,47 @@ def host(
     meta = _scratch(workspace, regions[3], cutlass.Int32)
     desc2 = _scratch(workspace, regions[4], cutlass.Int64)
     desc3 = desc2
-    if cutlass.const_expr(params.thd):
+    if cutlass.const_expr(thd):
         # All three GEMMs patch this descriptor scratch immediately before
         # launching; sequential launches on this stream serialize its reuse.
         desc3 = _scratch(workspace, regions[5], cutlass.Int64)
         # The setup kernel branches on lens_form before reading the prefix tail.
-        q_lens = _view(q_lens_ptr, ((params.batch + 1,), (1,)))
-        kv_lens = _view(kv_lens_ptr, ((params.batch + 1,), (1,)))
-        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, params.heads, params.batch, 128, params.granularity, params.units, stream)
+        q_lens = _view(q_lens_ptr, ((batch + 1,), (1,)))
+        kv_lens = _view(kv_lens_ptr, ((batch + 1,), (1,)))
+        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, heads, batch, 128, granularity, units, stream)
     # Zero once outside the head-chunk loop: stage 2 leaves mask-skipped tiles
     # unwritten, and stage 3 can consume a wider tile. The skipped set is the
     # same for every chunk, including THD, whose stage-3 K range is untrimmed.
-    if cutlass.const_expr(params.zero_workspace):
+    if cutlass.const_expr(zero_workspace):
         _zero_workspace(s_full, ds_full).launch(grid=(min((cute.size(s_full) // 8 + 255) // 256, 4096), 1, 1), block=(256, 1, 1), stream=stream)
-    padded_dim = (params.dim + 63) // 64 * 64
+    padded_dim = (dim + 63) // 64 * 64
     dot_do_o_host(o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, stream)
-    group = params.heads // params.kv_heads
+    group = heads // kv_heads
     dk_target, dv_target = dk, dv
     if cutlass.const_expr(group > 1):
         dk_target = _scratch(workspace, regions[6], dtype)
         dv_target = _scratch(workspace, regions[7], dtype)
     s_view, ds_view = s_full, ds_full
-    if cutlass.const_expr(not params.thd):
-        extent = (params.batch, params.chunk, params.q_max, params.kv_max)
+    if cutlass.const_expr(not thd):
+        extent = (batch, chunk, q_max, kv_max)
         s_view = cute.make_tensor(s_full.iterator, cute.make_layout(extent, stride=s_full.stride))
         ds_view = cute.make_tensor(ds_full.iterator, cute.make_layout(extent, stride=ds_full.stride))
-    for chunk_id in range(params.heads // params.chunk):
-        head_base = chunk_id * params.chunk
-        problem = (params.batch, params.heads, params.q_rows, params.kv_rows, params.chunk, params.kv_heads, params.q_max, params.kv_max, params.units)
+    for chunk_id in range(heads // chunk):
+        head_base = chunk_id * chunk
+        problem = (batch, heads, q_rows, kv_rows, chunk, kv_heads, q_max, kv_max, units)
         stage2(q, k, v, do, s_full, ds_full, stats, delta, meta, desc2, problem, scale, scale_log2, scale, head_base, 0, stream)
-        do_heads = _heads(do, head_base, params.chunk)
-        q_heads = _heads(q, head_base, params.chunk)
-        dv_heads = _heads(dv_target, head_base, params.chunk)
-        dk_heads = _heads(dk_target, head_base, params.chunk)
+        do_heads = _heads(do, head_base, chunk)
+        q_heads = _heads(q, head_base, chunk)
+        dv_heads = _heads(dv_target, head_base, chunk)
+        dk_heads = _heads(dk_target, head_base, chunk)
         _matmul(
             mm_lo,
             _permuted(s_view, (3, 2, 1, 0)),
             _permuted(do_heads, (3, 1, 2, 0)),
             _permuted(dv_heads, (1, 3, 2, 0)),
-            params.chunk,
-            params.batch,
-            params.kv_max,
+            chunk,
+            batch,
+            kv_max,
             meta,
             desc3,
             stream,
@@ -173,14 +174,14 @@ def host(
             _permuted(ds_view, (3, 2, 1, 0)),
             _permuted(q_heads, (3, 1, 2, 0)),
             _permuted(dk_heads, (1, 3, 2, 0)),
-            params.chunk,
-            params.batch,
-            params.kv_max,
+            chunk,
+            batch,
+            kv_max,
             meta,
             desc3,
             stream,
         )
-        kv_count = params.chunk // group
+        kv_count = chunk // group
         k_heads = _heads(k, head_base // group, kv_count)
         # Each GQA member addresses every group-th Q head against the shared K
         # head; dK/dV instead write per-Q-head partials and reduce below.
@@ -193,14 +194,14 @@ def host(
                 _permuted(k_heads, (3, 1, 2, 0)),
                 _permuted(output, (1, 3, 2, 0)),
                 kv_count,
-                params.batch,
-                params.q_max,
+                batch,
+                q_max,
                 meta,
                 desc3,
                 stream,
             )
     if cutlass.const_expr(group > 1):
-        dkv_reduce_host(dk_target, dv_target, dk, dv, params.dim, params.dim, group, dtype, False, stream)
+        dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
 
 
 def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key):
@@ -209,6 +210,8 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
 
     args = [ptr(dtype) for _ in range(5)] + [ptr(cutlass.Float32, 4)] + [ptr(dtype) for _ in range(3)]
     args += [ptr(cutlass.Int32, 4) if params.thd else None for _ in range(2)]
+    # The persistent artifact wrapper accepts primitive constexpr tuples; a
+    # dataclass argument prevents export even when it is compile-time-only.
     return compile_cached(
         host,
         *args,
@@ -219,7 +222,21 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
         stage2,
         mm_lo,
         mm_hi,
-        params,
+        (
+            params.batch,
+            params.heads,
+            params.kv_heads,
+            params.dim,
+            params.q_max,
+            params.kv_max,
+            params.q_rows,
+            params.kv_rows,
+            params.chunk,
+            params.thd,
+            params.zero_workspace,
+            params.units,
+            params.granularity,
+        ),
         geometry,
         regions,
         dtype,
