@@ -122,6 +122,7 @@ class LocalPairedBackwardSm100(BlockSparseAttnBackwardSm100Blk64):
     def __init__(self, sparse_block_size, has_block_sizes, skip_preprocess=False):
         super().__init__(sparse_block_size, has_block_sizes, skip_preprocess=skip_preprocess, kv_group_size=2)
         self.local_pairs = True
+        self.num_regs_load = self.num_regs_mma = self.num_regs_empty = 104
 
     @cute.jit
     def _compute_bwd_grid(self, problem_shape, bucketed_k2q_offsets):
