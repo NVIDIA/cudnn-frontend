@@ -16,7 +16,7 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 
 
 @cute.jit
-def host(
+def _launch(
     q_ptr: cute.Pointer,
     k_ptr: cute.Pointer,
     v_ptr: cute.Pointer,
@@ -129,7 +129,101 @@ def host(
     )
 
 
-def compile_host(kernel_host, cfg, storage_dtype, output_dtype, sf_smem_sizes, cache_key, d_qk, d_v, has_lse, lse_kind, *, partial_slot=True):
+@cute.jit
+def host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int32,
+    scale_softmax_log2: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    o_partial_ptr: Optional[cute.Pointer],
+    sf_q_ptr: cute.Pointer,
+    sf_k_ptr: cute.Pointer,
+    sf_v_ptr: cute.Pointer,
+    sf_tiles: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    amax_o_ptr: cute.Pointer,
+    kernel_host: cutlass.Constexpr,
+    cfg: cutlass.Constexpr,
+    sf_smem_sizes: cutlass.Constexpr[tuple],
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    lse_kind: cutlass.Constexpr[str],
+    partial_slot: cutlass.Constexpr[bool],
+    static_lse_strides: cutlass.Constexpr,
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    leading = (
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        o_desc_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+    )
+    trailing = (
+        lse_ext,
+        scale_softmax_log2,
+        n_thd_units,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        o_partial_ptr,
+        sf_q_ptr,
+        sf_k_ptr,
+        sf_v_ptr,
+        sf_tiles,
+        amax_o_ptr,
+        kernel_host,
+        cfg,
+        sf_smem_sizes,
+        d_qk,
+        d_v,
+        lse_kind,
+        partial_slot,
+    )
+    if cutlass.const_expr(static_lse_strides is None):
+        _launch(*leading, lse_strides, *trailing, stream=stream)
+    else:
+        # Preserve generic runtime layouts while specializing the declared
+        # dense Stats layout. Both arms launch the same logical operation.
+        if (lse_strides[0] == static_lse_strides[0]) & (lse_strides[1] == static_lse_strides[1]) & (lse_strides[2] == static_lse_strides[2]):
+            _launch(*leading, static_lse_strides, *trailing, stream=stream)
+        else:
+            _launch(*leading, lse_strides, *trailing, stream=stream)
+
+
+def compile_host(
+    kernel_host, cfg, storage_dtype, output_dtype, sf_smem_sizes, cache_key, d_qk, d_v, has_lse, lse_kind, *, partial_slot=True, static_lse_strides=None
+):
+    if static_lse_strides is not None:
+        if not has_lse or cfg.THD_VARLEN or cfg.SPLIT_KV != 1:
+            raise ValueError("Stats stride specialization requires dense unsplit Stats")
+        if len(static_lse_strides) != 3 or any(x < 0 for x in static_lse_strides):
+            raise ValueError("Stats stride specialization requires three nonnegative strides")
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared MXFP8 split-KV requires partial LSE")
     gmem = cute.AddressSpace.gmem
@@ -177,6 +271,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, sf_smem_sizes, c
         d_v,
         lse_kind,
         partial_slot,
+        static_lse_strides,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

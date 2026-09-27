@@ -2533,6 +2533,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
         accepted = inspect.signature(compile_fn).parameters
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "static_lse_strides" in accepted and self.lse_desc is not None and not self.thd and self.split_kv == 1:
+            # Plan metadata only. The compiled host retains a generic branch
+            # for other legal runtime Stats strides. SM100 D512 half outputs
+            # generate faster code with dynamic Stats addressing; FP8 outputs
+            # benefit from the declared-layout specialization.
+            dynamic_d512_half = self._device_cc != (10, 7) and self.flavor == (512, 512) and self._o_dtype() in (torch.float16, torch.bfloat16)
+            if not dynamic_d512_half:
+                kw["static_lse_strides"] = tuple(int(x) for x in self.lse_desc.stride)
         if "has_amax" in accepted:
             kw["has_amax"] = self.has_amax_o
         if "scale_o_in_combine" in accepted:

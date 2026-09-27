@@ -389,3 +389,36 @@ def test_prepared_mxfp8_graph_and_adapter_bind_same_frame(thd, d, dv, monkeypatc
     for i, name in enumerate(prepared.spec.order):
         if name != "stream":
             assert str(frames[0][i]) == str(frames[1][i]), name
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("layout", ["padded", "batch_inner"])
+def test_prepared_mxfp8_runtime_stats_layout_keeps_generic_branch(d, dv, layout):
+    g, vp, ws, bufs, tensors = _case(d=d, dv=dv)
+    original = bufs["lse"]
+    b, h, sq = original.shape
+    if layout == "padded":
+        rebound = torch.empty_strided((b, h, sq), (h * (sq + 16), sq + 16, 1), device="cuda", dtype=torch.float32)
+    else:
+        rebound = torch.empty((h, sq, b), device="cuda").permute(2, 0, 1)
+    assert rebound.stride() != original.stride()
+    # Match the graph's explicit BH S1 axes so native rank normalization
+    # does not reinterpret a physically contiguous axis permutation.
+    vp[tensors["lse"]] = rebound.unsqueeze(-1)
+    bufs["lse"] = rebound
+    rebound.fill_(float("nan"))
+    g.execute(vp, ws)
+    _check(bufs, thd=False)
+    with _cuda_graph() as captured:
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        _change_scales(bufs)
+        rebound.fill_(float("nan"))
+        captured.replay()
+        _check(bufs, thd=False)
+    # Reusing the originally declared layout remains valid.
+    vp[tensors["lse"]] = bufs["lse"] = original
+    original.fill_(float("nan"))
+    g.execute(vp, ws)
+    _check(bufs, thd=False)

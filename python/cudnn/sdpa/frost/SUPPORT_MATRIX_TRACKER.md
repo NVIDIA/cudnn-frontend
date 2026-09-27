@@ -1,5 +1,9 @@
 # FROST SDPA — support matrix
 
+Prepared scalar-output MXFP8 dense plans can specialize their declared Stats strides
+at compilation and retain a generic compiled host branch for other valid runtime
+Stats layouts. THD and split partials retain their existing binding contract.
+
 What the shipped FROST SDPA engines actually serve, one table per architecture.
 Columns are the kernel **flavors** (native head-dim geometry, with the model
 class it was tuned for in brackets) crossed with the pass; rows are features.

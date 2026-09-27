@@ -3890,6 +3890,7 @@ def compile_prepared(
     lse_kind: str = "dense",
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
+    static_lse_strides: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
@@ -3916,5 +3917,6 @@ def compile_prepared(
         d_v,
         has_lse,
         lse_kind,
+        static_lse_strides=static_lse_strides,
         partial_slot=False,
     )
