@@ -31,6 +31,17 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _sm107_target_for_metadata(monkeypatch):
+    """Model SM107 eligibility on other GPUs without requiring their DSL to target Rubin."""
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _E4M3, _BF16_OUT = 0, 2
 # (192, 128) is in the sweep for all three dtype families as of 2026-09-09 --
 # it is the flavor whose wider K moves SMEM offsets, so it is exactly the one
@@ -1673,7 +1684,7 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
     The quantized kernels keep the tensor entry, where signatures evolve append-only
     (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
-    ``gate_tensor`` LAST -- after ``stream``.  A ``gate_stride`` handed to an UNGATED tensor-entry
+    ``gate_tensor`` immediately after ``stream``; prepared flags may follow.  A ``gate_stride`` handed to an UNGATED tensor-entry
     module is a ValueError, not a silently ignored kwarg."""
     import inspect
 
@@ -1697,7 +1708,9 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         assert sig["gate_stride"].default is None
         assert sig["has_amax"].default is True
         host = list(inspect.signature(mod._host).parameters)
-        assert host[-2:] == ["stream", "gate_tensor"], (mod.__name__, host[-3:])
+        stream_slot = host.index("stream")
+        assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
+        assert host[stream_slot + 2 :] in ([], ["prepared"]), (mod.__name__, host[stream_slot:])
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters

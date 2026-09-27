@@ -197,3 +197,9 @@ Sparse metadata and cross-warp reduction scratch also need explicit reader
 completion before reuse. Run racecheck on both indexer and attention cases:
 ordering Q/K MMA alone does not publish every metadata lane's stores, and a
 max-to-sum reduction can overwrite shared scratch before all warps read it.
+
+SM107 metadata/heuristic tests run on non-SM107 CI lanes too. Model compiler
+target availability explicitly when testing a synthetic Rubin capability row;
+do not require the worker's DSL wheel to expose `sm_107a`. Keep real installed
+compiler-target decline tests separate, and retain the live target check for
+actual SM107 kernel execution. The release-DSL SM80 lane exposed this split.

@@ -2377,6 +2377,14 @@ def compile(
     lse_padded_order: tuple = (3, 2, 1, 0),
     dynamic_bhk: bool = False,
     lse_stride: Optional[tuple] = None,
+    # == EPILOGUE_FUSION_SEAM(compile) ==
+    # APPEND-ONLY.  gate_stride: the DECLARED BSHD stride of the bf16 gate
+    # tensor (same rules as q/k/v/o_stride); None = COMPACT bf16 [B, S, H_q,
+    # D_v] -- never "O's stride".  Only legal on an EPILOGUE_GATE module (the
+    # gate fake is built iff CFG.EPILOGUE_GATE; a stride on an ungated module
+    # raises).  has_amax: True = the legacy Amax_O output slot; False
+    # None-specializes amax_o_tensor and folds the fold + atomic out.  Both are
+    # part of the compile key (_template_key hashes locals()).
     gate_stride: Optional[tuple] = None,
     has_amax: bool = True,
 ) -> Callable:
