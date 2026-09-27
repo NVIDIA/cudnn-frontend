@@ -135,6 +135,11 @@ ordered after that read.**
   adapter admission in agreement; the detector is
   `test_prepared_fp8_output_stride_uses_output_element_width`.
 
+Stats stores obey the same full-indexing rule as O. Nonunit sequence stride
+can otherwise leave half the rows unwritten while corrupting padding. The
+SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
+rebound padded and batch-inner layouts under CUDA Graph replay.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 

@@ -1969,8 +1969,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, head_idx, q_row_global] = lse_val
 
         parity_last_rt = cutlass.Int32(0)
         if bounds.right > bounds.left:

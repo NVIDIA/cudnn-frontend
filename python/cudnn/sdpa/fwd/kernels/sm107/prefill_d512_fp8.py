@@ -1800,8 +1800,7 @@ def _compute_warp_group(
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
                         lse_arr = cutlass.make_array_view(lse_tensor)
-                        lse_row = lse_arr[batch_idx, head_idx, :]
-                        lse_row[q_row_global] = lse
+                        lse_arr[batch_idx, head_idx, q_row_global] = lse
 
         # End-of-tile: advance scheduler.
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)

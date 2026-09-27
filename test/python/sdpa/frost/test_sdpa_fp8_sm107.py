@@ -1153,6 +1153,25 @@ class TestPreparedSm107Fp8:
             graph.replay()
             _prepared_fp8_checks._check(bufs, thd=thd)
 
+    @pytest.mark.parametrize("d", [256, 512])
+    def test_sm107_fp8_stats_nonunit_row_stride(self, d):
+        g, vp, ws, bufs, tensors = _prepared_fp8_checks._case(d=d, dv=d)
+        b, h, sq = bufs["lse"].shape
+        storage = torch.full((b, h, sq, 2), 12345.0, device="cuda")
+        bufs["lse"] = storage[..., 0]
+        vp[tensors["lse"]] = bufs["lse"].unsqueeze(-1)
+        bufs["lse"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=False)
+        assert (storage[..., 1] == 12345).all()
+        with _prepared_fp8_checks._cuda_graph() as captured:
+            with torch.cuda.graph(captured):
+                g.execute(vp, ws)
+            bufs["lse"].fill_(float("nan"))
+            captured.replay()
+            _prepared_fp8_checks._check(bufs, thd=False)
+            assert (storage[..., 1] == 12345).all()
+
     @pytest.fixture(autouse=True)
     def _sm107_case(self, monkeypatch):
         original = _prepared_fp8_checks._case
