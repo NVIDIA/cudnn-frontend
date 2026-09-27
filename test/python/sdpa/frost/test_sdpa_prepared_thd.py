@@ -19,7 +19,7 @@ import torch
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep_mod
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _dsl_installed, requires_blackwell, requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0]
 
@@ -1391,3 +1391,68 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d):
         if captured is not None:
             captured.reset()
         rec.restore()
+
+
+# Define DSL probes at module scope: the tracer resolves names from the
+# defining module, not from a test function's local imports.
+if _dsl_installed():
+    import cuda.bindings.driver as _prefix_cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp
+
+    @cute.kernel
+    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        warp, lane = cutlass.Int32(tid) // 32, cutlass.Int32(tid) % 32
+        meta = cutlass.make_array_view(meta_t)
+        if warp == 0:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q), b, b, (flags & 1) != 0, lane, store_lengths=False)
+        if warp == 1:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(k), b, 2 * b + 1, (flags & 2) != 0, lane, store_lengths=True)
+
+        cute.arch.barrier()
+        write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64))
+        cute.arch.barrier()
+        write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
+
+    @cute.jit
+    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, stream):
+        _prefix_probe(m, q, k, b, flags).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+
+@pytest.fixture(scope="module")
+def _prefix_runner():
+    compiled = None
+
+    def run(meta, q, k, b, flags):
+        nonlocal compiled
+        tensor = lambda x: from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        args = (tensor(meta), tensor(q), tensor(k), cutlass.Int32(b), cutlass.Int32(flags), _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        if compiled is None:
+            compiled = cute.compile(_prefix_host, *args)
+        compiled(*args)
+
+    return run
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [0, 1, 2, 4, 7, 8, 9, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1024])
+@pytest.mark.parametrize("flags", range(4))
+def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _prefix_runner):
+    """Exact metadata across warp boundaries, zero lengths, and sliced prefixes."""
+    q = (torch.arange(b, dtype=torch.int32) * 17) % 257
+    k = (torch.arange(b, dtype=torch.int32) * 31) % 1025
+    cq = torch.cat((torch.zeros(1, dtype=torch.int32), q.cumsum(0, dtype=torch.int32)))
+    ck = torch.cat((torch.zeros(1, dtype=torch.int32), k.cumsum(0, dtype=torch.int32)))
+    q_in = (cq + 17 if flags & 1 else q).to(DEV)
+    k_in = (ck + 31 if flags & 2 else k).to(DEV)
+    meta = torch.full((4 * b + 4,), -12345, dtype=torch.int32, device=DEV)
+    _prefix_runner(meta, q_in, k_in, b, flags)
+    got = meta.cpu()
+    torch.testing.assert_close(got[: 3 * b + 2], torch.cat((k, cq, ck)), rtol=0, atol=0)
+    remap = torch.tensor(sorted(range(b), key=lambda i: (-int(q[i]), i)), dtype=torch.int32)
+    live = int(((q + 127) // 128).sum()) * 3
+    torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
