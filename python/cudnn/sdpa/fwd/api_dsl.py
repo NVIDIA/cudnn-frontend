@@ -5517,9 +5517,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
-    Known deviations, pre-existing and tracked rather than introduced here: an
-    off-flavor head dim pads V (and O, via a scratch) host-side; sink logits
-    are rescaled to log2 units with one (H,)-element multiply per execute.
+    Dense vector-aligned declarations with a native V width use one prepared
+    pointer host, including native GQA and strided Q/K/V/O/Stats. Other layouts,
+    off-flavor V widths and RoPE retain their existing tensor-entry staging.
+    Only that legacy path rescales sink logits with a separate torch operation.
     """
 
     def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
@@ -5547,6 +5548,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.right_bound_runtime: int = 0
         self._k_mod = None
         self._params = None
+        self._sm80_spec = None
         self._lse_stride: Optional[tuple[int, int, int]] = None
 
     # ------------------------------------------------------------------
@@ -5738,6 +5740,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._ensure_support_checked()
         from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
 
+        from cudnn.sdpa.fwd.prepared_sm80 import build_spec, native_layouts
+
+        prepared = native_layouts(self)
         self._params = _sm80_cfg.TemplateParams(
             io_bf16=(self.dtype == torch.bfloat16),
             d_qk=self.flavor_d_qk,
@@ -5759,8 +5764,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sched_policy=_sm80_sched_policy_int(self.sched_token),
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
+            sink_natural=prepared,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
+        if prepared:
+            self._sm80_spec = build_spec(self)
+            self._compiled_kernel = self._sm80_spec.artifact
+            self._logger.debug("compile completed")
+            return
         self._compiled_kernel = self._k_mod.compile(
             b=self.batch_size,
             # Dense GQA is served by adapter-side K/V head expansion until the
@@ -5793,6 +5804,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         strided-LSE staging, and the sinks log2 rescale — everything execute()
         would otherwise allocate. Sized in execute()'s carve order."""
         self._ensure_support_checked()
+        from cudnn.sdpa.fwd.prepared_sm80 import native_layouts
+
+        if native_layouts(self):
+            return 0
         if self.thd:
             return 0  # engine rows never lower THD; the wrapper path allocates
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
@@ -5839,6 +5854,16 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
         p = self._params
+        if self._sm80_spec is not None:
+            from cudnn.sdpa.fwd.prepared import facts_of_tensor
+            from cudnn.sdpa.fwd.prepared_sm80 import ROLES, execute
+
+            self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
+            facts = {name: facts_of_tensor(t) for name, t in zip(ROLES, buffers)}
+            execute(self._sm80_spec, facts, int(self._get_default_stream(current_stream)), scale=scale_softmax)
+            self._logger.debug("execute completed")
+            return
 
         # Init-time flags are compile-time specializations; execute must match
         # them exactly, in both directions (Hard Rule 1).
