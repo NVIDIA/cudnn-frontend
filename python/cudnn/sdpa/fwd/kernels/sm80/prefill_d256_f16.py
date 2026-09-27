@@ -1701,6 +1701,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     """
     _cache_key = _template_key(globals(), locals(), "compile")
     p = PARAMS
+    if p.thd_varlen and p.has_bias:
+        raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
     if p.thd_varlen:
         raise NotImplementedError("SM80 packed THD uses prepared_host.compile_thd_host")
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
