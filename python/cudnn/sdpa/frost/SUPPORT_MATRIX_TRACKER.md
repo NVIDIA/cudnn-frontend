@@ -1098,3 +1098,15 @@ Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
 MXFP8 also prepares its existing dense scalar-output paths as described above.
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
+
+### Prepared block-scaled output launch contract
+
+Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
+SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
+MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
+current O, SF_O, optional Amax and device scales with observed storage checks.
+FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
+SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
+their existing admission boundaries. PV-BF16 and remaining legacy layouts retain
+their tensor entries. Standalone prepared calls require caller-owned workspace.

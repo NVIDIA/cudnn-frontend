@@ -49,6 +49,7 @@ def host(
     descale_v_ptr: cute.Pointer,
     scale_o_ptr: Optional[cute.Pointer],
     amax_o_ptr: cute.Pointer,
+    sf_o_ptr: Optional[cute.Pointer],
     has_amax: cutlass.Constexpr[bool],
     kernel_host: cutlass.Constexpr,
     cfg: cutlass.Constexpr,
@@ -59,6 +60,7 @@ def host(
     paged_hnd: cutlass.Constexpr[bool],
     partial_slot: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
+    sfo_geometry: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind dense or THD pointer views and launch the selected FP8 host.
@@ -114,6 +116,7 @@ def host(
         block_table_v_ptr=block_table_v_ptr,
         table_strides=table_strides,
         n_pages=n_pages,
+        o_pack=2 if getattr(cfg, "O_BLOCK_SCALE", 0) == 16 else 1,
     )
 
     def scalar(ptr):
@@ -129,6 +132,15 @@ def host(
     if cutlass.const_expr(cfg.SPLIT_KV == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kernel_kwargs = dict(prepared=True)
+    if cutlass.const_expr(sfo_geometry is not None):
+        kernel_kwargs.update(
+            sf_o_tensor=scalar(sf_o_ptr),
+            sfo_plane_stride=cutlass.Int64(sfo_geometry[0]),
+            sfo_row_off_b=cutlass.Int64(sfo_geometry[1]),
+            sfo_col_off_h=cutlass.Int64(sfo_geometry[2]),
+            sfo_cols=cutlass.Int64(sfo_geometry[3]),
+            prepared_sfo_geometry=sfo_geometry,
+        )
     if cutlass.const_expr(partial_slot):
         kernel_kwargs.update(o_partial_f32=o_partial_f32)
     if cutlass.const_expr(getattr(cfg, "PAGED_KV", False)):
@@ -171,6 +183,7 @@ def compile_host(
     *,
     partial_slot=True,
     optional_amax=False,
+    sfo_geometry=None,
 ):
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")
@@ -215,6 +228,7 @@ def compile_host(
         P(cutlass.Float32, 4),
         None if scale_o_in_combine else P(cutlass.Float32, 4),
         P(cutlass.Float32, 4),
+        P(cutlass.Int8) if sfo_geometry is not None else None,
         has_amax,
         kernel_host,
         cfg,
@@ -225,6 +239,7 @@ def compile_host(
         paged_hnd,
         partial_slot,
         optional_amax,
+        sfo_geometry,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

@@ -37,6 +37,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
+from cudnn.datatypes import _DLPACK_FP4_CODE_BITS
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
 
@@ -46,6 +47,7 @@ _DLPACK_CUDA = 2
 _DLPACK_CPU = 1
 _I32_MAX = 2**31 - 1
 _DTYPE_BY_CODE = {(code, bits): name for name, (code, bits) in _buffers.DTYPES.items()}
+_DTYPE_BY_CODE[_DLPACK_FP4_CODE_BITS] = "float4_e2m1fn_x2"
 
 
 class BufferFacts(NamedTuple):
@@ -97,27 +99,78 @@ _QUANT_ROLES = ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
 _QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
 
 
+class BlockOutputSpec(NamedTuple):
+    geometry: Tuple[int, int, int, int]
+    nbytes: int
+    pack: int
+    has_scale: bool
+
+
 class QuantizedLaunchSpec(NamedTuple):
     has_amax: bool
     scratch_offset: int  # unused amax and an identity scale, in caller-owned workspace
     sf_sizes: Tuple[int, ...] = ()  # opaque F8_128x4 tile byte sizes; empty for per-tensor FP8
+    block_output: Optional[BlockOutputSpec] = None
 
 
 def _quant_spec(api):
+    if not (getattr(api, "_prepared_mxfp8", False) or getattr(api, "_prepared_fp8", False)):
+        return None
+    block = None
+    if api.o_block_scale:
+        plane, row_b, col_h, cols = api._sfo_geometry
+        b, h, rows = int(api.batch_size), int(api.h_q), int(api.sf_o_desc.shape[2])
+        needed = b * h * plane if plane else ((b * rows + 127) // 128 * 128) * cols
+        block = BlockOutputSpec((plane, row_b, col_h, cols), needed, 2 if api.o_block_scale == 16 else 1, bool(api.has_scale_o))
+    sizes = ()
     if getattr(api, "_prepared_mxfp8", False):
         km = api._k_mod
-        return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K, km.SF_SMEM_SIZE_V))
-    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K, km.SF_SMEM_SIZE_V)
+    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 
 def _quant_roles(quant):
-    return ("sf_q", "sf_k", "sf_v", "amax_o") if quant.sf_sizes else _QUANT_ROLES
+    roles = ("sf_q", "sf_k", "sf_v", "amax_o") if quant.sf_sizes else _QUANT_ROLES
+    if quant.block_output is not None:
+        roles += ("sf_o",) + (("scale_o",) if quant.sf_sizes else ())
+    return roles
 
 
 def _quant_slots(quant):
     if quant is None:
         return frozenset()
-    return frozenset(("sf_q_ptr", "sf_k_ptr", "sf_v_ptr", "sf_tiles", "amax_o_ptr")) if quant.sf_sizes else _QUANT_SLOTS
+    slots = frozenset(("sf_q_ptr", "sf_k_ptr", "sf_v_ptr", "sf_tiles", "amax_o_ptr", "scale_o_ptr")) if quant.sf_sizes else _QUANT_SLOTS
+    return slots | {"sf_o_ptr"}
+
+
+def _bind_block_output(spec, facts):
+    block = spec.quant.block_output
+    f = facts.get("sf_o")
+    if block is None:
+        if f is not None:
+            raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
+        return None
+    if f is None:
+        raise ValueError("cudnn.sdpa: block-scaled output requires sf_o")
+    _on_plan_device(spec, "sf_o", f)
+    if _buffers.DTYPE_ITEMSIZE.get(f.dtype) != 1:
+        raise ValueError("cudnn.sdpa: sf_o requires byte storage")
+    _sf_byte_count(f.shape, f.strides, f.dtype)
+    # Token-major graph declarations omit the final 128-row atom padding.
+    # Its capacity comes from the producer's observed storage, not logical
+    # numel. Bare addresses retain the unknown-span caller contract.
+    if 0 <= f.span < block.nbytes:
+        raise ValueError("cudnn.sdpa: sf_o storage does not cover the compiled atom layout")
+    if not f.ptr or f.ptr % 16:
+        raise ValueError("cudnn.sdpa: sf_o must be 16-byte aligned")
+    for name, other in facts.items():
+        if name == "sf_o" or other is None or not other.numel:
+            continue
+        width = _buffers.DTYPE_ITEMSIZE[other.dtype]
+        span = other.span if other.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(other.shape, other.strides))
+        if f.ptr < other.ptr + span * width and other.ptr < f.ptr + block.nbytes:
+            raise ValueError(f"cudnn.sdpa: sf_o overlaps {name}")
+    return f.ptr
 
 
 @lru_cache(maxsize=256)
@@ -186,10 +239,25 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
     quant = spec.quant
     if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
         raise ValueError("cudnn.sdpa: prepared FP8 requires an aligned caller workspace")
+    if quant.block_output is not None and quant.block_output.pack == 2:
+        o = facts.get("o")
+        if o is not None:
+            if o.dtype not in ("float4_e2m1fn_x2", "uint8"):
+                raise ValueError("cudnn.sdpa: NVFP4 O requires packed FP4 or byte storage")
+            # Both native graph facts and the torch packed carrier already
+            # report byte-slot geometry. Never divide that geometry again.
+            facts = dict(facts, o=o._replace(dtype="uint8"))
     patches = _bind_mxfp8_scales(spec, facts) if quant.sf_sizes else {}
+    if quant.block_output is not None or facts.get("sf_o") is not None:
+        patches["sf_o_ptr"] = _bind_block_output(spec, facts)
+    if quant.sf_sizes:
+        patches["scale_o_ptr"] = None
+        if quant.block_output is not None and (facts.get("scale_o") is not None) != quant.block_output.has_scale:
+            raise ValueError("cudnn.sdpa: scale_o presence must match the block-output specialization")
     identity = workspace_ptr + quant.scratch_offset + 4
     needs_identity = False
-    for name in (("amax_o",) if quant.sf_sizes else _QUANT_ROLES):
+    scalar_roles = (("amax_o",) + (("scale_o",) if quant.block_output is not None and quant.block_output.has_scale else ())) if quant.sf_sizes else _QUANT_ROLES
+    for name in scalar_roles:
         f = facts.get(name)
         if f is None:
             if name == "amax_o":
@@ -1020,6 +1088,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     if s.split > 1:  # the main kernel writes the split-major partial slabs, in the partial dtype
         s.expect["o"] = str(api._partial_torch_dtype()).split(".")[-1]
+    if s.quant is not None and s.quant.block_output is not None and s.quant.block_output.pack == 2:
+        s.expect["o"] = "uint8"
     s.elem_bytes = {n: _buffers.DTYPE_ITEMSIZE[t] for n, t in s.expect.items()}
     s.has_lse = (api.lse_desc is not None) or s.split > 1
     s.has_sink = bool(api.has_sink)
@@ -1042,7 +1112,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # compile neither (both fields are the FP8 flavors'), so this pins nothing today and guards their joining.
     params = getattr(km, "PARAMS", None)
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
-    if s.quant is not None and s.quant.sf_sizes:
+    if s.quant is not None and (s.quant.sf_sizes or s.quant.block_output is not None):
         s.shape_fixed = s.lpt_grid_fixed = True  # dense SF batch/head pitches are plan-fixed
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
@@ -1288,7 +1358,8 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         q = _dense_role(spec, facts, "q", spec.qh, spec.d_qk, spec.s_q_max, spec.expect["q"])
         b, s_q = q.b, q.s
         frame[ix["q_ptr"]], frame[ix["q_strides"]] = q.ptr, q.strides
-    o = _dense_role(spec, facts, "o", spec.qh, spec.d_v, spec.s_q_max, spec.expect["o"], b_mult=spec.split)
+    o_d = spec.d_v // (spec.quant.block_output.pack if spec.quant is not None and spec.quant.block_output is not None else 1)
+    o = _dense_role(spec, facts, "o", spec.qh, o_d, spec.s_q_max, spec.expect["o"], b_mult=spec.split)
     if o.b != b * spec.split or o.s != s_q:
         raise ValueError(
             f"cudnn.sdpa: o is ({o.b}, {spec.qh}, {o.s}, {spec.d_v}) but q runs batch {b} x seq {s_q}" + (f" ({spec.split} splits)" if spec.split > 1 else "")
