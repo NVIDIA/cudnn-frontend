@@ -1,5 +1,9 @@
 # FROST SDPA — support matrix
 
+Prepared scalar-output MXFP8 dense plans can specialize their declared Stats strides
+at compilation and retain a generic compiled host branch for other valid runtime
+Stats layouts. THD and split partials retain their existing binding contract.
+
 What the shipped FROST SDPA engines actually serve, one table per architecture.
 Columns are the kernel **flavors** (native head-dim geometry, with the model
 class it was tuned for in brackets) crossed with the pass; rows are features.
@@ -58,8 +62,12 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
-Block-scaled FP8 outputs, MXFP8,
-synthesized KV-tail padding and bias remain tensor-only and decline overrides;
+SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
+SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
+head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
+shape overrides remain declined because SF batch/head pitches are plan-fixed.
+Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
+and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -1074,3 +1082,19 @@ The batch stride is not gated: every sequence base comes from the ragged offsets
 the lowering binds the batch axis at extent 1, so its declared value is never read.
 FlashInfer declares it equal to the token stride (`h * d`), which the previous
 all-four-axes check refused at `b > 1`. Stats under THD are written in the caller's declared layout: packed `(T, H)` rows, head-major `(1, QH, head_stride)`, or -- a Stats tensor **without** ragged offsets -- the per-batch padded form -- the graph's logical `[b, h, s_max, 1]` Stats view over FlashInfer's physical, contiguous `(b, s_max, h)` `return_lse` buffer (declared strides `[s_max*h, 1, h, 1]`; the adapter rebuilds the view with `as_strided`, nothing is allocated in the logical order), stored per batch through the declared strides on every THD row (SM100 / SM107 / SM120, `Capabilities.thd_padded_stats`); the adapter seeds that buffer with `-inf` on the launch stream first, so the rows past a sequence's length read the backend's value. On SM100 / SM107 the THD templates compile with DYNAMIC batch and head extents (`compile(dynamic_bhk=True)`): one artifact per layout class (d, dtypes, masks, GQA ratio, packed vs declared strides), not per shape.
+
+
+### Prepared SM100/SM103 MXFP8 forward launch contract
+
+Scalar-output MXFP8 dense, native-shape THD and the existing dense split-KV
+paths use prepared pointer launches for D128, D192x128, D256 and D512.
+THD shape/stride overrides bind within the declared envelope; dense MXFP8
+keeps fixed geometry because its opaque scale-factor batch/head pitches are
+plan-specific. SF storage may be any dense physical-axis permutation and is
+validated against the producer's observed byte span. Packed SF tile totals are
+runtime metadata, never read from device lengths or used as compile keys.
+D512 retains half split partials; the other three flavors use FP32 partials.
+Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
+MXFP8 also prepares its existing dense scalar-output paths as described above.
+Standalone prepared calls require the declared
+caller workspace, like graph execution; no plan owns device scratch.

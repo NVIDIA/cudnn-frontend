@@ -2399,3 +2399,27 @@ def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
         paged_table_v_stride=v_stride,
     )
     assert SdpaFwdDslSm100._can_prepare_fp8(api) == (v_stride == (8, 1))
+
+
+@pytest.mark.parametrize(
+    "thd,override,split,accepted",
+    [(False, False, 1, True), (False, False, 4, True), (False, True, 1, False), (True, True, 1, True), (True, False, 1, True), (True, True, 4, False)],
+)
+@pytest.mark.parametrize("rubin_cc", [(10, 7), (10, 8), (11, 9)])
+def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_cc):
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = replace(_facts(graph), is_mxfp8=True, thd=thd, shape_overrides=override)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(mxfp8=True))
+    reason = engines._prepared_decline_reason(caps, facts, split)
+    assert (reason is None) == accepted, reason
+    if accepted:
+        for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
+            assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
+        rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
+        rubin_facts = replace(facts, device_cc=rubin_cc)
+        assert (engines._prepared_decline_reason(rubin, rubin_facts, split) is None) == (rubin_cc == (10, 7) and not thd and not override and split == 1)

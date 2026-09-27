@@ -517,10 +517,20 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     A complete assignment additionally checks the final O store's layout.
     Runtime geometry still has to fit the compiled binder's per-call contract.
     """
-    if capabilities.sm_lo not in (100, 107, 120) or facts.is_mxfp8:
+    if capabilities.sm_lo not in (100, 107, 120):
         return "this engine has no prepared shape/stride override executor"
-    if facts.is_fp8 and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
-        return "prepared SM107 FP8 requires device cc 10.7"
+    if (facts.is_fp8 or facts.is_mxfp8) and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
+        return "prepared SM107 FP8/MXFP8 requires device cc 10.7"
+    if facts.is_mxfp8 and (
+        capabilities.sm_lo not in (100, 107)
+        or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
+        or not capabilities.is_mxfp8
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+        or facts.o_block_scale
+        or facts.has_epilogue_gate
+        or (facts.shape_overrides and not facts.thd)
+    ):
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense scalar outputs"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
@@ -1222,7 +1232,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
-    in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
+    in cu_seqlens order — see prepared._bind_mxfp8_scales); the graph's declared
     SF dims stay the dense capacity, like the ragged Q/K/V storage.
     """
 
