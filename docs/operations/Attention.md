@@ -493,7 +493,7 @@ Where:
 
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-- Python tests (v2 with randomized configurations): [test/python/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_mhas_v2.py)
+- Python tests (v2 with randomized configurations): [test/python/sdpa/graph/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/graph/test_mhas_v2.py)
 
 
 **Example Usage:**
@@ -682,7 +682,7 @@ graph.sdpa_backward(
 
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-- Python tests (v2 with randomized configurations): [test/python/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_mhas_v2.py)
+- Python tests (v2 with randomized configurations): [test/python/sdpa/graph/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/graph/test_mhas_v2.py)
 
 #### Tensors
 
@@ -841,7 +841,7 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
 - `nvidia-cudnn-frontend`, cuDNN backend ≥ 9.6 (THD token-major
   stats), sm80+.
 
-Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).
+Tests: [test/python/sdpa/torch/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/torch/test_torch_ops.py).
 
 ### SDPA FP8 Forward
 

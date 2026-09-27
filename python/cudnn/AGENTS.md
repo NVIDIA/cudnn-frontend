@@ -8,7 +8,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 - A function and its implementation module can share a name. Python installs an imported
   submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
-  `test_ops_callable_exports_survive_import_order` in `test/python/test_import_boundaries.py`.
+  `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
@@ -598,7 +598,7 @@ Every OSS kernel API extends `APIBase` and implements:
 2. `APIBase` subclass + wrapper in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/fe_api/<family>/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
 6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
@@ -620,5 +620,5 @@ may compact valid active indices only if forward and backward share that exact
 metadata. Score targets must preserve original slots, mask invalid/inactive
 entries, and normalize over retained slots after summing heads. Never reuse
 compacted training indices as the caller-visible target order. Detector:
-`fe_api/dsa/test_DSA_training.py::test_native_training_and_original_score_slots`
+`deepseek_sparse_attention/cutedsl/test_DSA_training.py::test_native_training_and_original_score_slots`
 checks holes, duplicates, bounded lengths, all-masked rows and target alignment.
