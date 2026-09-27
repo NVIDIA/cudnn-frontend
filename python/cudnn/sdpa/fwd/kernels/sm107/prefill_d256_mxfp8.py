@@ -3049,9 +3049,9 @@ def compile_prepared(
     static_lse_strides: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
 
-    cache_key = _template_key(globals(), locals(), "compile_prepared")
     if CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA:
         raise NotImplementedError("prepared SM107 MXFP8 serves existing dense unsplit, unpacked plans")
     if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False) or getattr(CFG, "EPILOGUE_GATE", 0):

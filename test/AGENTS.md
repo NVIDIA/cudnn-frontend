@@ -258,3 +258,8 @@ configuration internally. `test_block_output_artifact_reloads_in_fresh_process`
 builds in one process, forbids JIT in another, and checks O/SF/Stats/Amax after
 execution and poisoned-output CUDA Graph replay. A same-process cache hit alone
 does not establish cross-process reuse.
+
+Compute `template_key(globals(), locals(), ...)` before local imports or other
+local assignments. Including a helper function in `locals()` makes the key
+uncacheable even when the graph's specialization is fully static; all eight
+SM100/SM107 MXFP8 prepared entries must obey this ordering.

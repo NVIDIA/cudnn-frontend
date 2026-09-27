@@ -3239,9 +3239,9 @@ def compile_prepared(
     has_scale_o: bool = False,
 ) -> Callable:
     """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
 
-    cache_key = _template_key(globals(), locals(), "compile_prepared")
     if getattr(CFG, "PV_BF16", False):
         raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
     if bool(getattr(CFG, "O_BLOCK_SCALE", 0)) != (sfo_geometry is not None):
