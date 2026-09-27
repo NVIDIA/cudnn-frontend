@@ -106,6 +106,10 @@ both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
 `fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
 online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
 documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
+The existing chain is prepared as one pointer host: tensor views, workspace
+offsets and SF layouts are fixed at plan time; execution binds current payload,
+SF and gradient buffers, caller workspace and stream. This does not remove the
+eleven device repacks or add new layouts or shapes.
 
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,

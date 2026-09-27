@@ -241,3 +241,10 @@ covers every native flavor with requested Amax. Physical SF stride units are
 16 bytes; widen tile-count products before multiplication. The L1
 `test_prepared_mxfp8_sf_head_stride_above_int32_units` steps a physical 64-GiB
 head stride and checks numerical output, with resource-only OOM skips.
+
+Linear SF repacks need the same width audit: an Int32 block index can wrap
+before the byte address is formed even without a wide declared stride.
+`test_sf_repack_steps_past_int32_with_allocated_guards` crosses the signed
+Int32 boundary for both backward SF layouts. Its source and destination
+prefixes keep the old negative offsets inside allocated storage, so the old
+implementation fails numerically rather than through an invalid access.
