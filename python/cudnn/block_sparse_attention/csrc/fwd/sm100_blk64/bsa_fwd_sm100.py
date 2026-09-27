@@ -2272,9 +2272,7 @@ class BlockSparseAttnForwardSm100Blk64:
             # Scale finite scores before introducing -inf mask sentinels so
             # zero scale gives a uniform distribution, including partial K.
             for i in cutlass.range_constexpr(0, 128, 2):
-                tSrS_t2r[i], tSrS_t2r[i + 1] = cute.arch.mul_packed_f32x2(
-                    (tSrS_t2r[i], tSrS_t2r[i + 1]), (score_scale_log2, score_scale_log2)
-                )
+                tSrS_t2r[i], tSrS_t2r[i + 1] = cute.arch.mul_packed_f32x2((tSrS_t2r[i], tSrS_t2r[i + 1]), (score_scale_log2, score_scale_log2))
 
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)

@@ -78,6 +78,10 @@ The default layout is `BHSD`. Pass `layout="bshd"` for tensors in `BSHD`
 layout. The output follows the input layout, while `lse` is always the FP32
 natural-log log-sum-exp with shape `(B, H_q, S_q)`.
 
+For explicit Blackwell blk64 calls, TMA-aligned BSHD inputs are read through
+strided views and unsplit outputs are written directly in BSHD order.
+Misaligned inputs and split-KV outputs retain their existing staging behavior.
+
 ### Sparse metadata
 
 | Argument | Shape | Dtype | Meaning |
@@ -264,6 +268,23 @@ preallocated `dq_tensor`, `dk_tensor`, and `dv_tensor` arguments are supported.
 The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
+
+The Blackwell blk64 path uses 4096-query-block buckets automatically at 3000
+query blocks or more. Explicit `bucket_size_blocks` values take precedence.
+With contiguous per-row count metadata and at least two KV blocks, backward
+can pair KV neighborhoods to reuse common Q/dO loads and dQ accumulation.
+Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
+layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
+The initial eight-KV matching is refined within 32-KV windows, with refinement
+skipped above 1024 bitset words. Metadata construction is included in the
+wrapper's work and is rebuilt for each call.
+
+These optimizations keep the public block size at 64 and preserve the existing
+wrapper-owned workspace model. They do not add an allocation-free graph engine.
+Use `benchmark/bsa/benchmark_sm100_blk64.py` for a synthetic complete-API
+comparison; it records the imported source, input hashes and individual CUDA
+Event samples. Numerical tests, sanitizer checks and measurements on each
+target GPU are required before drawing performance conclusions.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
