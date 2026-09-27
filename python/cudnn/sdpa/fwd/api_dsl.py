@@ -1325,7 +1325,7 @@ class SdpaFwdDsl(APIBase):
 
     # -- KV-split shared helpers (SM100 + SM120 dense split paths) -----------
 
-    def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream):
+    def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None):
         """Prepared FP8 always uses caller scratch, including omitted scales / amax.
 
         Standalone callers allocate scratch_workspace_bytes() before execute;
@@ -1347,7 +1347,12 @@ class SdpaFwdDsl(APIBase):
             facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
             spec = self._thd_spec
         else:
-            facts.update(seq_q_lens=facts_of_tensor(q_lens), seq_kv_lens=facts_of_tensor(kv_lens))
+            facts.update(
+                seq_q_lens=facts_of_tensor(q_lens),
+                seq_kv_lens=facts_of_tensor(kv_lens),
+                block_table=facts_of_tensor(block_table),
+                block_table_v=facts_of_tensor(block_table_v),
+            )
             spec = self._dense_spec
         execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
         self._logger.debug("execute (prepared FP8) completed")
@@ -2561,18 +2566,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self._pertensor
             and self._device_cc[0] == 10
             and self._device_cc != (10, 7)
-            and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128), (256, 256), (512, 512))
             and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
-            and not self.paged
             and not self.o_block_scale
             and self.gate_desc is None
         ):
+            return False
+        if self.paged and self.paged_table_stride != self.paged_table_v_stride:
+            # The pointer ABI has one table-stride pair. Retain the tensor
+            # compiler's two declared layouts for this existing static route.
             return False
         from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
         return self.thd or all(
             dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None
-            for desc in (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+            for desc in (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
         )
 
     def _prepared_quant_offset(self):
@@ -3001,6 +3008,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 scale_val,
                 workspace,
                 current_stream,
+                block_table=block_table,
+                block_table_v=block_table_v,
             )
             return
         if self._fp8 and self._pertensor:

@@ -2606,6 +2606,7 @@ def _host(
     sfo_cols: cutlass.Int32 = 0,
     stream: _cuda_driver.CUstream = None,
     prepared: cutlass.Constexpr[bool] = False,
+    paged_hnd_prepared: cutlass.Constexpr[bool] = False,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2639,9 +2640,14 @@ def _host(
     # descriptor must list dims innermost-first as (D, row, H_kv, page) and the
     # TMA-LDG warp swaps its (head, row) coords to match; NHD is the dense BSHD
     # order with batch -> page.
-    paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
-    if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
-        raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
+    if cutlass.const_expr(prepared):
+        # Pool layout is a plan fact; element strides are Int64 runtime values.
+        # The shared binder validates both pools against this specialization.
+        paged_hnd = paged_hnd_prepared
+    else:
+        paged_hnd = bool(PAGED_KV) and k_tensor.stride[1] < k_tensor.stride[2]
+        if cutlass.const_expr(PAGED_KV and (v_tensor.stride[1] < v_tensor.stride[2]) != paged_hnd):
+            raise ValueError("paged K and V pools must share an in-page layout (both HND or both NHD)")
     kv_stride_order = (3, 1, 2, 0) if paged_hnd else stride_order
 
     def _tma_swz(byte_w: int):
@@ -2981,8 +2987,8 @@ def compile_prepared(
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels.sm100.fp8_host import LSE_KINDS, compile_host
 
-    if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
-        raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
+    if getattr(CFG, "O_BLOCK_SCALE", 0):
+        raise NotImplementedError("prepared FP8 serves scalar-scaled outputs")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError("prepared FP8 head dimensions exceed the kernel envelope")
     if d_qk * CFG.BPE % 16 or d_v * CFG.BPE % 16 or d_v * CFG.BPE_O % 16:
@@ -2991,6 +2997,6 @@ def compile_prepared(
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
-    if paged_hnd:
-        raise ValueError("prepared FP8 does not serve paged KV")
-    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine)
+    if paged_hnd and not PARAMS.paged_kv:
+        raise ValueError("paged_hnd requires a paged-KV specialization")
+    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine, paged_hnd)

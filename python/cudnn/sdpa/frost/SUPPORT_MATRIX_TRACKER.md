@@ -31,9 +31,16 @@ SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 plans: dense zero-copy layouts, split-KV with a non-overlapping final O layout,
 and supported unsplit THD. Each runtime override must remain inside that plan's
 compiled geometry, dtype, layout and workspace envelope. SM100/SM103 per-tensor
-FP8 E4M3/E5M2 also supports prepared dense and THD at the native D128,
-D192x128, D256 and D512 dimensions, with FP16/BF16/E4M3/E5M2
-output and non-paged KV, including each shape's existing dense split-KV plans. Device scales rebind each call; requested
+FP8 E4M3/E5M2 also supports prepared dense launches across its existing
+D128, D192x128, D256 and D512 head envelopes, with FP16/BF16/E4M3/E5M2
+output, including existing dense split-KV plans. THD retains its four native
+head shapes. Its D128 flavor also prepares
+existing paged KV graphs and split plans with NHD or HND pools and separate K/V
+page tables. Page counts, table and pool strides bind at execution time; the
+compiled pool layout and page size stay fixed.
+K/V tables on this prepared FP8 path use the same batch/page strides. Distinct
+declared table strides retain the existing static tensor executor and decline
+shape/stride override plans before compilation. Device scales rebind each call; requested
 Amax_O is reset and unscaled on the launch stream. SM120/SM121 FP16/BF16 also
 supports prepared dense, dense split-KV and unsplit THD launches, with native
 KV-tail masking and bounded runtime geometry. Split partials retain the input
@@ -44,7 +51,7 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
-Block-scaled FP8 outputs, non-native SM100 FP8 dimensions, MXFP8,
+Block-scaled FP8 outputs, MXFP8,
 synthesized KV-tail padding and bias remain tensor-only and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph

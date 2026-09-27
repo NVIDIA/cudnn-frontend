@@ -2515,8 +2515,10 @@ def compile_prepared(
 
     if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
         raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
-    if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
-        raise NotImplementedError("prepared FP8 requires the native head dimensions")
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError("prepared FP8 head dimensions exceed the kernel envelope")
+    if d_qk * CFG.BPE % 16 or d_v * CFG.BPE % 16 or d_v * CFG.BPE_O % 16:
+        raise ValueError("prepared FP8 head dimensions require 16-byte global strides")
     if lse_kind not in LSE_KINDS:
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):

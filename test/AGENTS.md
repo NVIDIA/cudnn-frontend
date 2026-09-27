@@ -63,11 +63,19 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
 - **Pointer-ABI stride fakes must preserve Int64, including page tables.** Annotating a host stride as Int64 is insufficient if its compile-time fake uses a plain Python `0`, which can infer Int32. A singleton axis can legally have a stride above `2**31` without requiring a large allocation; use that layout to catch narrowing at binding time. `test_graph_decode_prepared_keeps_int64_page_table_batch_stride` is the decode detector.
 - **A native binder must keep observed storage separate from effective geometry.** Graph declarations and overrides can enlarge logical shapes without enlarging the caller's allocation. Derive ragged capacity from the producer's observed byte span in the effective element width; for fixed-size length/Stats reads validate known observed spans as well as logical numel. Keep the bare-pointer unknown-span contract explicit. `test_sdpa_native_thd_binding.py` checks these rules against the Python binder, including misaligned int32 lengths and overrides that claim more storage than the producer owns.
+- **Paged overrides retain the producer's storage bound.** Validate each pool's effective TMA byte strides and observed span, and page-table element alignment, before launch. A larger override does not enlarge the allocation. Use host-only malformed-fact probes instead of launching an invalid tensor; `test_sdpa_paged_binding.py` covers short pools, misaligned strides/tables, and valid wide-stride or unknown-span bindings.
 - **Wide host strides must stay wide through device setup arguments.** An Int64 pointer host can still truncate a stride while launching a descriptor-setup kernel. Check casts at the launch site and the setup parameter, not just the host signature. Exercise two live sequences with a physical row stride above `2**32` and poisoned output; a singleton-axis or binder-only probe never steps the truncated address. `test_thd_output_row_stride_above_int32_reaches_device_descriptors` checks numerical output and replay. Cover every served arch/flavor: a pre-Rubin-only marker hid narrowing in all four SM107 half hosts. `test_mhas_v2.py::test_sdpa_thd_output_stride_int64` is collected by both CI arch selections and checks native and Python binding independently, including D192/D128.
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
 ### Confirm you are testing the code you edited
+
+Bind tensor views in the graph's declared axis order. A BSHD allocation and
+a BHSD declaration can have identical shapes when H == S; shape equality then
+preserves the producer's strides and cannot infer the intended transpose.
+Use a metadata-only transpose at the test binding boundary, keeping the
+reference's allocation unchanged. `test_sdpa_fp8_paged_equal_head_and_query_axes`
+covers this collision through the actual FP8 harness and prepared executor.
 
 `pip install -e .` does **not** put the package on `sys.path`. It installs a
 `sys.meta_path` finder (`__editable___nvidia_cudnn_frontend_*_finder.py`) whose
@@ -149,6 +157,13 @@ strided-input graph was collected during the D384x320 case; tracing
 fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
+
+Test both graph prepared-plan admission and the standalone adapter's compiler
+selection when retaining a tensor fallback. Declining the graph attachment alone
+can still compile a prepared artifact inside the adapter and fail at execution.
+`test_fp8_paged_prepared_table_stride_admission` checks both decisions for distinct
+K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
+checks the retained tensor path numerically and under CUDA Graph replay.
 
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales

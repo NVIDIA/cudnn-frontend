@@ -1785,6 +1785,26 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True):
     assert after == before + 1, f"expected {FROST_FP8_ENGINE_KEY} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("b,h,hk,d,skv,page,dtype,qlens,kvlens", [
+    (4, 7, 7, 64, 175, 128, torch.float8_e5m2, [2, 2, 7, 1], [34, 133, 121, 32]),
+    (5, 5, 1, 96, 3439, 32, torch.float8_e4m3fn, [1, 1, 5, 3, 1], [3050, 128, 2572, 2010, 3009]),
+])
+def test_sdpa_fp8_paged_equal_head_and_query_axes(request, cudnn_handle, monkeypatch, b, h, hk, d, skv, page, dtype, qlens, kvlens):
+    """BSHD allocation axes must bind as BHSD even when H == S hides the swap."""
+    _require_frost_sm100(FROST_FP8_ENGINE)
+    cfg = ExecConfig(
+        data_type=dtype, output_type=dtype, rng_geom_seed=827, rng_data_seed=1045226910,
+        is_infer=True, is_paged=True, paged_nan_dead_pages=True, is_padding=True,
+        is_ragged=False, is_cu_seq_len=False, batches=b, h_q=h, h_k=hk, h_v=hk,
+        s_q=h, s_kv=skv, d_qk=d, d_v=d, block_size=page, seq_len_q=qlens, seq_len_kv=kvlens,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT, rescale_threshold=4.0,
+    )
+    cfg.fill_derived_fields()
+    monkeypatch.setenv("CUDNN_RESCALE_THRESHOLD", "4.0")
+    _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle)
+
+
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2005), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):

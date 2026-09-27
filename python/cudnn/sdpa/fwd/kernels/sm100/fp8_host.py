@@ -106,8 +106,8 @@ def host(
         thd=cfg.THD_VARLEN,
         split_kv=cfg.SPLIT_KV,
         tensor_map_qwords=16,
-        paged=False,
-        page_size=0,
+        paged=bool(getattr(cfg, "PAGED_KV", False)),
+        page_size=getattr(cfg, "PAGE_SIZE", 0),
         block_table_ptr=block_table_ptr,
         block_table_v_ptr=block_table_v_ptr,
         table_strides=table_strides,
@@ -126,6 +126,9 @@ def host(
     # memset creates an extra engine dependency before the attention kernel.
     if cutlass.const_expr(cfg.SPLIT_KV == 1):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    kernel_kwargs = dict(o_partial_f32=o_partial_f32, prepared=True)
+    if cutlass.const_expr(getattr(cfg, "PAGED_KV", False)):
+        kernel_kwargs.update(block_table_tensor=block_table_tensor, block_table_v_tensor=block_table_v_tensor, paged_hnd_prepared=paged_hnd)
     kernel_host(
         *args,
         scale_softmax_log2,
@@ -140,15 +143,16 @@ def host(
         thd_q_lens_tensor,
         thd_kv_lens_tensor,
         thd_lens_form,
-        o_partial_f32=o_partial_f32,
         stream=stream,
-        prepared=True,
+        **kernel_kwargs,
     )
     if cutlass.const_expr(has_amax and cfg.SPLIT_KV == 1):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
-def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine=False):
+def compile_host(
+    kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine=False, paged_hnd=False
+):
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")
     gmem = cute.AddressSpace.gmem
@@ -183,8 +187,8 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
         P(cutlass.Int32, 4) if thd else None,
         i32 if thd else None,
         P(cutlass.Float32) if cfg.SPLIT_KV > 1 else None,
-        None,
-        None,
+        P(cutlass.Int32, 4) if getattr(cfg, "PAGED_KV", False) else None,
+        P(cutlass.Int32, 4) if getattr(cfg, "PAGED_KV", False) else None,
         (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         P(cutlass.Float32, 4),
@@ -199,7 +203,7 @@ def compile_host(kernel_host, cfg, storage_dtype, output_dtype, d256, cache_key,
         d_qk,
         d_v,
         lse_kind,
-        False,
+        paged_hnd,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,
