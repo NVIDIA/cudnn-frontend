@@ -1095,7 +1095,8 @@ plan-specific. SF storage may be any dense physical-axis permutation and is
 validated against the producer's observed byte span. Packed SF tile totals are
 runtime metadata, never read from device lengths or used as compile keys.
 D512 retains half split partials; the other three flavors use FP32 partials.
-Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
+Gate and standalone PV-BF16 keep their tensor entries. D128 block-scaled O
+uses the prepared contract below. SM107
 MXFP8 also prepares its existing dense scalar-output paths as described above.
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
