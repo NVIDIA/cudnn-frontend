@@ -835,3 +835,11 @@ def test_prepared_sm100_raw_storage_and_explicit_overrides(role, ordered, monkey
     with pytest.raises(ValueError, match="runtime geometry"):
         case.graph.execute(pack, case.workspace, **kwargs)
     assert not launches
+
+
+@pytest.mark.parametrize("route", ["dense", "thd"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm100", route, dtype, tmp_path)

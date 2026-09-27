@@ -2101,3 +2101,13 @@ class TestPreparedSm120Bwd:
         with pytest.raises(ValueError):
             execute(spec, facts, workspace, torch.cuda.current_stream().cuda_stream, geometry=geometry)
         assert not launches
+
+
+@requires_dsl
+@pytest.mark.L0
+@pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm120", route, dtype, tmp_path)
