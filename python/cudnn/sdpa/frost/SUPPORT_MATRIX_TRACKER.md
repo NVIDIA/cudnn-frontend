@@ -483,8 +483,10 @@ multiple of 16.
 ᶜ Dense I/O with legal native TMA strides, including BHSD-contiguous dO, is
 addressed directly by the prepared SM100 path. Each operand must have unit D
 stride and positive outer strides aligned to eight half-precision elements.
-Layouts outside these native TMA requirements retain workspace staging (one
-copy in, and one back out for a gradient).
+Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
+bindings are rejected before launch. Dense layouts outside the native stride
+requirements retain workspace staging (one copy in, and one back out for a
+gradient).
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
