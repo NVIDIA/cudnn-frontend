@@ -106,19 +106,31 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
 
 
 @pytest.mark.L0
-def test_thd_wrapper_artifact_survives_capacity_change(monkeypatch):
+@pytest.mark.parametrize("cache_mode", ["disk", "disabled", "unknown_manifest"])
+def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+    from cudnn.frost import compiled_cache
 
+    compile_thd_host.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    if cache_mode == "disabled":
+        monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    elif cache_mode == "unknown_manifest":
+        monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: {"cuda_driver": "unknown"})
     a = _inputs(128, 128, torch.float16)
     lq, lk = (96, 129), (65, 193)
     cq, ck = _prefix(lq), _prefix(lk)
     _check(a, _run(a, cq, ck), lq, lk)
-    compile_thd_host.cache_clear()
+    before = compiled_cache.stats()
+    if cache_mode == "disk":
+        compile_thd_host.cache_clear()
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("artifact was not reloadable"))
     b = _inputs(128, 128, torch.float16, capq=512, capkv=640, seed=93)
     lq, lk = (129, 201), (80, 289)
     _check(b, _run(b, _prefix(lq), _prefix(lk), maxq=256), lq, lk)
+    if cache_mode == "disk":
+        assert compiled_cache.stats()["hits"] > before["hits"]
 
 
 @pytest.mark.L0
@@ -169,3 +181,57 @@ def test_thd_wrapper_physical_stride_and_product(role, product, d, dv):
     finally:
         graph.reset()
     assert backing.numel() >= tensors[index].numel()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dense_tensor_fallback_survives_thd_fake_cleanup(d, dv, rope, dtype, monkeypatch):
+    from cudnn.sdpa.fwd import api_dsl, sdpa_fwd_wrapper_sm80
+
+    q, k, v = (t.transpose(1, 2) for t in _inputs(d, dv, dtype, capq=128, capkv=256))
+    freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * torch.linspace(0.001, 0.01, d // 2, device="cuda")[None, :] if rope else None
+    calls = []
+    original = api_dsl._sm80_call
+
+    def tensor_call(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api_dsl, "_sm80_call", tensor_call)
+
+    def run():
+        return sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
+
+    def check(out):
+        qr, kr = q.double(), k.double()
+        if rope:
+
+            def rotate(t):
+                angles = freqs[: t.shape[2]].double()[None, None]
+                a, b = t.chunk(2, -1)
+                return torch.cat((a * angles.cos() - b * angles.sin(), b * angles.cos() + a * angles.sin()), -1).to(dtype).double()
+
+            qr, kr = rotate(qr), rotate(kr)
+        logits = qr @ kr.repeat_interleave(2, 1).transpose(-1, -2) / math.sqrt(d)
+        logits.masked_fill_(torch.arange(256, device="cuda")[None, :] > torch.arange(128, device="cuda")[:, None], -torch.inf)
+        stats = logits.logsumexp(-1)
+        ref = logits.softmax(-1) @ v.double().repeat_interleave(2, 1)
+        torch.testing.assert_close(out["o_tensor"].double(), ref, rtol=0.02, atol=0.003)
+        torch.testing.assert_close(out["lse_tensor"].double(), stats, rtol=0.002, atol=0.002)
+
+    check(run())
+    assert calls, "the dense off-flavor/RoPE case must exercise the retained tensor entry"
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run()
+        q.mul_(0.8)
+        if freqs is not None:
+            freqs.add_(0.1)
+        for value in captured.values():
+            value.fill_(float("nan"))
+        graph.replay()
+        check(captured)
+    finally:
+        graph.reset()
