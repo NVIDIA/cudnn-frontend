@@ -994,7 +994,7 @@ with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
 width. The served capability envelope is unchanged: other head dimensions and
 layouts retain their existing tensor-entry staging, as do the standalone
-RoPE and THD callers. Those remaining callers still require the tensor compiler.
+RoPE callers. Those remaining callers still require the tensor compiler.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
@@ -1036,8 +1036,20 @@ same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper pads to the native flavor width and uses this prepared packed chain.
 Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
-without complete optional-output declarations retain the tensor entry and
-its reachable compiler/fake construction. This does not change eligibility.
+without complete optional-output declarations retain their existing staging and
+optional-gradient copy-backs, followed by the same prepared pointer chain.
+Packed output casts and folds truncate flavor padding on device and leave capacity
+tails untouched. The obsolete generic and d64 tensor compilers and fake builders
+are removed. Standalone adapters require caller workspace, as native prepared
+adapters do; convenience wrappers continue to provide it. No eligibility changes.
+
+The standalone SM80 packed forward wrapper also uses a cached pointer host.
+Packed capacities, Q/K/V token and head strides, and launch bounds bind as
+runtime Int64 arguments; Sink logits remain in natural units. The wrapper
+preserves its output allocation, capacity-tail zeroing and off-flavor padding.
+THD tensor-fake construction has no remaining caller and is removed; dense
+off-flavor/RoPE tensor entries remain live. The forward graph row still
+declines THD, so this changes no graph eligibility.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a

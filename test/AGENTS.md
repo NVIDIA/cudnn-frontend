@@ -24,6 +24,11 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+- Source-package subprocess probes must exclude `__pycache__` and bytecode
+  when copying a tree shared by xdist workers. Python atomically renames its
+  temporary `.pyc` files, so `copytree` can enumerate a file that disappears
+  before it is copied (the causal-conv1d import-contract probe hit this in CI).
+
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
 - Crash isolation (`# Crash isolation` block in `conftest.py`): `pytest_cmdline_main` injects `-n1 --max-worker-restart=100000`, so a segfault, a poisoned CUDA context, or a hang kills only one xdist worker, which the controller replaces before continuing. After every test `pytest_runtest_logfinish` probes the context with `torch.cuda.synchronize()`; a per-test `faulthandler.dump_traceback_later(exit=True)` deadline (`CUDNN_TEST_TIMEOUT`, default 1500 s, `0` disables) covers the probe too. It is faulthandler's C watchdog, not a Python thread or `SIGALRM`, because a hung CUDA driver call holds the GIL and parks the main thread. Not injected under `-n<N>`, `-s`, `--pdb`, `--collect-only`, or `CUDNN_TEST_NO_ISOLATION=1`; without a worker to restart, a dead context stops the run via `pytest.exit` and a hang still hard-exits. Killing a worker does **not** stop a kernel it left running -- the driver keeps that context until the kernel ends, and the next worker can block behind it.
@@ -170,6 +175,12 @@ the existing dense conversion path. `test_staged_rebind_stream_capture` in
 `test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
 compilation/DLPack while checking changed allocations and replay.
 
+Optional gradients copied from accumulators after a prepared launch still need
+presence, dtype and extent checks before any staging write. They can be absent
+from the pointer ABI, so the common binder cannot validate them. The detector
+is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
+
 Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.
@@ -260,6 +271,23 @@ Int32 boundary for both backward SF layouts. Its source and destination
 prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
 
+### Packed SM80 forward launch migration
+
+After moving a wrapper to a prepared host, forbid the old tensor launcher
+after warmup and check fresh bindings plus changed-input graph replay. Keep
+physical stride and product-overflow probes on every native flavor, with
+wrapped addresses poisoned inside allocated guard storage.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
+THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+
+
+SM80's standalone packed wrapper preserves cumulative tensors as row offsets
+into the supplied storage. Do not substitute graph API cumulative-length
+normalization: that changes which Q/K/V rows the standalone call addresses.
+`test_thd_wrapper_preserves_packed_row_origins` checks different Q/KV origins,
+empty sequences and changed origins after capture, including zeroed output
+capacity outside those origins. Keep baseline compatibility evidence.
+
 
 Prepared THD artifact reuse must survive a disabled persistent cache and an
 unknown environment manifest. Change packed capacities and launch bounds with
@@ -269,6 +297,15 @@ memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
 SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
+
+A `None` compile sample may still occupy a positional TVM-FFI argument slot.
+When extending a prepared host with a staged-only operand, retain the native
+entry signature and delegate internally; do not assume the absent operand is
+removed from the exported call ABI. Exercise both native and staged routes,
+including a fresh-process artifact reload. For staged THD output padding,
+test the bounded cast/fold with physical wide output strides as well as the
+input staging; `test_staged_packed_physical_stride` covers both stride and
+index-product overflow with allocated guard storage.
 
 Prepared host migrations must preserve persistent compiled artifacts as well as
 warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
