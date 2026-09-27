@@ -5040,8 +5040,6 @@ def _sm80_call(
     seq_q,
     sinks_log2,
     bias,
-    cu_q,
-    cu_k,
     rope_cs,
     n_kv_tiles,
     scale_log2,
@@ -5050,12 +5048,11 @@ def _sm80_call(
     d,
     right_bound,
     inv_scale,
-    thd_q_tiles,
-    n_batch_logical,
     stream,
 ):
     """Invoke one compiled SM80 artifact (the traced ``_sdpa_host`` ABI:
-    12 tensors — LSE may be None-specialized — then 9 runtime scalars and the
+    12 operand slots — packed prefixes and optional LSE are None-specialized —
+    then 9 runtime scalars and the
     launch stream)."""
     import cutlass
     from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
@@ -5075,8 +5072,8 @@ def _sm80_call(
         from_dlpack(seq_q),
         from_dlpack(sinks_log2),
         from_dlpack(bias),
-        from_dlpack(cu_q),
-        from_dlpack(cu_k),
+        None,
+        None,
         from_dlpack(rope_cs),
         cutlass.Int32(n_kv_tiles),
         cutlass.Float32(scale_log2),
@@ -5085,8 +5082,8 @@ def _sm80_call(
         cutlass.Int32(d),
         cutlass.Int32(right_bound),
         cutlass.Float32(inv_scale),
-        cutlass.Int32(thd_q_tiles),
-        cutlass.Int32(n_batch_logical),
+        cutlass.Int32(0),
+        cutlass.Int32(1),
         stream,
     )
 
@@ -5605,7 +5602,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
             else:
                 rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
-            cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
 
             _sm80_call(
                 self._compiled_kernel,
@@ -5618,8 +5614,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 seq_q=seq_q_b,
                 sinks_log2=sinks_b,
                 bias=bias_b,
-                cu_q=cu_dummy,
-                cu_k=cu_dummy,
                 rope_cs=rope_b,
                 n_kv_tiles=(self.s_k_max + p.tile_n - 1) // p.tile_n,
                 scale_log2=scale_val * _LOG2E,
@@ -5628,8 +5622,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 d=self.head_dim_qk,
                 right_bound=int(self.right_bound_runtime),
                 inv_scale=1.0 / float(scale_val),
-                thd_q_tiles=0,
-                n_batch_logical=1,
                 stream=launch_stream,
             )
 
@@ -5644,14 +5636,23 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
     no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Rides the same
     TemplateParams-specialized module as the dense path; the packed token
-    extents compile DYNAMIC (``cute.sym_int``), so the compile key is
-    plan-time-only and a new token total re-binds the cached artifact (the
-    old per-total ``lru`` key — issue #604 — is gone).  Returns packed
+    extents and strides are Int64 runtime arguments, so new packed capacities
+    re-bind the same pointer artifact without a tensor wrapper or new compile.
+    Returns packed
     ``[1, T_q, H, D_v]`` O + packed ``[1, H, T_q]`` LSE."""
     from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
 
     if bias_tensor is not None:
         raise NotImplementedError("SM80 SDPA THD does not support bias (varlen has no single [1,H,SQ,SKV] bias shape)")
+    if q.dtype not in (torch.float16, torch.bfloat16) or q.device.type != "cuda":
+        raise ValueError("SM80 THD requires CUDA FP16/BF16 inputs")
+    for name, tensor in (("Q", q), ("K", k), ("V", v)):
+        if tensor.ndim != 4 or tensor.shape[0] != 1 or tensor.dtype != q.dtype or tensor.device != q.device:
+            raise ValueError(f"SM80 THD {name} must be [1,T,H,D] on Q's device and dtype")
+    if k.shape[2] < 1 or q.shape[2] < 1 or q.shape[2] % k.shape[2] or k.shape[1:3] != v.shape[1:3] or q.shape[-1] != k.shape[-1]:
+        raise ValueError("SM80 THD requires matching K/V token and head counts, Q/K widths, and integral GQA")
+    if int(max_s_q) < 1:
+        raise ValueError("SM80 THD max_s_q must be positive")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
@@ -5674,6 +5675,8 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     n_seqs = int(cu_q.numel()) - 1
     if n_seqs < 1:
         raise ValueError("cu_seqlens_q must have >= 2 entries")
+    if cu_k is None or cu_k.numel() != n_seqs + 1:
+        raise ValueError("cu_seqlens_q / cu_seqlens_k length mismatch")
     cu_q_t = cu_q.to(dtype=torch.int32, device=device).contiguous()
     cu_k_t = cu_k.to(dtype=torch.int32, device=device).contiguous()
 
@@ -5690,60 +5693,43 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         has_sink=sinks is not None,
         thd_varlen=True,
         has_lse=True,
+        sink_natural=True,
     )
     mod = _sm80_load_kernel_module(flavor, params)
-    # Off-flavor d_qk was HOST-PADDED to fdqk above, so the compiled fakes and
-    # the runtime d must both be the padded width: the kernel derives its Q/K
-    # row strides from d_runtime (Q_ROW_STRIDE_E = H * d_runtime), and the
-    # zero columns are exact for the QK dot products.  (Same contract as the
-    # pre-template forward(), which read d_runtime off the padded shape.)
-    fn = mod.compile(
-        b=1,
-        h=h_q,
-        h_kv=h_kv,
-        sq=0,
-        skv=0,
-        d=int(fdqk),
-        swa_window=int(max(0, wl)) if wl is not None and wl >= 0 else 0,
-        n_batch_logical=n_seqs,
-    )
+    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+
+    _artifact, fn = compile_thd_host(mod, h_q, h_kv, n_seqs, int(max(0, wl)) if wl is not None else 0)
 
     t_q = q.shape[1]
     o_buf = torch.zeros(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
     lse_buf = torch.zeros(1, h_q, t_q, dtype=torch.float32, device=device)
-    sinks_b = (
-        (sinks.to(dtype=torch.float32, device=device).reshape(h_q) * _LOG2E).contiguous()
-        if sinks is not None
-        else torch.ones(1, dtype=torch.float32, device=device)
-    )
-    dummy_i32 = torch.ones(1, dtype=torch.int32, device=device)
-    dummy_f32 = torch.ones(1, dtype=torch.float32, device=device)
-    dummy_io = torch.ones(1, dtype=q.dtype, device=device)
-
-    _sm80_call(
-        fn,
-        q=q,
-        k=k,
-        v=v,
-        o=o_buf,
-        lse=lse_buf,
-        seq_kv=dummy_i32,
-        seq_q=dummy_i32,
-        sinks_log2=sinks_b,
-        bias=dummy_io,
-        cu_q=cu_q_t,
-        cu_k=cu_k_t,
-        rope_cs=dummy_f32,
-        n_kv_tiles=(int(k.shape[1]) + tile_n - 1) // tile_n,
-        scale_log2=float(scale_softmax) * _LOG2E,
-        sq=int(t_q),
-        skv=int(k.shape[1]),
-        d=int(fdqk),
-        right_bound=int(right_bound),
-        inv_scale=1.0 / float(scale_softmax),
-        thd_q_tiles=(int(max_s_q) + tile_m - 1) // tile_m,
-        n_batch_logical=n_seqs,
-        stream=current_stream if current_stream is not None else cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    sinks_b = sinks.to(dtype=torch.float32, device=device).reshape(h_q).contiguous() if sinks is not None else None
+    for name, tensor in (("Q", q), ("K", k), ("V", v)):
+        if tensor.stride(-1) != 1 or tensor.data_ptr() % 16 or any(n > 1 and st % 8 for n, st in zip(tensor.shape[1:3], tensor.stride()[1:3])):
+            raise ValueError(f"SM80 THD {name} requires D-contiguous, 16-byte aligned rows and heads")
+    stream = current_stream if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
+    fn(
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        o_buf.data_ptr(),
+        lse_buf.data_ptr(),
+        cu_q_t.data_ptr(),
+        cu_k_t.data_ptr(),
+        sinks_b.data_ptr() if sinks_b is not None else None,
+        int(t_q),
+        int(k.shape[1]),
+        int(max_s_q),
+        int(q.stride(1)),
+        int(q.stride(2)),
+        int(k.stride(1)),
+        int(k.stride(2)),
+        int(v.stride(1)),
+        int(v.stride(2)),
+        float(scale_softmax) * _LOG2E,
+        1.0 / float(scale_softmax),
+        int(right_bound),
+        int(stream),
     )
     if pad_v:
         o_buf = o_buf[..., :d_v].contiguous()
@@ -5780,6 +5766,13 @@ def sdpa_fwd_wrapper_sm80(
     packed THD calls (``cum_seqlen_*``) ride the same template with dynamic
     token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
+
+    THD cumulative tensors contain raw packed-row offsets, including a possible
+    nonzero first offset. Callers must provide nonnegative, nondecreasing values
+    bounded by the corresponding Q or K/V token capacity, representable as int32.
+    ``max_s_q`` must bound every adjacent Q-offset difference. These device-value
+    preconditions apply to each eager call and each graph replay; this wrapper
+    validates tensor metadata without reading cumulative values back to the host.
     """
     # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
     # own, so decline by DSL version here instead of surfacing the DSL's own
