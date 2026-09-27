@@ -127,7 +127,6 @@ def host(
     scale: cutlass.Float32,
     module: cutlass.Constexpr,
     d64_module: cutlass.Constexpr,
-    params: cutlass.Constexpr,
     geometry: cutlass.Constexpr,
     regions: cutlass.Constexpr,
     zero_regions: cutlass.Constexpr,
@@ -138,6 +137,9 @@ def host(
     right_bound: cutlass.Constexpr[int],
     stream: driver.CUstream,
 ):
+    # The template module already owns the immutable configuration. Passing its
+    # dataclass again prevents compiled_cache from exporting this pointer ABI.
+    params = module.PARAMS
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -264,7 +266,6 @@ def compile_host(api, geometry, d64_module, cache_key):
         cutlass.Float32(0),
         api._kmod,
         d64_module,
-        api._params,
         geometry,
         regions,
         zeros,
