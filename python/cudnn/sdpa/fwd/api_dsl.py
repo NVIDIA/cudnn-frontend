@@ -5752,6 +5752,13 @@ def sdpa_fwd_wrapper_sm80(
     packed THD calls (``cum_seqlen_*``) ride the same template with dynamic
     token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
+
+    THD cumulative tensors contain raw packed-row offsets, including a possible
+    nonzero first offset. Callers must provide nonnegative, nondecreasing values
+    bounded by the corresponding Q or K/V token capacity, representable as int32.
+    ``max_s_q`` must bound every adjacent Q-offset difference. These device-value
+    preconditions apply to each eager call and each graph replay; this wrapper
+    validates tensor metadata without reading cumulative values back to the host.
     """
     # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
     # own, so decline by DSL version here instead of surfacing the DSL's own
