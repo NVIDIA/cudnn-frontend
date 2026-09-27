@@ -882,21 +882,27 @@ def test_graph_thd_compile_key_is_plan_time_only(tmp_path, monkeypatch):
 
     Token-major Stats keeps every stepped stride unchanged. Head-major Stats
     legitimately specializes its declared head stride. A fresh persistent-cache
-    directory and a forbidden compiler make a second shape-specific JIT fail.
+    directory, cleared process memo and a forbidden compiler make a second
+    shape-specific JIT fail at the persistent artifact boundary.
     """
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache, template_loader
+    from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
 
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    _compile_thd_artifact.cache_clear()
+    before = compiled_cache.stats()
     _, graph, _, _, _ = _run_graph((300, 128), (300, 128), stats_layout="token_major")
     assert graph._compiled_plans[graph._plan_index]._prepared is not None
     n_modules = len(template_loader._MODULES)
     first = compiled_cache.stats()
+    assert first["misses"] > before["misses"], "the empty cache must be populated before testing reload"
 
     def forbidden(*args, **kwargs):
         raise AssertionError("different packed totals minted a compile")
 
     monkeypatch.setattr(cute, "compile", forbidden)
+    _compile_thd_artifact.cache_clear()
     _run_graph((300, 64), (300, 64), stats_layout="token_major")
     second = compiled_cache.stats()
     assert second["misses"] == first["misses"], "runtime packed totals leaked into the compile key"

@@ -255,4 +255,6 @@ unknown environment manifest. Change packed capacities and launch bounds with
 JIT forbidden, then check numerical output and graph replay. Keep workspace
 sizing per plan and exclude tensors, pointers and streams from the artifact
 memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
-SM80 detector; clear that memo separately when testing disk-artifact reload.
+SM80 detector. When asserting disk-artifact hits, clear the process memo before
+both cache population and reload: otherwise an earlier test can prevent the
+temporary cache from being populated, or a memo hit can bypass the disk counter.
