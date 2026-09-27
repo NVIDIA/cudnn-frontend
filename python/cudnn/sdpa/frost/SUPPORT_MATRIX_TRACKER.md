@@ -42,9 +42,9 @@ head shapes. Its D128 flavor also prepares
 existing paged KV graphs and split plans with NHD or HND pools and separate K/V
 page tables. Page counts, table and pool strides bind at execution time; the
 compiled pool layout and page size stay fixed.
-K/V tables on this prepared FP8 path use the same batch/page strides. Distinct
-declared table strides retain the existing static tensor executor and decline
-shape/stride override plans before compilation. Device scales rebind each call; requested
+K/V page tables on this prepared FP8 path bind independent Int64 batch/page
+strides, including distinct declared layouts and runtime stride overrides.
+Each table retains its own observed storage bound. Device scales rebind each call; requested
 Amax_O is reset and unscaled on the launch stream. SM120/SM121 FP16/BF16 also
 supports prepared dense, dense split-KV and unsplit THD launches, with native
 KV-tail masking and bounded runtime geometry. Split partials retain the input

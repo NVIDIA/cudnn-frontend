@@ -17,10 +17,10 @@ from frost_test_utils import requires_dsl
 pytestmark = [requires_dsl, pytest.mark.L0]
 
 
-@pytest.mark.parametrize("route", ["pv128", "pv192", "gate_fp8", "gate_mxfp8"])
+@pytest.mark.parametrize("route", ["pv128", "pv192", "gate_fp8", "gate_mxfp8", "paged1", "paged4"])
 def test_quantized_variant_artifact_reloads_in_fresh_process(route, tmp_path):
     cc = torch.cuda.get_device_capability()
-    if (route.startswith("pv") and cc not in ((10, 0), (10, 3))) or (route.startswith("gate") and cc != (10, 7)):
+    if (route.startswith(("pv", "paged")) and cc not in ((10, 0), (10, 3))) or (route.startswith("gate") and cc != (10, 7)):
         pytest.skip("variant needs its native architecture")
     child = r"""
 import hashlib, json, sys
@@ -35,7 +35,19 @@ if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("fresh-process quantized variant invoked JIT")
     cute.compile = forbidden
-if route.startswith("pv"):
+if route.startswith("paged"):
+    import test_sdpa_prepared_fp8_paged as helper
+    g, vp, ws, bufs, ts = helper.paged._run_graph_fp8(
+        2, 4, 2, 128, 16, 16, [256, 256], False, out_dt=torch.bfloat16,
+        s_q=16, explicit_split=int(route[5:]), return_case=True,
+        v_table_layout="batch_inner", override=True,
+    )
+    owner = g._compiled_plans[g._plan_index]._prepared.spec.owner
+    bufs["v_table"].copy_(bufs["v_table"].flip(2))
+    run = lambda: g.execute(vp, ws)
+    check = lambda: helper._check(bufs)
+    outputs = [bufs[n] for n in ("o", "lse", "amax_o")]
+elif route.startswith("pv"):
     import test_sdpa_prepared_pv_bf16 as helper
     api, bufs, ws, scales = helper._case(d=int(route[2:]))
     owner = api._dense_spec.owner
