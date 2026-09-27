@@ -3273,5 +3273,4 @@ def compile_prepared(
         optional_amax=True,
         has_scale_o=has_scale_o,
         partial_slot=True,
-        has_amax=has_amax,
     )
