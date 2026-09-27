@@ -1641,6 +1641,11 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
         )
 
     _api().check_support()  # the real SM100 device: accepted
+    # Model compiler support for this synthetic device independently of the
+    # worker's release DSL; this test checks the paged capability boundary.
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
     with pytest.raises(NotImplementedError, match="SM107 sibling"):
         _api().check_support()
