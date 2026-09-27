@@ -63,7 +63,7 @@ across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
 SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
-SM107 MXFP8 uses prepared launches for its four existing dense, unsplit native
+SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
 Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding

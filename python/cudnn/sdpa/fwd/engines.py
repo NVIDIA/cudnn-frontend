@@ -519,8 +519,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     """
     if capabilities.sm_lo not in (100, 107, 120):
         return "this engine has no prepared shape/stride override executor"
-    if facts.is_fp8 and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
-        return "prepared SM107 FP8 requires device cc 10.7"
+    if (facts.is_fp8 or facts.is_mxfp8) and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
+        return "prepared SM107 FP8/MXFP8 requires device cc 10.7"
     if facts.is_mxfp8 and (
         capabilities.sm_lo not in (100, 107)
         or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
