@@ -1150,6 +1150,7 @@ def sdpa_operand_tensors(
     block_table_v_ptr=None,
     table_strides=(0, 0),
     n_pages=0,
+    o_pack=1,
 ) -> SdpaOperandTensors:
     """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
     host traces, so the branches below are static).
@@ -1161,7 +1162,7 @@ def sdpa_operand_tensors(
     "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
     B, QH, KH, SQ, SKV, _ = problem_size
     q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
-    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v, o_strides, thd)
+    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd)
     if paged:
         k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
         v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)

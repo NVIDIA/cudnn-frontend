@@ -1049,10 +1049,10 @@ class SdpaFwdDsl(APIBase):
         self._value_error_if(flat is None, f"sf_o must be contiguous; got strides {tuple(sf_o.stride())}")
         return {
             "sf_o_tensor": flat,
-            "sfo_plane_stride": cutlass.Int32(plane_stride),
-            "sfo_row_off_b": cutlass.Int32(row_off_b),
-            "sfo_col_off_h": cutlass.Int32(col_off_h),
-            "sfo_cols": cutlass.Int32(cols),
+            "sfo_plane_stride": cutlass.Int64(plane_stride),
+            "sfo_row_off_b": cutlass.Int64(row_off_b),
+            "sfo_col_off_h": cutlass.Int64(col_off_h),
+            "sfo_cols": cutlass.Int64(cols),
         }
 
     def _scale_view(self, t, name: str, device: torch.device) -> torch.Tensor:
@@ -1221,6 +1221,26 @@ class SdpaFwdDsl(APIBase):
         """Return the per-execution scratch requirement for this implementation."""
 
     # -- KV-split shared helpers (SM100 + SM120 dense split paths) -----------
+
+    def _prepared_operand_layout(self, desc):
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        shape, stride, width = tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize
+        if desc is self.o_desc and self.o_block_scale == 16:
+            import cudnn
+            from cudnn.graph_types import storage_geometry
+
+            geometry = storage_geometry(shape, stride, cudnn.data_type.FP4_E2M1)
+            if geometry is None:
+                return None
+            shape, stride = geometry
+            width = 1
+        return dense_bind_strides(shape, stride, width)
+
+    def _can_prepare_block_output(self):
+        return bool(self.o_block_scale) and not (
+            self.thd or self.paged or self.split_kv > 1 or self.pack_gqa or self.gate_desc is not None or getattr(self, "pv_bf16", False)
+        )
 
     def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None):
         """Prepared FP8 always uses caller scratch, including omitted scales / amax.
@@ -2469,8 +2489,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8
             and self._pertensor
             and self._device_cc[0] == 10
-            and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
-            and not self.o_block_scale
+            and (self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2) or self._can_prepare_block_output())
+            and (not self.o_block_scale or self._can_prepare_block_output())
             and self.gate_desc is None
         ):
             return False
@@ -2480,10 +2500,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return False
         if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor != (128, 128):
             return False
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
         return self.thd or all(
-            dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None
+            self._prepared_operand_layout(desc) is not None
             for desc in (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
         )
 
@@ -2492,19 +2510,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8
             and not self._pertensor
             and self._device_cc[0] == 10
-            and self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
-            and not self.o_block_scale
+            and (self._o_dtype() in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2) or self._can_prepare_block_output())
+            and (not self.o_block_scale or self._can_prepare_block_output())
             and not self.pv_bf16
             and self.gate_desc is None
         ):
             return False
         if self._device_cc == (10, 7) and (self.thd or self.split_kv > 1 or self.pack_gqa):
             return False
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
         return self.thd or all(
-            dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None
-            for desc in (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+            self._prepared_operand_layout(desc) is not None for desc in (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
         )
 
     def _prepared_quant_offset(self):
@@ -2542,6 +2557,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dynamic_d512_half = self._device_cc != (10, 7) and self.flavor == (512, 512) and self._o_dtype() in (torch.float16, torch.bfloat16)
             if not dynamic_d512_half:
                 kw["static_lse_strides"] = tuple(int(x) for x in self.lse_desc.stride)
+        if "sfo_geometry" in accepted and self.o_block_scale:
+            kw["sfo_geometry"] = self._sfo_geometry
+        if "has_scale_o" in accepted:
+            kw["has_scale_o"] = bool(self.o_block_scale and self.has_scale_o)
         if "has_amax" in accepted:
             kw["has_amax"] = self.has_amax_o
         if "scale_o_in_combine" in accepted:
@@ -2937,7 +2956,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o),
+                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o),
                 scale_val,
                 workspace,
                 current_stream,
@@ -2955,7 +2974,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o),
+                dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o, sf_o=sf_o, scale_o=scale_o),
                 scale_val,
                 workspace,
                 current_stream,
@@ -4246,7 +4265,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 lse_padded_rows=self.s_q_max if self.thd_stats_padded else 0,
                 lse_stride=self._lse_stride if self.thd_stats_padded else None,
                 prepared=True,
-                **({"has_amax": self.has_amax_o, "scale_o_in_combine": self._split_scale_o()} if self._prepared_fp8 else {}),
+                **(
+                    {
+                        "has_amax": self.has_amax_o,
+                        "scale_o_in_combine": self._split_scale_o(),
+                        **({"sfo_geometry": self._sfo_geometry} if self.o_block_scale else {}),
+                    }
+                    if self._prepared_fp8
+                    else {}
+                ),
                 persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
             )
             if self.thd:
@@ -4372,7 +4399,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     sinks,
                     seq_q_lens,
                     seq_kv_lens,
-                    dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o),
+                    dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o),
                     scale_val,
                     workspace,
                     current_stream,
@@ -4762,13 +4789,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return n
 
     def _can_prepare_layout(self):
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
         operands = (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
-        return self.thd or all(dense_bind_strides(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize) is not None for desc in operands)
+        return self.thd or all(self._prepared_operand_layout(desc) is not None for desc in operands)
 
     def _can_prepare_fp8(self):
-        return self._fp8 and not self.o_block_scale and self._can_prepare_layout()
+        return self._fp8 and (not self.o_block_scale or self._can_prepare_block_output()) and self._can_prepare_layout()
 
     def _prepared_quant_offset(self):
         if self.split_kv > 1:
