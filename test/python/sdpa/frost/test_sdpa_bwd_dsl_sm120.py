@@ -2105,7 +2105,7 @@ class TestPreparedSm120Bwd:
 
 @requires_dsl
 @pytest.mark.L0
-@pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+@pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k", "aux_fp32", "aux_io"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
     from prepared_bwd_cache_utils import check_backward_artifact_reload

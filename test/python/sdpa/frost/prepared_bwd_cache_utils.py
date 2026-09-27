@@ -27,7 +27,31 @@ if reload == "1":
         raise AssertionError("prepared backward plan invoked JIT in the second process")
     cute.compile = forbidden
 dtype = getattr(torch, dtype)
-if arch == "sm120":
+if arch == "sm120" and route.startswith("aux_"):
+    import test_sdpa_bwd_dsl_sm120 as helper
+    torch.manual_seed(903)
+    b, h, hk, sq, d = 2, 4, 2, 128, 64
+    q, k, v, do = [helper._bhsd(b, heads, sq, d, dtype) for heads in (h, hk, hk, h)]
+    bias = torch.randn(1, h, sq, sq, device="cuda", dtype=torch.float32)
+    sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
+    o, stats, dq, dk, dv, aux = helper._ref_bwd(q, k, v, do, scale=d**-0.5, is_causal=True, bias=bias, sink_token=sink)
+    o = helper._bhsd(b, h, sq, d, dtype, empty=True).copy_(o)
+    dbias = torch.empty_like(bias, dtype=torch.float32 if route == "aux_fp32" else dtype)
+    calls = []
+    original = cudnn.pygraph.execute
+    def record(g, *args, **kwargs):
+        calls.append((g, args))
+        return original(g, *args, **kwargs)
+    with patch.object(cudnn.pygraph, "execute", record):
+        grads = helper._run_bwd_graph(q, k, v, o, do, stats, scale=d**-0.5, is_causal=True, bias_gpu=bias, dbias_gpu=dbias, sink_gpu=sink)
+    assert grads[-1] == "sdpa_bwd_sm120"
+    g, (vp, ws) = calls[-1]
+    outputs = [*grads[:4], dbias]
+    expected = [dq, dk, dv, aux.dsink, aux.dbias]
+    def check():
+        for actual, want in zip(outputs, expected):
+            torch.testing.assert_close(actual.float(), want.float(), **helper._tolerances(dtype))
+elif arch == "sm120":
     from test_sdpa_bwd_dsl_sm120 import _prepared_bwd_case, _check_prepared_bwd
     case = _prepared_bwd_case(dtype=dtype, route=route)
     g, vp, ws = case.graph, case.pack, case.workspace
