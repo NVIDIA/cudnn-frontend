@@ -79,3 +79,58 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
     )
     torch.testing.assert_close(output.float(), expected, atol=0.03, rtol=0.03)
     torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("sq,sk", [(193, 129), (320, 1088), (513, 1025)])
+@pytest.mark.parametrize("variable", [False, True])
+def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
+    bsa = _bsa()
+    torch.manual_seed(27000 + sq)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    q = torch.randn((2, 3, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 3, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    nq, nk = (sq + 63) // 64, (sk + 63) // 64
+    width = min(4, nk)
+    indices = torch.rand((2, 3, nq, nk), device="cuda").argsort(-1)[..., :width].int().contiguous()
+    counts = torch.randint(0, width + 1, (2, 3, nq), device="cuda", dtype=torch.int32) if variable else None
+    sizes = torch.randint(1, 65, (nk,), device="cuda", dtype=torch.int32)
+    sizes[-1].clamp_(max=sk - (nk - 1) * 64)
+    mask = block_sparse_mask(indices, width, sizes, sq, sk, 64, counts)
+    qr, kr, vr = [t.float().detach().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.transpose(-1, -2) / 128**0.5 + mask
+    nonempty = torch.isfinite(mask).any(-1, keepdim=True)
+    probabilities = torch.where(nonempty, scores, 0).softmax(-1).masked_fill(~torch.isfinite(mask), 0)
+    expected = probabilities @ vr
+    expected.backward(do.float())
+    tensors = (q, k, v, do)
+    if layout == "bshd":
+        tensors = tuple(t.transpose(1, 2).contiguous() for t in tensors)
+    q, k, v, do = tensors
+    kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64, layout=layout)
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
+    canonical_output = output.transpose(1, 2) if layout == "bshd" else output
+    torch.testing.assert_close(canonical_output.float(), expected, atol=0.03, rtol=0.03)
+    buffers = tuple(torch.empty_like(t) for t in (q, k, v))
+    for bucket_size in (1, 3, nq + 1):
+        for buffer in buffers:
+            buffer.fill_(float("nan"))
+        gradients = bsa.block_sparse_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            output,
+            lse,
+            indices,
+            **kwargs,
+            bucket_size_blocks=bucket_size,
+            dq_tensor=buffers[0],
+            dk_tensor=buffers[1],
+            dv_tensor=buffers[2],
+        )
+        for got, buffer, ref in zip(gradients, buffers, (qr.grad, kr.grad, vr.grad)):
+            assert got.data_ptr() == buffer.data_ptr()
+            got = got.transpose(1, 2) if layout == "bshd" else got
+            torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
