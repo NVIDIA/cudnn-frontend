@@ -1884,24 +1884,9 @@ class BlockSparseAttnBackwardSm100Blk64:
             compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
             compute_mma_dS_consumer_state.advance()
 
-            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
             load_mma_dO_pipeline.consumer_wait(load_mma_dO_consumer_state)
 
-            # dP = dO * V
-            dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            for k_block in cutlass.range(0, cute.size(tdPrdO, mode=[2]), unroll_full=True):
-                cute.gemm(
-                    dOV_tiled_mma,
-                    tdPtdP,
-                    tdPrV[None, None, k_block, 0],
-                    tdPrdO[None, None, k_block, load_mma_dO_consumer_state.index],
-                    tdPtdP,
-                )
-                dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-
-            mma_compute_dP_pipeline.producer_commit(mma_compute_dP_producer_state)
-            mma_compute_dP_producer_state.advance()
-
+            # dV uses independent TMEM, so issue it before waiting for dQ readers.
             compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
 
             # dV = dO * P
@@ -1917,6 +1902,23 @@ class BlockSparseAttnBackwardSm100Blk64:
 
             compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
             compute_mma_P_consumer_state.advance()
+
+            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
+
+            # dP = dO * V
+            dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for k_block in cutlass.range(0, cute.size(tdPrdO, mode=[2]), unroll_full=True):
+                cute.gemm(
+                    dOV_tiled_mma,
+                    tdPtdP,
+                    tdPrV[None, None, k_block, 0],
+                    tdPrdO[None, None, k_block, load_mma_dO_consumer_state.index],
+                    tdPtdP,
+                )
+                dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+            mma_compute_dP_pipeline.producer_commit(mma_compute_dP_producer_state)
+            mma_compute_dP_producer_state.advance()
 
             load_mma_dO_pipeline.consumer_release(load_mma_dO_consumer_state)
             load_mma_dO_consumer_state.advance()
