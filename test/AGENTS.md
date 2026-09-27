@@ -259,6 +259,15 @@ SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
 
+A `None` compile sample may still occupy a positional TVM-FFI argument slot.
+When extending a prepared host with a staged-only operand, retain the native
+entry signature and delegate internally; do not assume the absent operand is
+removed from the exported call ABI. Exercise both native and staged routes,
+including a fresh-process artifact reload. For staged THD output padding,
+test the bounded cast/fold with physical wide output strides as well as the
+input staging; `test_staged_packed_physical_stride` covers both stride and
+index-product overflow with allocated guard storage.
+
 Prepared host migrations must preserve persistent compiled artifacts as well as
 warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
 artifact export even though its runtime slots disappear. Carry only the immutable

@@ -113,7 +113,7 @@ def test_no_tensor_plumbing(stats_layout, hkv, monkeypatch):
             patch.setattr(torch.Tensor, name, forbidden)
         for name in ("empty", "empty_like", "zeros", "zeros_like"):
             patch.setattr(torch, name, forbidden)
-        patch.setattr(api_dsl, "_fd_tvm", forbidden)
+        patch.setattr(api_dsl, "_fd_tvm", forbidden, raising=False)
         patch.setattr(cute, "compile", forbidden)
         torch.cuda.set_sync_debug_mode("error")
         try:
