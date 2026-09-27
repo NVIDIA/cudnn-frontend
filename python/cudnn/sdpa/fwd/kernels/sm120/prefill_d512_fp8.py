@@ -1624,7 +1624,8 @@ class SM120FusedMultiHeadAttentionForward:
                 cute.arch.fmax(lane_amax_half[0], lane_amax_half[1]) * row_valid[0],
                 cute.arch.fmax(lane_amax_half[2], lane_amax_half[3]) * row_valid[1],
             )
-            prims.atomicrmw(prims.AtomicOp.MAX, cutlass.make_array_view(amax_o), lane_amax_o.bitcast(cutlass.Int32))
+            if cutlass.const_expr(amax_o is not None):
+                prims.atomicrmw(prims.AtomicOp.MAX, cutlass.make_array_view(amax_o), lane_amax_o.bitcast(cutlass.Int32))
         prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
         return tiles_loaded
@@ -1645,7 +1646,7 @@ class SM120FusedMultiHeadAttentionForward:
         tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
         n_q_tiles: cutlass.Int32,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         o_scale_fused: cutlass.Float32,
         descale_q_t: cute.Tensor,
         descale_k_t: cute.Tensor,
@@ -1684,7 +1685,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param descale_v_t: ``(1,)`` fp32 device descale of V.
         :param scale_o_t: ``(1,)`` fp32 device Scale_O, applied before the O cast.
         """
-        if cutlass.const_expr(self.split_kv > 1):
+        if cutlass.const_expr(self.split_kv > 1 and amax_o is not None):
             _initialize_split_amax(amax_o)
         descale_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
         descale_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
@@ -1862,7 +1863,7 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
         descale_q_t: cute.Tensor,
