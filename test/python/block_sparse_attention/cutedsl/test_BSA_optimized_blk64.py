@@ -83,6 +83,44 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
     torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
+@pytest.mark.parametrize("variable", [False, True])
+def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
+    bsa = _bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface.bsa_attn_fwd_blk64_cutedsl, "compile_cache", {})
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(27191)
+    q = torch.randn((1, 2, 193, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, 129, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    indices = torch.arange(3, device="cuda", dtype=torch.int32).view(1, 1, 1, 3).expand(1, 2, 4, 3).contiguous()
+    counts = torch.tensor([3, 0, 1, 2], device="cuda", dtype=torch.int32).view(1, 1, 4).expand(1, 2, 4).contiguous() if variable else None
+    sizes = torch.tensor([64, 37, 1], device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(indices, 3, sizes, 193, 129, 64, counts)
+    nonempty = torch.isfinite(mask).any(-1, keepdim=True)
+    kwargs = dict(block_sparse_num=3, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64)
+    cache_sizes = None
+    # Change sign without changing tensor declarations or recompiling either path.
+    for scale in (128**-0.5, 0.0, -(128**-0.5), 128**-0.5):
+        qr, kr, vr = [t.double().detach().requires_grad_() for t in (q, k, v)]
+        scores = (qr @ kr.transpose(-1, -2)) * scale + mask
+        probabilities = torch.where(nonempty, scores, 0).softmax(-1).masked_fill(~torch.isfinite(mask), 0)
+        expected = probabilities @ vr
+        expected.backward(do.double())
+        output, lse = bsa.block_sparse_attention_forward(
+            q, k, v, indices, **kwargs, softmax_scale=scale, use_clc=clc, kv_splits=splits, allow_empty_block_nums=True
+        )
+        gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, softmax_scale=scale, bucket_size_blocks=3)
+        torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.03, rtol=0.03)
+        for got, ref in zip((output, *gradients), (expected, qr.grad, kr.grad, vr.grad)):
+            torch.testing.assert_close(got.double(), ref, atol=0.03, rtol=0.03)
+        current_sizes = (len(interface.bsa_attn_fwd_blk64_cutedsl.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache))
+        if cache_sizes is None:
+            cache_sizes = current_sizes
+        assert current_sizes == cache_sizes
+
+
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 @pytest.mark.parametrize("sq,sk", [(193, 129), (320, 1088), (513, 1025)])
 @pytest.mark.parametrize("variable", [False, True])
