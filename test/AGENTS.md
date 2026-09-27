@@ -258,6 +258,23 @@ Int32 boundary for both backward SF layouts. Its source and destination
 prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
 
+### Packed SM80 forward launch migration
+
+After moving a wrapper to a prepared host, forbid the old tensor launcher
+after warmup and check fresh bindings plus changed-input graph replay. Keep
+physical stride and product-overflow probes on every native flavor, with
+wrapped addresses poisoned inside allocated guard storage.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
+THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+
+
+SM80's standalone packed wrapper preserves cumulative tensors as row offsets
+into the supplied storage. Do not substitute graph API cumulative-length
+normalization: that changes which Q/K/V rows the standalone call addresses.
+`test_thd_wrapper_preserves_packed_row_origins` checks different Q/KV origins,
+empty sequences and changed origins after capture, including zeroed output
+capacity outside those origins. Keep baseline compatibility evidence.
+
 
 Prepared THD artifact reuse must survive a disabled persistent cache and an
 unknown environment manifest. Change packed capacities and launch bounds with
