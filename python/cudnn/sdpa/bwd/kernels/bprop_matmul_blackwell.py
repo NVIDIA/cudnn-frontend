@@ -1602,6 +1602,9 @@ def _bprop_matmul_bh_sm100_kernel(
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
 
 
+_bprop_matmul_bh_sm100_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _thd_patch_descs_kernel(
     c_tensor: cute.Tensor,
