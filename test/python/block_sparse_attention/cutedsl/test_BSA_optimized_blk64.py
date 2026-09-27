@@ -3,6 +3,8 @@
 
 """Numerical and layout regressions for the SM100/SM103 blk64 path."""
 
+import importlib
+
 import pytest
 import torch
 
@@ -134,3 +136,74 @@ def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
             assert got.data_ptr() == buffer.data_ptr()
             got = got.transpose(1, 2) if layout == "bshd" else got
             torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.parametrize("duplicates", [False, True])
+def test_paired_multiset_and_graph_replay(monkeypatch, duplicates):
+    bsa = _bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(27123)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    q = torch.randn((1, 2, 320, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, 1088, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    indices = torch.tensor([0, 2, 8, 16], device="cuda", dtype=torch.int32).view(1, 1, 1, 4).expand(1, 2, 5, 4).contiguous()
+    counts = torch.full((1, 2, 5), 4, device="cuda", dtype=torch.int32)
+    if duplicates:
+        indices[:, :, 1, 1] = indices[:, :, 1, 0]
+    kwargs = dict(q2k_block_nums=counts, sparse_block_size=64)
+
+    def step():
+        output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs)
+        gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=3)
+        return output, *gradients
+
+    eager = step()
+    # Duplicate slots contribute repeatedly; a boolean mask would hide a lost edge.
+    multiplicity = torch.zeros((1, 2, 320, 1088), device="cuda", dtype=torch.float32)
+    for h in range(2):
+        for row in range(5):
+            for block in indices[0, h, row].tolist():
+                multiplicity[0, h, row * 64 : (row + 1) * 64, block * 64 : (block + 1) * 64] += 1
+    qr, kr, vr = [t.float().detach().requires_grad_() for t in (q, k, v)]
+    ref_output = (qr @ kr.transpose(-1, -2) / 128**0.5 + multiplicity.log()).softmax(-1) @ vr
+    ref_output.backward(do.float())
+    for got, expected in zip(eager, (ref_output, qr.grad, kr.grad, vr.grad)):
+        torch.testing.assert_close(got.float(), expected, atol=0.03, rtol=0.03)
+    assert any(key[1] is True for key in interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    q.mul_(0.8)
+    counts.fill_(2)
+    graph.replay()
+    for got, expected in zip(captured, step()):
+        torch.testing.assert_close(got, expected, atol=0.03, rtol=0.03)
+
+
+def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
+    bsa = _bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    cache = interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache
+    for sq in (8192, 8256, 262144, 262208, 8192):
+        q = torch.zeros((1, 1, sq, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros((1, 1, 128, 128), device="cuda", dtype=q.dtype)
+        v, do = torch.full_like(k, 0.25), torch.ones_like(q)
+        indices = torch.arange(2, device="cuda", dtype=torch.int32).view(1, 1, 1, 2).expand(1, 1, sq // 64, 2).contiguous()
+        counts = torch.full((1, 1, sq // 64), 2, device="cuda", dtype=torch.int32)
+        kwargs = dict(q2k_block_nums=counts, sparse_block_size=64)
+        output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs)
+        gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=256)
+        torch.testing.assert_close(output, torch.full_like(output, 0.25), atol=0, rtol=0)
+        for i, gradient in enumerate(gradients):
+            expected = torch.full_like(gradient, sq / 128 if i == 2 else 0)
+            torch.testing.assert_close(gradient, expected, atol=0, rtol=0)
+        assert len(cache) == 1

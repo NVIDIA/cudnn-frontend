@@ -47,6 +47,8 @@ from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import (
     sm100_bwd_default_bucketed_k2q_size_blocks,
 )
 
+from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100_paired import MixedKvBackwardSm100
+
 try:
     from cudnn.block_sparse_attention.csrc.bwd.sm100_blk128.bsa_bwd_sm100 import (
         SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
@@ -2718,10 +2720,21 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     if dv is None:
         dv = torch.empty_like(v)
 
-    # One Q group gives every KV block one unique CTA owner. For aligned
+    pair_words = (num_q_blocks + 31) // 32
+    pair_count = (num_kv_blocks + 1) // 2
+    pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
+    use_paired_kv = (
+        q2k_block_nums is not None
+        and num_kv_blocks >= 2
+        and q2k_block_index.is_contiguous()
+        and q2k_block_nums.is_contiguous()
+        and pair_bytes <= 64 * 1024 * 1024
+    )
+    # Paired and residual tasks share dK/dV, so they still need FP32 accumulation.
+    # One Q group in the regular path gives each KV block one unique CTA owner. For aligned
     # physical KV64 tiles, that owner can scale/convert dK and dV directly
     # instead of using FP32 atomic workspaces and postprocessing.
-    use_dkv_postprocess = num_q_groups > 1 or seqlen_k % sparse_block_size != 0
+    use_dkv_postprocess = use_paired_kv or num_q_groups > 1 or seqlen_k % sparse_block_size != 0
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -2739,8 +2752,18 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
+    pair_tensors = ()
+    if use_paired_kv:
+        pair_bits = torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device)
+        pair_duplicates = torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device)
+        pair_flags = torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device)
+        pair_residuals = torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device)
+        pair_tensors = (q2k_block_index, q2k_block_nums, pair_bits, pair_duplicates, pair_flags, pair_residuals)
+
     compile_key = (
         "sm100_bucketed_k2q",
+        use_paired_kv,
+        bucket_size_blocks if use_paired_kv else None,
         q.dtype,
         head_dim,
         sparse_block_size,
@@ -2780,11 +2803,14 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         var_bs_t = _to_cute_tensor(variable_block_sizes, leading_dim=1)
         ws_t = _to_cute_tensor(workspace, fully_dynamic=True)
 
-        bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
-            sparse_block_size=sparse_block_size,
-            has_block_sizes=has_block_sizes,
-            force_dkv_postprocess=use_dkv_postprocess,
-        )
+        if use_paired_kv:
+            bwd_kernel = MixedKvBackwardSm100(sparse_block_size, has_block_sizes, bucket_size_blocks)
+        else:
+            bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
+                sparse_block_size=sparse_block_size,
+                has_block_sizes=has_block_sizes,
+                force_dkv_postprocess=use_dkv_postprocess,
+            )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
             bwd_kernel,
@@ -2804,6 +2830,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             ws_t,
             softmax_scale,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            *(_to_cute_tensor(t, assumed_align=4) for t in pair_tensors),
             options="--enable-tvm-ffi",
         )
 
@@ -2825,6 +2852,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             workspace,
             softmax_scale,
             current_stream,
+            *pair_tensors,
         )
 
     return dq, dk, dv
