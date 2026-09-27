@@ -238,3 +238,29 @@ def test_mxfp8_v_scale_plane_stride_multiplies_in_int64(d, monkeypatch):
     dtype, widths = observed[0]
     assert dtype is cutlass.Int64
     assert len(widths) >= 3 and set(widths) == {"i64"}
+
+
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("has_amax", [False, True])
+def test_mxfp8_prepared_amax_flag_reaches_compiler(d, dv, has_amax, monkeypatch):
+    """The host artifact and specialization cache key must describe the same Amax flag."""
+    import inspect
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    template = "prefill_d192_d128_mxfp8" if d == 192 else f"prefill_d{d}_mxfp8"
+    mod = _load("sm100", template, d, dv, dtype_qkv=0, dtype_o=2, cta_mma=1)
+    observed = []
+    sentinel = object()
+
+    def compiler(fn, *args, **kwargs):
+        bound = inspect.signature(fn).bind(*args, stream=kwargs["stream"])
+        observed.append(bound.arguments["has_amax"])
+        return sentinel
+
+    mod.compile_prepared.cache_clear()
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", compiler)
+    try:
+        assert mod.compile_prepared(d_qk=d, d_v=dv, has_amax=has_amax) is sentinel
+        assert observed == [has_amax]
+    finally:
+        mod.compile_prepared.cache_clear()

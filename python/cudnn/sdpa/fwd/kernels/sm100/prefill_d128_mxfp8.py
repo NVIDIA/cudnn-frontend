@@ -3251,6 +3251,7 @@ def compile_prepared(
         d_v,
         has_lse,
         lse_kind,
+        has_amax=has_amax,
         static_lse_strides=static_lse_strides,
         partial_slot=True,
     )
