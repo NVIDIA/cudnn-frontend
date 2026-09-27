@@ -256,7 +256,6 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     TemplateParams template with no standalone entry point)."""
     try:
         from cudnn.sdpa.bwd import api_dsl as api_sm80
-        from cudnn.sdpa.bwd.kernels.sm80 import bprop_d64_f16 as d64
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -283,12 +282,13 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     # Generic path: build the adapter directly (BHSD-logical views of the same
     # BSHD storage) with the d64 gate forced off, so it compiles + launches
     # the generic TemplateParams module.
+    eligible = api_sm80._sm80_d64_fast_path_eligible
     monkeypatch.setattr(api_sm80, "_sm80_d64_fast_path_eligible", lambda **kw: False)
     qb, kb, vb, ob, dob = (t.transpose(1, 2) for t in (q, k, v, o, do))
     dq_g = torch.empty(b, s, h, d, dtype=q.dtype, device="cuda").transpose(1, 2)
     dk_g = torch.empty_like(dq_g)
     dv_g = torch.empty_like(dq_g)
-    eng = api_sm80.SdpaBwdDslSm80(
+    ctor = dict(
         sample_q=qb,
         sample_k=kb,
         sample_v=vb,
@@ -301,6 +301,7 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
         is_causal=False,
         scale_softmax=scale,
     )
+    eng = api_sm80.SdpaBwdDslSm80(**ctor)
     assert eng.check_support()
     eng.compile()
     assert not eng._use_d64
@@ -318,11 +319,15 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
         scale_softmax=scale,
         workspace=workspace,
     )
-    dq_g, dk_g, dv_g = (t.transpose(1, 2) for t in (dq_g, dk_g, dv_g))  # back to BSHD
-    dq_d, dk_d, dv_d = d64.backward(q, k, v, do, o, lse, scale=scale)
-    torch.testing.assert_close(dq_d.float(), dq_g.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(dk_d.float(), dk_g.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(dv_d.float(), dv_g.float(), rtol=2e-2, atol=2e-2)
+    generic = tuple(t.clone() for t in (dq_g, dk_g, dv_g))
+    monkeypatch.setattr(api_sm80, "_sm80_d64_fast_path_eligible", eligible)
+    fast = api_sm80.SdpaBwdDslSm80(**ctor)
+    fast.compile()
+    assert fast._use_d64 and fast._prepared is not None
+    workspace = torch.empty(fast.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    fast.execute(qb, kb, vb, ob, dob, lse, dq_g, dk_g, dv_g, workspace=workspace)
+    for got, expected in zip((dq_g, dk_g, dv_g), generic):
+        torch.testing.assert_close(got.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1, sinks=None, deterministic=False, max_s_q=None):

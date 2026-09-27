@@ -168,6 +168,12 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+Optional gradients copied from accumulators after a prepared launch still need
+presence, dtype and extent checks before any staging write. They can be absent
+from the pointer ABI, so the common binder cannot validate them. The detector
+is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
+
 Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.
@@ -284,6 +290,15 @@ memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
 SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
+
+A `None` compile sample may still occupy a positional TVM-FFI argument slot.
+When extending a prepared host with a staged-only operand, retain the native
+entry signature and delegate internally; do not assume the absent operand is
+removed from the exported call ABI. Exercise both native and staged routes,
+including a fresh-process artifact reload. For staged THD output padding,
+test the bounded cast/fold with physical wide output strides as well as the
+input staging; `test_staged_packed_physical_stride` covers both stride and
+index-product overflow with allocated guard storage.
 
 Prepared host migrations must preserve persistent compiled artifacts as well as
 warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
