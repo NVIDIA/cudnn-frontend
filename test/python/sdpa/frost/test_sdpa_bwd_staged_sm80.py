@@ -246,7 +246,7 @@ def test_staged_workspace_slice_with_odd_extra_byte(features):
 
 
 @pytest.mark.parametrize("role", ["dbias", "dsink"])
-@pytest.mark.parametrize("problem", ["size", "unexpected", "missing", "dtype"])
+@pytest.mark.parametrize("problem", ["size", "shape", "unexpected", "missing", "dtype"])
 def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypatch):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
@@ -277,6 +277,8 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypa
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     if problem == "size":
         aux = torch.empty(aux.numel() + 1, device="cuda", dtype=aux.dtype)
+    elif problem == "shape":
+        aux = aux.transpose(1, 2) if role == "dbias" else aux.view(2, 2)
     elif problem == "missing":
         aux = None
     elif problem == "dtype":

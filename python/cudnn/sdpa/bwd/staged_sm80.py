@@ -137,6 +137,14 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             raise ValueError(f"sdpa_bwd_sm80: {role} was not compiled into this specialization")
         if f.numel != math.prod(region[1]):
             raise ValueError(f"sdpa_bwd_sm80: {role} must contain {math.prod(region[1])} elements")
+        expected_shape = tuple(desc.shape) if desc is not None else tuple(region[1])
+        shape = f.shape
+        if desc is None:
+            # Legacy wrappers can omit singleton axes (notably (H,) dSink).
+            shape = tuple(n for n in shape if n != 1)
+            expected_shape = tuple(n for n in expected_shape if n != 1)
+        if shape != expected_shape:
+            raise ValueError(f"sdpa_bwd_sm80: {role} must match the declared logical shape {expected_shape}")
         allowed = (desc.dtype,) if desc is not None else (torch.float32, api.dtype) if role == "dbias" else (torch.float32,)
         if original[role].dtype not in allowed:
             raise ValueError(f"sdpa_bwd_sm80: {role} dtype must match its declaration or accumulation output")
