@@ -10,6 +10,7 @@ from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.scheduler import (
+    SCHED_LPT,
     SCHED_LPT_L2,
     SCHED_NATURAL,
     lpt_tile_coords,
@@ -843,10 +844,25 @@ def make_sdpa_helpers(
             cb_nz = cute.math.max(cb, cutlass.Int32(1))
             in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
             local = u - acc
-            # Natural order within a sequence (head-major, ascending rows).
+            # Policies reorder the SAME live THD work list; they never decode
+            # the padded rectangular cache-shape envelope. NATURAL retains
+            # head-major ascending rows. LPT visits the heavier causal rows
+            # across all heads first; LPT_L2 keeps a KV-sharing head group
+            # together while reversing its rows. Other flavors retain their
+            # existing THD order until their policy contracts are validated.
+            head = local // cb_nz
+            row = local % cb_nz
+            if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (128, 256)):
+                if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                    head = local % n_qh
+                    row = cb - cutlass.Int32(1) - local // n_qh
+                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                    group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                    head = (local // (cb_nz * group)) * group + local % group
+                    row = cb - cutlass.Int32(1) - (local // group) % cb_nz
             f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb_nz).ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb_nz).ir_value(), f_qc.ir_value()))
+            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), head.ir_value(), f_head.ir_value()))
+            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), row.ir_value(), f_qc.ir_value()))
             done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
             acc = acc + units_b
         q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair

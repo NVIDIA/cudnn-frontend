@@ -1456,3 +1456,74 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
     remap = torch.tensor(sorted(range(b), key=lambda i: (-int(q[i]), i)), dtype=torch.int32)
     live = int(((q + 127) // 128).sum()) * 3
     torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
+    """Every public policy covers the same live rows, including empty sequences/KV."""
+    rubin = torch.cuda.get_device_capability() == (10, 7)
+    if rubin and d != 256:
+        pytest.skip("Only the D256 half flavor admits LPT on SM107")
+    b, hq, hk, qcap, kcap = 3, 16, 2, 1025, 2305
+    io_type = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g, t = _thd_graph(b, qcap, kcap, hq, hk, d, dtype=io_type, arch="sm107" if rubin else "sm100")
+    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    plans = []
+    for policy in ((0, 1) if rubin else (0, 1, 2)):
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})
+        index = g.get_execution_plan_count() - 1
+        g.build_plan_at_index(index)
+        plans.append(index)
+    bufs = _buffers(b, qcap, kcap, hq, hk, d, seed=91, dtype=dtype)
+    workspaces, captures = [], []
+    for index in plans:
+        g.build_plan_at_index(index)
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device=DEV)
+        g.execute(_pack(t, bufs), ws)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g.execute(_pack(t, bufs), ws)
+        workspaces.append(ws)
+        captures.append(graph)
+    for ql, kl in (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793])):
+        cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
+        for name, values in (
+            ("cu_q", cq),
+            ("cu_kv", ck),
+            ("off_q", [x * hq * d for x in cq]),
+            ("off_kv", [x * hk * d for x in ck]),
+            ("off_lse", [x * hq for x in cq]),
+        ):
+            bufs[name].copy_(torch.tensor(values, dtype=torch.int32, device=DEV))
+        bufs["q"].mul_(-0.5)
+        ref_o = torch.zeros(cq[-1], hq, d, dtype=torch.float32, device=DEV)
+        ref_s = torch.full((cq[-1], hq), -float("inf"), dtype=torch.float32, device=DEV)
+        for batch, (nq, nk) in enumerate(zip(ql, kl)):
+            if nq == 0 or nk == 0:
+                continue
+            q = bufs["q"][cq[batch] : cq[batch + 1]].float().transpose(0, 1)
+            k = bufs["k"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            v = bufs["v"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            score = q @ k.transpose(1, 2) / math.sqrt(d)
+            score.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None], -float("inf"))
+            ref_o[cq[batch] : cq[batch + 1]] = (score.softmax(-1) @ v).transpose(0, 1)
+            ref_s[cq[batch] : cq[batch + 1]] = score.logsumexp(-1).transpose(0, 1)
+        natural = None
+        for policy, graph in enumerate(captures):
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
+            torch.testing.assert_close(got_o.float(), ref_o, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(got_s, ref_s, atol=1e-3, rtol=1e-3)
+            assert torch.isnan(bufs["o"][cq[-1] :]).all(), "policy must not write past live packed Q"
+            assert torch.isnan(bufs["lse"][cq[-1] :]).all(), "policy must not write Stats past live packed Q"
+            if policy == 0:
+                natural = got_o.clone(), got_s.clone()
+            else:
+                torch.testing.assert_close(got_o, natural[0], atol=0, rtol=0)
+                torch.testing.assert_close(got_s, natural[1], atol=0, rtol=0)

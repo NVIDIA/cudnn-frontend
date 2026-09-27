@@ -486,12 +486,13 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:
-        # A ragged batch carries its own scheduler: it walks the LIVE units
-        # through batch_remap over a machine-sized grid. The LPT decodes map a
-        # linear tile id onto a dense rectangular tile space, so ranking them
-        # here would hand THD a decode built for a geometry it does not have --
-        # and spend autotune slots on it. Same exclusion the adapters apply to
-        # their standalone-wrapper derivation.
+        # A ragged batch walks LIVE units through batch_remap over a
+        # machine-sized grid. Only flavors with a THD policy decoder can tune
+        # its ordering; the dense rectangular LPT decoder cannot serve it.
+        # D128/D256 half THD implements policy ordering within the live list.
+        # Keep the existing default; expose alternatives for measured tuning.
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+            return [SCHED_NATURAL] + sorted(domain - {SCHED_NATURAL})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
