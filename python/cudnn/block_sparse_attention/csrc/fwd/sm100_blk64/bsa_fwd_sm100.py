@@ -25,7 +25,8 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
+from cutlass._mlir.dialects import nvvm
 
 from cudnn.block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
@@ -51,6 +52,38 @@ from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import SingleTileSch
 SAGE_P_QUANT_SCALE = 256.0
 SAGE_P_QUANT_LOG2_SCALE = math.log2(SAGE_P_QUANT_SCALE)
 SAGE_P_RESCALE_THRESHOLD = math.log2(448.0 / SAGE_P_QUANT_SCALE)
+
+
+class _SubsetNamedBarrier(pipeline_custom.NamedBarrier):
+    """CTA named barrier whose participants occupy only selected warp roles."""
+
+    @dsl_user_op
+    def arrive(self, *, loc=None, ip=None):
+        self.arrive_w_index(Int32(0), loc=loc, ip=ip)
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None):
+        self.arrive_and_wait_w_index(Int32(0), loc=loc, ip=ip)
+
+    @dsl_user_op
+    def arrive_w_index(self, index: Int32, *, loc=None, ip=None):
+        nvvm.barrier_cta_arrive(
+            Int32(self.barrier_id + index).ir_value(loc=loc, ip=ip),
+            Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def arrive_and_wait_w_index(self, index: Int32, *, loc=None, ip=None):
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id + index).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
 
 
 class BlockSparseAttnForwardSm100Blk64:
@@ -925,7 +958,7 @@ class BlockSparseAttnForwardSm100Blk64:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
+        tmem_alloc_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
@@ -996,7 +1029,7 @@ class BlockSparseAttnForwardSm100Blk64:
             defer_sync=True,
         )
         # Should put the NamedBarrier inside the pipeline class so we'll just have pipeline_sm_stats
-        sm_stats_barrier = pipeline_custom.NamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
+        sm_stats_barrier = _SubsetNamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
         reduce_mbar_ptr = storage.reduce_mbar.data_ptr()
         pipeline_o_epi = pipeline_custom.PipelineAsync.create(
             barrier_storage=storage.mbar_O_epi.data_ptr(),
@@ -1163,7 +1196,7 @@ class BlockSparseAttnForwardSm100Blk64:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1221,7 +1254,7 @@ class BlockSparseAttnForwardSm100Blk64:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1260,7 +1293,7 @@ class BlockSparseAttnForwardSm100Blk64:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -2680,7 +2713,9 @@ class BlockSparseAttnForwardSm100Blk64:
         exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
         if const_expr(self.allow_empty_block_nums):
             is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
-            if not is_zero_output:
+            # Aligned TMEM loads require converged participation of the entire warp.
+            warp_needs_tmem = cute.arch.vote_ballot_sync(not is_zero_output) != 0
+            if warp_needs_tmem:
                 bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                     Int32(tmem_o0_addr),
                     Int32(tmem_o1_addr),

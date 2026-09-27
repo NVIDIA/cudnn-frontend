@@ -49,3 +49,33 @@ def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
     assert output.is_contiguous()
     torch.testing.assert_close(output.transpose(1, 2).float(), ref_output, atol=0.03, rtol=0.03)
     torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
+@pytest.mark.parametrize("seqlen", [193, 1089])
+def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
+    bsa = _bsa()
+    torch.manual_seed(19000 + seqlen)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    q, k, v = [torch.randn((1, 2, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    blocks = (seqlen + 63) // 64
+    indices = torch.arange(blocks - 1, -1, -1, device="cuda", dtype=torch.int32).view(1, 1, 1, -1).expand(1, 2, blocks, blocks).contiguous()
+    counts = (torch.arange(2 * blocks, device="cuda", dtype=torch.int32) % (blocks + 1)).view(1, 2, blocks)
+    sizes = torch.full((blocks,), 64, device="cuda", dtype=torch.int32)
+    sizes[-1] = seqlen - (blocks - 1) * 64
+    mask = block_sparse_mask(indices, 0, sizes, seqlen, seqlen, 64, counts)
+    expected, expected_lse = attention_reference(q, k, v, mask)
+    output, lse = bsa.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        indices,
+        block_sizes=sizes,
+        q2k_block_nums=counts,
+        sparse_block_size=64,
+        use_clc=clc,
+        kv_splits=splits,
+        allow_empty_block_nums=True,
+    )
+    torch.testing.assert_close(output.float(), expected, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
