@@ -398,12 +398,34 @@ def test_sm80_bwd_thd_flavor_envelope_dims(d_qk, d_v):
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
 
+def _prepared_bwd_cache_totals(monkeypatch):
+    """Observe actual artifact hits/misses for backward, excluding forward JIT."""
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa.bwd.api_dsl import _sm80_thd_plan
+    from cudnn.sdpa.bwd.kernels.sm80 import prepared_host
+
+    _sm80_thd_plan.cache_clear()
+    counts = [0, 0]
+    original = prepared_host.compile_cached
+
+    def counted(*args, **kwargs):
+        before = compiled_cache.stats()
+        artifact = original(*args, **kwargs)
+        after = compiled_cache.stats()
+        counts[0] += after["misses"] - before["misses"]
+        counts[1] += after["hits"] - before["hits"]
+        return artifact
+
+    monkeypatch.setattr(prepared_host, "compile_cached", counted)
+    return lambda: tuple(counts)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_sm80_bwd_thd_compile_key_plan_time_only():
+def test_sm80_bwd_thd_compile_key_plan_time_only(monkeypatch):
     """Issue #604 regression (backward): the packed THD token totals are
     RUNTIME values, so two varlen backward calls with different totals must
-    re-bind ONE compiled artifact (the bprop template's per-shape lru sees a
+    re-bind ONE compiled artifact (the prepared artifact cache sees a
     single miss) — never mint a compile per step, the continuous-batching
     pathology no correctness test catches."""
     from cudnn.frost import template_loader
@@ -434,13 +456,7 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
             cum_seqlen_k_tensor=cu,
         )
 
-    def cache_totals():
-        # Count ONLY the bprop template's per-shape lru (the fwd wrapper runs
-        # too, and its counters are covered by the forward's twin test); the
-        # counters are session-global, so assert on DELTAS across our calls.
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+    cache_totals = _prepared_bwd_cache_totals(monkeypatch)
 
     varlen([96, 160])  # first call: one compile
     n_modules_before = len(template_loader._MODULES)
@@ -540,7 +556,7 @@ def test_sm80_bwd_strided_stats_native_reads():
 @torch_fork_set_rng(seed=0)
 def test_sm80_bwd_thd_max_s_kv_hint():
     """The THD wrapper's max_s_kv grid hint must (a) produce bitwise the same
-    grads as the hint-less host-read path, including when over-provisioned
+    grads as the hint-less capacity-bound path, including when over-provisioned
     (short kv-tiles early-out), and (b) be rejected on the dense path."""
     import itertools
 
@@ -854,19 +870,13 @@ def test_sm80_bwd_dense_sinks():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_sm80_bwd_thd_sinks_deterministic_compile_key():
+def test_sm80_bwd_thd_sinks_deterministic_compile_key(monkeypatch):
     """Rule 4 for the two new THD specializations: sinks and deterministic each
     mint exactly one bprop template compile (a new parameter set), and then
     re-bind across different token totals — and, for deterministic, a
     different max_s_q — without a new compile: neither T_q nor the relay
     counter's size is part of the key."""
-    from cudnn.frost import template_loader
-
-    def cache_totals():
-        """(misses, hits) summed over the loaded bprop template modules' compile caches."""
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+    cache_totals = _prepared_bwd_cache_totals(monkeypatch)
 
     sinks = torch.randn(4, dtype=torch.float32, device="cuda")
     try:

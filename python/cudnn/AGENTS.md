@@ -135,16 +135,14 @@ neither names the thing that breaks it most directly: a device-to-host read.
   range(B): int(cu[i])` loop). Extract the correct one and call it from both
   rather than writing the obvious loop again.
 
-Known violations, all pre-existing and each needing a kernel-side change, so
-none is precedent:
-
-- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
-  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
-  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
-  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
-  the graph's envelope `S_max` and turns the per-batch lengths into
-  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
-  violation on the wrapper surface (a caller contract, documented there).
+The SM80 packed backward wrapper now shares the prepared graph chain. When
+`max_s_kv` is absent, the packed capacity bounds the grid; B+1 prefixes stay
+on device. `test_wrapper_without_length_hints_does_not_sync` detects the old
+CPU copy after warmup (verified RED on the preceding wrapper). Capacity,
+Stats head pitch, launch bounds and deterministic-counter size are distinct:
+a caller may reserve more storage than `B * max_sequence_length`. Preserve
+that capacity while honoring the caller's valid launch bounds; cover poisoned
+slack and changed device prefixes under replay.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -186,9 +184,11 @@ not become a compile key.
   dataclass again. Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
   `test_replan_reloads_prepared_artifact` is the SM80 detector.
-- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
-  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
-  plus the plan-time sequence count; the regression tests are
+- **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
+  The prepared backward host takes Int64 capacities and launch bounds at
+  runtime, including the compact Stats head pitch and deterministic-counter
+  size; the retained tensor compiles use `cute.sym_int` and key on
+  `b = 1, sq = skv = 0` plus the plan-time sequence count. The regression tests are
   `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
   `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
   pattern, not a shape-keyed one.
