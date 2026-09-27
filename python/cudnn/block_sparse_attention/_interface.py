@@ -2521,6 +2521,7 @@ def _build_bucketed_k2q_csr(
     *,
     bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    parallel_offsets: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels.
 
@@ -2534,6 +2535,7 @@ def _build_bucketed_k2q_csr(
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=parallel_offsets,
     )
 
 
@@ -2607,6 +2609,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=True,
     )
 
     has_block_sizes = block_sizes is not None
