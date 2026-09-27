@@ -3,6 +3,11 @@
 """Prepared block-scaled outputs retain physical byte addressing."""
 
 import math
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -13,6 +18,68 @@ from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, engine_name
 from frost_test_utils import requires_dsl
 
 pytestmark = [requires_dsl]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("block", [16, 32])
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_block_output_artifact_reloads_in_fresh_process(block, mxfp8, tmp_path):
+    """Warm execute cannot detect a missing disk artifact: forbid fresh JIT."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("shared FP8/MXFP8 hosts require SM100/SM103/SM107")
+    child = r"""
+import hashlib, json, sys
+from pathlib import Path
+import torch, cudnn
+import cutlass.cute as cute
+from cudnn.frost import compiled_cache
+tests, package, block, mxfp8, reload = sys.argv[1:]
+assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
+sys.path.insert(0, tests)
+from test_sdpa_prepared_block_output import _fp8_case
+if reload == "1":
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fresh-process prepared block-output plan invoked JIT")
+    cute.compile = forbidden
+case = _fp8_case(int(block), mxfp8=bool(int(mxfp8)), stats=True)
+g, vp, ws, output, sf, amax, ts = case
+if reload == "1":
+    assert hasattr(g._compiled_plans[g._plan_index]._prepared.spec.owner, "_compiled_cache_raw")
+g.execute(vp, ws)
+names = ("o", "sf_o", "amax_o", "lse")
+def digest():
+    return {n: hashlib.sha256(vp[ts[n]].contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for n in names}
+expected = digest()
+assert torch.isfinite(amax).all() and torch.isfinite(vp[ts["lse"]]).all()
+graph = torch.cuda.CUDAGraph()
+try:
+    with torch.cuda.graph(graph):
+        g.execute(vp, ws)
+    for name in names:
+        vp[ts[name]].view(torch.uint8).fill_(0xAA)
+    graph.replay()
+    assert digest() == expected, "reloaded artifact replay changed outputs"
+finally:
+    graph.reset()
+print(json.dumps(dict(digest=expected, stats=compiled_cache.stats())))
+"""
+    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path))
+    env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
+    results = []
+    for reload in (0, 1):
+        result = subprocess.run(
+            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(block), str(int(mxfp8)), str(reload)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
+        results.append(json.loads(result.stdout.strip().splitlines()[-1]))
+    first, second = results
+    assert first["stats"]["misses"] > 0 and first["stats"]["hits"] == 0, first
+    assert second["stats"]["misses"] == 0 and second["stats"]["hits"] > 0, second
+    assert second["digest"] == first["digest"], "fresh-process artifact changed O/SF/Stats/Amax"
 
 
 def _fp8_case(block, *, plane_stride=None, mxfp8=False, stats=False, dtype=torch.float8_e4m3fn, scale_o=True, amax=True, b=2, h=1, sq=128, skv=128):

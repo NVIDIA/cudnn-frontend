@@ -248,3 +248,13 @@ before the byte address is formed even without a wide declared stride.
 Int32 boundary for both backward SF layouts. Its source and destination
 prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
+
+
+Prepared host migrations must preserve persistent compiled artifacts as well as
+warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
+artifact export even though its runtime slots disappear. Carry only the immutable
+primitive configuration facts the host needs, or read the template module's
+configuration internally. `test_block_output_artifact_reloads_in_fresh_process`
+builds in one process, forbids JIT in another, and checks O/SF/Stats/Amax after
+execution and poisoned-output CUDA Graph replay. A same-process cache hit alone
+does not establish cross-process reuse.

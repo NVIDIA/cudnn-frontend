@@ -1346,6 +1346,7 @@ import test_sdpa_prepared_block_output as _prepared_block_output_checks
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific block-output CI entry")
 class TestPreparedBlockOutput:
+    test_artifact_reload = staticmethod(_prepared_block_output_checks.test_block_output_artifact_reloads_in_fresh_process)
     test_rebind_and_replay = staticmethod(_prepared_block_output_checks.test_block_scaled_prepared_rebind_and_replay)
     test_invalid_storage = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup)
     test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)

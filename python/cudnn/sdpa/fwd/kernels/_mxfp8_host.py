@@ -47,7 +47,7 @@ def _launch(
     sf_o_ptr: Optional[cute.Pointer],
     scale_o_ptr: Optional[cute.Pointer],
     kernel_host: cutlass.Constexpr,
-    cfg: cutlass.Constexpr,
+    config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -59,6 +59,7 @@ def _launch(
     sfo_geometry: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    thd, split_kv, o_block_scale = config
     operands = sdpa_operand_tensors(
         q_ptr,
         k_ptr,
@@ -82,10 +83,10 @@ def _launch(
         d_qk=d_qk,
         d_v=d_v,
         lse_kind=lse_kind,
-        thd=cfg.THD_VARLEN,
-        split_kv=cfg.SPLIT_KV,
+        thd=thd,
+        split_kv=split_kv,
         tensor_map_qwords=16,
-        o_pack=2 if getattr(cfg, "O_BLOCK_SCALE", 0) == 16 else 1,
+        o_pack=2 if o_block_scale == 16 else 1,
     )
     b, qh, kh, _, _, _ = problem_size
 
@@ -97,7 +98,7 @@ def _launch(
         return cute.make_tensor(
             ptr,
             cute.make_layout(
-                (1 if cutlass.const_expr(cfg.THD_VARLEN) else b, heads, tiles, size),
+                (1 if cutlass.const_expr(thd) else b, heads, tiles, size),
                 stride=(batch_stride, head_stride, size, 1),
             ),
         )
@@ -106,7 +107,7 @@ def _launch(
     sf_k = scale_tensor(sf_k_ptr, kh, sf_tiles[1], sf_smem_sizes[1])
     sf_v = scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
     amax = None if cutlass.const_expr(optional_amax and not has_amax) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
-    if cutlass.const_expr(cfg.SPLIT_KV == 1 and (has_amax or not optional_amax)):
+    if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict()
     if cutlass.const_expr(sfo_geometry is not None):
@@ -182,7 +183,7 @@ def host(
     sf_o_ptr: Optional[cute.Pointer],
     scale_o_ptr: Optional[cute.Pointer],
     kernel_host: cutlass.Constexpr,
-    cfg: cutlass.Constexpr,
+    config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -227,7 +228,7 @@ def host(
         sf_o_ptr,
         scale_o_ptr,
         kernel_host,
-        cfg,
+        config,
         sf_smem_sizes,
         d_qk,
         d_v,
@@ -317,7 +318,7 @@ def compile_host(
         pointer(cutlass.Int8) if sfo_geometry is not None else None,
         pointer(cutlass.Float32, 4) if has_scale_o else None,
         kernel_host,
-        cfg,
+        (bool(cfg.THD_VARLEN), int(cfg.SPLIT_KV), int(getattr(cfg, "O_BLOCK_SCALE", 0))),
         sf_smem_sizes,
         d_qk,
         d_v,
