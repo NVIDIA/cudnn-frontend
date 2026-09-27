@@ -2360,11 +2360,6 @@ _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 _THD_STAGE2_DESC_SLOTS = 4
 _SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
-# do_dot's inner loop is `n_chunks = D_V // chunk_elems` with no tail, so D_V is
-# always passed ROUNDED UP to this and the kernel's padded-head-dim guard covers
-# the remainder. 64 keeps 8 threads/row, which is a 2x throughput cliff over 32.
-_SM100_DOT_CHUNK_ELEMS = 64
-_SM100_DOT_Q_TILE = 128
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
@@ -2499,8 +2494,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._skv_pad = -(-self.s_k_max // 128) * 128
         self._is_padded = self._sq_pad != self.s_q_max or self._skv_pad != self.s_k_max
         self._compiled = None
-        self._dot_fn = None
-        self._reduce_fn = None
+        self._staged_prepared = None
         self._zero_ws = False
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
         # Head-major Stats only: the caller's head stride, which the compiled
@@ -2559,6 +2553,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         assert vanishes under -O and an import-time crash is undebuggable from
         the frontend.
         """
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        error = cutedsl_requirement_error("SdpaBwdDslSm100")
+        if error:
+            raise NotImplementedError(error)
         self._value_error_if(self.head_dim_qk != self.head_dim_v, f"SM100 bwd: d_qk must equal d_v; got {self.head_dim_qk} / {self.head_dim_v}")
         self._value_error_if(not (256 < self.head_dim_qk <= 512), f"SM100 bwd: d must be in (256, 512]; got {self.head_dim_qk}")
         self._value_error_if(
@@ -2651,8 +2650,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
         operand-major and the other causal K-trim direction). Native layouts
-        compile the complete chain here; the retained conversion path still
-        compiles its tensor wrappers at first execute."""
+        and the existing dense conversion path both compile the complete
+        pointer chain here."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
@@ -2664,7 +2663,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             TemplateParams,
             vec_bytes_epi_for,
         )
-        from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
         stage2_mod = load_template(
@@ -2760,18 +2758,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
             self._compiled = self._prepared
             return self._compiled
-        stage2 = stage2_mod.compile(
-            b=self.batch_size,
-            qh=self.h_q,
-            sq=self._sq_pad,
-            skv=self._skv_pad,
-            qh_chunk=self._qh_chunk,
-            d=self.head_dim_qk,
-            qh_kv=self.h_kv,
-            sq_real=self.s_q_max,
-            skv_real=self.s_k_max,
-        )
-        self._compiled = (dot_do_o_host, stage2_mod, stage2, mm_lo, mm_hi)
+        from .prepared_sm100 import compile_staged
+
+        self._staged_prepared = compile_staged(self, stage2_mod, mm_lo, mm_hi)
+        self._compiled = self._staged_prepared
         return self._compiled
 
     # --- execution -----------------------------------------------------------
@@ -2816,224 +2806,12 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 current_stream,
                 scale_softmax,
             )
-        import cutlass
-        from cutlass.cute.runtime import from_dlpack, make_fake_stream
+        from .prepared_sm100 import execute_staged
 
-        dot_host, stage2_mod, stage2, mm_lo, mm_hi = self.compile()
-        b, h, sq, skv, d = self.batch_size, self.h_q, self.s_q_max, self.s_k_max, self.head_dim_qk
-        scale = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
-        scale_log2 = scale * math.log2(math.e)
-
-        # Logical BHSD over BSHD storage -> the [B, S, H, D] view the kernels
-        # declare. A permutation, never a copy.
-        as_bshd = lambda t: t.permute(0, 2, 1, 3)
-
-        stream = self._get_default_stream(current_stream)
-        with _torch_stream_context(current_stream, q_tensor.device):
-            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100")
-            # ROW_ROUND: dot_do_o_kernel strides delta by ceil(S_q/128)*128.
-            sq_dot = -(-sq // 128) * 128
-            delta = carver.take(b * h * sq_dot, torch.float32).reshape(b, h, sq_dot)
-            chunk = self._qh_chunk
-            # Allocated at the PADDED extent, because that is what stage 2's
-            # tiled grid writes; stage 3 consumes a REAL-extent slice, so the
-            # padded tail never reaches a GEMM's M/N/K at all.
-            sqp, skvp = self._sq_pad, self._skv_pad
-            s_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
-            ds_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
-            s_ws, ds_ws = s_ws_full[:, :, :sq, :skv], ds_ws_full[:, :, :sq, :skv]
-
-            # Layout normalisation. A conforming tensor is used in place (the
-            # permute is a view); a non-conforming one gets a BSHD staging buffer
-            # from the workspace -- copied IN for reads, and copied back OUT
-            # after the chain for the gradients.
-            def _stage(t, name, is_out):
-                if name not in (self._stage_out if is_out else self._stage_in):
-                    return as_bshd(t), None
-                bt, ht, st, dd = t.shape[0], t.shape[1], t.shape[2], t.shape[3]
-                # `buf` is the BSHD-physical [B, S, H, D] buffer the kernels
-                # want; `view` is its logical-BHSD alias, used only to copy
-                # against the caller's tensor. Returning `view` here instead of
-                # `buf` hands the kernel [B, H, S, D] and it rejects the shape.
-                buf = carver.take(int(bt) * int(st) * int(ht) * int(dd), self.dtype).view(int(bt), int(st), int(ht), int(dd))
-                view = buf.permute(0, 2, 1, 3)
-                if not is_out:
-                    view.copy_(t)
-                return buf, (view, t)
-
-            q, _ = _stage(q_tensor, "q", False)
-            k, _ = _stage(k_tensor, "k", False)
-            v, _ = _stage(v_tensor, "v", False)
-            o, _ = _stage(o_tensor, "o", False)
-            do, _ = _stage(do_tensor, "dO", False)
-            dq, dq_back = _stage(dq_tensor, "dQ", True)
-            dk, dk_back = _stage(dk_tensor, "dK", True)
-            dv, dv_back = _stage(dv_tensor, "dV", True)
-
-            # Under GQA the stage-3 dK/dV GEMMs write ONE PARTIAL PER Q HEAD and
-            # a separate reduce folds the group afterwards. Writing straight to
-            # dk/dv would have the group's Q heads overwrite each other instead
-            # of summing. MHA (group == 1) skips both the buffers and the reduce.
-            # Zero the S/dS workspace when the stage-3 K-trim can straddle the
-            # boundary of what stage 2 wrote.
-            #
-            # With shift == 0 it cannot: the trim starts at (m0 // 256) * 256 ==
-            # m0, and every q-cluster from there wrote the whole 256-wide M tile,
-            # so the skipped tiles are never read (the poisoned-workspace test
-            # proves it at 43.8% skipped). A non-zero shift -- band widening or
-            # bottom-right -- pulls the start BELOW m0, and then an M tile can
-            # straddle the written boundary and read residue. That showed up as a
-            # 1-in-6 catastrophic dK/dV (cos 0.0006), not a numerics drift,
-            # because it depends on whatever was in the buffer.
-            if self._zero_ws:
-                # NOT for padding: stage 2 writes its own zeros there. Its kv
-                # bound is div_up(REAL S_kv, TILE_N), so the tail tile IS visited
-                # and apply_mask_chunk zeroes the columns past the real length;
-                # the padded q rows are visited too (the grid is sized on the
-                # rounded S_q) and row_scale zeroes them. Only a MASK-SKIPPED
-                # tile is genuinely never written.
-                s_ws_full.zero_()
-                ds_ws_full.zero_()
-
-            gqa = self._gqa_group > 1
-            if gqa:
-                dk_part = carver.take(b * skv * h * d, self.dtype).view(b, skv, h, d)
-                dv_part = carver.take(b * skv * h * d, self.dtype).view(b, skv, h, d)
-                # Already [B, S_kv, H_q, D] -- the same BSHD orientation `_stage`
-                # hands back, so the `hs` head slice below hits the same axis.
-                dk_tgt, dv_tgt = dk_part, dv_part
-            else:
-                dk_tgt, dv_tgt = dk, dv
-
-            _t = lambda x: from_dlpack(x, assumed_align=16, enable_tvm_ffi=True)
-            # STAGE 1, hoisted out of the chunk loop: one streaming pass over O
-            # and dO instead of n_chunks passes. Nothing in the loop feeds it.
-            #
-            # The compiled artifact is CACHED on the adapter. Building it here on
-            # every call cost ~250 ms of WALL time per execute while device time
-            # stayed at 0.1 ms -- invisible to a device-time benchmark, ruinous
-            # for anything that measures the real call.
-            if self._dot_fn is None:
-                d_padded = -(-d // _SM100_DOT_CHUNK_ELEMS) * _SM100_DOT_CHUNK_ELEMS
-                self._dot_fn = cutlass.cute.compile(
-                    dot_host,
-                    _t(o),
-                    _t(do),
-                    _t(delta),
-                    None,
-                    None,
-                    _SM100_DOT_Q_TILE,
-                    d_padded,
-                    d_padded,
-                    _SM100_DOT_CHUNK_ELEMS,
-                    False,
-                    False,
-                    make_fake_stream(use_tvm_ffi_env_stream=False),
-                    options="--enable-tvm-ffi",
-                )
-            self._dot_fn(_t(o), _t(do), _t(delta), None, None, stream)
-
-            lse = stats_tensor.reshape(b, h, sq)
-            # Stage 2 / stage 3's THD ABI slots: dead on this dense path (every
-            # read is under const_expr(_THD)), but the compiled ABI is a (B,) int32
-            # and a 1-element int64 tensor, so borrow them from the workspace.
-            seq_kv = carver.take(b, torch.int32)
-            desc_words = carver.take(1, torch.int64)
-            for c in range(h // chunk):
-                hb = c * chunk
-                hs = slice(hb, hb + chunk)
-                # STAGE 2: head_base offsets every full-tensor read; the S/dS
-                # workspace stays chunk-local at origin.
-                # Stage 2 gets the FULL padded workspace and the REAL seq
-                # lengths; it computes the tail tile and masks it.
-                stage2(
-                    q,
-                    k,
-                    v,
-                    do,
-                    s_ws_full,
-                    ds_ws_full,
-                    lse,
-                    delta,
-                    seq_kv,
-                    desc_words,
-                    # The trailing 0 is N_THD_UNITS: the persistent grid's
-                    # cluster count, which only the THD path uses.
-                    (b, h, sqp, skvp, chunk, self.h_kv, sq, skv, 0),
-                    float(scale),
-                    float(scale_log2),
-                    float(scale),
-                    hb,
-                    0,
-                    stream,
-                )
-                # STAGE 3: consume the chunk workspace, write the full output's
-                # head slice. Every operand is a permuted view.
-                mm_lo.matmul_bh(
-                    s_ws.permute(3, 2, 1, 0),
-                    do[:, :, hs, :].permute(3, 1, 2, 0),
-                    dv_tgt[:, :, hs, :].permute(1, 3, 2, 0),
-                    n_head=chunk,
-                    n_batch=b,
-                    stream=stream,
-                    meta=seq_kv,
-                    desc_words=desc_words,
-                )
-                mm_lo.matmul_bh(
-                    ds_ws.permute(3, 2, 1, 0),
-                    q[:, :, hs, :].permute(3, 1, 2, 0),
-                    dk_tgt[:, :, hs, :].permute(1, 3, 2, 0),
-                    n_head=chunk,
-                    n_batch=b,
-                    stream=stream,
-                    meta=seq_kv,
-                    desc_words=desc_words,
-                )
-                # dQ = dS.K. Under GQA the K head is shared by `group` Q heads,
-                # so the GEMM runs once per group MEMBER: taking every `group`-th
-                # Q head lines A and the output up with the KV heads exactly, and
-                # every operand stays a strided view (no expand, no copy).
-                kv_lo, kv_n = hb // self._gqa_group, chunk // self._gqa_group
-                kvs = slice(kv_lo, kv_lo + kv_n)
-                for gi in range(self._gqa_group):
-                    a_g = ds_ws[:, gi :: self._gqa_group] if gqa else ds_ws
-                    o_g = dq[:, :, hs, :][:, :, gi :: self._gqa_group, :] if gqa else dq[:, :, hs, :]
-                    mm_hi.matmul_bh(
-                        a_g.permute(2, 3, 1, 0),
-                        k[:, :, kvs, :].permute(3, 1, 2, 0),
-                        o_g.permute(1, 3, 2, 0),
-                        n_head=kv_n,
-                        n_batch=b,
-                        stream=stream,
-                        meta=seq_kv,
-                        desc_words=desc_words,
-                    )
-
-            if gqa:
-                # Fold the Q-head partials onto the KV heads. Reused verbatim
-                # from the SM120 chain: arch-neutral, one thread per 16 B output
-                # vector, fixed-order fp32 accumulation (so it is deterministic).
-                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
-
-                io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
-                if self._reduce_fn is None:
-                    self._reduce_fn = cutlass.cute.compile(
-                        dkv_reduce_host,
-                        _t(dk_part),
-                        _t(dv_part),
-                        _t(dk),
-                        _t(dv),
-                        d,
-                        d,
-                        self._gqa_group,
-                        io_dt,
-                        False,
-                        make_fake_stream(use_tvm_ffi_env_stream=False),
-                        options="--enable-tvm-ffi",
-                    )
-                self._reduce_fn(_t(dk_part), _t(dv_part), _t(dk), _t(dv), stream)
-
-            for back in (dq_back, dk_back, dv_back):
-                if back is not None:
-                    staged, dest = back
-                    dest.copy_(staged)
+        return execute_staged(
+            self,
+            (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
+            workspace,
+            current_stream,
+            scale_softmax,
+        )

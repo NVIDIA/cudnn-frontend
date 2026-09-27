@@ -37,9 +37,7 @@ a crash -- it surfaces as an intermittent hang whose output is correct on every
 launch that completes.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
-from functools import lru_cache
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import cuda.bindings.driver as _cuda_driver
 import cutlass
@@ -1539,97 +1537,4 @@ def _host(
     )
 
 
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    qh_chunk: int = 1,
-    d: Optional[int] = None,
-    qh_kv: Optional[int] = None,
-    sq_real: Optional[int] = None,
-    skv_real: Optional[int] = None,
-) -> Callable:
-    """Per-shape compile cache.
-
-    ``qh_chunk`` decouples the workspace's head extent from the tensors': the
-    host loop chunks the flattened (b, h) index to hold S+dS under the workspace
-    cap, so Q/K/V/dO carry the full ``qh`` while the workspaces carry only the
-    chunk.  ``head_base`` / ``batch_base`` are RUNTIME args, so one
-    compiled artifact serves every chunk.
-    """
-    _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise ValueError("bwd d512: THD is compiled by the prepared pointer host")
-    if sq % (CFG.TILE_M * CFG.CTA_MMA) != 0:
-        raise ValueError(f"bwd d512: S_q must be a multiple of TILE_M*CTA_MMA ({CFG.TILE_M * CFG.CTA_MMA}); got {sq}")
-    if skv % CFG.TILE_N != 0:
-        raise ValueError(f"bwd d512: S_kv must be a multiple of TILE_N ({CFG.TILE_N}); got {skv}")
-    if qh % qh_chunk != 0:
-        raise ValueError(f"bwd d512: qh_chunk ({qh_chunk}) must divide qh ({qh}) -- even chunks keep one compiled artifact")
-    # Head dims below TILE_K need NO kernel change: the TMA descriptors are built
-    # `from_view`, so global_dims carries the REAL d, and a box reading past it is
-    # HW zero-filled.  The zeros then contribute nothing to either BMM -- we pay
-    # the full TILE_K-wide MMA and get the right answer.  The only hard rule is
-    # TMA's: the innermost extent must be 16-byte aligned, i.e. d * BPE % 16 == 0.
-    qh_kv = qh if qh_kv is None else int(qh_kv)
-    # sq / skv are the TILE-ROUNDED compile extents; the real lengths drive the
-    # masks and the operand tensors' own extents.
-    sq_real = sq if sq_real is None else int(sq_real)
-    skv_real = skv if skv_real is None else int(skv_real)
-    if qh % qh_kv != 0:
-        raise ValueError(f"bwd d512: qh ({qh}) must be a multiple of qh_kv ({qh_kv})")
-    d = CFG.TILE_K if d is None else int(d)
-    if not (0 < d <= CFG.TILE_K):
-        raise ValueError(f"bwd d512: d must be in (0, {CFG.TILE_K}]; got {d}")
-    if (d * CFG.BPE) % 16 != 0:
-        raise ValueError(f"bwd d512: d * {CFG.BPE} B must be a multiple of 16 (TMA innermost extent); got d={d}")
-
-    def _fake_bshd(shape, dtype=STORAGE_DTYPE):
-        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-
-    # Dense conversion fallback only; native dense and packed THD compile the
-    # pointer host directly and never build this tensor-ABI fake family.
-    fake_q = _fake_bshd((b, sq_real, qh, d))
-    fake_k = _fake_bshd((b, skv_real, qh_kv, d))
-    fake_v = _fake_bshd((b, skv_real, qh_kv, d))
-    fake_do = _fake_bshd((b, sq_real, qh, d))
-    fake_s = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
-    fake_ds = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
-    fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_real), stride_order=(2, 1, 0), assumed_align=16)
-    # do_dot's producer (dot_do_o_kernel) indexes delta with a row stride of
-    # ceil(S_q / 128) * 128, NOT S_q -- so the buffer, and this view of it, must
-    # use the same rounding. They coincide whenever S_q is a multiple of 128,
-    # which is why a non-multiple was the only shape that exposed it.
-    sq_dot = -(-sq_real // 128) * 128
-    fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
-    fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
-
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_do,
-        fake_s,
-        fake_ds,
-        fake_lse,
-        fake_do_dot,
-        fake_seq_kv_lens,
-        fake_desc_words,
-        (b, qh, sq, skv, qh_chunk, qh_kv, sq_real, skv_real, 0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_bwd",
-    )
-
-
-__all__ = ["CFG", "PARAMS", "Bars", "LAYOUT", "STORAGE_DTYPE", "WORKSPACE_DTYPE", "_kernel", "_host", "compile"]
+__all__ = ["CFG", "PARAMS", "Bars", "LAYOUT", "STORAGE_DTYPE", "WORKSPACE_DTYPE", "_kernel", "_host"]

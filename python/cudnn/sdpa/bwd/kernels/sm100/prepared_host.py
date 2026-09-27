@@ -205,6 +205,11 @@ def host(
 
 
 def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key):
+    # Source codegen domain; the complete engine remains qualified only on
+    # SM100/SM103. Other targets are used for isolated lowering checks.
+    if sm not in (100, 103, 107, 110):
+        raise ValueError(f"SM100 SDPA bwd has codegen targets for SM100, SM103, SM107, SM110; got SM{sm}")
+
     def ptr(t, align=16):
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 

@@ -503,7 +503,10 @@ stride and positive outer strides aligned to eight half-precision elements.
 Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
 bindings are rejected before launch. Dense layouts outside the native stride
 requirements retain workspace staging (one copy in, and one back out for a
-gradient).
+gradient). That existing staging path now calls the same prepared pointer
+chain after the copies. It retains no tensor-ABI compiler or per-call DLPack
+wrapping; current pointers, workspace storage origins and stream bind on each
+call. Native dense and packed layout admission is unchanged.
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
