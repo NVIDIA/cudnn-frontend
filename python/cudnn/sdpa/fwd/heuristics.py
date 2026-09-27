@@ -507,8 +507,9 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
                 and facts.s_q == facts.s_kv
                 and facts.page_size in (16, 128)
-                and not (facts.wants_stats or facts.has_sink or facts.has_epilogue_gate)
+                and not (facts.has_sink or facts.has_epilogue_gate)
             ):
+                # Packed Stats use the same measured full/prefix scheduling.
                 primary = SCHED_LPT_IF_FULL
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]

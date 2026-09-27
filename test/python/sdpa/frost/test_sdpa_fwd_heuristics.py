@@ -854,3 +854,45 @@ def test_live_lpt_domain_declines_unsupported_geometry(overrides, admitted):
         plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
         assert SCHED_LPT_IF_FULL in {p.knobs.sched_policy for p in plans}
         assert all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("wants_stats", [False, True])
+@pytest.mark.parametrize(
+    "hq,hkv,sq,skv,b,expected",
+    [
+        (8, 1, 4096, 4096, 1, 3),
+        (16, 2, 2048, 2048, 1, 3),
+        (8, 1, 8192, 8192, 1, 3),
+        (16, 2, 16384, 16384, 1, 3),
+        (8, 1, 2048, 2048, 1, 0),
+        (8, 1, 2048, 16384, 1, 0),
+        (16, 2, 8192, 8192, 2, 0),
+        (4, 1, 8192, 8192, 1, 0),
+    ],
+)
+def test_packed_stats_keep_bounded_full_prefill_preference(wants_stats, hq, hkv, sq, skv, b, expected):
+    """Requesting O/LSE must retain the measured full-prefill scheduling benefit.
+
+    Prefix chunks, mixed batches and unmeasured TP head counts retain NATURAL;
+    the change does not promote every graph that asks for Stats.
+    """
+    facts = _facts(
+        b=b,
+        h_q=hq,
+        h_kv=hkv,
+        d_qk=256,
+        d_v=256,
+        s_q=sq,
+        s_kv=skv,
+        dtype=cudnn.data_type.BFLOAT16,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=128,
+        bottom_right=True,
+        right_bound=0,
+        wants_stats=wants_stats,
+    )
+    plans = recommend("A", facts, {_F16: 20500})
+    assert plans and plans[0].knobs.sched_policy == expected
