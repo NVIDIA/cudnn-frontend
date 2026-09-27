@@ -56,7 +56,8 @@ for its four existing flavors, plus its existing D128 split-KV path. Int64
 strides reach descriptor setup; D256 keeps its optional Amax specialization.
 The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
-Epilogue-gate, block-scaled-output and conversion routes retain tensor execution.
+Epilogue-gate and conversion routes retain tensor execution. Fixed dense D128
+block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
@@ -66,7 +67,7 @@ SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or 
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
-Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
+MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
 and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
