@@ -1629,3 +1629,114 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     finally:
         for graph in captures:
             graph.reset()
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hk", [2, 16])
+@pytest.mark.parametrize("cga", [1, 2])
+def test_d192_thd_policies_capture_strided_value_and_stats(dtype, hk, cga):
+    """MLA dimensions with projection-strided V, mixed live lengths and packed Stats."""
+    b, h, d, dv, qcap, kcap = 3, 16, 192, 128, 1025, 2305
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    torch.manual_seed(731)
+    bufs = dict(
+        q=torch.randn(b * qcap, h, d, device=DEV, dtype=dtype),
+        k=torch.randn(b * kcap, hk, d, device=DEV, dtype=dtype),
+        v=torch.randn(b * kcap, hk, 256, device=DEV, dtype=dtype)[..., 128:],
+        o=torch.empty(b * qcap, h, dv, device=DEV, dtype=dtype),
+        lse=torch.empty(b * qcap, h, device=DEV),
+    )
+    cq = torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap
+    ck = torch.arange(b + 1, device=DEV, dtype=torch.int32) * kcap
+    bufs.update(cu_q=cq, cu_kv=ck)
+    for name in ("q", "k", "v", "o", "lse"):
+        bufs["off_" + name] = (cq if name in ("q", "o", "lse") else ck) * bufs[name].stride(0)
+    g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {name: g.tensor_like(x) for name, x in bufs.items() if name.startswith(("off_", "cu_"))}
+
+    def descriptor(name):
+        x = bufs[name]
+        cap = qcap if name in ("q", "o") else kcap
+        return [b, x.shape[1], cap, x.shape[2]], [cap * x.stride(0), x.stride(1), x.stride(0), x.stride(2)]
+
+    for name in ("q", "k", "v"):
+        dims, strides = descriptor(name)
+        t[name] = g.tensor(dim=dims, stride=strides, data_type=dt).set_ragged_offset(t["off_" + name])
+    t["o"], t["lse"] = g.sdpa(
+        q=t["q"],
+        k=t["k"],
+        v=t["v"],
+        generate_stats=True,
+        attn_scale=1 / math.sqrt(d),
+        use_causal_mask_bottom_right=True,
+        use_padding_mask=True,
+        cu_seq_len_q=t["cu_q"],
+        cu_seq_len_kv=t["cu_kv"],
+        max_total_seq_len_q=b * qcap,
+        max_total_seq_len_kv=b * kcap,
+    )
+    dims, strides = descriptor("o")
+    t["o"].set_output(True).set_dim(dims).set_stride(strides).set_ragged_offset(t["off_o"])
+    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride([qcap * h, 1, h, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    engine, knobs = g.get_engine_and_knobs_at_index(index)
+    graphs, workspaces = [], []
+    for policy in (0, 1, 2):
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy, cudnn.knob_type.TILE_CGA_M: cga})
+        g.build_plan_at_index(g.get_execution_plan_count() - 1)
+        ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+        pack = {t[name]: x for name, x in bufs.items()}
+        g.execute(pack, ws)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g.execute(pack, ws)
+        graphs.append(graph)
+        workspaces.append(ws)
+    try:
+        for ql, kl in (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 2305, 0])):
+            cq = [0, *accumulate(ql)]
+            ck = [0, *accumulate(kl)]
+            bufs["cu_q"].copy_(torch.tensor(cq, device=DEV, dtype=torch.int32))
+            bufs["cu_kv"].copy_(torch.tensor(ck, device=DEV, dtype=torch.int32))
+            for name in ("q", "k", "v", "o", "lse"):
+                prefix = bufs["cu_q"] if name in ("q", "o", "lse") else bufs["cu_kv"]
+                torch.mul(prefix, bufs[name].stride(0), out=bufs["off_" + name])
+            bufs["q"].mul_(-0.5)
+            bufs["k"][ck[-1] :].fill_(float("nan"))
+            bufs["v"][ck[-1] :].fill_(float("nan"))
+            ref_o = torch.zeros(cq[-1], h, dv, device=DEV, dtype=torch.float64)
+            ref_s = torch.full((cq[-1], h), -float("inf"), device=DEV, dtype=torch.float64)
+            for i, (nq, nk) in enumerate(zip(ql, kl)):
+                if not nq or not nk:
+                    continue
+                q = bufs["q"][cq[i] : cq[i + 1]].double().transpose(0, 1)
+                k = bufs["k"][ck[i] : ck[i + 1]].double().transpose(0, 1).repeat_interleave(h // hk, 0)
+                v = bufs["v"][ck[i] : ck[i + 1]].double().transpose(0, 1).repeat_interleave(h // hk, 0)
+                scores = q @ k.transpose(1, 2) / math.sqrt(d)
+                scores.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None] + nk - nq, -float("inf"))
+                ref_o[cq[i] : cq[i + 1]] = (scores.softmax(-1) @ v).transpose(0, 1)
+                ref_s[cq[i] : cq[i + 1]] = scores.logsumexp(-1).T
+            natural = None
+            for graph in graphs:
+                bufs["o"].fill_(float("nan"))
+                bufs["lse"].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
+                torch.testing.assert_close(got_o.float(), ref_o.float(), atol=0.012, rtol=0.012)
+                torch.testing.assert_close(got_s, ref_s.float(), atol=1e-3, rtol=1e-3)
+                assert torch.isnan(bufs["o"][cq[-1] :]).all() and torch.isnan(bufs["lse"][cq[-1] :]).all()
+                if natural is None:
+                    natural = got_o.clone(), got_s.clone()
+                else:
+                    torch.testing.assert_close(got_o, natural[0], atol=0, rtol=0)
+                    torch.testing.assert_close(got_s, natural[1], atol=0, rtol=0)
+    finally:
+        for graph in graphs:
+            graph.reset()

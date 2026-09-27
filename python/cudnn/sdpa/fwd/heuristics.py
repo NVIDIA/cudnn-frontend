@@ -490,10 +490,10 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # A ragged batch walks LIVE units through batch_remap over a
         # machine-sized grid. Only flavors with a THD policy decoder can tune
         # its ordering; the dense rectangular LPT decoder cannot serve it.
-        # D128/D256 half THD implements policy ordering within the live list.
+        # D128/D192/D256 half THD implements policy ordering within the live list.
         # Expose alternatives for tuning and prefer the live-length policy only
         # inside the measured single-sequence full-prefill envelope.
-        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (192, 128), (256, 256)):
             primary = SCHED_NATURAL
             # Measured B200 full-prefill envelopes. Runtime lengths may still
             # become prefix chunks after capture; policy 3 reads them on GPU.
