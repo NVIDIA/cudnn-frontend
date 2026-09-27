@@ -179,6 +179,13 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
+- **Prove artifact reuse across plans.** A stable key does not guarantee that
+  `compile_cached` exported an artifact: its wrapper serializer declines
+  dataclass compile arguments, including `Constexpr` ones. Read an immutable
+  template module's `PARAMS` inside the host instead of passing the same
+  dataclass again. Build a second plan with `cute.compile` forbidden, assert
+  a real cache hit, and check the reloaded artifact's outputs and graph replay;
+  `test_replan_reloads_prepared_artifact` is the SM80 detector.
 - **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
   the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
   plus the plan-time sequence count; the regression tests are

@@ -304,8 +304,19 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     assert eng.check_support()
     eng.compile()
     assert not eng._use_d64
+    workspace = torch.empty(eng.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     eng.execute(
-        q_tensor=qb, k_tensor=kb, v_tensor=vb, o_tensor=ob, do_tensor=dob, stats_tensor=lse, dq_tensor=dq_g, dk_tensor=dk_g, dv_tensor=dv_g, scale_softmax=scale
+        q_tensor=qb,
+        k_tensor=kb,
+        v_tensor=vb,
+        o_tensor=ob,
+        do_tensor=dob,
+        stats_tensor=lse,
+        dq_tensor=dq_g,
+        dk_tensor=dk_g,
+        dv_tensor=dv_g,
+        scale_softmax=scale,
+        workspace=workspace,
     )
     dq_g, dk_g, dv_g = (t.transpose(1, 2) for t in (dq_g, dk_g, dv_g))  # back to BSHD
     dq_d, dk_d, dv_d = d64.backward(q, k, v, do, o, lse, scale=scale)

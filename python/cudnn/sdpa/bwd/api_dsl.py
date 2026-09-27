@@ -1099,7 +1099,7 @@ def _sm80_bwd_call(
         cutlass.Float32(attn_scale),
         cutlass.Int32(right_bound),
         cutlass.Float32(inv_scale),
-        cutlass.Int32(bias_bstride),
+        cutlass.Int64(bias_bstride),
         cutlass.Int32(sem_q_stride),
         cutlass.Int32(grid_kv_tiles),
         cutlass.Int32(grid_batch),
@@ -1133,11 +1133,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     contract permits.
 
     Layouts: any dense layout with the head dim innermost-contiguous is
-    served — non-BSHD-compact operands (dense_flex) gather into carved
-    staging, a strided stats input is READ natively at its declared strides
-    (``Capabilities.strided_stats``; no gather), and head dims inside a
-    flavor envelope pad host-side into the same carved buffers (issue #514:
-    with a workspace provided, execute allocates nothing).
+    served. Native flavor widths with vector-aligned outer strides compile
+    a pointer chain that reads/writes each declared layout directly. Other
+    dense layouts and widths retain carved staging; strided Stats are read
+    natively in both paths. Prepared execute requires caller workspace, which
+    the graph and convenience wrapper provide outside the launch path.
     """
 
     def __init__(
@@ -1183,6 +1183,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self.right_bound_runtime: int = 0
         self._lse_stride: "Optional[tuple[int, int, int]]" = None
         self._dummy_cache: dict = {}
+        self._prepared = None
+        self._native_dense = False
         # THD (packed) plan-time state: token capacities the views bind at,
         # the Stats packing, and the compiled lengths -> cu_seqlens setup launch.
         self._t_q_cap: int = 0
@@ -1444,6 +1446,34 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
 
+        # Preserve the established d64 selection rule. Strided Stats and THD
+        # continue to use the generic chain; prepared compilation changes
+        # launch plumbing, not the kernel-selection policy.
+        self._use_d64 = _sm80_d64_fast_path_eligible(
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+            h_q=self.h_q,
+            h_kv=self.h_kv,
+            s_q=self.s_q_max,
+            s_kv=self.s_k_max,
+            mask_token=self.mask_token,
+            right_bound=int(self.right_bound_runtime),
+            causal_bottom_right=self.causal_bottom_right,
+            bw_kwargs=dict(
+                seq_kv_lens=object() if self.seq_kv_lens_present else None,
+                seq_len_q=object() if self.seq_q_lens_present else None,
+                bias=object() if self._has_bias else None,
+                sinks=object() if self.sink_desc is not None else None,
+                rope_freqs=object() if self._has_rope else None,
+                deterministic=self.deterministic,
+            ),
+        )
+        if self._lse_stride is not None or self.thd:
+            self._use_d64 = False  # preserve the dense, packed-Stats selection boundary
+        from .prepared_sm80 import native_layouts
+
+        self._native_dense = native_layouts(self)
+
         self._is_supported = True
         self._logger.debug("check_support completed")
         return True
@@ -1453,9 +1483,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         """Plan-time JIT: build the TemplateParams from the plan facts, load
         the specialized module via ``frost.template_loader`` (same seam as the
         SM120 adapter), and compile the full kernel chain for this shape.
-        The dedicated plain-dense d=64 fast path keeps its self-caching module
-        (dense-only — issue #604 concerns the THD extents, which never route
-        there); its JIT happens on the first execute."""
+        Native dense plans compile the entire pointer chain here, including
+        the dedicated d=64 main kernel and its unpermute epilogue. Retained
+        staging layouts use the existing tensor compiler."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
@@ -1494,31 +1524,13 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 bool(self.s_q_max % self._params.tile_q or self.s_k_max % self._params.tile_kv),
                 "SM80 bprop: RoPE requires S_q/S_kv tile-aligned",
             )
-        # d64 fast-path gate: every input is plan-time state now.  The
-        # dedicated kernel keeps legacy PACKED LSE reads, so a strided Stats
-        # declaration routes to the generic (stride-aware) module instead.
-        self._use_d64 = _sm80_d64_fast_path_eligible(
-            d_qk=self.head_dim_qk,
-            d_v=self.head_dim_v,
-            h_q=self.h_q,
-            h_kv=self.h_kv,
-            s_q=self.s_q_max,
-            s_kv=self.s_k_max,
-            mask_token=self.mask_token,
-            right_bound=int(self.right_bound_runtime),
-            causal_bottom_right=self.causal_bottom_right,
-            bw_kwargs=dict(
-                seq_kv_lens=object() if self.seq_kv_lens_present else None,
-                seq_len_q=object() if self.seq_q_lens_present else None,
-                bias=object() if self._has_bias else None,
-                sinks=object() if self.sink_desc is not None else None,
-                rope_freqs=object() if self._has_rope else None,
-                deterministic=self.deterministic,
-            ),
-        )
-        if self._lse_stride is not None or self.thd:
-            self._use_d64 = False  # the d64 kernel is dense-only with packed LSE reads
-        if self._use_d64:
+        if self._native_dense:
+            from .prepared_sm80 import build_spec
+
+            self._kmod = _load_sm80_bwd_module(self._params)
+            self._prepared = build_spec(self, _sm80_bwd_kernel_mod("d64") if self._use_d64 else None)
+            self._compiled_kernel = self._prepared.artifact
+        elif self._use_d64:
             self._kmod = None
             self._compiled_kernel = True  # d64 self-caches on first execute
         elif self.thd:
@@ -1605,6 +1617,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         kernel's set covers the d64 fast path's). All plan-time state — no
         arguments."""
         self._ensure_support_checked()
+        if self._native_dense:
+            from .kernels.sm80.prepared_host import workspace_regions
+
+            return workspace_regions(self)[1]
         if self.thd:
             return self._thd_scratch_bytes()
         from .kernels.sm80 import bprop_f16 as _kmod
@@ -1719,6 +1735,34 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         if not self.thd:
             self._value_error_if(self.seq_kv_lens_present != (seq_kv_lens is not None), "seq_kv_lens presence must match the plan")
             self._value_error_if(self.seq_q_lens_present != (seq_q_lens is not None), "seq_q_lens presence must match the plan")
+
+        if self._prepared is not None:
+            from .prepared_sm80 import execute_tensors
+
+            execute_tensors(
+                self,
+                (
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    do_tensor,
+                    stats_tensor,
+                    dq_tensor,
+                    dk_tensor,
+                    dv_tensor,
+                    seq_q_lens,
+                    seq_kv_lens,
+                    sink_tensor,
+                    dsink_tensor,
+                    bias_tensor,
+                    dbias_tensor,
+                ),
+                workspace,
+                current_stream,
+                scale_softmax,
+            )
+            return
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         device = q_tensor.device
@@ -2237,12 +2281,13 @@ def sdpa_bwd_wrapper_sm80(
     # contiguous (B, S, H, D) then transpose to a (B, H, S, D) view.
     b, h_q, s_q, d_qk = q_tensor.shape
     d_v = v_tensor.shape[-1]
-    dq = torch.empty((b, s_q, h_q, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
-    h_kv, s_kv = k_tensor.shape[1], k_tensor.shape[2]
-    dk = torch.empty((b, s_kv, h_kv, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
-    dv = torch.empty((b, s_kv, h_kv, d_v), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
-    dbias = torch.zeros_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
-    dsink = torch.zeros(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
+    with _torch_stream_context(current_stream, q_tensor.device):
+        dq = torch.empty((b, s_q, h_q, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
+        h_kv, s_kv = k_tensor.shape[1], k_tensor.shape[2]
+        dk = torch.empty((b, s_kv, h_kv, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
+        dv = torch.empty((b, s_kv, h_kv, d_v), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
+        dbias = torch.zeros_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
+        dsink = torch.zeros(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
 
     cache_key = (
         q_tensor.shape,
@@ -2251,6 +2296,10 @@ def sdpa_bwd_wrapper_sm80(
         q_tensor.stride(),
         k_tensor.stride(),
         v_tensor.stride(),
+        o_tensor.shape,
+        o_tensor.stride(),
+        do_tensor.shape,
+        do_tensor.stride(),
         # The compiled kernel is SPECIALIZED on the declared LSE layout
         # (compile()'s lse_stride — native strided reads), so the Stats
         # geometry is part of the plan identity, not just runtime data.
@@ -2266,7 +2315,8 @@ def sdpa_bwd_wrapper_sm80(
         seq_len_q is not None,
         bias_tensor is not None,
         (bias_tensor.dtype if bias_tensor is not None else None),
-        (bias_tensor.shape[0] if bias_tensor is not None else None),
+        (tuple(bias_tensor.shape) if bias_tensor is not None else None),
+        (tuple(bias_tensor.stride()) if bias_tensor is not None else None),
         sinks is not None,
         rope_freqs is not None,
         (int(rope_freqs.shape[0]) if rope_freqs is not None else 0),
@@ -2288,6 +2338,8 @@ def sdpa_bwd_wrapper_sm80(
             sample_dv=dv,
             sample_sink=sinks,
             sample_dsink=dsink,
+            sample_bias=bias_tensor,
+            sample_dbias=dbias,
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=(None if wl is None or wl < 0 else int(wl)),
@@ -2306,6 +2358,9 @@ def sdpa_bwd_wrapper_sm80(
         sdpa_bwd.compile()
         _sm80_bwd_cache[cache_key] = sdpa_bwd
 
+    with _torch_stream_context(current_stream, q_tensor.device):
+        workspace = torch.empty(sdpa_bwd.scratch_workspace_bytes(), dtype=torch.uint8, device=q_tensor.device)
+
     sdpa_bwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -2320,6 +2375,7 @@ def sdpa_bwd_wrapper_sm80(
         dsink_tensor=dsink,
         scale_softmax=scale_softmax,
         current_stream=current_stream,
+        workspace=workspace,
         seq_kv_lens=seq_kv_lens,
         seq_q_lens=seq_len_q,
         sink_tensor=sinks,
