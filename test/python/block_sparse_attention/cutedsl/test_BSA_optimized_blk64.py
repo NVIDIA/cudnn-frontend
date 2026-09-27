@@ -10,7 +10,7 @@ import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
 
-pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 def _bsa():
@@ -21,6 +21,7 @@ def _bsa():
     return BSA
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("num_q_blocks,expected", [(2999, None), (3000, 4096), (4096, 4096), (4097, 4096), (8192, 4096)])
 def test_large_bucket_policy(num_q_blocks, expected):
     from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import sm100_bwd_auto_bucketed_k2q_size_blocks
@@ -28,6 +29,7 @@ def test_large_bucket_policy(num_q_blocks, expected):
     assert sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks) == expected
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("misalignment", ["stride", "address", "aligned_stride"])
 @pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
 @pytest.mark.parametrize("splits", [1, 2])
@@ -53,6 +55,7 @@ def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
     torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
 @pytest.mark.parametrize("seqlen", [193, 1089])
 def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
@@ -83,6 +86,7 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
     torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
@@ -121,8 +125,9 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
         assert current_sizes == cache_sizes
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
-@pytest.mark.parametrize("sq,sk", [(193, 129), (320, 1088), (513, 1025)])
+@pytest.mark.parametrize("sq,sk", [(193, 129), (248, 2177), (320, 1088), (513, 1025)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
     bsa = _bsa()
@@ -176,17 +181,19 @@ def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable):
             torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("duplicates", [False, True])
-def test_paired_multiset_and_graph_replay(monkeypatch, duplicates):
+@pytest.mark.parametrize("kv_blocks", [17, 35])
+def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
     bsa = _bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
     torch.manual_seed(27123)
     torch.backends.cuda.matmul.allow_tf32 = False
     q = torch.randn((1, 2, 320, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((1, 2, 1088, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, kv_blocks * 64, 128), device="cuda", dtype=torch.bfloat16)
     v, do = torch.randn_like(k), torch.randn_like(q)
-    indices = torch.tensor([0, 2, 8, 16], device="cuda", dtype=torch.int32).view(1, 1, 1, 4).expand(1, 2, 5, 4).contiguous()
+    indices = torch.tensor([0, 2, 8, kv_blocks - 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 4).expand(1, 2, 5, 4).contiguous()
     counts = torch.full((1, 2, 5), 4, device="cuda", dtype=torch.int32)
     if duplicates:
         indices[:, :, 1, 1] = indices[:, :, 1, 0]
@@ -199,7 +206,7 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates):
 
     eager = step()
     # Duplicate slots contribute repeatedly; a boolean mask would hide a lost edge.
-    multiplicity = torch.zeros((1, 2, 320, 1088), device="cuda", dtype=torch.float32)
+    multiplicity = torch.zeros((1, 2, 320, kv_blocks * 64), device="cuda", dtype=torch.float32)
     for h in range(2):
         for row in range(5):
             for block in indices[0, h, row].tolist():
@@ -217,15 +224,19 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates):
     finally:
         torch.cuda.set_sync_debug_mode("default")
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = step()
-    q.mul_(0.8)
-    counts.fill_(2)
-    graph.replay()
-    for got, expected in zip(captured, step()):
-        torch.testing.assert_close(got, expected, atol=0.03, rtol=0.03)
+    try:
+        with torch.cuda.graph(graph):
+            captured = step()
+        q.mul_(0.8)
+        counts.fill_(2)
+        graph.replay()
+        for got, expected in zip(captured, step()):
+            torch.testing.assert_close(got, expected, atol=0.03, rtol=0.03)
+    finally:
+        graph.reset()
 
 
+@pytest.mark.L1
 def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
     bsa = _bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
