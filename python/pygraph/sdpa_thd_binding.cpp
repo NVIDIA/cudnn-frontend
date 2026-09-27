@@ -128,19 +128,17 @@ enum HostSlot : size_t {
     NumPages,
     NumHostSlots
 };
-constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
-                                                                    "v_ptr",           "o_ptr",
-                                                                    "q_strides",       "k_strides",
-                                                                    "v_strides",       "o_strides",
-                                                                    "thd_q_lens_ptr",  "thd_kv_lens_ptr",
-                                                                    "lse_ptr",         "lse_ext",
-                                                                    "problem_size",    "sinks_ptr",
-                                                                    "meta_ptr",        "o_desc_ptr",
-                                                                    "stream",          "scale_softmax_log2",
-                                                                    "n_thd_units", "block_table_ptr", "block_table_v_ptr",
-                                                                    "table_strides",   "n_pages"};
-constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
-constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {
+    "q_ptr",           "k_ptr",           "v_ptr",
+    "o_ptr",           "q_strides",       "k_strides",
+    "v_strides",       "o_strides",       "thd_q_lens_ptr",
+    "thd_kv_lens_ptr", "lse_ptr",         "lse_ext",
+    "problem_size",    "sinks_ptr",       "meta_ptr",
+    "o_desc_ptr",      "stream",          "scale_softmax_log2",
+    "n_thd_units",     "block_table_ptr", "block_table_v_ptr",
+    "table_strides",   "n_pages"};
+constexpr std::array<HostSlot, 4> pointer_slots = {QPtr, KPtr, VPtr, OPtr};
+constexpr std::array<HostSlot, 4> stride_slots  = {QStrides, KStrides, VStrides, OStrides};
 
 class SdpaThdBinder {
    public:
