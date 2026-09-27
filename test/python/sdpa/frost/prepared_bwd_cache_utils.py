@@ -21,7 +21,7 @@ import cutlass.cute as cute
 from cudnn.frost import compiled_cache
 tests, package, arch, route, dtype, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
-sys.path.insert(0, tests)
+sys.path[:0] = [tests, str(Path(tests).parents[1])]
 if reload == "1":
     def forbidden(*a, **kw):
         raise AssertionError("prepared backward plan invoked JIT in the second process")
@@ -99,6 +99,7 @@ print(json.dumps(compiled_cache.stats()))
         result = subprocess.run(
             [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, arch, route, dtype, str(reload)],
             env=env,
+            cwd=cache_dir,
             capture_output=True,
             text=True,
             timeout=300,

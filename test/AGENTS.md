@@ -127,6 +127,10 @@ module's `__file__` after conftest setup, not only `cudnn.__file__`.
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
 the selected package/source setup into each child and verify its loaded path.
+Children that import test helpers need both the helper directory and
+`test/python` on their own `sys.path`; pytest's parent-process path setup is
+not inherited. Run fresh-process cache probes from their temporary directory
+so launching pytest from `test/python` cannot hide missing child imports.
 
 ### Pending-consumer lifetime probes
 
