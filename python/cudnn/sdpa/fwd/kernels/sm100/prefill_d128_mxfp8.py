@@ -2856,7 +2856,7 @@ def _host(
     o_tensor: cute.Tensor,
     sf_q_tensor: cute.Tensor,
     sf_k_tensor: cute.Tensor,
-    sf_v_tensor: cute.Tensor,
+    sf_v_tensor: Optional[cute.Tensor],
     lse_tensor: Optional[cute.Tensor],
     amax_o_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
@@ -3000,7 +3000,12 @@ def _host(
 
     tma_q_sf_desc = _build_sf_desc(sf_q_tensor, _q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
     tma_k_sf_desc = _build_sf_desc(sf_k_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K // CFG.CTA_MMA, KH)
-    tma_v_sf_desc = _build_sf_desc(sf_v_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_V, SF_NUM_ROWS_V // CFG.CTA_MMA, KH)
+    # The BF16 PV specialization never issues an SF_V transaction. Reuse a
+    # valid descriptor for the dead kernel slot; no dummy buffer is needed.
+    if cutlass.const_expr(CFG.PV_BF16):
+        tma_v_sf_desc = tma_k_sf_desc
+    else:
+        tma_v_sf_desc = _build_sf_desc(sf_v_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_V, SF_NUM_ROWS_V // CFG.CTA_MMA, KH)
 
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
     q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster
@@ -3145,8 +3150,10 @@ def compile(  # noqa: A001
         cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K), stride_order=(3, 2, 1, 0), assumed_align=16
     )
 
-    fake_sf_v = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V), stride_order=(3, 2, 1, 0), assumed_align=16
+    fake_sf_v = (
+        None
+        if CFG.PV_BF16
+        else cute.runtime.make_fake_compact_tensor(cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V), stride_order=(3, 2, 1, 0), assumed_align=16)
     )
 
     if not has_lse:
@@ -3162,7 +3169,9 @@ def compile(  # noqa: A001
             else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_lse_batch, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
         )
 
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+    fake_amax_o = (
+        None if CFG.PV_BF16 and not CFG.EMIT_AMAX_O else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+    )
 
     fake_seq_q_lens = cutlass.Int64(0)
 
@@ -3242,8 +3251,6 @@ def compile_prepared(
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
 
-    if getattr(CFG, "PV_BF16", False):
-        raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
     if bool(getattr(CFG, "O_BLOCK_SCALE", 0)) != (sfo_geometry is not None):
         raise ValueError("prepared block-output geometry must match the specialization")
     if sfo_geometry is not None and (CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA):

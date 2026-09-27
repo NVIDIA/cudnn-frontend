@@ -3057,7 +3057,7 @@ def compile_prepared(
 
     if CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA:
         raise NotImplementedError("prepared SM107 MXFP8 serves existing dense unsplit, unpacked plans")
-    if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False) or getattr(CFG, "EPILOGUE_GATE", 0):
+    if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False):
         raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
         raise ValueError("prepared MXFP8 keeps the native head-dimension contract")

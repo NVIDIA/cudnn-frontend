@@ -41,11 +41,13 @@ def _launch(
     o_partial_ptr: Optional[cute.Pointer],
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
-    sf_v_ptr: cute.Pointer,
+    sf_v_ptr: Optional[cute.Pointer],
     sf_tiles: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     amax_o_ptr: cute.Pointer,
     sf_o_ptr: Optional[cute.Pointer],
     scale_o_ptr: Optional[cute.Pointer],
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     kernel_host: cutlass.Constexpr,
     config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
@@ -59,7 +61,7 @@ def _launch(
     sfo_geometry: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    thd, split_kv, o_block_scale = config
+    thd, split_kv, o_block_scale, epilogue_gate, pv_bf16 = config
     operands = sdpa_operand_tensors(
         q_ptr,
         k_ptr,
@@ -105,11 +107,14 @@ def _launch(
 
     sf_q = scale_tensor(sf_q_ptr, qh, sf_tiles[0], sf_smem_sizes[0])
     sf_k = scale_tensor(sf_k_ptr, kh, sf_tiles[1], sf_smem_sizes[1])
-    sf_v = scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
+    sf_v = None if cutlass.const_expr(pv_bf16) else scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
     amax = None if cutlass.const_expr(optional_amax and not has_amax) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict()
+    if cutlass.const_expr(epilogue_gate):
+        _, _, _, sq, _, _ = problem_size
+        kwargs.update(gate_tensor=cute.make_tensor(gate_ptr, cute.make_layout((b, sq, qh, d_v), stride=(*gate_strides, 1))))
     if cutlass.const_expr(sfo_geometry is not None):
         kwargs.update(
             sf_o_tensor=cute.make_tensor(sf_o_ptr, cute.make_layout((1,), stride=(1,))),
@@ -177,11 +182,13 @@ def host(
     o_partial_ptr: Optional[cute.Pointer],
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
-    sf_v_ptr: cute.Pointer,
+    sf_v_ptr: Optional[cute.Pointer],
     sf_tiles: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     amax_o_ptr: cute.Pointer,
     sf_o_ptr: Optional[cute.Pointer],
     scale_o_ptr: Optional[cute.Pointer],
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     kernel_host: cutlass.Constexpr,
     config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
@@ -227,6 +234,8 @@ def host(
         amax_o_ptr,
         sf_o_ptr,
         scale_o_ptr,
+        gate_ptr,
+        gate_strides,
         kernel_host,
         config,
         sf_smem_sizes,
@@ -290,7 +299,7 @@ def compile_host(
         host,
         pointer(storage_dtype),
         pointer(storage_dtype),
-        pointer(storage_dtype),
+        pointer(cutlass.BFloat16 if getattr(cfg, "PV_BF16", False) else storage_dtype),
         pointer(cutlass.Float32 if fp32_partial else output_dtype),
         pointer(cutlass.Float32, 4) if has_lse else None,
         pointer(cutlass.Float32),
@@ -312,13 +321,21 @@ def compile_host(
         pointer(cutlass.Float32) if fp32_partial else None,
         pointer(cutlass.Int8),
         pointer(cutlass.Int8),
-        pointer(cutlass.Int8),
+        None if getattr(cfg, "PV_BF16", False) else pointer(cutlass.Int8),
         (i32, i32, i32),
         pointer(cutlass.Float32, 4),
         pointer(cutlass.Int8) if sfo_geometry is not None else None,
         pointer(cutlass.Float32, 4) if has_scale_o else None,
+        pointer(cutlass.BFloat16) if getattr(cfg, "EPILOGUE_GATE", False) else None,
+        strides,
         kernel_host,
-        (bool(cfg.THD_VARLEN), int(cfg.SPLIT_KV), int(getattr(cfg, "O_BLOCK_SCALE", 0))),
+        (
+            bool(cfg.THD_VARLEN),
+            int(cfg.SPLIT_KV),
+            int(getattr(cfg, "O_BLOCK_SCALE", 0)),
+            bool(getattr(cfg, "EPILOGUE_GATE", False)),
+            bool(getattr(cfg, "PV_BF16", False)),
+        ),
         sf_smem_sizes,
         d_qk,
         d_v,

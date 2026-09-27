@@ -1352,3 +1352,15 @@ class TestPreparedBlockOutput:
     test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)
     test_graph_adapter_parity = staticmethod(_prepared_block_output_checks.test_block_scaled_graph_and_adapter_bind_same_frame)
     test_scale_presence = staticmethod(_prepared_block_output_checks.test_block_scaled_mxfp8_scale_presence_matches_compilation)
+
+
+import test_sdpa_prepared_quantized_gate as _prepared_quantized_gate_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific quantized-gate CI entry")
+class TestPreparedQuantizedGate:
+    from test_sdpa_prepared_quantized_artifact_cache import test_quantized_variant_artifact_reloads_in_fresh_process as _cache_reload
+
+    test_artifact_reload = staticmethod(_cache_reload)
+    test_rebind_and_replay = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_prepared_rebind_and_replay)
+    test_batch_override = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_bounded_batch_override)

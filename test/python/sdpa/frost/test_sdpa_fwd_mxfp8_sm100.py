@@ -542,9 +542,10 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api.check_support()
     api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     with pytest.raises(ValueError, match="without Amax_O"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, workspace=workspace)
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
@@ -565,7 +566,8 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api_amax.check_support()
     api_amax.compile()
-    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
+    workspace_amax = torch.empty(api_amax.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o, workspace=workspace_amax)
     torch.cuda.synchronize()
     torch.testing.assert_close(
         amax_o,
@@ -2465,3 +2467,13 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
     assert (
         err.max().item() <= 1e-4
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"
+
+
+# Explicit architecture CI entry; wide physical-stride probes remain opt-in L1.
+import test_sdpa_prepared_pv_bf16 as _prepared_pv_bf16_checks
+
+
+class TestPreparedPvBf16:
+    test_rebind_and_replay = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_prepared_rebind_and_replay)
+    test_retained_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_retained_conversion_omits_dead_operands)
+    test_explicit_no_amax = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_no_amax_flag_with_sample_descriptor)

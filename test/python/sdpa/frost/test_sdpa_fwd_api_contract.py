@@ -62,12 +62,13 @@ def test_d192_hybrid_elides_pv_scale_factor_storage_and_transactions():
 
 
 @pytest.mark.L0
-def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
-    """Hybrid execution must not materialize a sliced SF tensor per launch."""
+def test_hybrid_execute_elides_v_scale_factor_dummy():
+    """Hybrid execution specializes away the unused V scale-factor operand."""
     source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
 
     assert "sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous()" not in source
-    assert 'f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}"' in source
+    assert "pv_bf16_sf_v_" not in source
+    assert "sf_v_v = None if self.pv_bf16" in source
 
 
 @pytest.mark.L0

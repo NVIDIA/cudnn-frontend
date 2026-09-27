@@ -77,10 +77,8 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
     if t is None:
         return None
     shape, strides = tuple(t.shape), tuple(t.stride())
-    n = 1
-    for e in shape:
-        n *= int(e)
-    span = n if (n == 0 or t.is_contiguous()) else 1 + sum((int(s) - 1) * int(st) for s, st in zip(shape, strides))
+    n = int(t.numel())
+    span = n if (n == 0 or t.is_contiguous()) else int(1 + sum((s - 1) * st for s, st in zip(shape, strides)))
     dev = t.device
     device = (_DLPACK_CUDA, int(dev.index if dev.index is not None else 0)) if dev.type == "cuda" else (_DLPACK_CPU, 0)  # a known CPU tensor is not "unknown"
     return BufferFacts(t.data_ptr(), str(t.dtype).split(".")[-1], device, span, shape, strides)
@@ -125,12 +123,12 @@ def _quant_spec(api):
     sizes = ()
     if getattr(api, "_prepared_mxfp8", False):
         km = api._k_mod
-        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K, km.SF_SMEM_SIZE_V)
+        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
     return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 
 def _quant_roles(quant):
-    roles = ("sf_q", "sf_k", "sf_v", "amax_o") if quant.sf_sizes else _QUANT_ROLES
+    roles = (("sf_q", "sf_k", "sf_v")[: len(quant.sf_sizes)] + ("amax_o",)) if quant.sf_sizes else _QUANT_ROLES
     if quant.block_output is not None:
         roles += ("sf_o",) + (("scale_o",) if quant.sf_sizes else ())
     return roles
@@ -222,7 +220,12 @@ def _bind_mxfp8_scales(spec, facts):
             raise ValueError(f"cudnn.sdpa: {name} tile count exceeds Int32")
         patches[name + "_ptr"] = f.ptr if nbytes else 0
         tiles.append(max(1, count))
-    if tiles[1] != tiles[2]:
+    if len(tiles) == 2:
+        if facts.get("sf_v") is not None:
+            raise ValueError("cudnn.sdpa: PV-BF16 does not consume sf_v")
+        patches["sf_v_ptr"] = None
+        tiles.append(0)
+    elif tiles[1] != tiles[2]:
         raise ValueError("cudnn.sdpa: sf_k and sf_v must have the same packed tile count")
     patches["sf_tiles"] = tuple(tiles)
     return patches
