@@ -203,3 +203,8 @@ target availability explicitly when testing a synthetic Rubin capability row;
 do not require the worker's DSL wheel to expose `sm_107a`. Keep real installed
 compiler-target decline tests separate, and retain the live target check for
 actual SM107 kernel execution. The release-DSL SM80 lane exposed this split.
+
+A capability row's `sm_lo` names its lower bound, not the actual device.
+Prepared admission must respect the adapter's exact device support even when
+the row spans later compute capabilities. Include future-cc rejection controls
+alongside the supported device in `test_prepared_fp8_override_capability_envelope`.

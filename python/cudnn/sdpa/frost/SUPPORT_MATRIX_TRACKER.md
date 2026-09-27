@@ -47,9 +47,11 @@ KV-tail masking and bounded runtime geometry. Split partials retain the input
 half dtype; final Stats conversion runs in the common combine. Split plans keep
 the declared batch and Q length, while KV may shrink within its envelope. THD lengths and
 metadata stay on device, including mixed length forms and padded Stats.
-SM107 per-tensor FP8 also uses prepared dense and native-shape THD launches
+SM107 per-tensor FP8 at exact device cc 10.7 also uses prepared dense and native-shape THD launches
 for its four existing flavors, plus its existing D128 split-KV path. Int64
 strides reach descriptor setup; D256 keeps its optional Amax specialization.
+The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
+the standalone adapter does not support those devices.
 Epilogue-gate, block-scaled-output and conversion routes retain tensor execution.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD

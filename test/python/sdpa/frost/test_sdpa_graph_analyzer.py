@@ -232,7 +232,7 @@ def test_prepared_override_capability_declines_legacy_features(feature):
 
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
-@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107"])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107", "sm108", "sm119"])
 @pytest.mark.parametrize("arch", ["sm100", "sm120"])
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, arch):
@@ -252,9 +252,11 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
         split={},
         block_scaled_output=dict(o_block_scale=32),
         gate=dict(has_epilogue_gate=True),
-        sm107={},
+        sm107=dict(device_cc=(10, 7)),
+        sm108=dict(device_cc=(10, 8)),
+        sm119=dict(device_cc=(11, 9)),
     )[feature]
-    if feature == "sm107":
+    if feature in ("sm107", "sm108", "sm119"):
         caps = replace(caps, sm_lo=107, sm_hi=119)
     if feature == "paged":
         table = graph.tensor(dim=(B, 1, 8, 1), stride=(8, 8, 1, 1), data_type=cudnn.data_type.INT32)
