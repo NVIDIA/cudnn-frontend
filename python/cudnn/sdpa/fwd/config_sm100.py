@@ -39,6 +39,7 @@ from cudnn.frost.tile_dsl.constants import (
     MASK_SWA,
     SCHED_LPT,
     SCHED_LPT_L2,
+    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 
@@ -219,6 +220,11 @@ _SPLIT_KV_FLAVORS = frozenset({"d128", "d192", "d256", "d512"})
 _CTA_MMA_FLAVORS = frozenset({"d128", "d192"})
 
 
+def supports_live_lpt(d_shape, *, fp8, thd, paged, bottom_right, window_left, window_right):
+    """Geometry contract for the live-length THD policy; callers gate the device."""
+    return d_shape == (256, 256) and not fp8 and thd and paged and bottom_right and window_left is None and window_right == 0
+
+
 def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
@@ -255,8 +261,18 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
-    if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
-        raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
+    if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL):
+        raise ValueError(f"{flavor}: sched_policy must be NATURAL (0), LPT (1), LPT_L2 (2), or LPT_IF_FULL (3); got {k.sched_policy}")
+    if k.sched_policy == SCHED_LPT_IF_FULL and not supports_live_lpt(
+        (256, 256) if flavor == "d256" else None,
+        fp8=fp8,
+        thd=k.thd_varlen,
+        paged=k.paged_kv,
+        bottom_right=k.bottom_right,
+        window_left=k.window_left,
+        window_right=k.window_right,
+    ):
+        raise ValueError("SCHED_LPT_IF_FULL requires half D256 paged THD bottom-right causal attention without a left window")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
     if k.decode_q_tile:

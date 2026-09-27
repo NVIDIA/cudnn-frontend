@@ -11,6 +11,8 @@ MASK_SWA = 1 << 2
 SCHED_NATURAL = 0
 SCHED_LPT = 1
 SCHED_LPT_L2 = 2
+# THD: choose LPT per sequence only when its live Q and KV lengths match.
+SCHED_LPT_IF_FULL = 3
 
 DTYPE_E4M3 = 0
 DTYPE_E5M2 = 1

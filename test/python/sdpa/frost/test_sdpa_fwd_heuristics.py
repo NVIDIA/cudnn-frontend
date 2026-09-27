@@ -816,3 +816,41 @@ def test_quantized_thd_does_not_offer_half_worklist_policies(quant):
     facts = _facts(thd=True, padded=True, s_q=2048, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, **{"is_" + quant: True})
     plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
     assert plans and all(p.knobs.sched_policy == 0 for p in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "overrides, admitted",
+    [
+        ({}, True),
+        ({"d_qk": 200, "d_v": 200}, True),
+        ({"dtype": cudnn.data_type.BFLOAT16}, True),
+        ({"device_cc": (10, 3)}, False),
+        ({"device_cc": (10, 7)}, False),
+        ({"device_cc": (12, 0)}, False),
+        ({"d_qk": 128, "d_v": 128}, False),
+        ({"thd": False}, False),
+        ({"has_paged_kv": False}, False),
+        ({"bottom_right": False}, False),
+        ({"window_left": 128}, False),
+        ({"causal": False}, False),
+        ({"right_bound": 3, "right_band_widening": True}, False),
+        ({"is_fp8": True}, False),
+        ({"is_mxfp8": True}, False),
+    ],
+)
+def test_live_lpt_domain_declines_unsupported_geometry(overrides, admitted):
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_IF_FULL
+
+    values = dict(
+        d_qk=256, d_v=256, h_q=8, h_kv=1, s_q=4096, s_kv=8192, thd=True, padded=True, has_paged_kv=True, page_size=128, bottom_right=True, right_bound=0
+    )
+    values.update(overrides)
+    facts = _facts(**values)
+    caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == _F16)
+    domain = engines.effective_sched_policies(caps, facts)
+    assert (SCHED_LPT_IF_FULL in domain) == admitted
+    if admitted:
+        plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+        assert SCHED_LPT_IF_FULL in {p.knobs.sched_policy for p in plans}
+        assert all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)

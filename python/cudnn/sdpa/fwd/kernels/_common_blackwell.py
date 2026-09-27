@@ -9,6 +9,7 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
+from cudnn.frost.tile_dsl.constants import SCHED_LPT_IF_FULL
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT,
     SCHED_LPT_L2,
@@ -856,6 +857,15 @@ def make_sdpa_helpers(
                 if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
                     head = local % n_qh
                     row = cb - cutlass.Int32(1) - local // n_qh
+                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_IF_FULL):
+                    # Full causal prefill has a triangular tile cost. Prefix
+                    # chunks retain NATURAL's head locality. Both lengths are
+                    # live GPU metadata, including after graph capture.
+                    full = s_i == cutlass.Int32(cu[b])
+                    lpt_head = local % n_qh
+                    lpt_row = cb - cutlass.Int32(1) - local // n_qh
+                    head = cutlass.Int32(arith.select(full.ir_value(), lpt_head.ir_value(), head.ir_value()))
+                    row = cutlass.Int32(arith.select(full.ir_value(), lpt_row.ir_value(), row.ir_value()))
                 elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
                     group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
                     head = (local // (cb_nz * group)) * group + local % group
