@@ -2398,6 +2398,7 @@ def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
         paged_table_stride=(8, 1),
         paged_table_v_stride=v_stride,
     )
+    api._prepared_operand_layout = lambda desc: SdpaFwdDslSm100._prepared_operand_layout(api, desc)
     assert SdpaFwdDslSm100._can_prepare_fp8(api) == (v_stride == (8, 1))
 
 

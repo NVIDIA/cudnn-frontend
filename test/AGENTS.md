@@ -258,3 +258,17 @@ memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
 SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
+
+Prepared host migrations must preserve persistent compiled artifacts as well as
+warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
+artifact export even though its runtime slots disappear. Carry only the immutable
+primitive configuration facts the host needs, or read the template module's
+configuration internally. `test_block_output_artifact_reloads_in_fresh_process`
+builds in one process, forbids JIT in another, and checks O/SF/Stats/Amax after
+execution and poisoned-output CUDA Graph replay. A same-process cache hit alone
+does not establish cross-process reuse.
+
+Compute `template_key(globals(), locals(), ...)` before local imports or other
+local assignments. Including a helper function in `locals()` makes the key
+uncacheable even when the graph's specialization is fully static; all eight
+SM100/SM107 MXFP8 prepared entries must obey this ordering.
