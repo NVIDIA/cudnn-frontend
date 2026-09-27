@@ -3,16 +3,17 @@
 """SM80 declarations for the shared immutable backward pointer binder."""
 
 import math
+from functools import partial
 
 from cudnn.frost.compiled_cache import positional_entry, template_key
 from .prepared import BwdLaunchSpec, Operand, ROLES, execute
 
 
 def native_layouts(api):
-    """Select native vector-aligned dense operands with complete declarations."""
+    """Select native vector-aligned operands with complete declarations."""
     from cudnn.sdpa.graph_analyzer import dense_layout_ok
 
-    if api.thd or api._has_rope or (api.head_dim_qk, api.head_dim_v) != (api.flavor_d_qk, api.flavor_d_v):
+    if api._has_rope or (api.head_dim_qk, api.head_dim_v) != (api.flavor_d_qk, api.flavor_d_v):
         return False
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
@@ -35,8 +36,8 @@ def native_layouts(api):
 
 
 def build_spec(api, d64_module):
-    """Compile the complete chain against fixed geometry and workspace offsets."""
-    from .kernels.sm80.prepared_host import compile_host
+    """Compile the chain with plan-time strides and dynamic packed capacities."""
+    from .kernels.sm80.prepared_host import compile_host, launch_bounds
 
     for role in ROLES:
         if role in ("seq_q", "seq_kv"):
@@ -60,14 +61,26 @@ def build_spec(api, d64_module):
     operands, geometry = [], []
     for role in ROLES:
         if role in ("seq_q", "seq_kv"):
-            enabled = getattr(api, role + "_lens_present")
-            op = Operand("int32", (api.batch_size,), (1,), api.batch_size, 4, 4) if enabled else None
+            enabled = api.thd or getattr(api, role + "_lens_present")
+            op = Operand("int32", (api.batch_size,), (1,), api.batch_size, 4, 4, (api.batch_size, api.batch_size + 1) if api.thd else ()) if enabled else None
         else:
             desc = getattr(api, role + "_desc")
             if desc is None:
                 op = None
             else:
                 shape, strides = tuple(desc.shape), tuple(desc.stride)
+                if api.thd:
+                    if role in ROLES[:5] + ROLES[6:9]:
+                        tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
+                        token_stride = api._thd_token_strides[role]
+                        shape = (1, shape[1], tokens, shape[3])
+                        strides = (tokens * token_stride, shape[3], token_stride, 1)
+                    elif role == "stats":
+                        if api._thd_lse_token_major:
+                            shape, strides = (api._t_q_cap, api.h_q), (api.h_q, 1)
+                        else:
+                            hs = api._thd_lse_head_stride or api._t_q_cap
+                            shape, strides = (1, api.h_q, hs), (api.h_q * hs, hs, 1)
                 span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
                 alignment = 16 if role in ROLES[:5] + ROLES[6:9] else desc.dtype.itemsize
                 op = Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize)
@@ -82,14 +95,42 @@ def build_spec(api, d64_module):
         else:
             geometry.append(((math.prod(op.shape),), (1,)))
     geometry = tuple(geometry)
+    compile_geometry = geometry
+    if api.thd:
+        normalized = list(geometry)
+        for i, role in enumerate(ROLES):
+            if normalized[i] is None:
+                continue
+            shape, strides = normalized[i]
+            if role in ROLES[:5] + ROLES[6:9]:
+                token = -2 if role in ("k", "v", "dk", "dv") else -1
+                shape, strides = (1, token, shape[2], shape[3]), (0, *strides[1:])
+            elif role == "stats":
+                if api._thd_lse_token_major:
+                    shape = (-1, api.h_q)
+                elif not api._thd_lse_head_stride:
+                    shape, strides = (1, api.h_q, -1), (0, -1, 1)
+            normalized[i] = (shape, strides)
+        compile_geometry = tuple(normalized)
     key = template_key(
-        vars(api._kmod), dict(geometry=geometry, d64=api._use_d64, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime), "prepared_dense"
+        vars(api._kmod),
+        dict(
+            geometry=compile_geometry,
+            d64=api._use_d64,
+            swa_window=api.swa_window_runtime,
+            right_bound=api.right_bound_runtime,
+            thd=(api.batch_size, api._thd_lse_token_major) if api.thd else None,
+        ),
+        "prepared_pointer",
     )
-    artifact, workspace_bytes = compile_host(api, geometry, d64_module, key)
+    artifact, workspace_bytes = compile_host(api, compile_geometry, d64_module, key)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM80 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(artifact, fn, tuple(operands), workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm80")
+    fn = partial(fn, api._t_q_cap if api.thd else 0, api._t_kv_cap if api.thd else 0, *launch_bounds(api))
+    return BwdLaunchSpec(
+        artifact, fn, tuple(operands), workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm80", length_form=True
+    )
 
 
 def execute_tensors(api, tensors, workspace, stream, scale):
@@ -105,9 +146,19 @@ def execute_tensors(api, tensors, workspace, stream, scale):
 
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
+    if api.thd:
+        for role in ("seq_q", "seq_kv"):
+            f = facts[role]
+            if f is not None and f.numel not in (api.batch_size, api.batch_size + 1):
+                raise ValueError(f"SM80 bwd THD: {role}_lens must hold B = {api.batch_size} per-batch lengths or B+1 prefixes; got {f.numel}")
     stats = facts["stats"]
-    if stats is not None and (stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous)):
-        raise ValueError("stats must match the declared element count and storage layout")
+    if stats is not None:
+        if api.thd:
+            op = spec.operands[5]
+            if stats.shape != op.shape or stats.strides != op.strides:
+                raise ValueError("THD stats must match the declared packed layout")
+        elif stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous):
+            raise ValueError("stats must match the declared element count and storage layout")
     # Stats has always been a storage binding: compact plans accept flat buffers,
     # and strided plans reinterpret the declared strides after checking capacity.
     geometry = tuple((op.shape, op.strides) if op is not None and i < 9 and i != 5 else None for i, op in enumerate(spec.operands))

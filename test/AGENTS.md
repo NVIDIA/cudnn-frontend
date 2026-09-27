@@ -250,6 +250,15 @@ prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
 
 
+Prepared THD artifact reuse must survive a disabled persistent cache and an
+unknown environment manifest. Change packed capacities and launch bounds with
+JIT forbidden, then check numerical output and graph replay. Keep workspace
+sizing per plan and exclude tensors, pointers and streams from the artifact
+memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
+SM80 detector. When asserting disk-artifact hits, clear the process memo before
+both cache population and reload: otherwise an earlier test can prevent the
+temporary cache from being populated, or a memo hit can bypass the disk counter.
+
 Prepared host migrations must preserve persistent compiled artifacts as well as
 warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
 artifact export even though its runtime slots disappear. Carry only the immutable

@@ -10,6 +10,7 @@ import logging
 import math
 import os
 from abc import abstractmethod
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -817,178 +818,137 @@ def _sm80_bwd_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
     return torch.cat([t, pad], dim=-1).contiguous()
 
 
+@lru_cache(maxsize=128)
+def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtype, device, is_causal, window_size, bottom_right, has_sink, deterministic):
+    """Cache immutable wrapper plans without retaining tensors or runtime pointers.
+
+    Capacities and bounds size each plan's workspace; the prepared compiler
+    receives them as runtime scalars and reuses its artifact across plans.
+    """
+
+    def desc(h, d, s):
+        return TensorDesc(dtype, (n_seq, h, s, d), (s * h * d, d, h * d, 1), (3, 1, 2, 0), device)
+
+    q, k, v, o = desc(h_q, d_qk, t_q), desc(h_kv, d_qk, t_kv), desc(h_kv, d_v, t_kv), desc(h_q, d_v, t_q)
+    stats = TensorDesc(torch.float32, (n_seq, h_q, t_q), (h_q * t_q, t_q, 1), (2, 1, 0), device)
+    sink = TensorDesc(torch.float32, (h_q,), (1,), (0,), device) if has_sink else None
+    wl, wr = window_size
+    api = SdpaBwdDslSm80(
+        q,
+        k,
+        v,
+        o,
+        o,
+        stats,
+        q,
+        k,
+        v,
+        sample_sink=sink,
+        sample_dsink=sink,
+        is_causal=is_causal,
+        causal_bottom_right=bottom_right,
+        window_size_left=wl,
+        window_size_right=wr,
+        deterministic=deterministic,
+        thd=True,
+        max_total_seq_len_q=t_q,
+        max_total_seq_len_kv=t_kv,
+    )
+    assert api.check_support(), "Unsupported configuration"
+    # Wrapper buffers may have capacity beyond B * max_sequence_length.
+    # Preserve their physical capacity/Stats pitch while separately bounding
+    # the launch grid and deterministic counters from the caller's hints.
+    api._thd_launch_bounds = (max_sq, max_skv)
+    api.compile()
+    return api
+
+
 def _sm80_thd_backward(
     q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False, max_s_kv=None, max_s_q=None
 ):
-    """THD / varlen backward: q/k/v/o/do are PACKED ``[1, T, H, D]`` (BSHD,
-    B==1 — no transpose), ``lse`` is packed ``[1, H, T_q]`` (head-major,
-    matching the kernel's THD LSE layout), and cu_q/cu_k are ``[n_seq+1]``
-    cumulative seqlens.  Loads the THD template specialization (packed token
-    totals are ``cute.sym_int`` dynamics — one artifact per (params, n_seq),
-    issue #604) and drives the kernel chain directly (over-provisioned grid;
-    GQA reduces over the query-head group).  Returns packed ``[1, T, H, D]``
-    dQ/dK/dV (BHSD-equivalent for B==1).
+    """Allocate wrapper outputs and bind the same prepared chain as graph THD.
 
-    The over-provisioned grid needs the longest per-sequence KV length:
-    pass ``max_s_kv`` (any upper bound works — short tiles early-out) to keep
-    the call fully async; without it the wrapper reads it from ``cu_k`` on
-    the HOST (a D2H sync — the wrapper-only Rule-3 residual).  ``sinks``
-    ((H,) natural-log logits) adds a ``dsink_tensor`` output.  ``deterministic``
-    sizes the dQ relay counter from ``max_s_q`` (an upper bound on the
-    longest per-sequence Q length, trimmed to the packed total; the packed
-    total when absent — no D2H).  Like ``max_s_kv``, the hint is a caller
-    contract: the wrapper cannot validate it without a D2H read, and an
-    undersized value indexes the relay counter out of bounds.
+    Inputs and gradients are packed [1,T,H,D], Stats is [1,H,T_q], and
+    cu_q/cu_k contain B+1 prefixes. Missing sequence bounds use the packed
+    capacities, so no device-to-host length read is needed. Smaller caller
+    bounds must cover every sequence; validating their contents would sync.
     """
-    d_qk = q.shape[-1]
-    d_v = v.shape[-1]
-    h_q = q.shape[2]
-    h_kv = k.shape[2]
-    flavor = _sm80_bwd_pick_flavor(d_qk, d_v)
-    fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
-    # Resolve the default scale from the USER's head dim before padding: the
-    # kernel would otherwise derive 1/sqrt(D) from the padded flavor width
-    # (e.g. 1/sqrt(128) for a d=96 llama-flavor call) — silently wrong
-    # gradients.  Mirrors the forward THD path.
+    d_qk, d_v, h_q, h_kv = q.shape[-1], v.shape[-1], q.shape[2], k.shape[2]
+    fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[_sm80_bwd_pick_flavor(d_qk, d_v)]
+    # Resolve from the user's width before envelope padding (e.g. D=96).
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    pad_qk = d_qk < fdqk
-    pad_v = d_v < fdv
-    if pad_qk:
-        q = _sm80_bwd_pad_last_dim(q, fdqk)
-        k = _sm80_bwd_pad_last_dim(k, fdqk)
-    if pad_v:
-        v = _sm80_bwd_pad_last_dim(v, fdv)
-        o = _sm80_bwd_pad_last_dim(o, fdv)
-        do = _sm80_bwd_pad_last_dim(do, fdv)
-    # cuDNN's (is_causal, window_size=(left,right)) → mask params.
-    wl, wr = window_size
-    has_swa = wl is not None and wl >= 0
-    swa = int(wl) if has_swa else 0
-    right_bound = int(wr) if (is_causal and wr is not None and wr > 0) else 0
-    from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
-
-    # NOTE: llama-swept tiles always (matching the dense adapter — the gptoss
-    # wide-Q-tile row stays unwired pending a perf gate); the flavor picks
-    # only the ENVELOPE dims, which must reach the compiled kernel (a flavor
-    # name alone would leave the template at its 128/128 defaults while the
-    # buffers pad to the envelope — OOB at d=64, wrong grads at 192/256).
-    params = bwd_params_for_flavor(
-        "llama",
-        io_bf16=(q.dtype == torch.bfloat16),
-        d_qk=fdqk,
-        d_v=fdv,
-        is_causal=bool(is_causal),
-        has_swa=has_swa,
-        causal_bottom_right=bool(causal_bottom_right) and (bool(is_causal) or has_swa),
-        has_sink=sinks is not None,
-        deterministic=bool(deterministic),
-        thd_varlen=True,
-        sched_policy=_BWD_SCHED_NATURAL,  # LPT+THD is a future tweak
-    )
-    mod = _load_sm80_bwd_module(params)
-    # Host-side grid math.  n_seq is shape metadata (no sync); the longest KV
-    # length comes from the caller's max_s_kv hint, or from a host read of
-    # cu_k (the D2H documented above) when no hint is given.
+    if d_qk < fdqk:
+        q, k = _sm80_bwd_pad_last_dim(q, fdqk), _sm80_bwd_pad_last_dim(k, fdqk)
+    if d_v < fdv:
+        v, o, do = (_sm80_bwd_pad_last_dim(t, fdv) for t in (v, o, do))
     n_seq = cu_q.numel() - 1
-    assert cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
-    if max_s_kv is not None:
-        max_s_kv = int(max_s_kv)
-        assert max_s_kv > 0, f"max_s_kv must be > 0; got {max_s_kv}"
-    else:
-        cu_k_host = cu_k.to(dtype=torch.int32, device="cpu")
-        max_s_kv = int((cu_k_host[1:] - cu_k_host[:-1]).max())
-    c = mod.compile(1, h_q, h_kv, 0, 0, swa_window=swa, n_batch_logical=n_seq)
-    t_q = q.shape[1]
-    t_kv = k.shape[1]
-    dev = q.device
-    stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    q, k, v, o, do = (t.contiguous() for t in (q, k, v, o, do))
-    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous()
+    assert n_seq > 0 and cu_k is not None and cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
+    t_q, t_kv, dev = q.shape[1], k.shape[1], q.device
+    for label, hint in (("max_s_q", max_s_q), ("max_s_kv", max_s_kv)):
+        if hint is not None:
+            assert int(hint) > 0, f"{label} must be > 0; got {hint}"
+
+    # A zero-capacity wrapper operand gets one never-live row. Device prefixes
+    # still contain the actual totals; no adapter-side degenerate computation.
+    def packed(t):
+        return t.contiguous() if t.shape[1] else torch.empty((1, 1, *t.shape[2:]), dtype=t.dtype, device=dev)
+
+    q, k, v, o, do = map(packed, (q, k, v, o, do))
+    tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
+    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous() if t_q else torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
     cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
     cu_k_t = cu_k.to(dtype=torch.int32, device=dev).contiguous()
-    dq_acc = torch.zeros(1, t_q, h_q, fdqk, dtype=torch.float32, device=dev)
-    # The THD cast writes rows below cu_q[n_seq] only, so the returned dQ's
-    # rows past the packed total read zero (as they did when the cast covered
-    # the whole buffer from the zeroed accumulator).
-    dQ_k = torch.zeros(1, t_q, h_q, fdqk, dtype=q.dtype, device=dev)
-    # dK/dV write buffers carry the h_q query heads (one slice per query head);
-    # MHA: they ARE the outputs.  GQA: reduced over the group below.
-    dk_ws = torch.empty(1, t_kv, h_q, fdqk, dtype=q.dtype, device=dev)
-    dv_ws = torch.empty(1, t_kv, h_q, fdv, dtype=q.dtype, device=dev)
-    dot = torch.empty(1, h_q, t_q, dtype=torch.float32, device=dev)
-    dummy_i32 = torch.zeros(1, dtype=torch.int32, device=dev)
-    dummy_f32 = torch.zeros(1, dtype=torch.float32, device=dev)
-    c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _int32(h_q * t_q), stream)
-    dsink = None
-    if sinks is not None:
-        # Natural-log logits (the kernel applies log2e itself); one warp per
-        # (sequence, head) row over that sequence's tokens; zero-init target.
-        sinks_b = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous()
-        dsink = torch.zeros(h_q, dtype=torch.float32, device=dev)
-        c.dsink(_fd_tvm(lse_t), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink), _fd_tvm(cu_q_t), _int32(n_seq * h_q), stream)
-    # Deterministic relay counter: one int32 per (sequence, head, q-tile),
-    # sized from the max_s_q hint (any upper bound) or, without one, from the
-    # packed total — host shape metadata, so no D2H read.  Fresh zeros every
-    # call: a stale counter deadlocks the relay's equality spin.
-    if deterministic:
-        # The packed total bounds every per-sequence length, so an over-provisioned
-        # hint is trimmed to it; an UNDERSIZED hint is a contract violation the
-        # wrapper cannot detect without a D2H read of cu_q (same contract as
-        # max_s_kv) -- the relay indexes the counter by q-tile, so it would run
-        # off the end of dq_sem.
-        q_bound = min(int(max_s_q), t_q) if max_s_q is not None else t_q
-        assert q_bound > 0, f"max_s_q must be > 0; got {q_bound}"
-        sem_q_stride = (q_bound + params.tile_q - 1) // params.tile_q
-        dq_sem = torch.zeros(n_seq * h_q * sem_q_stride, dtype=torch.int32, device=dev)
-    else:
-        sem_q_stride = 0
-        dq_sem = dummy_i32
-    _sm80_bwd_call(
-        c.main,
-        q=q,
-        k=k,
-        v=v,
-        do=do,
-        dq_acc=dq_acc,
-        dk_ws=dk_ws,
-        dv_ws=dv_ws,
-        lse=lse_t,
-        do_dot=dot,
-        seq_kv=dummy_i32,
-        bias=dummy_f32,
-        dbias=dummy_f32,
-        rope_cs=dummy_f32,
-        cu_q=cu_q_t,
-        cu_k=cu_k_t,
-        seq_q=dummy_i32,
-        dq_sem=dq_sem,
-        n_q_tiles=(t_q + params.tile_q - 1) // params.tile_q,
-        scale_log2=float(scale_softmax) * _BWD_LOG2E,
-        attn_scale=float(scale_softmax),
-        right_bound=right_bound,
-        inv_scale=1.0 / float(scale_softmax),
-        bias_bstride=0,
-        sem_q_stride=sem_q_stride,
-        grid_kv_tiles=(max_s_kv + params.tile_kv - 1) // params.tile_kv,
-        grid_batch=n_seq,
-        stream=stream,
+    sinks_t = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous() if sinks is not None else None
+    # The cast/fold only writes live rows. Keep the established zeroed dQ and
+    # GQA output tails; MHA dK/dV remain direct kernel outputs.
+    dq = torch.zeros_like(q)
+    dk, dv = (torch.zeros_like(k), torch.zeros_like(v)) if h_q != h_kv else (torch.empty_like(k), torch.empty_like(v))
+    dsink = torch.empty(h_q, dtype=torch.float32, device=dev) if sinks is not None else None
+    wl, wr = window_size
+    wl = None if wl is None or wl < 0 else int(wl)
+    wr = None if wr is None or wr < 0 else int(wr)
+    api = _sm80_thd_plan(
+        n_seq,
+        h_q,
+        h_kv,
+        fdqk,
+        fdv,
+        tq_cap,
+        tkv_cap,
+        min(int(max_s_q), tq_cap) if max_s_q is not None else tq_cap,
+        min(int(max_s_kv), tkv_cap) if max_s_kv is not None else tkv_cap,
+        q.dtype,
+        dev,
+        bool(is_causal),
+        (wl, wr),
+        bool(causal_bottom_right) and (bool(is_causal) or wl is not None),
+        sinks is not None,
+        bool(deterministic),
     )
-    # THD cast / fold ABI: bounded by cu_*[n_seq] on device, at the envelope
-    # width here (the wrapper slices the head-dim padding below).
-    c.cast(_fd_tvm(dq_acc), _fd_tvm(dQ_k), _fd_tvm(cu_q_t), _int32(n_seq), _int32((t_q * h_q * fdqk) // 2), stream)
-    if h_q != h_kv:
-        dK_k = torch.zeros(1, t_kv, h_kv, fdqk, dtype=q.dtype, device=dev)
-        dV_k = torch.zeros(1, t_kv, h_kv, fdv, dtype=q.dtype, device=dev)
-        c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dK_k), _fd_tvm(cu_k_t), _int32(n_seq), _int32(t_kv * h_kv * fdqk), stream)
-        c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dV_k), _fd_tvm(cu_k_t), _int32(n_seq), _int32(t_kv * h_kv * fdv), stream)
-    else:
-        dK_k, dV_k = dk_ws, dv_ws
-    if pad_qk:
-        dQ_k = dQ_k[..., :d_qk].contiguous()
-        dK_k = dK_k[..., :d_qk].contiguous()
-    if pad_v:
-        dV_k = dV_k[..., :d_v].contiguous()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api.execute(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        o.transpose(1, 2),
+        do.transpose(1, 2),
+        lse_t,
+        dq.transpose(1, 2),
+        dk.transpose(1, 2),
+        dv.transpose(1, 2),
+        scale_softmax=scale_softmax,
+        workspace=workspace,
+        seq_q_lens=cu_q_t,
+        seq_kv_lens=cu_k_t,
+        sink_tensor=sinks_t,
+        dsink_tensor=dsink,
+    )
+    dQ_k, dK_k, dV_k = dq[:, :t_q, :, :d_qk], dk[:, :t_kv, :, :d_qk], dv[:, :t_kv, :, :d_v]
+    if d_qk < fdqk:
+        dQ_k, dK_k = dQ_k.contiguous(), dK_k.contiguous()
+    if d_v < fdv:
+        dV_k = dV_k.contiguous()
     out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
     if dsink is not None:
         out["dsink_tensor"] = dsink
@@ -1184,7 +1144,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._lse_stride: "Optional[tuple[int, int, int]]" = None
         self._dummy_cache: dict = {}
         self._prepared = None
-        self._native_dense = False
+        self._native_pointer = False
         # THD (packed) plan-time state: token capacities the views bind at,
         # the Stats packing, and the compiled lengths -> cu_seqlens setup launch.
         self._t_q_cap: int = 0
@@ -1472,7 +1432,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._use_d64 = False  # preserve the dense, packed-Stats selection boundary
         from .prepared_sm80 import native_layouts
 
-        self._native_dense = native_layouts(self)
+        self._native_pointer = native_layouts(self)
 
         self._is_supported = True
         self._logger.debug("check_support completed")
@@ -1483,8 +1443,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         """Plan-time JIT: build the TemplateParams from the plan facts, load
         the specialized module via ``frost.template_loader`` (same seam as the
         SM120 adapter), and compile the full kernel chain for this shape.
-        Native dense plans compile the entire pointer chain here, including
-        the dedicated d=64 main kernel and its unpermute epilogue. Retained
+        Native plans compile the entire pointer chain here, including packed
+        metadata setup or the dense d=64 kernel and its unpermute epilogue. Retained
         staging layouts use the existing tensor compiler."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
@@ -1524,7 +1484,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 bool(self.s_q_max % self._params.tile_q or self.s_k_max % self._params.tile_kv),
                 "SM80 bprop: RoPE requires S_q/S_kv tile-aligned",
             )
-        if self._native_dense:
+        if self._native_pointer:
             from .prepared_sm80 import build_spec
 
             self._kmod = _load_sm80_bwd_module(self._params)
@@ -1617,7 +1577,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         kernel's set covers the d64 fast path's). All plan-time state — no
         arguments."""
         self._ensure_support_checked()
-        if self._native_dense:
+        if self._native_pointer:
             from .kernels.sm80.prepared_host import workspace_regions
 
             return workspace_regions(self)[1]
@@ -2222,9 +2182,9 @@ def sdpa_bwd_wrapper_sm80(
     ALiBi and block_mask are not supported (use the graph API, which routes
     them to the cuDNN backend); bias/dBias remain fully served.
 
-    THD (``cum_seqlen_*``): pass ``max_s_kv`` (any upper bound on the
-    longest per-sequence KV length) to keep the call fully async; without it
-    the wrapper reads the max from ``cu_k`` on the host (a D2H sync).  With
+    THD (``cum_seqlen_*``): ``max_s_kv`` may bound the longest per-sequence
+    KV length to reduce the launch grid. Without it the packed capacity is
+    a safe upper bound, requiring no device-to-host length read. With
     ``deterministic=True``, ``max_s_q`` (an upper bound on the longest
     per-sequence Q length) sizes the dQ relay counter; the packed total is
     used when absent.  Both hints are caller contracts (validating them
