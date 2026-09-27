@@ -125,6 +125,21 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             raise ValueError(f"{role}_lens must contain B contiguous int32 lengths")
         if api.thd and tensor is None:
             raise ValueError(f"SM80 bwd THD: {role}_lens is required")
+    # These outputs copy from accumulators after launch and are deliberately
+    # absent from the pointer ABI. Validate them before any staging write.
+    for role, region in (("dbias", layout.regions[5]), ("dsink", layout.regions[6])):
+        f, desc = original_facts[role], getattr(api, role + "_desc")
+        if f is None:
+            if desc is not None:
+                raise ValueError(f"sdpa_bwd_sm80: {role} is required by this specialization")
+            continue
+        if region is None:
+            raise ValueError(f"sdpa_bwd_sm80: {role} was not compiled into this specialization")
+        if f.numel != math.prod(region[1]):
+            raise ValueError(f"sdpa_bwd_sm80: {role} must contain {math.prod(region[1])} elements")
+        allowed = (desc.dtype,) if desc is not None else (torch.float32, api.dtype) if role == "dbias" else (torch.float32,)
+        if original[role].dtype not in allowed:
+            raise ValueError(f"sdpa_bwd_sm80: {role} dtype must match its declaration or accumulation output")
     if stream is None:
         stream = torch.cuda.current_stream(device).cuda_stream
     cooked = dict(original, stats=stats, dbias=None, dsink=None, rope=None)

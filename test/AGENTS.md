@@ -159,6 +159,12 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+Optional gradients copied from accumulators after a prepared launch still need
+presence, dtype and extent checks before any staging write. They can be absent
+from the pointer ABI, so the common binder cannot validate them. The detector
+is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
+
 Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.

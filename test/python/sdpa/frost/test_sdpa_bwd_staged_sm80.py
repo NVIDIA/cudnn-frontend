@@ -243,3 +243,53 @@ def test_staged_workspace_slice_with_odd_extra_byte(features):
         check()
     finally:
         capture.reset()
+
+
+@pytest.mark.parametrize("role", ["dbias", "dsink"])
+@pytest.mark.parametrize("problem", ["size", "unexpected", "missing", "dtype"])
+def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypatch):
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
+
+    q = torch.zeros(2, 4, 128, 96, device="cuda", dtype=torch.float16)
+    v = torch.zeros(2, 4, 128, 80, device="cuda", dtype=torch.float16)
+    stats = torch.zeros(2, 4, 128, device="cuda", dtype=torch.float32)
+    outputs = (torch.empty_like(q), torch.empty_like(q), torch.empty_like(v))
+    enabled = problem != "unexpected"
+    bias = torch.zeros(1, 4, 128, 128, device="cuda") if enabled and role == "dbias" else None
+    sink = torch.zeros(4, device="cuda") if enabled and role == "dsink" else None
+    aux = torch.empty_like(bias if role == "dbias" else sink) if enabled else torch.empty(4, device="cuda")
+    api = SdpaBwdDslSm80(
+        q,
+        q,
+        v,
+        v,
+        v,
+        stats,
+        *outputs,
+        sample_bias=bias,
+        sample_sink=sink,
+        has_bias=bias is not None,
+        bias_is_fp32=True,
+        **{"sample_" + role: aux if enabled else None},
+    )
+    api.compile()
+    assert api._staged_prepared is not None
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    if problem == "size":
+        aux = torch.empty(aux.numel() + 1, device="cuda", dtype=aux.dtype)
+    elif problem == "missing":
+        aux = None
+    elif problem == "dtype":
+        aux = aux.to(torch.int32)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid auxiliary output reached a staging write or launch")
+
+    with monkeypatch.context() as guards:
+        guards.setattr(torch.Tensor, "copy_", forbidden)
+        guards.setattr(torch.Tensor, "zero_", forbidden)
+        from cudnn.sdpa.bwd import staged_sm80
+
+        guards.setattr(staged_sm80, "execute", forbidden)
+        with pytest.raises(ValueError, match=role):
+            api.execute(q, q, v, v, v, stats, *outputs, workspace=workspace, bias_tensor=bias, sink_tensor=sink, **{role + "_tensor": aux})
