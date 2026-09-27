@@ -7,8 +7,9 @@ This file is a TEMPLATE: ``frost.template_loader.load_template`` re-executes
 it as a fresh module per ``config_sm80.TemplateParams`` (injected as the
 ``FROST_TEMPLATE_PARAMS`` module global), so the feature/config axes fold at
 trace time; the remaining SHAPE axes compile through the module's own
-``compile()`` (per-shape ``@lru_cache``; THD packed token totals are DYNAMIC
-via ``cute.sym_int`` — plan-time-only keys, Hard Rule 4).  The adapter
+``compile()`` (per-shape ``@lru_cache``) for the remaining dense tensor path.
+Packed THD uses ``prepared_host.compile_thd_host`` with runtime Int64 geometry.
+The adapter
 (``api_dsl.SdpaFwdDslSm80``) owns validation, operand binding and launch.
 
 Online flash-attention with rowwise max / sum tracked per warp lane
@@ -1667,11 +1668,8 @@ def _sdpa_host(
 # ``cute.compile`` is expensive (trace + MLIR + NVVM + PTX → SASS, ~1-2 s on
 # A100).  The FEATURE / config axes are module identity — one loaded template
 # module per ``TemplateParams`` via ``frost.template_loader`` — so this cache
-# covers the remaining SHAPE axes only.  Every key component is PLAN-TIME
-# data (AGENTS.md Hard Rule 4): under ``PARAMS.thd_varlen`` the packed token
-# totals compile DYNAMIC (``cute.sym_int``) and are never part of the key —
-# callers pass ``sq = skv = 0`` there (a stray runtime total must not be
-# passed: it would only mint a redundant cache entry for the same artifact).
+# covers the remaining dense SHAPE axes only. Packed THD has a pointer-only
+# host in prepared_host.py and never builds tensor fakes here.
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001 — the template contract's entry point (matches the SM100 kernels)
     b: int,
@@ -1682,7 +1680,6 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     d: int,
     swa_window: int = 0,
     rope_max_s: int = 0,
-    n_batch_logical: int = 0,
     lse_stride: Optional[tuple[int, int, int]] = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
@@ -1696,73 +1693,55 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     entry point derived it: ``is_even_mn = (sq % tile_m == 0) and
     (skv % tile_n == 0)``; ``is_even_k = (d == PARAMS.d_qk)``.
 
-    THD (``PARAMS.thd_varlen``): q/k/v/o are packed ``[1, T, H, D]`` and the
-    LSE is packed ``[1, H, T]``; the token extents compile DYNAMIC — one
-    ``cute.sym_int`` symbol shared by the Q/O/LSE group and one for K/V — so
-    one artifact re-binds any packed totals (issue #604).  Pass ``b = 1``,
-    ``sq = skv = 0``; ``n_batch_logical`` (the logical sequence count) sizes
-    the ``cu_seqlens`` ABI and IS plan-time.  THD always takes the
-    predicated-store path (``is_even_mn = False``) and the over-provisioned
-    SCHED_DEFAULT grid, driven by the runtime ``thd_q_tiles``/``thd_n_batch``
-    launch arguments.
+    Packed THD uses ``prepared_host.compile_thd_host`` instead.
 
     ``PARAMS.has_lse = False`` compiles the LSE store out entirely (the LSE
     argument is None-specialized) — no buffer and no dummy at any level.
     """
     _cache_key = _template_key(globals(), locals(), "compile")
     p = PARAMS
-    if p.thd_varlen and p.has_bias:
-        raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
+    if p.thd_varlen:
+        raise NotImplementedError("SM80 packed THD uses prepared_host.compile_thd_host")
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
     sched_l2_bytes = p.sched_l2_mib * 1024 * 1024
     is_even_k = d == p.d_qk
-    if p.thd_varlen:
-        # One symbol per ragged group: Q/O (and the LSE's T axis) share t_q,
-        # K/V share t_kv — a new packed total re-binds the same artifact.
-        is_even_mn = False
-        t_q = cute.sym_int(divisibility=1)
-        t_kv = cute.sym_int(divisibility=1)
-        _b, _sq, _skv = 1, t_q, t_kv
-    else:
-        is_even_mn = (sq % p.tile_m == 0) and (skv % p.tile_n == 0)
-        _b, _sq, _skv = b, sq, skv
+    is_even_mn = (sq % p.tile_m == 0) and (skv % p.tile_n == 0)
 
     # Q and K share the QK head dim (= d, possibly < PARAMS.d_qk when
     # ~is_even_k); V and O follow PARAMS.d_v (DSv3: d_qk != d_v).
     fake_q = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _sq, h, d),
+        (b, sq, h, d),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _skv, h_kv, d),
+        (b, skv, h_kv, d),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _skv, h_kv, p.d_v),
+        (b, skv, h_kv, p.d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _sq, h, p.d_v),
+        (b, sq, h, p.d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    # LSE: dense [B, H, SQ]; THD packed [1, H, T] (shares the Q/O token
-    # symbol, which is exactly what the kernel's LSE.shape[2] read needs).
+    # Dense LSE [B, H, SQ].
     if p.has_lse:
         fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
-            if lse_stride is not None and not p.thd_varlen
+            cute.runtime.make_fake_tensor(cutlass.Float32, (b, h, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
-                (_b, h, _sq),
+                (b, h, sq),
                 stride_order=(2, 1, 0),
                 assumed_align=16,
             )
@@ -1797,10 +1776,6 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         stride_order=((3, 2, 1, 0) if p.has_bias else (0,)),
         assumed_align=16,
     )
-    # THD cumulative seqlens [B_logical + 1] int32 (or 1-elem dummies).
-    _cu_len = (n_batch_logical + 1) if p.thd_varlen else 1
-    fake_cu_q = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
-    fake_cu_k = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
     # RoPE (cos, sin) table [max_s, d_qk//2, 2] fp32 (or a 1-elem dummy).
     fake_rope_cs = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -1831,8 +1806,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         fake_seq_len_q,
         fake_sinks,
         fake_bias,
-        fake_cu_q,
-        fake_cu_k,
+        None,
+        None,
         fake_rope_cs,
         p.tile_m,
         p.num_warps,
@@ -1850,7 +1825,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         p.has_sink,
         p.has_bias,
         p.bias_is_fp32,
-        p.thd_varlen,
+        False,
         p.has_rope,
         p.sched_policy,
         sched_l2_bytes,

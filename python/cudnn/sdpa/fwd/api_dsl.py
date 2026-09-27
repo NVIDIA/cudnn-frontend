@@ -5026,8 +5026,6 @@ def _sm80_call(
     seq_q,
     sinks_log2,
     bias,
-    cu_q,
-    cu_k,
     rope_cs,
     n_kv_tiles,
     scale_log2,
@@ -5036,12 +5034,11 @@ def _sm80_call(
     d,
     right_bound,
     inv_scale,
-    thd_q_tiles,
-    n_batch_logical,
     stream,
 ):
     """Invoke one compiled SM80 artifact (the traced ``_sdpa_host`` ABI:
-    12 tensors — LSE may be None-specialized — then 9 runtime scalars and the
+    12 operand slots — packed prefixes and optional LSE are None-specialized —
+    then 9 runtime scalars and the
     launch stream)."""
     import cutlass
     from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
@@ -5061,8 +5058,8 @@ def _sm80_call(
         from_dlpack(seq_q),
         from_dlpack(sinks_log2),
         from_dlpack(bias),
-        from_dlpack(cu_q),
-        from_dlpack(cu_k),
+        None,
+        None,
         from_dlpack(rope_cs),
         cutlass.Int32(n_kv_tiles),
         cutlass.Float32(scale_log2),
@@ -5071,8 +5068,8 @@ def _sm80_call(
         cutlass.Int32(d),
         cutlass.Int32(right_bound),
         cutlass.Float32(inv_scale),
-        cutlass.Int32(thd_q_tiles),
-        cutlass.Int32(n_batch_logical),
+        cutlass.Int32(0),
+        cutlass.Int32(1),
         stream,
     )
 
@@ -5591,7 +5588,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
             else:
                 rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
-            cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
 
             _sm80_call(
                 self._compiled_kernel,
@@ -5604,8 +5600,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 seq_q=seq_q_b,
                 sinks_log2=sinks_b,
                 bias=bias_b,
-                cu_q=cu_dummy,
-                cu_k=cu_dummy,
                 rope_cs=rope_b,
                 n_kv_tiles=(self.s_k_max + p.tile_n - 1) // p.tile_n,
                 scale_log2=scale_val * _LOG2E,
@@ -5614,8 +5608,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 d=self.head_dim_qk,
                 right_bound=int(self.right_bound_runtime),
                 inv_scale=1.0 / float(scale_val),
-                thd_q_tiles=0,
-                n_batch_logical=1,
                 stream=launch_stream,
             )
 
@@ -5630,9 +5622,9 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
     no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Rides the same
     TemplateParams-specialized module as the dense path; the packed token
-    extents compile DYNAMIC (``cute.sym_int``), so the compile key is
-    plan-time-only and a new token total re-binds the cached artifact (the
-    old per-total ``lru`` key — issue #604 — is gone).  Returns packed
+    extents and strides are Int64 runtime arguments, so new packed capacities
+    re-bind the same pointer artifact without a tensor wrapper or new compile.
+    Returns packed
     ``[1, T_q, H, D_v]`` O + packed ``[1, H, T_q]`` LSE."""
     from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
 

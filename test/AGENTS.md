@@ -241,3 +241,13 @@ covers every native flavor with requested Amax. Physical SF stride units are
 16 bytes; widen tile-count products before multiplication. The L1
 `test_prepared_mxfp8_sf_head_stride_above_int32_units` steps a physical 64-GiB
 head stride and checks numerical output, with resource-only OOM skips.
+
+
+### Packed SM80 forward launch migration
+
+After moving a wrapper to a prepared host, forbid the old tensor launcher
+after warmup and check fresh bindings plus changed-input graph replay. Keep
+physical stride and product-overflow probes on every native flavor, with
+wrapped addresses poisoned inside allocated guard storage.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
+THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.

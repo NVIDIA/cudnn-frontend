@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pointer-only dense host shared by the four SM80 forward flavors."""
+"""Pointer-only dense and packed hosts shared by the SM80 forward flavors."""
 
 from functools import lru_cache
 from typing import Optional
