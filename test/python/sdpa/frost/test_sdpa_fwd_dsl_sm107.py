@@ -66,6 +66,12 @@ def test_f16_routes_to_the_sm107_sibling(flavor):
     assert "sm100" in _load(flavor, rubin=False).__name__
 
 
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_f16_thd_declares_its_persistent_scheduler(flavor):
+    mod = _load(flavor, rubin=True, thd_varlen=True, seq_kv_lens_present=True)
+    assert getattr(mod, "THD_PERSISTENT", False), "the device claim loop needs an occupancy-sized host grid"
+
+
 # Which flavors' MMA-operand SMEM crosses 256 KiB -- the boundary above which a
 # version-0 tcgen05 descriptor cannot address the buffer.  d512 alone does: its
 # Q(u)O and K(u)V slabs are 128 KiB each, putting the P transfer ring at exactly

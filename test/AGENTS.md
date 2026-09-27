@@ -208,3 +208,13 @@ A capability row's `sm_lo` names its lower bound, not the actual device.
 Prepared admission must respect the adapter's exact device support even when
 the row spans later compute capabilities. Include future-cc rejection controls
 alongside the supported device in `test_prepared_fp8_override_capability_envelope`.
+
+### Prepared THD launch bounds
+
+A shape-override cache envelope can be much larger than the live batch.
+Numerical tests do not detect a launch full of dead units. Check the bound
+against current host-known capacity while retaining the immutable artifact
+and any persistent resident-grid cap; never read device lengths to shrink it.
+`test_native_thd_launch_bound_uses_current_capacity` catches the stale grid;
+`test_thd_cache_shape_grid_tracks_runtime_capacity` checks O and packed Stats
+while changing batches and device lengths under capture/replay.

@@ -22,6 +22,7 @@ Gate-off traces byte-identically except for one aliased, unread
 ``tma_gate_desc`` GridConstant.  Dense, unsplit, unpaged, non-THD only.
 """
 
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
@@ -221,6 +222,8 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# The THD body claims work from a device counter; launch only resident clusters.
+THD_PERSISTENT = True
 
 # lpt_q_tiles_in_cga_units=True is REQUIRED, not optional: under a non-NATURAL
 # policy the LPT linearization needs q_tiles in CGA units, i.e. n_q_supers //
@@ -369,6 +372,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # Q∪O alias — single buffer (DTYPE_O == DTYPE_QKV).
     sQO_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)

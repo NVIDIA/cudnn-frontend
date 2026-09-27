@@ -64,6 +64,21 @@ THD_SETUP_THREADS = 256
 
 
 @cute.jit
+def exit_if_dead_thd_cluster(meta_t, n_batch: cutlass.Int32, cga_m: int) -> None:
+    """All threads of a dead cluster exit before TMEM allocation or barriers.
+
+    The setup launch publishes the live work count. Every CTA in a cluster
+    has the same unit id, including role-split clusters, so this predicate is
+    cluster-uniform. Call at kernel entry, before acquiring any shared resource.
+    Empty initial units must not enter the producer/consumer barrier pipeline.
+    """
+    meta = cutlass.make_array_view(meta_t)
+    uid = cute.arch.block_idx()[0] // cutlass.Int32(cga_m)
+    if uid >= cutlass.Int32(meta[THD_LIVE_OFF(n_batch)]):
+        nvvm.exit()
+
+
+@cute.jit
 def write_thd_meta(meta, ql, kl, lens_form: cutlass.Int32, n_batch: cutlass.Int32) -> None:
     """Single-thread body of the device-side THD metadata build (issue #552).
 
@@ -405,6 +420,7 @@ __all__ = [
     "THD_SETUP_THREADS",
     "emit_clamped_desc",
     "emit_seq_descs",
+    "exit_if_dead_thd_cluster",
     "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",

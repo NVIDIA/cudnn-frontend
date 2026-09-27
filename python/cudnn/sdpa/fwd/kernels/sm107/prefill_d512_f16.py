@@ -45,6 +45,7 @@ DSL-only adjustments applied (per the C++-to-DSL porting notes):
     (per project memory: bare nvvm op silently fires sender's local mbar).
 """
 
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
@@ -232,6 +233,8 @@ BMM2_V_NBLOCK_ADVANCE = CFG.TILE_N * (CFG.BMM2_N_PER_CALL // CFG.CTA_MMA) * CFG.
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128  # 8 chunks @ d=512 f16
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# The THD body claims work from a device counter; launch only resident clusters.
+THD_PERSISTENT = True
 
 # ----------------------------------------------------------------------------
 # Softmax-body constants — module-level so the top-level @cute.jit helper
@@ -543,6 +546,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # ------------------------------------------------------------------
     # SMEM allocations — natural Q / K / V / O order, NO Q∪K_ring or

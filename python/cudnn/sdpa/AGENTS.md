@@ -186,3 +186,16 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## Persistent THD launch admission
+
+A kernel using `scheduler_warp_loop_persistent` must declare `THD_PERSISTENT`
+so the host launch is sized to resident clusters. Bound the live workload
+with GPU metadata; retain host-known capacity bounds under graph replay.
+Dead initial clusters must exit uniformly before TMEM allocation and barrier
+initialization. A dead-unit O-store guard alone does not prove that an empty
+producer/consumer pipeline can drain repeatedly. Repeated overlaunch replay can expose a hang after hundreds of initially
+correct invocations; validate the dead initial-unit path explicitly.
+`test_sm107_f16_thd_declares_its_persistent_scheduler` catches missing host
+wiring; the THD overlaunch, multi-unit, zero-length and capture tests exercise
+the device contract.
