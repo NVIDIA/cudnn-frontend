@@ -1972,7 +1972,8 @@ class TestPreparedSm120Bwd:
 
     @pytest.mark.L0
     @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"])
-    def test_graph_accepts_strided_raw_storage(self, role):
+    @pytest.mark.parametrize("ordered", [False, True])
+    def test_graph_accepts_strided_raw_storage(self, role, ordered):
         case = _prepared_bwd_case()
         tensor = case.tensors[role]
         backing = torch.empty(tensor.numel() + 2, device="cuda", dtype=tensor.dtype)
@@ -1983,25 +1984,35 @@ class TestPreparedSm120Bwd:
         case.tensors[role] = declared
         for name in ("dq", "dk", "dv"):
             case.tensors[name].fill_(float("nan"))
-        case.graph.execute(case.pack, case.workspace)
+        if ordered:
+            items = list(reversed(list(case.pack.items())))
+            case.graph.execute([buffer for _, buffer in items], case.workspace, tensor_uids=[ref.get_uid() for ref, _ in items])
+        else:
+            case.graph.execute(case.pack, case.workspace)
         _check_prepared_bwd(case)
 
     @pytest.mark.L0
     @pytest.mark.parametrize("role", ["q", "stats", "dq"])
-    def test_graph_fixed_plan_override_validation(self, role, monkeypatch):
+    @pytest.mark.parametrize("ordered", [False, True])
+    def test_graph_fixed_plan_override_validation(self, role, ordered, monkeypatch):
         from dataclasses import replace
 
         case = _prepared_bwd_case()
         ref = case.refs[role]
         kwargs = dict(override_uids=[ref.get_uid()], override_shapes=[list(ref.get_dim())], override_strides=[list(ref.get_stride())])
-        case.graph.execute(case.pack, case.workspace, **kwargs)
+        pack = case.pack
+        if ordered:
+            items = list(reversed(list(pack.items())))
+            kwargs["tensor_uids"] = [tensor.get_uid() for tensor, _ in items]
+            pack = [buffer for _, buffer in items]
+        case.graph.execute(pack, case.workspace, **kwargs)
         _check_prepared_bwd(case)
         plan = case.graph._compiled_plans[case.graph._plan_index]
         launches = []
         monkeypatch.setattr(plan._prepared, "spec", replace(plan._prepared.spec, fn=lambda *args: launches.append(args)))
         kwargs["override_shapes"][0][2] //= 2
         with pytest.raises(ValueError, match="runtime geometry"):
-            case.graph.execute(case.pack, case.workspace, **kwargs)
+            case.graph.execute(pack, case.workspace, **kwargs)
         assert not launches
 
     @pytest.mark.L0

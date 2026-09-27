@@ -2166,7 +2166,8 @@ class pygraph:
             described = from_graph + schema.finish(native, from_graph)
         if extent is None:
             extent = self._workspace_extent_fallback(workspace)
-        return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described))
+        overridden = tuple(self._slot_of_uid[uid] for uid in override_uids) if override_uids else ()
+        return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described), overridden)
 
     def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
         """Turn the caller's variant pack into :class:`VariantPack`, once.
