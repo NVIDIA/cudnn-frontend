@@ -76,6 +76,7 @@ from cudnn.sdpa.fwd.engines import (
     SdpaFwdKnobs,
     _selected_d_shape,
     _synth_kv_padding,
+    _thd_decode_leg,
     effective_cgas,
     effective_sched_policies,
     mismatch,
@@ -728,14 +729,16 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     the row can pack this graph, which is the leg a decode-shaped graph
     proposes first.  The fit is a property of the candidate, not the graph:
     at ``S_q * p > 128 >= S_q`` the packed leg keeps the prefill tile while
-    the unpacked runner-up rides the decode tile.  Dense only: the decode tile
-    has no THD leg.  Measured on B200 (b=32, H=64/4, d128, S_kv=4096, page 16,
-    bf16): the prefill tile at cga2 119 us, the decode tile 49 us -- see the
-    kernel docstring; at S_q * G > 128 the prefill tile's second sub-tile is
-    live and cga2's collective MMA halves per-CTA K/V traffic, so the rule
-    stops there rather than at a measured crossover.
+    the unpacked runner-up rides the decode tile.  THD: the decode tile has no
+    THD_VARLEN leg; a ragged graph rides it only as the ragged-Q-over-paged-KV
+    leg (``engines._thd_decode_leg``: S_q(max) == 1, page pools, ragged Stats)
+    and keeps the prefill tile otherwise.  Measured on B200 (b=32, H=64/4,
+    d128, S_kv=4096, page 16, bf16): the prefill tile at cga2 119 us, the
+    decode tile 49 us -- see the kernel docstring; at S_q * G > 128 the prefill
+    tile's second sub-tile is live and cga2's collective MMA halves per-CTA K/V
+    traffic, so the rule stops there rather than at a measured crossover.
     """
-    if facts.thd:
+    if facts.thd and not _thd_decode_leg(caps, facts):
         return False
     if pack_gqa is None:
         pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
@@ -859,10 +862,12 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
     declines the same pair), there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
-    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked)."""
+    (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
+    A THD graph packs only on the decode tile's ragged-Q leg (the row base is
+    token-unit there, so the packed group composes with the ragged offset)."""
     return (
         True in caps.pack_gqas
-        and not facts.thd
+        and not (facts.thd and not _thd_decode_leg(caps, facts))
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
         and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
@@ -985,9 +990,15 @@ def _split_points(
     no_split = 1
     if not caps.split_kv_supported:
         return [no_split]
+    # The decode tile's ragged-Q leg (cga=1 on a THD-over-paged-KV graph at
+    # S_q(max) == 1): the combine places the ragged O / Stats rows, so the
+    # split path is the ONLY path -- the leading entry is at least 2 and there
+    # is no unsplit runner-up.  On the cga=2 prefill tile the same graph rides
+    # the THD leg, which packs its own flat grid and cannot split.
+    ragged_decode = facts.thd and cga == 1 and _thd_decode_leg(caps, facts)
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    if facts.thd or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+    if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
         return [no_split]
     if facts.has_epilogue_gate:
         # The fused O * sigmoid(G) epilogue lives in the unsplit kernel; the
@@ -1005,7 +1016,8 @@ def _split_points(
     # O dtype whatever it is, and the combine performs the only cast down to it.
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
-        return [no_split]
+        # The ragged-Q leg has no unsplit form: keep a legal split without the SM count.
+        return [2] if ragged_decode else [no_split]
     decode_pack_g = _decode_tile_pack_g(facts, pack_g)
     if _d256_decode_tile_selected(caps, facts, decode_pack_g):
         # The decode tile is a different machine from the one the prefill model
@@ -1063,6 +1075,9 @@ def _split_points(
         # KV) is unmeasured and timed slower on an SM100 board, so keep the
         # fitted answer there.
         split = min(split, _choose(physical=False))
+    if ragged_decode:
+        # No unsplit runner-up: the ragged final rows exist only through the combine.
+        return [max(split, 2)]
     if split <= 1:
         return [no_split]
     return [split, no_split]

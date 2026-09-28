@@ -160,8 +160,8 @@ reuse the same scratch for overlapping calls on different streams.
 From `test/python` in a GB300 or Rubin environment:
 
 ```bash
-pytest fe_api/dsa/test_DSA_aligned_hca_backward.py \
-    fe_api/dsa/test_DSA_aligned_hca_backward_boundaries.py -m 'L0 or L1'
+pytest deepseek_sparse_attention/cutedsl/test_DSA_aligned_hca_backward.py \
+    deepseek_sparse_attention/cutedsl/test_DSA_aligned_hca_backward_boundaries.py -m 'L0 or L1'
 ```
 
 Coverage includes reference gradients, changed-input graph replay, explicit

@@ -21,7 +21,7 @@ Two tiers, neither needs a cc 10.x device:
   asserted; only the SASS half is a SKIP when no candidate nvdisasm decodes the cubin.
 
 The kernel-vs-oracle ``torch.equal`` on a Rubin device belongs to the quantize kernel's own
-suite (``fe_api/gated_attention_block/test_quantize_fp4.py``); this module holds what that test
+suite (``gated_attention_block/cutedsl/test_quantize_fp4.py``); this module holds what that test
 takes as given.
 """
 
@@ -101,8 +101,8 @@ def e4m3_scale_emulation(amax: torch.Tensor) -> torch.Tensor:
 
 def _torchao_e2m1_codes(x: torch.Tensor) -> torch.Tensor:
     """The independent reference: torchao's ``_f32_to_floatx_unpacked(x, 2, 1)`` as vendored in
-    ``test/python/test_low_precision_matmul.py`` (path-loaded here, not collected)."""
-    path = os.path.join(_TEST_PYTHON, "test_low_precision_matmul.py")
+    ``test/python/gemm/graph/test_low_precision_matmul.py`` (path-loaded here, not collected)."""
+    path = os.path.join(_TEST_PYTHON, "gemm", "graph", "test_low_precision_matmul.py")
     if _TEST_PYTHON not in sys.path:
         sys.path.insert(0, _TEST_PYTHON)  # its ``import test_utils``
     spec = importlib.util.spec_from_file_location("_fp4_torchao_port_for_pointwise_test", path)

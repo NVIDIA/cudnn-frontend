@@ -105,6 +105,12 @@ class TemplateParams:
     # default budget.
     lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
+    # Ragged Q/O/Stats over PAGED K/V on the d128 DECODE tile (S_q(max) == 1):
+    # the Q row coordinate is the batch's ragged offset over the packed Q view
+    # and the split combine places the final O / Stats rows at their ragged
+    # offsets; the dense grid, PackGQA and the split path are all kept.  Not
+    # the prefill tile's THD leg (thd_varlen), which is mutually exclusive.
+    ragged_q: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
     # tiles stay full for GQA/MQA.  When G does not divide TILE_M the d128 and
@@ -231,8 +237,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) requires FP8 inputs")
         if flavor != "d128":
             raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) is only supported on d128")
-        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa:
-            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense, unsplit, unpacked graphs only")
+        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense (unpaged), unsplit, unpacked graphs only")
     if not fp8 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires DTYPE_O == DTYPE_QKV; got dtype_o={dtype_o}")
     if k.window_left is not None and k.window_left < 0:
@@ -291,13 +297,32 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.pack_gqa:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+    if k.ragged_q:
+        # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
+        # over the declared batch, Q rows at the ragged offsets, final O / Stats
+        # placed by the split combine -- so the split path is mandatory and the
+        # K/V side must be the page pools (a ragged K/V needs the THD leg).
+        if flavor != "d128" or k.cta_mma != 1:
+            raise ValueError(f"{flavor}: ragged_q is wired on the d128 decode tile only (cta_mma=1)")
+        if k.thd_varlen:
+            raise ValueError("d128 decode: ragged_q and thd_varlen are mutually exclusive")
+        if k.split_kv < 2:
+            raise ValueError("d128 decode: ragged_q rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2")
+        if not k.paged_kv:
+            raise ValueError("d128 decode: ragged_q serves ragged Q/O/Stats over PAGED K/V only")
+        if k.seq_q_lens_present:
+            raise ValueError("d128 decode: ragged_q derives per-sequence Q lengths from the ragged offsets; seq_q_lens_present is dense-only")
     if k.paged_kv:
         if flavor not in _PAGED_KV_FLAVORS:
             raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if fp8:
-            raise ValueError(f"{flavor}: paged_kv is wired for the f16/bf16 kernel only")
+        # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
+        # (wired on every native flavor), so
+        # the dtype family is NOT gated here: every kernel file WITHOUT the
+        # PAGED_KV specialization raises at module scope on paged_kv=True
+        # (next to its softmax_f16 guard), which is the backstop that cannot
+        # silently read a page pool as dense K/V.
         # A K/V tile is loaded as a stack of page-sized row boxes (or one box
         # inside a page when the page is taller than the tile). Either way a
         # box must never straddle a page, and the 128 B swizzle atom is 8 rows.
@@ -389,11 +414,10 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
     layout the kernels cannot bind zero-copy"; a caller that must tell the two
     apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback).  The rules are the kernels' own (``_fake_bshd`` in every
-    f16 / per-tensor-FP8 prefill kernel), restated here so the decision is made
-    BEFORE a compile rather than as a raise inside one -- and so the engine rows
+    copy fallback). The rules describe the kernels' TMA layout requirements,
+    checked before compilation so the engine rows
     (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter (``api_dsl.SdpaFwdDsl._bshd_zero_copy_stride``)
+    and the standalone adapter's admission and prepared binder
     judge a layout with ONE function (rule 8b lockstep):
 
       * the head dim is innermost-contiguous (stride 1);
@@ -1484,8 +1508,8 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             "d128: O_BLOCK_SCALE / O_PACK_DIV must follow DTYPE_O",
         ),
         (
-            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA),
-            "d128: block-scaled O serves dense, unsplit, unpacked graphs only",
+            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.PAGED_KV),
+            "d128: block-scaled O serves dense (unpaged), unsplit, unpacked graphs only",
         ),
     )
     for ok, msg in checks:
@@ -1622,6 +1646,11 @@ class CfgD128Decode(CfgD128):
     # 4 softmax + 4 corr + 1 MMA + 1 TMALDG + 1 TMASTG = 11 arrivers (cga1).
     READ_TILE_ARRIVERS: int = 11
 
+    # Ragged Q/O/Stats over paged K/V (TemplateParams.ragged_q): the TMA-LDG
+    # warp reads the batch's Q ragged offset as the row coordinate over the
+    # packed Q view; the combine places the final rows.  Split path mandatory.
+    RAGGED_Q: int = 0
+
 
 def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
     """Consistency checks on the d128 decode-tile geometry."""
@@ -1653,7 +1682,11 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d128 decode: dense graphs only (THD keeps the prefill tile)"),
+        (cfg.THD_VARLEN == 0, "d128 decode: no THD_VARLEN leg (ragged Q over paged K/V rides RAGGED_Q; other THD keeps the prefill tile)"),
+        (
+            cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
+            "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
+        ),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
             "d128 decode: 128 B swizzle on every operand",
@@ -1668,8 +1701,9 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     """Config for ``sm100/decode_d128_f16.py`` -- the d128 flavor at ``cta_mma=1``.
 
     Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
-    cga=1 on dense graphs only, and the adapter routes exactly that
-    combination here; anything else raising below is a gap in those gates.
+    cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
+    S_q(max) == 1), and the adapter routes exactly those combinations here;
+    anything else raising below is a gap in those gates.
     """
     _validate_params("d128", params)
     if params.cta_mma != 1:
@@ -1677,7 +1711,9 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
     if params.thd_varlen:
-        raise ValueError("d128 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+        raise ValueError(
+            "d128 decode: the THD_VARLEN leg is not wired on the decode tile (ragged Q over paged K/V rides ragged_q; other THD keeps the prefill tile)"
+        )
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
@@ -1713,6 +1749,7 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
         PACK_G=_pack_g(params, CfgD128Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
+        RAGGED_Q=int(params.ragged_q),
     )
     _validate_cfg_d128_decode(cfg)
     return cfg, _tma_iters(cfg)
@@ -1827,10 +1864,21 @@ def canonicalize_d192_lowering(
     template_window_right = window_right
     if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-        # MASK_NONE x32 path. 1 << 30 exceeds any dense D192 sequence that
-        # fits in SM100 memory while leaving signed-int32 headroom for q + R;
-        # it preserves the lowering without making the module key depend on S_kv.
-        template_window_right = 1 << 30
+        # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
+        # right band no sequence reaches.  The band is a compile-time
+        # `window_right` at the kernel's mask sites, so it must sit INSIDE the
+        # bit-word mask op's Int32 domain: `apply_mask_chunk` raises at trace
+        # time from MASK_BOUND_LIMIT (1 << 30) on, and a trace-time raise is a
+        # typed decline at engine.build_plan -- the former `1 << 30` dropped the
+        # FROST fp8 row out of every dense per-tensor d192 graph once the kernels
+        # masked in the bit-word form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
+        # sequence that fits in SM100 memory while leaving signed-int32 headroom
+        # for q + R, and keeps the module key independent of S_kv.  Imported here,
+        # not at module level: tile_dsl.mask imports cutlass, which stays off the
+        # eligibility path (this runs in the lowering, right before the compile).
+        from cudnn.frost.tile_dsl.mask import MASK_BOUND_LIMIT
+
+        template_window_right = MASK_BOUND_LIMIT - 1
 
     template_bottom_right = False if d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params.bottom_right
 

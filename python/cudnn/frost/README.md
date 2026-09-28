@@ -334,7 +334,20 @@ python/cudnn/
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
         thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
-    bwd/                        future: same shape, its own api_dsl.py
+    bwd/                        same shape, its own api_dsl.py / engines.py /
+                                config_sm*.py
+      kernels/                  one package per ARCH LINE, like fwd/
+        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
+        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
+        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
+                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/bprop_chain_f16.py      its launch chain (dot, dq2k, converts,
+                                      reduce, dsink)
+        bprop_matmul_blackwell.py SHARED stage-3 GEMM: codegen targets span
+                                  SM100/SM103/SM107/SM110, so it sits ABOVE
+                                  the arch packages like _common_blackwell.py
+        thd_helpers.py            SHARED by sm80/ + the sm100 chain
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
@@ -364,8 +377,8 @@ arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
 file sits in always names its only owner, and a file inside `sm107/` can be
 changed without asking who else imports it.
 
-A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
-coverage matrix on one screen.
+A new reader should be able to list `sdpa/fwd/kernels/*/` (or
+`sdpa/bwd/kernels/*/`) and see the whole coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 

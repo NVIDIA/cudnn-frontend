@@ -60,9 +60,17 @@ r // PACK_G, head r % PACK_G -- the whole group when it divides 128, else its
 largest divisor that does: partial PackGQA, 96/8 packs 4 of its 12 heads and
 three packed heads read one KV head), KV split with fp32 partials for
 ``sm100/split_combine.py``,
-and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  THD is
-NOT wired: the decode tile is dense-only (``make_cfg_d128_decode`` rejects it and
-the engine row declines cga=1 for THD graphs).
+and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  The
+prefill tile's THD leg (``THD_VARLEN``: device-built metadata, per-sequence O
+descriptors, the live-unit scheduler) is NOT wired here.  Ragged Q/O/Stats over
+PAGED K/V at ``S_q(max) == 1`` -- FlashInfer's prefill-style graph at one token
+per sequence -- rides ``CFG.RAGGED_Q`` instead: the dense grid stays (one unit
+per (packed head, batch, split)), the TMA-LDG warp reads this batch's Q ragged
+offset on device and uses it as the row coordinate over the packed ``[1, T, H,
+D]`` Q view, and the split path is mandatory so O/Stats never leave this kernel
+as final rows: the fp32 partials stay dense in the workspace and
+``sm100/split_combine.py`` places the recombined rows at the O/Stats ragged
+offsets (``make_cfg_d128_decode`` enforces ``split_kv > 1`` and ``paged_kv``).
 
 Selection: the (128, 128) f16/bf16 flavor at ``TILE_CGA_M=1`` IS this tile
 (``api_dsl._load_sm100_kernel_module``); the heuristics propose cga=1 exactly
@@ -155,12 +163,21 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_classic_bars,
     row_max_for_exp2,
     make_sdpa_helpers,
+    _bshd as _bshd_view,
 )
 
 if CFG.CTA_MMA != 1 or CFG.TILES_Q != 1 or CFG.THD_VARLEN:
     # make_cfg_d128_decode already enforces this; the module-level check keeps
-    # the body's assumptions (no peer CTA, one sub-tile, dense) visible.
-    raise ValueError("decode_d128_f16_sm100: the decode tile is cga1, TILES_Q=1 and dense-only")
+    # the body's assumptions (no peer CTA, one sub-tile, no THD leg) visible.
+    raise ValueError("decode_d128_f16_sm100: the decode tile is cga1, TILES_Q=1 and carries no THD_VARLEN leg")
+
+# Ragged Q over paged K/V (see the module docstring): the Q row coordinate is
+# this batch's ragged offset (int32 elements / RAGGED_Q_DIV = tokens) over the
+# packed [1, T, H, D] view; the partials stay dense and the combine pass owns
+# the ragged O/Stats placement, so the split path is mandatory.
+RAGGED_Q = bool(getattr(CFG, "RAGGED_Q", 0))
+if RAGGED_Q and (CFG.SPLIT_KV < 2 or not CFG.PAGED_KV):
+    raise ValueError("decode_d128_f16_sm100: RAGGED_Q rides the split path over paged K/V (split_kv > 1, paged_kv)")
 
 CGA_SIZE = 1
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_1
@@ -286,9 +303,15 @@ def _kernel(
     # one for V. None (folded out of the ABI) unless CFG.PAGED_KV.
     block_table_tensor: Optional[cute.Tensor] = None,
     block_table_v_tensor: Optional[cute.Tensor] = None,
+    # Ragged Q (CFG.RAGGED_Q): (B+1,) Q ragged offsets in elements (int32, or
+    # int64 under ragged_q_i64) and the elements-per-token divisor
+    # (H_q * D / multiplier); reads fold out unless the flag is set.
+    ragged_q_addr: cutlass.Int64 = 0,
+    ragged_q_div: cutlass.Int32 = 1,
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
+    ragged_q_i64: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -494,6 +517,9 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            ragged_q_addr=ragged_q_addr,
+            ragged_q_div=ragged_q_div,
+            ragged_q_i64=ragged_q_i64,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -587,6 +613,9 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    ragged_q_addr: cutlass.Int64 = 0,
+    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_i64: cutlass.Constexpr[bool] = False,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
     q_empty_phase = cutlass.Int32(1)
@@ -670,9 +699,25 @@ def _tmaldg_warp_group(
             mb_q_reload[0].wait(q_empty_phase)
             bars.mb_qo_slab_free[0].arrive()
             bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=nvvm.elect_sync())
+            # Ragged Q: the batch's first token row is its ragged offset over
+            # the packed [1, T, H, D] view (batch coord 0); a sequence past the
+            # view's token extent zero-fills through TMA OOB.  Dense: the
+            # (B, H, S, D) descriptor's batch coord.
+            q_seq_off = cutlass.Int32(0)
+            q_tma_batch = batch_idx
+            if cutlass.const_expr(RAGGED_Q):
+                # Divide in 64 bits: an element offset can exceed 2^31 on a large packed buffer.
+                if cutlass.const_expr(ragged_q_i64):
+                    _rq = cute.make_tensor(cute.make_ptr(cutlass.Int64, ragged_q_addr, cute.AddressSpace.gmem, assumed_align=8), cute.make_layout(1 << 24))
+                    _q_off64 = cutlass.Int64(_rq[batch_idx])
+                else:
+                    _rq = cute.make_tensor(cute.make_ptr(cutlass.Int32, ragged_q_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))
+                    _q_off64 = cutlass.Int64(cutlass.Int32(_rq[batch_idx]))
+                q_seq_off = cute.arch.make_warp_uniform(cutlass.Int32(_q_off64 // cutlass.Int64(ragged_q_div)))
+                q_tma_batch = cutlass.Int32(0)
             tma_load_tile(
                 sQ[0],
-                tma_q(cutlass.Int32(0), q_head_idx, q_row_base, batch_idx),
+                tma_q(cutlass.Int32(0), q_head_idx, q_row_base + q_seq_off, q_tma_batch),
                 bars.mb_q_full[0].smem_ptr,
                 cta_group=1,
                 mcast_mask=tma_mcast_mask,
@@ -1790,6 +1835,9 @@ def _launch(
     block_table_tensor: Optional[cute.Tensor],
     block_table_v_tensor: Optional[cute.Tensor],
     paged_hnd: cutlass.Constexpr[bool],
+    ragged_q_addr: cutlass.Int64,
+    ragged_q_div: cutlass.Int32,
+    ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """TMA construction and launch for the explicit pointer host entry."""
@@ -1881,7 +1929,10 @@ def _launch(
         o_partial_f32,
         block_table_tensor,
         block_table_v_tensor,
+        ragged_q_addr,
+        ragged_q_div,
         paged_hnd,
+        ragged_q_i64,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -1918,16 +1969,23 @@ def _host(
     block_table_v_ptr: Optional[cute.Pointer],
     table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
+    ragged_q_addr: cutlass.Int64,
+    ragged_q_div: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
 
     The private raw entry assumes validated operands, including the compiled GQA
     ratio. Graph/adapter calls bind through prepared.py; direct tests use launch_f16.
+
+    ``ragged_q_addr`` / ``ragged_q_div`` (CFG.RAGGED_Q only): the (B+1,) int32 Q
+    ragged offsets and the elements-per-token divisor; ``problem_size[5]`` then
+    carries the packed Q view's token capacity (0 and unused otherwise).
     """
     (
         q_tensor,
@@ -1976,6 +2034,10 @@ def _host(
         table_strides=table_strides,
         n_pages=n_pages,
     )
+    if cutlass.const_expr(RAGGED_Q):
+        # The packed [1, T, H, D] Q view (token capacity in problem_size[5]);
+        # the row coordinate is the batch's ragged offset (TMA-LDG warp).
+        q_tensor = _bshd_view(q_ptr, 1, problem_size[5], problem_size[1], d_qk, q_strides, True)
 
     _launch(
         q_tensor,
@@ -1993,12 +2055,17 @@ def _host(
         block_table_tensor,
         block_table_v_tensor,
         paged_hnd,
+        ragged_q_addr,
+        ragged_q_div,
+        ragged_q_i64,
         stream,
     )
 
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
-LSE_KINDS = ("dense",)  # the decode tile never serves THD
+# The decode tile's in-kernel Stats are always the dense (B[*split], H, S_q) form: on the
+# ragged-Q leg they are the split-major partial slab and the combine writes the ragged rows.
+LSE_KINDS = ("dense",)
 
 
 @lru_cache(maxsize=None)
@@ -2008,11 +2075,15 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    ragged_i64: bool = False,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
-    are runtime arguments; head-dim envelopes, Stats presence and pool layout
-    are specializations. All stride fakes, including page tables, are Int64."""
+    are runtime arguments; head-dim envelopes, Stats presence, pool layout and the
+    ragged-Q offset width (``ragged_i64``: int64 offsets; int32 otherwise -- CFG.RAGGED_Q
+    only) are specializations. All stride fakes, including page tables, are Int64."""
     _cache_key = _template_key(globals(), locals(), "compile")
+    if ragged_i64 and not RAGGED_Q:
+        raise ValueError("ragged_i64 is a RAGGED_Q specialization")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -2058,10 +2129,13 @@ def compile(  # noqa: A001
         P(cutlass.Int32, 4) if PAGED_KV else None,
         (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
+        cutlass.Int64(0),
+        i32,
         d_qk,
         d_v,
         lse_kind,
         paged_hnd,
+        bool(ragged_i64),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

@@ -953,6 +953,17 @@ def _f8_128x4_row_scale_index_expr(row: str, scale_col: str, n_col_quads: str, *
     return f"{prefix}(({row} // 128) * {n_col_quads} + ({scale_col} // 4)) * 512 + " f"({row} % 32) * 16 + (({row} % 128) // 32) * 4 + ({scale_col} % 4)"
 
 
+def _e8m0_f32(bits: str, *, reciprocal: bool = False) -> str:
+    """Widen a scale or its exact reciprocal without flushing subnormals.
+
+    E8M0 byte 0 is 2**-127; byte 255 is NaN. The reciprocal exponent
+    is 254-byte, with byte 254 producing the FP32 subnormal 2**-127.
+    """
+    exponent = f"(254 - {bits})" if reciprocal else bits
+    special = f"({bits} >= 254)" if reciprocal else f"(({bits} == 0) | ({bits} == 255))"
+    return f"(({exponent} << 23) | ({special}.to(cutlass.Int32) << 22)).bitcast(cutlass.Float32)"
+
+
 def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
     """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
     value back as fp32 — the data is divided by what was actually written, not
@@ -961,14 +972,14 @@ def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: s
     E4M3 round-trips through the DSL ``.to()``. The other two reach the cvt unit
     through the helpers :func:`compiler._quant_device_imports` emits (which
     documents why their ``.to()`` is not usable), and read the byte back as
-    ``byte << 23`` for ue8m0 — a bare exponent, so that IS the fp32, and byte 0
-    is 0.0 — or through the paired widening helper for ue5m3."""
+    the exact exponent encoding for ue8m0, including its minimum scale at
+    byte 0, or through the paired widening helper for ue5m3."""
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     if quant.scale_dtype == "fp8_e8m0":
         return [
             f"{p}_qb{sfx} = _frost_cvt_f32_to_e8m0_bits({src})",
             f"{scale_var} = (({p}_qb{sfx}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{back_var} = ({p}_qb{sfx} << 23).bitcast(cutlass.Float32)",
+            f"{back_var} = {_e8m0_f32(f'{p}_qb{sfx}')}",
         ]
     if quant.scale_dtype == "fp8_e5m3":
         return [
@@ -1000,9 +1011,9 @@ def _emit_scale_quantize_pair(p: str, a: tuple[str, str, str, str], b: tuple[str
     if quant.scale_dtype == "fp8_e8m0":
         return lines + [
             f"{scalea} = (({p}_qb{sa}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{backa} = ({p}_qb{sa} << 23).bitcast(cutlass.Float32)",
+            f"{backa} = {_e8m0_f32(f'{p}_qb{sa}')}",
             f"{scaleb} = (({p}_qb{sb}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{backb} = ({p}_qb{sb} << 23).bitcast(cutlass.Float32)",
+            f"{backb} = {_e8m0_f32(f'{p}_qb{sb}')}",
         ]
     return lines + [
         f"{scalea} = ({p}_qb{sa}).to({scale_dtype})",
@@ -1092,14 +1103,23 @@ def _emit_block_quant_col(
     # still share one vector reciprocal/min pipeline.  Keeping that pipeline as
     # TensorSSA gives the backend the same four-wide scheduling opportunity as
     # the specialized Rubin epilogue without changing RP/SATFINITE semantics.
-    lines.extend(
-        [
-            f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
-            *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
-            f"    {p}_upv = {p}_up4.load()",
-            f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
-        ]
-    )
+    if quant.scale_dtype == "fp8_e8m0":
+        lines.extend(
+            [
+                f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+                *(f"    {p}_up4[{i}] = {_e8m0_f32(f'{p}_qbb{i}', reciprocal=True)}" for i in range(4)),
+                f"    {p}_iv = {p}_up4.load()",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+                *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
+                f"    {p}_upv = {p}_up4.load()",
+                f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
+            ]
+        )
     for lane_in_batch in range(0, 4, 2):
         other = lane_in_batch + 1
         lines.extend(
@@ -1225,7 +1245,10 @@ def _emit_block_quant(
         lines.append(f"{p}_amax{k} = {p}_abs[None, {k}].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
         lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
-        lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
+        if quant.scale_dtype == "fp8_e8m0":
+            lines.append(f"{p}_inv{k} = {_e8m0_f32(f'{p}_qb{k}', reciprocal=True)}")
+        else:
+            lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
         for e in range(0, bs, 2):
             lines.append(
                 f"{p}_out[{base + e}], {p}_out[{base + e + 1}] = cute.arch.mul_packed_f32x2("
@@ -1305,6 +1328,11 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
         if chain is None or not chain.quants:
             raise AssertionError("quant scale tap requires FusionChain context")
         q = chain.quants[int(tap.source.rsplit("_", 1)[1])]
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        if q.grouped_by_moe and ((q.axis == 1) == swapped):
+            # The scheduler computes the segmented row prefix at runtime.
+            # Capacity belongs to the caller's allocation, not the JIT shape.
+            return "(cute.sym_int64(), cute.sym_int64(), 1)"
         b, m, n = q.scale_dim or (
             chain.matmul.batch,
             chain.matmul.M,

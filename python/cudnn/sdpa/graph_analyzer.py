@@ -224,13 +224,12 @@ _ELEM_BYTES = {
 def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     """Whether a rank-4 logical (B, H, S, D) tensor is one the fused-gate kernels
     can TMA-load ZERO-COPY: BSHD-compact, or a declared BSHD layout TMA can
-    express.  The exact twin of ``api_dsl._bshd_zero_copy_stride`` (None ==
-    compact or inexpressible; the adapter tells the two apart and RAISES on the
-    second), restated on IR dim/stride so the row declines what the adapter
-    would reject:
+    express. Uses the shared ``config_sm100.bshd_zero_copy_stride`` predicate,
+    distinguishing compact from inexpressible geometry so the row declines
+    what the adapter would reject:
 
       * head dim innermost-contiguous (stride 1);
-      * seq and head strides 16-byte multiples (they are TMA global strides);
+      * every stepped batch, seq and head stride is a 16-byte multiple;
       * the declaration COVERS the tensor (head >= d, seq >= h*head,
         batch >= s*seq) -- an overlapping declaration aliases distinct rows.
 
@@ -241,18 +240,10 @@ def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     """
     if len(dim) != 4 or len(stride) != 4:
         return False
-    b, h, s, d = (int(x) for x in dim)
-    bs, hs, ss, es = (int(x) for x in stride)  # BHSD-logical strides
-    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return True  # BSHD-compact
-    if es != 1:
-        return False
-    per16 = 16 // max(1, int(elem_bytes))
-    if ss % per16 or hs % per16:
-        return False
-    if hs < d or ss < h * hs or bs < s * ss:
-        return False
-    return True
+    from cudnn.sdpa.fwd.config_sm100 import bshd_compact, bshd_zero_copy_stride
+
+    dim, stride = tuple(int(x) for x in dim), tuple(int(x) for x in stride)
+    return bshd_compact(dim, stride) or bshd_zero_copy_stride(dim, stride, max(1, int(elem_bytes))) is not None
 
 
 @dataclass(frozen=True)
@@ -467,7 +458,7 @@ class SdpaGraphFacts:
     # fallback (Q/K/V/O do), so the standalone adapter's check_support raises on
     # anything else -- this fact lets the row DECLINE the same G by message
     # instead of admitting a plan that dies in the lowering (rule 8b).  Mirrors
-    # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
+    # the shared config_sm100 layout predicate (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
 
@@ -1095,6 +1086,12 @@ class SdpaBinding:
     # Epilogue gate G (the sdpa -> sigmoid(G) -> mul tail): a REQUIRED bound
     # operand of the fused kernel.  The tail's virtual O_v / s are never bound.
     gate: Any = None
+    # THD ragged-offset tensors of Q / O / Stats ((B+1,) int32): bound operands
+    # of the SM100 decode tile's ragged-Q leg, which reads them on device as the
+    # packed row bases.  Every other lowering leaves them unbound.
+    ragged_q: Any = None
+    ragged_o: Any = None
+    ragged_stats: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -1157,6 +1154,9 @@ class SdpaBinding:
                 self.sf_dO,
                 self.sf_dO_T,
                 self.gate,
+                self.ragged_q,
+                self.ragged_o,
+                self.ragged_stats,
             )
             if t is not None
         ]
@@ -1262,96 +1262,3 @@ def adapter_mask_args(facts: "SdpaGraphFacts") -> dict:
         window_size=(win_left, win_right),
         causal_bottom_right=bottom_right,
     )
-
-
-@dataclass
-class FeatureOperands:
-    """The optional feature operands of one sdpa graph, resolved from a
-    variant pack.  Raw buffers exactly as the caller provided them; each
-    lowering applies its own normalization on top."""
-
-    bias: Any = None
-    sinks: Any = None
-    seq_kv_lens: Any = None
-    seq_len_q: Any = None
-    block_mask: Any = None
-    alibi: bool = False
-    gate: Any = None  # epilogue gate G (facts.has_epilogue_gate)
-
-
-def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> FeatureOperands:
-    """Presence-checked resolution of the feature operands the facts demand.
-
-    A feature the graph requests whose buffer is absent from the variant pack
-    is an error here — every lowering would otherwise fail later and worse
-    (a silently-dense mask, a null-deref in the kernel host code).
-    """
-
-    def _need(t_ref, label):
-        buf = resolved.get(id(t_ref)) if t_ref is not None else None
-        if buf is None:
-            raise ValueError(f"cudnn.sdpa: {label} requested but no buffer was provided")
-        return buf
-
-    ops = FeatureOperands(alibi=facts.has_alibi)
-    if facts.padded:
-        # Either length form satisfies a side: per-batch seq_len_* or the
-        # (B+1,) cu_seq_len_* prefix sums (cuDNN 9.24+) — the cu buffer
-        # travels through the same operand slot (the adapter was constructed
-        # knowing the form).
-        if facts.cu_seq_kv_t is not None:
-            ops.seq_kv_lens = _need(facts.cu_seq_kv_t, "padding mask (cu_seq_len_kv)")
-        else:
-            ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
-        if facts.cu_seq_q_t is not None:
-            ops.seq_len_q = _need(facts.cu_seq_q_t, "per-batch query lengths (cu_seq_len_q)")
-        elif facts.seq_q_t is not None:
-            ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
-    if facts.has_bias:
-        ops.bias = _need(facts.bias_t, "bias")
-    if facts.has_sink:
-        ops.sinks = _need(facts.sink_t, "sink_token")
-    if facts.has_block_mask:
-        ops.block_mask = _need(facts.block_mask_t, "block_mask")
-    if facts.has_epilogue_gate:
-        ops.gate = _need(facts.epilogue_gate_t, "epilogue gate G")
-    return ops
-
-
-def adapter_feature_buffers(facts: "SdpaGraphFacts", resolved: dict) -> dict:
-    """:func:`resolve_feature_operands` mapped onto the standalone adapters'
-    kwarg vocabulary, with the flat-tensor normalization their kernels expect."""
-    ops = resolve_feature_operands(facts, resolved)
-    out: dict = {}
-    # Dtypes are facts-gated (seq lens int32, sinks fp32): pure views only —
-    # a .to() here would allocate and launch a cast kernel per execute.
-    if ops.seq_kv_lens is not None:
-        out["seq_kv_lens"] = ops.seq_kv_lens.reshape(-1)
-    if ops.seq_len_q is not None:
-        out["seq_len_q"] = ops.seq_len_q.reshape(-1)
-    if ops.bias is not None:
-        out["bias_tensor"] = ops.bias
-    if ops.sinks is not None:
-        out["sinks"] = ops.sinks.reshape(-1)
-    if ops.block_mask is not None:
-        out["block_mask"] = ops.block_mask
-    if ops.alibi:
-        out["alibi"] = True
-    if ops.gate is not None:
-        out["gate"] = ops.gate
-    return out
-
-
-def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
-    """BSHD-physical (stride order 3,1,2,0) copy of a rank-4 BHSD-logical
-    tensor; zero-copy when the buffer already is.  Delivers the dense_flex
-    layout relaxation for lowerings whose adapters require this order
-    (mirrors the DSL executor's canonical-buffer gather)."""
-    strides = t.stride()
-    # already BSHD-physical (size-1 dims wildcarded): D innermost, then H, S, B
-    order = sorted(range(4), key=lambda i: (strides[i], t.shape[i]))
-    act = tuple(ax for ax in order if t.shape[ax] != 1)
-    exp = tuple(ax for ax in (3, 1, 2, 0) if t.shape[ax] != 1)
-    if act == exp:
-        return t
-    return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)

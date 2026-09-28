@@ -165,4 +165,4 @@ graph.execute(
 
 ## Tests
 
-- **`test/python/test_sm100_rms_norm_silu_graph_api.py`** — Full 120-config sweep (bf16 + FP8 + NVFP4) of the optimized problem shapes for VAE on B200
+- **`test/python/norm/graph/test_sm100_rms_norm_silu_graph_api.py`** — Full 120-config sweep (bf16 + FP8 + NVFP4) of the optimized problem shapes for VAE on B200

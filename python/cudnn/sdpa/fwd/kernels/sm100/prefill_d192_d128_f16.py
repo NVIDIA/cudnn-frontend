@@ -128,6 +128,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_SWA,
 )
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
@@ -610,46 +611,6 @@ def _softmax_next_payload(
         segments[2],
         segments[3],
     )
-
-
-@cute.jit
-def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        # Right-band widening: the causal upper limit sits BAND_RIGHT columns
-        # right of the diagonal (cuDNN diagonal_band_right_bound).
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
-
-
-@cute.jit
-def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs + causal_diag - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
 
 
 @cute.jit
@@ -2106,33 +2067,54 @@ def _softmax_kv_body(
             if cutlass.const_expr(CFG.BOTTOM_RIGHT):
                 mask_q_abs = mask_q_abs + causal_diag
             mask_q_abs = cute.math.min(mask_q_abs, eff_seqlen_kv - cutlass.Int32(1))
+            # Causal + padded as ONE causal edge: kv > min(q (+ diag), seq_kv - 1) masks
+            # exactly the causal OR padded set, so the chunk sees a top-left causal mask
+            # anchored at mask_q_abs (WINDOW_RIGHT == 0 in this arm by _PADDED_CAUSAL).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     mask_q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
+            # Top-left causal (+ the compile-time right band, cuDNN diagonal_band_right_bound).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
+            # Bottom-right causal: the diagonal sits causal_diag = S_kv - S_q columns right of top-left.
             chunks_S = [
-                _apply_bottom_right_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
-                    causal_diag,
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    bottom_right=CFG.BOTTOM_RIGHT,
+                    causal_diag=causal_diag,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -3131,7 +3113,7 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
             n_thd_units,  # persistent cluster count; also seeds the claim counter
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to

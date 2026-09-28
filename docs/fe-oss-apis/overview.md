@@ -11,6 +11,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
+- [Kimi Delta Attention in JAX](kda_jax.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)
@@ -48,6 +49,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [NVFP4 Block-Scale Conversion](nvfp4_block_scale_conversion.md)
 - [DSv4.1 mHC projection/RMS backward](gemm_fusions/mhc_projection_bwd.md)
 
 ## Installation and setup
@@ -162,4 +164,4 @@ Methods:
 ## File structure and examples
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
-- Correctness tests/samples are implemented in the `test/python/fe_api` directory.
+- Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).

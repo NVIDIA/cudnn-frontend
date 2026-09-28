@@ -51,9 +51,17 @@ For select engines, cuDNN now provides a way to directly build a CUDA graph (not
 
 Engines supporting these APIs have the behavior note `CUDNN_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API`.
 
-Both the C++ and Pyhton APIs consist of two functions:
+Both the C++ and Python APIs consist of two functions:
 
   - `populate_cuda_graph()`
   - `update_cuda_graph()`
 
 For an example usage of these functions in C++, refer to the [cudagraphs.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/cpp/misc/cudagraphs.cpp) sample.
+
+### Lifetime of the execution plan
+
+A CUDA graph recorded from a frontend graph, whether through `populate_cuda_graph()`/`update_cuda_graph()` or through CUDA stream capture around `execute()`, keeps launching that graph's execution plan for as long as the CUDA graph, any clone of it, or any `cudaGraphExec_t` instantiated from it exists. The frontend therefore gives the CUDA graph a reference to the execution plan (a CUDA user object), so the plan and the kernel code it owns stay alive until the last such CUDA graph is destroyed, even if the application destroys the frontend graph first. No action is needed from the application; in particular it is safe to drop the frontend graph right after recording. Note that cuDNN releases runtime-compiled kernel code together with the execution plan, so without this reference a replay after the frontend graph was destroyed could run stale code.
+
+The plan is released on the next `execute()` that is not being captured (releasing it during a capture would invalidate the capture). An application that records a graph and never executes through the frontend again keeps that plan alive until process exit.
+
+The reference is a CUDA user object attached to the CUDA graph. CUDA graphs that carry user objects take a slightly slower launch path; on tiny graphs this has been measured at roughly 1-2 microseconds of additional replay latency per launch (H100, CUDA 13), which is negligible for graphs of realistic size but visible in micro-benchmarks that replay a single small kernel.

@@ -29,6 +29,7 @@ cudnn = pytest.importorskip("cudnn")
 la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 
 import torch.nn.functional as F  # noqa: E402
+import torch.utils.checkpoint  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
@@ -785,6 +786,28 @@ def test_bwd_gqa_qk_l2norm(backend, variant, H, HK, HV, V):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_varlen(backend, variant, seq_lens):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=seq_lens))
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_under_nonreentrant_activation_checkpoint(backend, variant):
+    """Saved-tensor hooks may be unpacked only once during checkpoint replay."""
+    case = make_case(variant, torch.bfloat16, T=128, H=1)
+    leaves = [value.detach().clone().requires_grad_(True) for value in thd_tensors(case)]
+
+    def forward(*values):
+        output, _ = pinned_op(backend, variant)(*values, *op_tail(case))
+        return output
+
+    with waive_unsupported(backend, variant):
+        output = torch.utils.checkpoint.checkpoint(
+            forward,
+            *leaves,
+            use_reentrant=False,
+        )
+        output.float().square().mean().backward()
+
+    assert all(value.grad is not None for value in leaves)
 
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
@@ -3343,15 +3366,49 @@ def assert_chain_grads_close(got, want, label="chain-vs-uncut"):
         assert_rms_close(f"d{name} {label}", g, want[name].float(), tol)
 
 
-def chain_reference_grads(case, state0, dO, d_final):
-    """fp64 gradients of every leaf and the initial state under ``dO`` and ``d_final``."""
-    ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in case_tensors(case).items()}
-    state0_ref = state0.detach().double().requires_grad_(True)
-    o_ref, fs_ref = reference_call(case.variant, ref_leaves, case.n, initial_state=state0_ref, cu_seqlens=case.cu)
-    grads = torch.autograd.grad(
-        [o_ref, fs_ref], list(ref_leaves.values()) + [state0_ref], [dO.double().reshape(o_ref.shape), d_final.double().reshape(fs_ref.shape)]
-    )
-    return dict(zip(list(ref_leaves) + ["initial_state"], grads))
+def chain_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
+    """fp64 gradients with bounded recurrent autograd storage for independent heads.
+
+    The production case still uses every head at once. Only its reference is
+    split: retaining a K x V state per token and head can otherwise exhaust
+    device memory when the reverse-band case scales H with the SM count.
+    Grouped heads retain the whole reference so shared-input reductions keep
+    their original order.
+    """
+    tensors = case_tensors(case)
+    chunk = head_chunk_size if case.H == case.HK == case.HV == case.HO else case.HO
+    dO = dO.reshape(case.B, case.T, case.HO, case.V)
+    pieces = []
+    for start in range(0, case.HO, chunk):
+        end = min(start + chunk, case.HO)
+        ref_leaves = {name: t[:, :, start:end].detach().double().requires_grad_(True) for name, t in tensors.items()}
+        state0_ref = state0[:, start:end].detach().double().requires_grad_(True)
+        o_ref, fs_ref = reference_call(case.variant, ref_leaves, case.n, initial_state=state0_ref, cu_seqlens=case.cu)
+        grads = torch.autograd.grad(
+            [o_ref, fs_ref],
+            list(ref_leaves.values()) + [state0_ref],
+            [dO[:, :, start:end].double(), d_final[:, start:end].double()],
+        )
+        pieces.append(dict(zip(list(ref_leaves) + ["initial_state"], grads)))
+    if len(pieces) == 1:
+        return pieces[0]
+    return {name: torch.cat([part[name] for part in pieces], dim=1 if name == "initial_state" else 2) for name in pieces[0]}
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("grouped", [False, True], ids=["independent", "grouped"])
+def test_chain_reference_head_chunks_match_whole(variant, grouped):
+    """Preserve every fp64 gradient, including empty sequences and a partial head chunk."""
+    n = HOUSEHOLDER if variant in HOUSEHOLDER_VARIANTS else 1
+    heads = dict(H=10, HK=2, HV=2) if grouped else dict(H=10 * n)
+    case = chain_case(variant, [17, 0, 23], K=8, V=16, **heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    dO = torch.randn(case.B * case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    whole = chain_reference_grads(case, state0, dO, d_final, head_chunk_size=case.HO)
+    chunked = chain_reference_grads(case, state0, dO, d_final)
+    assert chunked.keys() == whole.keys()
+    for name in whole:
+        torch.testing.assert_close(chunked[name], whole[name], rtol=1e-10, atol=1e-12, msg=lambda msg: f"d{name}: {msg}")
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)

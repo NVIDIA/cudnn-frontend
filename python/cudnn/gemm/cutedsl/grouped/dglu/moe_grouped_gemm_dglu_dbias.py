@@ -132,6 +132,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
+        geglu_alpha: float = 1.702,
+        glu_clamp_max: float = 7.0,
+        glu_clamp_min: float = -7.0,
+        round_dgrad_to_input_dtype: bool = False,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -208,6 +212,10 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.weight_mode = weight_mode
 
         self.act_func = act_func
+        self.geglu_alpha = geglu_alpha
+        self.glu_clamp_max = glu_clamp_max
+        self.glu_clamp_min = glu_clamp_min
+        self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
 
     def _setup_attributes(self):
         """Set up input-dependent BF16 GEMM attributes."""
@@ -436,6 +444,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         dbias_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        activation: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -449,6 +458,12 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type  # B must match A dtype
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
+        self.generate_activation = activation is not None
+        if cutlass.const_expr(self.generate_activation):
+            if cutlass.const_expr(self.act_func != "dgeglu" or self.c_dtype != cutlass.BFloat16 or self.d_dtype != cutlass.BFloat16):
+                raise ValueError("activation output requires BF16 C/D and dgeglu")
+            if cutlass.const_expr(activation.element_type != cutlass.BFloat16):
+                raise ValueError("activation output must be BF16")
         self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
@@ -662,6 +677,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             self.d_smem_layout_staged,
             self.epi_tile,
             self.sched_params,
+            activation,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -792,6 +808,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     rnd="rn",
                     ftz=False,
                 )
+                if cutlass.const_expr(self.round_dgrad_to_input_dtype):
+                    acc_vec[i] = acc_vec[i].to(self.a_dtype).to(self.acc_dtype)
+                    acc_vec[i + 1] = acc_vec[i + 1].to(self.a_dtype).to(self.acc_dtype)
                 ab1_vec_acc_type = cute.arch.mul_packed_f32x2(
                     (
                         ab1_vec_load[i + 0].to(self.acc_dtype),
@@ -923,6 +942,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             ab2_vec_load = ab2_vec_load.load()
 
             acc_vec = acc_vec * square_alpha  # apply scale for A*B
+            if cutlass.const_expr(self.round_dgrad_to_input_dtype):
+                acc_vec = acc_vec.to(self.a_dtype).to(self.acc_dtype)
             ab1_vec_load = ab1_vec_load * beta_val  # apply scale for C
             ab2_vec_load = ab2_vec_load * beta_val  # apply scale for C
 
@@ -955,12 +976,13 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         square_alpha: Float32,
         linear_offset: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
+        activation_vec: Optional[cute.Tensor] = None,
     ):
-        geglu_max_value = cutlass.Float32(7.0)
-        geglu_min_value = cutlass.Float32(-7.0)
+        geglu_max_value = cutlass.Float32(self.glu_clamp_max)
+        geglu_min_value = cutlass.Float32(self.glu_clamp_min)
         fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
         fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
-        scale_1702 = (1.702, 1.702)
+        gate_scale = (self.geglu_alpha, self.geglu_alpha)
         ones2 = (1.0, 1.0)
         mprob2 = (mProb, mProb)
         beta2 = (beta_val, beta_val)
@@ -972,6 +994,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             dx2_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             for i in cutlass.range(0, cute.size(acc_vec), 2, unroll_full=True):
                 acc = fmul2((acc_vec[i], acc_vec[i + 1]), square_alpha2)
+                if cutlass.const_expr(self.round_dgrad_to_input_dtype):
+                    acc = (acc[0].to(self.a_dtype).to(self.acc_dtype), acc[1].to(self.a_dtype).to(self.acc_dtype))
                 x1_0, x1_1 = fmul2(
                     (
                         x1_vec_load[i].to(self.acc_dtype),
@@ -998,7 +1022,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 y2 = (y2_0, y2_1)
 
                 # y1 = 1.702 * x1
-                y1_scaled = fmul2(y1, scale_1702)
+                y1_scaled = fmul2(y1, gate_scale)
 
                 sigmoid_out_0 = sigmoid_f32(y1_scaled[0], fastmath=True)
                 sigmoid_out_1 = sigmoid_f32(y1_scaled[1], fastmath=True)
@@ -1017,6 +1041,11 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 # y2 + linear_offset
                 y2_with_linear_offset_0, y2_with_linear_offset_1 = fadd2(y2, linear_offset2)
 
+                if cutlass.const_expr(activation_vec is not None):
+                    primal = fmul2(y1, (sigmoid_out_0, sigmoid_out_1))
+                    primal = fmul2(primal, (y2_with_linear_offset_0, y2_with_linear_offset_1))
+                    activation_vec[i], activation_vec[i + 1] = fmul2(primal, mprob2)
+
                 # dy1 = g * sigmoid_out * (y2 + linear_offset)
                 dy1_pre_0, dy1_pre_1 = fmul2(
                     (y2_with_linear_offset_0, y2_with_linear_offset_1),
@@ -1026,17 +1055,15 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 dy1_0, dy1_1 = fmul2((dy1_pre_0, dy1_pre_1), y1_scaled)
                 dy1_0, dy1_1 = fmul2((dy1_0, dy1_1), mprob2)
 
-                x1_filter_0 = y1_0 if x1_0 <= geglu_max_value else cutlass.Float32(0.0)
-                x1_filter_1 = y1_1 if x1_1 <= geglu_max_value else cutlass.Float32(0.0)
+                x1_filter_0 = cutlass.Float32(1.0) if x1_0 <= geglu_max_value else cutlass.Float32(0.0)
+                x1_filter_1 = cutlass.Float32(1.0) if x1_1 <= geglu_max_value else cutlass.Float32(0.0)
 
                 dx1_vec[i], dx1_vec[i + 1] = fmul2((dy1_0, dy1_1), (cutlass.Float32(x1_filter_0), cutlass.Float32(x1_filter_1)))
 
                 # dy2 = g * y1 * sigmoid_out * mProb
                 dy2_0, dy2_1 = fmul2(y1, acc_mul_sigmoid_prob)
-                x2_filter_0 = x2_0 if x2_0 <= geglu_max_value else cutlass.Float32(0.0)
-                x2_filter_1 = x2_1 if x2_1 <= geglu_max_value else cutlass.Float32(0.0)
-                x2_filter_0 = y2_0 if x2_filter_0 >= geglu_min_value else cutlass.Float32(0.0)
-                x2_filter_1 = y2_1 if x2_filter_1 >= geglu_min_value else cutlass.Float32(0.0)
+                x2_filter_0 = cutlass.Float32(1.0) if geglu_min_value <= x2_0 <= geglu_max_value else cutlass.Float32(0.0)
+                x2_filter_1 = cutlass.Float32(1.0) if geglu_min_value <= x2_1 <= geglu_max_value else cutlass.Float32(0.0)
                 dx2_vec[i], dx2_vec[i + 1] = fmul2((dy2_0, dy2_1), (cutlass.Float32(x2_filter_0), cutlass.Float32(x2_filter_1)))
 
                 if cutlass.const_expr(self.generate_dprob):
@@ -1050,10 +1077,13 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             dx2_vec = dx2_vec.load()
             if cutlass.const_expr(self.generate_dprob):
                 dprob_swiglu = dprob_swiglu.load()
-            return dx1_vec, dx2_vec, dprob_swiglu
+            primal = activation_vec.load() if cutlass.const_expr(activation_vec is not None) else None
+            return dx1_vec, dx2_vec, dprob_swiglu, primal
         else:
             element_count = cute.size(x1_vec_load)
             acc_vec = acc_vec.load() * square_alpha
+            if cutlass.const_expr(self.round_dgrad_to_input_dtype):
+                acc_vec = acc_vec.to(self.a_dtype).to(self.acc_dtype)
             x1_vec_load = x1_vec_load.load().to(cutlass.Float32) * beta_val
             x2_vec_load = x2_vec_load.load().to(cutlass.Float32) * beta_val
             dx1_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
@@ -1063,18 +1093,24 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
             for i in cutlass.range_constexpr(element_count):
                 fc2_dgrad = acc_vec[i]
                 g = fc2_dgrad * mProb
-                y1 = min(x1_vec_load[i], 7.0)
-                y2 = min(x2_vec_load[i], 7.0)
-                y2 = max(y2, -7.0)
+                y1 = min(x1_vec_load[i], geglu_max_value)
+                y2 = min(x2_vec_load[i], geglu_max_value)
+                y2 = max(y2, geglu_min_value)
 
-                sigmoid_out = sigmoid_f32(y1 * 1.702, fastmath=True)
+                sigmoid_out = sigmoid_f32(y1 * self.geglu_alpha, fastmath=True)
 
-                dy1 = g * sigmoid_out * (1 + 1.702 * y1 * (1 - sigmoid_out)) * (y2 + linear_offset)
+                if cutlass.const_expr(activation_vec is not None):
+                    # Explicit RN operations keep the additional primal expression
+                    # separate from compiler contraction of the scalar derivatives.
+                    primal_pair = fmul2((y1, y1), (sigmoid_out, sigmoid_out))
+                    primal_pair = fmul2(primal_pair, fadd2((y2, y2), linear_offset2))
+                    activation_vec[i] = fmul2(primal_pair, mprob2)[0]
+
+                dy1 = g * sigmoid_out * (1 + self.geglu_alpha * y1 * (1 - sigmoid_out)) * (y2 + linear_offset)
                 dy2 = g * y1 * sigmoid_out
 
-                x1_filter = x1_vec_load[i] if x1_vec_load[i] <= 7.0 else 0.0
-                x2_filter = x2_vec_load[i] if x2_vec_load[i] <= 7.0 else 0.0
-                x2_filter = x2_filter if x2_filter >= -7.0 else 0.0
+                x1_filter = 1.0 if x1_vec_load[i] <= geglu_max_value else 0.0
+                x2_filter = 1.0 if geglu_min_value <= x2_vec_load[i] <= geglu_max_value else 0.0
 
                 dx1_vec[i] = x1_filter * dy1
                 dx2_vec[i] = x2_filter * dy2
@@ -1083,7 +1119,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     prob_grad = y1 * sigmoid_out * (y2 + linear_offset) * fc2_dgrad
                     dprob_swiglu[i] = prob_grad
 
-            return dx1_vec.load(), dx2_vec.load(), dprob_swiglu.load()
+            primal = activation_vec.load() if cutlass.const_expr(activation_vec is not None) else None
+            return dx1_vec.load(), dx2_vec.load(), dprob_swiglu.load(), primal
 
     @cute.jit
     def stg_256(self, ptr, vec8_f32, *, loc=None, ip=None):
@@ -1153,6 +1190,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         sched_params: MoESchedulerParams,
+        mActivation: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1702,6 +1740,11 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                 # Per-expert gmem tensor setup via extension
                 #
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
+                if cutlass.const_expr(self.generate_activation):
+                    real_activation, _ = epi_ext.get_gmem_tensor("d", mActivation, padded_offsets, epi_work_tile_info)
+                    activation_subtile = (cute.make_layout(128), cute.make_layout(self.mma_tiler[1]))
+                    g_activation = cute.local_tile(real_activation, activation_subtile, (None, None, None))
+                    t_activation = cute.filter_zeros(tiled_copy_t2r.get_slice(epi_tidx).partition_D(g_activation))
                 thr_mma_epi = tiled_mma.get_slice(mma_tile_coord_v)
 
                 if cutlass.const_expr(not self.store_d_directly):
@@ -1804,8 +1847,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     if cutlass.const_expr(self.act_func == "dswiglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dgeglu(
-                            acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, linear_offset, dprob_swiglu
+                        activation_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32) if cutlass.const_expr(self.generate_activation) else None
+                        d1_vec, d2_vec, dprob_swiglu, primal = self.dgeglu(
+                            acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, linear_offset, dprob_swiglu, activation_vec
                         )
 
                     if cutlass.const_expr(self.generate_dprob):
@@ -1830,6 +1874,16 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                                 cutlass.Float32(0.0),
                                 0,
                             )
+
+                    if cutlass.const_expr(self.generate_activation):
+                        # Preserve the existing derivative/reduction region before
+                        # introducing the optional store and its tail branch.
+                        r_activation = cute.make_rmem_tensor(tRS_rD1.shape, cutlass.BFloat16)
+                        r_activation.store(primal.to(cutlass.BFloat16))
+                        activation_n = epi_work_tile_info.tile_n_idx * self.mma_tiler[1] + real_subtile_idx * self.epi_tile[1]
+                        if activation_n < cute.size(real_activation, mode=[1]):
+                            dst = t_activation[(None, 0, real_subtile_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
+                            self.store_global_memory_256b(dst, r_activation)
 
                     #
                     # Generate dBias
