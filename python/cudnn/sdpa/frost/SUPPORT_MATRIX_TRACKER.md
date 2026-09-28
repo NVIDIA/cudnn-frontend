@@ -1069,6 +1069,15 @@ and natural-unit sinks. RoPE preserves its angle-table values through the shared
 its obsolete tensor-staging executor and dedicated host compiler are removed.
 The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
 
+Standalone packed forward/backward wrappers share prepared bitwise data copies
+for their existing head-width padding, backward compaction and output trimming.
+One fused copy handles the selected operands; native operands bind directly.
+The bounded wrapper allocation-recipe memo contains only host metadata, while
+compiled copy artifacts specialize on head/width geometry and bind Int64 token
+capacities, strides and addresses per call. The former Torch padding helpers
+are removed. CPU prefix/scalar conversion and zeroed output tails retain their
+existing convenience-wrapper contract; graph eligibility is unchanged.
+
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a
 feature-free d=64 graph.

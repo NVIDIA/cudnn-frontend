@@ -807,17 +807,6 @@ def _sm80_bwd_pick_flavor(d_qk: int, d_v: int) -> str:
     raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {_SM80_BWD_FLAVOR_DIMS}.")
 
 
-def _sm80_bwd_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
-    """Zero-pad the trailing dim of an fp16/bf16 tensor up to ``new_last``."""
-    old_last = t.shape[-1]
-    if old_last == new_last:
-        return t
-    if old_last > new_last:
-        raise ValueError(f"_sm80_bwd_pad_last_dim: tensor's last dim {old_last} exceeds target {new_last}")
-    pad = torch.zeros((*t.shape[:-1], new_last - old_last), dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=-1).contiguous()
-
-
 @lru_cache(maxsize=128)
 def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtype, device, is_causal, window_size, bottom_right, has_sink, deterministic):
     """Cache immutable wrapper plans without retaining tensors or runtime pointers.
@@ -878,10 +867,6 @@ def _sm80_thd_backward(
     # Resolve from the user's width before envelope padding (e.g. D=96).
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    if d_qk < fdqk:
-        q, k = _sm80_bwd_pad_last_dim(q, fdqk), _sm80_bwd_pad_last_dim(k, fdqk)
-    if d_v < fdv:
-        v, o, do = (_sm80_bwd_pad_last_dim(t, fdv) for t in (v, o, do))
     n_seq = cu_q.numel() - 1
     assert n_seq > 0 and cu_k is not None and cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
     t_q, t_kv, dev = q.shape[1], k.shape[1], q.device
@@ -889,10 +874,15 @@ def _sm80_thd_backward(
         if hint is not None:
             assert int(hint) > 0, f"{label} must be > 0; got {hint}"
 
+    if d_qk < fdqk or d_v < fdv or any(not t.is_contiguous() for t in (q, k, v, o, do)):
+        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+
+        q, k, v, o, do = copy_packed_half((q, k, v, o, do), (fdqk, fdqk, fdv, fdv, fdv), (True, False, False, True, True), compact=True)
+
     # A zero-capacity wrapper operand gets one never-live row. Device prefixes
     # still contain the actual totals; no adapter-side degenerate computation.
     def packed(t):
-        return t.contiguous() if t.shape[1] else torch.empty((1, 1, *t.shape[2:]), dtype=t.dtype, device=dev)
+        return t if t.shape[1] else torch.empty((1, 1, *t.shape[2:]), dtype=t.dtype, device=dev)
 
     q, k, v, o, do = map(packed, (q, k, v, o, do))
     tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
@@ -944,11 +934,9 @@ def _sm80_thd_backward(
         sink_tensor=sinks_t,
         dsink_tensor=dsink,
     )
-    dQ_k, dK_k, dV_k = dq[:, :t_q, :, :d_qk], dk[:, :t_kv, :, :d_qk], dv[:, :t_kv, :, :d_v]
-    if d_qk < fdqk:
-        dQ_k, dK_k = dQ_k.contiguous(), dK_k.contiguous()
-    if d_v < fdv:
-        dV_k = dV_k.contiguous()
+    dQ_k, dK_k, dV_k = dq[:, :t_q], dk[:, :t_kv], dv[:, :t_kv]
+    if d_qk < fdqk or d_v < fdv:
+        dQ_k, dK_k, dV_k = copy_packed_half((dQ_k, dK_k, dV_k), (d_qk, d_qk, d_v), (True, False, False))
     out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
     if dsink is not None:
         out["dsink_tensor"] = dsink
