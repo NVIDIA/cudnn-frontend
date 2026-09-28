@@ -168,6 +168,13 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+When testing a retained staging path, choose a declaration that the graph
+validator accepts but the native pointer layout declines. A nonunit D stride
+is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
+the existing dense conversion path. `test_staged_rebind_stream_capture` in
+`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay.
+
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
 from the pointer ABI, so the common binder cannot validate them. The detector
@@ -331,6 +338,12 @@ and tensor-operand elision must use the same effective presence decision.
 `test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
+
+For a GEMM+GLU failure, compare the final output with both the stored GEMM
+intermediate and an independent dot product before attributing it to GEMM.
+SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
+halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
+bounded failure output, and preservation of the original assertion.
 
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
