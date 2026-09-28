@@ -27,9 +27,9 @@ def _plan(dtypes, device_index):
     major, minor = torch.cuda.get_device_capability(device_index)
     artifact = compile_metadata(dtypes, device_index, f"sm_{major}{minor}")
     entry = positional_entry(artifact)
-    if entry is None:
-        raise NotImplementedError("SDPA forward metadata requires a positional tvm-ffi entry")
-    return artifact, entry
+    # A foreign target may compile without a runnable entry in some DSL
+    # versions. Preserve Torch preparation for that unsupported environment.
+    return None if entry is None else (artifact, entry)
 
 
 def _torch_column(tensor, dtype, shape):
@@ -94,6 +94,8 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
             None if sink_native else _DTYPE_NAMES[sinks.dtype],
         )
         plan = _plan(dtypes, device.index)
+        if plan is None:
+            return tuple(_torch_column(tensor, dtype, shape) if tensor is not None else None for tensor, dtype, shape in zip(values, types, shapes))
         plan[1](
             None if q_native else seq_q.data_ptr(),
             None if kv_native else seq_kv.data_ptr(),

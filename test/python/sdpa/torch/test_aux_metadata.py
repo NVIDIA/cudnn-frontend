@@ -16,8 +16,10 @@ pytestmark = pytest.mark.L0
 @pytest.mark.parametrize("role", ["lengths", "sinks"])
 @pytest.mark.parametrize("strided", [False, True])
 def test_forward_auxiliary_storage_matches_graph(provider, role, strided, monkeypatch):
-    if provider == "frost" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("pinned forward metadata route requires SM100/SM103")
+    if provider == "frost":
+        _require_prepared()
+        if torch.cuda.get_device_capability() not in ((8, 0), (10, 0), (10, 3), (10, 7), (12, 0)):
+            pytest.skip("pinned forward metadata route requires an available dense FROST engine")
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     original = cudnn.pygraph.create_execution_plans
     selected = []
@@ -313,3 +315,38 @@ print(json.dumps(compiled_cache.stats()))
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))
     assert results[0]["misses"] > 0 and results[0]["hits"] == 0
     assert results[1]["misses"] == 0 and results[1]["hits"] > 0
+
+
+def test_forward_metadata_missing_execution_entry_falls_back(monkeypatch):
+    _require_prepared()
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa import forward_metadata as metadata
+
+    metadata._plan.cache_clear()
+    calls = []
+    original = metadata._torch_column
+
+    def fallback(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(compiled_cache, "positional_entry", lambda artifact: None)
+    monkeypatch.setattr(metadata, "_torch_column", fallback)
+    values = tuple(torch.arange(7, device="cuda", dtype=dtype)[::2] for dtype in (torch.int64, torch.int32, torch.bfloat16))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        _check_columns(metadata.prepare_forward_metadata(*values, 4, 4), values, 4, 4)
+        with torch.cuda.graph(graph):
+            captured = metadata.prepare_forward_metadata(*values, 4, 4)
+        for value in values:
+            value.add_(2)
+        for output in captured:
+            output.fill_(-19)
+        graph.replay()
+        _check_columns(captured, values, 4, 4)
+        assert len(calls) == 6
+        assert metadata._plan.cache_info().misses == 1
+        assert metadata._plan.cache_info().hits == 1
+    finally:
+        graph.reset()
+        metadata._plan.cache_clear()
