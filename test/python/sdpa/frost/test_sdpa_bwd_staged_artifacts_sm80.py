@@ -21,7 +21,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
 def test_staged_backward_artifact_fresh_process(route, tmp_path):
     child = r"""
 import json, sys
@@ -35,18 +35,25 @@ assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
 import test_sdpa_bwd_staged_sm80 as helper
 artifacts = []
-original = staged_sm80.build_spec
-def record(*args, **kwargs):
-    spec = original(*args, **kwargs)
+original = staged_sm80.compile_staged
+def record(api, *args, **kwargs):
+    spec = original(api, *args, **kwargs)
     artifacts.append(spec.artifact)
+    if api._staged_copies is not None:
+        copies, auxiliary = api._staged_copies
+        artifacts.extend(entry[0] for entry in copies if entry is not None)
+        artifacts.extend(single[0] for entry in copies if entry is not None for single in entry[3])
+        artifacts.extend(entry[1] for _, _, entries in auxiliary for entry in entries)
     return spec
-staged_sm80.build_spec = record
+staged_sm80.compile_staged = record
 if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("fresh-process staged backward invoked JIT")
     cute.compile = forbidden
 if route == "dense":
     helper.test_dense_staged_rebind_and_replay(torch.bfloat16, 160, 112, 1, False, True)
+elif route == "aux":
+    helper.test_dense_staged_rebind_and_replay(torch.bfloat16, 96, 80, 2, True, False)
 elif route == "packed":
     helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
 else:
@@ -75,7 +82,7 @@ print(json.dumps(compiled_cache.stats()))
     assert second["misses"] == 0 and second["hits"] > 0, second
 
 
-@pytest.mark.parametrize("route", ["dense", "packed", "rope"])
+@pytest.mark.parametrize("route", ["dense", "packed", "aux", "rope"])
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
 def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
@@ -91,6 +98,12 @@ def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, 
         monkeypatch.delenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", raising=False)
         manifest = dict(compiled_cache.environment_manifest(), test_unknown="unknown")
         monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: manifest)
+    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
+    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
+    from cudnn.sdpa.bwd.kernels.sm80.staged_copy import compile_cast
+
+    for cached in (compile_gather, compile_copy, compile_cast):
+        cached.cache_clear()
     prepared_host._compile_thd_artifact.cache_clear()
     memo = getattr(prepared_host, "_compile_staged_artifact", None)
     if memo is not None:
@@ -99,6 +112,8 @@ def test_staged_backward_replan_without_disk_cache(route, cache_mode, tmp_path, 
     def run():
         if route == "dense":
             helper.test_dense_staged_rebind_and_replay(torch.bfloat16, 160, 112, 1, False, True)
+        elif route == "aux":
+            helper.test_dense_staged_rebind_and_replay(torch.bfloat16, 96, 80, 2, True, False)
         elif route == "packed":
             helper.test_packed_staged_preserves_output_tail(torch.bfloat16, 160, 112, 2, "token_major")
         else:

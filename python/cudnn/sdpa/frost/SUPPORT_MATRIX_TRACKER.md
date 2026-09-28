@@ -1042,9 +1042,13 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper pads to the native flavor width and uses this prepared packed chain.
-Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
-without complete optional-output declarations retain their existing staging and
-optional-gradient copy-backs, followed by the same prepared pointer chain.
+Off-flavor graph/direct-adapter widths, unaligned strides and older direct adapters
+without complete optional-output declarations use prepared gather/pad, gradient
+scatter and auxiliary cast recipes around the same pointer chain. These replace
+the existing tensor copies within the same caller-workspace budget. Packed copy
+capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
+share one scatter launch, while overlapping storage ranges retain ordered copy-back.
+Standalone RoPE keeps its angle-table preprocessing and tensor staging.
 Packed output casts and folds truncate flavor padding on device and leave capacity
 tails untouched. The obsolete generic and d64 tensor compilers and fake builders
 are removed. Standalone adapters require caller workspace, as native prepared

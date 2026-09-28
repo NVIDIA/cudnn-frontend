@@ -429,3 +429,9 @@ shape-only cache reuses an incompatible native plan.
 layouts and returns to the first one to verify both separation and reuse.
 When padding Q/K to a vector width, retain the original attention scale and
 check non-multiple-of-eight widths against an independent reference.
+
+When a test is re-exported from another module, the source module's `pytestmark`
+does not follow it. A subprocess-based GPU test must check architecture in the
+parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
+Keep genuine child failures failing on supported devices. The half SDPA artifact
+reload detector is re-exported through `TestStagedHalf` and covers this boundary.
