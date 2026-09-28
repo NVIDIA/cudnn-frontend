@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Packed SM80 forward pointer binding, replay and artifact reuse."""
+"""SM80 packed/staged forward pointer binding, replay and artifact reuse."""
 
 import itertools
 import math
@@ -186,7 +186,7 @@ def test_thd_wrapper_physical_stride_and_product(role, product, d, dv):
 @pytest.mark.L0
 @pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dense_tensor_fallback_survives_thd_fake_cleanup(d, dv, rope, dtype, monkeypatch):
+def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeypatch):
     from cudnn.sdpa.fwd import api_dsl, sdpa_fwd_wrapper_sm80
 
     q, k, v = (t.transpose(1, 2) for t in _inputs(d, dv, dtype, capq=128, capkv=256))
@@ -221,7 +221,14 @@ def test_dense_tensor_fallback_survives_thd_fake_cleanup(d, dv, rope, dtype, mon
         torch.testing.assert_close(out["lse_tensor"].double(), stats, rtol=0.002, atol=0.002)
 
     check(run())
-    assert calls, "the dense off-flavor/RoPE case must exercise the retained tensor entry"
+    assert calls, "the dense off-flavor/RoPE case must exercise the staged entry"
+    import cutlass.cute.runtime as runtime
+
+    def forbid_dlpack(*args, **kwargs):
+        pytest.fail("SM80 staged launch rebuilt DLPack operands")
+
+    monkeypatch.setattr(runtime, "from_dlpack", forbid_dlpack)
+    check(run())
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
@@ -275,3 +282,138 @@ def test_thd_wrapper_preserves_packed_row_origins(d, dv, dtype, features):
         check(out)
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_dense_staged_artifact_reload_in_new_process(d, dv, rope, dtype, tmp_path):
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    import cudnn
+
+    child = r"""
+import json, sys
+from pathlib import Path
+import torch, pytest, cudnn
+import cutlass.cute as cute
+from cudnn.frost import compiled_cache
+from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
+tests, package, d, dv, rope, dtype, reload = sys.argv[1:]
+assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
+assert torch.cuda.get_device_capability() == (8, 0)
+sys.path.insert(0, tests)
+from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
+original = prepared_host.compile_staged_host
+artifacts = []
+def record(*args):
+    artifact, fn = original(*args)
+    artifacts.append(artifact)
+    return artifact, fn
+with pytest.MonkeyPatch.context() as patch:
+    patch.setattr(prepared_host, "compile_staged_host", record)
+    if reload == "1":
+        def forbidden(*args, **kwargs):
+            raise AssertionError("staged forward invoked JIT in the second process")
+        patch.setattr(cute, "compile", forbidden)
+    test_dense_staged_pointer_launch_and_rope_replay(int(d), int(dv), rope == "1", getattr(torch, dtype), patch)
+assert artifacts
+if reload == "1":
+    assert all(hasattr(a, "_compiled_cache_raw") for a in artifacts)
+print(json.dumps(compiled_cache.stats()))
+"""
+    env = dict(os.environ, CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path))
+    env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
+    results = []
+    for reload in (0, 1):
+        result = subprocess.run(
+            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(d), str(dv), str(int(rope)), dtype, str(reload)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
+        results.append(json.loads(result.stdout.strip().splitlines()[-1]))
+    first, second = results
+    assert first["misses"] > 0 and first["hits"] == 0, first
+    assert second["misses"] == 0 and second["hits"] > 0, second
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
+def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode, tmp_path, monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache
+    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
+
+    compile_staged_host.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    if cache_mode == "disabled":
+        monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    else:
+        monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: {"cuda_driver": "unknown"})
+    for reload in (0, 1):
+        _sm80_wrapper_cache.clear()
+        with pytest.MonkeyPatch.context() as patch:
+            if reload:
+                patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("staged forward lost process-local artifact reuse"))
+            test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, torch.float16, patch)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "role,invalid",
+    [(role, invalid) for role in ("q", "k", "v", "o") for invalid in ("shape", "dtype", "device")]
+    + [(role, invalid) for role in ("lse", "sinks", "seq_q_lens", "seq_kv_lens", "bias_tensor") for invalid in ("dtype", "device")]
+    + [("bias_tensor", "empty_batch")],
+)
+def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, monkeypatch):
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd import api_dsl
+
+    q = torch.empty((2, 17, 4, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
+    kv = torch.empty((2, 33, 2, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
+    values = dict(q=q, k=kv, v=kv, o=torch.empty_like(q), lse=torch.empty((2, 4, 17), device="cuda"))
+    values.update(
+        sinks=torch.ones(4, device="cuda"),
+        seq_q_lens=torch.ones(2, device="cuda", dtype=torch.int32),
+        seq_kv_lens=torch.ones(2, device="cuda", dtype=torch.int32),
+        bias_tensor=torch.zeros((1, 4, 17, 33), device="cuda"),
+    )
+    api = api_dsl.SdpaFwdDslSm80(
+        **{"sample_" + n: values[n] for n in ("q", "k", "v", "o", "lse")},
+        has_sink=True,
+        seq_q_lens_present=True,
+        seq_kv_lens_present=True,
+        bias_present=True,
+        bias_fp32=True,
+    )
+    api.check_support()
+    # No device launch is needed to test rejection. In particular the baseline
+    # must fail at this tripwire instead of launching an unsafe short buffer.
+    api._compiled_kernel = object()
+    api._sm80_spec = None
+    api._params = SimpleNamespace(has_lse=True, has_bias=True, has_rope=False, has_sink=True, has_seq_kv_lens=True, has_seq_q_lens=True, bias_is_fp32=True)
+    monkeypatch.setattr(api_dsl, "WorkspaceCarver", lambda *a, **k: pytest.fail("invalid operand reached workspace staging"))
+    tensor = values[role]
+    if invalid == "shape":
+        values[role] = tensor[:, :, :-1]
+    elif invalid == "dtype":
+        values[role] = torch.empty_like(tensor, dtype=torch.float64)
+    elif invalid == "empty_batch":
+        values[role] = tensor[:0]
+    else:
+        values[role] = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+    with pytest.raises(ValueError):
+        api.execute(
+            **{n + "_tensor": values[n] for n in ("q", "k", "v", "o", "lse")},
+            **{n: v for n, v in values.items() if n not in ("q", "k", "v", "o", "lse")},
+            workspace=torch.empty(1024, device="cuda", dtype=torch.uint8),
+        )

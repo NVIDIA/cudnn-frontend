@@ -282,6 +282,23 @@ wrapped addresses poisoned inside allocated guard storage.
 THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
 
 
+### SM80 staged pointer launches
+
+A pointer host can follow existing layout staging without changing that
+staging's numerical contract. Keep off-flavor and RoPE references, mutate
+angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
+after warmup so a return to tensor launch plumbing fails independently of
+numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
+RED on the old tensor launcher for both dtypes and both template families.
+
+Trailing-dimension and contiguity checks do not prove that a broadcast input
+has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
+it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
+case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+RED-then-green detector. A compiler-memo test must also rebuild the wrapper
+on its second call: clear the wrapper cache while retaining the compiler memo,
+then forbid JIT. Reusing the same adapter cannot test compiler reuse.
+
 SM80's standalone packed wrapper preserves cumulative tensors as row offsets
 into the supplied storage. Do not substitute graph API cumulative-length
 normalization: that changes which Q/K/V rows the standalone call addresses.
@@ -338,6 +355,13 @@ and tensor-operand elision must use the same effective presence decision.
 `test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
+
+For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
+and all auxiliary bindings before workspace carving or any copy/fill. A tensor
+compiler previously checked some of these at dispatch; raw addresses cannot.
+The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
+replaces the workspace carver with a tripwire so an invalid short buffer fails
+safely before it can reach a GPU launch.
 
 For a GEMM+GLU failure, compare the final output with both the stored GEMM
 intermediate and an independent dot product before attributing it to GEMM.
