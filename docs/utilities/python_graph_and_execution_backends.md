@@ -772,6 +772,17 @@ only to decline is why `closed_under` existed.
   It reserves partial O/LSE for 256 packed rows. Policy 1 retains its 128-row
   selection and workspace contract; neither policy is proposed by normal
   heuristics. The selected artifact is still fixed at capture time.
+- `SPLIT_KV_POLICY=3` adds two packed split members for the same graph domain
+  with `H_q=H_kv` in `{4, 8, 16}`. For one sequence and KV capacity at least
+  32768, host-observed Q capacity `[1, 128]` selects `128/H_q` splits with
+  128 reserved rows; `[129, 256]` selects `64/H_q` splits with 256 reserved
+  rows. Other calls retain the recorded unsplit CGA choice. Both members
+  reserve the same partial O/LSE size (16384 head-rows), so caller workspace
+  covers their maximum rather than their sum. The graph builds all artifacts
+  once, and each invocation independently binds its selected member.
+  Capture retains that choice; device length changes during replay do not
+  reselect. This experimental policy is not proposed by normal heuristics.
+  Policies 1 and 2 retain their original H16 selection and workspace contracts.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's

@@ -385,20 +385,20 @@ class SdpaThdBinder {
         return units;
     }
 
-    bool
-    split_candidate(const std::vector<NativeOperandView> &facts, int64_t max_q_capacity) const {
-        // The recorded policy bounds the short-Q/long-KV, single-sequence H16 region.
+    int64_t
+    split_query_capacity(const std::vector<NativeOperandView> &facts, int64_t max_q_capacity) const {
+        // The recorded policy bounds the short-Q/long-KV, single-sequence region.
         // Capacities are host observations, never reads of mutable device lengths.
         const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
-        if (b != 1) return false;
+        if (b != 1) return 0;
         int64_t tq = std::min(capacity(required(facts, Q), resolve(facts[Q], Q, b), "q"),
                               capacity(required(facts, O), resolve(facts[O], O, b), "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
-        if (tq <= 0 || tq > max_q_capacity) return false;
+        if (tq <= 0 || tq > max_q_capacity) return 0;
         int64_t tkv = std::min(capacity(required(facts, K), resolve(facts[K], K, b), "k"),
                                capacity(required(facts, V), resolve(facts[V], V, b), "v"));
         if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
-        return tkv >= 32768;
+        return tkv >= 32768 ? tq : 0;
     }
 
    private:
@@ -590,11 +590,14 @@ class SdpaThdPlanChoices {
                        int64_t sm_count,
                        int64_t policy,
                        const py::object &split,
-                       int64_t split_policy)
+                       int64_t split_policy,
+                       const py::object &split_large)
         : binders_{SdpaThdBinder(single), SdpaThdBinder(pair)}, sm_count_(sm_count), policy_(policy) {
         if (policy != 1 && policy != 2) invalid("unknown native THD CGA policy");
-        if (split_policy != 0 && split_policy != 1 && split_policy != 2) invalid("unknown native THD split policy");
+        if (split_policy < 0 || split_policy > 3) invalid("unknown native THD split policy");
         if (split.is_none() != (split_policy == 0)) invalid("a split member requires its explicit split policy");
+        if (split_large.is_none() != (split_policy != 3))
+            invalid("split policy3 requires both short and long prepared split members");
         for (const auto &member : {single, pair}) {
             if (py::hasattr(member, "split_workspace") && !member.attr("split_workspace").is_none())
                 invalid("CGA policy requires unsplit plan members");
@@ -606,8 +609,9 @@ class SdpaThdPlanChoices {
             invalid("native plan choices require unsplit nonpaged half D192/V128 tiles of 128 and 512 rows");
         // A plan family changes only launch geometry. Each member owns its
         // immutable host frame, compiled artifact and workspace layout.
-        const auto common_members =
-            split.is_none() ? std::vector<py::object>{pair} : std::vector<py::object>{pair, split};
+        std::vector<py::object> common_members{pair};
+        if (!split.is_none()) common_members.push_back(split);
+        if (!split_large.is_none()) common_members.push_back(split_large);
         for (const auto &member : common_members) {
             for (const char *name : {"b",
                                      "qh",
@@ -634,6 +638,25 @@ class SdpaThdPlanChoices {
             }
         }
         if (!split.is_none()) {
+            const auto heads = single.attr("qh").cast<int64_t>();
+            if (split_policy == 3) {
+                if ((heads != 4 && heads != 8 && heads != 16) || single.attr("kh").cast<int64_t>() != heads)
+                    invalid("split policy3 requires H_q=H_kv in {4, 8, 16}");
+                const std::array<py::object, 2> split_members{split, split_large};
+                for (size_t i = 0; i < split_members.size(); ++i) {
+                    const auto &member = split_members[i];
+                    if (!py::hasattr(member, "split_workspace") || member.attr("split_workspace").is_none())
+                        invalid("split policy requires a prepared split member");
+                    const auto workspace = member.attr("split_workspace").cast<std::array<int64_t, 4>>();
+                    const auto capacity  = i == 0 ? 128 : 256;
+                    const auto splits    = (i == 0 ? 128 : 64) / heads;
+                    if (workspace[0] != splits || workspace[1] != capacity)
+                        invalid("split policy3 requires 128/256 row members with 128/H and 64/H splits");
+                    binders_.emplace_back(member);
+                }
+                split_q_capacity_ = 256;
+                return;
+            }
             if (!py::hasattr(split, "split_workspace") || split.attr("split_workspace").is_none())
                 invalid("split policy requires a prepared split member");
             const auto workspace = split.attr("split_workspace").cast<std::array<int64_t, 4>>();
@@ -675,7 +698,10 @@ class SdpaThdPlanChoices {
 
     int
     select(const std::vector<NativeOperandView> &facts) const {
-        if (binders_.size() == 3 && binders_[0].split_candidate(facts, split_q_capacity_)) return 2;
+        if (binders_.size() >= 3) {
+            const auto q_capacity = binders_[0].split_query_capacity(facts, split_q_capacity_);
+            if (q_capacity > 0) return binders_.size() == 4 && q_capacity > 128 ? 3 : 2;
+        }
         const auto units = binders_[0].choice_units(facts);
         if (policy_ == 1) return units[0] <= sm_count_ ? 0 : 1;
         const auto waves = [](int64_t work, int64_t resident) { return work / resident + (work % resident != 0); };
@@ -712,13 +738,21 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("stream"),
              py::arg("scale") = py::none());
     py::class_<SdpaThdPlanChoices>(m, "_SdpaThdPlanChoices")
-        .def(py::init<const py::object &, const py::object &, int64_t, int64_t, const py::object &, int64_t>(),
+        .def(py::init<const py::object &,
+                      const py::object &,
+                      int64_t,
+                      int64_t,
+                      const py::object &,
+                      int64_t,
+                      const py::object &>(),
              py::arg("single"),
              py::arg("pair"),
              py::arg("sm_count"),
              py::arg("policy")       = 1,
              py::arg("split")        = py::none(),
-             py::arg("split_policy") = 0)
+             py::arg("split_policy") = 0,
+             py::arg("split_large")  = py::none())
+        .def_property_readonly_static("supports_balanced_split", [](py::object) { return true; })
         .def("select_index", &SdpaThdPlanChoices::select_index, py::arg("pack"), py::arg("indices"))
         .def("bind",
              &SdpaThdPlanChoices::bind,

@@ -187,8 +187,8 @@ def _cga_policy_graph(dtype, stats, record=None, h=16, *, kcap=128, stats_log2=F
 @requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype,stats,log2", [(torch.bfloat16, "HN", False), (torch.bfloat16, None, False), (torch.float16, "NH", True)])
-@pytest.mark.parametrize("splits", [2, 8])
-def test_prepared_packed_split_workspace_rebind_and_old_capture(dtype, stats, log2, splits, monkeypatch):
+@pytest.mark.parametrize("splits,heads", [(2, 16), (8, 16), (4, 16), (16, 8), (32, 4)])
+def test_prepared_packed_split_workspace_rebind_and_old_capture(dtype, stats, log2, splits, heads, monkeypatch):
     """Internal lowering before policy admission: one host, independent caller storage."""
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
@@ -197,7 +197,7 @@ def test_prepared_packed_split_workspace_rebind_and_old_capture(dtype, stats, lo
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("packed split currently targets SM100")
     torch.manual_seed(5350)
-    h = 16
+    h = heads
     g, _ = _cga_policy_graph(dtype, stats, h=h, kcap=1024, stats_log2=log2)
     base = _plan(g)._prepared.variants[0].spec
     module = _load_sm100_kernel_module(
@@ -336,6 +336,14 @@ def test_thd_runtime_split_record_rebind_and_capture(dtype, stats, split_policy,
     _runtime_policy_record_rebind_and_capture(dtype, stats, 2, 16, monkeypatch, split_policy=split_policy)
 
 
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype,stats", [(torch.bfloat16, "HN"), (torch.float16, "NH"), (torch.bfloat16, None)])
+@pytest.mark.parametrize("heads", [4, 8, 16])
+def test_thd_balanced_split_record_rebind_and_capture(dtype, stats, heads, monkeypatch):
+    _runtime_policy_record_rebind_and_capture(dtype, stats, 2, heads, monkeypatch, split_policy=3)
+
+
 def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypatch, split_policy=None):
     """Public policy records keep both artifacts, independent frames and old captures."""
     from concurrent.futures import ThreadPoolExecutor
@@ -366,13 +374,18 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
         record[1].pop(cudnn.knob_type.SPLIT_KV, None)
         record[1][cudnn.knob_type.SPLIT_KV_POLICY] = split_policy
     rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h, kcap=kcap)
-    expected_modules = [(1, False), (2, policy == 2)] + ([(1, False)] if split_policy else [])
+    expected_modules = [(1, False), (2, policy == 2)] + ([(1, False)] * (2 if split_policy == 3 else 1) if split_policy else [])
     assert loaded[-len(expected_modules) :] == expected_modules
     assert rebuilt.get_engine_and_knobs_at_index(rebuilt._plan_index) == record
     family = _plan(rebuilt)._prepared
     assert isinstance(family, prep_mod.PreparedThdChoices)
-    assert len(family.variants) == (3 if split_policy else 2)
-    if split_policy:
+    assert len(family.variants) == (4 if split_policy == 3 else 3 if split_policy else 2)
+    if split_policy == 3:
+        short, long = (v.spec for v in family.variants[2:])
+        assert (short.split_workspace.capacity, short.split_workspace.splits) == (128, 128 // h)
+        assert (long.split_workspace.capacity, long.split_workspace.splits) == (256, 64 // h)
+        assert short.scratch_bytes == long.scratch_bytes
+    elif split_policy:
         assert family.variants[2].spec.split_workspace.capacity == (128 if split_policy == 1 else 256)
     assert _plan(rebuilt).get_workspace_size() >= max(v.spec.scratch_bytes for v in family.variants)
     seen, held = set(), []
@@ -408,8 +421,10 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
             kbase += nk
 
     try:
-        cases = [([127], 65), ([2048], 65), ([513, 127], 65), ([65, 0, 192], 65)]
-        if split_policy:
+        cases = [([127], 65), ([max(2048, 32768 // h)], 65), ([513, 127], 65), ([65, 0, 192], 65)]
+        if split_policy == 3:
+            cases = [([64], 32768), ([128], 32768), ([129], 32768), ([256], 32768), *cases, ([257], 32768)]
+        elif split_policy:
             capacity = 128 if split_policy == 1 else 256
             cases = [([64], 32768), ([capacity], 32768), *cases, ([capacity + 1], 32768)]
         for lengths, nk in cases:
@@ -477,7 +492,7 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
                 torch.cuda.synchronize()
                 verify(old, old_lengths)
                 assert torch.all(old_ws[workspace_bytes:] == 0xA5)
-        assert seen == ({0, 1, 2} if split_policy else {0, 1})
+        assert seen == ({0, 1, 2, 3} if split_policy == 3 else {0, 1, 2} if split_policy else {0, 1})
         # Both modules were warmed serially above. Exercise two different
         # members of the same plan concurrently with independent workspaces.
         streams = [torch.cuda.Stream() for _ in range(2)]

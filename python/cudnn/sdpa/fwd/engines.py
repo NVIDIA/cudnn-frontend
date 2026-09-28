@@ -697,7 +697,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         if knobs.split_kv_policy is not None:
-            if not runtime_cga_choices(capabilities, facts) or facts.h_q != 16 or facts.h_kv != 16:
+            if knobs.split_kv_policy == 3:
+                if not runtime_cga_choices(capabilities, facts) or facts.h_q not in (4, 8, 16) or facts.h_kv != facts.h_q:
+                    return "runtime split policy3 requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv in {4, 8, 16}"
+            elif not runtime_cga_choices(capabilities, facts) or facts.h_q != 16 or facts.h_kv != 16:
                 return "runtime split policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv=16"
             if knobs.split_kv is not None:
                 return "split_kv and split_kv_policy are mutually exclusive, including split_kv=1"
@@ -1079,7 +1082,7 @@ def _sm100_spec() -> EngineSpec:
             sm_hi=106,
             phase="prefill",
             cga_policies=frozenset({1, 2}),
-            split_kv_policies=frozenset({1, 2}),
+            split_kv_policies=frozenset({1, 2, 3}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1857,27 +1860,28 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
         selected = variants[0]
         prepared = [v.prepared for v in variants]
         workspace = max(v.workspace_bytes for v in variants)
-        if knobs.split_kv_policy in (1, 2):
+        if knobs.split_kv_policy in (1, 2, 3):
             from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
             from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-            km = _load_sm100_kernel_module(
-                (192, 128),
-                TemplateParams(
-                    dtype_qkv=2 if facts.dtype == cudnn.data_type.BFLOAT16 else 3,
-                    cta_mma=1,
-                    split_kv=8,
-                    thd_varlen=True,
-                    seq_kv_lens_present=True,
-                    stats_log2=facts.has_stats_log2,
-                    sched_policy=knobs.sched_policy or 0,
-                ),
-            )
-            split = copy(prepared[0])
-            capacity = 128 if knobs.split_kv_policy == 1 else 256
-            split.spec = build_thd_split_spec(split.spec, km, capacity=capacity, resident_units=facts.device_sm_count)
-            prepared.append(split)
-            workspace = max(workspace, split.spec.scratch_bytes)
+            members = ((128, 128 // facts.h_q), (256, 64 // facts.h_q)) if knobs.split_kv_policy == 3 else ((128 if knobs.split_kv_policy == 1 else 256, 8),)
+            for capacity, splits in members:
+                km = _load_sm100_kernel_module(
+                    (192, 128),
+                    TemplateParams(
+                        dtype_qkv=2 if facts.dtype == cudnn.data_type.BFLOAT16 else 3,
+                        cta_mma=1,
+                        split_kv=splits,
+                        thd_varlen=True,
+                        seq_kv_lens_present=True,
+                        stats_log2=facts.has_stats_log2,
+                        sched_policy=knobs.sched_policy or 0,
+                    ),
+                )
+                split = copy(prepared[0])
+                split.spec = build_thd_split_spec(split.spec, km, capacity=capacity, resident_units=facts.device_sm_count)
+                prepared.append(split)
+                workspace = max(workspace, split.spec.scratch_bytes)
         selected.prepared = PreparedThdChoices(tuple(prepared), facts.device_sm_count, knobs.cga_policy, knobs.split_kv_policy)
         selected.workspace_bytes = workspace
         return selected

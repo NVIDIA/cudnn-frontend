@@ -8,6 +8,7 @@ production fallback for native plans. No test pins a heuristic or timing.
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,19 +177,96 @@ def test_cga_policy_cannot_silently_acquire_split_semantics():
         cudnn._pybind_module._SdpaThdPlanChoices(split, variants[1], 148, 2)
 
 
-def _split_policy_fixture(dtype="bfloat16", layout="HN", capacity=128):
-    variants, launches = _choice_fixture(dtype, layout, kh=16)
-    split = copy(variants[0])
+def _split_member(base, launches, splits, capacity, index):
+    split = copy(base)
     split.order = list(split.order) + ["lse_partial_ptr", "partial_o_strides"]
     split.index = {name: i for i, name in enumerate(split.order)}
     split.template = list(split.template) + [None, None]
     split.template[split.index["n_thd_units"]] = 148
-    off_lse = 8192 + 8 * capacity * 16 * 128 * 4
-    split.split_workspace = prep.ThdSplitWorkspace(8, capacity, 8192, off_lse)
-    split.scratch_bytes = off_lse + 8 * capacity * 16 * 4
-    split.fn = lambda *frame: launches.append((2, frame))
+    off_lse = 8192 + splits * capacity * split.qh * 128 * 4
+    split.split_workspace = prep.ThdSplitWorkspace(splits, capacity, 8192, off_lse)
+    split.scratch_bytes = off_lse + splits * capacity * split.qh * 4
+    split.fn = lambda *frame: launches.append((index, frame))
     split.native = cudnn._pybind_module._SdpaThdBinder(split)
+    return split
+
+
+def _split_policy_fixture(dtype="bfloat16", layout="HN", capacity=128):
+    variants, launches = _choice_fixture(dtype, layout, kh=16)
+    split = _split_member(variants[0], launches, 8, capacity, 2)
     return [*variants, split], launches
+
+
+@pytest.mark.parametrize("heads,short_splits,long_splits", [(4, 32, 16), (8, 16, 8), (16, 8, 4)])
+@pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
+def test_balanced_split_policy_binds_four_artifacts_and_keeps_old_frames(heads, short_splits, long_splits, dtype, layout):
+    variants, launches = _choice_fixture(dtype, layout, qh=heads, kh=heads)
+    variants += [_split_member(variants[0], launches, short_splits, 128, 2), _split_member(variants[0], launches, long_splits, 256, 3)]
+    assert variants[2].scratch_bytes == variants[3].scratch_bytes == 8192 + 16384 * (128 + 1) * 4
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 3, variants[3])
+    cases = [(1, q, 32768, selected) for q, selected in ((1, 2), (64, 2), (127, 2), (128, 2), (129, 3), (255, 3), (256, 3), (257, 0))]
+    cases += [(1, 128, 32767, 0), (1, 129, 131072, 3), (2, 64, 32768, 0), (1, 32768 // heads, 32768, 1)]
+    saved = []
+    for batch, total, kv, expected in cases:
+        facts = _choice_facts(variants[0], batch, total, total, kv)
+        workspace, stream = 0x4000000 * (len(saved) + 1), 31 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        assert list(frame) == _reference(variants[index], facts, workspace, stream)
+        assert choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(frame))
+        saved.append((frame, tuple(frame)))
+        assert all(tuple(old) == original for old, original in saved)
+
+
+@pytest.mark.parametrize(
+    "bad", ["missing", "unrecorded", "small_capacity", "large_capacity", "small_splits", "large_splits", "contract", "heads", "same_member"]
+)
+def test_balanced_split_policy_rejects_incomplete_or_incompatible_members(bad):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    small = _split_member(variants[0], launches, 16, 128, 2)
+    large = _split_member(variants[0], launches, 8, 256, 3)
+    policy = 3
+    if bad == "missing":
+        large = None
+    elif bad == "same_member":
+        large = small
+    elif bad == "unrecorded":
+        policy = 2
+    elif bad == "small_capacity":
+        small.split_workspace = small.split_workspace._replace(capacity=256)
+    elif bad == "large_capacity":
+        large.split_workspace = large.split_workspace._replace(capacity=128)
+    elif bad == "small_splits":
+        small.split_workspace = small.split_workspace._replace(splits=8)
+    elif bad == "large_splits":
+        large.split_workspace = large.split_workspace._replace(splits=16)
+    elif bad == "contract":
+        large.total_q = 64
+    else:
+        for member in (*variants, small, large):
+            member.qh = member.kh = 32
+    with pytest.raises(ValueError, match="split policy|plan choices must share"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, 2, small, policy, large)
+
+
+def test_balanced_split_requires_matching_native_support_without_breaking_older_policies(monkeypatch):
+    variants, launches = _choice_fixture(kh=16)
+    variants += [_split_member(variants[0], launches, 8, 128, 2), _split_member(variants[0], launches, 4, 256, 3)]
+    members = [SimpleNamespace(spec=s, _roles=("q",), _uids=(1,)) for s in variants]
+    calls = []
+
+    def old_factory(*args):
+        calls.append(args)
+        assert len(args) == 6
+        return object()
+
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
+    prep.PreparedThdChoices(members[:3], 148, policy=2, split_policy=1)
+    with pytest.raises(NotImplementedError, match="matching native"):
+        prep.PreparedThdChoices(members, 148, policy=2, split_policy=3)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
@@ -239,7 +317,7 @@ def test_split_policy_rejects_incompatible_or_unrecorded_members(bad, split_poli
     if bad == "unrecorded":
         policy = 0
     elif bad == "unknown":
-        policy = 3
+        policy = 4
     elif bad == "missing":
         split = None
     elif bad == "capacity":
