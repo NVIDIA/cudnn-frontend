@@ -45,9 +45,10 @@ def _overrides(bufs, tensors, names):
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_prepared_fp8_paged_rebind(d, hnd, split, in_key, dtype, monkeypatch):
-    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
+    import cutlass.cute.runtime as runtime
 
-    monkeypatch.setattr(fp8_host, "make_fake_aux", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
     g, vp, ws, bufs, tensors = _case(d=d, hnd=hnd, split=split, dtype=dtype, in_key=in_key)
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared is not None and prepared.spec.paged
@@ -121,9 +122,10 @@ def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, monkeypatch):
 @pytest.mark.parametrize("d,dv,split", [(64, 64, 1), (64, 64, 4), (112, 96, 1), (112, 96, 4), (384, 320, 1)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_prepared_fp8_dense_head_envelopes(d, dv, split, dtype, monkeypatch):
-    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
+    import cutlass.cute.runtime as runtime
 
-    monkeypatch.setattr(fp8_host, "make_fake_aux", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
     g, vp, ws, bufs, _ = shared._case(d=d, dv=dv, sq=16, skv=256, output_dtype=dtype, split_kv=split, override=True)
     assert g._compiled_plans[g._plan_index]._prepared is not None
     g.execute(vp, ws)
@@ -231,9 +233,10 @@ def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_fp8_paged_distinct_table_strides_prepared(v_table_layout, split, hnd, override, dtype, monkeypatch):
     import cutlass.cute as cute
-    from cudnn.sdpa.fwd.kernels import _fp8_host
+    import cutlass.cute.runtime as runtime
 
-    monkeypatch.setattr(_fp8_host, "make_fake_aux", lambda *a, **k: pytest.fail("distinct tables reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("distinct tables reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("distinct tables reentered tensor compilation"))
     g, vp, ws, bufs, tensors = paged._run_graph_fp8(
         2,
         4,

@@ -399,7 +399,8 @@ def test_fp8_softmax_f16_e2e():
         )
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse, workspace=workspace)
         torch.cuda.synchronize()
         outs[precision] = out.float()
 
@@ -704,7 +705,8 @@ def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, c
         )
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, descale_q=dq, descale_k=dk, descale_v=dv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
         torch.cuda.synchronize()
         outs[pol] = out.clone()
     rep = hq // hkv
@@ -788,7 +790,18 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
         )
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, lse_tensor=lse if with_stats else None, descale_q=dq, descale_k=dk, descale_v=dv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(
+            q_tensor=q8,
+            k_tensor=k8,
+            v_tensor=v8,
+            o_tensor=out,
+            lse_tensor=lse if with_stats else None,
+            descale_q=dq,
+            descale_k=dk,
+            descale_v=dv,
+            workspace=workspace,
+        )
         torch.cuda.synchronize()
         outs[with_stats] = out.clone()
     assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (Sigma normalizes O in both specializations)"
@@ -861,9 +874,10 @@ def test_fp8_d256_gate_module_is_a_separate_specialization():
 
     assert on.GATE_STORAGE_DTYPE is cutlass.BFloat16, "the FP8 kernel stages a bf16 G (row: epilogue_gate_dtypes={BFLOAT16})"
     for mod in (off, on):
-        params = inspect.signature(mod.compile).parameters
+        params = inspect.signature(mod.compile_prepared).parameters
         assert "has_amax" in params and params["has_amax"].default is True
-        assert "gate_stride" in params and params["gate_stride"].default is None
+        assert "gate_stride" not in params
+        assert "gate_strides" in inspect.signature(mod._host_prepared).parameters
         assert not hasattr(mod, "AMAX_O"), "Amax_O is a compile-time fact (has_amax), not a module knob"
     # The e4m3-O geometry must NOT leak into the gate's: with a 1-byte O the two
     # TMA walks differ (O: 2 subtiles of 128; bf16 G: 4 of 64).
@@ -1075,7 +1089,7 @@ def test_fp8_d256_has_amax_false_is_bitwise_and_writes_nothing():
     # The two are different kernel specializations (has_amax is a compile() kwarg), not a runtime branch.
     import inspect
 
-    assert "has_amax" in inspect.signature(api_off._k_mod.compile).parameters
+    assert "has_amax" in inspect.signature(api_off._k_mod.compile_prepared).parameters
 
 
 def test_fp8_d256_amax_is_the_pre_gate_value():
@@ -1364,3 +1378,29 @@ class TestPreparedQuantizedGate:
     test_artifact_reload = staticmethod(_cache_reload)
     test_rebind_and_replay = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_prepared_rebind_and_replay)
     test_batch_override = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_bounded_batch_override)
+
+
+@pytest.mark.parametrize("rubin", [False, True])
+def test_fp8_d256_compile_cli_uses_prepared_entry(rubin, monkeypatch):
+    import sys
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    mod = _load_sm100_kernel_module(_D256, TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1), fp8=True, pertensor=True, rubin=rubin)
+    calls = []
+
+    def compile_prepared():
+        calls.append(True)
+        return "compiled pointer entry"
+
+    monkeypatch.setattr(mod, "compile_prepared", compile_prepared)
+    monkeypatch.setattr(sys, "argv", ["compile-probe", "--b", "2", "--sq", "512", "--validate"])
+    assert mod._main() == 0
+    assert calls == [True]
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestMixedStagedFp8:
+    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
+
+    test_mixed_layout = staticmethod(_mixed_layout)

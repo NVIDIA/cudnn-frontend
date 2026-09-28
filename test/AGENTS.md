@@ -393,6 +393,18 @@ device and keep that device context active through gather, launch and scatter.
 A nondefault stream on Q's device must remain authoritative even when another
 CUDA device is current; restore the caller's device after execution.
 
+When retiring a fake-tensor builder, move negative guards to the live
+`cute.runtime.make_fake_tensor` and `make_fake_compact_tensor` constructors.
+Patching a deleted helper with `raising=False` proves nothing. Keep direct
+SASS and split-partial tests on the production pointer entry, including
+partial-output inspection before combine.
+
+When retiring a compiler entry, audit its standalone `_main()` as well as
+adapter and test callers. A leftover unqualified `compile(...)` silently
+resolves to Python's builtin after the definition is deleted. Execute the
+actual CLI with its replacement compiler intercepted and assert that the
+prepared entry is called; import-only checks cannot catch this failure.
+
 ### Wrapper coverage after workspace migrations
 
 When a prepared adapter starts requiring caller workspace for an existing

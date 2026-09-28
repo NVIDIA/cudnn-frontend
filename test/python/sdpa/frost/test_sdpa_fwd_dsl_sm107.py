@@ -454,43 +454,37 @@ def test_sm107_fp8_pack_gqa_is_d128_only():
     assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
 
-# The sm107 kernels that still raise at `compile()` on a DENSE strided Stats layout (`lse_stride` given, no padded
-# rows): the guard reads "strided Stats not ported (contiguous [B, H, S] only)".  The fp8 row's d128 / d192x128
-# kernels ported it (Rubin run 2026-09-23: test_fp8_strided_stats + test_fp8_strided_stats_other_flavors[d192_d128_*]
-# PASS on cc 10.7); the fp8 d256 / d512 kernels and every MXFP8 kernel did not.
+# MXFP8 retains its legacy tensor compiler; per-tensor FP8 binds Stats strides
+# dynamically through the shared pointer host for every flavor.
 _SM107_STRIDED_STATS_NOT_PORTED = {
-    "fp8": {(256, 256), (512, 512)},
+    "fp8": set(),
     "mxfp8": {(128, 128), (192, 128), (256, 256), (512, 512)},
 }
 
 
-def test_sm107_fp8_strided_stats_is_not_ported_beyond_d192():
-    """A Capabilities GAP, pinned so it is visible: the sm107 per-tensor FP8 row declares Stats on all four flavors and
-    `engines.mismatch` admits any dense-compatible Stats layout (`ga.dense_layout_ok`, no per-flavor field), but the
-    d256 and d512 sm107 fp8 kernels raise `NotImplementedError("strided Stats not ported ...")` from `compile()` on a
-    strided dense layout -- so on cc 10.7 the pinned engine dies at build_plans on `test_fp8_d256_strided_stats`
-    (measured 2026-09-23; that test carries `_skip_strided_stats_d256_on_rubin` with this reason).  The raise is at
-    the top of `compile()`, before any JIT work, so this is host-only.  The d128 / d192x128 kernels take the layout.
-    Follow-up (not this PR): port strided Stats to the d256 / d512 fp8 kernels (the d256 f16 sibling's `lse_strides`
-    is the model) OR declare the layout per flavor on the row; then INVERT the raise assertion for that shape and
-    drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+def test_sm107_fp8_strided_stats_is_ported_for_all_flavors(monkeypatch):
+    """Invert the previous D256/D512 gap detector; runtime Stats strides are
+    accepted by each prepared entry, with native numerics in the FP8 suite."""
+    from cudnn.sdpa.fwd.kernels import _fp8_host
+
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert not any(f.startswith("stats_layout") or f.startswith("strided_stats") for f in caps.__dataclass_fields__), "a per-flavor field exists now: use it"
-    fp8_kw = dict(_DTYPE_FAMILIES[1][1])
+    captured = []
+    sentinel = object()
+
+    def compile_host(*args, **kwargs):
+        captured.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(_fp8_host, "compile_host", compile_host)
     for flavor in _FLAVORS:
-        mod = _load(flavor, rubin=True, **fp8_kw)
-        d_qk, d_v = flavor
-        sq = 128
-        strided = (sq * 4 * 2, sq * 2, 2)  # any declared (B, H, S) stride: the guard fires on `is not None`
+        mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[1][1])
+        assert not hasattr(mod, "compile"), "per-tensor FP8 must use the pointer compiler"
         with open(mod.__file__, encoding="utf-8") as fh:
-            has_guard = "strided Stats not ported" in _code_lines(fh.read())
-        if flavor in _SM107_STRIDED_STATS_NOT_PORTED["fp8"]:
-            assert has_guard, f"{mod.__name__}: the guard is gone -- strided Stats ported?  Invert this arm and drop the marker."
-            with pytest.raises(NotImplementedError, match="strided Stats not ported"):
-                mod.compile(b=2, qh=4, kh=2, sq=sq, skv=128, d_qk=d_qk, d_v=d_v, has_lse=True, lse_stride=strided)
-        else:
-            assert not has_guard, f"{mod.__name__}: a strided-Stats guard appeared on a flavor that had ported it"
+            assert "strided Stats not ported" not in _code_lines(fh.read())
+        # Bypass the memoized result so the real entry forwards its metadata.
+        assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
+    assert len(captured) == len(_FLAVORS)
     for flavor in _FLAVORS:
         mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[2][1])
         with open(mod.__file__, encoding="utf-8") as fh:
@@ -1682,7 +1676,7 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     """The f16 kernel is an explicit pointer/int host: the gate is a MODULE specialization
     (TemplateParams.epilogue_gate -> CFG.EPILOGUE_GATE), its slot (``gate_ptr`` + runtime
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
-    The quantized kernels keep the tensor entry, where signatures evolve append-only
+    MXFP8 keeps the tensor entry, where signatures evolve append-only
     (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
     ``gate_tensor`` immediately after ``stream``; prepared flags may follow.  A ``gate_stride`` handed to an UNGATED tensor-entry
     module is a ValueError, not a silently ignored kwarg."""
@@ -1696,17 +1690,20 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     assert "gate_ptr" in f16_host and "gate_strides" in f16_host, list(f16_host)[-6:]
     assert list(f16_host)[-1] == "stream"
 
-    fp8_c = list(inspect.signature(fp8.compile).parameters)
+    fp8_c = inspect.signature(fp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & fp8_c.keys()
+    assert fp8_c["has_amax"].default is True
+    fp8_host = inspect.signature(fp8._host_prepared).parameters
+    assert {"gate_ptr", "gate_strides"} <= fp8_host.keys()
+    assert list(fp8_host)[-1] == "stream"
     mx_c = list(inspect.signature(mxfp8.compile).parameters)
-    assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
     assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
-    for params in (fp8_c, mx_c):
-        assert params.index("lse_stride") < params.index("gate_stride")
-        assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
+    assert mx_c.index("lse_stride") < mx_c.index("gate_stride")
+    assert mx_c[: mx_c.index("gate_stride")] == [p for p in mx_c if p not in ("gate_stride", "has_amax")]
+    sig = inspect.signature(mxfp8.compile).parameters
+    assert sig["gate_stride"].default is None
+    assert sig["has_amax"].default is True
     for mod in (fp8, mxfp8):
-        sig = inspect.signature(mod.compile).parameters
-        assert sig["gate_stride"].default is None
-        assert sig["has_amax"].default is True
         host = list(inspect.signature(mod._host).parameters)
         stream_slot = host.index("stream")
         assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
@@ -1722,8 +1719,8 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
     assert off.CFG.EPILOGUE_GATE == 0 and "gate_ptr" in inspect.signature(off._host).parameters
-    # Ungated quantized modules refuse a gate stride before any trace.
-    for kw in _QUANT_LOAD_KWS:
+    # The remaining MXFP8 tensor compiler rejects ungated gate metadata.
+    for kw in _QUANT_LOAD_KWS[1:]:
         off = _load(_D256, rubin=True, **kw)
         with pytest.raises(ValueError, match="epilogue_gate"):
             off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
@@ -1735,6 +1732,7 @@ def test_sm107_gate_seams_are_named_once():
     pipeline order with one grep and a dropped / duplicated seam is visible.
     And none of the fork's module knobs survived the port (contract rule 5)."""
     import re
+    from pathlib import Path
 
     for mod in _all_gate_kernel_modules():
         with open(mod.__file__, encoding="utf-8") as fh:
@@ -1747,6 +1745,10 @@ def test_sm107_gate_seams_are_named_once():
         for knob in _RETIRED_GATE_KNOBS:
             assert not re.search(rf"^{knob}\b\s*[:=]", code, re.M), f"{mod.__name__}: fork-era module knob {knob} survived"
             assert not re.search(rf"\b{knob}\b", code), f"{mod.__name__}: fork-era knob {knob} is still referenced"
+        if not hasattr(mod, "compile"):
+            from cudnn.sdpa.fwd.kernels import _fp8_host
+
+            code = Path(_fp8_host.__file__).read_text()
         assert 'options="--enable-tvm-ffi"' in code, f"{mod.__name__}: compile options must stay the production ones"
 
 
@@ -2734,7 +2736,10 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
     # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
-    mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
+    if quant == "fp8":
+        mod.compile_prepared(d_qk=d, d_v=d, has_lse=True)
+    else:
+        mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2904,8 +2909,9 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
     mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
-    kw = {k: v for k, v in kw.items() if k in inspect.signature(mod.compile).parameters}
-    mod.compile(**kw)
+    entry = mod.compile_prepared if quant == "fp8" else mod.compile
+    kw = {k: v for k, v in kw.items() if k in inspect.signature(entry).parameters}
+    entry(**kw)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Preserve SM120's existing dense conversions around an immutable pointer plan.
+"""Preserve existing dense conversions around an immutable pointer plan.
 
 Conversion buffers belong to the caller workspace, whose size is known after
 check_support. Native-layout plans retain their original workspace requirements.
@@ -22,10 +22,15 @@ class StagedLaunch:
     workspace_bytes: int
     plan_device: tuple
     copies: tuple
+    label: str
+
+
+def _cc(api):
+    return api._device_cc or api.compute_capability
 
 
 def _layout(api):
-    """Metadata only: the old tensor entry made every operand compact BSHD."""
+    """Metadata only: compact dense operands, preserving paged K/V pools."""
     from .api_dsl import ws_align
     from .prepared import BufferFacts
 
@@ -33,11 +38,16 @@ def _layout(api):
     compact._compiled_kernel = None
     compact._staged_spec = None
     operands, regions = [], []
+    # The prior SM107 D256 quantized fallback preserved each bindable operand.
+    native_quant = _cc(api) == (10, 7) and api._fp8 and api.flavor == (256, 256)
     for role in ("q", "k", "v", "o"):
         desc = getattr(api, role + "_desc")
         b, h, s, d = desc.shape
         stride = (s * h * d, d, h * d, 1)
-        setattr(compact, role + "_desc", replace(desc, stride=stride, stride_order=(3, 1, 2, 0)))
+        pool = getattr(api, "paged", False) and role in ("k", "v")
+        direct = pool or (native_quant and api._prepared_operand_layout(desc) is not None)
+        if not direct:
+            setattr(compact, role + "_desc", replace(desc, stride=stride, stride_order=(3, 1, 2, 0)))
         shape, strides, dtype = tuple(desc.shape), tuple(desc.stride), desc.dtype
         if role == "o" and api.o_block_scale == 16:
             import cudnn
@@ -45,16 +55,17 @@ def _layout(api):
 
             geometry = storage_geometry(shape, strides, cudnn.data_type.FP4_E2M1)
             if geometry is None:
-                raise ValueError("SM120 staged FP4 output requires byte-addressable geometry")
+                raise ValueError("staged FP4 output requires byte-addressable geometry")
             shape, strides = geometry
             dtype = torch.uint8
         allowed = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)) if role == "o" and api.o_block_scale == 16 else (dtype,)
         operands.append((role, shape, dtype, str(dtype).split(".")[-1], allowed, dtype.itemsize))
         physical_d = shape[-1]
-        if any(n > 1 and st != want for n, st, want in zip(shape, strides, (s * h * physical_d, physical_d, h * physical_d, 1))):
+        if not direct and any(n > 1 and st != want for n, st, want in zip(shape, strides, (s * h * physical_d, physical_d, h * physical_d, 1))):
             regions.append((role, (b, s, h, physical_d), dtype))
-    if not compact._can_prepare_layout():
-        raise NotImplementedError("SM120 compact conversion geometry has no prepared host")
+    ready = compact._can_prepare_layout() if _cc(api)[0] == 12 else compact._can_prepare_fp8()
+    if not ready:
+        raise NotImplementedError("compact conversion geometry has no prepared host")
     offset = compact.scratch_workspace_bytes()
     allocated = []
     for role, shape, dtype in regions:
@@ -75,6 +86,10 @@ def compile_plan(api):
     compact, operands, regions, required = _layout(api)
     compact.compile()
     api._k_mod = compact._k_mod
+    if hasattr(compact, "kernel_template"):
+        api.kernel_template = compact.kernel_template
+    major, minor = _cc(api)
+    label = f"SM{major}{minor} staged"
     from .kernels.staged_copy import compile_copy
     from cudnn.frost.compiled_cache import positional_entry
 
@@ -94,6 +109,7 @@ def compile_plan(api):
         required,
         (2, int(api.q_desc.device.index or 0)),
         tuple(copies),
+        label,
     )
 
 
@@ -110,18 +126,19 @@ def execute(api, tensors, workspace, stream, scale):
     from .prepared import BufferFacts, _bind_block_output, bind_dense, bind_dense_split, execute_quantized, facts_of_tensor
 
     staged = api._staged_spec
+    label = staged.label
     spec = staged.core
     device = api.q_desc.device
     if workspace is None or workspace.device != device or not workspace.is_contiguous():
-        raise ValueError("SM120 staged forward requires contiguous workspace on the Q device")
-    base = api._scratch_base(workspace, "SM120 staged forward", staged.workspace_bytes)
+        raise ValueError(f"{label} forward requires contiguous workspace on the Q device")
+    base = api._scratch_base(workspace, label + " forward", staged.workspace_bytes)
     facts = {}
     plan_device = staged.plan_device
     ends = []
     for role, shape, dtype, dtype_name, allowed, elem_bytes in staged.operands:
         t = tensors.get(role)
         if t is None or t.shape != shape or t.dtype not in allowed or t.device != device:
-            raise ValueError(f"SM120 staged {role} requires shape {shape}, dtype {dtype}, device {device}")
+            raise ValueError(f"{label} {role} requires shape {shape}, dtype {dtype}, device {device}")
         st = t.stride()
         span = 1 + (shape[0] - 1) * st[0] + (shape[1] - 1) * st[1] + (shape[2] - 1) * st[2] + (shape[3] - 1) * st[3]
         ptr = t.data_ptr()
@@ -152,11 +169,11 @@ def execute(api, tensors, workspace, stream, scale):
     ws_end = base + staged.workspace_bytes
     for role, ptr, end in ends:
         if base < end and ptr < ws_end:
-            raise ValueError(f"SM120 staged workspace overlaps {role}")
+            raise ValueError(f"{label} workspace overlaps {role}")
         # The core binder sees the gathered buffers. Preserve its Amax alias
         # check against the caller's original operands as well.
         if amax is not None and role != "amax_o" and amax.device == facts[role].device and amax.ptr < end and ptr < amax.ptr + 4:
-            raise ValueError(f"SM120 staged amax_o overlaps {role}")
+            raise ValueError(f"{label} amax_o overlaps {role}")
     # Each copy binds fresh source/destination pointers. No torch views or
     # allocations are needed to expose the caller's scratch storage.
     copy_frames = []
@@ -171,7 +188,7 @@ def execute(api, tensors, workspace, stream, scale):
                 from .prepared import _covering
 
                 if not _covering(original.shape, original.strides):
-                    raise ValueError("SM120 staged output must have non-overlapping strides")
+                    raise ValueError(f"{label} output must have non-overlapping strides")
             temp = template._replace(ptr=base + offset)
             src, dst = (temp, original) if output else (original, temp)
             sources.append(src.ptr)
@@ -198,7 +215,10 @@ def execute(api, tensors, workspace, stream, scale):
         with context:
             if spec.quant is not None:
                 execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
-                api._logger.debug("execute (SM120 FP8 per-tensor) completed")
+                if label.startswith("SM12"):
+                    api._logger.debug("execute (SM120 FP8 per-tensor) completed")
+                else:
+                    api._logger.debug("execute (FP8 per-tensor) completed")
             else:
                 combine = None
                 if spec.combine is not None:
