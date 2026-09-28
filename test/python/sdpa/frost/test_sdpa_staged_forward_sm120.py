@@ -48,6 +48,12 @@ def _case(d=128, *, fp8=False, split=1, features=False, b=2):
     return api, tensors, storage
 
 
+def _forbid_staging(monkeypatch):
+    from cudnn.sdpa.fwd import prepared_staged_sm120
+
+    monkeypatch.setattr(prepared_staged_sm120, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
+
+
 def _execute(api, tensors, workspace, stream=None):
     api.execute(
         **{n + "_tensor": tensors[n] for n in ("q", "k", "v", "o", "lse")},
@@ -247,6 +253,7 @@ def test_staged_default_stream_with_another_device_current(fp8, monkeypatch):
         "q_shape",
         "k_dtype",
         "o_device",
+        "o_overlap",
         "lse_dtype",
         "sinks_dtype",
         "seq_q_lens_dtype",
@@ -267,6 +274,9 @@ def test_staged_invalid_operand_is_rejected_before_any_copy(fp8, bad, monkeypatc
         tensors["k"] = tensors["k"].float()
     elif bad == "o_device":
         tensors["o"] = torch.empty(tensors["o"].shape, dtype=tensors["o"].dtype)
+    elif bad == "o_overlap":
+        t = tensors["o"]
+        tensors["o"] = t.as_strided(t.shape, (0, *t.stride()[1:]))
     elif bad in ("lse_dtype", "sinks_dtype", "seq_q_lens_dtype"):
         role = bad.removesuffix("_dtype")
         tensors[role] = tensors[role].double()
@@ -280,6 +290,7 @@ def test_staged_invalid_operand_is_rejected_before_any_copy(fp8, bad, monkeypatc
         workspace = torch.empty(workspace.numel() * 2, device="cuda", dtype=torch.uint8)[::2]
     else:
         tensors["sinks"] = workspace[:16].view(torch.float32)
+    _forbid_staging(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid operand reached a staging copy"))
     monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("invalid operand reached attention"))
     with pytest.raises(ValueError):
@@ -293,6 +304,7 @@ def test_staged_amax_alias_checks_original_operand(role, monkeypatch):
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     # Reinterpret a small contiguous island without touching device contents.
     tensors["amax_o"] = tensors[role][0, 0, 0, :4].view(torch.float32)[:1]
+    _forbid_staging(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased Amax reached staging"))
     with pytest.raises(ValueError, match="amax_o overlaps"):
         _execute(api, tensors, workspace)
@@ -306,6 +318,7 @@ def test_staged_sf_alias_checks_original_operand(block, role, monkeypatch):
     g, vp, ws, _, sf, _, ts = _fp8_case(block, stats=True, staged=True)
     source = vp[ts[role]].view(torch.uint8)
     vp[ts["sf_o"]] = source.as_strided((sf.numel(),), (1,)).view(sf.shape)
+    _forbid_staging(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased SF output reached staging"))
     with pytest.raises(ValueError, match="sf_o overlaps"):
         g.execute(vp, ws)
@@ -371,6 +384,7 @@ api.compile()
 owner = api._staged_spec.core.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
+    assert all(entry is None or hasattr(entry[0], "_compiled_cache_raw") for entry in api._staged_spec.copies)
 _execute(api, tensors, workspace)
 _check(tensors, storage)
 graph = torch.cuda.CUDAGraph()
@@ -502,3 +516,59 @@ def test_compiled_workspace_query_uses_prepared_budget(fp8, staged, monkeypatch)
     monkeypatch.setattr(api, "_can_prepare_layout", lambda: pytest.fail("compiled workspace query rebuilt layout"))
     monkeypatch.setattr(api, "_can_prepare_fp8", lambda: pytest.fail("compiled workspace query repeated admission"))
     assert api.scratch_workspace_bytes() == required
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("broadcast_q", [False, True])
+def test_staged_copy_preserves_runtime_element_stride_and_broadcast(fp8, broadcast_q):
+    api, tensors, storage = _case(fp8=fp8)
+    api.compile()
+    b, h, sq, d = tensors["o"].shape
+    output_storage = torch.full((b, sq, h, d * 2), 11, device="cuda", dtype=tensors["o"].dtype)
+    tensors["o"] = output_storage[..., ::2].transpose(1, 2)
+    if broadcast_q:
+        tensors["q"] = tensors["q"][:, :, :1].expand_as(tensors["q"])
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    _execute(api, tensors, workspace)
+    _check(tensors, storage)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            _execute(api, tensors, workspace)
+        tensors["v"].copy_(tensors["v"].float().mul_(0.5).to(tensors["v"].dtype))
+        graph.replay()
+        _check(tensors, storage)
+        assert torch.all(output_storage[..., 1::2] == 11)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_staged_explicit_stream_with_another_device_current(fp8, monkeypatch):
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd import prepared_staged_sm120
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    device = torch.cuda.current_device()
+    other_device = (device + 1) % torch.cuda.device_count()
+    api, tensors, storage = _case(fp8=fp8)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    target = torch.cuda.Stream(device=device)
+    target.wait_stream(torch.cuda.current_stream(device))
+    original = prepared_staged_sm120._copy
+    streams = []
+
+    def copy(entry, frame, stream):
+        assert stream == target.cuda_stream
+        streams.append(stream)
+        return original(entry, frame, stream)
+
+    monkeypatch.setattr(prepared_staged_sm120, "_copy", copy)
+    with torch.cuda.device(other_device):
+        _execute(api, tensors, workspace, driver.CUstream(target.cuda_stream))
+        assert torch.cuda.current_device() == other_device
+    torch.cuda.current_stream(device).wait_stream(target)
+    assert len(streams) == 2
+    _check(tensors, storage)

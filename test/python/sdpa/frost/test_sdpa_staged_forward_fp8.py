@@ -351,6 +351,9 @@ def test_staged_invalid_operand_is_rejected_before_any_copy(bad, monkeypatch):
         workspace = torch.empty(workspace.numel() * 2, device="cuda", dtype=torch.uint8)[::2]
     else:
         tensors["sinks"] = workspace[:16].view(torch.float32)
+    from cudnn.sdpa.fwd import prepared_staged_forward
+
+    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid operand reached a staging copy"))
     monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("invalid operand reached attention"))
     with pytest.raises(ValueError):
@@ -364,6 +367,9 @@ def test_staged_amax_alias_checks_original_operand(role, monkeypatch):
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     # Reinterpret a small contiguous island without touching device contents.
     tensors["amax_o"] = tensors[role][0, 0, 0, :4].view(torch.float32)[:1]
+    from cudnn.sdpa.fwd import prepared_staged_forward
+
+    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased Amax reached staging"))
     with pytest.raises(ValueError, match="amax_o overlaps"):
         _execute(api, tensors, workspace)
@@ -377,6 +383,9 @@ def test_staged_sf_alias_checks_original_operand(block, role, monkeypatch):
     g, vp, ws, _, sf, _, ts = _fp8_case(block, stats=True, staged=True)
     source = vp[ts[role]].view(torch.uint8)
     vp[ts["sf_o"]] = source.as_strided((sf.numel(),), (1,)).view(sf.shape)
+    from cudnn.sdpa.fwd import prepared_staged_forward
+
+    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased SF output reached staging"))
     with pytest.raises(ValueError, match="sf_o overlaps"):
         g.execute(vp, ws)

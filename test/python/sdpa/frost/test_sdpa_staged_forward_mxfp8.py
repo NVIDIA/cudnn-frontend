@@ -134,6 +134,9 @@ def test_mxfp8_staged_sf_rejects_before_copy(role, bad, monkeypatch):
         buffers[role] = torch.empty(original.shape, dtype=original.dtype)
     else:
         buffers[role] = workspace[: original.numel()].view(original.dtype).view(original.shape)
+    from cudnn.sdpa.fwd import prepared_staged_forward
+
+    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid SF reached a staging copy"))
     with pytest.raises(ValueError):
         _execute(api, buffers, workspace)

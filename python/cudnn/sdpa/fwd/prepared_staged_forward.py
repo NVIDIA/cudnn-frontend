@@ -11,6 +11,8 @@ from copy import copy
 from dataclasses import dataclass, replace
 import math
 
+import torch
+
 
 @dataclass(frozen=True)
 class StagedLaunch:
@@ -18,7 +20,8 @@ class StagedLaunch:
     operands: tuple
     regions: tuple
     workspace_bytes: int
-    region_dtypes: tuple
+    plan_device: tuple
+    copies: tuple
     label: str
 
 
@@ -28,7 +31,6 @@ def _cc(api):
 
 def _layout(api):
     """Metadata only: compact dense operands, preserving paged K/V pools."""
-    import torch
     from .api_dsl import ws_align
     from .prepared import BufferFacts
 
@@ -53,7 +55,8 @@ def _layout(api):
                 raise ValueError("staged FP4 output requires byte-addressable geometry")
             shape, strides = geometry
             dtype = torch.uint8
-        operands.append((role, shape, dtype, str(dtype).split(".")[-1]))
+        allowed = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)) if role == "o" and api.o_block_scale == 16 else (dtype,)
+        operands.append((role, shape, dtype, str(dtype).split(".")[-1], allowed, dtype.itemsize))
         physical_d = shape[-1]
         if not pool and any(n > 1 and st != want for n, st, want in zip(shape, strides, (s * h * physical_d, physical_d, h * physical_d, 1))):
             regions.append((role, (b, s, h, physical_d), dtype))
@@ -87,11 +90,35 @@ def compile_plan(api):
         api.kernel_template = compact.kernel_template
     major, minor = _cc(api)
     label = f"SM{major}{minor} staged"
-    return StagedLaunch(compact._dense_spec, operands, regions, required, tuple(dict.fromkeys(region[3] for region in regions)), label)
+    from .kernels.staged_copy import compile_copy
+    from cudnn.frost.compiled_cache import positional_entry
+
+    copies = []
+    for output in (False, True):
+        group = tuple(region for region in regions if (region[0] == "o") == output)
+        if group:
+            shapes = tuple((f.shape[0], f.shape[2], f.shape[1], f.shape[3]) for *_, f in group)
+            owner = compile_copy(shapes, tuple(dtype.itemsize for _, _, _, dtype, _ in group))
+            copies.append((owner, positional_entry(owner), group))
+        else:
+            copies.append(None)
+    return StagedLaunch(
+        compact._dense_spec,
+        operands,
+        regions,
+        required,
+        (2, int(api.q_desc.device.index or 0)),
+        tuple(copies),
+        label,
+    )
+
+
+def _copy(entry, frame, stream):
+    """Launch one prepared copy after the complete operand validation."""
+    entry[1](*frame, stream)
 
 
 def execute(api, tensors, workspace, stream, scale):
-    import torch
     from cudnn._device import ensure_current_context as _ensure_current_context
     from .api_dsl import _torch_stream_context
     from cudnn._torch_stream import _raw_current_stream
@@ -106,17 +133,19 @@ def execute(api, tensors, workspace, stream, scale):
         raise ValueError(f"{label} forward requires contiguous workspace on the Q device")
     base = api._scratch_base(workspace, label + " forward", staged.workspace_bytes)
     facts = {}
-    plan_device = (2, int(device.index or 0))
-    for role, shape, dtype, dtype_name in staged.operands:
+    plan_device = staged.plan_device
+    ends = []
+    for role, shape, dtype, dtype_name, allowed, elem_bytes in staged.operands:
         t = tensors.get(role)
-        allowed = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)) if role == "o" and api.o_block_scale == 16 else (dtype,)
         if t is None or t.shape != shape or t.dtype not in allowed or t.device != device:
             raise ValueError(f"{label} {role} requires shape {shape}, dtype {dtype}, device {device}")
         st = t.stride()
         span = 1 + (shape[0] - 1) * st[0] + (shape[1] - 1) * st[1] + (shape[2] - 1) * st[2] + (shape[3] - 1) * st[3]
-        facts[role] = BufferFacts(t.data_ptr(), dtype_name, plan_device, span, shape, st)
+        ptr = t.data_ptr()
+        facts[role] = BufferFacts(ptr, dtype_name, plan_device, span, shape, st)
+        ends.append((role, ptr, ptr + span * elem_bytes))
     for role, t in tensors.items():
-        if role in facts:
+        if role in facts or t is None:
             continue
         if (
             role in ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
@@ -130,36 +159,48 @@ def execute(api, tensors, workspace, stream, scale):
             facts[role] = BufferFacts(t.data_ptr(), "float32", plan_device, 1, (1,), (1,))
         else:
             facts[role] = facts_of_tensor(t)
+        f = facts[role]
+        ends.append((role, f.ptr, f.ptr + f.span * t.element_size()))
     if spec.quant is not None and spec.quant.block_output is not None:
         # SF output must not alias the original Q/K/V/O either: after gather,
         # the core binder sees only their workspace replacements.
         _bind_block_output(spec, facts)
     amax = facts.get("amax_o")
-    for role, f in facts.items():
-        if f is None:
-            continue
-        end = f.ptr + f.span * tensors[role].element_size()
-        if base < end and f.ptr < base + staged.workspace_bytes:
+    ws_end = base + staged.workspace_bytes
+    for role, ptr, end in ends:
+        if base < end and ptr < ws_end:
             raise ValueError(f"{label} workspace overlaps {role}")
         # The core binder sees the gathered buffers. Preserve its Amax alias
         # check against the caller's original operands as well.
-        if amax is not None and role != "amax_o" and amax.device == f.device and amax.ptr < end and f.ptr < amax.ptr + 4:
+        if amax is not None and role != "amax_o" and amax.device == facts[role].device and amax.ptr < end and ptr < amax.ptr + 4:
             raise ValueError(f"{label} amax_o overlaps {role}")
-    # Slice byte storage before dtype viewing: an odd excess capacity is legal,
-    # and the caller's current view origin is the workspace origin.
-    raw = workspace if workspace.dtype == torch.uint8 and workspace.ndim == 1 else workspace.view(torch.uint8).view(-1)
-    raw = raw[: staged.workspace_bytes]
-    views = {dtype: raw.view(dtype) for dtype in staged.region_dtypes}
-    bound = dict(tensors)
-    for role, offset, nbytes, dtype, template in staged.regions:
-        view = views[dtype]
-        bound[role] = view.as_strided(template.shape, template.strides, view.storage_offset() + offset // dtype.itemsize)
-        facts[role] = template._replace(ptr=base + offset)
+    # Each copy binds fresh source/destination pointers. No torch views or
+    # allocations are needed to expose the caller's scratch storage.
+    copy_frames = []
+    for output, entry in enumerate(staged.copies):
+        if entry is None:
+            copy_frames.append(None)
+            continue
+        sources, destinations, source_strides, destination_strides = [], [], [], []
+        for role, offset, nbytes, dtype, template in entry[2]:
+            original = facts[role]
+            if output:
+                from .prepared import _covering
+
+                if not _covering(original.shape, original.strides):
+                    raise ValueError(f"{label} output must have non-overlapping strides")
+            temp = template._replace(ptr=base + offset)
+            src, dst = (temp, original) if output else (original, temp)
+            sources.append(src.ptr)
+            destinations.append(dst.ptr)
+            source_strides.append((src.strides[0], src.strides[2], src.strides[1], src.strides[3]))
+            destination_strides.append((dst.strides[0], dst.strides[2], dst.strides[1], dst.strides[3]))
+            facts[role] = temp
+        copy_frames.append((tuple(sources), tuple(destinations), tuple(source_strides), tuple(destination_strides)))
 
     def gather():
-        for role, *_ in staged.regions:
-            if role != "o":
-                bound[role].copy_(tensors[role])
+        if copy_frames[0] is not None:
+            _copy(staged.copies[0], copy_frames[0], stream_int)
 
     # Resolve the Q device's current stream, even if another GPU is ambient.
     # Keep that device active through both the torch copies and driver launches.
@@ -191,6 +232,5 @@ def execute(api, tensors, workspace, stream, scale):
                 spec.fn(*frame)
                 if combine is not None:
                     spec.combine.fn(*combine)
-            if any(role == "o" for role, *_ in staged.regions):
-                target = tensors["o"].view(torch.uint8) if api.o_block_scale == 16 else tensors["o"]
-                target.copy_(bound["o"])
+            if copy_frames[1] is not None:
+                _copy(staged.copies[1], copy_frames[1], stream_int)
