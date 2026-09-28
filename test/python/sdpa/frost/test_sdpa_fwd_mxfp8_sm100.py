@@ -2483,6 +2483,7 @@ class TestPreparedPvBf16:
 import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
 
 
+@pytest.mark.L0
 class TestStagedMxfp8:
     test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
     test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)

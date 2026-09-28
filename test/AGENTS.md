@@ -197,6 +197,10 @@ real host expression before descriptor encoding and must fail before widening.
 The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
 FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
 with a move; a new sibling file alone is not exercised by that lane.
+An imported test function does not inherit its source module's `pytestmark`.
+When re-exporting L0 checks into another architecture file, mark the wrapper
+class L0 explicitly and verify collection with the lane's marker expression.
+`test_sdpa_fwd_mxfp8_sm100.py::TestStagedMxfp8` covers this boundary.
 
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales
