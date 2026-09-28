@@ -1,0 +1,163 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Preserve SM120's existing dense conversions around an immutable pointer plan.
+
+Conversion buffers belong to the caller workspace, whose size is known after
+check_support. Native-layout plans retain their original workspace requirements.
+"""
+
+from contextlib import nullcontext
+from copy import copy
+from dataclasses import dataclass, replace
+import math
+
+
+@dataclass(frozen=True)
+class StagedLaunch:
+    core: object
+    operands: tuple
+    regions: tuple
+    workspace_bytes: int
+    region_dtypes: tuple
+
+
+def _layout(api):
+    """Metadata only: the old tensor entry made every operand compact BSHD."""
+    import torch
+    from .api_dsl import ws_align
+    from .prepared import BufferFacts
+
+    compact = copy(api)
+    compact._compiled_kernel = None
+    compact._staged_spec = None
+    operands, regions = [], []
+    for role in ("q", "k", "v", "o"):
+        desc = getattr(api, role + "_desc")
+        b, h, s, d = desc.shape
+        stride = (s * h * d, d, h * d, 1)
+        setattr(compact, role + "_desc", replace(desc, stride=stride, stride_order=(3, 1, 2, 0)))
+        shape, strides, dtype = tuple(desc.shape), tuple(desc.stride), desc.dtype
+        if role == "o" and api.o_block_scale == 16:
+            import cudnn
+            from cudnn.graph_types import storage_geometry
+
+            geometry = storage_geometry(shape, strides, cudnn.data_type.FP4_E2M1)
+            if geometry is None:
+                raise ValueError("SM120 staged FP4 output requires byte-addressable geometry")
+            shape, strides = geometry
+            dtype = torch.uint8
+        operands.append((role, shape, dtype, str(dtype).split(".")[-1]))
+        physical_d = shape[-1]
+        if any(n > 1 and st != want for n, st, want in zip(shape, strides, (s * h * physical_d, physical_d, h * physical_d, 1))):
+            regions.append((role, (b, s, h, physical_d), dtype))
+    if not compact._can_prepare_layout():
+        raise NotImplementedError("SM120 compact conversion geometry has no prepared host")
+    offset = compact.scratch_workspace_bytes()
+    allocated = []
+    for role, shape, dtype in regions:
+        nbytes = math.prod(shape) * dtype.itemsize
+        b, seq, h, d = shape
+        logical_shape, strides = (b, h, seq, d), (seq * h * d, d, h * d, 1)
+        facts = BufferFacts(0, str(dtype).split(".")[-1], (2, int(api.q_desc.device.index or 0)), math.prod(shape), logical_shape, strides)
+        allocated.append((role, offset, nbytes, dtype, facts))
+        offset += ws_align(nbytes)
+    return compact, tuple(operands), tuple(allocated), offset
+
+
+def workspace_bytes(api):
+    return _layout(api)[3]
+
+
+def compile_plan(api):
+    compact, operands, regions, required = _layout(api)
+    compact.compile()
+    api._k_mod = compact._k_mod
+    return StagedLaunch(compact._dense_spec, operands, regions, required, tuple(dict.fromkeys(region[3] for region in regions)))
+
+
+def execute(api, tensors, workspace, stream, scale):
+    import torch
+    from cudnn._device import ensure_current_context as _ensure_current_context
+    from .api_dsl import _torch_stream_context
+    from .prepared import BufferFacts, bind_dense, bind_dense_split, execute_quantized, facts_of_tensor
+
+    staged = api._staged_spec
+    spec = staged.core
+    device = api.q_desc.device
+    if workspace is None or workspace.device != device or not workspace.is_contiguous():
+        raise ValueError("SM120 staged forward requires contiguous workspace on the Q device")
+    base = api._scratch_base(workspace, "SM120 staged forward", staged.workspace_bytes)
+    facts = {}
+    plan_device = (2, int(device.index or 0))
+    for role, shape, dtype, dtype_name in staged.operands:
+        t = tensors.get(role)
+        allowed = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)) if role == "o" and api.o_block_scale == 16 else (dtype,)
+        if t is None or t.shape != shape or t.dtype not in allowed or t.device != device:
+            raise ValueError(f"SM120 staged {role} requires shape {shape}, dtype {dtype}, device {device}")
+        st = t.stride()
+        span = 1 + (shape[0] - 1) * st[0] + (shape[1] - 1) * st[1] + (shape[2] - 1) * st[2] + (shape[3] - 1) * st[3]
+        facts[role] = BufferFacts(t.data_ptr(), dtype_name, plan_device, span, shape, st)
+    for role, t in tensors.items():
+        if role in facts:
+            continue
+        if (
+            role in ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
+            and t is not None
+            and t.dtype == torch.float32
+            and t.device == device
+            and t.numel() == 1
+        ):
+            # A scalar's unit axes carry no addressing information. Keep only
+            # its observed one-element span and this call's pointer.
+            facts[role] = BufferFacts(t.data_ptr(), "float32", plan_device, 1, (1,), (1,))
+        else:
+            facts[role] = facts_of_tensor(t)
+    amax = facts.get("amax_o")
+    for role, f in facts.items():
+        if f is None:
+            continue
+        end = f.ptr + f.span * tensors[role].element_size()
+        if base < end and f.ptr < base + staged.workspace_bytes:
+            raise ValueError(f"SM120 staged workspace overlaps {role}")
+        # The core binder sees the gathered buffers. Preserve its Amax alias
+        # check against the caller's original operands as well.
+        if amax is not None and role != "amax_o" and amax.device == f.device and amax.ptr < end and f.ptr < amax.ptr + 4:
+            raise ValueError(f"SM120 staged amax_o overlaps {role}")
+    context = nullcontext() if stream is None else _torch_stream_context(stream, device)
+    stream = api._get_default_stream(stream)
+    stream_int = int(stream)
+    _ensure_current_context(stream_int, device.index)
+    # Slice byte storage before dtype viewing: an odd excess capacity is legal,
+    # and the caller's current view origin is the workspace origin.
+    raw = workspace if workspace.dtype == torch.uint8 and workspace.ndim == 1 else workspace.view(torch.uint8).view(-1)
+    raw = raw[: staged.workspace_bytes]
+    views = {dtype: raw.view(dtype) for dtype in staged.region_dtypes}
+    bound = dict(tensors)
+    for role, offset, nbytes, dtype, template in staged.regions:
+        view = views[dtype]
+        bound[role] = view.as_strided(template.shape, template.strides, view.storage_offset() + offset // dtype.itemsize)
+        facts[role] = template._replace(ptr=base + offset)
+
+    def gather():
+        for role, *_ in staged.regions:
+            if role != "o":
+                bound[role].copy_(tensors[role])
+
+    with context:
+        if spec.quant is not None:
+            execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
+            api._logger.debug("execute (SM120 FP8 per-tensor) completed")
+        else:
+            combine = None
+            if spec.combine is not None:
+                frame, combine = bind_dense_split(spec, facts, base, stream, stream_int)
+            else:
+                frame = bind_dense(spec, facts, stream, stream_int)
+            frame[spec.index["scale_softmax_log2"]] = scale * math.log2(math.e)
+            gather()
+            spec.fn(*frame)
+            if combine is not None:
+                spec.combine.fn(*combine)
+        if any(role == "o" for role, *_ in staged.regions):
+            target = tensors["o"].view(torch.uint8) if api.o_block_scale == 16 else tensors["o"]
+            target.copy_(bound["o"])

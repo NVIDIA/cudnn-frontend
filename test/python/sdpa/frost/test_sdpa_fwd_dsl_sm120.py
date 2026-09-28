@@ -336,17 +336,17 @@ def _run_dsl_graph(
     plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
-    # Honest workspace: the SM120 kernel None-specializes the LSE store, so a
-    # stats-less dense graph needs no dummy-LSE chunk and no scratch at all.
-    # Only a KV split (the heuristics choose one for short-S_q, long-S_kv
-    # shapes) carves scratch: the half-precision partial O slab and the fp32
-    # partial LSE slab the combine pass reduces, each carve-aligned.
+    # Native dense plans have no dummy LSE scratch. Split plans add the
+    # partial O/LSE slabs; retained conversion layouts also declare their
+    # existing compact Q/K/V/O buffers in caller-owned workspace.
     split_kv = plan.knobs.split_kv or 1
     expected_workspace = 0
     if split_kv > 1:
         b, h, s_q, _ = q_gpu.shape
         d_v = v_gpu.shape[-1]
         expected_workspace = ws_align(split_kv * b * s_q * h * d_v * q_gpu.element_size()) + ws_align(split_kv * b * h * s_q * 4)
+    if graph._compiled_plans[graph._plan_index]._prepared is None:
+        expected_workspace += sum(ws_align(t.numel() * t.element_size()) for t in (q_gpu, k_gpu, v_gpu, o_gpu) if not t.transpose(1, 2).is_contiguous())
     assert graph.get_workspace_size() == expected_workspace, (split_kv, graph.get_workspace_size(), expected_workspace)
 
     variant_pack[o] = o_gpu

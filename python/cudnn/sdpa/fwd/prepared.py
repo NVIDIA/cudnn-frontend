@@ -231,7 +231,7 @@ def _bind_mxfp8_scales(spec, facts):
     return patches
 
 
-def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None):
+def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None, stage_inputs=None):
     """Bind the shared geometry and runtime FP8 scalars before initializing or launching.
 
     Scales remain device pointers. The compiled host unscales a requested amax on the
@@ -315,6 +315,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             patches["scale_o_ptr"] = None
     else:
         frame = bind_dense(spec, facts, stream, stream_int)
+    if stage_inputs is not None:
+        stage_inputs()  # All binding checks precede the existing input conversions.
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
     if frame is not None:

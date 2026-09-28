@@ -342,3 +342,9 @@ Calling `template_key` there otherwise returns `None` and silently bypasses
 persistent caching. Give the module a source identity and require fresh-process
 reload of the whole chain, including split combine and both pointer/tensor
 calling conventions; forbidding JIT only around the attention kernel misses it.
+
+For staged pointer launches, validate aliases against the original caller operands
+before replacing them with workspace views. The core binder only sees gathered
+buffers and otherwise misses an Amax scalar aliasing the original Q or O.
+`test_staged_amax_alias_checks_original_operand` intercepts copies to detect this
+before any kernel is launched.
