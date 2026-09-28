@@ -4766,79 +4766,82 @@ def sdpa_fwd_wrapper_sm80(
                 current_stream=current_stream,
             )
 
-    b, h_q, s_q, _ = q_tensor.shape
-    d_v = v_tensor.shape[-1]
-    o_tensor = torch.empty(
-        (b, s_q, h_q, d_v),
-        dtype=q_tensor.dtype,
-        device=q_tensor.device,
-    ).transpose(1, 2)
-    lse_tensor = _allocate_lse_tensor(q_tensor)
+    # Tag per-call outputs and scratch with the stream that consumes them so
+    # the allocator cannot recycle a block while an explicit stream is pending.
+    with _torch_stream_context(current_stream, q_tensor.device):
+        b, h_q, s_q, _ = q_tensor.shape
+        d_v = v_tensor.shape[-1]
+        o_tensor = torch.empty(
+            (b, s_q, h_q, d_v),
+            dtype=q_tensor.dtype,
+            device=q_tensor.device,
+        ).transpose(1, 2)
+        lse_tensor = _allocate_lse_tensor(q_tensor)
 
-    wl, wr = window_size
-    if not is_causal and wr >= 0:
-        raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
-    rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
-    cache_key = (
-        q_tensor.shape,
-        k_tensor.shape,
-        v_tensor.shape,
-        q_tensor.stride(),
-        k_tensor.stride(),
-        v_tensor.stride(),
-        q_tensor.dtype,
-        bool(is_causal),
-        (wl, wr),
-        scale_softmax,
-        scheduler,
-        bool(causal_bottom_right),
-        seq_kv_lens is not None,
-        seq_len_q is not None,
-        sinks is not None,
-        bias_tensor is not None,
-        (bias_tensor.dtype if bias_tensor is not None else None),
-        rope_max_s,
-        q_tensor.device,
-    )
-    api = _sm80_wrapper_cache.get(cache_key)
-    if api is None:
-        api = SdpaFwdDslSm80(
-            sample_q=q_tensor,
-            sample_k=k_tensor,
-            sample_v=v_tensor,
-            sample_o=o_tensor,
-            sample_lse=lse_tensor,
-            is_causal=is_causal,
-            causal_bottom_right=causal_bottom_right,
-            window_size_left=(wl if wl >= 0 else None),
-            window_size_right=(wr if (is_causal and wr >= 0) else None),
-            scale_softmax=scale_softmax,
-            seq_kv_lens_present=seq_kv_lens is not None,
-            seq_q_lens_present=seq_len_q is not None,
-            has_sink=sinks is not None,
-            scheduler=scheduler,
-            bias_present=bias_tensor is not None,
-            bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
-            rope_max_s=rope_max_s,
+        wl, wr = window_size
+        if not is_causal and wr >= 0:
+            raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
+        rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
+        cache_key = (
+            q_tensor.shape,
+            k_tensor.shape,
+            v_tensor.shape,
+            q_tensor.stride(),
+            k_tensor.stride(),
+            v_tensor.stride(),
+            q_tensor.dtype,
+            bool(is_causal),
+            (wl, wr),
+            scale_softmax,
+            scheduler,
+            bool(causal_bottom_right),
+            seq_kv_lens is not None,
+            seq_len_q is not None,
+            sinks is not None,
+            bias_tensor is not None,
+            (bias_tensor.dtype if bias_tensor is not None else None),
+            rope_max_s,
+            q_tensor.device,
         )
-        api.check_support()
-        api.compile()
-        _sm80_wrapper_cache[cache_key] = api
-    required = api.scratch_workspace_bytes()
-    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
-    api.execute(
-        q_tensor=q_tensor,
-        k_tensor=k_tensor,
-        v_tensor=v_tensor,
-        o_tensor=o_tensor,
-        lse_tensor=lse_tensor,
-        sinks=sinks,
-        seq_q_lens=seq_len_q,
-        seq_kv_lens=seq_kv_lens,
-        scale_softmax=scale_softmax,
-        current_stream=current_stream,
-        bias_tensor=bias_tensor,
-        rope_freqs=rope_freqs,
-        workspace=workspace,
-    )
-    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
+        api = _sm80_wrapper_cache.get(cache_key)
+        if api is None:
+            api = SdpaFwdDslSm80(
+                sample_q=q_tensor,
+                sample_k=k_tensor,
+                sample_v=v_tensor,
+                sample_o=o_tensor,
+                sample_lse=lse_tensor,
+                is_causal=is_causal,
+                causal_bottom_right=causal_bottom_right,
+                window_size_left=(wl if wl >= 0 else None),
+                window_size_right=(wr if (is_causal and wr >= 0) else None),
+                scale_softmax=scale_softmax,
+                seq_kv_lens_present=seq_kv_lens is not None,
+                seq_q_lens_present=seq_len_q is not None,
+                has_sink=sinks is not None,
+                scheduler=scheduler,
+                bias_present=bias_tensor is not None,
+                bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
+                rope_max_s=rope_max_s,
+            )
+            api.check_support()
+            api.compile()
+            _sm80_wrapper_cache[cache_key] = api
+        required = api.scratch_workspace_bytes()
+        workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
+        api.execute(
+            q_tensor=q_tensor,
+            k_tensor=k_tensor,
+            v_tensor=v_tensor,
+            o_tensor=o_tensor,
+            lse_tensor=lse_tensor,
+            sinks=sinks,
+            seq_q_lens=seq_len_q,
+            seq_kv_lens=seq_kv_lens,
+            scale_softmax=scale_softmax,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            rope_freqs=rope_freqs,
+            workspace=workspace,
+        )
+        return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)

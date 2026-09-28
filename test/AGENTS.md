@@ -417,7 +417,13 @@ checks with explicit workspace cannot detect a wrapper that still omits it.
 Exercise BHSD-contiguous and padded conversion inputs plus the compact control,
 including plan-cache reuse and a non-default current stream. The allocating
 wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
-the input device; a zero-workspace plan should keep its allocation-free path.
+the input device and actual launch stream; a zero-workspace plan should keep its
+allocation-free path. Test an explicit stream different from the ambient stream:
+a non-default current stream alone cannot expose premature scratch reuse.
+`test_wrapper_scratch_survives_explicit_stream_consumer` warms the real SM80
+wrapper, intercepts execution with a bounded byte write, and checks live ambient-
+stream allocations while that consumer is pending. Prewarm the churn allocator
+pool too: a fresh `cudaMalloc` can synchronize away the intended overlap.
 The SM120 detector is `TestStagedSm120Wrapper` in
 `test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.
 
