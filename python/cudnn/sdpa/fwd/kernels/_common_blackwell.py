@@ -28,7 +28,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
     _div_up,
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
-from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero
+from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
 from cudnn.frost.tile_dsl.tma import tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
@@ -1077,6 +1077,36 @@ def gate_inv_sum(inv_sum):
     max element a normal fp32, which is what lets the FP8 / MXFP8 kernels'
     Amax_O fold consume ``h`` and double once per tile."""
     return inv_sum * cutlass.Float32(0.5)
+
+
+def o_epilogue_convert_store(o_scaled, row_empty, amax_acc, smem_ptr, *, n: int, apply_select: bool, out_dtype, swizzle):
+    """One O block of the sg1 epilogue AFTER the ``o_fp32 * beta`` multiply: SELECT the dead-row zero, fold |O| into the
+    running Amax_O, pack to the O dtype, swizzled SMEM store.  Trace-time helper (plain Python over traced values, like
+    :func:`gate_epilogue_pairs`): it emits straight-line IR at the call site and holds NO control flow, so a caller may
+    place it under a runtime branch (the d512 kernels' dead-row fast path) -- never a collective op inside it.
+
+    ``apply_select=True`` is the classic body: ``select(row_empty, 0, x)`` per element (a SELECT, never ``* 0`` -- the TMEM
+    residue of an empty row can be a NaN bit pattern, sdpa-invariants.md s2) and the amax fold over the SUBSTITUTED values,
+    so a dead row cannot poison Amax_O.  ``apply_select=False`` is the same body with ``select(False, 0, x) == x`` folded:
+    legal ONLY when the caller has proven no lane of the executing warp holds a dead row (a warp-uniform ``vote.any`` on
+    ``row_empty``), which makes the two arms bit-identical.
+
+    ``amax_acc`` is the fp32 Amax_O accumulator (an :func:`opaque_f32_zero`-seeded value, folded through ``fmax_f32`` so it
+    lowers to FMNMX3, frost-tile-dsl.md s9) or ``None`` for a kernel without Amax_O (half-precision O); the new accumulator
+    (or ``None``) is returned.  ``o_scaled[i]`` are the ``n`` fp32 elements of the block; ``smem_ptr`` is the block's swizzled
+    SMEM destination (``store_swizzled`` at ``alignment=64``, the epilogue's 16-B granule)."""
+    elems = []
+    for i in range(n):
+        e = o_scaled[i]
+        if apply_select:
+            e = cutlass.Float32(arith.select(row_empty.ir_value(), cutlass.Float32(0.0).ir_value(), e.ir_value()))
+        elems.append(e)
+    if amax_acc is not None:
+        for e in elems:
+            amax_acc = fmax_f32(amax_acc, cute.math.abs(e))
+    o_out = cutlass.Vector.from_elements(tuple(elems), cutlass.Float32).to(out_dtype)
+    smem_ptr.store_swizzled(o_out, alignment=64, swizzle=swizzle)
+    return amax_acc
 
 
 def gate_half_opaque():
