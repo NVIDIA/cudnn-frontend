@@ -396,6 +396,10 @@ For staged copies on multiple GPUs, resolve an omitted launch stream on Q's
 device and keep that device context active through gather, launch and scatter.
 A nondefault stream on Q's device must remain authoritative even when another
 CUDA device is current; restore the caller's device after execution.
+In multi-GPU tests, check the operand device's architecture before allocating or
+launching on it. A module-level marker only checks the initially current device;
+it cannot admit a second target on a heterogeneous machine. Allow a different
+architecture on the caller's current device when testing context restoration.
 
 When retiring a fake-tensor builder, move negative guards to the live
 `cute.runtime.make_fake_tensor` and `make_fake_compact_tensor` constructors.

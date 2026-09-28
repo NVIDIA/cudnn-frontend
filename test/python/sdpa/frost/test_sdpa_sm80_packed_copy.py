@@ -108,6 +108,8 @@ def test_packed_copy_restores_caller_device(device_index):
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two GPUs")
+    if torch.cuda.get_device_capability(device_index) != (8, 0):
+        pytest.skip("requires SM80 operands; the caller's current device may use another architecture")
     original = torch.cuda.current_device()
     try:
         torch.cuda.set_device(1 - device_index)
@@ -169,7 +171,10 @@ def test_packed_copy_physical_int64_stride_and_replay(role):
     span = 1 + sum((n - 1) * st for n, st in zip(old.shape, strides))
     if torch.cuda.mem_get_info()[0] < span * old.element_size() + 2**30:
         pytest.skip("wide-stride copy control needs about 9 GiB free")
-    owner = torch.empty(span, device="cuda", dtype=old.dtype)
+    try:
+        owner = torch.empty(span, device="cuda", dtype=old.dtype)
+    except torch.OutOfMemoryError:
+        pytest.skip("insufficient memory for the wide-stride copy allocation")
     tensors[role] = owner.as_strided(old.shape, strides).copy_(old)
 
     def run():
