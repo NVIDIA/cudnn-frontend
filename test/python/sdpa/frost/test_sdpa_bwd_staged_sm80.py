@@ -18,21 +18,15 @@ pytestmark = [
 
 @pytest.fixture(autouse=True)
 def _pointer_only(monkeypatch):
-    from cudnn.sdpa.bwd import api_dsl
+    import cutlass.cute as cute
 
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-    original = api_dsl._load_sm80_bwd_module
 
-    def load(params):
-        module = original(params)
+    def forbidden(*args, **kwargs):
+        pytest.fail("staged backward reached tensor-fake construction")
 
-        def forbidden(*args, **kwargs):
-            pytest.fail("staged backward reached the legacy tensor compiler")
-
-        monkeypatch.setattr(module, "compile", forbidden, raising=False)
-        return module
-
-    monkeypatch.setattr(api_dsl, "_load_sm80_bwd_module", load)
+    monkeypatch.setattr(cute.runtime, "make_fake_tensor", forbidden)
+    monkeypatch.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -292,6 +286,9 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypa
         guards.setattr(torch.Tensor, "zero_", forbidden)
         from cudnn.sdpa.bwd import staged_sm80
 
-        guards.setattr(staged_sm80, "execute", forbidden)
+        guards.setattr(staged_sm80, "_copy", forbidden)
+        from dataclasses import replace
+
+        guards.setattr(api, "_staged_prepared", replace(api._staged_prepared, fn=forbidden))
         with pytest.raises(ValueError, match=role):
             api.execute(q, q, v, v, v, stats, *outputs, workspace=workspace, bias_tensor=bias, sink_tensor=sink, **{role + "_tensor": aux})

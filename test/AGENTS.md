@@ -203,6 +203,10 @@ real host expression before descriptor encoding and must fail before widening.
 The SM107 CI lane selects `test_sdpa_fp8_sm107.py` explicitly. Keep its prepared
 FP8 cases in `TestPreparedSm107Fp8` there, or update the lane selector together
 with a move; a new sibling file alone is not exercised by that lane.
+An imported test function does not inherit its source module's `pytestmark`.
+When re-exporting L0 checks into another architecture file, mark the wrapper
+class L0 explicitly and verify collection with the lane's marker expression.
+`test_sdpa_fwd_mxfp8_sm100.py::TestStagedMxfp8` covers this boundary.
 
 Rebind scale buffers with different values, not only cloned storage: identical
 values let a stale pointer pass. Poison and rebind amax too, then change scales
@@ -402,8 +406,75 @@ shared-stride constraint for a host whose ABI still has only one stride pair.
 A shared kernel imported as an ordinary module has no template-loader digest.
 Calling `template_key` there otherwise returns `None` and silently bypasses
 persistent caching. Give the module a source identity and require fresh-process
-reload of the whole chain, including split combine and both pointer/tensor
-calling conventions; forbidding JIT only around the attention kernel misses it.
+reload of the whole chain, including split combine and every supported pointer
+calling convention; forbidding JIT only around the attention kernel misses it.
+
+For staged pointer launches, validate aliases against the original caller operands
+before replacing them with workspace views. The core binder only sees gathered
+buffers and otherwise misses an Amax scalar or block-scale SF output aliasing
+the original Q or O. `test_staged_amax_alias_checks_original_operand` and
+`test_staged_sf_alias_checks_original_operand` intercept copies to detect these
+aliases before any kernel is launched. Reuse the SF binder on original facts
+so its full atom span and output/input alias rules remain consistent.
+
+For staged copies on multiple GPUs, resolve an omitted launch stream on Q's
+device and keep that device context active through gather, launch and scatter.
+A nondefault stream on Q's device must remain authoritative even when another
+CUDA device is current; restore the caller's device after execution.
+In multi-GPU tests, check the operand device's architecture before allocating or
+launching on it. A module-level marker only checks the initially current device;
+it cannot admit a second target on a heterogeneous machine. Allow a different
+architecture on the caller's current device when testing context restoration.
+
+When retiring a fake-tensor builder, move negative guards to the live
+`cute.runtime.make_fake_tensor` and `make_fake_compact_tensor` constructors.
+Patching a deleted helper with `raising=False` proves nothing. Keep direct
+SASS and split-partial tests on the production pointer entry, including
+partial-output inspection before combine.
+
+When retiring a compiler entry, audit its standalone `_main()` as well as
+adapter and test callers. A leftover unqualified `compile(...)` silently
+resolves to Python's builtin after the definition is deleted. Execute the
+actual CLI with its replacement compiler intercepted and assert that the
+prepared entry is called; import-only checks cannot catch this failure.
+
+### Wrapper coverage after workspace migrations
+
+When a prepared adapter starts requiring caller workspace for an existing
+layout, test every public convenience wrapper that constructs it. Adapter
+checks with explicit workspace cannot detect a wrapper that still omits it.
+Exercise BHSD-contiguous and padded conversion inputs plus the compact control,
+including plan-cache reuse and a non-default current stream. The allocating
+wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
+the input device and actual launch stream; a zero-workspace plan should keep its
+allocation-free path. Test an explicit stream different from the ambient stream:
+a non-default current stream alone cannot expose premature scratch reuse.
+`test_wrapper_scratch_survives_explicit_stream_consumer` warms the real SM80
+wrapper, intercepts execution with a bounded byte write, and checks live ambient-
+stream allocations while that consumer is pending. Prewarm the churn allocator
+pool too: a fresh `cudaMalloc` can synchronize away the intended overlap.
+The SM120 detector is `TestStagedSm120Wrapper` in
+`test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.
+
+
+A fixed-layout wrapper cache must include every input stride used by the prepared
+plan. Same-shape calls can alternate compact, padded and permuted storage; a
+shape-only cache reuses an incompatible native plan.
+`test_wrapper_cache_distinguishes_current_input_strides` exercises three SM80
+layouts and returns to the first one to verify both separation and reuse.
+When padding Q/K to a vector width, retain the original attention scale and
+check non-multiple-of-eight widths against an independent reference.
+
+When a test is re-exported from another module, the source module's `pytestmark`
+does not follow it. A subprocess-based GPU test must check architecture in the
+parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
+Keep genuine child failures failing on supported devices. The half SDPA artifact
+reload detector is re-exported through `TestStagedHalf` and covers this boundary.
+
+Gate layout admission must share the adapter's TMA predicate, including batch
+stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
+an unaligned batch pitch. `test_gate_batch_stride_alignment` covers FP8, half
+and float element widths and the non-stepped singleton-batch control.
 
 ### Single-CTA persistent SDPA validation
 

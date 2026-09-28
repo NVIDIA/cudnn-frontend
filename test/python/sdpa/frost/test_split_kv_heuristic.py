@@ -13,6 +13,7 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
+from frost_test_utils import requires_dsl
 from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
@@ -577,38 +578,65 @@ def test_quantized_and_half_outputs_choose_the_same_split():
     assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
 
 
-def test_every_combine_call_site_matches_the_compiled_arity():
-    """The combine is invoked POSITIONALLY, so adding a parameter to its host
-    silently breaks every call site that was not updated with it.
+@requires_dsl
+@pytest.mark.parametrize("kind", ["dense", "ragged", "quantized"])
+@pytest.mark.parametrize("stats", [False, True])
+def test_every_combine_call_site_matches_the_compiled_arity(kind, stats):
+    """Actual prepared frames must match each pointer host's runtime ABI.
 
-    The failure is a TypeError raised only when a split actually runs, so a
-    missed site hides until some shape happens to split -- and the arms that
-    never split (dense half, THD) look fine either way. Compare the sites
-    against the signature instead of waiting for a shape to find them."""
-    import ast
+    The fixture contains metadata and sentinel addresses only. Both compiled
+    launch functions are intercepted; no CUDA operation receives these addresses.
+    """
     import inspect
-
-    from cudnn.sdpa.fwd import api_dsl
-    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
-
     from typing import get_origin
 
     import cutlass
+    from cudnn.sdpa.fwd import prepared as prep
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from test_sdpa_prepared_geometry import _split_fixture
 
-    # Constexpr values specialize the compiled callable; they are absent from
-    # its runtime ABI. Call sites pass the stream separately by keyword.
+    host = {"dense": split_combine._host_ptr, "ragged": split_combine._host_ptr_ragged, "quantized": split_combine._host_ptr_quantized}[kind]
     params = [
-        name
-        for name, param in inspect.signature(split_combine._host).parameters.items()
-        if name != "stream" and param.annotation is not cutlass.Constexpr and get_origin(param.annotation) is not cutlass.Constexpr
+        param
+        for param in inspect.signature(host).parameters.values()
+        if param.annotation is not cutlass.Constexpr and get_origin(param.annotation) is not cutlass.Constexpr
     ]
-    expected = len(params)
+    signature = inspect.Signature(params)
+    seen = []
 
-    tree = ast.parse(inspect.getsource(api_dsl))
-    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_combine_kernel"]
-    assert sites, "no combine call sites found — did the attribute get renamed?"
-    bad = [(n.lineno, len(n.args)) for n in sites if len(n.args) != expected]
-    assert not bad, f"combine call sites passing != {expected} positional args ({params}): {bad}"
+    def check_frame(*args):
+        assert len(args) == len(params), (kind, len(args), list(signature.parameters))
+        signature.bind(*args)
+        assert args[-1] == 17
+        seen.append(args)
+
+    spec, facts = _split_fixture(stats)
+    spec.fn = lambda *args: None
+    spec.combine = spec.combine._replace(fn=check_frame)
+    if kind == "ragged":
+        spec.ragged, spec.ragged_i64 = True, False
+        spec.total_q = spec.b * spec.s_q_max
+        spec.ragged_divs = (spec.qh * spec.d_qk, spec.qh * spec.d_v, spec.qh)
+        for i, role in enumerate(("ragged_q", "ragged_o", "ragged_lse")):
+            if role != "ragged_lse" or stats:
+                facts[role] = prep.BufferFacts(0x50000 + i * 0x1000, "int32", (2, 0), spec.b + 1, (spec.b + 1,), (1,))
+        if stats:
+            facts["lse"] = facts["lse"]._replace(shape=(spec.total_q, spec.qh), strides=(spec.qh, 1))
+    if kind == "quantized":
+        spec.quant = prep.QuantizedLaunchSpec(True, 65536)
+        for role in ("q", "k", "v"):
+            spec.expect[role] = "float8_e4m3fn"
+            facts[role] = facts[role]._replace(dtype="float8_e4m3fn")
+        for i, role in enumerate(("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")):
+            facts[role] = prep.BufferFacts(0x60000 + i * 0x1000, "float32", (2, 0), 1, (1,), (1,))
+            spec.index[role + "_ptr"] = len(spec.template)
+            spec.template.append(None)
+        # All scalars are present, so execute_quantized needs no CUDA fill.
+        assert prep.execute_quantized(spec, facts, 0x100000, 17, 17)
+    else:
+        _, args = prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+        spec.combine.fn(*args)
+    assert len(seen) == 1, "no prepared combine frame checked"
 
 
 def test_every_split_capable_sm100_kernel_has_the_slot():

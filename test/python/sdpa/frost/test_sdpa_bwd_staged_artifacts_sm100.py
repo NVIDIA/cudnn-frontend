@@ -37,6 +37,8 @@ original = prepared_sm100.compile_staged
 def record(*args):
     result = original(*args)
     owners.append(result.spec.artifact.entry)
+    owners.extend(entry[0] for entry in result.launches if entry is not None)
+    owners.extend(single[0] for entry in result.launches if entry is not None for single in entry[3])
     return result
 prepared_sm100.compile_staged = record
 from test_sdpa_bwd_staged_sm100 import _case, _check

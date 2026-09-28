@@ -37,7 +37,7 @@ epilogue folds |h| with h = o*(inv_sum/2) -- EXACTLY half the ungated value --
 and doubles the running max once per tile (corr_release).
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -2367,115 +2367,6 @@ def _host(
     )
 
 
-@lru_cache(maxsize=None)
-def compile(
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    d_qk: int = CFG.TILE_K,
-    d_v: int = CFG.TILE_O,
-    has_lse: bool = True,
-    q_stride: Optional[tuple] = None,
-    k_stride: Optional[tuple] = None,
-    v_stride: Optional[tuple] = None,
-    o_stride: Optional[tuple] = None,
-    lse_head_major: bool = False,
-    lse_head_stride: int = 0,
-    lse_padded_rows: int = 0,
-    lse_padded_order: tuple = (3, 2, 1, 0),
-    dynamic_bhk: bool = False,
-    lse_stride: Optional[tuple] = None,
-    # == EPILOGUE_FUSION_SEAM(compile) ==
-    # APPEND-ONLY.  gate_stride: the DECLARED BSHD stride of the bf16 gate
-    # tensor (same rules as q/k/v/o_stride); None = COMPACT bf16 [B, S, H_q,
-    # D_v] -- never "O's stride".  Only legal on an EPILOGUE_GATE module (the
-    # gate fake is built iff CFG.EPILOGUE_GATE; a stride on an ungated module
-    # raises).  has_amax: True = the legacy Amax_O output slot; False
-    # None-specializes amax_o_tensor and folds the fold + atomic out.  Both are
-    # part of the compile key (_template_key hashes locals()).
-    gate_stride: Optional[tuple] = None,
-    has_amax: bool = True,
-) -> Callable:
-    """Compile the remaining dense tensor entry for conversion or fused output paths.
-
-    THD uses compile_prepared; no packed tensor fakes are constructed here.
-    Dense tensor strides and the existing gate/Amax specializations remain
-    compile-time facts. Runtime pointers bind through the cached artifact."""
-    if CFG.THD_VARLEN:
-        raise ValueError("SM107 FP8 THD uses compile_prepared; the tensor entry is dense-only")
-    if dynamic_bhk or lse_head_major or lse_head_stride or lse_padded_rows:
-        raise ValueError("THD layout parameters belong to compile_prepared")
-    _cache_key = _template_key(globals(), locals(), "compile")
-    _b0, _qh0, _kh0 = (b, qh, kh)
-    if lse_stride is not None and (not lse_padded_rows):
-        raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
-    if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or (d_v <= 0):
-        raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
-    _fake_batch = b
-
-    def _fake_bshd(shape, stride, dtype=STORAGE_DTYPE, bpe=CFG.BPE):
-        """BSHD fake tensor, compact or at the caller's DECLARED strides.
-
-        The head dim must be innermost-contiguous, and the seq/head global
-        strides feed TMA so they obey the 16-byte global-stride rule.  Under THD
-        the fake binds the token stride for the extent-1 batch dim, as _thd_view
-        does at runtime: tokens * token_stride is never stepped and overflows
-        the int32 stride slot on long packed KV (GitHub #980)."""
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if stride[3] != 1:
-            raise ValueError(f"declared stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-        for axis in (1, 2):
-            if stride[axis] * bpe % 16 != 0:
-                raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
-        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
-
-    fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
-    fake_k = _fake_bshd((_fake_batch, skv, kh, d_qk), k_stride)
-    fake_v = _fake_bshd((_fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd((_fake_batch, sq, qh, d_v), o_stride, dtype=OUT_STORAGE_DTYPE, bpe=CFG.BPE_O)
-    if gate_stride is not None and (not CFG.EPILOGUE_GATE):
-        raise ValueError(
-            f"{__name__}: gate_stride given but this module was loaded with epilogue_gate=False (CFG.EPILOGUE_GATE=0); load it with TemplateParams(epilogue_gate=True)"
-        )
-    fake_gate = _fake_bshd((_fake_batch, sq, qh, d_v), gate_stride, dtype=GATE_STORAGE_DTYPE, bpe=CFG.GATE_BPE) if CFG.EPILOGUE_GATE else None
-    if not has_lse:
-        fake_lse = None
-    else:
-        fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_fake_batch, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
-    from cudnn.sdpa.fwd.kernels._fp8_host import make_fake_aux
-
-    aux = make_fake_aux(b, qh)
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        aux.sinks,
-        aux.kv_lens,
-        aux.o_desc,
-        (_b0, _qh0, _kh0, sq, skv, 0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        *aux.scales,
-        (aux.amax_o if has_amax else None),
-        aux.seq_q_lens,
-        None,
-        None,
-        None,
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        gate_tensor=fake_gate,
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
-    )
-
-
 from cudnn.sdpa.fwd.kernels._fp8_host import host as _host_prepared
 
 
@@ -2494,6 +2385,7 @@ def compile_prepared(
     if CFG.SPLIT_KV > 1:
         raise NotImplementedError("prepared SM107 FP8 split is wired only for D128")
     cache_key = _template_key(globals(), locals(), "compile_prepared")
+    # == EPILOGUE_FUSION_SEAM(compile) ==
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
     if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
@@ -2538,8 +2430,11 @@ def _main():
     parser.add_argument("--iters", type=int, default=0)
     args = parser.parse_args()
 
-    print(f"[d256_fp8] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
-    fn = compile(args.b, args.hq, args.hk, args.sq, args.skv)
+    print(
+        f"[d256_fp8] compile shape-generic prepared host; CLI shape (not specialized): b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}",
+        flush=True,
+    )
+    fn = compile_prepared()
     print(f"[d256_fp8] compile OK: {fn}", flush=True)
     if args.validate:
         print("[d256_fp8] --validate: run via the test driver, not this CLI.")

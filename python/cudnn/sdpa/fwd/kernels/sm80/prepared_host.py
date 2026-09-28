@@ -154,45 +154,7 @@ def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bou
 
 
 def compile_host(module, params, geometry, swa_window, right_bound, cache_key):
-    return _compile_pointer_host(host, module, params, geometry, swa_window, right_bound, cache_key)
-
-
-@lru_cache(maxsize=128)
-def compile_staged_host(module, b, h, sq, skv, d, swa_window, right_bound, rope_max_s, lse_stride, device_index):
-    """Compile the existing compact staging contract, including optional RoPE."""
-    p = module.PARAMS
-    if p.thd_varlen and p.has_bias:
-        raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
-    if p.thd_varlen:
-        raise NotImplementedError("SM80 packed THD uses prepared_host.compile_thd_host")
-
-    def compact(shape):
-        strides, step = [], 1
-        for n in reversed(shape):
-            strides.append(step)
-            step *= n
-        return tuple(shape), tuple(reversed(strides))
-
-    # These are the compact buffers already produced by the adapter's staging
-    # contract. Input KV heads are expanded there; no runtime tensor is cached.
-    geometry = (
-        compact((b, sq, h, d)),
-        compact((b, skv, h, d)),
-        compact((b, skv, h, p.d_v)),
-        compact((b, sq, h, p.d_v)),
-        (((b, h, sq), lse_stride) if lse_stride is not None else compact((b, h, sq))) if p.has_lse else None,
-        compact((b,)) if p.has_seq_kv_lens else None,
-        compact((b,)) if p.has_seq_q_lens else None,
-        compact((h,)) if p.has_sink else None,
-        compact((1, h, sq, skv)) if p.has_bias else None,
-        compact((rope_max_s, p.d_qk // 2, 2)) if p.has_rope else None,
-    )
-    key = template_key(vars(module), dict(geometry=geometry, swa_window=swa_window, right_bound=right_bound), "prepared_staged")
-    artifact = _compile_pointer_host(_dense_host, module, p, geometry, swa_window, right_bound, key)
-    fn = positional_entry(artifact)
-    if fn is None:
-        raise NotImplementedError("SM80 staged forward requires a positional tvm-ffi entry")
-    return artifact, fn
+    return _compile_pointer_host(_dense_host if len(geometry) == 10 else host, module, params, geometry, swa_window, right_bound, cache_key)
 
 
 @cute.jit

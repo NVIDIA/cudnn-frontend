@@ -27,7 +27,10 @@ import math
 import os
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
@@ -666,10 +669,8 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     else:
         o_out = torch.zeros(B, 1, H, d_v, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, 1, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B, h=H, sq=1, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, 1, d_v), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, 1, d_v), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     ref_o, ref_lse = _ref(q[:, 0], k_pool, v_pool, bt, seq_lens, hnd, scale)
     live = seq_lens > 0
@@ -1656,7 +1657,7 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
     """FP8 twin of test_paged_adapter_cuda_graph_replay_no_host_sync (Rule 3), plus
     Rule 4: one compiled artifact serves a bigger pool and a wider block table
     (num_pages / max_pages are dynamic extents), so the SECOND execute takes no
-    cute.compile at all -- the template's compile() cache sees no new miss."""
+    cute.compile at all -- the prepared compiler cache sees no new miss."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 8, 16, 4, 16, 64
@@ -1727,7 +1728,7 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
     # maximum the kernel derives grows with it) over the same declared pool binds
     # the same artifact: no new compile() miss.  The extra slots are dead (never
     # dereferenced: every length stays within the first max_pages pages).
-    info_before = api._k_mod.compile.cache_info()
+    info_before = api._k_mod.compile_prepared.cache_info()
     wide_pages = max_pages + 24
     bt2 = torch.zeros(B, wide_pages, dtype=torch.int32, device=dev)
     bt2[:, :max_pages] = bt
@@ -1749,7 +1750,7 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
         amax_o=amax,
     )
     torch.cuda.synchronize()
-    assert api._k_mod.compile.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
+    assert api._k_mod.compile_prepared.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
     ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
     live = lens2 > 0
     _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
@@ -1822,7 +1823,7 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
     3 / 4 / 3 pages) -- share ONE compiled artifact: the second and third compile() add no
     miss to the template's compile cache and return the same callable. Eligible dense D128
     fp8-to-half plans use the prepared pointer entry: 96 / 128 / 96 share its artifact and
-    do not touch the legacy tensor-entry compile cache. Each dense plan executes and
+    expose no legacy tensor compiler. Each dense plan executes and
     checks O/LSE against its own extent, including the extra KV tail at 128."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
@@ -1852,12 +1853,12 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
         return api
 
     first = paged_plan(96)
-    misses = first._k_mod.compile.cache_info().misses
+    misses = first._k_mod.compile_prepared.cache_info().misses
     for max_kv in (128, 96):
         api = paged_plan(max_kv)
         assert api._k_mod is first._k_mod, "the same template module serves every paged fp8 d128 plan of this shape"
         assert (
-            api._k_mod.compile.cache_info().misses == misses
+            api._k_mod.compile_prepared.cache_info().misses == misses
         ), f"paged_attention_max_seq_len_kv={max_kv} minted a new compile: the logical KV maximum leaked into the paged compile key"
         assert api._compiled_kernel is first._compiled_kernel, max_kv
 
@@ -1887,12 +1888,11 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
 
     dense_96 = dense_plan(96)
     assert dense_96._prepared_fp8 and dense_96._dense_spec is not None
-    legacy_cache = dense_96._k_mod.compile.cache_info()
+    assert not hasattr(dense_96._k_mod, "compile"), "the retired tensor compiler must remain absent"
     prepared_misses = dense_96._k_mod.compile_prepared.cache_info().misses
     for max_kv in (128, 96):
         api = dense_plan(max_kv)
         assert api._prepared_fp8 and api._dense_spec is not None
         assert api._k_mod is dense_96._k_mod
-        assert api._k_mod.compile.cache_info() == legacy_cache, "prepared dense plans must not call the legacy compiler"
         assert api._k_mod.compile_prepared.cache_info().misses == prepared_misses, "runtime KV extents must not specialize the prepared artifact"
         assert api._compiled_kernel is dense_96._compiled_kernel, max_kv

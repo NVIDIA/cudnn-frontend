@@ -58,7 +58,8 @@ The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
 The existing D256 quantized epilogue gate also uses prepared launches, with
 runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
-output's maximum. Conversion routes retain tensor execution.
+output's maximum. Existing conversion routes use prepared gather/scatter copies
+around a compact prepared attention plan.
 Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
@@ -72,7 +73,8 @@ shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
 operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
-layouts and bias retain their tensor executor and decline overrides;
+layouts and bias continue to decline runtime shape/stride overrides. Existing
+conversion layouts use staged copies around a prepared compact plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -503,10 +505,12 @@ stride and positive outer strides aligned to eight half-precision elements.
 Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
 bindings are rejected before launch. Dense layouts outside the native stride
 requirements retain workspace staging (one copy in, and one back out for a
-gradient). That existing staging path now calls the same prepared pointer
-chain after the copies. It retains no tensor-ABI compiler or per-call DLPack
-wrapping; current pointers, workspace storage origins and stream bind on each
-call. Native dense and packed layout admission is unchanged.
+gradient). That existing staging path uses prepared bitwise gather/scatter
+entries around the same pointer chain. It retains no tensor-ABI compiler,
+per-call tensor staging views or DLPack wrapping; current pointers, Int64
+strides, workspace storage origins and stream bind on each call. Potentially
+overlapping gradient outputs preserve ordered copy-back. Native dense and
+packed layout admission is unchanged.
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
@@ -992,9 +996,13 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. The served capability envelope is unchanged: other head dimensions and
-layouts and standalone RoPE retain their existing adapter staging, then
-launch through a pointer host. All forward entries share prepared host lowering;
+width. Other admitted head dimensions and layouts use prepared bitwise
+gather/pad and scatter kernels in caller workspace around the same native GQA
+host. Q/K padding preserves the original attention scale; sink conversion remains
+inside attention. Native operands bind directly without redundant copies. The
+standalone dense wrapper keys plans by input strides and supplies current scratch.
+The capability envelope is unchanged; standalone RoPE retains its angle-table
+preprocessing and uses prepared data copies. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
@@ -1036,9 +1044,14 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper pads to the native flavor width and uses this prepared packed chain.
-Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
-without complete optional-output declarations retain their existing staging and
-optional-gradient copy-backs, followed by the same prepared pointer chain.
+Off-flavor graph/direct-adapter widths, unaligned strides and older direct adapters
+without complete optional-output declarations use prepared gather/pad, gradient
+scatter and auxiliary cast recipes around the same pointer chain. These replace
+the existing tensor copies within the same caller-workspace budget. Packed copy
+capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
+share one scatter launch, while overlapping storage ranges retain ordered copy-back.
+Standalone RoPE uses the same prepared data-copy recipes and keeps its
+existing angle-table preprocessing on the launch stream.
 Packed output casts and folds truncate flavor padding on device and leave capacity
 tails untouched. The obsolete generic and d64 tensor compilers and fake builders
 are removed. Standalone adapters require caller workspace, as native prepared
@@ -1048,9 +1061,20 @@ The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-All SM80 forward tensor-fake construction is removed. Dense off-flavor/RoPE
-also use a pointer host after their existing staging. The forward graph row still
-declines THD, so this changes no graph eligibility.
+All SM80 forward tensor-fake construction is removed. Dense conversion copies,
+including standalone RoPE, share prepared gather/scatter plans with native GQA
+and natural-unit sinks. RoPE retains its existing angle-table preprocessing;
+its obsolete tensor-staging executor and dedicated host compiler are removed.
+The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
+
+Standalone packed forward/backward wrappers share prepared bitwise data copies
+for their existing head-width padding, backward compaction and output trimming.
+One fused copy handles the selected operands; native operands bind directly.
+The bounded wrapper allocation-recipe memo contains only host metadata, while
+compiled copy artifacts specialize on head/width geometry and bind Int64 token
+capacities, strides and addresses per call. The former Torch padding helpers
+are removed. CPU prefix/scalar conversion and zeroed output tails retain their
+existing convenience-wrapper contract; graph eligibility is unchanged.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a
@@ -1150,7 +1174,8 @@ SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
 MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
 current O, SF_O, optional Amax and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
-SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+SF_O offsets and prepared copy strides preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
-their existing admission boundaries. Remaining conversion layouts retain their
-tensor entries. Standalone prepared calls require caller-owned workspace.
+their existing admission boundaries. Remaining conversion layouts use prepared
+gather/scatter copies around a compact prepared plan. Standalone prepared calls
+require caller-owned workspace.

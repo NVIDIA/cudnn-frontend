@@ -46,21 +46,10 @@ pytestmark = [requires_blackwell, requires_dsl]
 #     no PackGQA path in the wider siblings) -- a DECLARED decline
 #     (test_sm107_fp8_pack_gqa_is_d128_only); the packed d192 / d256 execute
 #     tests skip with that reason;
-#   * the sm107 fp8 d256 (and d512) kernels have NOT ported strided Stats
-#     (`compile()` raises "strided Stats not ported (contiguous [B, H, S] only)")
-#     while the row declares Stats on every flavor and the generic stride check
-#     admits any dense-compatible layout -- a Capabilities GAP, follow-up: port it
-#     or declare it per flavor (test_sm107_fp8_strided_stats_is_not_ported_beyond_d192).
-#     Measured on cc 10.7 (2026-09-23): the pinned engine raises the typed
-#     NotImplementedError at build_plans, so select_engine's strict pin FAILS.
+# Per-tensor FP8 Stats strides are now runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
 _skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(
     _SM == 107, reason="the Rubin per-tensor FP8 row packs GQA on d128 only (pack_gqa_d_shapes; pinned by test_sm107_fp8_pack_gqa_is_d128_only)"
-)
-_skip_strided_stats_d256_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="sm107 fp8 d256 kernel: strided Stats not ported (contiguous [B, H, S] only); the row declares it -- Capabilities gap, follow-up "
-    "(pinned by test_sm107_fp8_strided_stats_is_not_ported_beyond_d192)",
 )
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
@@ -866,7 +855,6 @@ def test_fp8_d256_masks(in_key, mask):
 
 
 @pytest.mark.L1
-@_skip_strided_stats_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=59)
 def test_fp8_d256_strided_stats(in_key):
@@ -2279,7 +2267,7 @@ _SM100_D128_FP8_SASS_PROBE = sass_probe_source("""
     print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
-    mod.compile(b=1, qh=64, kh=8, sq=8192, skv=8192, has_lse=True)
+    mod.compile_prepared(d_qk=128, d_v=128, has_lse=True)
     """)
 # The two specializations the breadth measurement covered: dense (NATURAL) and top-left causal (LPT_L2, the heuristics'
 # pick on both trees), as extra TemplateParams fields on top of the per-arch record.

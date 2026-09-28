@@ -158,8 +158,6 @@ def test_dense_geometry_cache_is_bounded_and_safe_across_layouts():
     ],
 )
 def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, match):
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
     spec = SimpleNamespace(b=2, device_index=0)
     original = prep.BufferFacts(4096, "bfloat16", (2, 0), 2048, (2, 8, 1, 128), (1024, 128, 1024, 1))
 
@@ -167,10 +165,10 @@ def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, ma
         return prep._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
 
     before = bind(original)
-    hits = dense_bind_strides.cache_info().hits
+    hits = prep._dense_role_layout.cache_info().hits
     assert bind(original._replace(ptr=8192)).ptr == 8192
     assert before.ptr == 4096
-    assert dense_bind_strides.cache_info().hits == hits + 1
+    assert prep._dense_role_layout.cache_info().hits == hits + 1
     with pytest.raises(ValueError, match=match):
         bind(original._replace(**updates))
 

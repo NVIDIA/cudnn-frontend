@@ -439,11 +439,10 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
     layout the kernels cannot bind zero-copy"; a caller that must tell the two
     apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback).  The rules are the kernels' own (``_fake_bshd`` in every
-    f16 / per-tensor-FP8 prefill kernel), restated here so the decision is made
-    BEFORE a compile rather than as a raise inside one -- and so the engine rows
+    copy fallback). The rules describe the kernels' TMA layout requirements,
+    checked before compilation so the engine rows
     (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter (``api_dsl.SdpaFwdDsl._bshd_zero_copy_stride``)
+    and the standalone adapter's admission and prepared binder
     judge a layout with ONE function (rule 8b lockstep):
 
       * the head dim is innermost-contiguous (stride 1);

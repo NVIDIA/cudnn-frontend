@@ -232,7 +232,7 @@ def _bind_mxfp8_scales(spec, facts):
     return patches
 
 
-def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None):
+def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None, stage_inputs=None):
     """Bind the shared geometry and runtime FP8 scalars before initializing or launching.
 
     Scales remain device pointers. The compiled host unscales a requested amax on the
@@ -316,6 +316,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             patches["scale_o_ptr"] = None
     else:
         frame = bind_dense(spec, facts, stream, stream_int)
+    if stage_inputs is not None:
+        stage_inputs()  # All binding checks precede the existing input conversions.
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
     if frame is not None:
@@ -1390,6 +1392,41 @@ class _DenseRole(NamedTuple):
     s: int
 
 
+@lru_cache(maxsize=256)
+def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, name):
+    """Cache geometry only; current addresses, device, dtype and span stay per-call."""
+    if len(shape) != 4:
+        raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(shape)}")
+    b, h, seq, dd = (int(x) for x in shape)
+    if h != heads or dd != d:
+        raise ValueError(f"cudnn.sdpa: {name}: this plan was built for {heads} heads of dim {d}; got {tuple(shape)}")
+    if b < 1 or b > b_max:
+        raise ValueError(f"cudnn.sdpa: {name}: batch {b} is outside this plan's envelope (1..{b_max})")
+    if seq < 1 or seq > s_max:
+        raise ValueError(f"cudnn.sdpa: {name}: sequence length {seq} is outside this plan's envelope (1..{s_max})")
+    # ONE layout predicate for admission and execution (the lowering's attach decision uses it too):
+    # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    if tma:
+        bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in strides), elem_bytes)
+    else:
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+        if not dense_layout_ok(shape, strides):
+            raise ValueError(f"cudnn.sdpa: {name}: split output needs contiguous D and non-overlapping strides; got {shape} / {strides}")
+        st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(shape, strides))
+        bound = st[0], st[2], st[1]
+    if bound is None:
+        raise ValueError(
+            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be "
+            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+        )
+    bs, ss, hs = bound
+    need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
+    return (bs, ss, hs), b, seq, need
+
+
 def _dense_role(
     spec: DenseLaunchSpec,
     facts: Dict[str, Optional[BufferFacts]],
@@ -1415,38 +1452,24 @@ def _dense_role(
     align = _ALIGN_TMA if tma else _buffers.DTYPE_ITEMSIZE[expect]
     if f.ptr % align != 0:
         raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {align}-byte aligned; got data_ptr() % {align} == {f.ptr % align}")
-    if len(f.shape) != 4:
-        raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(f.shape)}")
-    b, h, seq, dd = (int(x) for x in f.shape)
-    if h != heads or dd != d:
-        raise ValueError(f"cudnn.sdpa: {name}: this plan was built for {heads} heads of dim {d}; got {tuple(f.shape)}")
-    if b < 1 or b > spec.b * b_mult:
-        raise ValueError(f"cudnn.sdpa: {name}: batch {b} is outside this plan's envelope (1..{spec.b * b_mult})")
-    if seq < 1 or seq > s_max:
-        raise ValueError(f"cudnn.sdpa: {name}: sequence length {seq} is outside this plan's envelope (1..{s_max})")
-    # ONE layout predicate for admission and execution (the lowering's attach decision uses it too):
-    # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-    if tma:
-        bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in f.strides), _buffers.DTYPE_ITEMSIZE[expect])
-    else:
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok
-
-        if not dense_layout_ok(f.shape, f.strides):
-            raise ValueError(f"cudnn.sdpa: {name}: split output needs contiguous D and non-overlapping strides; got {f.shape} / {f.strides}")
-        st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(f.shape, f.strides))
-        bound = st[0], st[2], st[1]
-    if bound is None:
-        raise ValueError(
-            f"cudnn.sdpa: {name}: shape {tuple(f.shape)} strides {tuple(f.strides)} is not a layout the kernel binds zero-copy: the head dim must be "
-            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
-        )
-    bs, ss, hs = bound
-    need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
+    bound, b, seq, need = _dense_role_layout(tuple(f.shape), tuple(f.strides), heads, d, s_max, spec.b * b_mult, _buffers.DTYPE_ITEMSIZE[expect], tma, name)
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; its geometry {tuple(f.shape)} / {tuple(f.strides)} needs {need}")
-    return _DenseRole(f.ptr, (bs, ss, hs), b, seq)
+    return _DenseRole(f.ptr, bound, b, seq)
+
+
+@lru_cache(maxsize=256)
+def _dense_lse_layout(shape, strides, b, s_q, qh):
+    """Stats layout/envelope validation contains no runtime storage observations."""
+    sh, st = tuple(int(x) for x in shape), tuple(int(x) for x in strides)
+    if len(sh) == 4 and sh[3] == 1:
+        sh, st = sh[:3], st[:3]
+    if len(sh) != 3 or sh[0] < b or sh[1] != qh or sh[2] < s_q:
+        raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {qh}, {s_q}[, 1]) or larger; got {tuple(shape)}")
+    need = (b - 1) * st[0] + (qh - 1) * st[1] + (s_q - 1) * st[2] + 1
+    if not _covering((b, qh, s_q), st):
+        raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
+    return (st[0], st[1], st[2]), need
 
 
 def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: int, *, required: bool):
@@ -1459,17 +1482,10 @@ def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: i
             raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
         if lse.ptr % _ALIGN_F32 != 0:
             raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-        sh, st = tuple(int(x) for x in lse.shape), tuple(int(x) for x in lse.strides)
-        if len(sh) == 4 and sh[3] == 1:
-            sh, st = sh[:3], st[:3]
-        if len(sh) != 3 or sh[0] < b or sh[1] != spec.qh or sh[2] < s_q:
-            raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {spec.qh}, {s_q}[, 1]) or larger; got {tuple(lse.shape)}")
-        need = (b - 1) * st[0] + (spec.qh - 1) * st[1] + (s_q - 1) * st[2] + 1
+        strides, need = _dense_lse_layout(tuple(lse.shape), tuple(lse.strides), b, s_q, spec.qh)
         if lse.span >= 0 and lse.span < need:
             raise ValueError(f"cudnn.sdpa: lse_tensor spans {lse.span} elements; its geometry needs {need}")
-        if not _covering((b, spec.qh, s_q), st):
-            raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
-        return lse.ptr, (st[0], st[1], st[2])
+        return lse.ptr, strides
     elif lse is not None:
         raise ValueError("cudnn.sdpa: this specialization was compiled without a Stats output; construct the API without sample_lse")
 

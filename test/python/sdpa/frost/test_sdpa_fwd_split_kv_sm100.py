@@ -17,7 +17,10 @@ import os
 from typing import NamedTuple, Optional
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_pre_rubin_blackwell, requires_dsl
 
@@ -81,7 +84,7 @@ def _partial_kwargs(splits, o_p):
 
 
 def _partial_tag(splits, o_dtype):
-    """The matching ``dtype_partial`` for ``sm100/split_combine.compile``.
+    """The matching ``dtype_partial`` for ``sm100/split_combine.compile_ptr``.
 
     Compiling the combine for the wrong width reinterprets the workspace and
     yields garbage rather than an error, so it has to track _partial_o_dtype.
@@ -147,10 +150,8 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
 
     o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=dtype)
     lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined O"
     return o_out.float(), (q, k, v, scale)
@@ -263,53 +264,19 @@ def test_split_kv_requires_lse():
 
 
 @pytest.mark.L0
-def test_split_combine_compile_keeps_partial_lse_compact_and_strides_final_lse(monkeypatch):
-    """Only the caller-visible Stats output inherits its non-compact layout."""
+def test_split_combine_keeps_partial_lse_compact_and_strides_final_lse():
+    """Only caller-visible Stats inherits its non-compact layout."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from test_sdpa_split_combine_sm100 import _partials, _output, _check
 
-    def fake_compact_tensor(_dtype, shape, **kwargs):
-        return {"kind": "compact", "shape": tuple(shape), **kwargs}
-
-    def fake_tensor(_dtype, shape, stride, **kwargs):
-        return {"kind": "strided", "shape": tuple(shape), "stride": tuple(stride), **kwargs}
-
-    captured = {}
-    compiled = object()
-
-    def fake_compile(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return compiled
-
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_compact_tensor", fake_compact_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_tensor", fake_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_stream", lambda **_kwargs: object())
-    monkeypatch.setattr(comb.cute, "compile", fake_compile)
-
-    comb.compile.cache_clear()
-    try:
-        result = comb.compile(
-            b=2,
-            h=4,
-            sq=5,
-            d_v=16,
-            splits=3,
-            has_lse=True,
-            lse_stride=(97, 19, 3),
-        )
-    finally:
-        comb.compile.cache_clear()
-
-    assert result is compiled
-    assert captured["args"][2]["kind"] == "compact"
-    assert captured["args"][2]["shape"] == (6, 4, 5)
-    assert captured["args"][2]["assumed_align"] == 16
-    assert captured["args"][4] == {
-        "kind": "strided",
-        "shape": (2, 4, 5),
-        "stride": (97, 19, 3),
-        "assumed_align": 4,
-    }
+    b, h, sq, d, splits = 2, 4, 5, 16, 3
+    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    assert lp.shape == (splits * b, h, sq) and lp.is_contiguous()
+    o, ostorage, oused = _output((b, sq, h, d), (sq * h * d, h * d, d, 1), torch.float16)
+    lse, lstorage, lused = _output((b, h, sq), (97, 19, 3), torch.float32)
+    fn = positional_entry(comb.compile_ptr(has_lse=True, dtype_partial="f32"))
+    fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, o.stride(), lse.stride(), torch.cuda.current_stream().cuda_stream)
+    _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
 
 
 # --- cga1 (CTA_MMA=1) ---------------------------------------------------
@@ -476,8 +443,8 @@ def test_empty_splits_every_flavor(flavor):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16))
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), S, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
 
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN from an empty split"
@@ -561,10 +528,7 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         params,
         tag=f"t_{d_qk}_{d_v}_{dtype_qkv}_{splits}_{cta_mma}_{int(causal)}",
     )
-    compile_kwargs = dict(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
-    if not mx:
-        compile_kwargs.update(d_qk=d_qk, d_v=d_v)
-    fn = mod.compile(**compile_kwargs)
+    fn = mod.compile_prepared(d_qk=d_qk, d_v=d_v, has_lse=True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(splits, torch.float16))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
@@ -574,6 +538,16 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     ps = (B, H, H, SQ, SKV, 0)
     log2e = cutlass.Float32(scale * _math.log2(_math.e))
 
+    import cutlass.cute as cute
+
+    storage_dtype = cutlass.Float8E5M2 if dtype_qkv == DTYPE_E5M2 else cutlass.Float8E4M3FN
+
+    def ptr(t, dtype, align=16):
+        return cute.runtime.make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+    def strides(t):
+        return tuple(cutlass.Int64(n) for n in t.stride()[:3])
+
     if not mx:
         fp8_dtype = torch.float8_e5m2 if dtype_qkv == DTYPE_E5M2 else torch.float8_e4m3fn
 
@@ -582,32 +556,44 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
 
         q, k, v = mk(B, SQ, H, d_qk), mk(B, SKV, H, d_qk), mk(B, SKV, H, d_v)
 
-        # The FP8 entry takes four 1-element fp32 DEVICE scale tensors
-        # (descale_q/k/v, scale_o) — the scales fold in-kernel — and no Amax_S.
-        def one():
-            return torch.ones(1, dtype=torch.float32, device=dev)
-
-        # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
+        # Bind the pointer ABI directly to preserve inspection of partial O/LSE
+        # before combine. Keep every scalar owner alive until the final sync.
+        scales = [torch.ones(1, dtype=torch.float32, device=dev) for _ in range(4)]
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
+
         fn(
-            q,
-            k,
-            v,
-            o_p,
-            lse_p,
-            zH,
-            zB,
-            o_desc,
+            ptr(q, storage_dtype),
+            ptr(k, storage_dtype),
+            ptr(v, storage_dtype),
+            ptr(o_p, cutlass.Float32 if splits > 1 else cutlass.Float16),
+            ptr(lse_p, cutlass.Float32, 4),
+            ptr(zH, cutlass.Float32),
+            ptr(zB, cutlass.Int32),
+            ptr(o_desc, cutlass.Int64),
             ps,
+            strides(q),
+            strides(k),
+            strides(v),
+            strides(o_p),
+            strides(lse_p),
+            cutlass.Int32(SQ),
             log2e,
-            cutlass.Float32(1.0),
             cutlass.Int32(0),
-            one(),
-            one(),
-            one(),
-            one(),
-            amax_o,
-            **_partial_kwargs(splits, o_p),
+            cutlass.Int64(0),
+            None,
+            None,
+            None,
+            ptr(o_p, cutlass.Float32) if splits > 1 else None,
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0)),
+            cutlass.Int32(0),
+            *(ptr(t, cutlass.Float32, 4) for t in scales),
+            ptr(amax_o, cutlass.Float32, 4),
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+            None,
             stream=stream,
         )
         qf, kf, vf = (t.float().permute(0, 2, 1, 3) for t in (q, k, v))
@@ -638,7 +624,40 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         v8 = v8.reshape(B, H, SKV, d_v).permute(0, 2, 1, 3).contiguous()
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
-        fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, o_desc, ps, log2e, cutlass.Int32(0), **_partial_kwargs(splits, o_p), stream=stream)
+        fn(
+            ptr(q8, storage_dtype),
+            ptr(k8, storage_dtype),
+            ptr(v8, storage_dtype),
+            ptr(o_p, cutlass.Float32 if splits > 1 else cutlass.Float16),
+            ptr(lse_p, cutlass.Float32, 4),
+            ptr(zH, cutlass.Float32),
+            ptr(zB, cutlass.Int32),
+            ptr(o_desc, cutlass.Int64),
+            ps,
+            strides(q8),
+            strides(k8),
+            strides(v8),
+            strides(o_p),
+            strides(lse_p),
+            cutlass.Int32(SQ),
+            log2e,
+            cutlass.Int32(0),
+            cutlass.Int64(0),
+            None,
+            None,
+            None,
+            ptr(o_p, cutlass.Float32) if splits > 1 else None,
+            ptr(sfq, cutlass.Int8),
+            ptr(sfk, cutlass.Int8),
+            ptr(sfv, cutlass.Int8),
+            tuple(cutlass.Int32(t.shape[2]) for t in (sfq, sfk, sfv)),
+            ptr(amax_o, cutlass.Float32, 4),
+            None,
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+            stream=stream,
+        )
 
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
     if causal:
@@ -652,8 +671,12 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
     # has_amax: at splits > 1 the per-split epilogues skip their amax write, so
     # the combine is what reports it -- over the RECOMBINED O.
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16))
-    cfn(o_p, lse_p, o_out, None, amax_o, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(
+        comb.compile_ptr(
+            dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16), quantized=True, has_scale_o_input=False
+        )
+    )
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), splits, o_out.stride(), (0, 0, 0), amax_o.data_ptr(), None, int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined fp8-family O"
     return o_out.float(), ref, amax_o
@@ -743,8 +766,8 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d192_d128_mxfp8.py")
     params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
     mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
-    with pytest.raises(ValueError, match="dense LSE strides"):
-        mod.compile(b=1, qh=2, kh=2, sq=128, skv=256, has_lse=True, lse_stride=(256, 128, 1))
+    with pytest.raises(ValueError, match="dense unsplit Stats"):
+        mod.compile_prepared(d_qk=192, d_v=128, has_lse=True, static_lse_strides=(256, 128, 1))
 
 
 @pytest.mark.L0
@@ -820,10 +843,8 @@ def test_combine_lse_matches_reference(splits, stats_log2):
     else:
         o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=torch.float16)
         lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), int(stream))
         torch.cuda.synchronize()
         got_lse = lse_out
     assert not torch.isnan(got_lse).any(), "NaN in recombined LSE"
@@ -884,10 +905,8 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), S, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN"
     ref = _ref_sdpa(q, k, v, scale, is_causal=False, kh=H)
@@ -952,10 +971,8 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
         torch.cuda.synchronize()
         return o_p.float(), q, k, v, scale
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), splits, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN under mask+split"
     return o_out.float(), q, k, v, scale
@@ -1114,7 +1131,7 @@ def _expected_split(b, h_q, s_q, s_kv, *, rows_per_tile=512, ctas_per_tile=2, kv
     )
 
 
-def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_layout="contiguous", split_kv=None):
+def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_layout="contiguous", split_kv=None, native=False):
     """Drive SdpaFwdDslSm100 the way the graph path does — the chooser's value
     arrives as the explicit ``split_kv`` constructor knob, exactly as
     ``lower_dsl_prefill`` forwards a plan's knobs; return (split, O, ref)."""
@@ -1128,6 +1145,8 @@ def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_la
     q = torch.randn(b, h_q, s_q, d, device=dev, dtype=torch.float16)  # BHSD samples
     k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
     v = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
+    if native:
+        q, k, v = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q, k, v))
     o = torch.zeros_like(q)
     lse_storage = None
     if not with_lse:
@@ -1185,7 +1204,7 @@ def test_api_does_not_split_a_full_chip():
     so hard-coding split==1 would fail on a smaller SM100 part for a device
     reason rather than a policy one."""
     want = _expected_split(1, 16, 2048, 8192)
-    result = _api_case(1, 16, 16, 2048, 8192)
+    result = _api_case(1, 16, 16, 2048, 8192, native=True)
     assert result.split == want
     assert (result.workspace_bytes > 0) == (result.split > 1), "workspace is needed exactly when we split"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
@@ -1194,9 +1213,9 @@ def test_api_does_not_split_a_full_chip():
 @pytest.mark.L0
 @pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
 def test_api_split_with_and_without_workspace(workspace):
-    """With a workspace the partials are carved from it; without one they are
-    torch-allocated (standalone use). Same answer either way."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
+    """Native layouts retain the standalone split-scratch allocation fallback.
+    Conversion layouts require caller workspace, covered by the staged suite."""
+    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace, native=True)
     assert result.split > 1
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
@@ -1512,7 +1531,9 @@ def test_quantized_split_reduces_in_half_not_in_the_output_type(out_dtype):
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        return api.scratch_workspace_bytes()
+        # Conversion O belongs to caller scratch now. Remove that separately
+        # sized final-output region when comparing the partial reservations.
+        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
 
     assert carved(out_dtype) == carved(torch.float16) > 0
 
@@ -1586,7 +1607,9 @@ def test_api_d256_quantized_split_reduces_in_half():
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        return api.scratch_workspace_bytes()
+        # Conversion O belongs to caller scratch now. Remove that separately
+        # sized final-output region when comparing the partial reservations.
+        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
 
     assert carved(torch.float8_e4m3fn) == carved(torch.float16) > 0
 
@@ -1659,7 +1682,9 @@ def test_split_workspace_is_sized_for_fp32_partials(split):
     run past the end of the O slab, over the LSE slab that follows it and then
     over whatever the caller placed after the workspace."""
     b, h_q, s_q, d = 1, 8, 512, 128
-    _api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
+    api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
+    assert {region[0] for region in api._staged_spec.regions} == {"q", "o"}
+    wsb -= b * h_q * s_q * d * (1 + torch.float16.itemsize)  # gathered FP8 Q and final half O
     o_bytes = split * b * s_q * h_q * d * 4
     lse_bytes = split * b * h_q * s_q * 4
     assert wsb >= o_bytes + lse_bytes, f"workspace {wsb} cannot hold fp32 partials ({o_bytes} O + {lse_bytes} LSE)"
@@ -1675,12 +1700,12 @@ def test_fp32_partials_compile_the_combine_for_f32():
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     seen = []
-    orig = comb.compile
+    orig = comb.compile_ptr
     try:
-        comb.compile = lambda **kw: (seen.append(kw), orig(**kw))[1]
+        comb.compile_ptr = lambda **kw: (seen.append(kw), orig(**kw))[1]
         _fp32_partials_api(4)
     finally:
-        comb.compile = orig
+        comb.compile_ptr = orig
     assert seen, "the combine was never compiled"
     assert seen[0]["dtype_partial"] == "f32", f"combine partial dtype is {seen[0]['dtype_partial']!r}"
 
@@ -1691,7 +1716,9 @@ def test_fp32_partials_fold_off_without_a_split():
     fold away and leave the single-pass SMEM/TMA epilogue byte-identical."""
     api, _got, _ref, wsb = _fp32_partials_api(1)
     assert not api._fp32_partial_split()
-    assert wsb == 0
+    assert api._staged_spec.core.combine is None
+    # Dense conversion still owns Q/O scratch and the core scalar dummies.
+    assert wsb == 1 * 8 * 512 * 128 * (1 + torch.float16.itemsize) + 128
 
 
 # --- narrow head dims under a split -----------------------------------------

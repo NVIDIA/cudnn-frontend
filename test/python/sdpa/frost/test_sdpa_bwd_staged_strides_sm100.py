@@ -14,7 +14,7 @@ from sdpa.frost.test_sdpa_bwd_dsl_sm100 import _reference, _check_prepared
 pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive, requires_dsl, requires_pre_rubin_blackwell]
 
 
-@pytest.mark.parametrize("role", ["q", "dq"])
+@pytest.mark.parametrize("role", ["q", "dq", "dv"])
 @pytest.mark.parametrize("product", [False, True])
 def test_staged_physical_batch_stride(role, product):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
