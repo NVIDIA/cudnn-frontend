@@ -10,6 +10,7 @@ from cudnn.api_base import TensorDesc
 
 
 def api_class():
+    """Load the API when the GPU and CuTe DSL are supported."""
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("SM107 required")
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
@@ -23,6 +24,7 @@ def api_class():
 
 
 def desc(tokens, heads, dtype=torch.bfloat16):
+    """Describe a contiguous THD tensor on the current CUDA device."""
     return TensorDesc(
         dtype=dtype, shape=(tokens, heads, 256), stride=(heads * 256, 256, 1), stride_order=(2, 1, 0), device=torch.device("cuda", torch.cuda.current_device())
     )
@@ -30,6 +32,7 @@ def desc(tokens, heads, dtype=torch.bfloat16):
 
 @pytest.mark.L0
 def test_support_contract():
+    """Check supported metadata and bounded workspace sizing."""
     cls = api_class()
     q, k = desc(65536, 8), desc(65536, 1)
     lse = TensorDesc(dtype=torch.float32, shape=(65536, 8, 1), stride=(8, 1, 1), stride_order=(2, 1, 0), device=q.device)
@@ -45,6 +48,7 @@ def test_support_contract():
 
 
 def fixture(return_call=False, lengths=(128, 384), spans=None):
+    """Build packed inputs and a matching native backward call."""
     te = pytest.importorskip("transformer_engine.pytorch.cpp_extensions.fused_attn")
     spans = lengths if spans is None else spans
     total, maximum = sum(spans), max(lengths)
@@ -76,6 +80,7 @@ def fixture(return_call=False, lengths=(128, 384), spans=None):
 
 
 def check_gradients(actual, expected):
+    """Check finite gradients and relative error against the reference."""
     errors = []
     for actual_tensor, reference in zip(actual, expected[:3]):
         a, b = actual_tensor.float(), reference.float()
@@ -90,6 +95,7 @@ def check_gradients(actual, expected):
 
 @pytest.mark.L2
 def test_full_packed_stream_pointers_and_workspace():
+    """Check 64K gradients, stream ordering, and workspace ownership."""
     from functools import partial
 
     cls = api_class()
@@ -142,6 +148,7 @@ def test_full_packed_stream_pointers_and_workspace():
 
 @pytest.mark.L2
 def test_changing_packs_reuse_compiled_kernel():
+    """Check changing packs and padding with one compiled plan."""
     cls = api_class()
     torch.manual_seed(2300)
     plan = None
@@ -196,6 +203,7 @@ def test_changing_packs_reuse_compiled_kernel():
 
 @pytest.mark.L2
 def test_te_certification_and_fallback(monkeypatch):
+    """Check certified packing, per-step dispatch, and native fallback."""
     api_class()
     from cudnn.sdpa.bwd.compact_gqa import te as adapter
     from transformer_engine.pytorch.attention.dot_product_attention import backends
@@ -308,6 +316,7 @@ def test_ds_budget_resize_is_atomic(monkeypatch):
         plan.scratch_workspace_bytes(129)
 
     def unexpected_compile(*args, **kwargs):
+        """Fail if invalid capacity reaches compilation."""
         raise AssertionError("Invalid capacity reached compilation")
 
     monkeypatch.setattr(plan, "compile", unexpected_compile)
@@ -325,6 +334,7 @@ def test_default_stream_context(monkeypatch):
     default = torch.cuda.default_stream(plan.device)
 
     def unexpected_external(*args, **kwargs):
+        """Fail if a default stream reaches ExternalStream."""
         raise AssertionError("Default stream reached ExternalStream")
 
     monkeypatch.setattr(torch.cuda, "ExternalStream", unexpected_external)
@@ -342,6 +352,7 @@ def test_te_older_signature_falls_back(isolated_adapter, monkeypatch, trace):
     calls = []
 
     def native(q):
+        """Record native dispatch for the older signature."""
         calls.append(q)
         return "native"
 
@@ -367,6 +378,7 @@ def test_te_none_window_falls_back(isolated_adapter, monkeypatch):
     signature = inspect.signature(backends.fused_attn_bwd)
 
     def native(*args, **kwargs):
+        """Return the native fallback sentinel."""
         return "native"
 
     native.__signature__ = signature
@@ -392,6 +404,7 @@ def test_te_kernel_error_propagates(isolated_adapter, monkeypatch):
         adapter.register_packing(bound.arguments[name], (0, 128, 512))
 
     def failed_compile(*args, **kwargs):
+        """Simulate a candidate compilation failure."""
         raise TypeError("candidate compilation failed")
 
     monkeypatch.setattr(api.CompactGqaBackward, "compile", failed_compile)
@@ -428,6 +441,7 @@ def test_te_workspace_plan_switch(isolated_adapter):
     signature = inspect.signature(backends.fused_attn_bwd)
 
     def call(lengths, lse_rank):
+        """Build a certified TE call with the requested LSE rank."""
         args, kwargs = fixture(return_call=True, lengths=lengths)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
