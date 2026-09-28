@@ -230,6 +230,59 @@ def test_sm107_every_mask_site_calls_apply_mask_chunk(flavor, kind, load_kw):
         assert not re.search(spelling, code), f"{mod.__name__}: {spelling!r} -- the per-kernel mask-form selector was collapsed into apply_mask_chunk"
 
 
+# ------------------------------------------------------------------ the O store / epilogue levers of the d512 kernels: module constants
+# The sm107 d512 kernels (the cga4x1 role-split, one TMA-STG warp per CTA) carry two measured perf levers, each spelled ONCE as a
+# module constant next to CFG and folded at every site with ``cutlass.const_expr`` -- the SPIN_RING_WAITS discipline:
+#   O_STORE_STREAM  -- the sg1 TMA-STG warp issues chunk c's TMA-O subtile (``tile_dsl.tma.tma_store_subtile``) right behind its
+#                      ``mb_tma_o_full[c]`` wait instead of queueing the whole tile after the last chunk.  The store's cost is
+#                      the SM's in-order TMA ENGINE occupancy ahead of the next work item's V loads, not HBM bytes: +16.3 / +16.5 /
+#                      +5.9 / +0.5 % of time at S_KV = 512 / 1024 / 2048 / 8192 on the d512 mxfp8 kernel (212-SM Rubin, B=1 H_Q=64
+#                      H_KV=1 S_Q=16K bf16-O dense, A/B/A x3, controls <= 0.03 %), O / LSE / Amax_O bitwise identical.
+#   O_EPI_PIPELINE  -- the sg1 epilogue issues the tcgen05.ld batch of chunk c+1 before chunk c's ALU / STS / fence / arrive (the
+#                      fence + arrive pin a tcgen05.ld; the classic order exposes one TMEM latency per chunk) and skips the
+#                      per-element dead-row select behind a warp-uniform vote; +1.7 pt @1024, -1.1 pt @8192 on top of the stream.
+# Both arms of both levers trace, and both constants False is cubin-md5-identical to develop (f16 / fp8 / mxfp8, sm_107a).  The
+# per-block body is ONE shared helper (``_common_blackwell.o_epilogue_convert_store``) and the subtile store ONE library op -- the
+# kernels carry no in-file copy of either (twice hand-rolled belongs in the library).  The SASS twin of this check is
+# test_sm107_d512_o_store_path_sass_pins.
+_O_STORE_LEVERS = ("O_STORE_STREAM", "O_EPI_PIPELINE")
+_D512 = (512, 512)
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
+    """Every sm107 d512 kernel holds both levers as bool module constants (the module's own values, not a source grep), defines
+    each exactly once, folds each at its sites with ``const_expr`` (no literal, both arms present), streams the O store through
+    ``tile_dsl.tma.tma_store_subtile`` and converts through ``_common_blackwell.o_epilogue_convert_store`` -- with no in-file
+    copy of either (the experiment's ``_tma_store_subtile`` / ``_o_epi_convert_store``) and no bare bulk-tensor store op."""
+    import re
+
+    mod = _load(_D512, rubin=True, **load_kw)
+    for name in _O_STORE_LEVERS:
+        val = getattr(mod, name)
+        assert isinstance(val, bool) and val is True, f"{mod.__name__}: {name}={val!r}, the shipped value is True"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    for name in _O_STORE_LEVERS:
+        assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one {name} definition"
+        assert f"const_expr({name})" in code, f"{mod.__name__}: {name} is not folded at a site"
+    assert "const_expr(not O_STORE_STREAM)" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
+    assert re.search(r"\btma_store_tile\(", code) and re.search(r"\btma_store_subtile\(", code), f"{mod.__name__}: both store forms must trace"
+    assert "    tma_store_subtile," in code, f"{mod.__name__}: tma_store_subtile must come from cudnn.frost.tile_dsl.tma"
+    assert (
+        "o_epilogue_convert_store(" in code and "o_epilogue_convert_store" in code.split("def _compute_warp_group")[0]
+    ), f"{mod.__name__}: the per-block convert is the shared _common_blackwell helper"
+    for spelling in (
+        "def _tma_store_subtile",
+        "def _o_epi_convert_store",
+        "nvvm.cp_async_bulk_tensor_global_shared_cta(",
+        "_O_STORE_STREAM",
+        "_O_EPI_LD_GROUP",
+        "abs_max_tree",
+    ):
+        assert spelling not in code, f"{mod.__name__}: {spelling!r} -- an in-file copy / experiment knob is back"
+
+
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_sm107_f16_thd_specialization_matches_the_ported_flavors(flavor):
     """A THD config must TRACE for a ported f16 flavor and be REFUSED for the
@@ -2811,6 +2864,129 @@ def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o,
     assert (
         stats["STL"] <= spill_max and stats["LDL"] <= spill_max
     ), f"the {quant} d={d} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
+
+
+# ============================================================================ Rubin SASS pins: the d512 O store path
+# The two d512 levers above are invisible to every numerics test (O / LSE / Amax_O bit-identical either way); their SASS is the
+# tripwire.  O_STORE_STREAM: each `UTMASTG` sits right behind ITS chunk's `PHASECHK` wait, so the longest run of UTMASTG with no
+# PHASECHK between them is _O_SUBTILES_PER_CHUNK (1 at the 128 B O swizzle); the whole-tile form reads a run of TMA_O_ITERS_HOST
+# (8 at a half-precision O, 4 at fp8 O -- the develop counts).  O_EPI_PIPELINE: the dead-row fast path is the kernel's only
+# `VOTE.ANY` (develop: 0; the correction loop's vote is VOTE.ALL).  Both: ONE bulk group per tile (1 UTMACMDFLUSH + 1 DEPBAR), no
+# GPU-scope drain, no spill, and REG within the measured ceiling -- the fp8-O batch sizing is what the REG pin holds: a 2-block
+# tcgen05.ld batch at an FP8 O is 256 live registers and read REG 255 / STACK 512 / 192 STL / 332 LDL before the batch was sized by
+# registers (frost-tile-dsl.md; both O dtypes of the mxfp8 kernel are pinned for that reason).  Measured 2026-09-28 on the branch
+# (sm_107a, cutlass-dsl 4.8.0 + CUDA 13.5 ptxas, dense B=1 H=128 S=8192 LSE on, production cga2): REG f16 205 / fp8 156 / mxfp8 224 /
+# mxfp8-fp8out 158 (develop 203 / 158 / 222 / -), STL = LDL = 0 on every row; a REG slack of 16 tolerates ptxas drift and still
+# catches the 255 of a wrong batch.
+_SM107_O_STORE_PROBE = textwrap.dedent("""
+    import glob, os, re, subprocess, sys
+    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    fp8 = quant != "f16"
+    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    # E4M3 in on the quantized rows, BF16 in on the f16 row; the row picks the O dtype.
+    params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma)
+    mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=(quant == "fp8"), rubin=True)
+    print("EXPECT_UTMASTG", mod.TMA_O_ITERS_HOST)
+    print("EXPECT_UTMASTG_MAX_RUN", mod._O_SUBTILES_PER_CHUNK if mod.O_STORE_STREAM else mod.TMA_O_ITERS_HOST)
+    print("EXPECT_VOTE_ANY", 1 if mod.O_EPI_PIPELINE else 0)
+    entry = getattr(mod, "compile_prepared", None) or mod.compile
+    entry(d_qk=d, d_v=d, has_lse=True)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    for key in ("UTMASTG", "UTMACMDFLUSH", "DEPBAR", "STL", "LDL", "CGAERRBAR"):
+        print("SASS", key, cnt(key))
+    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
+    print("SASS VOTE_ANY", cnt("VOTE.ANY"))
+    run = best = 0
+    for ln in sass:
+        if "UTMASTG" in ln:
+            run += 1; best = max(best, run)
+        elif "PHASECHK" in ln:
+            run = 0
+    print("SASS UTMASTG_MAX_RUN", best)
+    # REG of the main kernel = the largest REG of any function in the cubin (the amax reset / unscale helpers are tiny), read by the
+    # cuobjdump that ships beside the nvdisasm that decoded the cubin; -1 when there is none (the REG bound is then not checked).
+    cuobj = os.path.join(os.path.dirname(nvd), "cuobjdump")
+    reg = -1
+    if os.path.isfile(cuobj):
+        ru = subprocess.run([cuobj, "--dump-resource-usage", cubins[-1]], capture_output=True, text=True).stdout
+        regs = [int(m) for m in re.findall(r"REG:(\\d+)", ru)]
+        reg = max(regs) if regs else -1
+    print("SASS REG", reg)
+    print("SASS LINES", len(sass))
+    """)
+
+_REG_SLACK = 16
+_SM107_O_STORE_SASS_ROWS = [
+    # (quant, TemplateParams.dtype_o, REG measured on the branch)
+    pytest.param("f16", _BF16_OUT, 205, id="f16-d512"),
+    pytest.param("fp8", _E4M3, 156, id="fp8-d512"),
+    pytest.param("mxfp8", _BF16_OUT, 224, id="mxfp8-d512"),
+    pytest.param("mxfp8", _E4M3, 158, id="mxfp8-d512-fp8out"),
+]
+
+
+@pytest.mark.parametrize("quant, dtype_o, reg_measured", _SM107_O_STORE_SASS_ROWS)
+def test_sm107_d512_o_store_path_sass_pins(tmp_path, quant, dtype_o, reg_measured):
+    """The streamed O store (one UTMASTG per chunk wait, TMA_O_ITERS_HOST stores, one bulk group per tile), the pipelined epilogue
+    (one VOTE.ANY), no GPU-scope drain, no spill, REG within the measured ceiling -- on every sm107 d512 kernel, both O dtypes of the
+    mxfp8 one.  Expectations come from the module itself (its constants and TMA geometry), so a flipped lever re-pins its own row."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_ostore_{quant}_o{dtype_o}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_O_STORE_PROBE, str(dump), quant, "512", str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d=512 dtype_o={dtype_o} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("EXPECT_") and len(ln.split()) == 2}
+    print(f"\nsm107 {quant} d=512 dtype_o={dtype_o} sm_107a SASS: {stats}; module says {expect}")
+    assert stats["UTMASTG"] == expect["EXPECT_UTMASTG"], f"{stats['UTMASTG']} UTMASTG, the module's TMA-O geometry says {expect['EXPECT_UTMASTG']}"
+    assert stats["UTMASTG_MAX_RUN"] == expect["EXPECT_UTMASTG_MAX_RUN"], (
+        f"longest UTMASTG run without a PHASECHK between = {stats['UTMASTG_MAX_RUN']}, O_STORE_STREAM says {expect['EXPECT_UTMASTG_MAX_RUN']}: "
+        "a store is no longer issued behind its own chunk wait (or the whole-tile arm is being traced)"
+    )
+    assert (
+        stats["UTMACMDFLUSH"] == 1 and stats["DEPBAR"] == 1
+    ), f"{stats['UTMACMDFLUSH']} commit / {stats['DEPBAR']} wait_group: the store must stay ONE bulk group per tile"
+    assert (
+        stats["VOTE_ANY"] == expect["EXPECT_VOTE_ANY"]
+    ), f"{stats['VOTE_ANY']} VOTE.ANY, O_EPI_PIPELINE says {expect['EXPECT_VOTE_ANY']}: the dead-row fast path (which pins the pipelined loads) is gone"
+    assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
+    assert (
+        stats["STL"] == 0 and stats["LDL"] == 0
+    ), f"the {quant} d=512 dtype_o={dtype_o} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL): a tcgen05.ld batch wider than 64 fp32 per lane?"
+    if stats["REG"] >= 0:
+        assert (
+            stats["REG"] <= reg_measured + _REG_SLACK
+        ), f"REG {stats['REG']} > {reg_measured} + {_REG_SLACK}: the pipelined epilogue holds more than two 64-register load batches"
 
 
 # ============================================================================ Rubin SASS pins: the ring-wait retry form
