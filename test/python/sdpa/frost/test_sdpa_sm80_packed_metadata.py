@@ -198,6 +198,8 @@ def test_packed_metadata_physical_wide_addresses(d, role, product):
 
 
 def test_packed_metadata_fresh_process_artifact_reload(tmp_path):
+    if _SM != 80:
+        pytest.skip("fresh-process packed metadata reload requires native SM80")
     import json
     import os
     from pathlib import Path
