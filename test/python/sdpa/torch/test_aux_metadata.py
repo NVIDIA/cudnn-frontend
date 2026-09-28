@@ -336,6 +336,7 @@ def test_forward_metadata_missing_execution_entry_falls_back(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     try:
         _check_columns(metadata.prepare_forward_metadata(*values, 4, 4), values, 4, 4)
+        monkeypatch.setattr(torch, "empty", lambda *a, **k: pytest.fail("unsupported entry allocated unused prepared output"))
         with torch.cuda.graph(graph):
             captured = metadata.prepare_forward_metadata(*values, 4, 4)
         for value in values:

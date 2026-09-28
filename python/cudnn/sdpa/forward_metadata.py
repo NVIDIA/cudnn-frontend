@@ -78,12 +78,9 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
 
     context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
     with context:
-        out_q = (seq_q.reshape(shapes[0]) if seq_q is not None else None) if q_native else torch.empty(shapes[0], dtype=torch.int32, device=device)
-        out_kv = (seq_kv.reshape(shapes[1]) if seq_kv is not None else None) if kv_native else torch.empty(shapes[1], dtype=torch.int32, device=device)
-        out_sink = (sinks.reshape(shapes[2]) if sinks is not None else None) if sink_native else torch.empty(shapes[2], dtype=torch.float32, device=device)
         active_counts = (0 if q_native else batch, 0 if kv_native else batch, 0 if sink_native else heads)
         if max(active_counts) == 0:
-            return out_q, out_kv, out_sink
+            return tuple(_torch_column(tensor, dtype, shape) if tensor is not None else None for tensor, dtype, shape in zip(values, types, shapes))
         stream = _raw_current_stream(torch, device)
         if stream is None:
             stream = torch.cuda.current_stream(device).cuda_stream
@@ -96,6 +93,9 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
         plan = _plan(dtypes, device.index)
         if plan is None:
             return tuple(_torch_column(tensor, dtype, shape) if tensor is not None else None for tensor, dtype, shape in zip(values, types, shapes))
+        out_q = (seq_q.reshape(shapes[0]) if seq_q is not None else None) if q_native else torch.empty(shapes[0], dtype=torch.int32, device=device)
+        out_kv = (seq_kv.reshape(shapes[1]) if seq_kv is not None else None) if kv_native else torch.empty(shapes[1], dtype=torch.int32, device=device)
+        out_sink = (sinks.reshape(shapes[2]) if sinks is not None else None) if sink_native else torch.empty(shapes[2], dtype=torch.float32, device=device)
         plan[1](
             None if q_native else seq_q.data_ptr(),
             None if kv_native else seq_kv.data_ptr(),
