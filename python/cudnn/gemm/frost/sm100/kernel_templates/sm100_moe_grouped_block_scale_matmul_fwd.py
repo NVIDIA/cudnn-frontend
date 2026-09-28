@@ -33,7 +33,7 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
     dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
 )
-from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.tile_helpers import (
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,

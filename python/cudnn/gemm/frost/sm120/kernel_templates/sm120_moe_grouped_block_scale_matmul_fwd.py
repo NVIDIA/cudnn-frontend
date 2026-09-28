@@ -54,6 +54,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import moe_swizzle_tile as _moe_swizzle_tile
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
@@ -258,8 +259,8 @@ def _sf_word_offset(r, r_in_block):
 
 
 # ---------------------------------------------------------------------------
-# Grouped scheduling helpers (the sm100 MoE kernels', inlined here the way the
-# dense sm120 kernel inlines its own L2 raster).
+# Group-local swizzle width depends on this template's injected constants.
+# Tile mapping is shared through tile_helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -281,21 +282,6 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     if cutlass.min(rows, n) * row_bytes <= budget and rows <= n:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
-
-
-@cute.jit
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (tile_m, tile_n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
 
 
 @cute.kernel

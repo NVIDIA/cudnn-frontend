@@ -623,10 +623,11 @@ class MoeSpec:
     MatmulSpec dims: M=total tokens, K=hidden, N=weight; a_batch=1,
     b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
     (grouped persistent scheduler + per-group A TMA descriptor replacement).
-    POC scope: ``mode == "none"`` only (gather/scatter rejected)."""
+    In ``gather`` mode, M counts routed rows and ``token_index`` maps each
+    routed row to a source token. Template capabilities gate execution."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
-    mode: str = "none"  # "none" only in the POC
+    mode: str = "none"
     # first_token_offset dtype (INT32 or INT64; cuDNN accepts both). Baked at JIT
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
@@ -638,8 +639,8 @@ class MoeSpec:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
             object.__setattr__(self, "num_groups", self.num_experts)
-        if self.mode != "none":
-            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
+        if self.mode not in ("none", "gather"):
+            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported; only 'none' and 'gather' are supported")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:

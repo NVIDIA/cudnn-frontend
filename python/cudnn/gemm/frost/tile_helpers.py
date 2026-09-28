@@ -1,14 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tile-level helpers shared by the rendered kernel templates.
+"""Tile-level helpers shared by the SM100 and SM120 kernel templates.
 
 A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
 constants) and then exec'd from the kernel cache under a synthetic module
 name, so it cannot use relative imports and this module is never rendered.
 Everything here therefore takes what it needs as ARGUMENTS -- a helper that
 reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
-has to stay in the template, or be re-signed to receive it.
+has to stay in the template, or receive it explicitly.
+
+Scheduling and gather helpers serve both families. The tcgen05 wrappers are
+used only by the SM100 family and retain its instruction-specific contracts.
 """
 
 from __future__ import annotations
@@ -161,6 +164,61 @@ def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
     for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
         dst_i64_ptr.subview(i).store((src_words + i).load())
+
+
+@cute.jit
+def moe_gather_row(token_index, row, group_end, source_rows):
+    # Never read beyond the routed group. An out-of-range source row asks TMA
+    # to zero-fill the padding while still completing the expected byte count.
+    src = cutlass.Int32(source_rows)
+    if row < group_end:
+        src = cutlass.Int32(token_index[row])
+    return src
+
+
+@cute.jit
+def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
+    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
+
+    No mask selects shared::cta (SM120); a mask selects SM100 cluster multicast.
+    The experimental DSL TMA wrapper currently validates two coordinates for
+    this five-coordinate instruction, so issue the PTX directly.
+    """
+    bar_addr = mbar.data_ptr().toint(dtype=cutlass.Int32)
+    if cutlass.const_expr(cta_group == 2):
+        bar_addr = bar_addr & cutlass.Int32(0xFEFFFFFF)
+    args = [
+        dst.data_ptr().toint(dtype=cutlass.Int32).ir_value(),
+        desc.toint().ir_value(),
+        cutlass.Int32(k).ir_value(),
+        cutlass.Int32(r0).ir_value(),
+        cutlass.Int32(r1).ir_value(),
+        cutlass.Int32(r2).ir_value(),
+        cutlass.Int32(r3).ir_value(),
+        bar_addr.ir_value(),
+    ]
+    if cutlass.const_expr(mask is None):
+        llvm.inline_asm(
+            None,
+            args,
+            "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4." "mbarrier::complete_tx::bytes [$0], [$1, {$2, $3, $4, $5, $6}], [$7];",
+            "r,l,r,r,r,r,r,r,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    else:
+        llvm.inline_asm(
+            None,
+            args + [cutlass.Int16(mask).ir_value()],
+            "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."
+            "mbarrier::complete_tx::bytes.multicast::cluster."
+            f"cta_group::{cta_group} [$0], [$1, {{$2, $3, $4, $5, $6}}], [$7], $8;",
+            "r,l,r,r,r,r,r,r,h,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
 
 
 def tcgen05_alloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):

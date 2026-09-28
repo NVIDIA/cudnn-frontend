@@ -42,9 +42,49 @@ The support matrix is based on the latest cuDNN backend.
 
 ### Important Notes
 
-1. `FirstTokenOffset` contains `B * E` values with the total token count implicit from the token tensor dimension.
+1. `FirstTokenOffset` contains `B * E` starts. The final endpoint is implicit: `TokenIndex.shape[1]` in Gather mode, otherwise `Token.shape[1]`.
 2. In **Scatter** mode, both `TokenIndex` and `TokenKs` are required, and `top_k` must be explicitly provided.
 3. In **Gather** mode, `TokenIndex` is required.
+
+### FROST GATHER support
+
+The opt-in `frost_gemm` engine supports non-block-scaled GATHER in both SM100
+orientations, token-by-weight and weight-by-token (`SWAP_AB=1`), and in the
+SM120 token-by-weight path. Enable it with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning. Block-scaled GATHER
+and the remaining mode-specific support-surface checks are pending.
+SCATTER remains unsupported.
+
+Let `T` be the source token count and `R` the routed row count. Supply token
+`[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
+and INT32 or INT64 `first_token_offset` `[G,1,1]`. The result is `[1,R,N]`.
+Offsets are nondecreasing starts beginning at zero, with implicit endpoint R;
+group `g` uses expert `g % E`, and empty groups are supported. Each index is a
+source row in `[0,T)`, so repeated source tokens are allowed.
+
+```python
+fc1 = graph.moe_grouped_matmul(
+    token, weight, first_token_offset,
+    token_index=token_index,
+    mode=cudnn.moe_grouped_matmul_mode.GATHER,
+)
+activated = graph.swish(input=fc1)
+activated.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+Routing logits, top-k selection, offsets, and indices are computed by the
+caller. FROST uses TMA `tile::gather4` to load four indexed source rows directly
+into shared memory, then runs grouped matmul and the supported epilogue in the
+same kernel. No globally materialized permutation of the token matrix is
+needed. With `SWAP_AB=1`, tokens are the internal B operand and GATHER4 loads
+the token columns of the transposed matmul; the public tensors and routed
+output order stay the same. SM120 uses the `shared::cta` GATHER4 instruction
+with its existing warp-MMA mainloop and STG epilogue; its workspace remains
+the 128-byte scheduler counter. SM100 supports parallel GEMMs, including the
+gate/up pair for SwiGLU, sharing the same offsets and indices. SM120 retains
+its existing single-GEMM fusion support, including activation epilogues.
+Output rows and row-wise epilogue auxiliaries use routed order.
+The existing dtype, layout, alignment, and fusion support gates still apply.
 
 ---
 

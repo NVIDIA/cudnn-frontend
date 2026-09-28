@@ -356,11 +356,15 @@ python/cudnn/
                                 import (arch_family.py picks it from the GPU, or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
-                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+                                + kernel_templates/ (sm100_*, sm103_*)
     sm120/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm120_*)
     kernel_templates/           SHARED by both trees (the split-K reduction), so
                                 it sits above them like thd_helpers.py does
+    tile_helpers.py             SHARED device helpers: tile/group mapping, TMA
+                                gather and descriptor operations, plus the
+                                SM100-only tcgen05 compatibility wrappers;
+                                imported directly, never rendered as a kernel
 ```
 
 Two levels under the pass directory, always. **Arch is the one coverage axis

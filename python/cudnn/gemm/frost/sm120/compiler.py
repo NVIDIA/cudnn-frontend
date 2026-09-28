@@ -957,6 +957,7 @@ def _render_tile_constants(
         f"frost_compile_options = {_frost_compile_options()!r}",
     ]
     if chain.has_moe:
+        lines.append(f"moe_gather = {chain.moe.mode == 'gather'}")
         # MoE grouped matmul: the grouped persistent scheduler launches a FIXED
         # grid of co-resident CTAs and pulls tiles off a global counter.
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
@@ -1593,16 +1594,15 @@ def _render_template(
     # (The sm120 STG arm builds one vsize-wide fp32 vector per GEMM, so the binding
     # is the whole vector -- no sub-slicing by chunk index as on the tcgen05 arm.)
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)) or "pass"
-    # MoE multi-GEMM: the kernel also takes the raw A (token) tensor per distinct
-    # A operand (for the per-group patched base address) — same tensors the host
-    # uses to build the A descriptors.
-    moe_kernel_ma_params = ",\n".join([f"mA_{i}: cute.Tensor" for i in range(na)] + [f"a_stride_m_{i}: cutlass.Int64" for i in range(na)])
-    if moe_kernel_ma_params:
-        moe_kernel_ma_params += ","
-    moe_ma_list = "mA_list = [" + ", ".join(f"mA_{i}" for i in range(na)) + "]\n" "a_stride_m_list = [" + ", ".join(f"a_stride_m_{i}" for i in range(na)) + "]"
-    moe_host_ma_pass = ",\n".join([f"a_{i}" for i in range(na)] + [f"_a_stride_sets[{i}][0]" for i in range(na)])
-    if moe_host_ma_pass:
-        moe_host_ma_pass += ","
+    # SM120 uses global token descriptors. GATHER additionally needs the index
+    # vector and source extent, independently of the routed output extent.
+    moe_kernel_ma_params = moe_ma_list = moe_host_ma_pass = ""
+    if chain.has_moe and chain.moe.mode == "gather":
+        host_ab_params = "token_index: cute.Tensor,\n" + host_ab_params
+        compile_ab_fakes += "\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, (sym_m,), stride_order=(0,), assumed_align=4)"
+        compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
+        moe_kernel_ma_params = "token_index: cute.Tensor,\nsource_rows: cutlass.Int64,"
+        moe_host_ma_pass = "token_index,\na_0.shape[0],"
 
     # Indentation matches the marker's column in the template (8 spaces inside
     # _kernel/_host signatures, 4 inside compile() body).
@@ -3772,7 +3772,7 @@ def _kernel_order(buf, t, memo: "dict | None" = None):
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     """Resolve a MoE variant-pack dict into the positional-call buffers,
     inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
-    aux_bufs, fto, sfa, sfb, (S, N, K))``."""
+    aux_bufs, fto, sfa, sfb, token_index, (S, N, K))``."""
     b = compiled.binding
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
@@ -3800,6 +3800,19 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     S = a_bufs[0].shape[1]
+    token_index = None
+    if compiled.chain.moe.mode == "gather":
+        token_index = pull(b.token_index, "token_index")
+        shape = tuple(token_index.shape)
+        if len(shape) != 3 or shape[0] != 1 or shape[2] != 1 or shape[1] < 1:
+            raise ValueError("MoE GATHER token_index must have shape [1, routed_rows, 1]")
+        if buffers.dtype_name(token_index) != "int32" or token_index.stride(1) != 1 or buffers.data_ptr(token_index) % 4:
+            raise ValueError("MoE GATHER token_index must be aligned INT32 with contiguous routed rows")
+        if any(len(a.shape) != 3 or a.shape[0] != 1 or tuple(a.shape) != tuple(a_bufs[0].shape) for a in a_bufs):
+            raise ValueError("MoE GATHER token operands must share shape [1, source_rows, K]")
+        S = shape[1]
+        # Only singleton axes are removed; this never copies the routing data.
+        token_index = token_index.reshape([S])
     K = a_bufs[0].shape[2] * k_factor
     # N from the weight: a dense output may be FP4-packed (N/2 bytes).
     N = b_bufs[0].shape[1]
@@ -3810,7 +3823,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     _align_reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, S, N, K)
     if _align_reason is not None:
         raise ValueError(_align_reason)
-    return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, (S, N, K)
+    return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, (S, N, K)
 
 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
@@ -3939,7 +3952,7 @@ class CompiledMoeGemm:
         _check_plan_device(self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
-    def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None):
+    def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None):
         first_token_offset = _offset_vector(first_token_offset)
         if len(snke) < 3:
             raise ValueError("MoE call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
@@ -4003,6 +4016,7 @@ class CompiledMoeGemm:
             problem_size,
             first_token_offset,
             workspace,
+            *((token_index,) if token_index is not None else ()),
             a,
             b,
             *_moe_launch_tail(cs, tma_slots=self.tma_slots),
@@ -4010,7 +4024,7 @@ class CompiledMoeGemm:
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
-        a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, snk = _resolve_moe_variant_pack(self, variant_pack)
+        a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, snk = _resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = _output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         _named = (
@@ -4025,10 +4039,10 @@ class CompiledMoeGemm:
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         if self.chain.is_multi_gemm or self.chain.ops:
             pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream)
-        return self._launch_single(a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream)
+            return self._call_multi_gemm(pairs, fto, out, snk, *aux_bufs, workspace=workspace, stream=stream, token_index=token_index)
+        return self._launch_single(a_bufs[0], b_bufs[0], fto, out, snk, workspace=workspace, stream=stream, token_index=token_index)
 
-    def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None):
+    def _call_multi_gemm(self, gemm_pairs, first_token_offset, output, snke, *aux, workspace=None, stream=None, token_index=None):
         """Multi-GEMM MoE call:
         ``compiled([(tok, w0), (tok, w1), ...], fto, out, (S, N, K[, ...]), *aux)``.
 
@@ -4130,6 +4144,7 @@ class CompiledMoeGemm:
             problem_size,
             first_token_offset,
             workspace,
+            *((token_index,) if token_index is not None else ()),
             *a_wrapped,
             *b_wrapped,
             *_moe_launch_tail(cs, aux, tma_slots=self.tma_slots),
@@ -4155,7 +4170,7 @@ def _jit_moe(
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeGemm:
-    """JIT path for a MoE grouped matmul forward pass (mode=NONE)."""
+    """JIT path for a MoE grouped matmul forward pass (NONE or GATHER)."""
     _precheck_moe(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
@@ -4405,7 +4420,7 @@ class CompiledMoeBlockScaleGemm:
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
-        a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, snk = _resolve_moe_variant_pack(self, variant_pack)
+        a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, _token_index, snk = _resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = _output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         _named = (

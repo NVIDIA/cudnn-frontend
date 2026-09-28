@@ -67,6 +67,10 @@ def validate_node(node) -> None:
         _validate_matmul(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
+        import cudnn
+
+        if node.params.get("mode") in (cudnn.moe_grouped_matmul_mode.GATHER, cudnn.moe_grouped_matmul_mode.SCATTER):
+            _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
 
