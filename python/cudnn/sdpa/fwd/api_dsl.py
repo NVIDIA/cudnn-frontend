@@ -4028,8 +4028,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
     Dense vector-aligned declarations with a native V width use one prepared
     pointer host, including native GQA and strided Q/K/V/O/Stats. Other layouts,
-    off-flavor V widths and RoPE retain their existing tensor-entry staging.
-    Only that legacy path rescales sink logits with a separate torch operation.
+    off-flavor widths use prepared bitwise copies and native GQA. RoPE retains
+    its existing tensor staging and separate sink-logit rescale.
     """
 
     def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
@@ -4058,6 +4058,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._k_mod = None
         self._params = None
         self._sm80_spec = None
+        self._sm80_copy_spec = None
         self._lse_stride: Optional[tuple[int, int, int]] = None
 
     # ------------------------------------------------------------------
@@ -4273,12 +4274,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sched_policy=_sm80_sched_policy_int(self.sched_token),
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
-            sink_natural=prepared,
+            sink_natural=not self._rope_max_s,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if prepared:
             self._sm80_spec = build_spec(self)
             self._compiled_kernel = self._sm80_spec.artifact
+            self._logger.debug("compile completed")
+            return
+        if not self._rope_max_s:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import compile_plan
+
+            self._sm80_copy_spec = compile_plan(self)
+            self._compiled_kernel = self._sm80_copy_spec.core.artifact
             self._logger.debug("compile completed")
             return
         from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
@@ -4312,11 +4320,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         expansion, the V head-dim pad, the kernel-layout O staging those need,
         strided-LSE staging, and the sinks log2 rescale — everything execute()
         would otherwise allocate. Sized in execute()'s carve order."""
+        if self._sm80_spec is not None:
+            return 0
+        if self._sm80_copy_spec is not None:
+            return self._sm80_copy_spec.workspace_bytes
         self._ensure_support_checked()
         from cudnn.sdpa.fwd.prepared_sm80 import native_layouts
 
         if native_layouts(self):
             return 0
+        if not self._rope_max_s:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import workspace_bytes
+
+            return workspace_bytes(self)
         if self.thd:
             return 0  # engine rows never lower THD; the wrapper path allocates
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
@@ -4363,6 +4379,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
         p = self._params
+        if self._sm80_copy_spec is not None:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
+
+            self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
+            execute(self, buffers, workspace, current_stream, scale_softmax)
+            self._logger.debug("execute completed")
+            return
         if self._sm80_spec is not None:
             from cudnn.sdpa.fwd.prepared import facts_of_tensor
             from cudnn.sdpa.fwd.prepared_sm80 import ROLES, execute
@@ -4742,73 +4766,82 @@ def sdpa_fwd_wrapper_sm80(
                 current_stream=current_stream,
             )
 
-    b, h_q, s_q, _ = q_tensor.shape
-    d_v = v_tensor.shape[-1]
-    o_tensor = torch.empty(
-        (b, s_q, h_q, d_v),
-        dtype=q_tensor.dtype,
-        device=q_tensor.device,
-    ).transpose(1, 2)
-    lse_tensor = _allocate_lse_tensor(q_tensor)
+    # Tag per-call outputs and scratch with the stream that consumes them so
+    # the allocator cannot recycle a block while an explicit stream is pending.
+    with stream_context(current_stream, q_tensor.device) if current_stream is not None else nullcontext():
+        b, h_q, s_q, _ = q_tensor.shape
+        d_v = v_tensor.shape[-1]
+        o_tensor = torch.empty(
+            (b, s_q, h_q, d_v),
+            dtype=q_tensor.dtype,
+            device=q_tensor.device,
+        ).transpose(1, 2)
+        lse_tensor = _allocate_lse_tensor(q_tensor)
 
-    wl, wr = window_size
-    if not is_causal and wr >= 0:
-        raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
-    rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
-    cache_key = (
-        q_tensor.shape,
-        k_tensor.shape,
-        v_tensor.shape,
-        q_tensor.dtype,
-        bool(is_causal),
-        (wl, wr),
-        scale_softmax,
-        scheduler,
-        bool(causal_bottom_right),
-        seq_kv_lens is not None,
-        seq_len_q is not None,
-        sinks is not None,
-        bias_tensor is not None,
-        (bias_tensor.dtype if bias_tensor is not None else None),
-        rope_max_s,
-        q_tensor.device,
-    )
-    api = _sm80_wrapper_cache.get(cache_key)
-    if api is None:
-        api = SdpaFwdDslSm80(
-            sample_q=q_tensor,
-            sample_k=k_tensor,
-            sample_v=v_tensor,
-            sample_o=o_tensor,
-            sample_lse=lse_tensor,
-            is_causal=is_causal,
-            causal_bottom_right=causal_bottom_right,
-            window_size_left=(wl if wl >= 0 else None),
-            window_size_right=(wr if (is_causal and wr >= 0) else None),
-            scale_softmax=scale_softmax,
-            seq_kv_lens_present=seq_kv_lens is not None,
-            seq_q_lens_present=seq_len_q is not None,
-            has_sink=sinks is not None,
-            scheduler=scheduler,
-            bias_present=bias_tensor is not None,
-            bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
-            rope_max_s=rope_max_s,
+        wl, wr = window_size
+        if not is_causal and wr >= 0:
+            raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
+        rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
+        cache_key = (
+            q_tensor.shape,
+            k_tensor.shape,
+            v_tensor.shape,
+            q_tensor.stride(),
+            k_tensor.stride(),
+            v_tensor.stride(),
+            q_tensor.dtype,
+            bool(is_causal),
+            (wl, wr),
+            scale_softmax,
+            scheduler,
+            bool(causal_bottom_right),
+            seq_kv_lens is not None,
+            seq_len_q is not None,
+            sinks is not None,
+            bias_tensor is not None,
+            (bias_tensor.dtype if bias_tensor is not None else None),
+            rope_max_s,
+            q_tensor.device,
         )
-        api.check_support()
-        api.compile()
-        _sm80_wrapper_cache[cache_key] = api
-    api.execute(
-        q_tensor=q_tensor,
-        k_tensor=k_tensor,
-        v_tensor=v_tensor,
-        o_tensor=o_tensor,
-        lse_tensor=lse_tensor,
-        sinks=sinks,
-        seq_q_lens=seq_len_q,
-        seq_kv_lens=seq_kv_lens,
-        scale_softmax=scale_softmax,
-        current_stream=current_stream,
-        bias_tensor=bias_tensor,
-        rope_freqs=rope_freqs,
-    )
-    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
+        api = _sm80_wrapper_cache.get(cache_key)
+        if api is None:
+            api = SdpaFwdDslSm80(
+                sample_q=q_tensor,
+                sample_k=k_tensor,
+                sample_v=v_tensor,
+                sample_o=o_tensor,
+                sample_lse=lse_tensor,
+                is_causal=is_causal,
+                causal_bottom_right=causal_bottom_right,
+                window_size_left=(wl if wl >= 0 else None),
+                window_size_right=(wr if (is_causal and wr >= 0) else None),
+                scale_softmax=scale_softmax,
+                seq_kv_lens_present=seq_kv_lens is not None,
+                seq_q_lens_present=seq_len_q is not None,
+                has_sink=sinks is not None,
+                scheduler=scheduler,
+                bias_present=bias_tensor is not None,
+                bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
+                rope_max_s=rope_max_s,
+            )
+            api.check_support()
+            api.compile()
+            _sm80_wrapper_cache[cache_key] = api
+        required = api.scratch_workspace_bytes()
+        workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
+        api.execute(
+            q_tensor=q_tensor,
+            k_tensor=k_tensor,
+            v_tensor=v_tensor,
+            o_tensor=o_tensor,
+            lse_tensor=lse_tensor,
+            sinks=sinks,
+            seq_q_lens=seq_len_q,
+            seq_kv_lens=seq_kv_lens,
+            scale_softmax=scale_softmax,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            rope_freqs=rope_freqs,
+            workspace=workspace,
+        )
+        return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
