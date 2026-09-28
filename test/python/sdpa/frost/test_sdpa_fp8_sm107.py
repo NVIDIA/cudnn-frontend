@@ -822,7 +822,8 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"
 
 
-# ============================================================================
+# =====================================================================
+
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
 # ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
@@ -834,7 +835,8 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 # quantized O itself is the gated value.  The row-level claims are pinned in
 # test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
 # declines (CPU) and the Rubin e2e behind them.
-# ============================================================================
+# =====================================================================
+
 
 _D256 = (256, 256)
 # The d256 O bound of the shared fp8 suite (test_sdpa_fwd_fp8_sm100._half_atol at
@@ -1412,3 +1414,11 @@ class TestStagedSm107Mxfp8:
     test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
     test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
     test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestMixedStagedFp8:
+    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
+
+    test_mixed_layout = staticmethod(_mixed_layout)
