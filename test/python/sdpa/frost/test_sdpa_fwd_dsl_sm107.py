@@ -2525,76 +2525,10 @@ def test_sm107_mxfp8_gate_matches_the_dequant_oracle(in_key, out_key, causal, s)
     torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
 
 
-def test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel(tmp_path):
-    """The one-time "gate-off == develop" proof for the MXFP8 body: the working-tree
-    kernel loaded with epilogue_gate=False and has_amax=True must be BITWISE the
-    kernel ``origin/develop`` ships (O, LSE and Amax_O) on the same block-scaled
-    problem.  The shipped file is extracted with ``git show`` and run through
-    the SAME adapter marshalling (its ``_k_mod`` / ``_compiled_kernel`` swapped in),
-    so the comparison is kernel-vs-kernel, not harness-vs-harness.  Live only
-    while develop is PRE-gate: once develop carries ``gate_stride`` the test
-    skips (the proof is recorded in the tracker), and an unreachable ref skips."""
-    import inspect
-    import pathlib
-    import subprocess
-
-    import torch
-
-    import cudnn
-    from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    _rubin_only()
-    root = pathlib.Path(cudnn.__file__).resolve().parents[2]
-    rel = "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_mxfp8.py"
-    try:
-        src = subprocess.run(["git", "-C", str(root), "show", f"origin/develop:{rel}"], check=True, capture_output=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # no checkout / no such ref here
-        pytest.skip(f"origin/develop:{rel} is not reachable from {root}: {exc}")
-    shipped_file = tmp_path / "shipped_prefill_d256_mxfp8.py"
-    shipped_file.write_bytes(src)
-
-    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
-    ops, _, gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
-    q8, k8, v8, sfq, sfk, sfv = ops
-    amax_p = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_p, out_p, lse_p = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=False, amax=amax_p)
-    params = api_p.template_params()
-    assert params.epilogue_gate is False
-    assert getattr(api_p, "_amax_folded_out", None) is False
-
-    shipped = load_template(str(shipped_file), params, tag="shipped_sm107_mxfp8_d256")
-    if hasattr(shipped, "compile_prepared") or "gate_stride" in inspect.signature(shipped.compile).parameters:
-        # Post-merge: develop itself carries the gate, so there is no PRE-gate
-        # reference left to compare against.  A SKIP, not a failure -- a test
-        # must not depend on its own branch not having landed (it would turn the
-        # Rubin nightly red on the first run after the merge).  The one-time
-        # proof is on record: SUPPORT_MATRIX_TRACKER.md footnote viii, 2026-09-15
-        # (O / LSE / Amax_O bitwise vs develop `18091c19` at B=2 H=8 H_kv=2
-        # S=1000 causal, e4m3 in, bf16 O, has_amax=True).
-        pytest.skip("origin/develop already carries the epilogue gate; the one-time gate-off == shipped proof was recorded 2026-09-15 (tracker footnote viii)")
-    assert shipped.DESC_VERSION == api_p._k_mod.DESC_VERSION == 0
-    api_s = SdpaFwdDslSm100(
-        q8, k8, v8, out_p, lse_p, is_causal=True, scale_softmax=d**-0.5, pertensor_fp8=False, dtype_o=torch.bfloat16, sched_policy=SCHED_NATURAL
-    )
-    assert api_s.check_support() and api_s.template_params() == params
-    # Swap the SHIPPED module in under the same adapter (compile() would load the working-tree file).
-    api_s._k_mod = shipped
-    api_s._kernel_accepts = None
-    api_s._compiled_kernel = shipped.compile(b=b, qh=h, kh=h_kv, sq=s, skv=s, d_qk=d, d_v=d, has_lse=True)
-    api_s._combine_kernel = None
-    api_s._amax_folded_out = False
-    out_s = torch.empty_like(out_p)
-    _mx_sentinel_fill(out_s)
-    lse_s = torch.full_like(lse_p, float("nan"))
-    amax_s = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_s.execute(q8, k8, v8, out_s, lse_tensor=lse_s, sf_q=sfq, sf_k=sfk, sf_v=sfv, amax_o=amax_s)
-    torch.cuda.synchronize()
-    assert _mx_sentinel_survivors(out_s) == 0
-    assert torch.equal(out_s.view(torch.uint8), out_p.view(torch.uint8)), "gate-off production O must be BITWISE the shipped kernel's"
-    assert torch.equal(lse_s, lse_p), "gate-off production LSE must be BITWISE the shipped kernel's"
-    assert torch.equal(amax_s, amax_p) and amax_p.item() > 0.0, "gate-off production Amax_O must be BITWISE the shipped kernel's"
+# The one-time MXFP8 gate-off comparison against the pre-gate tensor entry
+# is recorded in SUPPORT_MATRIX_TRACKER.md footnote viii (2026-09-15).
+# That entry is retired; the live gate-off/gate-on and Amax checks below use
+# the supported prepared path and remain the ongoing regressions.
 
 
 def test_sm107_mxfp8_gate_lse_is_bitwise_independent_of_the_gate():
