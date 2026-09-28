@@ -157,7 +157,7 @@ def test_staged_standalone_and_runtime_layout(dtype, monkeypatch):
     _check_prepared(case)
     wrong = dict(args, q_tensor=case.tensors["q"].contiguous())
     with monkeypatch.context() as guards:
-        guards.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("invalid metadata reached a staging write"))
+        guards.setattr(prepared_sm100, "_copy", lambda *a, **k: pytest.fail("invalid metadata reached a prepared staging write"))
         with pytest.raises(ValueError, match="declared shape and strides"):
             api.execute(**wrong, workspace=workspace)
     launches = []
