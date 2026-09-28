@@ -253,3 +253,19 @@ def test_ordered_gradient_copy_back(overlap, monkeypatch):
         torch.testing.assert_close(case.bufs["dv"].float(), case.expected["dv"].float(), atol=0.03, rtol=0.03)
     else:
         _check(case)
+
+
+@pytest.mark.parametrize("explicit_stream", [False, True])
+def test_staged_execution_preserves_other_current_device(explicit_stream):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    with torch.cuda.device(0):
+        case = _case(96, 80)
+        api, workspace = _adapter(case)
+        launch = torch.cuda.Stream()
+        launch.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.device(1):
+            _execute(api, case.bufs, workspace, launch.cuda_stream if explicit_stream else None)
+            assert torch.cuda.current_device() == 1, "staged execution leaked Q's device into the caller"
+        launch.synchronize()
+        _check(case)
