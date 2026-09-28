@@ -480,3 +480,15 @@ A `stream_context(None, device)` is deliberately a no-op; it does not select the
 operand device. Packed wrappers must guard that device for both compilation and
 pointer launch and restore the caller. Test a foreign current device on both
 operand GPUs, with default and explicit streams; validate outputs after the call.
+
+A saved Stats tensor can have `requires_grad=True` inside an ordinary provider
+backward where grad mode is disabled. Route assertions must exercise that caller;
+only an active differentiable helper call needs the Torch autograd fallback.
+`test_varlen_backward_uses_prepared_stats` guards the real provider route.
+Selecting an operand CUDA context does not necessarily change CuTe DSL's default
+compiler target on heterogeneous hosts. Pass the operand architecture explicitly
+to the compiler and include it in the artifact key; the metadata target detector
+checks this alongside execution. For packed-to-padded conversion, include highly
+uneven lengths and heavy padding in correctness and performance comparisons;
+measure multiple calls per captured graph so host replay submission cannot hide
+a device regression.

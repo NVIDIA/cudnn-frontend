@@ -205,3 +205,68 @@ print(json.dumps(compiled_cache.stats()))
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))
     assert results[0]["misses"] > 0 and results[0]["hits"] == 0
     assert results[1]["misses"] == 0 and results[1]["hits"] > 0
+
+
+def test_packed_lse_heavily_padded_replay():
+    _require_prepared()
+    lengths = [2048] + [1] * 63
+    values = [0]
+    for length in lengths:
+        values.append(values[-1] + length)
+    source = torch.arange(values[-1] * 32, dtype=torch.float32, device="cuda").reshape(-1, 32)
+    prefix = torch.tensor(values, dtype=torch.int32, device="cuda")
+    thd_lse_to_padded(source, prefix, 2048)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            result = thd_lse_to_padded(source, prefix, 2048)
+        source.add_(11)
+        result.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(result.cpu(), _reference(source, values, 2048), atol=0, rtol=0)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("axis", ["batch", "head"])
+def test_packed_lse_large_grid_dimension_falls_back(axis, monkeypatch):
+    from cudnn.sdpa import packed_lse
+
+    source = torch.empty((0, 65536 if axis == "head" else 1), dtype=torch.float32, device="cuda")
+    prefix = torch.zeros(65537 if axis == "batch" else 2, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(packed_lse, "_plan", lambda *a, **k: pytest.fail("oversized CUDA grid entered the compiled path"))
+    result = thd_lse_to_padded(source, prefix, 1)
+    assert torch.count_nonzero(result) == 0
+
+
+@pytest.mark.parametrize("helper", ["stats", "lengths"])
+def test_prepared_metadata_explicit_operand_target(helper, monkeypatch, tmp_path):
+    _require_prepared()
+    from cudnn.sdpa import packed_lse, varlen_metadata
+    from cudnn.sdpa.fwd.kernels import packed_lse as stats_kernel, varlen_metadata as lengths_kernel
+
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    expected = f"--gpu-arch sm_{major}{minor}"
+    module = stats_kernel if helper == "stats" else lengths_kernel
+    original = module.compile_cached
+    options = []
+
+    def compile_for_operand(*args, **kwargs):
+        assert expected in kwargs.get("options", ""), "compiler target did not name the operand GPU"
+        options.append(kwargs["options"])
+        return original(*args, **kwargs)
+
+    packed_lse._plan.cache_clear()
+    varlen_metadata._plan.cache_clear()
+    stats_kernel.compile_packed_lse.cache_clear()
+    lengths_kernel.compile_metadata.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setattr(module, "compile_cached", compile_for_operand)
+    prefix = torch.tensor([0, 3, 7], dtype=torch.int32, device="cuda")
+    if helper == "stats":
+        source = torch.arange(21, device="cuda", dtype=torch.float32).reshape(7, 3)
+        torch.testing.assert_close(thd_lse_to_padded(source, prefix, 4).cpu(), _reference(source, [0, 3, 7], 4), atol=0, rtol=0)
+    else:
+        result = varlen_metadata.prepare_varlen_metadata(prefix, prefix, (2**32 + 16,), (32,))
+        torch.testing.assert_close(result[2].flatten(), prefix.long() * (2**32 + 16), atol=0, rtol=0)
+    assert options

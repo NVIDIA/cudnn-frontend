@@ -17,7 +17,8 @@ def _plan(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index):
     from cudnn.frost.compiled_cache import positional_entry
     from .fwd.kernels.varlen_metadata import compile_metadata
 
-    artifact = compile_metadata(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index)
+    major, minor = torch.cuda.get_device_capability(device_index)
+    artifact = compile_metadata(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index, f"sm_{major}{minor}")
     entry = positional_entry(artifact)
     if entry is None:
         raise NotImplementedError("SDPA metadata preparation requires a positional tvm-ffi entry")

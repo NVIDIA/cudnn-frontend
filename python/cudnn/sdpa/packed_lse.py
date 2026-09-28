@@ -17,7 +17,8 @@ def _plan(prefix_dtype, device_index):
     from cudnn.frost.compiled_cache import positional_entry
     from .fwd.kernels.packed_lse import compile_packed_lse
 
-    artifact = compile_packed_lse(prefix_dtype, device_index)
+    major, minor = torch.cuda.get_device_capability(device_index)
+    artifact = compile_packed_lse(prefix_dtype, device_index, f"sm_{major}{minor}")
     entry = positional_entry(artifact)
     if entry is None:
         raise NotImplementedError("SDPA Stats preparation requires a positional tvm-ffi entry")
@@ -46,8 +47,10 @@ def _execute(lse, cu_seqlens, max_seqlen):
         and lse.device == cu_seqlens.device
         and lse.dtype == torch.float32
         and lse.ndim == 2
+        and lse.shape[1] <= 65535
         and cu_seqlens.ndim == 1
         and cu_seqlens.numel() > 0
+        and cu_seqlens.numel() - 1 <= 65535
         and cu_seqlens.dtype in (torch.int32, torch.int64)
     )
     if not supported or cutedsl_arch_requirement_error(torch.cuda.get_device_capability(lse.device)):
@@ -84,7 +87,7 @@ def prepare_padded_lse(lse, cu_seqlens, max_seqlen):
     """Allocate Stats without reading device prefixes or caching runtime bindings."""
     # Stats consumed by SDPA backward are non-differentiable. Keep the old
     # differentiable torch behavior for other direct callers of this helper.
-    if lse.requires_grad:
+    if lse.requires_grad and torch.is_grad_enabled():
         return _torch_repad(lse, cu_seqlens, max_seqlen)
     # AOT backward can trace FakeTensor/FunctionalTensor inputs while
     # torch.compiler.is_compiling() is false. Always keep the pointer launch
