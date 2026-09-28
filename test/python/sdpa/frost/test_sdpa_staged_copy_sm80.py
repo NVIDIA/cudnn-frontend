@@ -257,3 +257,19 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     assert first["stats"]["misses"] > 0 and first["stats"]["hits"] == 0, first
     assert second["stats"]["misses"] == 0 and second["stats"]["hits"] > 0, second
     assert first["digest"] == second["digest"]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_compiled_workspace_query_reuses_plan_budget(staged, monkeypatch):
+    from cudnn.sdpa.fwd import prepared_sm80, prepared_staged_sm80
+
+    api, case = _case(96, 96) if staged else _case(128, 128, pad=0)
+    expected = api.scratch_workspace_bytes()
+    api.compile()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("compiled workspace query rebuilt layout metadata")
+
+    monkeypatch.setattr(prepared_sm80, "native_layouts", forbidden)
+    monkeypatch.setattr(prepared_staged_sm80, "_layout", forbidden)
+    assert api.scratch_workspace_bytes() == expected

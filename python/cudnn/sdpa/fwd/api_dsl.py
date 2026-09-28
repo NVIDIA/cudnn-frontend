@@ -4320,6 +4320,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         expansion, the V head-dim pad, the kernel-layout O staging those need,
         strided-LSE staging, and the sinks log2 rescale — everything execute()
         would otherwise allocate. Sized in execute()'s carve order."""
+        if self._sm80_spec is not None:
+            return 0
+        if self._sm80_copy_spec is not None:
+            return self._sm80_copy_spec.workspace_bytes
         self._ensure_support_checked()
         from cudnn.sdpa.fwd.prepared_sm80 import native_layouts
 
@@ -4328,7 +4332,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if not self._rope_max_s:
             from cudnn.sdpa.fwd.prepared_staged_sm80 import workspace_bytes
 
-            return self._sm80_copy_spec.workspace_bytes if self._sm80_copy_spec is not None else workspace_bytes(self)
+            return workspace_bytes(self)
         if self.thd:
             return 0  # engine rows never lower THD; the wrapper path allocates
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
