@@ -374,3 +374,9 @@ When retiring a fake-tensor builder, move negative guards to the live
 Patching a deleted helper with `raising=False` proves nothing. Keep direct
 SASS and split-partial tests on the production pointer entry, including
 partial-output inspection before combine.
+
+When retiring a compiler entry, audit its standalone `_main()` as well as
+adapter and test callers. A leftover unqualified `compile(...)` silently
+resolves to Python's builtin after the definition is deleted. Execute the
+actual CLI with its replacement compiler intercepted and assert that the
+prepared entry is called; import-only checks cannot catch this failure.

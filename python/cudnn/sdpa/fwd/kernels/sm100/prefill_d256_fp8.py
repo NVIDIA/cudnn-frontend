@@ -2880,7 +2880,7 @@ def _main():
     args = parser.parse_args()
 
     print(f"[d256_fp8_sm100] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
-    fn = compile(args.b, args.hq, args.hk, args.sq, args.skv)
+    fn = compile_prepared()
     print(f"[d256_fp8_sm100] compile OK: {fn}", flush=True)
     if args.validate:
         print("[d256_fp8_sm100] compiled - run validation via the frost SDPA test suite.")

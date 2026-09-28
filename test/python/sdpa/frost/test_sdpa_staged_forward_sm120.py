@@ -208,7 +208,7 @@ def test_staged_default_stream_is_resolved_for_q_device(fp8, monkeypatch):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_staged_default_stream_with_another_device_current(fp8):
+def test_staged_default_stream_with_another_device_current(fp8, monkeypatch):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
     device = torch.cuda.current_device()
@@ -217,11 +217,26 @@ def test_staged_default_stream_with_another_device_current(fp8):
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     target = torch.cuda.Stream(device=device)
     target.wait_stream(torch.cuda.current_stream(device))
+    from cudnn import _torch_stream
+
+    original = _torch_stream._raw_current_stream
+    resolved = []
+
+    def resolve(torch_module, selected_device):
+        raw = original(torch_module, selected_device)
+        assert selected_device == api.q_desc.device
+        assert raw == target.cuda_stream
+        resolved.append(raw)
+        return raw
+
+    monkeypatch.setattr(_torch_stream, "_raw_current_stream", resolve)
+    other_device = (device + 1) % torch.cuda.device_count()
     with torch.cuda.stream(target):
-        with torch.cuda.device((device + 1) % torch.cuda.device_count()):
+        with torch.cuda.device(other_device):
             _execute(api, tensors, workspace)
-            assert torch.cuda.current_device() != device
+            assert torch.cuda.current_device() == other_device
     torch.cuda.current_stream(device).wait_stream(target)
+    assert resolved
     _check(tensors, storage)
 
 
