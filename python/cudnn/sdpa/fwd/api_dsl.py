@@ -2496,10 +2496,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self.paged and self.paged_table_stride != self.paged_table_v_stride:
-            # The pointer ABI has one table-stride pair. Retain the tensor
-            # compiler's two declared layouts for this existing static route.
-            return False
         if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor != (128, 128):
             return False
         return self.thd or all(

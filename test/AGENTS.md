@@ -178,8 +178,9 @@ Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.
 `test_fp8_paged_prepared_table_stride_admission` checks both decisions for distinct
-K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
-checks the retained tensor path numerically and under CUDA Graph replay.
+K/V page-table strides; `test_fp8_paged_distinct_table_strides_prepared`
+checks both routes numerically with the tensor compiler forbidden, changed
+allocations and CUDA Graph replay.
 
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
@@ -330,3 +331,14 @@ and tensor-operand elision must use the same effective presence decision.
 `test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
+
+Independent page tables need independent observed-span checks and Int64 stride
+slots in the prepared host. Test distinct K/V page values and layouts, then
+rebind allocations and mutate table values under capture replay. Preserve the
+shared-stride constraint for a host whose ABI still has only one stride pair.
+
+A shared kernel imported as an ordinary module has no template-loader digest.
+Calling `template_key` there otherwise returns `None` and silently bypasses
+persistent caching. Give the module a source identity and require fresh-process
+reload of the whole chain, including split combine and both pointer/tensor
+calling conventions; forbidding JIT only around the attention kernel misses it.

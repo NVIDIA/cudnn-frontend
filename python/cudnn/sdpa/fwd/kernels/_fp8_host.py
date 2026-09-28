@@ -63,6 +63,7 @@ def host(
     partial_slot: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
     sfo_geometry: cutlass.Constexpr,
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind dense or THD pointer views and launch the selected FP8 host.
@@ -120,6 +121,7 @@ def host(
         table_strides=table_strides,
         n_pages=n_pages,
         o_pack=2 if o_block_scale == 16 else 1,
+        table_v_strides=table_v_strides,
     )
 
     def scalar(ptr):
@@ -257,6 +259,7 @@ def compile_host(
         partial_slot,
         optional_amax,
         sfo_geometry,
+        (cutlass.Int64(0), cutlass.Int64(0)) if getattr(cfg, "PAGED_KV", False) else None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,
