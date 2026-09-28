@@ -208,7 +208,7 @@ def test_staged_default_stream_is_resolved_for_q_device(fp8, monkeypatch):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_staged_default_stream_with_another_device_current(fp8):
+def test_staged_default_stream_with_another_device_current(fp8, monkeypatch):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
     device = torch.cuda.current_device()
@@ -217,11 +217,26 @@ def test_staged_default_stream_with_another_device_current(fp8):
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     target = torch.cuda.Stream(device=device)
     target.wait_stream(torch.cuda.current_stream(device))
+    from cudnn import _torch_stream
+
+    original = _torch_stream._raw_current_stream
+    resolved = []
+
+    def resolve(torch_module, selected_device):
+        raw = original(torch_module, selected_device)
+        assert selected_device == api.q_desc.device
+        assert raw == target.cuda_stream
+        resolved.append(raw)
+        return raw
+
+    monkeypatch.setattr(_torch_stream, "_raw_current_stream", resolve)
+    other_device = (device + 1) % torch.cuda.device_count()
     with torch.cuda.stream(target):
-        with torch.cuda.device((device + 1) % torch.cuda.device_count()):
+        with torch.cuda.device(other_device):
             _execute(api, tensors, workspace)
-            assert torch.cuda.current_device() != device
+            assert torch.cuda.current_device() == other_device
     torch.cuda.current_stream(device).wait_stream(target)
+    assert resolved
     _check(tensors, storage)
 
 
@@ -428,3 +443,62 @@ def test_staged_block_output_matches_native_graph(block, dtype):
         check()
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "padded", "compact"])
+@pytest.mark.parametrize("d", [128, 384])
+@pytest.mark.parametrize("side_stream", [False, True])
+def test_sm120_wrapper_supplies_conversion_workspace(layout, d, side_stream, monkeypatch):
+    from cudnn.sdpa.fwd.api_dsl import sdpa_fwd_wrapper_dsl_sm120
+
+    _, tensors, _ = _case(d)
+    if layout == "bhsd":
+        tensors.update({n: tensors[n].contiguous() for n in ("q", "k", "v")})
+    elif layout == "compact":
+        tensors.update({n: tensors[n].transpose(1, 2).contiguous().transpose(1, 2) for n in ("q", "k", "v")})
+    launch_stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    original_execute = SdpaFwdDslSm120.execute
+    seen = []
+
+    def execute(api, **kwargs):
+        workspace = kwargs.get("workspace")
+        required = api.scratch_workspace_bytes()
+        if layout == "compact":
+            assert required == 0 and workspace is None
+        else:
+            assert required > 0 and workspace is not None
+            assert workspace.device == tensors["q"].device
+            assert workspace.dtype == torch.uint8 and workspace.numel() == required
+        seen.append(api)
+        return original_execute(api, **kwargs)
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "execute", execute)
+    with torch.cuda.stream(launch_stream):
+        # The cached plan must also supply fresh caller-owned scratch on reuse.
+        for factor in (1.0, 0.5):
+            tensors["v"].mul_(factor)
+            result = sdpa_fwd_wrapper_dsl_sm120(*(tensors[n] for n in ("q", "k", "v")))
+            q, k, v = (tensors[n].double() for n in ("q", "k", "v"))
+            scores = q @ k.repeat_interleave(2, 1).transpose(-1, -2) / math.sqrt(d)
+            ref = scores.softmax(-1) @ v.repeat_interleave(2, 1)
+            torch.testing.assert_close(result["o_tensor"].double(), ref, atol=3e-3, rtol=4e-2)
+            torch.testing.assert_close(result["lse_tensor"].double(), scores.logsumexp(-1), atol=3e-4, rtol=3e-4)
+    torch.cuda.current_stream().wait_stream(launch_stream)
+    assert len(seen) == 2 and seen[0] is seen[1]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("staged", [False, True])
+def test_compiled_workspace_query_uses_prepared_budget(fp8, staged, monkeypatch):
+    api, tensors, _ = _case(fp8=fp8)
+    if not staged:
+        for name in ("q", "k", "v", "o"):
+            tensors[name] = tensors[name].transpose(1, 2).contiguous().transpose(1, 2)
+        api = SdpaFwdDslSm120(**{"sample_" + n: tensors[n] for n in ("q", "k", "v", "o", "lse")}, pertensor_fp8=fp8)
+        assert api.check_support()
+    required = api.scratch_workspace_bytes()
+    api.compile()
+    monkeypatch.setattr(api, "_can_prepare_layout", lambda: pytest.fail("compiled workspace query rebuilt layout"))
+    monkeypatch.setattr(api, "_can_prepare_fp8", lambda: pytest.fail("compiled workspace query repeated admission"))
+    assert api.scratch_workspace_bytes() == required

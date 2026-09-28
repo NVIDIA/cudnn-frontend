@@ -374,3 +374,21 @@ When retiring a fake-tensor builder, move negative guards to the live
 Patching a deleted helper with `raising=False` proves nothing. Keep direct
 SASS and split-partial tests on the production pointer entry, including
 partial-output inspection before combine.
+
+When retiring a compiler entry, audit its standalone `_main()` as well as
+adapter and test callers. A leftover unqualified `compile(...)` silently
+resolves to Python's builtin after the definition is deleted. Execute the
+actual CLI with its replacement compiler intercepted and assert that the
+prepared entry is called; import-only checks cannot catch this failure.
+
+### Wrapper coverage after workspace migrations
+
+When a prepared adapter starts requiring caller workspace for an existing
+layout, test every public convenience wrapper that constructs it. Adapter
+checks with explicit workspace cannot detect a wrapper that still omits it.
+Exercise BHSD-contiguous and padded conversion inputs plus the compact control,
+including plan-cache reuse and a non-default current stream. The allocating
+wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
+the input device; a zero-workspace plan should keep its allocation-free path.
+The SM120 detector is `TestStagedSm120Wrapper` in
+`test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.

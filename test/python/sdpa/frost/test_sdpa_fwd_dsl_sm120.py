@@ -1935,3 +1935,14 @@ def test_dsl_sm120_thd_padded_stats_execute_checks_the_buffer():
 @torch_fork_set_rng(seed=13)
 def test_dsl_sm120_wide_stats(head_dim, stats_use_log2):
     _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=head_dim, check_stats=True, stats_use_log2=stats_use_log2, is_causal=True)
+
+
+# Keep the convenience-wrapper regression in the explicit SM120 CI entry.
+import test_sdpa_staged_forward_sm120 as _staged_forward_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestStagedSm120Wrapper:
+    test_compiled_workspace_budget = staticmethod(_staged_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
+    test_conversion_workspace = staticmethod(_staged_forward_checks.test_sm120_wrapper_supplies_conversion_workspace)
