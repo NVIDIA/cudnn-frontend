@@ -386,18 +386,35 @@ def _swiglu_failure_details(a, b, ab12, c, expected, alpha, *, atol, rtol, limit
     Columns are interleaved in 32-element input/gate blocks, not two halves.
     This runs only after the existing output assertion has failed.
     """
-    actual = c.detach().cpu().double()
-    expected = expected.to(torch.float32 if c.dtype in {torch.float8_e4m3fn, torch.float8_e5m2} else c.dtype).cpu().double()
+    compare_dtype = torch.float32 if c.dtype in {torch.float8_e4m3fn, torch.float8_e5m2} else c.dtype
+    actual = c.detach().cpu().to(compare_dtype)
+    expected = expected.cpu().to(compare_dtype)
+    # Match assert_close's comparison dtype before doing diagnostic arithmetic
+    # in float64; promoting the mask itself changes tolerance-boundary points.
     bad = ~torch.isclose(actual, expected, atol=atol, rtol=rtol)
-    indices = bad.nonzero()[:limit].tolist()
-    aa, bb, intermediate = (t.detach().cpu().double() for t in (a, b, ab12))
+    count = int(bad.sum())
+    flat_bad = bad.reshape(-1)
+    indices = []
+    columns, batches = c.shape[1:]
+    for start in range(0, flat_bad.numel(), 4096):
+        if len(indices) == limit:
+            break
+        local = flat_bad[start : start + 4096].nonzero().flatten()[: limit - len(indices)]
+        for index in local.tolist():
+            m, offset = divmod(start + index, columns * batches)
+            n, batch = divmod(offset, batches)
+            indices.append((m, n, batch))
     rows = []
     for m, n, batch in indices:
         input_col = (n // 32) * 64 + n % 32
         gate_col = input_col + 32
-        inp, gate = intermediate[m, input_col, batch], intermediate[m, gate_col, batch]
-        exact_inp = alpha * (aa[m, :, batch] * bb[input_col, :, batch]).sum()
-        exact_gate = alpha * (aa[m, :, batch] * bb[gate_col, :, batch]).sum()
+        # Transfer only these rows/scalars; a failed large GEMM need not make
+        # full float64 copies of its input and intermediate matrices.
+        inp = ab12[m, input_col, batch].detach().cpu().double()
+        gate = ab12[m, gate_col, batch].detach().cpu().double()
+        aa = a[m, :, batch].detach().cpu().double()
+        exact_inp = alpha * (aa * b[input_col, :, batch].detach().cpu().double()).sum()
+        exact_gate = alpha * (aa * b[gate_col, :, batch].detach().cpu().double()).sum()
         rows.append(
             dict(
                 index=[m, n, batch],
@@ -414,7 +431,7 @@ def _swiglu_failure_details(a, b, ab12, c, expected, alpha, *, atol, rtol, limit
             )
         )
     return dict(
-        mismatches=int(bad.sum()),
+        mismatches=count,
         alpha=alpha,
         operands={
             name: dict(shape=list(t.shape), strides=list(t.stride()), dtype=str(t.dtype), device=str(t.device))

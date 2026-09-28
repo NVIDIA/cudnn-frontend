@@ -50,10 +50,49 @@ def test_diagnostic_error_preserves_original_assertion(monkeypatch, capsys):
 
     a, b, intermediate, expected = _case()
 
-    def broken(*args, **kwargs):
+    def fail_diagnostic(*args, **kwargs):
         raise RuntimeError("diagnostic probe")
 
-    monkeypatch.setattr(helpers, "_swiglu_failure_details", broken)
+    monkeypatch.setattr(helpers, "_swiglu_failure_details", fail_diagnostic)
     with pytest.raises(AssertionError, match="Tensor-likes are not close"):
         check_ref_gemm_swiglu(a, b, intermediate, expected + 10, alpha=0.7)
     assert "diagnostic unavailable: diagnostic probe" in capsys.readouterr().out
+
+
+def test_diagnostic_transfers_only_selected_intermediate_rows(monkeypatch):
+    a, b, intermediate, expected = _case()
+    transfer = torch.Tensor.cpu
+    seen = []
+
+    def record(t, *args, **kwargs):
+        seen.append(tuple(t.shape))
+        return transfer(t, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", record)
+    details = _swiglu_failure_details(a, b, intermediate, expected + 10, expected, 0.7, atol=0.01, rtol=9e-3)
+    assert details["mismatches"] == expected.numel()
+    assert len(details["points"]) == 8
+    assert tuple(a.shape) not in seen and tuple(b.shape) not in seen and tuple(intermediate.shape) not in seen
+    assert (a.shape[1],) in seen
+
+
+@pytest.mark.parametrize(
+    "dtype,actual_value,expected_value",
+    [
+        (torch.float16, 0.0200958251953125, 0.01000213623046875),
+        (torch.bfloat16, 0.0908203125, 0.080078125),
+        (torch.float32, 0.03017999976873398, 0.019999999552965164),
+    ],
+)
+def test_diagnostic_matches_assertion_at_tolerance_boundary(dtype, actual_value, expected_value):
+    a, b, intermediate, expected = _case()
+    expected = expected.to(dtype)
+    actual = expected.clone()
+    expected[0, 0, 0], actual[0, 0, 0] = expected_value, actual_value
+    # This pair passes in the assertion's dtype but fails after promotion to
+    # float64. Another coordinate triggers the diagnostic for a real failure.
+    torch.testing.assert_close(actual[0, 0, 0], expected[0, 0, 0], atol=0.01, rtol=9e-3)
+    actual[1, 63, 1] += 10
+    details = _swiglu_failure_details(a, b, intermediate, actual, expected, 0.7, atol=0.01, rtol=9e-3)
+    assert details["mismatches"] == 1
+    assert details["points"][0]["index"] == [1, 63, 1]
