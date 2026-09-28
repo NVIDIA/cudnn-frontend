@@ -1523,17 +1523,23 @@ _SASS_PIN_ROWS = [
     pytest.param("f16", "causal", id="f16-causal"),
     pytest.param("fp8", "dense", id="fp8-dense"),
     pytest.param("fp8", "causal", id="fp8-causal"),
+    # The sliding-window specialization the fp8 SWA perf cell runs: `compute_q_loop_bounds` trims each kv block's q loop
+    # from ABOVE by the window (the same call the f16 body makes), the SWA term joins the causal one in the bit-word mask
+    # arm.  Its SASS is the causal row's plus the trim arithmetic (+32 lines, every other pinned count identical, 2026-09-28).
+    pytest.param("fp8", "causal_swa", id="fp8-causal-swa"),
 ]
 # The masked rows of the above: the mask form pin (rules/frost-tile-dsl.md s10d) applies to them only.
 _MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
 # Spill bounds: the counts MEASURED on the branch's own toolchain (cutlass-dsl 4.8.0 + the internal CUDA toolkit's ptxas,
-# 2026-09-23, B=1 H=8 S=1024): 0 / 0 STL / LDL on all three rows -- the plan's target (s10.9) -- plus the DSL / ptxas
-# jitter frost_test_utils.SPILL_TOLERANCE allows.  Never loosen a row to turn it green; a real spill adds tens.
+# 2026-09-23, B=1 H=8 S=1024; the fp8 SWA row 2026-09-28): 0 / 0 STL / LDL on every row -- the plan's target (s10.9) --
+# plus the DSL / ptxas jitter frost_test_utils.SPILL_TOLERANCE allows.  Never loosen a row to turn it green; a real spill
+# adds tens.
 _SPILL_PINS = {
     ("f16", "dense"): {"STL": 0, "LDL": 0},
     ("f16", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
     ("fp8", "causal"): {"STL": 0, "LDL": 0},
+    ("fp8", "causal_swa"): {"STL": 0, "LDL": 0},
 }
 # One trace-compile per (family, mask) per session: every pin below reads the same SASS, so the probe runs once and
 # the tests share its counts (a compile is 20-60 s; the dump dir of the FIRST caller holds the cubin).
