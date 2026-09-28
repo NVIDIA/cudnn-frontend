@@ -332,6 +332,12 @@ and tensor-operand elision must use the same effective presence decision.
 tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
 failure and an output that was simultaneously required and forbidden.
 
+For a GEMM+GLU failure, compare the final output with both the stored GEMM
+intermediate and an independent dot product before attributing it to GEMM.
+SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
+halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
+bounded failure output, and preservation of the original assertion.
+
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
 rebind allocations and mutate table values under capture replay. Preserve the
