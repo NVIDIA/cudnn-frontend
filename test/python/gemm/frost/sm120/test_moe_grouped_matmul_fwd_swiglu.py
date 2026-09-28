@@ -28,7 +28,7 @@ pytestmark = pytest.mark.L0
 # grouped matmul chain this module builds (== kernel_registry.candidates() for a bf16
 # K-major dual-GEMM MoE chain): the catalog entries whose CTA tile fits the 256-row/column
 # TMA box AND keep both GEMMs' warp-MMA accumulators resident -- 2 x warp_tile_m x
-# warp_tile_n / 32 fp32 registers <= kernel_registry.MULTI_GEMM_ACC_REG_BUDGET (128), i.e.
+# warp_tile_n / 32 fp32 registers <= Sm120KernelTemplate.MULTI_GEMM_ACC_REG_BUDGET (128), i.e.
 # cta_tile_m * cta_tile_n <= 16384 with 8 compute warps. The 99 larger tiles (128x144 ..
 # 128x256, 256x80 .. 256x256) are legal for a single-GEMM MoE chain but would need 256
 # accumulator registers per warp here; the renderer declines them by name. sm120 has no
@@ -282,6 +282,7 @@ def _ref(token, w0, w1, offsets, scale, S, N, num_experts, num_groups):
 
 # --- Analyzer (no GPU needed) ---
 
+
 @requires_sm120
 def test_analyzer_detects_dual_moe_grouped_matmul_fwd() -> None:
     chain = analyze(_build_graph(9, 2000, 248, 520, 36))
@@ -293,6 +294,7 @@ def test_analyzer_detects_dual_moe_grouped_matmul_fwd() -> None:
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (2000, 248, 520)
     assert [o.op for o in chain.ops] == ["swish", "mul", "mul"]
     assert len(chain.outputs) == 1 and chain.outputs[0].source == "op_2"
+
 
 @requires_sm120
 def test_analyzer_detects_dual_moe_grouped_matmul_fwd_reduction() -> None:
@@ -481,6 +483,7 @@ def _geglu_ref(token, w0, w1, bias0, bias1, offsets, S, N, E, num_groups, cmax=7
         s = torch.nn.functional.silu(alpha * torch.clamp(gate, max=cmax))
         out[b:e] = s * (torch.clamp(up, cmin, cmax) + loff)
     return out
+
 
 @requires_sm120
 def test_analyzer_detects_dual_moe_geglu() -> None:

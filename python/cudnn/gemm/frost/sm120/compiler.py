@@ -853,12 +853,12 @@ def _render_tile_constants(
     if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
         raise NotImplementedError(f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by the MoE template")
     if chain.is_multi_gemm:
-        from ..kernel_registry import multi_gemm_reject, sm120_multi_gemm_ab_stages
-
-        _mg = multi_gemm_reject(chain, cfg, smem_fixed_reserve=tmpl.smem_fixed_reserve)
+        # Sm120KernelTemplate owns the multi-GEMM feasibility rules (registers,
+        # SMEM); the funnel's _extra_reject asks the same methods, so both agree.
+        _mg = tmpl.multi_gemm_reject(chain, cfg)
         if _mg is not None:
             raise NotImplementedError(f"{tmpl.file}: {_mg}")
-        _ab_stages, _, _ = sm120_multi_gemm_ab_stages(chain, cfg, smem_fixed_reserve=tmpl.smem_fixed_reserve)
+        _ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
     else:
         _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     if chain.has_moe and chain.matmul.a_major != "k":
@@ -916,7 +916,7 @@ def _render_tile_constants(
         # epilogue staging out of it by giving up whole stages (the catalog's
         # _sm120_smem_feasible sweep counts the same way). Multi-GEMM: one SMEM
         # tile per DISTINCT operand per stage, with the staging taken off the
-        # budget in BYTES first (kernel_registry.sm120_multi_gemm_ab_stages) --
+        # budget in BYTES first (Sm120KernelTemplate.multi_gemm_ab_stages) --
         # a whole multi-operand stage may be all that fits, so the template is
         # told not to deduct (stg_epi_prefunded).
         f"ab_stages = {_ab_stages}",

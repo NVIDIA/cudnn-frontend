@@ -45,8 +45,8 @@ One SMEM tile per DISTINCT operand per stage, one register accumulator per
 GEMM (``gemm_a_idx`` / ``gemm_b_idx`` pick each GEMM's operands, as in the
 sm100 template). Every GEMM's accumulators stay resident for the whole tile,
 so the renderer caps ``num_gemms * _ACC_REGS`` and sizes the SMEM ring with
-the epilogue staging pre-funded (kernel_registry ``multi_gemm_reject`` /
-``sm120_multi_gemm_ab_stages``). The STG epilogue stages the GEMMs' fragments
+the epilogue staging pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` /
+``.multi_gemm_ab_stages`` in kernel_registry). The STG epilogue stages the GEMMs' fragments
 through the same warp-private buffer one after another and hands the fused
 epilogue one fp32 vector per GEMM (``vec_f32``, ``vec_f32_1``, ...).
 """
@@ -155,7 +155,7 @@ _AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_
 # Single-GEMM: the staging is funded by giving up whole AB stages (legacy
 # accounting; the catalog sweep and every existing kernel count the same way).
 # Multi-GEMM: the renderer took the staging off the budget in BYTES before
-# sizing the ring (kernel_registry.sm120_multi_gemm_ab_stages) -- a whole
+# sizing the ring (Sm120KernelTemplate.multi_gemm_ab_stages) -- a whole
 # multi-operand stage may be all that fits -- so nothing is deducted here.
 if not stg_epi_prefunded:
     ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
