@@ -1,5 +1,14 @@
 # test — Agent Guide
 
+Recurrent FP64 autograd references can retain a K x V state for every token
+and head. When a production stress case scales heads with the GPU SM count,
+bound the reference by independent head chunks while keeping the full kernel
+workload and tolerances. Compare every chunked gradient with the original
+whole-head reference on smaller cases, including ragged/empty sequences and
+partial chunks; preserve grouped-head reductions unless explicitly validated.
+An OOM in the reference after kernel comparisons passed is not evidence of a
+kernel allocation failure. Keep that attribution explicit in CI triage.
+
 Two suites: `test/cpp` (Catch2, C++ graph API) and `test/python` (pytest). Both need an NVIDIA GPU and a cuDNN 9.x backend at runtime. Build/install commands: [../AGENTS.md](../AGENTS.md).
 
 ## C++ tests (`test/cpp`)
