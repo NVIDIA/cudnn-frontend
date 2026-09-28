@@ -4340,11 +4340,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
-        if not self._can_prepare_layout():
+        compiled = self._compiled_kernel is not None
+        staged = getattr(self, "_staged_spec", None)
+        if staged is not None:
+            return staged.workspace_bytes
+        if not compiled and not self._can_prepare_layout():
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if self._can_prepare_fp8():
+        if self._prepared_fp8 if compiled else self._can_prepare_fp8():
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].
@@ -4432,6 +4436,8 @@ def sdpa_fwd_wrapper_dsl_sm120(
         tile_m=q_tile,
         tile_n=kv_tile,
     )
+    required = sdpa_fwd.scratch_workspace_bytes()
+    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -4443,6 +4449,7 @@ def sdpa_fwd_wrapper_dsl_sm120(
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
         current_stream=current_stream,
+        workspace=workspace,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
