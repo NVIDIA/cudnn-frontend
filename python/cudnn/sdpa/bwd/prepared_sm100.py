@@ -3,6 +3,7 @@
 """Plan-time geometry and workspace for the large-head backward pointer host."""
 
 import math
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -120,6 +121,18 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
 class StagedPlan:
     spec: BwdLaunchSpec
     copies: tuple
+    launches: tuple
+    workspace_bytes: int
+
+
+def _copy_entry(shapes):
+    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
+
+    artifact = compile_copy(shapes, (2,) * len(shapes))
+    fn = positional_entry(artifact)
+    if fn is None:
+        raise NotImplementedError("SM100 backward staging requires a positional tvm-ffi entry")
+    return artifact, fn
 
 
 def compile_staged(api, stage2, mm_lo, mm_hi):
@@ -142,19 +155,34 @@ def compile_staged(api, stage2, mm_lo, mm_hi):
         offset += (math.prod(shape) * 2 + 127) // 128 * 128
     if offset > api.scratch_workspace_bytes():
         raise RuntimeError("SM100 backward staging exceeds its advertised workspace")
-    return StagedPlan(spec, tuple(regions))
+    launches = []
+    for output in (False, True):
+        group = tuple(r for r in regions if (r[0] in ("dq", "dk", "dv")) == output)
+        if not group:
+            launches.append(None)
+            continue
+        shapes = tuple((b, s, h, d) for _, _, (b, h, s, d), _ in group)
+        # Potentially overlapping runtime gradient buffers retain the previous
+        # ordered copy-back semantics. Disjoint buffers share one launch.
+        serial = tuple(_copy_entry((shape,)) for shape in shapes) if output and len(group) > 1 else ()
+        launches.append((*_copy_entry(shapes), group, serial))
+    return StagedPlan(spec, tuple(regions), tuple(launches), api.scratch_workspace_bytes())
+
+
+def _copy(entry, frame, stream):
+    entry[1](*frame, stream)
 
 
 def execute_staged(api, tensors, workspace, current_stream, scale):
     import torch
-    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
-    from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
-    from .prepared import _same_geometry, execute
+    from cudnn._device import ensure_current_context
+    from cudnn.sdpa.fwd.prepared import BufferFacts, _covering, facts_of_tensor
+    from .prepared import _same_geometry, bind
 
     staged = api._staged_prepared
     spec = staged.spec
     ws = facts_of_tensor(workspace)
-    total = api.scratch_workspace_bytes()
+    total = staged.workspace_bytes
     if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < total or ws.device != (2, spec.device_index):
         raise ValueError(f"{spec.name} requires {total} bytes of contiguous uint8 caller workspace")
     if ws.ptr % 16:
@@ -174,17 +202,41 @@ def execute_staged(api, tensors, workspace, current_stream, scale):
             raise ValueError(f"{spec.name}: caller workspace overlaps {role}")
     if current_stream is None:
         current_stream = torch.cuda.current_stream(api.q_desc.device).cuda_stream
-    with _torch_stream_context(current_stream, api.q_desc.device):
-        typed = workspace[:total].view(api.dtype)
-        origin = typed.storage_offset()
-        views = {}
-        for role, offset, shape, strides in staged.copies:
-            view = typed.as_strided(shape, strides, origin + offset // 2)
-            views[role] = view
-            facts[role] = BufferFacts(ws.ptr + offset, spec.operands[0].dtype, ws.device, math.prod(shape), shape, strides)
-            if role in ROLES[:5]:
-                view.copy_(original[role])
-        execute(spec, facts, ws.ptr, int(current_stream), scale=scale)
-        for role in ("dq", "dk", "dv"):
-            if role in views:
-                original[role].copy_(views[role])
+    frames, outputs = [], []
+    for output, entry in enumerate(staged.launches):
+        if entry is None:
+            frames.append(None)
+            continue
+        srcs, dsts, src_strides, dst_strides = [], [], [], []
+        for role, offset, shape, strides in entry[2]:
+            f = facts[role]
+            if not f.ptr or f.ptr % 2:
+                raise ValueError(f"{spec.name}: {role} requires an aligned live address")
+            if output:
+                if not _covering(f.shape, f.strides):
+                    raise ValueError(f"{spec.name}: {role} must have non-overlapping strides")
+                outputs.append(f)
+            temp = BufferFacts(ws.ptr + offset, f.dtype, ws.device, math.prod(shape), shape, strides)
+            src, dst = (temp, f) if output else (f, temp)
+            srcs.append(src.ptr)
+            dsts.append(dst.ptr)
+            src_strides.append(tuple(src.strides[i] for i in (0, 2, 1, 3)))
+            dst_strides.append(tuple(dst.strides[i] for i in (0, 2, 1, 3)))
+            facts[role] = temp
+        frames.append((tuple(srcs), tuple(dsts), tuple(src_strides), tuple(dst_strides)))
+    serial_scatter = any(a.ptr < b.ptr + b.span * 2 and b.ptr < a.ptr + a.span * 2 for i, a in enumerate(outputs) for b in outputs[i + 1 :])
+    stream = int(current_stream)
+    # Validate native operands and the core workspace before the first copy.
+    frame = bind(spec, facts, ws.ptr, stream, scale=scale)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        if frames[0] is not None:
+            _copy(staged.launches[0], frames[0], stream)
+        spec.fn(*frame)
+        if frames[1] is not None:
+            if serial_scatter:
+                for i, entry in enumerate(staged.launches[1][3]):
+                    _copy(entry, tuple((leaves[i],) for leaves in frames[1]), stream)
+            else:
+                _copy(staged.launches[1], frames[1], stream)
