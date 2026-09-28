@@ -1099,15 +1099,9 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
     dispatch, where reading a cu value to host raises
     GuardOnDataDependentSymNode.
     """
-    B = cu_seqlens_q.numel() - 1
-    T, H = lse_th.shape
-    cu = cu_seqlens_q.long()
-    token = torch.arange(T, device=lse_th.device)
-    seq_of_token = torch.searchsorted(cu[1:], token, right=True)  # t in [cu[i], cu[i+1]) -> i
-    pos_in_seq = token - cu[seq_of_token]
-    padded = torch.zeros(B, H, max_seqlen_q, 1, dtype=torch.float32, device=lse_th.device)
-    padded[seq_of_token, :, pos_in_seq, 0] = lse_th
-    return padded
+    from ..packed_lse import prepare_padded_lse
+
+    return prepare_padded_lse(lse_th, cu_seqlens_q, max_seqlen_q)
 
 
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
