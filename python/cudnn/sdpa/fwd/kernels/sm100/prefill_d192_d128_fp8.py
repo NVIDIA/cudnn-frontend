@@ -13,7 +13,9 @@ d_qk=192/d_v=128 while preserving the FP8-on-Blackwell K-path:
   1. **cga1/cga2, STAGES_KV=2/4** (config; FP8 BPE=1).
   2. **512-col TMEM** with per-sub-tile stats on the S_acc heads (col 0/128;
      FP8 P is 4:1-packed at the S_acc tails 96/224, so the heads are free).
-  3. **Manual row-max** (no LDTM.STAT).
+  3. **Row-max**: fused LDTM.STAT (``tcgen05.ld.red.f32.max``) on cc10.3+ for
+     unmasked tiles; manual ``tcgen05_ld`` + software reduction on cc10.0 and
+     on every masked tile.
   4. **FP8 MMA uses the Blackwell K=32 QMMA path** — idesc ``k_dim=0`` +
      ``TILE_K_HW=32`` (config).  ``NUM_KPHASES_PV`` derives from
      ``CFG.TILE_K_HW_BMM2`` (→ 4 k-steps at TILE_K_HW=32).  Confirmed by the
@@ -85,11 +87,12 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.3+ fuses the MASK_NONE S load + row-max into one LDTM.STAT
+    # (tmem_load_max_reduction_x64); cc10.0 and every masked iter keep the
+    # manual tcgen05_ld + software row_max_reduction (see _softmax_kv_body).
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
 )
@@ -113,6 +116,11 @@ _REUSE_BMM2_ELECT = (not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_NONE) or (CFG
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
 MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
+# LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
+# cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software
+# row_max_reduction (default 0). api_dsl sets this from the device capability at
+# compile time; a distinct value yields a distinct kernel specialization (cache key).
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 
 
 @cute.jit
@@ -1857,7 +1865,9 @@ def _softmax_kv_body(
     """Per-kv-iter softmax body with rotated S/P ownership.
 
     Compile-time apply_mask picks the load+max strategy:
-    - False: tcgen05.ld.red.f32.max fast path (fused HW row-max).
+    - False, FUSED_LDTM_STAT (cc10.3+): tcgen05.ld.red.f32.max fast path
+      (fused HW row-max, 64-wide chunks).
+    - False, cc10.0: manual 32-wide tcgen05_ld + sw row_max_reduction.
     - True: chunked load + apply_mask_chunk + sw row_max_reduction.
     HW max can't observe NEG_INFINITY written after the load, so masked
     iters fall back; 3-segment kv-loop keeps the fast path on interior iters.
@@ -1928,6 +1938,20 @@ def _softmax_kv_body(
             ]
         chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
         reg_S_vec = vec_concat(chunks_S)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3+: fused HW row-max — one tcgen05.ld.red.f32.max per 64-col chunk
+        # does the S_acc load AND the row-max in one op, returning 64 data regs
+        # plus the max at index CHUNK.  Halves the LDTM count (64-wide vs the
+        # 32-wide loads below) and drops the software max tree entirely.
+        # Unmasked tiles only: the fused .max reduces before a mask could be
+        # applied, so masked tiles keep the software path above.
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(CFG.TILE_N // CHUNK)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)

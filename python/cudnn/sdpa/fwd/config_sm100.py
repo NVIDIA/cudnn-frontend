@@ -140,7 +140,8 @@ class TemplateParams:
     cta_mma: int = 2
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
-    # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
+    # capability at compile time (MXFP8 + the per-tensor FP8 d192x128 kernel; the f16
+    # kernels do not read it, and the SM107 siblings carry the instruction unconditionally).
     fused_ldtm_stat: bool = False
     # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/prefill_d128_mxfp8.py,
     # prefill_d128_fp8.py and prefill_d192_d128_f16.py): 32 of the 128 exp2 per row on the FMA pipe

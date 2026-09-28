@@ -1953,11 +1953,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         former ``compile()`` prologue; requires ``check_support()``.
         """
         self._ensure_support_checked()
-        # MXFP8 on cc10.3+ fuses the S_acc row-max into the LDTM (the fp8/f16 kernels
-        # don't read this flag). Auto-set from the device capability so an SM103 run
-        # picks the fused path with no user action.
-        mxfp8 = self._fp8 and not self._pertensor
-        fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        # Quantized kernels on cc10.3+ fuse the S_acc row-max into the LDTM
+        # (tcgen05.ld.red.f32.max). Wired in the MXFP8 kernels and the per-tensor
+        # FP8 d192x128 kernel; the f16 kernels do not read this flag, and the SM107
+        # siblings carry the instruction unconditionally. Auto-set from the device
+        # capability so an SM103 run picks the fused path with no user action.
+        fused_ldtm_stat = self._fp8 and (self._device_cc == (10, 3))
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 kernels) -- see _exp2_fma_split_for; the kernels not listed there never read the field.
         exp2_fma_split = _exp2_fma_split_for(self._device_cc, kind=_quant_kind(self._fp8, self._pertensor), flavor=self.flavor)
