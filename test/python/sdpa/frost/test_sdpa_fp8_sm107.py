@@ -1396,3 +1396,11 @@ def test_fp8_d256_compile_cli_uses_prepared_entry(rubin, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["compile-probe", "--b", "2", "--sq", "512", "--validate"])
     assert mod._main() == 0
     assert calls == [True]
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestMixedStagedFp8:
+    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
+
+    test_mixed_layout = staticmethod(_mixed_layout)
