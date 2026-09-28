@@ -12,6 +12,11 @@ from cudnn._torch_stream import _raw_current_stream
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 
 
+@lru_cache(maxsize=16)
+def _can_prepare(device_index, installed, version):
+    return installed and not cutedsl_too_old(version) and not cutedsl_arch_requirement_error(torch.cuda.get_device_capability(device_index))
+
+
 @lru_cache(maxsize=128)
 def _plan(dtypes, device_index):
     from cudnn.frost.compiled_cache import positional_entry
@@ -56,27 +61,20 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
     installed, version = cutedsl_state()
     allowed = ((torch.int32, torch.int64), (torch.int32, torch.int64), (torch.float16, torch.bfloat16, torch.float32))
     supported = (
-        installed
-        and not cutedsl_too_old(version)
-        and device.type == "cuda"
+        device.type == "cuda"
+        and _can_prepare(device.index, installed, version)
         and all(not copy or (tensor.device == device and tensor.ndim == 1 and tensor.dtype in dtypes) for tensor, copy, dtypes in zip(values, pending, allowed))
     )
-    if not supported or cutedsl_arch_requirement_error(torch.cuda.get_device_capability(device)):
+    if not supported:
         return tuple(
             _torch_column(tensor, dtype, shape) if copy else output for tensor, dtype, shape, copy, output in zip(values, types, shapes, pending, outputs)
         )
 
     context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
     with context:
-        if pending[0] or pending[1]:
-            pitch = (batch + 3) // 4 * 4
-            owner = torch.empty((2, pitch), dtype=torch.int32, device=device)
-            columns = owner.as_strided((2, batch, 1, 1, 1), (pitch, 1, 1, 1, 1)).unbind(0)
-            for index in range(2):
-                if pending[index]:
-                    outputs[index] = columns[index]
-        if pending[2]:
-            outputs[2] = torch.empty(shapes[2], dtype=torch.float32, device=device)
+        for index in range(3):
+            if pending[index]:
+                outputs[index] = torch.empty(shapes[index], dtype=types[index], device=device)
         active_counts = tuple(count if copy else 0 for count, copy in zip(counts, pending))
         if max(active_counts) == 0:
             return tuple(outputs)
