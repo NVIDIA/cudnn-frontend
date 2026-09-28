@@ -101,6 +101,28 @@ def _check_columns(outputs, inputs, batch, heads):
             torch.testing.assert_close(output.flatten(), tensor.flatten().to(dtype), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_forward_metadata_compact_sink_needs_no_compiler(dtype, offset, monkeypatch):
+    from cudnn.sdpa import forward_metadata as metadata
+
+    monkeypatch.setattr(metadata, "cutedsl_state", lambda: pytest.fail("single compact sink queried compiler eligibility"))
+    values = (None, None, torch.arange(8 + offset, device="cuda", dtype=dtype)[offset:])
+    output = metadata.prepare_forward_metadata(*values, 2, 8)
+    _check_columns(output, values, 2, 8)
+    assert output[2].data_ptr() != values[2].data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = metadata.prepare_forward_metadata(*values, 2, 8)
+        values[2].add_(0.5)
+        captured[2].fill_(float("nan"))
+        graph.replay()
+        _check_columns(captured, values, 2, 8)
+    finally:
+        graph.reset()
+
+
 def test_forward_metadata_native_views_need_no_compiler(monkeypatch):
     from cudnn.sdpa import forward_metadata as metadata
 

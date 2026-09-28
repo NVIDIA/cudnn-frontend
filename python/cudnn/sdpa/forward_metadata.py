@@ -56,6 +56,11 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
             sinks.reshape(1, heads, 1, 1) if sinks is not None else None,
         )
 
+    # A compact half sink alone already needs just one cast. Keep that cheap
+    # Torch path: a dtype-changing copy is compact and freshly aligned.
+    if seq_q is None and seq_kv is None and sinks.dtype in (torch.float16, torch.bfloat16) and sinks.is_contiguous():
+        return None, None, sinks.to(torch.float32).reshape(1, heads, 1, 1)
+
     values = (seq_q, seq_kv, sinks)
     counts = (batch, batch, heads)
     shapes = ((batch, 1, 1, 1), (batch, 1, 1, 1), (1, heads, 1, 1))
