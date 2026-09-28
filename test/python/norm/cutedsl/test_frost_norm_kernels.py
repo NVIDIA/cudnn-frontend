@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Numerical correctness tests for the sm_100 CUTLASS-primitive norm kernels.
 
 Covers all five variants (LayerNorm, RMSNorm, GroupNorm, InstanceNorm,
@@ -7,7 +9,7 @@ autograd. Requires a Blackwell (sm_100) GPU and the internal CUTLASS DSL
 
 Run standalone (no built cuDNN extension required):
 
-    python cudnn/norm/tests/test_norms.py
+    pytest test/python/norm/cutedsl/test_frost_norm_kernels.py
 
 A lightweight stub ``cudnn`` package (with a dummy ``pygraph`` so the shared
 ``cudnn.frost`` lifecycle patch installs) is registered so the pure-Python
@@ -19,16 +21,12 @@ import os
 import sys
 import types
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CUDNN_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))  # .../python/cudnn
-if "cudnn" not in sys.modules:
-    stub = types.ModuleType("cudnn")
-    stub.__path__ = [_CUDNN_DIR]
-    stub.pygraph = type("pygraph", (), {})  # dummy for cudnn.frost lifecycle patch
-    sys.modules["cudnn"] = stub
 
+import pytest
 import torch
 import torch.nn.functional as F
+
+pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
 
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop
 
@@ -66,7 +64,7 @@ def _ref_grads(fn, x, g, b, dy):
     return y.detach(), dx, dg, db
 
 
-def test_variant(variant, xshape, ref_fn, *, glen, has_beta=True, fwd=None, bwd=None):
+def _check_variant(variant, xshape, ref_fn, *, glen, has_beta=True, fwd=None, bwd=None):
     fwd = fwd or {}
     bwd = bwd or {}
     all_ok = True
@@ -95,27 +93,44 @@ def main():
     ok = True
     D = 256
 
-    ok &= test_variant(
-        NormVariant.LAYER_NORM, (8, D), lambda x, g, b: F.layer_norm(x, (D,), g, b, 1e-5),
-        glen=D, fwd=dict(normalized_shape=[D], eps=1e-5), bwd=dict(normalized_shape=[D]),
+    ok &= _check_variant(
+        NormVariant.LAYER_NORM,
+        (8, D),
+        lambda x, g, b: F.layer_norm(x, (D,), g, b, 1e-5),
+        glen=D,
+        fwd=dict(normalized_shape=[D], eps=1e-5),
+        bwd=dict(normalized_shape=[D]),
     )
-    ok &= test_variant(
-        NormVariant.RMS_NORM, (8, D), lambda x, g, b: F.rms_norm(x, (D,), g, eps=1e-5),
-        glen=D, has_beta=False, fwd=dict(normalized_shape=[D], eps=1e-5), bwd=dict(normalized_shape=[D]),
+    ok &= _check_variant(
+        NormVariant.RMS_NORM,
+        (8, D),
+        lambda x, g, b: F.rms_norm(x, (D,), g, eps=1e-5),
+        glen=D,
+        has_beta=False,
+        fwd=dict(normalized_shape=[D], eps=1e-5),
+        bwd=dict(normalized_shape=[D]),
     )
-    ok &= test_variant(
-        NormVariant.GROUP_NORM, (4, 8, 32), lambda x, g, b: F.group_norm(x, 4, g, b, 1e-5),
-        glen=8, fwd=dict(num_groups=4, eps=1e-5), bwd=dict(num_groups=4),
+    ok &= _check_variant(
+        NormVariant.GROUP_NORM,
+        (4, 8, 32),
+        lambda x, g, b: F.group_norm(x, 4, g, b, 1e-5),
+        glen=8,
+        fwd=dict(num_groups=4, eps=1e-5),
+        bwd=dict(num_groups=4),
     )
-    ok &= test_variant(
-        NormVariant.INSTANCE_NORM, (4, 8, 32),
+    ok &= _check_variant(
+        NormVariant.INSTANCE_NORM,
+        (4, 8, 32),
         lambda x, g, b: F.instance_norm(x, weight=g, bias=b, use_input_stats=True, eps=1e-5),
-        glen=8, fwd=dict(eps=1e-5),
+        glen=8,
+        fwd=dict(eps=1e-5),
     )
-    ok &= test_variant(
-        NormVariant.BATCH_NORM, (16, 8, 4),
+    ok &= _check_variant(
+        NormVariant.BATCH_NORM,
+        (16, 8, 4),
         lambda x, g, b: F.batch_norm(x, None, None, g, b, True, 0.1, 1e-5),
-        glen=8, fwd=dict(training=True, eps=1e-5),
+        glen=8,
+        fwd=dict(training=True, eps=1e-5),
     )
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
@@ -124,3 +139,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_frost_norm_kernels():
+    """pytest entry point; this module also runs standalone via ``__main__``."""
+    try:
+        main()
+    except SystemExit as exc:
+        assert not exc.code, "checks failed -- see captured stdout"

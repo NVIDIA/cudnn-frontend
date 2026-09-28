@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Coverage for every staging/vectorization path of the row-wise kernels.
 
 ``norm_fprop``/``norm_bprop`` auto-pick TMA bulk staging + scalar stores, so this
@@ -5,27 +7,29 @@ test forces each ``Cfg`` (STAGE_NONE / STAGE_CPASYNC / STAGE_BULK, vec on/off) o
 the LayerNorm and GroupNorm kernels directly and checks fprop + bprop vs PyTorch
 autograd. cp.async requires ``M % (bt*V) == 0``; the harness picks a valid ``bt``.
 
-    python cudnn/norm/tests/test_staging.py
+    pytest test/python/norm/cutedsl/test_frost_norm_staging.py
 """
 
 import os
 import sys
 import types
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CUDNN_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))
-if "cudnn" not in sys.modules:
-    stub = types.ModuleType("cudnn")
-    stub.__path__ = [_CUDNN_DIR]
-    stub.pygraph = type("pygraph", (), {})
-    sys.modules["cudnn"] = stub
 
+import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
+
 from cudnn.norm.config_sm100 import (
-    STAGE_BULK, STAGE_CPASYNC, STAGE_NONE,
-    Cfg, NormVariant as NV, TemplateParams, rowwise_spec, vector_width,
+    STAGE_BULK,
+    STAGE_CPASYNC,
+    STAGE_NONE,
+    Cfg,
+    NormVariant as NV,
+    TemplateParams,
+    rowwise_spec,
+    vector_width,
 )
 from cudnn.norm.dtypes import DTYPE_BYTES, torch_dtype_to_str
 from cudnn.norm.fprop.kernels import groupnorm_sm100 as gf, layernorm_sm100 as lf
@@ -52,10 +56,12 @@ def _cpasync_bt(M, V):
 
 
 def _modes(M, V, eb):
-    out = [("bulk+scal", Cfg(256, V, STAGE_BULK, False, eb)),
-           ("bulk+vec", Cfg(256, V, STAGE_BULK, True, eb)),
-           ("none+scal", Cfg(256, V, STAGE_NONE, False, eb)),
-           ("none+vec", Cfg(256, V, STAGE_NONE, True, eb))]
+    out = [
+        ("bulk+scal", Cfg(256, V, STAGE_BULK, False, eb)),
+        ("bulk+vec", Cfg(256, V, STAGE_BULK, True, eb)),
+        ("none+scal", Cfg(256, V, STAGE_NONE, False, eb)),
+        ("none+vec", Cfg(256, V, STAGE_NONE, True, eb)),
+    ]
     cbt = _cpasync_bt(M, V)
     if cbt is not None:
         out.append(("cpasync+vec", Cfg(cbt, V, STAGE_CPASYNC, True, eb)))
@@ -82,8 +88,7 @@ def _ln(dt):
     dxr, dgr, dbr = torch.autograd.grad(yref, [xr, gr, br], grad_outputs=dy)
     for name, cfg in _modes(spec.M, V, eb):
         y, mean, rstd = lf.forward(spec, x.reshape(spec.R, spec.M), g, b, eps=1e-5, cfg=cfg, params=p)
-        dx, dgamma, dbeta = lb.backward(spec, dy.to(dt).reshape(spec.R, spec.M), x.reshape(spec.R, spec.M),
-                                        g, mean, rstd, has_beta=True, cfg=cfg, params=p)
+        dx, dgamma, dbeta = lb.backward(spec, dy.to(dt).reshape(spec.R, spec.M), x.reshape(spec.R, spec.M), g, mean, rstd, has_beta=True, cfg=cfg, params=p)
         _chk(f"LN {name} y", y.reshape(x.shape), yref, tol)
         _chk(f"LN {name} dx", dx.reshape(x.shape), dxr, tol)
         _chk(f"LN {name} dgamma", dgamma, dgr, tol)
@@ -108,8 +113,7 @@ def _gn(dt):
     dxr, dgr, dbr = torch.autograd.grad(yref, [xr, gr, br], grad_outputs=dy)
     for name, cfg in _modes(spec.M, V, eb):
         y, mean, rstd = gf.forward(spec, x.reshape(spec.R, spec.M), g, b, eps=1e-5, cfg=cfg, params=p)
-        dx, dgamma, dbeta = gb.backward(spec, dy.to(dt).reshape(spec.R, spec.M), x.reshape(spec.R, spec.M),
-                                        g, mean, rstd, has_beta=True, cfg=cfg, params=p)
+        dx, dgamma, dbeta = gb.backward(spec, dy.to(dt).reshape(spec.R, spec.M), x.reshape(spec.R, spec.M), g, mean, rstd, has_beta=True, cfg=cfg, params=p)
         _chk(f"GN {name} y", y.reshape(x.shape), yref, tol)
         _chk(f"GN {name} dx", dx.reshape(x.shape), dxr, tol)
         _chk(f"GN {name} dgamma", dgamma, dgr, tol)
@@ -127,3 +131,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_frost_norm_staging():
+    """pytest entry point; this module also runs standalone via ``__main__``."""
+    try:
+        main()
+    except SystemExit as exc:
+        assert not exc.code, "checks failed -- see captured stdout"

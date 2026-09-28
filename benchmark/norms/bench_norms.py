@@ -1,6 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Quick bandwidth benchmark: sm_100 CUTLASS-primitive LayerNorm vs PyTorch.
 
-    python cudnn/norm/tests/bench_norms.py
+    python benchmark/norms/bench_norms.py
 
 Norm forward is memory-bound; the figure of merit is achieved global bandwidth
 (GB/s) reading X once (cp.async-staged) + writing Y.
@@ -50,18 +52,18 @@ def bench_layernorm(N, D, dtype):
     def torch_ln():
         F.layer_norm(x, (D,), g, b, eps=1e-5)
 
-    frost(); torch_ln()  # prime compiles
+    frost()
+    torch_ln()  # prime compiles
     tf, tt = _time(frost), _time(torch_ln)
     gbps = lambda ms: bytes_moved / (ms * 1e-3) / 1e9
-    print(f"LN N={N} D={D} {str(dtype).split('.')[-1]:>8}: "
-          f"frost {gbps(tf):.0f} | torch {gbps(tt):.0f} GB/s  ({tt / tf:.2f}x torch)")
+    print(f"LN N={N} D={D} {str(dtype).split('.')[-1]:>8}: " f"frost {gbps(tf):.0f} | torch {gbps(tt):.0f} GB/s  ({tt / tf:.2f}x torch)")
 
 
 def main():
     assert torch.cuda.is_available()
     print(f"GPU: {torch.cuda.get_device_name(0)} {torch.cuda.get_device_capability(0)}")
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
-        for (N, D) in [(4096, 1024), (8192, 4096), (16384, 8192)]:
+        for N, D in [(4096, 1024), (8192, 4096), (16384, 8192)]:
             bench_layernorm(N, D, dtype)
 
 

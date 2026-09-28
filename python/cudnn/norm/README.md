@@ -99,7 +99,7 @@ global directly (strided cross-batch access — no contiguous row to stage).
 
 `fprop/engines.py` and `bprop/engines.py` register **two** engines total —
 `norm_fprop_sm100` and `norm_bprop_sm100` — with the shared `cudnn.frost` engine
-framework (listed in `cudnn.frost.dispatch._OPSET_MODULES`). The variants are not
+framework (one `EngineFamily` per phase in `cudnn/engines/manifest.py`). The variants are not
 distinct kernel geometries (unlike SDPA's d256/d512), so one engine per phase
 serves *all* variants: its `Capabilities.variants` advertises the set and its
 `lower` dispatches to the right per-flavor kernel by `facts.variant` (the
@@ -138,9 +138,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128   # Blackwe
 ## Tests
 
 ```bash
-PYTHONPATH=python python cudnn/norm/tests/test_norms.py     # correctness vs PyTorch
-PYTHONPATH=python python cudnn/norm/tests/test_engines.py   # engine facts/probe logic
-PYTHONPATH=python python cudnn/norm/tests/bench_norms.py    # LayerNorm bandwidth
+pytest test/python/norm/cutedsl/test_frost_norm_kernels.py   # correctness vs PyTorch
+pytest test/python/norm/graph/test_frost_norm_engines.py     # engine facts/probe logic
+python benchmark/norms/bench_norms.py                        # LayerNorm bandwidth
 ```
 
 Both correctness suites register a stub `cudnn` package (with a dummy `pygraph`

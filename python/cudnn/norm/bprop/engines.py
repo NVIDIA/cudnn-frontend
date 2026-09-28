@@ -14,13 +14,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Optional
 
 import torch
 
-from cudnn.frost import register_engine
-from cudnn.frost.dispatch import requested_knobs
 from cudnn.norm import graph_analyzer as ga
 from cudnn.norm.config_sm100 import NormVariant
 
@@ -44,8 +41,7 @@ class Capabilities:
     dtypes: frozenset = _ALL_DTYPES
 
 
-def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts",
-             requested: Optional[NormBwdKnobs] = None) -> Optional[str]:
+def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: Optional[NormBwdKnobs] = None) -> Optional[str]:
     """First reason this engine cannot serve these facts, or None if it can."""
     if facts.invalid:
         return facts.invalid
@@ -75,22 +71,26 @@ ENGINE_NAME = "norm_bprop_sm100"
 ENGINE_SPECS = (EngineSpec(name=ENGINE_NAME, capabilities=Capabilities()),)
 
 
-def probe(spec: EngineSpec, graph) -> bool:
+def analyze_for(graph):
+    """This family's facts for ``graph``, or None if it is not a single norm node."""
+    return ga.analyze(graph)
+
+
+def probe(spec: EngineSpec, graph, requested=None) -> bool:
     facts = ga.analyze(graph)
     if facts is None:
         return False
-    reason = mismatch(spec.capabilities, facts, requested_knobs(graph))
+    reason = mismatch(spec.capabilities, facts, requested)
     if reason is not None:
         _LOG.debug("cudnn.norm: %s ineligible: %s", spec.name, reason)
         return False
     return True
 
 
-def build(spec: EngineSpec, graph):
+def build(spec: EngineSpec, graph, requested=None):
     facts = ga.analyze(graph)
     if facts is None:
         raise ValueError("cudnn.norm: graph is not a single norm-backward node")
-    requested = requested_knobs(graph)
     reason = mismatch(spec.capabilities, facts, requested)
     if reason is not None:
         raise ValueError(f"cudnn.norm: {spec.name}: {reason}")
@@ -98,18 +98,24 @@ def build(spec: EngineSpec, graph):
     return lower(spec, facts, requested)
 
 
-def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts",
-                     requested: Optional[NormBwdKnobs] = None):
+def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Optional[NormBwdKnobs] = None):
     """Default lowering: resolve buffers at execute time and call
     :func:`cudnn.norm.bprop.api.norm_bprop` (dispatches by ``facts.variant``);
     outputs are copied into the graph's DX / Dscale / Dbias buffers."""
     from cudnn.norm.bprop.api import norm_bprop
 
-    binding = ga.NormBinding({
-        "dy": facts.dy_t, "x": facts.x_t, "scale": facts.scale_t,
-        "mean": facts.mean_t, "inv_var": facts.inv_var_t,
-        "dx": facts.dx_t, "dscale": facts.dscale_t, "dbias": facts.dbias_t,
-    })
+    binding = ga.NormBinding(
+        {
+            "dy": facts.dy_t,
+            "x": facts.x_t,
+            "scale": facts.scale_t,
+            "mean": facts.mean_t,
+            "inv_var": facts.inv_var_t,
+            "dx": facts.dx_t,
+            "dscale": facts.dscale_t,
+            "dbias": facts.dbias_t,
+        }
+    )
 
     def _execute(variant_pack):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
@@ -119,8 +125,14 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts",
         mean = resolved.get(id(facts.mean_t)) if facts.mean_t is not None else None
         rstd = resolved.get(id(facts.inv_var_t)) if facts.inv_var_t is not None else None
         dx, dgamma, dbeta = norm_bprop(
-            facts.variant, dy, x, gamma, mean, rstd,
-            normalized_shape=facts.normalized_shape, num_groups=facts.num_groups,
+            facts.variant,
+            dy,
+            x,
+            gamma,
+            mean,
+            rstd,
+            normalized_shape=facts.normalized_shape,
+            num_groups=facts.num_groups,
             has_beta=facts.has_beta,
         )
         _copy_into(resolved.get(id(facts.dx_t)), dx)
@@ -142,7 +154,4 @@ def engine_name() -> str:
     return ENGINE_NAME
 
 
-for _s in ENGINE_SPECS:
-    register_engine(_s.name, partial(probe, _s), partial(build, _s))
-
-__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "ENGINE_NAME", "NormBwdKnobs", "engine_name", "mismatch"]
+__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "ENGINE_NAME", "analyze_for", "build", "probe", "NormBwdKnobs", "engine_name", "mismatch"]
