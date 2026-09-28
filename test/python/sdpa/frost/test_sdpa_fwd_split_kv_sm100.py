@@ -17,7 +17,10 @@ import os
 from typing import NamedTuple, Optional
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_pre_rubin_blackwell, requires_dsl
 
@@ -81,7 +84,7 @@ def _partial_kwargs(splits, o_p):
 
 
 def _partial_tag(splits, o_dtype):
-    """The matching ``dtype_partial`` for ``sm100/split_combine.compile``.
+    """The matching ``dtype_partial`` for ``sm100/split_combine.compile_ptr``.
 
     Compiling the combine for the wrong width reinterprets the workspace and
     yields garbage rather than an error, so it has to track _partial_o_dtype.
@@ -147,10 +150,8 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
 
     o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=dtype)
     lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined O"
     return o_out.float(), (q, k, v, scale)
@@ -263,53 +264,19 @@ def test_split_kv_requires_lse():
 
 
 @pytest.mark.L0
-def test_split_combine_compile_keeps_partial_lse_compact_and_strides_final_lse(monkeypatch):
-    """Only the caller-visible Stats output inherits its non-compact layout."""
+def test_split_combine_keeps_partial_lse_compact_and_strides_final_lse():
+    """Only caller-visible Stats inherits its non-compact layout."""
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from test_sdpa_split_combine_sm100 import _partials, _output, _check
 
-    def fake_compact_tensor(_dtype, shape, **kwargs):
-        return {"kind": "compact", "shape": tuple(shape), **kwargs}
-
-    def fake_tensor(_dtype, shape, stride, **kwargs):
-        return {"kind": "strided", "shape": tuple(shape), "stride": tuple(stride), **kwargs}
-
-    captured = {}
-    compiled = object()
-
-    def fake_compile(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return compiled
-
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_compact_tensor", fake_compact_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_tensor", fake_tensor)
-    monkeypatch.setattr(comb.cute.runtime, "make_fake_stream", lambda **_kwargs: object())
-    monkeypatch.setattr(comb.cute, "compile", fake_compile)
-
-    comb.compile.cache_clear()
-    try:
-        result = comb.compile(
-            b=2,
-            h=4,
-            sq=5,
-            d_v=16,
-            splits=3,
-            has_lse=True,
-            lse_stride=(97, 19, 3),
-        )
-    finally:
-        comb.compile.cache_clear()
-
-    assert result is compiled
-    assert captured["args"][2]["kind"] == "compact"
-    assert captured["args"][2]["shape"] == (6, 4, 5)
-    assert captured["args"][2]["assumed_align"] == 16
-    assert captured["args"][4] == {
-        "kind": "strided",
-        "shape": (2, 4, 5),
-        "stride": (97, 19, 3),
-        "assumed_align": 4,
-    }
+    b, h, sq, d, splits = 2, 4, 5, 16, 3
+    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    assert lp.shape == (splits * b, h, sq) and lp.is_contiguous()
+    o, ostorage, oused = _output((b, sq, h, d), (sq * h * d, h * d, d, 1), torch.float16)
+    lse, lstorage, lused = _output((b, h, sq), (97, 19, 3), torch.float32)
+    fn = positional_entry(comb.compile_ptr(has_lse=True, dtype_partial="f32"))
+    fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, o.stride(), lse.stride(), torch.cuda.current_stream().cuda_stream)
+    _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
 
 
 # --- cga1 (CTA_MMA=1) ---------------------------------------------------
@@ -476,8 +443,8 @@ def test_empty_splits_every_flavor(flavor):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16))
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16", has_lse=False, dtype_partial=_partial_tag(S, torch.float16)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), S, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
 
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN from an empty split"
@@ -704,8 +671,12 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
     # has_amax: at splits > 1 the per-split epilogues skip their amax write, so
     # the combine is what reports it -- over the RECOMBINED O.
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16))
-    cfn(o_p, lse_p, o_out, None, amax_o, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(
+        comb.compile_ptr(
+            dtype_o="f16", has_lse=False, has_amax=True, dtype_partial=_partial_tag(splits, torch.float16), quantized=True, has_scale_o_input=False
+        )
+    )
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), splits, o_out.stride(), (0, 0, 0), amax_o.data_ptr(), None, int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined fp8-family O"
     return o_out.float(), ref, amax_o
@@ -872,10 +843,8 @@ def test_combine_lse_matches_reference(splits, stats_log2):
     else:
         o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=torch.float16)
         lse_out = torch.zeros(B, H, SQ, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, torch.float16), stats_log2=stats_log2))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, SQ, D), splits, o_out.stride(), lse_out.stride(), int(stream))
         torch.cuda.synchronize()
         got_lse = lse_out
     assert not torch.isnan(got_lse).any(), "NaN in recombined LSE"
@@ -936,10 +905,8 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
         stream=stream,
     )
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=S, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(S), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(S, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), S, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), f"{flavor}: NaN"
     ref = _ref_sdpa(q, k, v, scale, is_causal=False, kh=H)
@@ -1004,10 +971,8 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
         torch.cuda.synchronize()
         return o_p.float(), q, k, v, scale
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
-    cfn = comb.compile(
-        b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype)
-    )
-    cfn(o_p, lse_p, o_out, None, None, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
+    cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False, dtype_partial=_partial_tag(splits, dtype)))
+    cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), None, (B, H, SQ, d_v), splits, o_out.stride(), (0, 0, 0), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN under mask+split"
     return o_out.float(), q, k, v, scale

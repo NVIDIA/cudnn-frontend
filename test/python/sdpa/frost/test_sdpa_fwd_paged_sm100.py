@@ -27,7 +27,10 @@ import math
 import os
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
@@ -666,10 +669,8 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     else:
         o_out = torch.zeros(B, 1, H, d_v, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, 1, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B, h=H, sq=1, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, 1, d_v), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, 1, d_v), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     ref_o, ref_lse = _ref(q[:, 0], k_pool, v_pool, bt, seq_lens, hnd, scale)
     live = seq_lens > 0

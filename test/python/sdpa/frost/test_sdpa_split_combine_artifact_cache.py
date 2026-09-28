@@ -16,14 +16,13 @@ from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 
-@pytest.mark.parametrize("route", ["dense", "ragged32", "ragged64", "tensor"])
+@pytest.mark.parametrize("route", ["dense", "ragged32", "ragged64", "quantized"])
 def test_shared_combine_artifact_reloads_in_fresh_process(route, tmp_path):
     child = r"""
 import hashlib, json, sys
 from pathlib import Path
-import torch, cudnn, cutlass
+import torch, cudnn
 import cutlass.cute as cute
-from cuda.bindings import driver
 from cudnn.frost import compiled_cache
 from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 tests, package, route, reload = sys.argv[1:]
@@ -44,21 +43,26 @@ out_b = 1 if ragged else b
 ostride, lstride = helper._strides(out_b, h, sq, d, "strided")
 o, os_, ou = helper._output((out_b, sq, h, d), ostride, torch.float16)
 lse, ls, lu = helper._output((out_b, h, sq), lstride, torch.float32)
-if route == "tensor":
-    owner = comb.compile(b, h, sq, d, splits, has_lse=True, lse_stride=lstride, dtype_partial="f32", o_stride=ostride)
-    run = lambda: owner(op, lp, o, lse, None, None, (b,h,sq,d), cutlass.Int32(splits), stream=driver.CUstream(torch.cuda.current_stream().cuda_stream))
-else:
-    owner = comb.compile_ptr(dtype_o="f16", has_lse=True, ragged=ragged, ragged_i64=route == "ragged64")
-    fn = compiled_cache.positional_entry(owner)
-    extra = ()
-    if ragged:
-        offsets = torch.tensor([0,3,5], device="cuda", dtype=torch.int64 if route == "ragged64" else torch.int32)
-        extra = (offsets.data_ptr(), offsets.data_ptr(), offsets.data_ptr(), (1,1,1), (sq,sq))
-    run = lambda: fn(op.data_ptr(),lp.data_ptr(),o.data_ptr(),lse.data_ptr(),(b,h,sq,d),splits,ostride,lstride,*extra,torch.cuda.current_stream().cuda_stream)
+quantized = route == "quantized"
+amax = torch.zeros(1, device="cuda") if quantized else None
+scale = torch.tensor([1.75], device="cuda") if quantized else None
+owner = comb.compile_ptr(dtype_o="f16", has_lse=True, ragged=ragged, ragged_i64=route == "ragged64", quantized=quantized,
+                         has_amax=quantized, has_scale_o=quantized, has_scale_o_input=quantized)
+fn = compiled_cache.positional_entry(owner)
+extra = ()
+if ragged:
+    offsets = torch.tensor([0,3,5], device="cuda", dtype=torch.int64 if route == "ragged64" else torch.int32)
+    extra = (offsets.data_ptr(), offsets.data_ptr(), offsets.data_ptr(), (1,1,1), (sq,sq))
+elif quantized:
+    extra = (amax.data_ptr(), scale.data_ptr())
+def run():
+    if amax is not None: amax.zero_()
+    fn(op.data_ptr(),lp.data_ptr(),o.data_ptr(),lse.data_ptr(),(b,h,sq,d),splits,ostride,lstride,*extra,torch.cuda.current_stream().cuda_stream)
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
 def check():
-    helper._check(o,lse,os_,ou,ls,lu,ref_o,ref_lse,False)
+    helper._check(o,lse,os_,ou,ls,lu,ref_o * (1.75 if quantized else 1.0),ref_lse,False)
+    if quantized: torch.testing.assert_close(amax.cpu(), ref_o.abs().amax().float().view(1), atol=2e-6, rtol=2e-6)
 run();check()
 graph=torch.cuda.CUDAGraph()
 try:
