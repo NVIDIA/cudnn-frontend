@@ -6,6 +6,7 @@ __all__ = ["CompactGqaBackward", "compact_gqa_backward"]
 
 
 def __getattr__(name):
+    """Load the compact backward API on demand."""
     if name not in __all__:
         raise AttributeError(name)
     from . import api

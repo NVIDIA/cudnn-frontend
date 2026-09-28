@@ -23,6 +23,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn._torch_stream import stream_context
 from cudnn.sdpa import graph_analyzer
 
 from ._blas import load_helper
@@ -42,6 +43,7 @@ class CompactGqaBackward(APIBase):
     _dq_cls = DirectCausalDq
 
     def __init__(self, q, k, v, o, do, lse, *, max_seqlen=None, query_rows=16384, groups=4, fast_store=True, ds_budget_bytes=8 * 1024**3, packed=True):
+        """Describe the inputs and reserve a bounded scratch layout."""
         super().__init__()
         assert query_rows >= 128 and query_rows % 128 == 0
         self.query_rows = query_rows
@@ -65,6 +67,7 @@ class CompactGqaBackward(APIBase):
         self._layout, self._scratch_bytes = self._workspace_layout(self._capacity)
 
     def _workspace_layout(self, capacity):
+        """Size aligned scratch regions for every band up to capacity."""
         if capacity < 1:
             raise ValueError("Workspace sequence capacity must be positive.")
         chunk_rows = min(self.query_rows, (capacity + 127) // 128 * 128)
@@ -90,11 +93,14 @@ class CompactGqaBackward(APIBase):
             offset = (scratch_bytes + 255) // 256 * 256
             layout[name] = (offset, count, shape, dtype)
             scratch_bytes = offset + count
-        self._band_geometry(capacity, layout["ds"][1] // 2)
+        elements = layout["ds"][1] // 2
+        last_band = (capacity + 127) // 128 * 128 - 128
+        self._band_geometry(capacity, elements, last_band)
         return layout, scratch_bytes
 
     def _band_geometry(self, length, elements, query_start=0):
         # Fit only the keys reachable by this query band.
+        """Choose the largest query band that fits the dS buffer."""
         end = (length + 127) // 128 * 128
         low, high = 1, min(self.query_rows, end - query_start) // 128
         best = 0
@@ -111,16 +117,19 @@ class CompactGqaBackward(APIBase):
         return best, query_start + best
 
     def _band_views(self, workspace_views, length, query_start=0):
+        """View dS with the shape required by this causal band."""
         result = dict(workspace_views)
         rows, leading = self._band_geometry(max(1, length), result["ds"].numel(), query_start)
         result["ds"] = result["ds"].narrow(0, 0, 8 * rows * leading).view(1, 8, rows, leading)
         return result
 
     def _sequence_batches(self, offsets, lengths, spans, storage):
+        """Group short sequences without exceeding scratch capacity."""
         pending = []
         maximum = 0
 
         def fits(items, width):
+            """Check the batch against metadata and scratch limits."""
             count = len(items)
             total = items[-1][0] + items[-1][2] - items[0][0]
             return (
@@ -147,6 +156,7 @@ class CompactGqaBackward(APIBase):
             yield pending
 
     def _execute_packed(self, inputs, outputs, storage, members):
+        """Compute gradients for a batch of short packed sequences."""
         count = len(members)
         start = members[0][0]
         span = members[-1][0] + members[-1][2] - start
@@ -182,6 +192,7 @@ class CompactGqaBackward(APIBase):
         self._packed_sequences += count
 
     def check_support(self):
+        """Validate SM107, BF16 THD inputs, and token-major FP32 LSE."""
         if torch.cuda.get_device_capability(self.device) != (10, 7):
             raise NotImplementedError("CompactGqaBackward requires SM107.")
         if self.tokens < 1:
@@ -204,20 +215,23 @@ class CompactGqaBackward(APIBase):
         return True
 
     def scratch_workspace_bytes(self, max_seqlen=None):
+        """Return required bytes, validating any requested capacity."""
         if max_seqlen is None:
             return self._scratch_bytes
         return self._workspace_layout(operator.index(max_seqlen))[1]
 
     @contextmanager
     def _context(self, current_stream):
+        """Run torch work on the plan's CUDA stream."""
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device).cuda_stream if current_stream is None else int(current_stream)
             if self._stream is not None and stream != self._stream:
                 raise ValueError("Use one plan per CUDA stream.")
-            with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=self.device)):
+            with stream_context(stream, self.device):
                 yield stream
 
     def compile(self, current_stream=None):
+        """Compile runtime-length kernels and create a cuBLAS handle."""
         self._ensure_support_checked()
         with self._context(current_stream) as stream:
             if self._compiled_kernel is not None:
@@ -225,6 +239,7 @@ class CompactGqaBackward(APIBase):
             self._stream = stream
 
             def fake(dtype, shape, align=16):
+                """Describe contiguous storage without allocating device memory."""
                 return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=align)
 
             length = cute.sym_int(divisibility=1)
@@ -297,10 +312,12 @@ class CompactGqaBackward(APIBase):
 
     @staticmethod
     def _check_status(status):
+        """Raise on a failed cuBLAS operation."""
         if status:
             raise RuntimeError(f"cuBLAS status {status}")
 
     def _views(self, workspace):
+        """Validate caller scratch and expose its typed regions."""
         if (
             workspace.dtype != torch.uint8
             or workspace.device != self.device
@@ -313,17 +330,19 @@ class CompactGqaBackward(APIBase):
         return {name: workspace.narrow(0, offset, size).view(dtype).view(shape) for name, (offset, size, shape, dtype) in self._layout.items()}
 
     def initialize_workspace(self, workspace, current_stream=None, *, max_seqlen=None):
-        """Zero compact dS once per workspace allocation."""
+        """Reset dS when its allocation or owning plan changes."""
+        capacity = self._capacity if max_seqlen is None else operator.index(max_seqlen)
+        layout, scratch_bytes = self._workspace_layout(capacity)
         self.compile(current_stream)
         with self._context(current_stream):
-            if max_seqlen is not None:
-                self._capacity = operator.index(max_seqlen)
-                self._layout, self._scratch_bytes = self._workspace_layout(self._capacity)
+            self._capacity = capacity
+            self._layout, self._scratch_bytes = layout, scratch_bytes
             self._views(workspace)["ds"].zero_()
             self._ds_geometry = None
             self._workspace_ref = weakref.ref(workspace)
 
     def _validate_runtime(self, inputs, outputs):
+        """Check runtime tensor metadata, alignment, and aliasing."""
         tokens = inputs[0].shape[0]
         if tokens < 1:
             raise ValueError("Expected a nonempty packed token buffer.")
@@ -354,6 +373,7 @@ class CompactGqaBackward(APIBase):
                     raise ValueError("Gradient outputs must not overlap inputs or each other.")
 
     def execute(self, q, k, v, o, do, lse, dq, dk, dv, workspace, current_stream=None, *, sequence_offsets=None, sequence_lengths=None):
+        """Write gradients using caller scratch and host packing metadata."""
         if self._compiled_kernel is None or not self._handle:
             raise RuntimeError("Compile the plan before execute.")
         if self._workspace_ref is None or self._workspace_ref() is not workspace:
@@ -413,6 +433,7 @@ class CompactGqaBackward(APIBase):
                 self._reduce(*args, self._cuda_stream)
 
     def close(self):
+        """Release the plan's cuBLAS handle."""
         if self._handle:
             with torch.cuda.device(self.device):
                 self._check_status(self._lib.gqa_destroy(self._handle))

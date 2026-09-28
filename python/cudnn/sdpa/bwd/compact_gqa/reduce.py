@@ -9,6 +9,7 @@ from cuda.bindings import driver as cuda
 
 class ReduceAndPointers:
     def __init__(self, coarse_bin=4096, groups=4):
+        """Configure grouped gradient reduction."""
         assert coarse_bin > 0 and groups in (1, 2, 4, 8)
         self.coarse_bin = coarse_bin
         self.groups = groups
@@ -26,10 +27,12 @@ class ReduceAndPointers:
         dv: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        """Launch reduction and output preparation."""
         self.run(k, dq, ds, tables, dkp, dvp, dk, dv).launch(grid=(cute.ceil_div(dk.shape[0] * 256, 2048), 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def run(self, k: cute.Tensor, dq: cute.Tensor, ds: cute.Tensor, tables: cute.Tensor, dkp: cute.Tensor, dvp: cute.Tensor, dk: cute.Tensor, dv: cute.Tensor):
+        """Reduce grouped partials and zero padded gradients."""
         bx, _, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         pos = bx * 2048 + tx * 8
@@ -65,17 +68,18 @@ class ReduceAndPointers:
                     qo = cute.make_tensor(dq.iterator + (token * 8 + head) * 256 + dim, cute.make_layout(8))
                     cute.autovec_copy(outk, qo)
 
-
-ReduceAndPointers.run.set_name_prefix("cudnn_gqa_reduce", remove_cutlass_symbol=True)
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 class BandPointers:
     @cute.jit
     def __call__(self, k: cute.Tensor, dq: cute.Tensor, ds: cute.Tensor, tables: cute.Tensor, query_start: cutlass.Int32, stream: cuda.CUstream):
+        """Launch pointer-table setup for a causal band."""
         self.run(k, dq, ds, tables, query_start).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def run(self, k: cute.Tensor, dq: cute.Tensor, ds: cute.Tensor, tables: cute.Tensor, query_start: cutlass.Int32):
+        """Write GEMM pointers for each query head."""
         tx, _, _ = cute.arch.thread_idx()
         if tx < 8:
             for tile in range(tables.shape[0]):
@@ -84,14 +88,18 @@ class BandPointers:
                 tables[tile, 1, tx] = ds.iterator.toint() + (cutlass.Int64(tx) * ds.shape[2] + local_start) * ds.shape[3] * 2
                 tables[tile, 2, tx] = dq.iterator.toint() + (cutlass.Int64(query_start + local_start) * 2048 + tx * 256) * 2
 
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
 
 class PackK:
     @cute.jit
     def __call__(self, src: cute.Tensor, dst: cute.Tensor, query_start: cutlass.Int32, rows: cutlass.Int32, stream: cuda.CUstream):
+        """Launch K packing for the dQ GEMM."""
         self.run(src, dst, query_start, rows).launch(grid=(cute.ceil_div((query_start + rows) * 256, 2048), dst.shape[0], 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def run(self, src: cute.Tensor, dst: cute.Tensor, query_start: cutlass.Int32, rows: cutlass.Int32):
+        """Copy valid keys and zero the padding."""
         bx, tile, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         width = cutlass.min(rows - tile * 4096, 4096)
@@ -110,18 +118,18 @@ class PackK:
             out = cute.make_tensor(dst.iterator + offset, cute.make_layout(8))
             cute.autovec_copy(value, out)
 
-
-BandPointers.run.set_name_prefix("cudnn_gqa_band_pointers", remove_cutlass_symbol=True)
-PackK.run.set_name_prefix("cudnn_gqa_band_pack_k", remove_cutlass_symbol=True)
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 class ClearDiagonal:
     @cute.jit
     def __call__(self, ds: cute.Tensor, stream: cuda.CUstream):
+        """Launch clearing of masked diagonal entries."""
         self.run(ds).launch(grid=(cute.ceil_div(ds.shape[2] * 4096, 16384), 8, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def run(self, ds: cute.Tensor):
+        """Zero dS entries above the causal diagonal."""
         bx, head, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         pos = bx * 16384 + tx * 64
@@ -136,5 +144,4 @@ class ClearDiagonal:
             store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
             cute.copy(store, zero, out)
 
-
-ClearDiagonal.run.set_name_prefix("cudnn_gqa_band_clear_diagonal", remove_cutlass_symbol=True)
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)

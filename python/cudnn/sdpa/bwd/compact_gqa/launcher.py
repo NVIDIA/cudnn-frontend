@@ -14,6 +14,7 @@ from cudnn.flex_attention.plan.kernels import BlockSparseTensors
 
 class FusedPipelined:
     def __init__(self, groups=1, coarse_bin=4096, max_len=32768, fast_store=True):
+        """Configure the banded dK/dV and dS producer."""
         self.groups = groups
         assert groups in (1, 2, 4, 8)
         self.core = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(8 // groups, coarse_bin, max_len)
@@ -42,6 +43,7 @@ class FusedPipelined:
         query_start: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch preprocessing and the banded producer."""
         assert q.shape[1] == 8 and k.shape[1] == 1 and q.shape[2] == 256
         rows = cute.ceil_div(o.shape[0], 128) * 128
         if query_start == 0:
@@ -60,6 +62,7 @@ class FusedPipelined:
 
     @cute.kernel
     def pre(self, o: cute.Tensor, do: cute.Tensor, lse: cute.Tensor, lse2: cute.Tensor, delta: cute.Tensor, dqa: cute.Tensor, cu: cute.Tensor):
+        """Compute softmax statistics for backward."""
         bx, _, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         lane = tx % 32
@@ -86,8 +89,7 @@ class FusedPipelined:
                         delta[head, token] = cutlass.Float32(0.0)
                         lse2[head, token] = cutlass.Float32(0.0)
 
-
-FusedPipelined.pre.set_name_prefix("cudnn_gqa_fused_pre", remove_cutlass_symbol=True)
+    pre.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 from .packed import PackedPre
@@ -95,6 +97,7 @@ from .packed import PackedPre
 
 class FusedPacked:
     def __init__(self, groups=1, coarse_bin=4096, max_len=32768, fast_store=True):
+        """Configure the producer for short packed sequences."""
         self.groups = groups
         assert groups in (1, 2, 4, 8)
         self.core = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(8 // groups, coarse_bin, max_len)
@@ -128,6 +131,7 @@ class FusedPacked:
         query_start: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch preprocessing and the packed producer."""
         assert q.shape[1] == 8 and k.shape[1] == 1 and q.shape[2] == 256
         self.pre(k, o, do, lse, lse2, delta, cu, lengths, ds_global, kr, tables, dq, stream)
         k_view = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], self.groups, k.shape[2]), stride=(k.stride[0], 0, k.stride[2])))

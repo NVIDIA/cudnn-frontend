@@ -43,6 +43,7 @@ class PersistentDenseGemmKernel:
     def __init__(
         self, acc_dtype: Type[cutlass.Numeric], use_2cta_instrs: bool, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Tuple[int, int], use_tma_store: bool
     ):
+        """Configure the persistent GEMM tile and scheduling policy."""
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -60,6 +61,7 @@ class PersistentDenseGemmKernel:
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
+        """Derive tensor layouts and shared-memory requirements."""
         tiled_mma = sm100_utils.make_trivial_tiled_mma(self.a_dtype, self.a_major_mode, self.b_major_mode, self.acc_dtype, self.cta_group, self.mma_tiler[:2])
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
@@ -104,6 +106,7 @@ class PersistentDenseGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
+        """Build descriptors and launch the persistent GEMM."""
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -201,6 +204,7 @@ class PersistentDenseGemmKernel:
         query_start: cutlass.Int32,
         epilogue_op: cutlass.Constexpr,
     ):
+        """Compute and store persistent GEMM tiles."""
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         if warp_idx == self.tma_warp_id:
@@ -392,9 +396,9 @@ class PersistentDenseGemmKernel:
                 bSG_gC = None
                 tTR_gC = None
                 if cutlass.const_expr(self.use_tma_store):
-                    bSG_gC = bSG_gC_partitioned[None, None, None, *mma_tile_coord_mnl]
+                    bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
                 else:
-                    tTR_gC = tTR_gC_partitioned[None, None, None, None, None, *mma_tile_coord_mnl]
+                    tTR_gC = tTR_gC_partitioned[(None, None, None, None, None, *mma_tile_coord_mnl)]
                 tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, acc_consumer_state.index]
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -443,9 +447,12 @@ class PersistentDenseGemmKernel:
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     def epilog_tmem_copy_and_partition(
         self, tidx: cutlass.Int32, tAcc: cute.Tensor, gC_mnl: cute.Tensor, epi_tile: cute.Tile, use_2cta_instrs: Union[cutlass.Boolean, bool]
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        """Partition tensor-memory accumulators for the epilogue."""
         copy_atom_t2r = sm100_utils.get_tmem_load_op(self.cta_tile_shape_mnk, self.c_layout, self.c_dtype, self.acc_dtype, epi_tile, use_2cta_instrs)
         tAcc_epi = cute.flat_divide(tAcc[(None, None), 0, 0, None], epi_tile)
         tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[None, None, 0, 0, 0])
@@ -459,6 +466,7 @@ class PersistentDenseGemmKernel:
     def epilog_smem_copy_and_partition(
         self, tiled_copy_t2r: cute.TiledCopy, tTR_rC: cute.Tensor, tidx: cutlass.Int32, sC: cute.Tensor
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        """Partition shared memory for the epilogue."""
         copy_atom_r2s = sm100_utils.get_smem_store_op(self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r)
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -469,6 +477,7 @@ class PersistentDenseGemmKernel:
     def epilog_gmem_copy_and_partition(
         self, tidx: cutlass.Int32, atom: Union[cute.CopyAtom, cute.TiledCopy], gC_mnl: cute.Tensor, epi_tile: cute.Tile, sC: cute.Tensor
     ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
+        """Partition output storage for the epilogue."""
         gC_epi = cute.flat_divide(gC_mnl[(None, None), 0, 0, None, None, None], epi_tile)
         if cutlass.const_expr(self.use_tma_store):
             tma_atom_c = atom
@@ -497,6 +506,7 @@ class PersistentDenseGemmKernel:
         occupancy: int,
         use_tma_store: bool,
     ) -> Tuple[int, int, int]:
+        """Fit pipeline stages into the shared-memory budget."""
         num_acc_stage = 2
         num_c_stage = 2 if use_tma_store else 0
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
@@ -517,6 +527,7 @@ class PersistentDenseGemmKernel:
     def _compute_grid(
         c: cute.Tensor, cta_tile_shape_mnk: Tuple[int, int, int], cluster_shape_mn: Tuple[int, int], max_active_clusters: cutlass.Constexpr
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+        """Size the persistent launch grid."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[0, (None, None, None)].shape
@@ -527,6 +538,7 @@ class PersistentDenseGemmKernel:
 
     @staticmethod
     def _compute_num_tmem_alloc_cols(tiled_mma: cute.TiledMma, mma_tiler: Tuple[int, int, int], num_acc_stage: int) -> int:
+        """Determine tensor-memory columns for the accumulator."""
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
         num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
@@ -535,12 +547,14 @@ class PersistentDenseGemmKernel:
 
 class DirectCausalDq:
     def __init__(self):
+        """Configure direct dQ tiles for causal attention."""
         self.gemm = PersistentDenseGemmKernel(cutlass.Float32, True, (128, 256), (2, 1), True)
 
     @cute.jit
     def __call__(
         self, ds: cute.Tensor, k: cute.Tensor, dq: cute.Tensor, query_start: cutlass.Int32, max_active_clusters: cutlass.Constexpr, stream: cuda.CUstream
     ):
+        """Launch dQ over the current causal query band."""
         rows = cutlass.min(ds.shape[2], k.shape[0] - query_start)
         keys = cutlass.min(k.shape[0], query_start + ds.shape[2])
         a = cute.make_tensor(ds.iterator, cute.make_layout((rows, keys, 8), stride=(ds.shape[3], 1, cutlass.Int64(ds.shape[2]) * ds.shape[3])))

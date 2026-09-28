@@ -15,6 +15,7 @@ import tempfile
 
 @lru_cache(maxsize=1)
 def load_helper():
+    """Load or build the wrapper around installed cuBLAS APIs."""
     source = Path(__file__).parent / "csrc" / "compact_gqa_blas.cpp"
     cuda_root = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
     if not (cuda_root / "include/cublas_v2.h").is_file():

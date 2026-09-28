@@ -1291,6 +1291,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
+    dkdv_bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def get_Q_block_min_max(
         self,
@@ -1740,6 +1742,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         block_sparse_tensors: Optional[BlockSparseTensors],
         m_block_max: tuple[Int32, Int32],
     ):
+        """Load LSE and softmax-gradient statistics."""
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord_k, blk_coord_h_k, blk_coord_b = cute.arch.block_idx()
         mma_tile_coord_m = blk_coord_k // 2
@@ -2061,6 +2064,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dp_idx: Int32,
         wg_idx: Int32,
     ):
+        """Stage register values for the two-CTA MMA."""
         smem_slice = smem[None, None, None, index]
         # K>> smem_slice:  tensor<ptr<f16, smem, align<1024>, S<3,4,3>> o ((64,16),1,(4,2)):((64,1),0,(16,4096))>
         thread_layout = cute.make_ordered_layout(
@@ -2399,6 +2403,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tensor_shape: cute.Shape,
         accumulate: cutlass.Boolean,
     ):
+        """Store partial gradients and compact dS tiles."""
         for i in cutlass.range(cute.size(coord, mode=[2]), unroll_full=True):
             coord_i = coord[None, 0, i]
             gmem_i = gmem[None, 0, i]

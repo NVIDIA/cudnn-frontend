@@ -10,6 +10,7 @@ from cuda.bindings import driver as cuda
 
 class PackedReduce:
     def __init__(self, groups):
+        """Configure reduction of grouped dK/dV partials."""
         self.groups = groups
 
     @cute.jit
@@ -25,10 +26,12 @@ class PackedReduce:
         max_span: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch gradient reduction for packed sequences."""
         self.run(dkp, dvp, dq, dk, dv, cu, lengths).launch(grid=(cute.ceil_div(max_span, 8), lengths.shape[0], 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def run(self, dkp: cute.Tensor, dvp: cute.Tensor, dq: cute.Tensor, dk: cute.Tensor, dv: cute.Tensor, cu: cute.Tensor, lengths: cute.Tensor):
+        """Reduce dK/dV partials and zero padded gradients."""
         bx, batch, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         local = bx * 8 + tx // 32
@@ -61,6 +64,8 @@ class PackedReduce:
                     offset = cute.assume((cutlass.Int64(token) * 8 + head) * 256 + dim, divby=8)
                     cute.autovec_copy(outk, cute.make_tensor(dq.iterator + offset, cute.make_layout(8)))
 
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
 
 class PackedPre:
     @cute.jit
@@ -80,6 +85,7 @@ class PackedPre:
         dq: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        """Launch packed statistics and GEMM metadata preparation."""
         self.run(k, o, do, lse, lse2, delta, cu, lengths, ds, kr, tables, dq).launch(
             grid=(cute.ceil_div(ds.shape[2], 4), lengths.shape[0], 1), block=(256, 1, 1), stream=stream
         )
@@ -100,6 +106,7 @@ class PackedPre:
         tables: cute.Tensor,
         dq: cute.Tensor,
     ):
+        """Prepare packed statistics, K storage, and GEMM pointers."""
         bx, batch, _ = cute.arch.block_idx()
         tx, _, _ = cute.arch.thread_idx()
         lane, head = tx % 32, tx // 32
@@ -133,6 +140,4 @@ class PackedPre:
                     delta[head, dst] = cutlass.Float32(0.0)
                     lse2[head, dst] = cutlass.Float32(0.0)
 
-
-PackedPre.run.set_name_prefix("cudnn_gqa_packed_pre", remove_cutlass_symbol=True)
-PackedReduce.run.set_name_prefix("cudnn_gqa_packed_reduce", remove_cutlass_symbol=True)
+    run.set_name_prefix("cudnn", remove_cutlass_symbol=True)

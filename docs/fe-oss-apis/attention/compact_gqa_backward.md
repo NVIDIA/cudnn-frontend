@@ -46,7 +46,8 @@ linear metadata and partial-gradient buffers still grow with capacity.
 ds_budget_bytes and query_rows control the memory/launch-count tradeoff.
 Query `scratch_workspace_bytes(new_capacity)` before resizing, then pass that
 capacity to `initialize_workspace(..., max_seqlen=new_capacity)`.
-Reinitialize replacement workspaces and keep their contents private to the plan.
+Insufficient budgets are rejected before initialization or execution.
+Reinitialize replacement workspaces and whenever another plan has used their contents.
 Retain tensors and scratch until queued work completes. Outputs must not alias
 inputs or workspace.
 
@@ -69,10 +70,16 @@ attention rank; native-only runs do not validate the candidate.
 
 ## Validation status
 
-Latest VR200 full-workload comparison against stock backward.
-Mean policy-training time over all ten steps is 118.77 s → 116.41 s, a 1.98%
-reduction. Accuracy is 74.50%; all 152640 backward calls use the candidate.
-Both runs use FE 1.29 and the same image, config, and seed; rollout samples vary.
-Both hit the existing compliance check mismatch: 251 validation samples vs 256.
+Latest recorded VR200 full-workload comparison: mean policy-training time over
+all ten steps is 118.77 s → 116.92 s, a 1.55% reduction computed from unrounded
+measurements. Accuracy is 74.90% versus stock's 73.31%; all 152640 backward
+calls use the candidate, with zero fallback. Both runs use FE 1.29 and the same
+image, config, and seed. Real rollouts differ: valid training tokens increase
+6.46% and call-weighted causal pairs decrease 0.22%; timings are not normalized.
 
-Gradient replay, workspace reuse/resizing, and VR200 sanitizer checks passed.
+These are development measurements, not a submitted MLPerf result. The checker
+used for those runs rejected 251 validation samples against its 256 requirement.
+These historical results predate the review fixes and do not validate them.
+
+Gradient replay, workspace reuse/resizing, and VR200 sanitizer checks passed
+before the review fixes; their regression results are reported separately.

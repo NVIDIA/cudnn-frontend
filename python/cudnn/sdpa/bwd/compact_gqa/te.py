@@ -17,6 +17,7 @@ _plans = {}
 _workspace = None
 _workspace_key = None
 _workspace_capacity = 0
+_workspace_owner = None
 _step = 0
 _enabled = False
 _installed = False
@@ -41,6 +42,7 @@ def register_packing(tensor, host_offsets):
     key = (tensor.device, tensor.data_ptr())
 
     def expired(ref):
+        """Remove metadata when its tensor owner expires."""
         if _prefixes.get(key, (None,))[0] is ref:
             _prefixes.pop(key, None)
 
@@ -48,6 +50,7 @@ def register_packing(tensor, host_offsets):
 
 
 def _host_offsets(tensor):
+    """Return certified offsets without reading device memory."""
     if tensor is None or tensor.dtype != torch.int32 or not tensor.is_contiguous():
         return None
     entry = _prefixes.get((tensor.device, tensor.data_ptr()))
@@ -61,11 +64,13 @@ def _host_offsets(tensor):
 
 
 def _certified(tensor, tokens):
+    """Check that certified offsets cover the token buffer."""
     offsets = _host_offsets(tensor)
     return offsets is not None and offsets[-1] == tokens
 
 
 def _packing(x):
+    """Validate matching logical and padded sequence boundaries."""
     logical = _host_offsets(x["cu_seqlens_q"])
     if logical is None or logical != _host_offsets(x["cu_seqlens_kv"]):
         return None
@@ -117,6 +122,7 @@ def eligible(x):
 
 
 def report():
+    """Print per-step dispatch and optional packing counts."""
     if _counts:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
         data = {"step": _step, "rank": rank, "native_only": _native_only, **_counts}
@@ -128,12 +134,13 @@ def report():
 
 def set_enabled(enabled):
     """Release candidate scratch when switching to a native control."""
-    global _enabled, _workspace, _workspace_key, _workspace_capacity
+    global _enabled, _workspace, _workspace_key, _workspace_capacity, _workspace_owner
     _enabled = bool(enabled)
     if not _enabled:
         _workspace = None
         _workspace_key = None
         _workspace_capacity = 0
+        _workspace_owner = None
 
 
 def begin_step():
@@ -149,6 +156,7 @@ def begin_step():
 
 
 def install():
+    """Install the opt-in wrapper around TE fused backward."""
     global _installed
     if _installed:
         return
@@ -159,17 +167,22 @@ def install():
 
     @functools.wraps(original)
     def backward(*args, **kwargs):
-        global _workspace, _workspace_key, _workspace_capacity, _unmatched_packing_calls
+        """Use compact backward when metadata is supported."""
+        global _workspace, _workspace_key, _workspace_capacity, _workspace_owner, _unmatched_packing_calls
         params = signature.bind(*args, **kwargs)
         params.apply_defaults()
         x = params.arguments
+        try:
+            usable = _enabled and eligible(x)
+            packing = _packing(x) if _trace_packs else None
+        except (KeyError, TypeError):
+            usable, packing = False, None
         if _trace_packs:
-            packing = _packing(x)
             if packing is None:
                 _unmatched_packing_calls += 1
             else:
                 _packing_work[packing] = _packing_work.get(packing, 0) + 1
-        if not _enabled or not eligible(x):
+        if not usable:
             reason = "native_control" if _native_only else "native_startup" if not _enabled else "native_fallback"
             _counts[reason] = _counts.get(reason, 0) + 1
             return original(*args, **kwargs)
@@ -191,8 +204,10 @@ def install():
             _workspace = torch.empty(plan.scratch_workspace_bytes(capacity), dtype=torch.uint8, device=q.device)
             _workspace_key = (q.device, stream)
             _workspace_capacity = capacity
-        if plan._workspace_ref is None or plan._workspace_ref() is not _workspace:
+            _workspace_owner = None
+        if _workspace_owner is not plan or plan._workspace_ref is None or plan._workspace_ref() is not _workspace:
             plan.initialize_workspace(_workspace, stream, max_seqlen=_workspace_capacity)
+            _workspace_owner = plan
         result = compact_gqa_backward(
             q,
             x["k"],

@@ -245,3 +245,215 @@ def test_te_certification_and_fallback(monkeypatch):
     adapter._installed = False
     adapter._step = 0
     adapter._counts.clear()
+
+
+@pytest.fixture
+def isolated_adapter(monkeypatch):
+    """Restore TE dispatch and adapter caches after each test."""
+    api_class()
+    from cudnn.sdpa.bwd.compact_gqa import te as adapter
+    from transformer_engine.pytorch.attention.dot_product_attention import backends
+
+    monkeypatch.setattr(backends, "fused_attn_bwd", backends.fused_attn_bwd)
+    for name, value in {
+        "_prefixes": {},
+        "_plans": {},
+        "_workspace": None,
+        "_workspace_key": None,
+        "_workspace_owner": None,
+        "_workspace_capacity": 0,
+        "_installed": False,
+        "_enabled": False,
+        "_step": 0,
+        "_counts": {},
+        "_packing_work": {},
+        "_unmatched_packing_calls": 0,
+        "_native_only": False,
+        "_trace_packs": False,
+    }.items():
+        monkeypatch.setattr(adapter, name, value, raising=False)
+    yield adapter, backends
+    adapter.set_enabled(False)
+    for plan in adapter._plans.values():
+        plan.close()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capacity", [128, 129, 1024, 4097, 65536])
+@pytest.mark.parametrize("extra_bytes", [-1, 0, 1])
+def test_ds_budget_capacity_boundary(capacity, extra_bytes):
+    """Reject budgets that cannot hold the final causal tile."""
+    cls = api_class()
+    q, k = desc(capacity, 8), desc(capacity, 1)
+    lse = TensorDesc(dtype=torch.float32, shape=(capacity, 8), stride=(8, 1), stride_order=(1, 0), device=q.device)
+    minimum = 8 * 128 * ((capacity + 127) // 128 * 128) * 2
+    if extra_bytes < 0:
+        with pytest.raises(ValueError, match="dS budget"):
+            cls(q, k, k, q, q, lse, ds_budget_bytes=minimum + extra_bytes)
+    else:
+        plan = cls(q, k, k, q, q, lse, ds_budget_bytes=minimum + extra_bytes)
+        start = (capacity + 127) // 128 * 128 - 128
+        assert plan._band_geometry(capacity, plan._layout["ds"][1] // 2, start)[0] == 128
+
+
+@pytest.mark.L0
+def test_ds_budget_resize_is_atomic(monkeypatch):
+    """Validate resized capacity before compilation or plan mutation."""
+    cls = api_class()
+    q, k = desc(128, 8), desc(128, 1)
+    lse = TensorDesc(dtype=torch.float32, shape=(128, 8), stride=(8, 1), stride_order=(1, 0), device=q.device)
+    plan = cls(q, k, k, q, q, lse, ds_budget_bytes=8 * 128 * 128 * 2)
+    before = (plan._capacity, plan._layout, plan._scratch_bytes, plan._workspace_ref)
+    with pytest.raises(ValueError, match="dS budget"):
+        plan.scratch_workspace_bytes(129)
+
+    def unexpected_compile(*args, **kwargs):
+        raise AssertionError("Invalid capacity reached compilation")
+
+    monkeypatch.setattr(plan, "compile", unexpected_compile)
+    with pytest.raises(ValueError, match="dS budget"):
+        plan.initialize_workspace(None, max_seqlen=129)
+    assert (plan._capacity, plan._layout, plan._scratch_bytes, plan._workspace_ref) == before
+
+
+@pytest.mark.L0
+def test_default_stream_context(monkeypatch):
+    """Never wrap default-stream sentinels in ExternalStream."""
+    cls = api_class()
+    plan = cls.__new__(cls)
+    plan.device, plan._stream = torch.device("cuda", torch.cuda.current_device()), None
+    default = torch.cuda.default_stream(plan.device)
+
+    def unexpected_external(*args, **kwargs):
+        raise AssertionError("Default stream reached ExternalStream")
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", unexpected_external)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        for handle in (0, 1, 2, default.cuda_stream):
+            with plan._context(handle):
+                assert torch.cuda.current_stream(plan.device) == default
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("trace", [False, True])
+def test_te_older_signature_falls_back(isolated_adapter, monkeypatch, trace):
+    """Unsupported TE signatures must preserve native dispatch."""
+    adapter, backends = isolated_adapter
+    calls = []
+
+    def native(q):
+        calls.append(q)
+        return "native"
+
+    monkeypatch.setattr(backends, "fused_attn_bwd", native)
+    monkeypatch.setattr(adapter, "_trace_packs", trace)
+    adapter.install()
+    adapter.set_enabled(True)
+    q = torch.empty((1, 8, 256), device="cuda", dtype=torch.bfloat16)
+    assert backends.fused_attn_bwd(q) == "native"
+    assert len(calls) == 1
+    assert adapter._counts == {"native_fallback": 1}
+    assert adapter._unmatched_packing_calls == int(trace)
+
+
+@pytest.mark.L0
+def test_te_none_window_falls_back(isolated_adapter, monkeypatch):
+    """A missing window tuple must not fail in eligibility checks."""
+    import inspect
+
+    adapter, backends = isolated_adapter
+    torch.manual_seed(2300)
+    args, kwargs = fixture(return_call=True)
+    signature = inspect.signature(backends.fused_attn_bwd)
+
+    def native(*args, **kwargs):
+        return "native"
+
+    native.__signature__ = signature
+    monkeypatch.setattr(backends, "fused_attn_bwd", native)
+    adapter.install()
+    adapter.set_enabled(True)
+    assert backends.fused_attn_bwd(*args, **dict(kwargs, window_size=None)) == "native"
+    assert adapter._counts == {"native_fallback": 1}
+
+
+@pytest.mark.L0
+def test_te_kernel_error_propagates(isolated_adapter, monkeypatch):
+    """Do not convert candidate execution errors into native fallback."""
+    import inspect
+    from cudnn.sdpa.bwd.compact_gqa import api
+
+    adapter, backends = isolated_adapter
+    torch.manual_seed(2300)
+    args, kwargs = fixture(return_call=True)
+    bound = inspect.signature(backends.fused_attn_bwd).bind(*args, **kwargs)
+    bound.apply_defaults()
+    for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded"):
+        adapter.register_packing(bound.arguments[name], (0, 128, 512))
+
+    def failed_compile(*args, **kwargs):
+        raise TypeError("candidate compilation failed")
+
+    monkeypatch.setattr(api.CompactGqaBackward, "compile", failed_compile)
+    adapter.install()
+    adapter.set_enabled(True)
+    with pytest.raises(TypeError, match="candidate compilation failed"):
+        backends.fused_attn_bwd(*args, **kwargs)
+
+
+def fp64_gradients(inputs, lengths):
+    """Compute independent causal attention gradients in FP64."""
+    result = [torch.zeros_like(t, dtype=torch.float64) for t in inputs[:3]]
+    start = 0
+    for length in lengths:
+        q, k, v = [t[start : start + length].double().detach().requires_grad_() for t in inputs[:3]]
+        scores = torch.einsum("qhd,khd->hqk", q, k.expand(-1, 8, -1)) / 16
+        mask = torch.ones((length, length), device=q.device, dtype=torch.bool).tril()
+        p = scores.masked_fill(~mask, -float("inf")).softmax(-1)
+        output = torch.einsum("hqk,khd->qhd", p, v.expand(-1, 8, -1))
+        grads = torch.autograd.grad(output, (q, k, v), inputs[4][start : start + length].double())
+        for target, grad in zip(result, grads):
+            target[start : start + length].copy_(grad)
+        start += length
+    return result
+
+
+@pytest.mark.L0
+def test_te_workspace_plan_switch(isolated_adapter):
+    """Reusing one scratch allocation across A-B-A plans must be safe."""
+    import inspect
+
+    adapter, backends = isolated_adapter
+    torch.manual_seed(2300)
+    signature = inspect.signature(backends.fused_attn_bwd)
+
+    def call(lengths, lse_rank):
+        args, kwargs = fixture(return_call=True, lengths=lengths)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        x = bound.arguments
+        aux = list(x["aux_ctx_tensors"])
+        shape = (sum(lengths), 8) if lse_rank == 2 else (sum(lengths), 8, 1)
+        aux[0] = aux[0].view(shape)
+        x["aux_ctx_tensors"] = aux
+        for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded"):
+            adapter.register_packing(x[name], tuple(accumulate(lengths, initial=0)))
+        return bound
+
+    large_a, small_a, large_b = call((1024,), 2), call((128, 384), 2), call((1024,), 3)
+    x = small_a.arguments
+    reference = fp64_gradients(tuple(x[n] for n in ("q", "k", "v", "o", "d_o")), (128, 384))
+    adapter.install()
+    adapter.set_enabled(True)
+    backends.fused_attn_bwd(*large_a.args, **large_a.kwargs)
+    first = backends.fused_attn_bwd(*small_a.args, **small_a.kwargs)
+    check_gradients(first[:3], reference)
+    workspace = adapter._workspace
+    backends.fused_attn_bwd(*large_b.args, **large_b.kwargs)
+    last = backends.fused_attn_bwd(*small_a.args, **small_a.kwargs)
+    check_gradients(last[:3], reference)
+    assert adapter._workspace is workspace
+    assert len(adapter._plans) == 2
+    assert adapter._counts == {"candidate": 4}
+    for before, after in zip(first[:3], last[:3]):
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
