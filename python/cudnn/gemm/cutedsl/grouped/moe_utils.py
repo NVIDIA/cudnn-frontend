@@ -635,10 +635,10 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
 
     @staticmethod
     def slot_names(input_order, weight_mode) -> list:
-        names = []
-        if input_order == WGradInputOrder.TensorRagged:
-            names.extend(["a", "b"])
-        names.extend(["sfa", "sfb"])
+        # A/B need expert-local bounds in both input modes.  In Tensor2D mode
+        # the underlying storage remains a single strided tensor, but a global
+        # descriptor would treat the fixed-capacity tail as in bounds.
+        names = ["a", "b", "sfa", "sfb"]
         if weight_mode == MoEWeightMode.DENSE:
             return names
         names.append("c")
@@ -664,54 +664,61 @@ class WgradSfTensormapConstructor(OnlineTensormapDescCreator):
         c1 = cutlass.Int32(1)
         c0 = cutlass.Int32(0)
 
+        a_dtype = self.a_tensor.element_type
+        a_m_dim = cute.size(self.a_tensor, mode=[0])
         if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
-            a_dtype = self.a_tensor.element_type
-            a_m_dim = cute.size(self.a_tensor, mode=[0])
             a_elem_offset = cutlass.Int64(a_m_dim) * cutlass.Int64(token_offset)
-            a_byte_offset = (a_elem_offset * a_dtype.width) // 8
-            a_iter_u8 = cute.recast_ptr(self.a_tensor.iterator, dtype=cutlass.Uint8)
-            a_iter_e = cute.recast_ptr(a_iter_u8 + a_byte_offset, dtype=a_dtype)
             if cutlass.const_expr(self.a_major_mode == OperandMajorMode.K):
                 a_stride_e = (tokens_i, c1, c0)
             else:
                 a_stride_e = (c1, a_m_dim, c0)
-            a_tensor_e = cute.make_tensor(
-                a_iter_e,
-                cute.make_layout((a_m_dim, tokens_i, c1), stride=a_stride_e),
-            )
-            tma_atom_a, _ = cute.nvgpu.make_tiled_tma_atom_A(
-                self.a_tma_op,
-                a_tensor_e,
-                self.a_smem_layout,
-                self.mma_tiler,
-                self.tiled_mma,
-                self.cluster_layout_vmnk_shape,
-            )
-            store_tma_desc(tma_atom_a, self.get_desc_ptr("a", expert_idx))
+        else:
+            a_elem_offset = cutlass.Int64(self.a_tensor.stride[1]) * cutlass.Int64(token_offset)
+            a_stride_e = (self.a_tensor.stride[0], self.a_tensor.stride[1], c0)
+        a_byte_offset = (a_elem_offset * a_dtype.width) // 8
+        a_iter_u8 = cute.recast_ptr(self.a_tensor.iterator, dtype=cutlass.Uint8)
+        a_iter_e = cute.recast_ptr(a_iter_u8 + a_byte_offset, dtype=a_dtype)
+        a_tensor_e = cute.make_tensor(
+            a_iter_e,
+            cute.make_layout((a_m_dim, tokens_i, c1), stride=a_stride_e),
+        )
+        tma_atom_a, _ = cute.nvgpu.make_tiled_tma_atom_A(
+            self.a_tma_op,
+            a_tensor_e,
+            self.a_smem_layout,
+            self.mma_tiler,
+            self.tiled_mma,
+            self.cluster_layout_vmnk_shape,
+        )
+        store_tma_desc(tma_atom_a, self.get_desc_ptr("a", expert_idx))
 
-            b_dtype = self.b_tensor.element_type
-            b_n_dim = cute.size(self.b_tensor, mode=[0])
+        b_dtype = self.b_tensor.element_type
+        b_n_dim = cute.size(self.b_tensor, mode=[0])
+        if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
             b_elem_offset = cutlass.Int64(b_n_dim) * cutlass.Int64(token_offset)
-            b_byte_offset = (b_elem_offset * b_dtype.width) // 8
-            b_iter_u8 = cute.recast_ptr(self.b_tensor.iterator, dtype=cutlass.Uint8)
-            b_iter_e = cute.recast_ptr(b_iter_u8 + b_byte_offset, dtype=b_dtype)
             if cutlass.const_expr(self.b_major_mode == OperandMajorMode.K):
                 b_stride_e = (tokens_i, c1, c0)
             else:
                 b_stride_e = (c1, b_n_dim, c0)
-            b_tensor_e = cute.make_tensor(
-                b_iter_e,
-                cute.make_layout((b_n_dim, tokens_i, c1), stride=b_stride_e),
-            )
-            tma_atom_b, _ = cute.nvgpu.make_tiled_tma_atom_B(
-                self.b_tma_op,
-                b_tensor_e,
-                self.b_smem_layout,
-                self.mma_tiler,
-                self.tiled_mma,
-                self.cluster_layout_vmnk_shape,
-            )
-            store_tma_desc(tma_atom_b, self.get_desc_ptr("b", expert_idx))
+        else:
+            b_elem_offset = cutlass.Int64(self.b_tensor.stride[1]) * cutlass.Int64(token_offset)
+            b_stride_e = (self.b_tensor.stride[0], self.b_tensor.stride[1], c0)
+        b_byte_offset = (b_elem_offset * b_dtype.width) // 8
+        b_iter_u8 = cute.recast_ptr(self.b_tensor.iterator, dtype=cutlass.Uint8)
+        b_iter_e = cute.recast_ptr(b_iter_u8 + b_byte_offset, dtype=b_dtype)
+        b_tensor_e = cute.make_tensor(
+            b_iter_e,
+            cute.make_layout((b_n_dim, tokens_i, c1), stride=b_stride_e),
+        )
+        tma_atom_b, _ = cute.nvgpu.make_tiled_tma_atom_B(
+            self.b_tma_op,
+            b_tensor_e,
+            self.b_smem_layout,
+            self.mma_tiler,
+            self.tiled_mma,
+            self.cluster_layout_vmnk_shape,
+        )
+        store_tma_desc(tma_atom_b, self.get_desc_ptr("b", expert_idx))
 
         m_dim = cute.size(self.sfa_tensor, mode=[0])
         sfa_elem_offset = cutlass.Int64(m_dim) * cutlass.Int64(token_offset) // self.sf_vec_size

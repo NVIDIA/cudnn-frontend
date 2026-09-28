@@ -51,16 +51,22 @@ def _expected_split(api):
     )
 
 
-def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None, stats_log2=False):
+def _sm120_case(
+    h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None, stats_log2=False, zero_copy=False
+):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("SM120 part required")
     b, dev = 1, "cuda"
     torch.manual_seed(0)
-    q = torch.randn(b, h_q, s_q, d, device=dev, dtype=torch.float16)
-    k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
-    v = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
+
+    def operand(h, s):
+        if zero_copy:
+            return torch.randn(b, s, h, d, device=dev, dtype=torch.float16).transpose(1, 2)
+        return torch.randn(b, h, s, d, device=dev, dtype=torch.float16)
+
+    q, k, v = operand(h_q, s_q), operand(h_kv, s_kv), operand(h_kv, s_kv)
     o = torch.zeros_like(q)
     lse_storage = None
     if not with_lse:
@@ -88,6 +94,8 @@ def _sm120_case(h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, 
     split = api.split_kv
     ws_bytes = api.scratch_workspace_bytes()
     api.compile()
+    if zero_copy:
+        assert api._dense_spec is not None
     ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if (workspace and ws_bytes) else None
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=ws)
     torch.cuda.synchronize()
@@ -131,9 +139,13 @@ def test_sm120_does_not_split_a_full_part():
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
-@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
+@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "missing"])
 def test_sm120_split_with_and_without_workspace(workspace):
-    result = _sm120_case(8, 1, 128, 32768, workspace=workspace)
+    if not workspace:
+        with pytest.raises(ValueError, match="requires a .* workspace"):
+            _sm120_case(8, 1, 128, 32768, workspace=False, split_kv=2, zero_copy=True)
+        return
+    result = _sm120_case(8, 1, 128, 32768, workspace=True, split_kv=2, zero_copy=True)
     assert result.split == result.expected_split
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 

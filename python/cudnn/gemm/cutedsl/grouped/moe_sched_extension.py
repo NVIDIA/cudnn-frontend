@@ -392,13 +392,12 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
         c1 = cutlass.Int32(1)
 
         if cutlass.const_expr(tensor_name in ("a", "b")):
-            if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
-                real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], tokens_i, c1))
-                desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
-                return (real, desc)
-            real = cute.domain_offset((0, token_offset, 0), gmem_tensor_in_moe_view)
-            real = rewrite_tensor_shape(real, (shape[0], tokens_i, c1))
-            return (real, None)
+            # The descriptor owns the expert base offset and exact K bound for
+            # both TensorRagged and Tensor2D. Keep coordinates expert-local;
+            # applying domain_offset here would offset Tensor2D twice.
+            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], tokens_i, c1))
+            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
+            return (real, desc)
 
         if cutlass.const_expr(tensor_name == "c"):
             if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):

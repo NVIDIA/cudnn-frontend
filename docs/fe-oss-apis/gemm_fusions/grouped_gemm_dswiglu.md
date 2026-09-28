@@ -523,4 +523,4 @@ an automatic `jax.grad` rule. Full TE training integration is separate validatio
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_dswiglu.py` + `test/python/fe_api/grouped_gemm/test_grouped_gemm_dswiglu_utils.py`
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_dswiglu.py` + `test/python/gemm/cutedsl/test_grouped_gemm_dswiglu_utils.py`

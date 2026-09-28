@@ -50,11 +50,12 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
    ├─ family_for(graph) → resolve_heuristics(family)
    │     declares none → _unranked: accepting engines, then the backend
    │
-   └─ <family>.recommend(modes, facts, offered, backend_plans)
-      │                                    e.g. sdpa/fwd/heuristics.py
+   └─ _assemble(modes, <family>.recommend(kind, facts, offered), backend_plans)
+      │                                    e.g. sdpa/fwd/heuristics.py (propose)
       ├─ A  → per eligible cell: a measured rule (_sm120_tiles) names the config,
       │       runners-up behind it; a cell with one point per axis contributes one
-      │       entry. Placed against the backend's A block by _MEASURED_BEHIND.
+      │       entry. The backend's A block goes where the family's BACKEND marker
+      │       sits (sdpa/fwd/placement.py per shard; ours first without a marker).
       ├─ FALLBACK → the config expected to build, + the backend's FALLBACK block
       ├─ OPENSOURCE → our candidates, then the delegating entry (see below)
       └─ dedup by (engine_id, knobs), first position wins
@@ -83,10 +84,48 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
-  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
-  a python plan is compiled for the shapes the graph declared, so `execute()`
-  refuses them rather than silently running a different problem. Simple eager
-  engines implement `execute()` only.
+  handle/stream/workspace. Runtime shape/stride overrides are supported by the
+  cuDNN backend and compatible `VariantPack` plans. A legacy uid-map plan rejects
+  overrides rather than silently ignoring them. Simple eager engines implement
+  `execute()` only.
+
+#### Ordered bindings for repeated execution
+
+`graph.execute` accepts either its existing tensor mapping or a tuple/list of
+buffers paired with a `tensor_uids` tuple/list. Both forms use the selected plan,
+workspace, and handle in the same way for the cuDNN backend and Python engines,
+including FROST. There is no additional preparation call:
+
+```python
+# Q, K, V, O are graph tensors; q, k, v, out are runtime buffers.
+uids = (Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid())
+graph.execute((q, k, v, out), workspace, handle=handle, tensor_uids=uids)
+```
+
+UIDs must be distinct integers, with one UID per buffer; their order need not
+be sorted. As with mappings, buffers for unused UIDs are ignored, explicit
+bindings take precedence over graph-bound inputs, and all required operands
+must be supplied. The parameter name `tensor_dict` is retained for existing
+keyword callers; it accepts the buffer sequence when `tensor_uids` is present.
+`execute_plan_at_index` accepts the same ordered form.
+
+Existing `override_uids`, `override_shapes`, and `override_strides` arguments
+also work with ordered bindings. Supply all three together, using the graph's
+axis order and element units. Each override UID must name an operand, and
+geometry must be supported by the selected plan. This form does not extend an
+engine's supported layouts or dynamic-shape envelope.
+
+FE prepares the graph's binding layout internally and reuses the most recent
+UID/override metadata by value. Changing a list in place is observed on the
+next call. Every execution reads the current buffers and workspace and creates
+its own pointer pack; the cache retains no runtime tensors, addresses, or
+stream. Buffer descriptions, capacity, and device information remain available
+to engine validation. Bare addresses retain the existing caller-responsibility
+contract; use real buffer objects when metadata must be validated.
+
+Buffer and workspace lifetimes remain the caller's responsibility through GPU
+completion, and through all replays of a captured CUDA graph. Changing a later
+call's bindings does not update an already captured graph's addresses.
 
 #### The variant pack is normalized once
 
@@ -293,7 +332,7 @@ are close.
   optional dependency can only surface at build time — without it, a host
   lacking the `cutedsl` extra would lose graphs the backend could have served.
 - The contract is proven end to end without a GPU in
-  `test/python/test_dispatch.py`, with stand-in engines injected through the
+  `test/python/core/test_dispatch.py`, with stand-in engines injected through the
   manifest — the same path production uses. Those engines do no arithmetic:
   what dispatch is responsible for is reaching the engine and resolving the
   caller's buffers, and checking a result against `torch.matmul` would put a
@@ -517,8 +556,10 @@ without being imported. Everything else is the engine's own `check_support()`.
   class because the gate must answer without importing the engine.
 - **A family may name a `heuristics` hook** — like `analyzer`, a
   `("module", "callable")` pair kept as strings so the coarse key stays
-  import-free. It is handed the facts, the family's offered ids and the
-  backend's entries, and what it returns IS the plan list.
+  import-free. It is handed the facts and the family's offered ids and returns
+  its proposals; a `BACKEND` marker in that list says where the backend's own
+  block goes inside each mode block (ours first when absent). The SDPA-forward
+  family decides that per measured shard (`sdpa/fwd/placement.py`).
 - **A family may name a `validator` hook** — the same import-free pair,
   `validate_graph(graph) -> bool`. When the manifest offers a python engine for
   the graph, `validate()` runs it instead of the eager C++ lowering: it applies
@@ -600,18 +641,17 @@ only to decline is why `closed_under` existed.
   `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
   since pinning that high would make cudnn-frontend incompatible with anything
   holding the DSL back.
-- `test/python/test_import_boundaries.py` holds all of this, in a fresh
+- `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
 ### Ranking and the one plan list
 
-- `create_execution_plans()` gathers the inputs — the parsed facts, the family's
-  offered ids, and the backend's own `(engine_id, knobs)` recommendation from
-  `backend_plan_entries()` — and hands all of it to the graph's family in ONE
-  call (`engines/heuristics.py::rank` → the family's `recommend`). What comes
-  back IS the plan list, position for position. There is no second merge step:
-  splitting the decision is what forced the previous design to concatenate the
-  two sides and call it ranking.
+- `create_execution_plans()` gathers the parsed facts, eligible engine ids, and
+  the backend's `(engine_id, knobs)` entries. `engines/heuristics.py::rank` calls
+  the family's hook with `(kind, facts, offered)`. The hook returns its own
+  proposals plus an optional internal `cudnn.engines.heuristics.BACKEND` marker.
+  `_assemble()` expands that marker into the mode's backend block, then strips
+  mode annotations and deduplicates to form the final `graph.plans` list.
 - **The backend's entries arrive tagged with the mode that produced them.**
   `_create_backend_plans()` asks C++ one heuristic mode at a time and records
   `get_execution_plan_count()` after each, so a family can say "the backend's
@@ -642,8 +682,9 @@ only to decline is why `closed_under` existed.
   spans.** An OPENSOURCE query registers a C++ OSS candidate without adding a
   plan, so it contributes no span; judging by spans would rethrow a later
   mode's failure and discard the delegate that successful query earned.
-- The family places the backend's entries wherever it wants; nothing rewrites
-  the list it returns, so a ranked index means what the heuristics said.
+- The family positions the backend block with its marker; without a marker,
+  its proposals precede the backend. Ranked indices address the assembled list,
+  never the marker or an unexpanded family proposal.
   `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry
   `backend_plan_entries()` appends, where the backend picks among OSS
   candidates it never exposes as plans and which therefore cannot be
@@ -901,10 +942,12 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
 - FALLBACK is one config per cell today — the smallest tile the row admits, the
   config that asks least of the device. Picking the handful that between them
   cover the plane needs measurements; the TODO is in `_mode_fallback`.
-- `_MEASURED_BEHIND` is an empty set: which side leads is meant to be a
-  measurement, and an untimed cell keeps the order this dispatch has always
-  had. A cost model that can compare a python config against a cuDNN engine on
-  a common currency (predicted time) turns that set into a number.
+- `sdpa/fwd/placement.py` places the SDPA-forward family using B200 / RTX PRO
+  6000 measurements; an untimed row keeps the order this dispatch has always
+  had. Rankings are tuned and evaluated offline; unit tests check the planner's
+  marker contract independently of workload winners. A cost model
+  that can compare a python config against a cuDNN engine on a common currency
+  (predicted time) would replace the table with a number.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own

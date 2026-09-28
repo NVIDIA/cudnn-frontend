@@ -17,10 +17,11 @@ import math
 from typing import Optional
 
 import torch
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
+import cuda.bindings.driver as cuda
 
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
@@ -43,6 +44,11 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+# CUDA exposes 227 KiB (232448 bytes) as B200's maximum opt-in dynamic shared
+# memory per block.  Budgeting the nominal 228 KiB asks the driver to launch an
+# impossible 233472-byte kernel at H128/D512.
+_SM100_SMEM_BYTES = 227 * 1024
 
 
 def _normalize_dense_precision(
@@ -195,8 +201,7 @@ def _sparse_indexer_score_recompute(
         with _torch_stream_context(current_stream):
             out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     sK_per_stage = n_block_size * head_dim_padded * 2  # BF16
     sQ_size = m_block_size * head_dim_padded * 2  # BF16
@@ -206,15 +211,15 @@ def _sparse_indexer_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -417,8 +422,7 @@ def _sparse_attn_score_recompute(
         with _torch_stream_context(current_stream):
             out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     k_block_size_eff = k_block_size if k_block_size is not None else head_dim_padded
     sK_per_stage = n_block_size * k_block_size_eff * 2  # BF16
@@ -429,15 +433,15 @@ def _sparse_attn_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -651,8 +655,6 @@ def sparse_attn_score_recompute(
 # Dense backward: full KV via TMA, no topk
 # =============================================================================
 
-_SM100_SMEM_BYTES = 228 * 1024
-
 
 def _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes):
     """Auto-select k_block_size so that sQ + sK(1 stage) + overhead fits in SMEM.
@@ -774,36 +776,15 @@ def _dispatch_dense_indexer_tile_params(
     precision: str = "bf16",
     k_block_size: Optional[int] = None,
 ):
-    """Select (m_block_size, n_block_size, k_block_size) for dense indexer backward.
+    """Select (m_block_size, n_block_size, k_block_size) for indexer score recompute.
 
-    m_block_size = qhpkv * 2 (2 q_tokens per tile) when SMEM allows,
-    falling back to qhpkv when it doesn't.
-
-    Returns (m_block_size, n_block_size, k_block_size) where k_block_size=None
-    means no head_dim splitting.
-
-    Rules tuned on B200 via dense score sweeps.
+    M128 packs four query tokens for 32 heads or two for 64 heads.
     """
+    assert head_dim == 128, f"Indexer score requires head_dim=128, got {head_dim}"
     precision = precision.lower()
-    if precision == "mxfp8":
-        return 128, 128, 64 if k_block_size is None else k_block_size
-    if precision != "bf16":
+    if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
-
-    m = _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes=2)
-    n = 128
-
-    if head_dim == 128:
-        return m, n, 64 if k_block_size is None else k_block_size
-
-    # Fallback: auto-select from SMEM budget
-    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    k = _select_dense_k_block_size(head_dim_padded, m, n, per_head_elem_bytes=2)
-    if k == head_dim_padded:
-        k = None
-    if k_block_size is not None:
-        k = k_block_size
-    return m, n, k
+    return 128, 128, 64 if k_block_size is None else k_block_size
 
 
 # ---- Internal dense functions (explicit tile params) ------------------------

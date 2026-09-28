@@ -27,7 +27,7 @@ pip install -e tools/cudnn_repro
 # 1. Run a test with logging
 export CUDNN_FRONTEND_LOG_INFO=1
 export CUDNN_FRONTEND_LOG_FILE=/tmp/sdpa.log
-pytest test/python/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]
+pytest test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]
 
 # 2. Generate repro command
 cudnn-repro /tmp/sdpa.log

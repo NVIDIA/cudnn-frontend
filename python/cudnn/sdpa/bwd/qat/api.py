@@ -12,6 +12,8 @@ from typing import Iterator, Optional
 import cuda.bindings.driver as cuda
 import torch
 
+from cudnn._torch_stream import stream_context
+
 from cudnn.api_base import APIBase, TupleDict
 
 from ._workspace import nvfp4_workspace_layout
@@ -22,19 +24,8 @@ _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0), (12, 1)}
 @contextmanager
 def _stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run torch allocations and Triton launches on ``current_stream``."""
-    with torch.cuda.device(device):
-        if current_stream is None:
-            yield
-            return
-        stream_handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(device)
-        if stream_handle == torch_current.cuda_stream:
-            yield
-            return
-        torch_default = torch.cuda.default_stream(device)
-        launch_stream = torch_default if stream_handle == torch_default.cuda_stream else torch.cuda.ExternalStream(stream_handle, device=device)
-        with torch.cuda.stream(launch_stream):
-            yield
+    with torch.cuda.device(device), stream_context(current_stream, device):
+        yield
 
 
 class Nvfp4AttentionQatBackward(APIBase):

@@ -730,6 +730,14 @@ def _sg0_softmax_kv_iter(
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
+        # Pin the loads AHEAD of this iteration's `mb_s_acc_empty` arrive.  `tcgen05.ld` is asynchronous and
+        # the arrive (below) has no data dependency on the loaded registers, so without this wait ptxas is free to
+        # schedule the arrive between the two chunk loads -- and on the sm107 twin it did, once the mask code got
+        # shorter (the bit-word mask form): the parked MMA then overwrites the S parity slot under the still-pending
+        # second read, which shows as a two-launch delta on O.  The dense arm is ordered by its own wait(LOAD)
+        # right after tmem_load_tile; the d128 / d192 / d256 kernels by their P `tcgen05.st` + `wait(STORE)`
+        # data dependency.  One instruction per masked KV tile.
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
             apply_mask_chunk(
@@ -2020,7 +2028,7 @@ def _host(
     o_partial_ptr: Optional[cute.Pointer],
     block_table_ptr: Optional[cute.Pointer],
     block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[int, int],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -2150,7 +2158,7 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
             n_thd_units,  # persistent cluster count; also seeds the claim counter
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
@@ -2261,7 +2269,7 @@ def compile(  # noqa: A001
         P(cutlass.Float32) if _FP32_PARTIALS else None,
         None,
         None,
-        (0, 0),
+        (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         d_qk,
         d_v,

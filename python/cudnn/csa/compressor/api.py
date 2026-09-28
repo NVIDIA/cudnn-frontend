@@ -60,6 +60,8 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 
 import torch
+
+from cudnn._torch_stream import as_torch_stream, stream_context
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -126,10 +128,7 @@ def _resolve_stream_handle(current_stream: Optional[cuda.CUstream]) -> Optional[
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run torch work on ``current_stream`` (device-tagged) when one is given."""
-    if current_stream is None:
-        yield
-        return
-    with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream), device)):
+    with stream_context(current_stream, device):
         yield
 
 
@@ -361,7 +360,7 @@ class _CSACompressorBase(APIBase):
         """
         if current_stream is None:
             return
-        consumer = torch.cuda.get_stream_from_external(int(current_stream), device)
+        consumer = as_torch_stream(int(current_stream), device)
         for t in tensors:
             t.record_stream(consumer)
 

@@ -172,6 +172,19 @@ def decode_work_item(cfg, tile_idx, mWorkItems):
 
 
 @cute.jit
+def decode_head(cfg, head_idx):
+    """``(head_o, v_offset)`` of tile head ``head_idx``: the gate / output head and the tile's first value column.  Under
+    ``cfg.tiles_per_head`` > 1 every gate head runs as ``tiles_per_head`` tiles of ``cfg.d_v`` value columns each."""
+    if cutlass.const_expr(cfg.tiles_per_head > 1):
+        head_o = head_idx // cfg.tiles_per_head
+        v_offset = (head_idx - head_o * cfg.tiles_per_head) * cfg.d_v
+    else:
+        head_o = head_idx
+        v_offset = cutlass.Int32(0)
+    return head_o, v_offset
+
+
+@cute.jit
 def emit_item(mWorkItems, mCount, batch_idx, head_idx, write_start, write_end, compute_start, compute_end, batch_start, batch_end, batch_num_chunks):
     slot = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, mCount.iterator, cutlass.Int32(1)))
     mWorkItems[slot, 0] = batch_idx
@@ -198,9 +211,9 @@ def clamped_log2(log_gate: cutlass.Constexpr[bool], gate_val: cutlass.Float32) -
 
 
 @cute.jit
-def load_cu(expand_num: cutlass.Constexpr[int], mCuSeqlens, i):
-    """One ``cu_seqlens`` load, scaled onto GDP's ``expand_num``-expanded
-    sub-token timeline (1 folds to the plain load)."""
+def expanded_cu_seqlen(expand_num: cutlass.Constexpr[int], mCuSeqlens, i):
+    """One cumulative token boundary, ``mCuSeqlens[i]`` (``cu_seqlens`` or a ``cu_pieces`` slot boundary in the same units),
+    scaled onto GDP's ``expand_num``-expanded sub-token timeline (1 folds to the plain load)."""
     v = cutlass.Int32(mCuSeqlens[i])
     if cutlass.const_expr(expand_num > 1):
         v = v * cutlass.Int32(expand_num)
@@ -294,7 +307,7 @@ def common_span(
         min_chunks = cutlass.Int32(2147483647)
         b = cutlass.Int32(0)
         while b < batch_size:
-            nc = cute.ceil_div(load_cu(expand_num, mCuSeqlens, b + 1) - load_cu(expand_num, mCuSeqlens, b), b_t)
+            nc = cute.ceil_div(expanded_cu_seqlen(expand_num, mCuSeqlens, b + 1) - expanded_cu_seqlen(expand_num, mCuSeqlens, b), b_t)
             max_chunks = max_chunks if max_chunks > nc else nc
             min_chunks = min_chunks if min_chunks < nc else nc
             b = b + cutlass.Int32(1)
@@ -305,7 +318,7 @@ def common_span(
             blocks = cutlass.Int32(0)
             b = cutlass.Int32(0)
             while b < batch_size:
-                nc = cute.ceil_div(load_cu(expand_num, mCuSeqlens, b + 1) - load_cu(expand_num, mCuSeqlens, b), b_t)
+                nc = cute.ceil_div(expanded_cu_seqlen(expand_num, mCuSeqlens, b + 1) - expanded_cu_seqlen(expand_num, mCuSeqlens, b), b_t)
                 _, nb = piece_choice(overhead_chunks, num_sms, nc, n_tiles, ideal_chunks, cutlass.Int32(0), expand_num)
                 blocks = blocks + nb
                 b = b + cutlass.Int32(1)
@@ -321,7 +334,7 @@ def common_span(
                     ctas = cutlass.Int32(0)
                     b = cutlass.Int32(0)
                     while b < batch_size:
-                        nc = cute.ceil_div(load_cu(expand_num, mCuSeqlens, b + 1) - load_cu(expand_num, mCuSeqlens, b), b_t)
+                        nc = cute.ceil_div(expanded_cu_seqlen(expand_num, mCuSeqlens, b + 1) - expanded_cu_seqlen(expand_num, mCuSeqlens, b), b_t)
                         ctas = ctas + cute.ceil_div(nc, s)
                         b = b + cutlass.Int32(1)
                     ctas = ctas * n_heads_out
@@ -491,7 +504,7 @@ def frost_split_k_plan(
     cut = cutlass.Int32(0)
     b = tidx
     while b < batch_size:
-        nc = cute.ceil_div(load_cu(expand_num, mCuSeqlens, b + 1) - load_cu(expand_num, mCuSeqlens, b), b_t)
+        nc = cute.ceil_div(expanded_cu_seqlen(expand_num, mCuSeqlens, b + 1) - expanded_cu_seqlen(expand_num, mCuSeqlens, b), b_t)
         _, nb = piece_choice(overhead_chunks, num_sms, nc, n_tiles, ideal_chunks, cutlass.Int32(0), expand_num)
         cut = cutlass.Int32(1) if nb > cutlass.Int32(1) else cut
         b = b + cutlass.Int32(PLAN_THREADS)
@@ -554,12 +567,12 @@ def frost_split_k_scan_channel(
             hi = batch_size - cutlass.Int32(1)
             while lo < hi:
                 mid = (lo + hi + cutlass.Int32(1)) // cutlass.Int32(2)
-                take = load_cu(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row0
+                take = expanded_cu_seqlen(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row0
                 lo = mid if take else lo
                 hi = hi if take else mid - cutlass.Int32(1)
             batch_idx = lo
-            batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-            batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+            batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+            batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
             batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
             chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
             span, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
@@ -567,11 +580,11 @@ def frost_split_k_scan_channel(
             for rr in cutlass.range_constexpr(scan_rows):
                 row = row0 + cutlass.Int32(rr)
                 while (batch_idx + cutlass.Int32(1) < batch_size) and (
-                    load_cu(expand_num, mCuSeqlens, batch_idx + 1) // cutlass.Int32(b_t) + batch_idx + cutlass.Int32(1) <= row
+                    expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1) // cutlass.Int32(b_t) + batch_idx + cutlass.Int32(1) <= row
                 ):
                     batch_idx = batch_idx + cutlass.Int32(1)
-                    batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-                    batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+                    batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+                    batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
                     batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
                     chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
                     span, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
@@ -711,12 +724,12 @@ def frost_split_k_scan_scalar(
             hi = batch_size - cutlass.Int32(1)
             while lo < hi:
                 mid = (lo + hi + cutlass.Int32(1)) // cutlass.Int32(2)
-                take = load_cu(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row0
+                take = expanded_cu_seqlen(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row0
                 lo = mid if take else lo
                 hi = hi if take else mid - cutlass.Int32(1)
             batch_idx = lo
-            batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-            batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+            batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+            batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
             batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
             chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
             span, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
@@ -724,11 +737,11 @@ def frost_split_k_scan_scalar(
             for rr in cutlass.range_constexpr(scan_rows):
                 row = row0 + cutlass.Int32(rr)
                 while (batch_idx + cutlass.Int32(1) < batch_size) and (
-                    load_cu(expand_num, mCuSeqlens, batch_idx + 1) // cutlass.Int32(b_t) + batch_idx + cutlass.Int32(1) <= row
+                    expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1) // cutlass.Int32(b_t) + batch_idx + cutlass.Int32(1) <= row
                 ):
                     batch_idx = batch_idx + cutlass.Int32(1)
-                    batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-                    batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+                    batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+                    batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
                     batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
                     chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
                     span, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
@@ -804,8 +817,8 @@ def frost_split_k_walk(
     # ---- tile decode: chunk_value_base is the row base in the chunk scratch ----------
     batch_idx = tile // n_heads_out
     head_idx = tile % n_heads_out
-    batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-    batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+    batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+    batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
     batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
     chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
     span = cutlass.Int32(0)
@@ -962,8 +975,8 @@ def gen_item_bounds(b_t: cutlass.Constexpr[int], n_heads_out, mCuSeqlens, item, 
     whole-sequence item ``item``, a no-cuts table row is pure geometry."""
     batch_idx = item // n_heads_out
     head_idx = item % n_heads_out
-    batch_start = load_cu(expand_num, mCuSeqlens, batch_idx)
-    batch_end = load_cu(expand_num, mCuSeqlens, batch_idx + 1)
+    batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
+    batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
     batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
     return batch_idx, head_idx, batch_start, batch_end, batch_num_chunks
 
@@ -1003,8 +1016,8 @@ def piece_item_bounds(
         slot = item // n_heads_out
     else:
         slot = mSlotRows[batch_idx] // n_heads_out + slot_in_seq
-    row_start = load_cu(expand_num, mCuPieces, slot)
-    row_end = load_cu(expand_num, mCuPieces, slot + 1)
+    row_start = expanded_cu_seqlen(expand_num, mCuPieces, slot)
+    row_end = expanded_cu_seqlen(expand_num, mCuPieces, slot + 1)
     num_chunks = cute.ceil_div(row_end - row_start, b_t)
     final_dst = batch_idx if slot_in_seq == last else cutlass.Int32(-1)
     dstate_dst = batch_idx if slot_in_seq == cutlass.Int32(0) else cutlass.Int32(-1)

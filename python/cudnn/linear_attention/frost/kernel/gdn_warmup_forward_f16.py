@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One compiled launch for the GDN warmup and uncut forwards: the split-K table (plan, scan and walk, warmup only), the
+"""One compiled launch for the GDN warmup, uncut and dv_split forwards: the split-K table (plan, scan and walk, warmup only), the
 prefill prologue and the prefill issued from a single host, the way ``split_k.launch`` already sequences its three kernels.
 Every kernel, its host and the tensor placeholder each host was compiled with are the standalone modules' own; this host
 only sequences the launches, so the kernels' SASS is unchanged and the Python side crosses into the DSL once per call
@@ -55,6 +55,7 @@ def warmup_forward_host(
     io_dtype: cutlass.Constexpr,
     order_gen: cutlass.Constexpr[bool],
     prefill_cfg: cutlass.Constexpr,
+    tiles_per_head: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
     batch_size: cutlass.Int32,
@@ -146,6 +147,7 @@ def warmup_forward_host(
         None,
         workspace,
         stream,
+        tiles_per_head,
     )
     gdn_prefill_f16.host(
         prefill_cfg,
@@ -209,13 +211,14 @@ def build_warmup_forward(
     scale,
     device,
     stream,
+    tiles_per_head=1,
 ):
-    """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, state and checkpoint
+    """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
     of the standalone split-table and prefill builds so every kernel compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -261,6 +264,7 @@ def build_warmup_forward(
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        int(tiles_per_head),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -276,8 +280,9 @@ def build_warmup_forward(
             allow_neg_eigval=allow_neg_eigval,
             tinv_source="compute",
             d_k=DK,
-            d_v=DV,
+            d_v=DV // tiles_per_head,
             expand_num=expand_num,
+            tiles_per_head=tiles_per_head,
         )
 
         gate_table_placeholder = None
@@ -327,6 +332,7 @@ def build_warmup_forward(
             io_dtype,
             not split,
             prefill_cfg,
+            int(tiles_per_head),
             cutlass.Int32(facts.n_tiles),
             cutlass.Int32(facts.ideal_chunks),
             cutlass.Int32(facts.batch_size),

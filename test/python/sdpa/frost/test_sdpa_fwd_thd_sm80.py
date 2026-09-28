@@ -121,13 +121,17 @@ def _make_graph(
 
 
 def _plan(graph):
+    _build_plan(graph)
+    return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+
+
+def _build_plan(graph):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
     select_engine(graph, _ENGINE)
     graph.check_support()
     graph.build_plans()
-    return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
 
 
 @pytest.mark.parametrize(
@@ -264,7 +268,10 @@ def test_graph_thd_all_q_empty():
     assert vp[nodes[4]].numel() == 0
 
 
-def test_graph_thd_execute_does_not_allocate_or_sync():
+def test_graph_thd_execute_does_not_allocate_or_sync(monkeypatch):
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "_sm80_call", lambda *a, **kw: pytest.fail("THD graph reached legacy tensor launch"))
     graph, vp, nodes, _ = _make_graph((144, 96), (160, 128))
     workspace = _plan(graph)
     graph.execute(vp, workspace)
@@ -290,25 +297,38 @@ def test_graph_thd_execute_does_not_allocate_or_sync():
     torch.cuda.synchronize()
 
 
-def test_graph_thd_compile_key_ignores_packed_totals():
-    from cudnn.frost import template_loader
+def test_graph_thd_build_does_not_allocate_or_sync():
+    warm, _, _, _ = _make_graph((144, 96), (160, 128))
+    _build_plan(warm)
+    graph, vp, _, _ = _make_graph((144, 96), (160, 128))
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    prior_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _build_plan(graph)
+    finally:
+        torch.cuda.set_sync_debug_mode(prior_mode)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "THD graph build allocated device memory"
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    graph.execute(vp, workspace)
+    torch.cuda.synchronize()
 
-    def cache_totals():
-        modules = [mod for (path, params), mod in template_loader._MODULES.items() if "sm80/prefill" in str(path) and getattr(params, "thd_varlen", False)]
-        infos = [mod.compile.cache_info() for mod in modules]
-        return sum(info.misses for info in infos), sum(info.hits for info in infos)
+
+def test_graph_thd_compile_key_ignores_packed_totals():
+    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 
     first, vp1, _, _ = _make_graph((144, 96), (160, 128), stats_layout="token_major")
     first.execute(vp1, _plan(first))
     torch.cuda.synchronize()
-    misses_0, hits_0 = cache_totals()
+    before = compile_thd_host.cache_info()
     second, vp2, _, _ = _make_graph((144, 64), (160, 64), stats_layout="token_major")
     second.execute(vp2, _plan(second))
     torch.cuda.synchronize()
-    misses_1, hits_1 = cache_totals()
-    assert misses_0 > 0
-    assert misses_1 == misses_0, "a different live token total minted a new compiled SM80 artifact"
-    assert hits_1 > hits_0, "same plan-time geometry should hit the SM80 compile cache"
+    after = compile_thd_host.cache_info()
+    assert before.misses > 0
+    assert after.misses == before.misses, "a different live token total minted a new compiled SM80 artifact"
+    assert after.hits > before.hits, "same plan-time geometry should hit the SM80 compile cache"
 
 
 def test_graph_thd_rebinds_smaller_live_total_on_one_plan():

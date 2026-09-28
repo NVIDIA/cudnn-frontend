@@ -21,7 +21,7 @@ gate (beta) and the per-value write gate (w), 16 warps (512 threads); the
 derived SMEM/TMEM sizes and offsets are stamped by ``build_cfg`` in
 ``gdn2_bprop_f16.py``.
 
-Target arch: Blackwell SM100 / SM103.
+Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass

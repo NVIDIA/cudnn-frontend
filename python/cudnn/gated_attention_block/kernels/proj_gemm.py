@@ -28,7 +28,7 @@ stored ``[N, K]`` row-major (``nn.Linear``), read transposed. No repacking, at
 plan time or execute time.
 
 **When this gets FORKED — and the fork already has prior art in this repo.**
-``sdpa/bwd/kernels/bprop_matmul_sm100.py`` forked this same template to give its
+``sdpa/bwd/kernels/bprop_matmul_blackwell.py`` forked this same template to give its
 stage-3 gradient GEMMs a 2-D ``(batch, head)`` batch: it takes a **rendered
 dense-bf16 expansion** of the template and widens the TMA descriptors to 4-D
 ``[k, m, h, b]``, keeping the mainloop, the CLC scheduler, the TMEM pipeline and

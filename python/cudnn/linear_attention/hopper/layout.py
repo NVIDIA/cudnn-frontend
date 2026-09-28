@@ -118,9 +118,12 @@ def packed_addresses(names: Sequence[str], views: Iterable, engine: str, stream:
         padded.append((name, view))
 
     if padded:
-        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream))):
-            for name, view in padded:
-                packed = torch.from_dlpack(view).contiguous()
+        from cudnn.linear_attention.hopper.marshal import stream_ctx
+
+        sources = [(name, torch.from_dlpack(view)) for name, view in padded]
+        with stream_ctx(stream, sources[0][1].device):
+            for name, source in sources:
+                packed = source.contiguous()
                 keepalive.append(packed)
                 addr[name] = int(packed.data_ptr())
     return addr, keepalive

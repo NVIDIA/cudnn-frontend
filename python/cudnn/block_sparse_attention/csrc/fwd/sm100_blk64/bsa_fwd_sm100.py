@@ -10,6 +10,7 @@
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
+
 import math
 from typing import Type, Tuple, Callable, Optional
 from functools import partial
@@ -24,7 +25,6 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from cudnn.block_sparse_attention.csrc.utils import copy_utils, layout_utils
@@ -39,6 +39,7 @@ from cudnn.block_sparse_attention.csrc.fwd.sm100_blk64 import bsa_fwd_helpers
 from cudnn.block_sparse_attention.csrc.utils.named_barrier import NamedBarrierFwdSm100
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 import cutlass.pipeline as cutlass_pipeline
+from cudnn._cutlass_compat import Arch, LayoutEnum, SmemAllocator, TmemAllocator
 from cudnn.block_sparse_attention.csrc.utils.block_sparse_tile_scheduler import (
     TileSchedulerArguments,
     TileSchedulerProtocol,
@@ -504,7 +505,7 @@ class BlockSparseAttnForwardSm100Blk64:
         q_major_mode = cute.nvgpu.OperandMajorMode.K
         k_major_mode = cute.nvgpu.OperandMajorMode.K
         v_major_mode = cute.nvgpu.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -917,7 +918,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     cpasync.prefetch_descriptor(tma_atom)
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -925,7 +926,7 @@ class BlockSparseAttnForwardSm100Blk64:
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
         # Tensor memory allocator
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

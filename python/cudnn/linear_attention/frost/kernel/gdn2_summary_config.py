@@ -18,7 +18,7 @@
 """GDN-2 fused state-summary kernel config: fixed compile-time constants of the BT=16 schedule that runs the H
 recurrence (state from zero or an initial state) and the M recurrence (identity seed, zero values: the piece
 transition) in lockstep on one 16-warp CTA per (piece, head).  Derived SMEM / TMEM sizes and offsets are stamped
-by ``build_cfg`` in ``gdn2_summary_f16.py``.  Target arch: Blackwell SM100 / SM103.
+by ``build_cfg`` in ``gdn2_summary_f16.py``.  Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass

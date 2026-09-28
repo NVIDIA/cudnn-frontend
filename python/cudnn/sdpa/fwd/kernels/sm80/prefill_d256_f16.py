@@ -7,8 +7,9 @@ This file is a TEMPLATE: ``frost.template_loader.load_template`` re-executes
 it as a fresh module per ``config_sm80.TemplateParams`` (injected as the
 ``FROST_TEMPLATE_PARAMS`` module global), so the feature/config axes fold at
 trace time; the remaining SHAPE axes compile through the module's own
-``compile()`` (per-shape ``@lru_cache``; THD packed token totals are DYNAMIC
-via ``cute.sym_int`` — plan-time-only keys, Hard Rule 4).  The adapter
+``compile()`` (per-shape ``@lru_cache``) for the remaining dense tensor path.
+Packed THD uses ``prepared_host.compile_thd_host`` with runtime Int64 geometry.
+The adapter
 (``api_dsl.SdpaFwdDslSm80``) owns validation, operand binding and launch.
 
 Sibling of ``sm80/prefill_f16.py`` — same online flash-attention
@@ -152,28 +153,28 @@ def _sdpa_kernel(
     LSE: Optional[cute.Tensor],  # [B, HQ, SQ] fp32 (LSE in natural log); THD
     # packed [1, HQ, T].  None ⇒ no Stats output —
     # the whole LSE compute + store is compiled out.
-    seq_kv_lens: cute.Tensor,  # [B] int32 — per-batch KV length (padded mask)
-    seq_len_q: cute.Tensor,  # [B] int32 — per-batch effective Q length.  Consulted
+    seq_kv_lens: Optional[cute.Tensor],  # [B] int32 — per-batch KV length (padded mask)
+    seq_len_q: Optional[cute.Tensor],  # [B] int32 — per-batch effective Q length.  Consulted
     # only when has_seq_len_q (BR diagonal under padding;
     # br_base = eff_skv - eff_sq).  1-elem dummy otherwise.
-    sinks: cute.Tensor,  # [H] fp32 — per-Q-head sink logit in log2 units
+    sinks: Optional[cute.Tensor],  # [H] fp32 — per-Q-head sink logit in log2 units
     # (= sink_h * log2(e), the same log2-of-scaled-logit
     # units as row_max).  Consulted only when has_sink;
     # joins the softmax DENOMINATOR only (V_sink = 0).
     # 1-elem dummy when unused.
-    bias: cute.Tensor,  # [1, H, SQ, SKV] additive attention bias (broadcast
+    bias: Optional[cute.Tensor],  # [1, H, SQ, SKV] additive attention bias (broadcast
     # over batch).  io_dtype (fp16/bf16) OR fp32 per
     # bias_is_fp32.  Consulted only when has_bias; a
     # 1-elem dummy otherwise.  Added pre-scale into S_acc
     # as bias * inv_softmax_scale so the late
     # * softmax_scale_log2 reproduces the reference's
     # post-scale ``s += bias`` in the log2 domain.
-    cu_q: cute.Tensor,  # [B+1] int32 cumulative Q seqlens (THD/varlen).  Q/O
+    cu_q: Optional[cute.Tensor],  # [B+1] int32 cumulative Q seqlens (THD/varlen).  Q/O
     # are packed [1,T,H,D]; sequence b owns rows
     # [cu_q[b], cu_q[b+1]).  Consulted only when
     # THD_VARLEN; a 1-elem dummy otherwise.
-    cu_k: cute.Tensor,  # [B+1] int32 cumulative KV seqlens (THD/varlen).
-    rope_cs: cute.Tensor,  # [max_s, d_qk//2, 2] fp32 — host-precomputed
+    cu_k: Optional[cute.Tensor],  # [B+1] int32 cumulative KV seqlens (THD/varlen).
+    rope_cs: Optional[cute.Tensor],  # [max_s, d_qk//2, 2] fp32 — host-precomputed
     # (cos, sin) RoPE table.  Consulted only when
     # has_rope; a 1-elem dummy otherwise.  Applied as
     # the half-split rotate_half to Q AND K in SMEM
@@ -421,33 +422,27 @@ def _sdpa_kernel(
         q_seq_origin = cutlass.Int64(batch_idx) * cutlass.Int64(SQ)
         kv_seq_origin = cutlass.Int64(batch_idx) * cutlass.Int64(SKV)
 
-    # Row stride along S axis in ELEMENTS (fp16) — ``+ N`` on a Float16-
-    # typed pointer advances ``N * 2`` bytes.  Earlier byte-unit code
-    # crashed with cudaErrorIllegalAddress at SKV > 1 tile (2x overshoot).
-    # Q/K strides are derived from the RUNTIME D (= d_runtime) so the kernel
-    # supports D < compile-time d_qk without slicing the user tensor; the
-    # compile-time d_qk still governs SMEM, regs, and MMA shapes (the K-axis
-    # tile is always d_qk fp16 wide, with cols ≥ d_runtime zero-padded via
-    # cp.async predication).  V/O strides use the COMPILE-TIME d_v — the
-    # kernel does not support partial d_v, so V's last dim is always exactly
-    # d_v (matches the user tensor shape).  Q/O use H_q, K/V use H_kv (only
-    # differs for GQA/MQA).
-    Q_ROW_STRIDE_E = cutlass.Int32(H) * d_runtime
-    K_ROW_STRIDE_E = cutlass.Int32(H_kv) * d_runtime
-    V_ROW_STRIDE_E = cutlass.Int32(H_kv * d_v)
-    O_ROW_STRIDE_E = cutlass.Int32(H * d_v)
-    d_runtime64 = d_runtime.to(cutlass.Int64)
-    d_v64 = cutlass.Int64(d_v)
-
-    # Per-tile GMEM element offsets to (batch, q_row_base, head, 0).
+    # Use the declared layout in element units. Cast BEFORE every product:
+    # both a single stride and an index*stride product may exceed signed Int32.
+    # The tensor entry supplies compact layouts; the pointer host preserves
+    # B/H/S permutations and padded strides without a gather or scatter.
+    Q_ROW_STRIDE_E = cutlass.Int64(Q.stride[1])
+    K_ROW_STRIDE_E = cutlass.Int64(K.stride[1])
+    V_ROW_STRIDE_E = cutlass.Int64(V.stride[1])
+    O_ROW_STRIDE_E = cutlass.Int64(O.stride[1])
     q_row_base = q_tile_idx * tile_m
-    SKV_i64 = cutlass.Int64(SKV)
-    H_kv_i64 = cutlass.Int64(H_kv)
-    # Seq origin (in rows) absorbs both the dense batch*S term and the THD
-    # cu_*[b] packed offset — the row-stride multiply is identical either way.
-    q_seq_abs64 = q_seq_origin + cutlass.Int64(q_row_base)
-    Q_BASE = q_seq_abs64 * Q_ROW_STRIDE_E.to(cutlass.Int64) + cutlass.Int64(head_idx) * d_runtime64
-    O_BASE = q_seq_abs64 * O_ROW_STRIDE_E.to(cutlass.Int64) + cutlass.Int64(head_idx) * d_v64
+    if cutlass.const_expr(THD_VARLEN):
+        Q_BATCH_OFF = q_seq_origin * Q_ROW_STRIDE_E
+        O_BATCH_OFF = q_seq_origin * O_ROW_STRIDE_E
+        K_BATCH_OFF = kv_seq_origin * K_ROW_STRIDE_E
+        V_BATCH_OFF = kv_seq_origin * V_ROW_STRIDE_E
+    else:
+        Q_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(Q.stride[0])
+        O_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(O.stride[0])
+        K_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(K.stride[0])
+        V_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(V.stride[0])
+    Q_BASE = Q_BATCH_OFF + cutlass.Int64(q_row_base) * Q_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(Q.stride[2])
+    O_BASE = O_BATCH_OFF + cutlass.Int64(q_row_base) * O_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(O.stride[2])
     # LSE: dense [B, H_q, SQ]; THD packed [1, H_q, T]. Dense strides are
     # compile-time layout metadata; THD remains compact.
     # None-specialized: no Stats output ⇒ view/base/pointer are compiled out
@@ -465,27 +460,14 @@ def _sdpa_kernel(
             )
         lse_gmem = LSE_view.data_ptr() + LSE_BASE
 
-    # K/V offsets parameterised on kv_row_base (variable in mainloop).  Uses
-    # H_kv and kv_head_idx (Q-heads sharing a KV head land at the same K/V
-    # tile but accumulate into distinct Q rows + O rows).  K uses d_runtime
-    # (allowed to be < d_qk); V uses compile-time d_v.  ``kv_seq_origin``
-    # carries the dense batch*SKV or the THD cu_k[b] packed row offset.
-    K_BATCH_OFF = kv_seq_origin * K_ROW_STRIDE_E.to(cutlass.Int64)
-    K_HEAD_OFF = kv_head_idx.to(cutlass.Int64) * d_runtime64
-    V_BATCH_OFF = kv_seq_origin * V_ROW_STRIDE_E.to(cutlass.Int64)
-    V_HEAD_OFF = kv_head_idx.to(cutlass.Int64) * d_v64
-
+    K_HEAD_OFF = cutlass.Int64(kv_head_idx) * cutlass.Int64(K.stride[2])
+    V_HEAD_OFF = cutlass.Int64(kv_head_idx) * cutlass.Int64(V.stride[2])
     q_gmem = Q_view.data_ptr() + Q_BASE
     o_gmem = O_view.data_ptr() + O_BASE
     k_gmem_batch_head = K_view.data_ptr() + K_BATCH_OFF + K_HEAD_OFF
     v_gmem_batch_head = V_view.data_ptr() + V_BATCH_OFF + V_HEAD_OFF
-    # Per-iter element advance: ``+ TILE_N rows`` on a Float16-typed ptr.
-    # K and V have separate tile strides when d_qk != d_v (DSv3).  Stays
-    # in Int32 (max value ``128 (max kv_iter) * 64 (TILE_N) * 64 (max H) *
-    # 192 (max D) ~ 2^27``), so the mainloop only pays one Int32 mul +
-    # Int64 sign-extend per iter instead of the old full Int64 multiply.
-    K_TILE_STRIDE_E = cutlass.Int32(tile_n) * K_ROW_STRIDE_E
-    V_TILE_STRIDE_E = cutlass.Int32(tile_n) * V_ROW_STRIDE_E
+    K_TILE_STRIDE_E = cutlass.Int64(tile_n) * K_ROW_STRIDE_E
+    V_TILE_STRIDE_E = cutlass.Int64(tile_n) * V_ROW_STRIDE_E
 
     # ---- MAINLOOP BOUNDS — causal / SWA trimming -------------------------
     # Mirror ``compute_kv_loop_bounds`` from the upstream C++ prefill
@@ -849,7 +831,7 @@ def _sdpa_kernel(
     # O accumulator — m_blocks * SV_N_FRAGS * 4 fp32 per lane, m-block major.
     # mma_step indexes acc as ``acc[m_block * SV_N_FRAGS*4 + n_frag*4 + i]``.
     O_acc = cutlass.Array(cutlass.Float32, m_blocks * SV_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-    for i in cutlass.range_constexpr(m_blocks * SV_N_FRAGS * 4):
+    for i in cutlass.range(m_blocks * SV_N_FRAGS * 4, unroll_full=True):
         O_acc[i] = cutlass.Float32(0.0)
 
     # ---- Online-softmax per-lane state ------------------------------------
@@ -1359,6 +1341,8 @@ def _sdpa_kernel(
     if cutlass.const_expr(has_sink):
         _sink_ptr = cutlass.make_array_view(sinks).data_ptr()
         sink_log2_h = Pointer(_sink_ptr, dtype=cutlass.Float32)[head_idx]
+        if cutlass.const_expr(PARAMS.sink_natural):
+            sink_log2_h = sink_log2_h * cutlass.Float32(1.4426950408889634)
         for m_block in cutlass.range_constexpr(m_blocks):
             sk_o_base = m_block * SV_N_FRAGS * 4
             sk_lo = m_block * 2
@@ -1577,13 +1561,13 @@ def _sdpa_host(
     V: cute.Tensor,
     O: cute.Tensor,
     LSE: Optional[cute.Tensor],
-    seq_kv_lens: cute.Tensor,
-    seq_len_q: cute.Tensor,
-    sinks: cute.Tensor,
-    bias: cute.Tensor,
-    cu_q: cute.Tensor,
-    cu_k: cute.Tensor,
-    rope_cs: cute.Tensor,
+    seq_kv_lens: Optional[cute.Tensor],
+    seq_len_q: Optional[cute.Tensor],
+    sinks: Optional[cute.Tensor],
+    bias: Optional[cute.Tensor],
+    cu_q: Optional[cute.Tensor],
+    cu_k: Optional[cute.Tensor],
+    rope_cs: Optional[cute.Tensor],
     tile_m: cutlass.Constexpr[int],
     num_warps: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
@@ -1685,11 +1669,8 @@ def _sdpa_host(
 # ``cute.compile`` is expensive (trace + MLIR + NVVM + PTX → SASS, ~1-2 s on
 # A100).  The FEATURE / config axes are module identity — one loaded template
 # module per ``TemplateParams`` via ``frost.template_loader`` — so this cache
-# covers the remaining SHAPE axes only.  Every key component is PLAN-TIME
-# data (AGENTS.md Hard Rule 4): under ``PARAMS.thd_varlen`` the packed token
-# totals compile DYNAMIC (``cute.sym_int``) and are never part of the key —
-# callers pass ``sq = skv = 0`` there (a stray runtime total must not be
-# passed: it would only mint a redundant cache entry for the same artifact).
+# covers the remaining dense SHAPE axes only. Packed THD has a pointer-only
+# host in prepared_host.py and never builds tensor fakes here.
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001 — the template contract's entry point (matches the SM100 kernels)
     b: int,
@@ -1700,7 +1681,6 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     d: int,
     swa_window: int = 0,
     rope_max_s: int = 0,
-    n_batch_logical: int = 0,
     lse_stride: Optional[tuple[int, int, int]] = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
@@ -1714,15 +1694,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     entry point derived it: ``is_even_mn = (sq % tile_m == 0) and
     (skv % tile_n == 0)``; ``is_even_k = (d == PARAMS.d_qk)``.
 
-    THD (``PARAMS.thd_varlen``): q/k/v/o are packed ``[1, T, H, D]`` and the
-    LSE is packed ``[1, H, T]``; the token extents compile DYNAMIC — one
-    ``cute.sym_int`` symbol shared by the Q/O/LSE group and one for K/V — so
-    one artifact re-binds any packed totals (issue #604).  Pass ``b = 1``,
-    ``sq = skv = 0``; ``n_batch_logical`` (the logical sequence count) sizes
-    the ``cu_seqlens`` ABI and IS plan-time.  THD always takes the
-    predicated-store path (``is_even_mn = False``) and the over-provisioned
-    SCHED_DEFAULT grid, driven by the runtime ``thd_q_tiles``/``thd_n_batch``
-    launch arguments.
+    Packed THD uses ``prepared_host.compile_thd_host`` instead.
 
     ``PARAMS.has_lse = False`` compiles the LSE store out entirely (the LSE
     argument is None-specialized) — no buffer and no dummy at any level.
@@ -1731,56 +1703,48 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     p = PARAMS
     if p.thd_varlen and p.has_bias:
         raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
+    if p.thd_varlen:
+        raise NotImplementedError("SM80 packed THD uses prepared_host.compile_thd_host")
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
     sched_l2_bytes = p.sched_l2_mib * 1024 * 1024
     is_even_k = d == p.d_qk
-    if p.thd_varlen:
-        # One symbol per ragged group: Q/O (and the LSE's T axis) share t_q,
-        # K/V share t_kv — a new packed total re-binds the same artifact.
-        is_even_mn = False
-        t_q = cute.sym_int(divisibility=1)
-        t_kv = cute.sym_int(divisibility=1)
-        _b, _sq, _skv = 1, t_q, t_kv
-    else:
-        is_even_mn = (sq % p.tile_m == 0) and (skv % p.tile_n == 0)
-        _b, _sq, _skv = b, sq, skv
+    is_even_mn = (sq % p.tile_m == 0) and (skv % p.tile_n == 0)
 
     # Q and K share the QK head dim (= d, possibly < PARAMS.d_qk when
     # ~is_even_k); V and O follow PARAMS.d_v (DSv3: d_qk != d_v).
     fake_q = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _sq, h, d),
+        (b, sq, h, d),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _skv, h_kv, d),
+        (b, skv, h_kv, d),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _skv, h_kv, p.d_v),
+        (b, skv, h_kv, p.d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         io_dtype,
-        (_b, _sq, h, p.d_v),
+        (b, sq, h, p.d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    # LSE: dense [B, H, SQ]; THD packed [1, H, T] (shares the Q/O token
-    # symbol, which is exactly what the kernel's LSE.shape[2] read needs).
+    # Dense LSE [B, H, SQ].
     if p.has_lse:
         fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
+            cute.runtime.make_fake_tensor(cutlass.Float32, (b, h, sq), lse_stride, assumed_align=4)
             if lse_stride is not None
             else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
-                (_b, h, _sq),
+                (b, h, sq),
                 stride_order=(2, 1, 0),
                 assumed_align=16,
             )
@@ -1815,10 +1779,6 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         stride_order=((3, 2, 1, 0) if p.has_bias else (0,)),
         assumed_align=16,
     )
-    # THD cumulative seqlens [B_logical + 1] int32 (or 1-elem dummies).
-    _cu_len = (n_batch_logical + 1) if p.thd_varlen else 1
-    fake_cu_q = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
-    fake_cu_k = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
     # RoPE (cos, sin) table [max_s, d_qk//2, 2] fp32 (or a 1-elem dummy).
     fake_rope_cs = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -1849,8 +1809,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         fake_seq_len_q,
         fake_sinks,
         fake_bias,
-        fake_cu_q,
-        fake_cu_k,
+        None,
+        None,
         fake_rope_cs,
         p.tile_m,
         p.num_warps,
@@ -1868,7 +1828,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
         p.has_sink,
         p.has_bias,
         p.bias_is_fp32,
-        p.thd_varlen,
+        False,
         p.has_rope,
         p.sched_policy,
         sched_l2_bytes,

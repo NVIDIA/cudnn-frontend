@@ -18,6 +18,7 @@
 #include "cudnn_frontend_utils.h"
 #include "cudnn_frontend/backend/kernel_cache.h"
 #include "cudnn_frontend/backend/device_properties.h"
+#include "cudnn_frontend/utils/cuda_graph_retention.h"
 
 namespace cudnn_frontend {
 ///
@@ -140,7 +141,30 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     ExecutionPlan_v8 &
     operator=(ExecutionPlan_v8 const &) = default;
 
+    //! Make `graph` keep this plan's backend descriptor alive for as long as the graph, its
+    //! clones and graphExecs exist. A graph recorded from this plan keeps launching its kernels,
+    //! and cuDNN releases runtime-compiled kernel code with the plan.
+    cudaError_t
+    retain_on_cuda_graph(cudaGraph_t graph) const {
+        return cuda_graph_retention.retain_on_graph(graph, [this] { return make_graph_retention_payload(); });
+    }
+
+    //! Same as retain_on_cuda_graph() for the graph `stream` is capturing into, if any.
+    cudaError_t
+    retain_on_capturing_stream(cudaStream_t stream) const {
+        return cuda_graph_retention.retain_on_capturing_stream(stream,
+                                                               [this] { return make_graph_retention_payload(); });
+    }
+
    private:
+    // What a recorded CUDA graph has to keep alive is the plan's backend descriptor: it owns
+    // the engine and the loaded kernel code. The kernel cache the plan was built with is only
+    // consulted while the plan is finalized, so it is deliberately not retained.
+    std::shared_ptr<void>
+    make_graph_retention_payload() const {
+        return pointer;
+    }
+
     void
     fetchNotes(ManagedOpaqueDescriptor &extractedEngine) {
         auto status                               = CUDNN_STATUS_SUCCESS;
@@ -308,6 +332,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
 
     float execution_time_ms                   = 0.0f;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
+    // Lends references to `pointer` to the CUDA graphs recorded from this plan.
+    mutable detail::CudaGraphRetainedResource cuda_graph_retention;
 };
 
 ///

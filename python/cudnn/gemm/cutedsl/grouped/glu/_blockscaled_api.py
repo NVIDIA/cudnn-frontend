@@ -49,16 +49,6 @@ _GLU_CLAMP_MAX_DEFAULT = 7.0
 _GLU_CLAMP_MIN_DEFAULT = -7.0
 
 
-def _reject_unsupported_rubin_glu_tune_params(
-    is_rubin_kernel: bool,
-    geglu_alpha: float,
-    glu_clamp_max: float,
-    glu_clamp_min: float,
-) -> None:
-    if is_rubin_kernel and (geglu_alpha != _GEGGLU_ALPHA_DEFAULT or glu_clamp_max != _GLU_CLAMP_MAX_DEFAULT or glu_clamp_min != _GLU_CLAMP_MIN_DEFAULT):
-        raise NotImplementedError("Rubin grouped GEMM GLU does not support geglu_alpha, glu_clamp_max, or glu_clamp_min tuning")
-
-
 class GroupedGemmGluBlockScaledAPI(APIBase):
     """Unified API for grouped GEMM GLU forward operation on SM100+ GPUs.
 
@@ -895,8 +885,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 )
 
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
-        # linear_offset is a runtime cutlass.Float32 on both paths. geglu_alpha and the
-        # clamp limits are only supported on the SM100 kernel.
+        # Activation offset, alpha, and clamp bounds are runtime scalars on both architectures.
         compile_kwargs = dict(
             a=a_cute_fake,
             b=b_cute_fake,
@@ -922,14 +911,14 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             stream=fake_stream,
             epilogue_op=lambda x: x,
             linear_offset=cutlass.Float32(0.0),
+            geglu_alpha=cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
+            glu_clamp_max=cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
+            glu_clamp_min=cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
-                    "glu_clamp_max": cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
-                    "glu_clamp_min": cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
                     "situ_beta1": cutlass.Float32(4.0),
                     "situ_beta2": cutlass.Float32(25.0),
                 }
@@ -986,15 +975,15 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 bias_tensor,
                 stream,
                 cutlass.Float32(linear_offset),
+                cutlass.Float32(geglu_alpha),
+                cutlass.Float32(glu_clamp_max),
+                cutlass.Float32(glu_clamp_min),
             )
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
                     cutlass.Float32(situ_beta1),
                     cutlass.Float32(situ_beta2),
                 )
@@ -1098,7 +1087,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
-        # linear_offset is runtime on both paths; clamp/alpha tuning kwargs are SM100-only.
+        # Activation offset, alpha, and clamp bounds are runtime scalars on both architectures.
         self._logger.debug("Compiling discrete grouped GEMM GLU kernel")
         discrete_compile_args = (
             gemm_glu,
@@ -1126,15 +1115,15 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             fake_stream,
             lambda x: x,  # epilogue_op (Constexpr, baked in)
             cutlass.Float32(0.0),
+            cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
+            cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
+            cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
         )
         if self._is_rubin_kernel:
             _compiled_kernel = cute.compile(*discrete_compile_args, options="--enable-tvm-ffi")
         else:
             _compiled_kernel = cute.compile(
                 *discrete_compile_args,
-                cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
-                cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
-                cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
                 cutlass.Float32(4.0),
                 cutlass.Float32(25.0),
                 options="--enable-tvm-ffi",
@@ -1200,15 +1189,15 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 bias_tensor,
                 stream,
                 cutlass.Float32(linear_offset),
+                cutlass.Float32(geglu_alpha),
+                cutlass.Float32(glu_clamp_max),
+                cutlass.Float32(glu_clamp_min),
             )
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
                     cutlass.Float32(situ_beta1),
                     cutlass.Float32(situ_beta2),
                 )
@@ -1281,7 +1270,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param geglu_alpha: Pre-sigmoid scaling factor for the GeGLU activation.
             The fused activation is
             ``out = (clamp(up, glu_clamp_min, glu_clamp_max) + linear_offset)
-                    * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))``.
+                    * gate_clamped * sigmoid(geglu_alpha * gate_clamped)``,
+            where ``gate_clamped = min(gate, glu_clamp_max)``.
             Defaults to ``1.702`` (GPT-OSS / scaled-GeGLU). Ignored when
             ``act_func == "swiglu"``.
         :param glu_clamp_max: Upper clamp limit applied to both ``gate`` and
@@ -1323,12 +1313,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 float(situ_beta1) != self.situ_beta1,
                 "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
-        _reject_unsupported_rubin_glu_tune_params(
-            self._is_rubin_kernel,
-            geglu_alpha,
-            glu_clamp_max,
-            glu_clamp_min,
-        )
 
         self._logger.debug("Executing grouped GEMM GLU kernel")
         if self._has_bias:

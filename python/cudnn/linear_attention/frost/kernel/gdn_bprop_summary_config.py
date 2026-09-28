@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fixed compile-time constants of the GDN bprop state-summary kernel (SM100 / SM103); the per-compile attributes live on
+"""Fixed compile-time constants of the GDN bprop state-summary kernel (SM100 / SM103 / SM107); the per-compile attributes live on
 ``GdnBpropSummaryCfg`` in the kernel file.
 """
 

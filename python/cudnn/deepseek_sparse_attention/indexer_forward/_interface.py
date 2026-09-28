@@ -384,12 +384,14 @@ def indexer_fwd(
 
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
+    max_q_tokens_per_tile = 4 if head_dim == 128 and qhead_per_kv_head == 32 else 2
+    if precision == "bf16" and m_block_size // qhead_per_kv_head > max_q_tokens_per_tile:
         if m_block_size == 128:
             m_block_size = qhead_per_kv_head * 2
         else:
             raise ValueError(
-                "SM100 indexer_fwd supports at most 2 q tokens per tile; got " f"m_block_size={m_block_size}, qhead_per_kv_head={qhead_per_kv_head}"
+                f"SM100 indexer_fwd supports at most {max_q_tokens_per_tile} q tokens per tile; got "
+                f"m_block_size={m_block_size}, qhead_per_kv_head={qhead_per_kv_head}"
             )
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")

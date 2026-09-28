@@ -313,10 +313,10 @@ def build_warmup_backward(
     placeholders repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute and
     bprop prologues read the split table's item scratch as their ordering staging when the plan hands it to them
     (``recompute_orders`` / ``bwd_orders`` with ``split``), and generate their own order otherwise."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
-    HO = gate.shape[1]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
+    gate.shape[1]
     if not safe_gate:
         a_log = None
         dt_bias = None
