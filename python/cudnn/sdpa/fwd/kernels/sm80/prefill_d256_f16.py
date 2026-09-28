@@ -394,12 +394,16 @@ def _sdpa_kernel(
     # path keeps batch*S.  s_q_b / s_kv_b feed the per-batch eff lengths +
     # predication below.
     if cutlass.const_expr(THD_VARLEN):
-        _cuq = Pointer(cutlass.make_array_view(cu_q).data_ptr(), dtype=cutlass.Int32)
-        _cuk = Pointer(cutlass.make_array_view(cu_k).data_ptr(), dtype=cutlass.Int32)
-        cu_q_b = _cuq[batch_idx]
-        s_q_b = _cuq[batch_idx + cutlass.Int32(1)] - cu_q_b
-        cu_k_b = _cuk[batch_idx]
-        s_kv_b = _cuk[batch_idx + cutlass.Int32(1)] - cu_k_b
+        _cuq = Pointer(cutlass.make_array_view(cu_q).data_ptr(), dtype=cu_q.element_type)
+        _cuk = Pointer(cutlass.make_array_view(cu_k).data_ptr(), dtype=cu_k.element_type)
+        # Prefix storage can be strided Int32/Int64. Widen before the address
+        # product, then preserve the established Int32 sequence-value contract.
+        q_prefix_offset = cutlass.Int64(batch_idx) * cutlass.Int64(cu_q.stride[0])
+        k_prefix_offset = cutlass.Int64(batch_idx) * cutlass.Int64(cu_k.stride[0])
+        cu_q_b = cutlass.Int32(_cuq[q_prefix_offset])
+        s_q_b = cutlass.Int32(_cuq[q_prefix_offset + cutlass.Int64(cu_q.stride[0])]) - cu_q_b
+        cu_k_b = cutlass.Int32(_cuk[k_prefix_offset])
+        s_kv_b = cutlass.Int32(_cuk[k_prefix_offset + cutlass.Int64(cu_k.stride[0])]) - cu_k_b
         q_seq_origin = cutlass.Int64(cu_q_b)
         kv_seq_origin = cutlass.Int64(cu_k_b)
     else:
@@ -1326,7 +1330,7 @@ def _sdpa_kernel(
     # zeroes O and the denominator becomes exp2(0) = 1 → O = 0, lse = sink.
     if cutlass.const_expr(has_sink):
         _sink_ptr = cutlass.make_array_view(sinks).data_ptr()
-        sink_log2_h = Pointer(_sink_ptr, dtype=cutlass.Float32)[head_idx]
+        sink_log2_h = cutlass.Float32(Pointer(_sink_ptr, dtype=sinks.element_type)[cutlass.Int64(head_idx) * cutlass.Int64(sinks.stride[0])])
         if cutlass.const_expr(PARAMS.sink_natural):
             sink_log2_h = sink_log2_h * cutlass.Float32(1.4426950408889634)
         for m_block in cutlass.range_constexpr(m_blocks):
