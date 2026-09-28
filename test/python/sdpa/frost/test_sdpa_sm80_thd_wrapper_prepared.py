@@ -48,7 +48,7 @@ def test_wrapper_rebind_capture_and_capacity_tails(d, d_v, dtype, monkeypatch):
     kwargs = dict(deterministic=True, max_s_q=160, max_s_kv=128)
     first = _wrapper(cases[0], cu_q, cu_k, **kwargs)
     _check(cases[0], *(first[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
-    monkeypatch.setattr(api_dsl, "_fd_tvm", lambda *a, **kw: pytest.fail("THD wrapper reached legacy tensor plumbing"))
+    monkeypatch.setattr(api_dsl, "_fd_tvm", lambda *a, **kw: pytest.fail("THD wrapper reached legacy tensor plumbing"), raising=False)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:

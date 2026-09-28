@@ -35,7 +35,7 @@ def native_layouts(api):
     return True
 
 
-def build_spec(api, d64_module):
+def build_spec(api, d64_module, *, staged=False):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
     from .kernels.sm80.prepared_host import compile_host, launch_bounds
 
@@ -94,6 +94,15 @@ def build_spec(api, d64_module):
             geometry.append((op.shape[:3], op.strides[:3]))
         else:
             geometry.append(((math.prod(op.shape),), (1,)))
+    roles = ROLES
+    if staged:
+        # The existing native entry retains its fifteen-operand ABI. Only the
+        # staged wrapper supplies a precomputed RoPE table.
+        roles += ("rope",)
+        shape = (api._rope_max_s, api.flavor_d_qk // 2, 2)
+        strides = (api.flavor_d_qk, 2, 1)
+        operands.append(Operand("float32", shape, strides, math.prod(shape), 4, 4) if api._has_rope else None)
+        geometry.append((shape, strides) if api._has_rope else None)
     geometry = tuple(geometry)
     compile_geometry = geometry
     if api.thd:
@@ -129,7 +138,7 @@ def build_spec(api, d64_module):
         raise NotImplementedError("SM80 backward requires a positional tvm-ffi entry")
     fn = partial(fn, api._t_q_cap if api.thd else 0, api._t_kv_cap if api.thd else 0, *launch_bounds(api))
     return BwdLaunchSpec(
-        artifact, fn, tuple(operands), workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm80", length_form=True
+        artifact, fn, tuple(operands), workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm80", length_form=True, roles=roles
     )
 
 

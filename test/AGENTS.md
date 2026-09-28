@@ -168,12 +168,19 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+Optional gradients copied from accumulators after a prepared launch still need
+presence, dtype and extent checks before any staging write. They can be absent
+from the pointer ABI, so the common binder cannot validate them. The detector
+is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
+
 Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.
 `test_fp8_paged_prepared_table_stride_admission` checks both decisions for distinct
-K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
-checks the retained tensor path numerically and under CUDA Graph replay.
+K/V page-table strides; `test_fp8_paged_distinct_table_strides_prepared`
+checks both routes numerically with the tensor compiler forbidden, changed
+allocations and CUDA Graph replay.
 
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
@@ -294,6 +301,15 @@ SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
 
+A `None` compile sample may still occupy a positional TVM-FFI argument slot.
+When extending a prepared host with a staged-only operand, retain the native
+entry signature and delegate internally; do not assume the absent operand is
+removed from the exported call ABI. Exercise both native and staged routes,
+including a fresh-process artifact reload. For staged THD output padding,
+test the bounded cast/fold with physical wide output strides as well as the
+input staging; `test_staged_packed_physical_stride` covers both stride and
+index-product overflow with allocated guard storage.
+
 Prepared host migrations must preserve persistent compiled artifacts as well as
 warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
 artifact export even though its runtime slots disappear. Carry only the immutable
@@ -331,3 +347,20 @@ compiler previously checked some of these at dispatch; raw addresses cannot.
 The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
 replaces the workspace carver with a tripwire so an invalid short buffer fails
 safely before it can reach a GPU launch.
+
+For a GEMM+GLU failure, compare the final output with both the stored GEMM
+intermediate and an independent dot product before attributing it to GEMM.
+SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
+halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
+bounded failure output, and preservation of the original assertion.
+
+Independent page tables need independent observed-span checks and Int64 stride
+slots in the prepared host. Test distinct K/V page values and layouts, then
+rebind allocations and mutate table values under capture replay. Preserve the
+shared-stride constraint for a host whose ABI still has only one stride pair.
+
+A shared kernel imported as an ordinary module has no template-loader digest.
+Calling `template_key` there otherwise returns `None` and silently bypasses
+persistent caching. Give the module a source identity and require fresh-process
+reload of the whole chain, including split combine and both pointer/tensor
+calling conventions; forbidding JIT only around the attention kernel misses it.
