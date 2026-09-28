@@ -310,10 +310,11 @@ _logger = logging.getLogger(__name__)
 # strided views -- is REJECTED, and the reason is specific rather than
 # aesthetic. Such a view has a padded token stride (N, not H*D). The SDPA's
 # dense path accepts that layout (``sdpa/graph_analyzer.dense_layout_ok``
-# explicitly allows padded strides) and then NORMALIZES it: ``_to_bshd`` is
-# ``transpose(1, 2)`` followed by ``.contiguous()`` if the view is neither already
-# contiguous nor at the strides the artifact was compiled for
-# (``SdpaFwdDsl._to_bshd`` in ``sdpa/fwd/api_dsl.py``). That is a **gather copy of Q**, which
+# explicitly allows padded strides). The historical tensor adapter normalized
+# layouts outside its direct-binding domain with an implicit gather. Current
+# plans bind TMA-compatible strides directly and prepare any required copies
+# with explicit scratch; the block still chooses a layout requiring no copies.
+# A **gather copy of Q**,
 # at 1M tokens is 16 GiB moved twice, silently, inside a block whose whole
 # premise is that it does not do that (AGENTS.md Rule 2).
 #
@@ -2442,10 +2443,9 @@ def _bhsd_desc(b: int, h: int, s: int, d: int, dtype: torch.dtype, device, name:
     The SDPA's operand contract is rank-4 ``(B, H, S, D)``; the block's buffers
     are ``[B, S, H, D]`` compact, so what it hands over is ``.transpose(1, 2)``
     — strides ``(S*H*D, D, H*D, 1)``. That is exactly the layout the SDPA's own
-    normalization recognises as already-canonical: ``_to_bshd`` transposes back
-    and finds it contiguous, so it returns the view unchanged and **no copy
-    happens** (``SdpaFwdDsl._to_bshd`` in ``sdpa/fwd/api_dsl.py``). This is the whole reason stage (1)
-    writes four compact buffers instead of one fused slab — see § 1.
+    prepared binder accepts directly: the pointer stays unchanged and the
+    BSHD strides go to the kernel without a copy. Stage (1) writes compact
+    buffers to keep that zero-copy handover explicit — see § 1.
 
     Built as a descriptor rather than from a sample tensor so declaring the
     block costs no device allocation.
@@ -2453,7 +2453,7 @@ def _bhsd_desc(b: int, h: int, s: int, d: int, dtype: torch.dtype, device, name:
     # token_stride = 0 means COMPACT (h*d). A larger value declares a column
     # slice of a wider row -- Q/K/V inside the fused projection, token stride
     # n_qkvg. The SDPA compiles its descriptors at whatever this declares and
-    # binds the view directly (api_dsl._bshd_zero_copy_stride), so a padded
+    # binds the view directly (config_sm100.dense_bind_strides), so a padded
     # stride costs no copy; what it must not do is OVERLAP, hence the >= check.
     ts = int(token_stride) if token_stride else h * d
     if ts < h * d:
@@ -2952,9 +2952,9 @@ class _VCompaction(_ElementwiseStage):
     **This stage exists only because stage (1) is the UNFORKED FROST GEMM.** Q
     and K are de-interleaved for free by (2)+(3), which already read and write
     them; V is untouched between the projection and the SDPA, so without this it
-    would reach the SDPA as a padded-stride view that ``_to_bshd`` silently
-    ``.contiguous()``-copies — a hidden kernel inside the adapter (Rule 2).
-    Doing it here makes the cost NAMED and MEASURED instead.
+    would reach the SDPA as a padded-stride view. The historical adapter copied
+    such layouts implicitly; this block keeps its explicit compaction stage
+    and hands compact storage to the prepared SDPA plan (Rule 2).
 
     Forking stage (1) to write four compact buffers (§ 1) deletes this outright.
     Until then it is 1/16 of Q's traffic, which is why it is an acceptable v1.
@@ -3034,9 +3034,9 @@ class GatedAttentionBlockFwd(APIBase):
     Stage (3b) exists only because stage (1) is the UNFORKED FROST GEMM, which
     writes one fused ``[T, N]``. Q and K are de-interleaved for FREE by (2+3),
     which already reads and writes them; V is untouched between the projection
-    and the SDPA, so without (3b) it would reach the SDPA as a padded-stride view
-    that ``_to_bshd`` silently ``.contiguous()``-copies — a hidden kernel inside
-    the adapter, which Rule 2 bans. **Forking stage (1) to write four compact
+    and the SDPA. Stage (3b) makes V compaction explicit and hands compact
+    storage to the prepared SDPA plan (Rule 2).
+    **Forking stage (1) to write four compact
     buffers (§ 1) deletes (3b) outright**; until then it is the measurable price
     of not having forked, and V is 1/16 of Q so the price is small.
 

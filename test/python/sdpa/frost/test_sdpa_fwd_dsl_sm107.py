@@ -454,47 +454,32 @@ def test_sm107_fp8_pack_gqa_is_d128_only():
     assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
 
-# The sm107 kernels that still raise at `compile()` on a DENSE strided Stats layout (`lse_stride` given, no padded
-# rows): the guard reads "strided Stats not ported (contiguous [B, H, S] only)".  The fp8 row's d128 / d192x128
-# kernels ported it (Rubin run 2026-09-23: test_fp8_strided_stats + test_fp8_strided_stats_other_flavors[d192_d128_*]
-# PASS on cc 10.7); the fp8 d256 / d512 kernels and every MXFP8 kernel did not.
-_SM107_STRIDED_STATS_NOT_PORTED = {
-    "fp8": {(256, 256), (512, 512)},
-    "mxfp8": {(128, 128), (192, 128), (256, 256), (512, 512)},
-}
+@pytest.mark.parametrize("family", ["fp8", "mxfp8"])
+def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeypatch):
+    """Invert the previous D256/D512 gap detector; runtime Stats strides are
+    accepted by each prepared entry, with native numerics in the FP8 suite."""
+    from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
 
-
-def test_sm107_fp8_strided_stats_is_not_ported_beyond_d192():
-    """A Capabilities GAP, pinned so it is visible: the sm107 per-tensor FP8 row declares Stats on all four flavors and
-    `engines.mismatch` admits any dense-compatible Stats layout (`ga.dense_layout_ok`, no per-flavor field), but the
-    d256 and d512 sm107 fp8 kernels raise `NotImplementedError("strided Stats not ported ...")` from `compile()` on a
-    strided dense layout -- so on cc 10.7 the pinned engine dies at build_plans on `test_fp8_d256_strided_stats`
-    (measured 2026-09-23; that test carries `_skip_strided_stats_d256_on_rubin` with this reason).  The raise is at
-    the top of `compile()`, before any JIT work, so this is host-only.  The d128 / d192x128 kernels take the layout.
-    Follow-up (not this PR): port strided Stats to the d256 / d512 fp8 kernels (the d256 f16 sibling's `lse_strides`
-    is the model) OR declare the layout per flavor on the row; then INVERT the raise assertion for that shape and
-    drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
-    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    host_module = _fp8_host if family == "fp8" else _mxfp8_host
+    load_kw = _DTYPE_FAMILIES[1 if family == "fp8" else 2][1]
+    caps = _caps("sdpa_fwd_prefill_sm107_" + family)
     assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert not any(f.startswith("stats_layout") or f.startswith("strided_stats") for f in caps.__dataclass_fields__), "a per-flavor field exists now: use it"
-    fp8_kw = dict(_DTYPE_FAMILIES[1][1])
+    captured = []
+    sentinel = object()
+
+    def compile_host(*args, **kwargs):
+        captured.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(host_module, "compile_host", compile_host)
     for flavor in _FLAVORS:
-        mod = _load(flavor, rubin=True, **fp8_kw)
-        d_qk, d_v = flavor
-        sq = 128
-        strided = (sq * 4 * 2, sq * 2, 2)  # any declared (B, H, S) stride: the guard fires on `is not None`
+        mod = _load(flavor, rubin=True, **load_kw)
+        assert not hasattr(mod, "compile"), "quantized attention must use the pointer compiler"
         with open(mod.__file__, encoding="utf-8") as fh:
-            has_guard = "strided Stats not ported" in _code_lines(fh.read())
-        if flavor in _SM107_STRIDED_STATS_NOT_PORTED["fp8"]:
-            assert has_guard, f"{mod.__name__}: the guard is gone -- strided Stats ported?  Invert this arm and drop the marker."
-            with pytest.raises(NotImplementedError, match="strided Stats not ported"):
-                mod.compile(b=2, qh=4, kh=2, sq=sq, skv=128, d_qk=d_qk, d_v=d_v, has_lse=True, lse_stride=strided)
-        else:
-            assert not has_guard, f"{mod.__name__}: a strided-Stats guard appeared on a flavor that had ported it"
-    for flavor in _FLAVORS:
-        mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[2][1])
-        with open(mod.__file__, encoding="utf-8") as fh:
-            assert ("strided Stats not ported" in _code_lines(fh.read())) == (flavor in _SM107_STRIDED_STATS_NOT_PORTED["mxfp8"]), mod.__name__
+            assert "strided Stats not ported" not in _code_lines(fh.read())
+        # Bypass the memoized result so the real entry forwards its metadata.
+        assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
+    assert len(captured) == len(_FLAVORS)
 
 
 def test_sm107_rows_carry_the_padded_stats_trim():
@@ -1682,10 +1667,9 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     """The f16 kernel is an explicit pointer/int host: the gate is a MODULE specialization
     (TemplateParams.epilogue_gate -> CFG.EPILOGUE_GATE), its slot (``gate_ptr`` + runtime
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
-    The quantized kernels keep the tensor entry, where signatures evolve append-only
-    (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
-    ``gate_tensor`` immediately after ``stream``; prepared flags may follow.  A ``gate_stride`` handed to an UNGATED tensor-entry
-    module is a ValueError, not a silently ignored kwarg."""
+    Both quantized families use prepared pointer hosts with runtime gate strides.
+    Their internal tensor host signatures remain append-only: ``gate_tensor``
+    immediately follows ``stream``; prepared flags may follow."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
@@ -1696,17 +1680,19 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     assert "gate_ptr" in f16_host and "gate_strides" in f16_host, list(f16_host)[-6:]
     assert list(f16_host)[-1] == "stream"
 
-    fp8_c = list(inspect.signature(fp8.compile).parameters)
-    mx_c = list(inspect.signature(mxfp8.compile).parameters)
-    assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
-    assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
-    for params in (fp8_c, mx_c):
-        assert params.index("lse_stride") < params.index("gate_stride")
-        assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
+    fp8_c = inspect.signature(fp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & fp8_c.keys()
+    assert fp8_c["has_amax"].default is True
+    fp8_host = inspect.signature(fp8._host_prepared).parameters
+    assert {"gate_ptr", "gate_strides"} <= fp8_host.keys()
+    assert list(fp8_host)[-1] == "stream"
+    mx_c = inspect.signature(mxfp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & mx_c.keys()
+    assert mx_c["has_amax"].default is True
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    assert {"gate_ptr", "gate_strides"} <= inspect.signature(_mxfp8_host.host).parameters.keys()
     for mod in (fp8, mxfp8):
-        sig = inspect.signature(mod.compile).parameters
-        assert sig["gate_stride"].default is None
-        assert sig["has_amax"].default is True
         host = list(inspect.signature(mod._host).parameters)
         stream_slot = host.index("stream")
         assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
@@ -1722,11 +1708,6 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
     assert off.CFG.EPILOGUE_GATE == 0 and "gate_ptr" in inspect.signature(off._host).parameters
-    # Ungated quantized modules refuse a gate stride before any trace.
-    for kw in _QUANT_LOAD_KWS:
-        off = _load(_D256, rubin=True, **kw)
-        with pytest.raises(ValueError, match="epilogue_gate"):
-            off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
 
 
 def test_sm107_gate_seams_are_named_once():
@@ -1735,6 +1716,7 @@ def test_sm107_gate_seams_are_named_once():
     pipeline order with one grep and a dropped / duplicated seam is visible.
     And none of the fork's module knobs survived the port (contract rule 5)."""
     import re
+    from pathlib import Path
 
     for mod in _all_gate_kernel_modules():
         with open(mod.__file__, encoding="utf-8") as fh:
@@ -1747,6 +1729,11 @@ def test_sm107_gate_seams_are_named_once():
         for knob in _RETIRED_GATE_KNOBS:
             assert not re.search(rf"^{knob}\b\s*[:=]", code, re.M), f"{mod.__name__}: fork-era module knob {knob} survived"
             assert not re.search(rf"\b{knob}\b", code), f"{mod.__name__}: fork-era knob {knob} is still referenced"
+        if not hasattr(mod, "compile"):
+            from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
+
+            host_module = _mxfp8_host if "mxfp8" in mod.__file__ else _fp8_host
+            code = Path(host_module.__file__).read_text()
         assert 'options="--enable-tvm-ffi"' in code, f"{mod.__name__}: compile options must stay the production ones"
 
 
@@ -1831,7 +1818,9 @@ def test_gate_check_support_declines_typed(monkeypatch):
         api = _gate_api(dtype=dt)
         assert api.check_support()
         assert api.gate_desc is not None and api.gate_desc.dtype == dt
-        assert api._gate_declared is None, "a compact G declares no stride"
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        assert dense_bind_strides(tuple(api.gate_desc.shape), tuple(api.gate_desc.stride), dt.itemsize) is not None
         assert api.template_params().epilogue_gate is True
     assert _gate_api(with_gate=False).template_params().epilogue_gate is False
     assert _gate_api(fp8=True).check_support(), "bf16 G on the per-tensor FP8 path"
@@ -2109,7 +2098,19 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
     dt = torch.bfloat16
     q, k, v, gate = _gate_problem(b, h, h, s, d, dt)
     api_c, out_c, lse_c = _run_gated(q, k, v, gate, causal=True)
-    assert api_c._gate_declared is None
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+
+    def check_binding(api, values, output, stats, expected):
+        spec = api._dense_spec
+        facts = {name: facts_of_tensor(t) for name, t in zip(("q", "k", "v", "gate", "o", "lse"), (*values, output, stats))}
+        stream = torch.cuda.current_stream().cuda_stream
+        frame = bind_dense(spec, facts, driver.CUstream(stream), stream)
+        for role, strides in expected.items():
+            assert frame[spec.index[role + "_ptr"]] == facts[role].ptr
+            assert frame[spec.index[role + "_strides"]] == strides
+
+    check_binding(api_c, (q, k, v, gate), out_c, lse_c, {"gate": (s * h * d, h * d, d)})
 
     n = 4 * h * d  # a [B, S, N] slab: q | k | v | gate column blocks
     slab = torch.zeros(b, s, n, device="cuda", dtype=dt)
@@ -2120,13 +2121,11 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
 
     # G strided alone.
     api_g, out_g, lse_g = _run_gated(q, k, v, sliced[3], causal=True)
-    assert api_g._gate_declared == (s * n, n, d, 1), api_g._gate_declared
-    assert api_g._bshd_zero_copy_stride(api_g.gate_desc, 2) == (s * n, n, d, 1)
+    check_binding(api_g, (q, k, v, sliced[3]), out_g, lse_g, {"gate": (s * n, n, d)})
     assert torch.equal(out_g, out_c) and torch.equal(lse_g, lse_c), "a strided G must read bitwise as the compact one"
     # Everything strided (the block's layout).
     api_s, out_s, lse_s = _run_gated(*sliced, causal=True)
-    assert api_s._gate_declared == (s * n, n, d, 1)
-    assert all(st == (s * n, n, d, 1) for st in api_s._bshd_declared[:3]), api_s._bshd_declared
+    check_binding(api_s, sliced, out_s, lse_s, dict.fromkeys(("q", "k", "v", "gate"), (s * n, n, d)))
     assert torch.equal(out_s, out_c) and torch.equal(lse_s, lse_c), "strided Q/K/V/G must read bitwise as compact"
 
 
@@ -2526,76 +2525,10 @@ def test_sm107_mxfp8_gate_matches_the_dequant_oracle(in_key, out_key, causal, s)
     torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
 
 
-def test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel(tmp_path):
-    """The one-time "gate-off == develop" proof for the MXFP8 body: the working-tree
-    kernel loaded with epilogue_gate=False and has_amax=True must be BITWISE the
-    kernel ``origin/develop`` ships (O, LSE and Amax_O) on the same block-scaled
-    problem.  The shipped file is extracted with ``git show`` and run through
-    the SAME adapter marshalling (its ``_k_mod`` / ``_compiled_kernel`` swapped in),
-    so the comparison is kernel-vs-kernel, not harness-vs-harness.  Live only
-    while develop is PRE-gate: once develop carries ``gate_stride`` the test
-    skips (the proof is recorded in the tracker), and an unreachable ref skips."""
-    import inspect
-    import pathlib
-    import subprocess
-
-    import torch
-
-    import cudnn
-    from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    _rubin_only()
-    root = pathlib.Path(cudnn.__file__).resolve().parents[2]
-    rel = "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_mxfp8.py"
-    try:
-        src = subprocess.run(["git", "-C", str(root), "show", f"origin/develop:{rel}"], check=True, capture_output=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # no checkout / no such ref here
-        pytest.skip(f"origin/develop:{rel} is not reachable from {root}: {exc}")
-    shipped_file = tmp_path / "shipped_prefill_d256_mxfp8.py"
-    shipped_file.write_bytes(src)
-
-    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
-    ops, _, gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
-    q8, k8, v8, sfq, sfk, sfv = ops
-    amax_p = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_p, out_p, lse_p = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=False, amax=amax_p)
-    params = api_p.template_params()
-    assert params.epilogue_gate is False
-    assert getattr(api_p, "_amax_folded_out", None) is False
-
-    shipped = load_template(str(shipped_file), params, tag="shipped_sm107_mxfp8_d256")
-    if "gate_stride" in inspect.signature(shipped.compile).parameters:
-        # Post-merge: develop itself carries the gate, so there is no PRE-gate
-        # reference left to compare against.  A SKIP, not a failure -- a test
-        # must not depend on its own branch not having landed (it would turn the
-        # Rubin nightly red on the first run after the merge).  The one-time
-        # proof is on record: SUPPORT_MATRIX_TRACKER.md footnote viii, 2026-09-15
-        # (O / LSE / Amax_O bitwise vs develop `18091c19` at B=2 H=8 H_kv=2
-        # S=1000 causal, e4m3 in, bf16 O, has_amax=True).
-        pytest.skip("origin/develop already carries the epilogue gate; the one-time gate-off == shipped proof was recorded 2026-09-15 (tracker footnote viii)")
-    assert shipped.DESC_VERSION == api_p._k_mod.DESC_VERSION == 0
-    api_s = SdpaFwdDslSm100(
-        q8, k8, v8, out_p, lse_p, is_causal=True, scale_softmax=d**-0.5, pertensor_fp8=False, dtype_o=torch.bfloat16, sched_policy=SCHED_NATURAL
-    )
-    assert api_s.check_support() and api_s.template_params() == params
-    # Swap the SHIPPED module in under the same adapter (compile() would load the working-tree file).
-    api_s._k_mod = shipped
-    api_s._kernel_accepts = None
-    api_s._compiled_kernel = shipped.compile(b=b, qh=h, kh=h_kv, sq=s, skv=s, d_qk=d, d_v=d, has_lse=True)
-    api_s._combine_kernel = None
-    api_s._amax_folded_out = False
-    out_s = torch.empty_like(out_p)
-    _mx_sentinel_fill(out_s)
-    lse_s = torch.full_like(lse_p, float("nan"))
-    amax_s = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_s.execute(q8, k8, v8, out_s, lse_tensor=lse_s, sf_q=sfq, sf_k=sfk, sf_v=sfv, amax_o=amax_s)
-    torch.cuda.synchronize()
-    assert _mx_sentinel_survivors(out_s) == 0
-    assert torch.equal(out_s.view(torch.uint8), out_p.view(torch.uint8)), "gate-off production O must be BITWISE the shipped kernel's"
-    assert torch.equal(lse_s, lse_p), "gate-off production LSE must be BITWISE the shipped kernel's"
-    assert torch.equal(amax_s, amax_p) and amax_p.item() > 0.0, "gate-off production Amax_O must be BITWISE the shipped kernel's"
+# The one-time MXFP8 gate-off comparison against the pre-gate tensor entry
+# is recorded in SUPPORT_MATRIX_TRACKER.md footnote viii (2026-09-15).
+# That entry is retired; the live gate-off/gate-on and Amax checks below use
+# the supported prepared path and remain the ongoing regressions.
 
 
 def test_sm107_mxfp8_gate_lse_is_bitwise_independent_of_the_gate():
@@ -2734,7 +2667,7 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
     # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
-    mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
+    mod.compile_prepared(d_qk=d, d_v=d, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2904,8 +2837,9 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
     mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
-    kw = {k: v for k, v in kw.items() if k in inspect.signature(mod.compile).parameters}
-    mod.compile(**kw)
+    entry = mod.compile_prepared
+    kw = {k: v for k, v in kw.items() if k in inspect.signature(entry).parameters}
+    entry(**kw)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2967,3 +2901,20 @@ def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spi
     for name, want in (("SYNCS_PHASECHK", n_syncs), ("USYNCS_PHASECHK", n_usyncs), ("NANOSLEEP", n_sleep)):
         slack = _WAIT_FORM_SLACK[name]
         assert abs(stats[name] - want) <= slack, f"{name} = {stats[name]}, pinned {want} +- {slack} for SPIN_RING_WAITS={spin}"
+
+
+# The CI arch targets select this module explicitly; imported tests need L0.
+import test_sdpa_staged_forward_half as _staged_half_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestStagedHalf:
+    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
+    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
+    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
+    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)

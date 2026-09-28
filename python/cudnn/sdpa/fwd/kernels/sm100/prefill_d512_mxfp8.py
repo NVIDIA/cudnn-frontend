@@ -10,7 +10,7 @@ and 512-column TMEM limits and outperforms the validated two-CTA M128 design.
 
 from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
@@ -140,7 +140,7 @@ SF_TMEM_COLS_P = SF_NUM_BLOCKS_P * SF_NUM_BLOCKS_K_BMM2 * SF_REGISTERS_PER_BLOCK
 SF_TMEM_COLS_V = SF_NUM_BLOCKS_V * SF_NUM_BLOCKS_K_BMM2 * SF_REGISTERS_PER_BLOCK
 SF_SMEM_SIZE_P = _round_up(CFG.TILE_M, 128) * CFG.TILE_N // BLOCK_SCALE_BLOCK_SIZE
 SF_SMEM_SIZE_V_SLICE = _round_up(CFG.TILE_O, 128) * CFG.TILE_N // BLOCK_SCALE_BLOCK_SIZE
-# Public input-tile size consumed by api_dsl._reshape_sf().
+# Public input-tile size consumed by the prepared scale-factor binder.
 SF_SMEM_SIZE_V = _round_up(FULL_DV, 128) * CFG.TILE_N // BLOCK_SCALE_BLOCK_SIZE
 SF_CONST_VALUE = 0x7F
 
@@ -3846,137 +3846,6 @@ def _host(
         )
 
 
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    has_lse: bool = True,
-    lse_head_major: bool = False,
-    lse_head_stride: int = 0,
-    lse_padded_rows: int = 0,
-    lse_padded_order: tuple = (3, 2, 1, 0),
-    dynamic_bhk: bool = False,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-    k_stride: Optional[tuple] = None,
-    v_stride: Optional[tuple] = None,
-    block_table_stride: Optional[tuple[int, int]] = None,
-    block_table_v_stride: Optional[tuple[int, int]] = None,
-) -> Callable:
-    "Legacy dense tensor entry for layouts and fused outputs outside the prepared contract. THD uses compile_prepared."
-
-    if CFG.THD_VARLEN or dynamic_bhk:
-        raise NotImplementedError("THD MXFP8 uses compile_prepared and pointer bindings")
-
-    _cache_key = _template_key(globals(), locals(), "compile")
-
-    _b0, _qh0, _kh0 = (b, qh, kh)
-
-    if SPLIT_KV > 1 and (not has_lse):
-        raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-
-    if lse_stride is not None and SPLIT_KV > 1:
-        raise ValueError("split_kv partial LSE is compact; lse_stride describes only the final combine output")
-
-    fake_batch = b
-
-    q_sf_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
-
-    kv_sf_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
-
-    def _fake(dtype, shape):
-        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=16)
-
-    fake_q = _fake(STORAGE_DTYPE, (fake_batch, sq, qh, CFG.TILE_K))
-    fake_o = _fake(OUT_STORAGE_DTYPE, (fake_batch * SPLIT_KV, sq, qh, FULL_DV))
-
-    fake_sf_q = _fake(cutlass.Int8, (fake_batch, qh, q_sf_tiles, SF_SMEM_SIZE_Q))
-    if PAGED_KV:
-        if k_stride is None or v_stride is None:
-            raise ValueError("PAGED_KV: k_stride / v_stride (the pools' strides in [num_pages, page_size, H_kv, D] order) are required")
-        n_pages = cute.sym_int(divisibility=1)
-        _max_pages = cute.sym_int(divisibility=1)
-        fake_k = cute.runtime.make_fake_tensor(STORAGE_DTYPE, (n_pages, PAGE_SIZE, kh, CFG.TILE_K), tuple(k_stride), assumed_align=16)
-        fake_v = cute.runtime.make_fake_tensor(STORAGE_DTYPE, (n_pages, PAGE_SIZE, kh, FULL_DV), tuple(v_stride), assumed_align=16)
-        fake_sf_k = _fake(cutlass.Int8, (n_pages, kh, TILES_PER_PAGE, SF_SMEM_SIZE_K))
-        fake_sf_v = _fake(cutlass.Int8, (n_pages, kh, TILES_PER_PAGE, SF_SMEM_SIZE_V))
-
-        def _fake_table(stride):
-            if stride is None:
-                return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b, _max_pages), stride_order=(1, 0), assumed_align=4)
-            return cute.runtime.make_fake_tensor(cutlass.Int32, (b, _max_pages), tuple(stride), assumed_align=4)
-
-        fake_block_table = _fake_table(block_table_stride)
-        fake_block_table_v = _fake_table(block_table_v_stride)
-    else:
-        fake_k = _fake(STORAGE_DTYPE, (fake_batch, skv, kh, CFG.TILE_K))
-        fake_v = _fake(STORAGE_DTYPE, (fake_batch, skv, kh, FULL_DV))
-        fake_sf_k = _fake(cutlass.Int8, (fake_batch, kh, kv_sf_tiles, SF_SMEM_SIZE_K))
-        fake_sf_v = _fake(cutlass.Int8, (fake_batch, kh, kv_sf_tiles, SF_SMEM_SIZE_V))
-        fake_block_table = fake_block_table_v = None
-    if lse_padded_rows:
-        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
-
-    if not has_lse:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
-        fake_lse = None
-    else:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are unsupported for dense MXFP8")
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, sq), lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else _fake(cutlass.Float32, (b * SPLIT_KV, qh, sq))
-        )
-
-    fake_sinks = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (qh,), stride_order=(0,), assumed_align=16)
-
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
-
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
-
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (1,), stride_order=(0,), assumed_align=16)
-
-    fake_seq_q_lens = cutlass.Int64(0)
-
-    fake_thd_q_lens = None
-
-    fake_thd_kv_lens = None
-
-    fake_thd_lens_form = None
-
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_sf_q,
-        fake_sf_k,
-        fake_sf_v,
-        fake_lse,
-        fake_amax_o,
-        fake_sinks,
-        fake_seq_kv_lens,
-        fake_o_desc,
-        (_b0, _qh0, _kh0, sq, skv, 0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        fake_seq_q_lens,
-        fake_thd_q_lens,
-        fake_thd_kv_lens,
-        fake_thd_lens_form,
-        *((fake_block_table, fake_block_table_v) if PAGED_KV else ()),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
-    )
-
-
 def _main():
     import argparse
 
@@ -3991,15 +3860,11 @@ def _main():
     args = parser.parse_args()
 
     print(f"[d512_mxfp8_sm100] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
-    fn = compile(args.b, args.hq, args.hk, args.sq, args.skv)
+    fn = compile_prepared()
     print(f"[d512_mxfp8_sm100] compile OK: {fn}", flush=True)
     if args.validate:
         print("[d512_mxfp8_sm100] compiled - run validation via the frost SDPA test suite.")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())
 
 
 from cudnn.sdpa.fwd.kernels._mxfp8_host import host as _host_prepared
@@ -4044,3 +3909,7 @@ def compile_prepared(
         static_lse_strides=static_lse_strides,
         partial_slot=False,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

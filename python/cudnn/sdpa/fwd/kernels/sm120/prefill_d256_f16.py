@@ -41,7 +41,7 @@ Constraints:
   capacity
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Type
@@ -1743,20 +1743,15 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple[int, int, int, int]] = None,
     o_stride: Optional[tuple[int, int, int, int]] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
-    prepared: bool = False,
+    prepared: bool = True,
     persistent_ctas: int = 0,
 ) -> Callable:
-    """Compile a prepared pointer entry or the remaining dense tensor entry.
-
-    All half THD plans use ``prepared=True``. Their batch/Q envelope and
-    Stats packing specialize the host; packed capacities, strides and device
-    length pointers bind at execution. No THD tensor fakes are constructed.
-    Dense conversion routes retain shape/stride-specialized tensor operands.
-    ``has_lse=False`` compiles out the Stats store without a dummy buffer.
-    """
+    """Compile the dense/packed pointer host; geometry binds at execution."""
 
     # Head dims that do not tile to (256, 256) belong to sm120/prefill_f16.py.
     _cache_key = _template_key(globals(), locals(), "compile")
+    if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
+        raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
     if pick_flavor(d_qk, d_v, fp8=False) != D256_FLAVOR:
         raise ValueError(f"SM120 SDPA d256 kernel: head dims ({d_qk}, {d_v}) do not tile to {D256_FLAVOR}")
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -1783,85 +1778,4 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
-    if prepared:
-        return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
-    if PARAMS.thd_varlen:
-        raise ValueError("SM120 half THD uses prepared=True; the tensor entry is dense-only")
-    if PARAMS.split_kv > 1 and not has_lse:
-        raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    if lse_stride is not None and PARAMS.split_kv > 1:
-        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
-    fake_batch = b
-    # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on the
-    # batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.
-    o_fake_batch = fake_batch * PARAMS.split_kv
-    lse_fake_batch = fake_batch * PARAMS.split_kv
-
-    def _fake_bshd(shape, stride):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
-
-    fake_q = _fake_bshd((fake_batch, sq, qh, d_qk), q_stride)
-    fake_k = _fake_bshd((fake_batch, skv, kh, d_qk), k_stride)
-    fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd((o_fake_batch, sq, qh, d_v), o_stride)
-    fake_lse_shape = (lse_fake_batch, qh, sq)
-    if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
-        fake_lse = None
-    else:
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, fake_lse_shape, lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                fake_lse_shape,
-                stride_order=(2, 1, 0),
-                assumed_align=4,
-            )
-        )
-    fake_sinks = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (qh,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if PARAMS.has_sink
-        else None
-    )
-    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    return _compile_cached(
-        kernel,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_sinks,
-        fake_seq_q_lens,
-        fake_seq_kv_lens,
-        cutlass.Float32(1.0),
-        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
-        None,
-        None,
-        None,
-        cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
-    )
+    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)

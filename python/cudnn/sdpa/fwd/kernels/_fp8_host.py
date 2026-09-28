@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Shared SM100/SM107 per-tensor FP8 host binding and compile-time auxiliary operands."""
+"""Shared SM100/SM107 per-tensor FP8 prepared pointer host."""
 
 from types import SimpleNamespace
 from typing import Optional, Tuple
@@ -264,25 +264,4 @@ def compile_host(
         options="--enable-tvm-ffi",
         cache_key=cache_key,
         symbol="frost_sdpa_fwd_prepared",
-    )
-
-
-def make_fake_aux(b, qh, *, amax_align=16):
-    """Dense tensor-entry auxiliaries for remaining legacy layouts and fused outputs.
-
-    Prepared launches never construct these tensor fakes. All SM100/SM107 per-tensor
-    FP8 THD routes now use the pointer entry, so no packed metadata, descriptor
-    arrays, dynamic head extents or length-array fakes remain here.
-    """
-
-    def vector(dtype, length, align):
-        return cute.runtime.make_fake_compact_tensor(dtype, (length,), stride_order=(0,), assumed_align=align)
-
-    return SimpleNamespace(
-        sinks=vector(cutlass.Float32, qh, 16),
-        kv_lens=vector(cutlass.Int32, b, 16),
-        o_desc=vector(cutlass.Int64, 1, 16),
-        seq_q_lens=cutlass.Int64(0),  # device address, never an Int32 length
-        scales=tuple(vector(cutlass.Float32, 1, 4) for _ in range(4)),
-        amax_o=vector(cutlass.Float32, 1, amax_align),
     )

@@ -192,13 +192,16 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
     q, k, v = (t.transpose(1, 2) for t in _inputs(d, dv, dtype, capq=128, capkv=256))
     freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * torch.linspace(0.001, 0.01, d // 2, device="cuda")[None, :] if rope else None
     calls = []
-    original = api_dsl._sm80_call
+    from cudnn.sdpa.fwd import prepared_staged_sm80
 
-    def tensor_call(*args, **kwargs):
+    module, entry = (api_dsl, "_sm80_call") if rope else (prepared_staged_sm80, "_copy")
+    original = getattr(module, entry)
+
+    def staged_call(*args, **kwargs):
         calls.append(True)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(api_dsl, "_sm80_call", tensor_call)
+    monkeypatch.setattr(module, entry, staged_call)
 
     def run():
         return sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
@@ -308,14 +311,20 @@ assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 assert torch.cuda.get_device_capability() == (8, 0)
 sys.path.insert(0, tests)
 from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
-original = prepared_host.compile_staged_host
+from cudnn.sdpa.fwd import prepared_staged_sm80
+module, entry = (prepared_host, "compile_staged_host") if rope == "1" else (prepared_staged_sm80, "compile_plan")
+original = getattr(module, entry)
 artifacts = []
 def record(*args):
-    artifact, fn = original(*args)
-    artifacts.append(artifact)
-    return artifact, fn
+    result = original(*args)
+    if rope == "1":
+        artifacts.append(result[0])
+    else:
+        artifacts.append(result.core.artifact)
+        artifacts.extend(c[0] for c in result.copies if c is not None)
+    return result
 with pytest.MonkeyPatch.context() as patch:
-    patch.setattr(prepared_host, "compile_staged_host", record)
+    patch.setattr(module, entry, record)
     if reload == "1":
         def forbidden(*args, **kwargs):
             raise AssertionError("staged forward invoked JIT in the second process")
@@ -353,7 +362,12 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
     from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
 
-    compile_staged_host.cache_clear()
+    from cudnn.sdpa.fwd.prepared_staged_sm80 import _compile_core
+    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
+    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
+
+    for cached in (compile_staged_host, _compile_core, compile_gather, compile_copy):
+        cached.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     if cache_mode == "disabled":
         monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
@@ -375,8 +389,7 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
     + [("bias_tensor", "empty_batch")],
 )
 def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, monkeypatch):
-    from types import SimpleNamespace
-    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd import api_dsl, prepared_staged_sm80
 
     q = torch.empty((2, 17, 4, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
     kv = torch.empty((2, 33, 2, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
@@ -396,12 +409,9 @@ def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, mon
         bias_fp32=True,
     )
     api.check_support()
-    # No device launch is needed to test rejection. In particular the baseline
-    # must fail at this tripwire instead of launching an unsafe short buffer.
-    api._compiled_kernel = object()
-    api._sm80_spec = None
-    api._params = SimpleNamespace(has_lse=True, has_bias=True, has_rope=False, has_sink=True, has_seq_kv_lens=True, has_seq_q_lens=True, bias_is_fp32=True)
-    monkeypatch.setattr(api_dsl, "WorkspaceCarver", lambda *a, **k: pytest.fail("invalid operand reached workspace staging"))
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    monkeypatch.setattr(prepared_staged_sm80, "_copy", lambda *a, **k: pytest.fail("invalid operand reached workspace staging"))
     tensor = values[role]
     if invalid == "shape":
         values[role] = tensor[:, :, :-1]
@@ -415,5 +425,5 @@ def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, mon
         api.execute(
             **{n + "_tensor": values[n] for n in ("q", "k", "v", "o", "lse")},
             **{n: v for n, v in values.items() if n not in ("q", "k", "v", "o", "lse")},
-            workspace=torch.empty(1024, device="cuda", dtype=torch.uint8),
+            workspace=workspace,
         )

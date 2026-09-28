@@ -58,7 +58,8 @@ The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
 The existing D256 quantized epilogue gate also uses prepared launches, with
 runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
-output's maximum. Conversion routes retain tensor execution.
+output's maximum. Existing conversion routes use prepared gather/scatter copies
+around a compact prepared attention plan.
 Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
@@ -72,7 +73,8 @@ shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
 operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
-layouts and bias retain their tensor executor and decline overrides;
+layouts and bias continue to decline runtime shape/stride overrides. Existing
+conversion layouts use staged copies around a prepared compact plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -1003,9 +1005,13 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. The served capability envelope is unchanged: other head dimensions and
-layouts and standalone RoPE retain their existing adapter staging, then
-launch through a pointer host. All forward entries share prepared host lowering;
+width. Other admitted non-RoPE head dimensions and layouts use prepared bitwise
+gather/pad and scatter kernels in caller workspace around the same native GQA
+host. Q/K padding preserves the original attention scale; sink conversion remains
+inside attention. Native operands bind directly without redundant copies. The
+standalone dense wrapper keys plans by input strides and supplies current scratch.
+The capability envelope is unchanged; standalone RoPE retains its angle-table
+and tensor staging. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
@@ -1059,8 +1065,8 @@ The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-All SM80 forward tensor-fake construction is removed. Dense off-flavor/RoPE
-also use a pointer host after their existing staging. The forward graph row still
+All SM80 forward tensor-fake construction is removed. Non-RoPE dense conversion
+copies are prepared too; RoPE retains tensor staging before its pointer host. The forward graph row still
 declines THD, so this changes no graph eligibility.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
@@ -1161,7 +1167,8 @@ SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
 MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
 current O, SF_O, optional Amax and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
-SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+SF_O offsets and prepared copy strides preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
-their existing admission boundaries. Remaining conversion layouts retain their
-tensor entries. Standalone prepared calls require caller-owned workspace.
+their existing admission boundaries. Remaining conversion layouts use prepared
+gather/scatter copies around a compact prepared plan. Standalone prepared calls
+require caller-owned workspace.

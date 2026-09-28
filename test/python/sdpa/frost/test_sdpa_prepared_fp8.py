@@ -190,12 +190,13 @@ def _check(bufs, *, thd, b=2, sq=128, skv=128):
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_prepared_fp8_rebind_scales_and_buffers(thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch):
     """All scalar output dtypes use the pointer entry, including every THD route."""
-    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
+    import cutlass.cute.runtime as runtime
 
     def legacy_fake(*args, **kwargs):
         pytest.fail("prepared launch reentered the legacy tensor compiler")
 
-    monkeypatch.setattr(fp8_host, "make_fake_aux", legacy_fake)
+    monkeypatch.setattr(runtime, "make_fake_tensor", legacy_fake)
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", legacy_fake)
     g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, stats=stats, amax=amax, dtype=dtype, output_dtype=output_dtype)
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared is not None, "FP8 must use the normalized prepared executor"
