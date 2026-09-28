@@ -54,6 +54,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import moe_scatter_row
 from cudnn.gemm.frost.tile_helpers import moe_swizzle_tile as _moe_swizzle_tile
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
@@ -294,6 +295,7 @@ def _kernel(
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
+    # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
@@ -1149,6 +1151,7 @@ def _host(
         first_token_offset,
         a_tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
+        # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@

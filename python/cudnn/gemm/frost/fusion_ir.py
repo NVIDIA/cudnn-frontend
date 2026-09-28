@@ -624,7 +624,9 @@ class MoeSpec:
     b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
     (grouped persistent scheduler + per-group A TMA descriptor replacement).
     In ``gather`` mode, M counts routed rows and ``token_index`` maps each
-    routed row to a source token. Template capabilities gate execution."""
+    routed row to a source token. In ``scatter`` mode, the input stays grouped
+    and output row is ``token_index[row] * top_k + token_ks[row]``.
+    Template capabilities gate execution."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
     mode: str = "none"
@@ -633,14 +635,17 @@ class MoeSpec:
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
     offset_multiple: int = 1
+    top_k: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
             object.__setattr__(self, "num_groups", self.num_experts)
-        if self.mode not in ("none", "gather"):
-            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported; only 'none' and 'gather' are supported")
+        if self.mode not in ("none", "gather", "scatter"):
+            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported")
+        if self.top_k < 1:
+            raise ValueError("MoE top_k must be positive")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:

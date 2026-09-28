@@ -13,6 +13,8 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
     dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
 )
 from cudnn.gemm.frost.tile_helpers import (
+    moe_scatter_row,
+    tma_scatter4,
     moe_gather_row,
     tma_gather4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
@@ -1172,7 +1174,7 @@ def _kernel(
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
         previous_group_end = cutlass.Int32(-1)
-        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
+        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
             for _di in cutlass.range_constexpr(n_tma_outputs):
                 if elect_one:
                     _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
@@ -1205,7 +1207,7 @@ def _kernel(
             # Under `moe_aligned_offsets` no tile crosses `group_end` in the
             # first place -- `cgrp_tile_n` divides every group -- so the clip
             # has nothing to clip and the original descriptor serves.
-            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
+            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
                 if group_end != previous_group_end:
                     previous_group_end = group_end
                     # One drain retires the in-flight stores of EVERY descriptor,

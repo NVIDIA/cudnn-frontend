@@ -516,6 +516,7 @@ def _build_graph(
     epilogue_relu=False,
     output_major="n",
     offset_multiple=1,
+    scatter_top_k=None,
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
     a_dt = default_dt if a_dt_override is None else a_dt_override
@@ -551,13 +552,21 @@ def _build_graph(
     fto.set_alignment_value(offset_multiple)
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size]) if dequant_a else tok
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1]) if dequant_b else w
+    routing = {}
+    if scatter_top_k is not None:
+        routing = {
+            "token_index": g.tensor(name="token_index", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
+            "token_ks": g.tensor(name="token_ks", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
+            "top_k": scatter_top_k,
+        }
     out = g.moe_grouped_matmul(
         tok_d,
         w_d,
         fto,
-        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        mode=cudnn.moe_grouped_matmul_mode.NONE if scatter_top_k is None else cudnn.moe_grouped_matmul_mode.SCATTER,
         compute_data_type=cudnn.data_type.FLOAT,
         name="moe",
+        **routing,
     )
     if epilogue_relu:
         out = g.relu(input=out, name="relu")
@@ -793,6 +802,8 @@ def _run_e2e(
     offset_multiple=1,
     force_stg=False,
     swap_ab=False,
+    scatter_top_k=None,
+    epilogue_relu=False,
 ):
     dev = "cuda"
     torch.manual_seed(0)
@@ -848,6 +859,8 @@ def _run_e2e(
             weight_major=weight_major,
             output_major=output_major,
             offset_multiple=offset_multiple,
+            scatter_top_k=scatter_top_k,
+            epilogue_relu=epilogue_relu,
         ),
         config=cfg,
         swap_ab=swap_ab,
@@ -900,7 +913,16 @@ def _run_e2e(
         else:
             output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
 
-    compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
+    vp = _vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets)
+    if scatter_top_k is not None:
+        from gemm_test_utils import graph_binding
+
+        binding = graph_binding(compiled)
+        dest = torch.randperm(S, device=dev, dtype=torch.int32)
+        index = (dest // scatter_top_k).view(1, S, 1)
+        slots = (dest % scatter_top_k).view(1, S, 1)
+        vp.update({binding.token_index: index, binding.token_ks: slots})
+    compiled(vp)
     torch.cuda.synchronize()
 
     tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
@@ -912,6 +934,12 @@ def _run_e2e(
         if b == e:
             continue
         ref[b:e] = tok_s[b:e] @ w_s[gi % E].T
+    if epilogue_relu:
+        ref = ref.relu()
+    if scatter_top_k is not None:
+        grouped_ref = ref
+        ref = torch.empty_like(grouped_ref)
+        ref[dest.long()] = grouped_ref
     # nvfp4 (integer operands) is tight; mx paths carry fp16 rounding.
     tol = (1e-1, 1e-2) if combo == "nvfp4" else (2e-1, 2e-2)
     if quant:
@@ -939,7 +967,80 @@ def _run_e2e(
         if output_major == "m":
             assert (raw[2 * ldm * N :] == 0xAB).all(), "the store ran past the output"
             assert (storage[:, :, 2 * S :] == 0xAB).all(), "the store overwrote column padding"
+    if scatter_top_k is not None:
+        capture = torch.cuda.CUDAGraph()
+        workspace = torch.empty(compiled.workspace_bytes, device=dev, dtype=torch.uint8)
+        try:
+            with torch.cuda.graph(capture):
+                compiled._compiled(vp, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+            index.copy_(S // scatter_top_k - 1 - index)
+            slots.copy_(scatter_top_k - 1 - slots)
+            capture.replay()
+            torch.testing.assert_close(output[0], ref.flip(0).to(torch.bfloat16), atol=tol[0], rtol=tol[1])
+        finally:
+            capture.reset()
     return compiled
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("output_major,force_stg", [("n", False), ("n", True), ("m", False)])
+def test_scatter_block_scale(combo, swap_ab, output_major, force_stg):
+    compiled = _run_e2e(
+        E=2,
+        S=258,
+        N=256,
+        K=256,
+        offsets_list=[0, 3, 3, 131, 257],
+        combo=combo,
+        config_name=_CFG_1CTA,
+        cta_group=1,
+        output_major=output_major,
+        force_stg=force_stg,
+        swap_ab=swap_ab,
+        scatter_top_k=2,
+        epilogue_relu=True,
+    )
+    if output_major == "n" and not force_stg:
+        assert compiled._compiled.tma_slots == frozenset({0})
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("output_major", ["n", "m"])
+def test_scatter_block_scale_sm120(combo, output_major):
+    _run_e2e(
+        E=2,
+        S=258,
+        N=256,
+        K=256,
+        offsets_list=[0, 3, 3, 131, 257],
+        combo=combo,
+        config_name=_SM120_BS_CFG,
+        cta_group=None,
+        output_major=output_major,
+        scatter_top_k=2,
+        epilogue_relu=True,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_scatter_block_scale_cluster(swap_ab):
+    _run_e2e(
+        E=2,
+        S=258,
+        N=256,
+        K=256,
+        offsets_list=[0, 3, 3, 131, 257],
+        combo="mxfp8",
+        config_name="CONFIG_sm100_128x128x128_128x128x32_cluster2x2_2ctamma",
+        cta_group=2,
+        swap_ab=swap_ab,
+        scatter_top_k=2,
+        epilogue_relu=True,
+    )
 
 
 @requires_sm100
@@ -1790,7 +1891,8 @@ def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> Non
 
 
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
-def test_sm120_moe_block_scale_render_smoke(combo: str) -> None:
+@pytest.mark.parametrize("scatter", [False, True])
+def test_sm120_moe_block_scale_render_smoke(combo: str, scatter: bool) -> None:
     """Render the template (tile constants + epilogue snippets, no cute.compile)
     through the sm120 tree by name: marker-free, parseable, the grouped-scheduler
     constants present, no descriptor patching."""
@@ -1801,7 +1903,7 @@ def test_sm120_moe_block_scale_render_smoke(combo: str) -> None:
     from cudnn.gemm.frost.sm120 import compiler as C120
     from cudnn.gemm.frost.sm120.epilogue_codegen import generate
 
-    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4, combo=combo))
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4, combo=combo, scatter_top_k=2 if scatter else None))
     cfg = by_name(_SM120_BS_CFG)
     snippets = generate(
         chain,
@@ -1819,7 +1921,20 @@ def test_sm120_moe_block_scale_render_smoke(combo: str) -> None:
     assert "if row < group_end:" in src
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]
-    assert params == ["problem_size", "first_token_offset", "a_tma_workspace", "a_0", "b_0", "sfa_0", "sfb_0", "c_tap_0", "stream"], params
+    assert params == [
+        "problem_size",
+        "first_token_offset",
+        "a_tma_workspace",
+        *(["token_ks", "token_index"] if scatter else []),
+        "a_0",
+        "b_0",
+        "sfa_0",
+        "sfb_0",
+        "c_tap_0",
+        "stream",
+    ], params
+    if scatter:
+        assert "moe_scatter_row(token_index, token_ks" in src
 
 
 @pytest.mark.parametrize("cfg_name", _SM120_BS_CFGS, ids=lambda n: n.removeprefix("CONFIG_sm120_"))

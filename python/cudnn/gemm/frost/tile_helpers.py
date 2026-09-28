@@ -177,6 +177,40 @@ def moe_gather_row(token_index, row, group_end, source_rows):
 
 
 @cute.jit
+def moe_scatter_row(token_index, token_ks, row, group_end, output_rows, top_k: cutlass.Constexpr):
+    """Map a routed row to its token/top-k slot; clip padding with an OOB row."""
+    dst = cutlass.Int32(output_rows)
+    if row < group_end:
+        token = cutlass.Int32(token_index[row])
+        slot = cutlass.Int32(token_ks[row])
+        if token >= 0 and token < output_rows // top_k and slot >= 0 and slot < top_k:
+            dst = token * top_k + slot
+    return dst
+
+
+@cute.jit
+def tma_scatter4(desc, src, col, r0, r1, r2, r3):
+    """Store four indexed rows through a rank-2 map with box_dims[1] == 1."""
+    llvm.inline_asm(
+        None,
+        [
+            desc.toint().ir_value(),
+            src.toint(dtype=cutlass.Int32).ir_value(),
+            cutlass.Int32(col).ir_value(),
+            cutlass.Int32(r0).ir_value(),
+            cutlass.Int32(r1).ir_value(),
+            cutlass.Int32(r2).ir_value(),
+            cutlass.Int32(r3).ir_value(),
+        ],
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group [$0, {$2, $3, $4, $5, $6}], [$1];",
+        "l,r,r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
     """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
 

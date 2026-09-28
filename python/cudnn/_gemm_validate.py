@@ -71,6 +71,8 @@ def validate_node(node) -> None:
 
         if node.params.get("mode") in (cudnn.moe_grouped_matmul_mode.GATHER, cudnn.moe_grouped_matmul_mode.SCATTER):
             _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
+        if node.params.get("mode") == cudnn.moe_grouped_matmul_mode.SCATTER:
+            _validate_required(node, "MoeGroupedMatmul", ("token_ks",), ())
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""MoE grouped matmul forward (NONE and GATHER): analyzer detection + end-to-end
+"""MoE grouped matmul forward (NONE, GATHER and SCATTER): analyzer detection + end-to-end
 correctness vs a torch group-loop reference (uneven + empty groups)."""
 
 from __future__ import annotations
@@ -374,6 +374,265 @@ def _build_gather_graph(
     if m_major:
         y.set_stride([n * (rows + 7), 1, rows + 7])
     return g, x, weights, offsets, indices, y
+
+
+def _build_scatter_graph(*, rows=387, n=96, k=96, top_k=3, m_major=False, activation=False):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    x = g.tensor(name="tokens", dim=[1, rows, k], stride=[rows * k, k, 1])
+    w = g.tensor(name="weights", dim=[3, k, n], stride=[k * n, 1, k])
+    offsets = g.tensor(name="offsets", dim=[6, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    indices = g.tensor(name="indices", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    ks = g.tensor(name="ks", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    y = g.moe_grouped_matmul(x, w, offsets, token_index=indices, token_ks=ks, top_k=top_k, mode=cudnn.moe_grouped_matmul_mode.SCATTER)
+    if activation:
+        y = g.swish(input=y)
+    y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    if m_major:
+        y.set_stride([n * (rows + 5), 1, rows + 5])
+    return g, x, w, offsets, indices, ks, y
+
+
+def test_scatter_shape_and_binding():
+    g, _, _, _, indices, ks, y = _build_scatter_graph()
+    chain, binding = analyze_with_binding(g)
+    assert chain.moe.mode == "scatter"
+    assert chain.moe.top_k == 3
+    assert chain.matmul.M == 387
+    assert binding.token_index is indices
+    assert binding.token_ks is ks
+    assert ks in binding.bound_tensors()
+    assert y.get_dim() == [1, 387, 96]
+
+
+@pytest.mark.parametrize("fault", ["missing_ks", "ks_dtype", "ks_stride", "ks_shape", "index_rows", "top_k_zero", "top_k_large", "top_k_indivisible"])
+def test_scatter_metadata_rejected(fault):
+    g, _, _, _, indices, ks, _ = _build_scatter_graph()
+    if fault == "missing_ks":
+        g.nodes[0].inputs.pop("token_ks")
+        with pytest.raises(ValueError, match="token_ks"):
+            g.validate()
+    elif fault == "ks_dtype":
+        ks.set_data_type(cudnn.data_type.INT64)
+    elif fault == "ks_stride":
+        ks.set_stride([774, 2, 1])
+    elif fault == "ks_shape":
+        ks.set_dim([1, 386, 1])
+    elif fault == "index_rows":
+        indices.set_dim([1, 384, 1])
+        ks.set_dim([1, 384, 1])
+    else:
+        g.nodes[0].params["top_k"] = {"top_k_zero": 0, "top_k_large": 4, "top_k_indivisible": 2}[fault]
+    with pytest.raises((ValueError, NotImplementedError), match="token_ks|token_index|top_k"):
+        analyze_with_binding(g)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("feature", ["quant", "reduction", "packed_output"])
+def test_scatter_epilogue_support_surface(family, feature):
+    from importlib import import_module
+
+    compiler = import_module(f"cudnn.gemm.frost.{family}.compiler")
+    g, *_, y = _build_scatter_graph()
+    if feature == "quant":
+        q, sf = g.block_scale_quantize(input=y, block_size=32)
+        q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        sf.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    elif feature == "reduction":
+        r = g.reduction(input=y, mode=cudnn.reduction_mode.ADD)
+        r.set_dim([1, 1, 96]).set_stride([96, 96, 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    else:
+        y.set_data_type(cudnn.data_type.FP4_E2M1)
+    with pytest.raises(NotImplementedError, match="SCATTER"):
+        compiler._check_executable(analyze(g))
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        "128x128x128_128x128x32_cluster2x2_2ctamma",
+        "64x128x128_64x128x32_cluster1x1_1ctamma",
+        "64x128x128_64x128x32_cluster2x1_2ctamma",
+        "512x128x128_128x128x32_cluster1x1_1ctamma",
+    ],
+)
+def test_scatter_tma_geometry(geometry, swap_ab):
+    from cudnn.gemm.frost import compiler as C
+
+    _run_scatter_numerics(C, replace(by_name("CONFIG_sm100_" + geometry), swap_ab=swap_ab))
+
+
+def _run_scatter_numerics(compiler, cfg, *, m_major=False, stg=False, activation=False):
+    g, x, w, offsets, indices, ks, y = _build_scatter_graph(m_major=m_major, activation=activation)
+    if stg:
+        with compiler.force_stg_epi():
+            compiled = compiler.jit_from_cudnn_graph(g, config=cfg)
+    else:
+        compiled = compiler.jit_from_cudnn_graph(g, config=cfg)
+    if cfg.pipeline == "sm100" and not m_major and not stg:
+        assert compiled.tma_slots == frozenset({0})
+        assert "tma_scatter4(" in compiled.generated_path.read_text()
+    torch.manual_seed(136)
+    tokens = torch.randn(1, 387, 96, dtype=torch.bfloat16, device="cuda")
+    weights = torch.randn(3, 96, 96, dtype=torch.bfloat16, device="cuda") * 0.1
+    starts = [0, 3, 3, 134, 257, 258]
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(6, 1, 1)
+    destination = torch.randperm(387, device="cuda", dtype=torch.int32)
+    index = (destination // 3).view(1, 387, 1)
+    slots = (destination % 3).view(1, 387, 1)
+    backing = torch.full((96, 392) if m_major else (392, 112), 123, device="cuda", dtype=torch.bfloat16)
+    out = (backing[:, :387].T if m_major else backing[:387, :96]).unsqueeze(0)
+    vp = {x: tokens, w: weights, offsets: fto, indices: index, ks: slots, y: out}
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+
+    def check():
+        grouped = torch.empty(387, 96, device="cuda", dtype=torch.float32)
+        for group, begin in enumerate(starts):
+            end = starts[group + 1] if group + 1 < len(starts) else 387
+            grouped[begin:end] = tokens[0, begin:end].float() @ weights[group % 3].float().T
+        if activation:
+            grouped = torch.nn.functional.silu(grouped)
+        ref = torch.empty_like(grouped)
+        ref[(index.flatten() * 3 + slots.flatten()).long()] = grouped
+        torch.testing.assert_close(out[0].float(), ref.to(torch.bfloat16).float(), atol=0.03, rtol=0.02)
+        if m_major:
+            assert torch.all(backing[:, 387:] == 123)
+        else:
+            assert torch.all(backing[387:] == 123)
+            assert torch.all(backing[:, 96:] == 123)
+
+    compiled(vp, workspace=workspace)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            compiled(vp, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+        index.copy_(128 - index)
+        slots.copy_(2 - slots)
+        starts[:] = [0, 0, 17, 129, 129, 386]
+        fto.copy_(torch.tensor(starts, device="cuda", dtype=torch.int32).view(6, 1, 1))
+        graph.replay()
+        check()
+    finally:
+        graph.reset()
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("m_major,stg,activation", [(False, False, False), (False, True, True), (True, False, True)])
+def test_scatter_numerics(swap_ab, m_major, stg, activation):
+    from cudnn.gemm.frost import compiler as C
+
+    cfg = replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=swap_ab)
+    _run_scatter_numerics(C, cfg, m_major=m_major, stg=stg, activation=activation)
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("m_major,activation", [(False, False), (False, True), (True, True)])
+def test_scatter_numerics_sm120(m_major, activation):
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    _run_scatter_numerics(C, by_name(_SM120_CFG), m_major=m_major, activation=activation)
+
+
+def _run_scatter_coordinates(compiler, cfg):
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    g, x, w, offsets, indices, ks, base = _build_scatter_graph()
+    base.set_output(False).set_data_type(cudnn.data_type.FLOAT)
+    base = g.identity(input=base)
+    base.set_data_type(cudnn.data_type.FLOAT)
+    value = base
+    aux_buffers = {}
+    for name, shape in (("rows", (1, 387, 1)), ("columns", (1, 1, 96)), ("elements", (1, 387, 96))):
+        buf = torch.arange(shape[1] * shape[2], device="cuda", dtype=torch.float32).view(shape) % 7
+        aux = g.tensor(name=name, dim=list(shape), stride=list(buf.stride()), data_type=cudnn.data_type.FLOAT)
+        aux_buffers[aux] = buf
+        value = g.add(a=value, b=aux)
+    for axis in (1, 2):
+        value = g.add(a=value, b=g.gen_index(input=base, axis=axis))
+    base.set_output(True)
+    value.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride([96 * 392, 1, 392])
+    compiled = compiler.jit_from_cudnn_graph(g, config=cfg)
+    assert compiled.store_modes == (("tma", "stg") if cfg.pipeline == "sm100" else ("stg", "stg"))
+    tokens = (torch.arange(387, device="cuda") % 7).to(torch.bfloat16).view(1, 387, 1).expand(1, 387, 96).contiguous()
+    weights = torch.arange(1, 4, device="cuda", dtype=torch.bfloat16).view(3, 1, 1).expand(3, 96, 96).contiguous()
+    starts = [0, 3, 3, 134, 257, 258, 387]
+    fto = torch.tensor(starts[:-1], device="cuda", dtype=torch.int32)
+    destination = torch.randperm(387, device="cuda", dtype=torch.int32)
+    index, slots = (destination // 3).view(1, 387, 1), (destination % 3).view(1, 387, 1)
+    out_base = torch.empty(1, 387, 96, device="cuda", dtype=torch.float32)
+    backing = torch.full((96, 392), 123, device="cuda", dtype=torch.bfloat16)
+    out_value = backing[:, :387].T.unsqueeze(0)
+    vp = {x: tokens, w: weights, offsets: fto, indices: index, ks: slots, base: out_base, value: out_value, **aux_buffers}
+    ref = torch.empty_like(out_base)
+    for group, (begin, end) in enumerate(zip(starts, starts[1:])):
+        ref[0, destination[begin:end].long()] = tokens[0, begin:end].float() * (96 * (group % 3 + 1))
+    expected = ref + sum(aux_buffers.values()) + torch.arange(387, device="cuda").view(1, 387, 1) + torch.arange(96, device="cuda")
+
+    g.validate()
+    g.build_operation_graph()
+    engine_id = next(row.engine_id for row in MANIFEST if row.name == "frost_gemm")
+    g.create_execution_plan(engine_id, GemmKnobs.from_config(cfg).to_public())
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine.name == "frost_gemm"
+    workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    g.execute(vp, workspace)
+    torch.testing.assert_close(out_base, ref, atol=0, rtol=0)
+    torch.testing.assert_close(out_value, expected.to(torch.bfloat16), atol=0, rtol=0)
+    assert torch.all(backing[:, 387:] == 123)
+    for bad_ks in (slots.to(torch.int64), slots[:, :-1], torch.empty(1, 387, 2, device="cuda", dtype=torch.int32)[:, :, :1]):
+        with pytest.raises(ValueError, match="token_ks"):
+            compiled({**vp, ks: bad_ks})
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_scatter_coordinates_and_public_replay(swap_ab):
+    from cudnn.gemm.frost import compiler as C
+
+    _run_scatter_coordinates(C, replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=swap_ab))
+
+
+@requires_matmul_gpu
+def test_scatter_coordinates_and_public_replay_sm120():
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    _run_scatter_coordinates(C, by_name(_SM120_CFG))
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_scatter_parallel_gemms(swap_ab):
+    from cudnn.gemm.frost import compiler as C
+
+    g, x, w, offsets, indices, ks, first = _build_scatter_graph()
+    first.set_output(False).set_data_type(cudnn.data_type.FLOAT)
+    w2 = g.tensor(name="weights2", dim=[3, 96, 96], stride=[96 * 96, 1, 96])
+    second = g.moe_grouped_matmul(x, w2, offsets, token_index=indices, token_ks=ks, top_k=3, mode=cudnn.moe_grouped_matmul_mode.SCATTER)
+    y = g.mul(a=g.swish(input=first), b=second)
+    y.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    cfg = replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=swap_ab)
+    compiled = C.jit_from_cudnn_graph(g, config=cfg)
+    token_values = (torch.arange(387, device="cuda") % 7).float()
+    tokens = token_values.to(torch.bfloat16).view(1, 387, 1).expand(1, 387, 96).contiguous()
+    expert_values = torch.arange(1, 4, device="cuda", dtype=torch.bfloat16)
+    weights = (expert_values / 128).view(3, 1, 1).expand(3, 96, 96).contiguous()
+    weights2 = ((expert_values + 1) / 128).view(3, 1, 1).expand(3, 96, 96).contiguous()
+    starts = [0, 3, 3, 134, 257, 258, 387]
+    fto = torch.tensor(starts[:-1], device="cuda", dtype=torch.int32)
+    destination = torch.randperm(387, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(tokens)
+    compiled({x: tokens, w: weights, w2: weights2, offsets: fto, indices: (destination // 3).view(1, 387, 1), ks: (destination % 3).view(1, 387, 1), y: out})
+    ref = torch.empty(387, device="cuda")
+    for group, (begin, end) in enumerate(zip(starts, starts[1:])):
+        a = token_values[begin:end] * (96 * (group % 3 + 1) / 128)
+        b = token_values[begin:end] * (96 * (group % 3 + 2) / 128)
+        ref[destination[begin:end].long()] = torch.nn.functional.silu(a) * b
+    torch.testing.assert_close(out, ref.to(torch.bfloat16).view(1, 387, 1).expand_as(out), atol=0.01, rtol=0.01)
 
 
 def test_gather_shape_and_binding():
