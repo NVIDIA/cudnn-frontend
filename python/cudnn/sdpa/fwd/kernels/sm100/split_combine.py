@@ -225,6 +225,99 @@ def _combine_kernel(
 _combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+@cute.kernel
+def _combine_packed_kernel(
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_out: cute.Tensor,
+    lse_out: Optional[cute.Tensor],
+    total_q: cute.Tensor,
+    n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
+) -> None:
+    """Four packed rows per CTA; each warp reuses split weights across D.
+
+    Packed partials have no per-sequence padding or batch coordinate. The
+    device total guards their unwritten tail before any partial is read.
+    Final O/Stats retain the caller's strides and partial Stats stay in ln.
+    """
+    thread = cute.arch.thread_idx()[0]
+    lane = thread % 32
+    row = cute.arch.block_idx()[0] * 4 + thread // 32
+    head = cute.arch.block_idx()[1]
+    if (row >= o_partial.shape[1]) | (row >= cutlass.make_array_view(total_q)[0]):
+        # Warp-uniform, with no CTA barriers in this kernel.
+        nvvm.exit()
+    op = cutlass.make_array_view(o_partial)
+    lp = cutlass.make_array_view(lse_partial)
+    oo = cutlass.make_array_view(o_out)
+    neg_inf = cutlass.Float32(NEG_INF)
+    parallel = n_splits <= 32
+    m = neg_inf
+    m_safe = cutlass.Float32(0.0)
+    all_dead = m == neg_inf
+    den = cutlass.Float32(0.0)
+    lane_weight = cutlass.Float32(0.0)
+    if parallel:
+        lane_lse = neg_inf
+        if lane < n_splits:
+            lane_lse = cutlass.Float32(lp[lane, head, row])
+        m = lane_lse
+        for bit in cutlass.range_constexpr(5):
+            m = cute.math.max(m, cute.arch.shuffle_sync_bfly(m, 1 << bit))
+        all_dead = m == neg_inf
+        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+        if lane_lse > neg_inf:
+            lane_weight = cute.math.exp(lane_lse - m_safe, fastmath=True)
+        den = lane_weight
+        for bit in cutlass.range_constexpr(5):
+            den = den + cute.arch.shuffle_sync_bfly(den, 1 << bit)
+    else:
+        # Preserve arbitrary runtime split counts for internal prepared users.
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            m = cute.math.max(m, cutlass.Float32(lp[split, head, row]))
+        all_dead = m == neg_inf
+        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            partial_lse = cutlass.Float32(lp[split, head, row])
+            if partial_lse > neg_inf:
+                den = den + cute.math.exp(partial_lse - m_safe, fastmath=True)
+    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+    inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
+    for d_base in cutlass.range(0, o_partial.shape[3], 128, unroll=1):
+        acc = cute.make_rmem_tensor((4,), cutlass.Float32)
+        acc.fill(0.0)
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            weight = cutlass.Float32(0.0)
+            if parallel:
+                weight = cute.arch.shuffle_sync(lane_weight, split)
+            else:
+                partial_lse = cutlass.Float32(lp[split, head, row])
+                if partial_lse > neg_inf:
+                    weight = cute.math.exp(partial_lse - m_safe, fastmath=True)
+            # Dead splits may have non-finite payloads: skip their loads;
+            # multiplication by zero would not remove a NaN contribution.
+            if weight > cutlass.Float32(0.0):
+                for slot in cutlass.range_constexpr(4):
+                    d = d_base + lane + slot * 32
+                    if d < o_partial.shape[3]:
+                        acc[slot] = acc[slot] + weight * cutlass.Float32(op[split, row, head, d])
+        for slot in cutlass.range_constexpr(4):
+            d = d_base + lane + slot * 32
+            if d < o_partial.shape[3]:
+                oo[0, row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
+    if cutlass.const_expr(lse_out is not None):
+        if lane == 0:
+            value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
+            value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
+            if cutlass.const_expr(stats_log2):
+                value = value * cutlass.Float32(1.4426950408889634)
+            cutlass.make_array_view(lse_out)[0, head, row] = value
+
+
+_combine_packed_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     o_partial: cute.Tensor,
@@ -338,8 +431,8 @@ def _host_ptr_packed(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     total_q = cute.make_tensor(total_q_ptr, cute.make_layout((1,), stride=(1,)))
-    _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream, total_q
+    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2).launch(
+        grid=((problem_size[2] + 3) // 4, problem_size[1], 1), block=[THREADS, 1, 1], stream=stream
     )
 
 

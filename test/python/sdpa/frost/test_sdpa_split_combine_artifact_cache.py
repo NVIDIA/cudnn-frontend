@@ -16,7 +16,7 @@ from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 
-@pytest.mark.parametrize("route", ["dense", "ragged32", "ragged64", "tensor"])
+@pytest.mark.parametrize("route", ["dense", "ragged32", "ragged64", "tensor", "packed"])
 def test_shared_combine_artifact_reloads_in_fresh_process(route, tmp_path):
     child = r"""
 import hashlib, json, sys
@@ -34,7 +34,8 @@ if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("fresh-process shared combine invoked JIT")
     cute.compile = forbidden
-b, h, sq, d, splits = 2, 3, 5, 160, 3
+packed = route == "packed"
+b, h, sq, d, splits = 1 if packed else 2, 3, 5, 160, 3
 op, lp, ref_o, ref_lse = helper._partials(b, h, sq, d, splits)
 ragged = route.startswith("ragged")
 if ragged:
@@ -48,12 +49,15 @@ if route == "tensor":
     owner = comb.compile(b, h, sq, d, splits, has_lse=True, lse_stride=lstride, dtype_partial="f32", o_stride=ostride)
     run = lambda: owner(op, lp, o, lse, None, None, (b,h,sq,d), cutlass.Int32(splits), stream=driver.CUstream(torch.cuda.current_stream().cuda_stream))
 else:
-    owner = comb.compile_ptr(dtype_o="f16", has_lse=True, ragged=ragged, ragged_i64=route == "ragged64")
+    owner = comb.compile_ptr(dtype_o="f16", has_lse=True, ragged=ragged, ragged_i64=route == "ragged64", packed=packed)
     fn = compiled_cache.positional_entry(owner)
     extra = ()
     if ragged:
         offsets = torch.tensor([0,3,5], device="cuda", dtype=torch.int64 if route == "ragged64" else torch.int32)
         extra = (offsets.data_ptr(), offsets.data_ptr(), offsets.data_ptr(), (1,1,1), (sq,sq))
+    if packed:
+        total = torch.tensor([sq], device="cuda", dtype=torch.int32)
+        extra = (total.data_ptr(),)
     run = lambda: fn(op.data_ptr(),lp.data_ptr(),o.data_ptr(),lse.data_ptr(),(b,h,sq,d),splits,ostride,lstride,*extra,torch.cuda.current_stream().cuda_stream)
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
