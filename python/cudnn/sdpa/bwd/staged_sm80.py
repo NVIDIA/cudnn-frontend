@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared launches after the existing SM80 wrapper's staging operations."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import math
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import torch
 
 from cudnn.sdpa.fwd.api_dsl import _torch_stream_context, ws_align
 from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
-from .prepared import ROLES, execute
+from .prepared import ROLES, bind, execute
 from .prepared_sm80 import build_spec
 from .kernels.sm80.prepared_host import workspace_regions
 
@@ -56,9 +57,9 @@ def layout_for(api):
                 plan._thd_token_strides[role] = heads * dim
             copies.append((role, offset, shape))
             offset += ws_align(math.prod(shape) * 2)
-    # Auxiliary accumulators stay in the chain workspace. The old wrapper's
-    # optional/strided gradient outputs are copied from those same accumulators
-    # after launch; no extra output staging or auxiliary copy kernel is added.
+    # Auxiliary accumulators stay in the chain workspace. Prepared casts
+    # replace the old wrapper's copies to optional/strided gradient outputs;
+    # no extra output staging or conversion domain is introduced.
     plan.dbias_desc = plan.dsink_desc = None
     if api._has_bias and plan.bias_desc is None:
         shape = (api._bias_batch, api.h_q, api.s_q_max, api.s_k_max)
@@ -71,7 +72,9 @@ def layout_for(api):
 def compile_staged(api, d64_module):
     plan = api._staged_layout.declaration
     plan._kmod, plan._params = api._kmod, api._params
-    return build_spec(plan, d64_module, staged=True)
+    spec = build_spec(plan, d64_module, staged=True)
+    api._staged_copies = None if api._has_rope else _compile_copies(api)
+    return spec
 
 
 def _view_from_region(workspace, region, dtype):
@@ -117,8 +120,23 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
         op = spec.operands[5]
         if stats.dtype != torch.float32 or tuple(stats.shape) != op.shape or tuple(stats.stride()) != op.strides:
             raise ValueError("THD stats must match the declared packed layout")
-    else:
+    elif api._has_rope:
         stats = api._checked_lse_view(stats.squeeze(-1) if stats.ndim == 4 else stats)
+    elif stats.dtype != torch.float32 or stats.numel() != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.is_contiguous()):
+        raise ValueError("stats must match the declared dtype, element count and storage layout")
+    if not api.thd and not api._has_rope:
+        # Preserve the standalone Stats storage-binding contract without
+        # rebuilding its declared as_strided view. A flat runtime container can
+        # expose fewer logical elements than its backing allocation covers.
+        f, op = original_facts["stats"], spec.operands[5]
+        if f.span < op.span:
+            available = (stats.untyped_storage().nbytes() - stats.storage_offset() * 4) // 4
+            if available < op.span:
+                raise ValueError("sdpa_bwd_sm80: stats backing storage is too small for the declared strides")
+            f = f._replace(span=op.span)
+            original_facts["stats"] = f
+        if ws.ptr < f.ptr + op.span * 4 and f.ptr < ws.ptr + layout.workspace_bytes:
+            raise ValueError("sdpa_bwd_sm80: caller workspace overlaps stats")
     for role in ("seq_q", "seq_kv"):
         tensor = original[role]
         if tensor is not None and (tensor.dtype != torch.int32 or not tensor.is_contiguous() or tensor.numel() != api.batch_size):
@@ -150,8 +168,11 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             raise ValueError(f"sdpa_bwd_sm80: {role} dtype must match its declaration or accumulation output")
     if stream is None:
         stream = torch.cuda.current_stream(device).cuda_stream
+    cooked_facts = dict(original_facts, stats=facts_of_tensor(stats) if api._has_rope else original_facts["stats"], dbias=None, dsink=None, rope=None)
+    if not api._has_rope:
+        _run_copies(api, original_facts, cooked_facts, ws.ptr, int(stream), scale)
+        return
     cooked = dict(original, stats=stats, dbias=None, dsink=None, rope=None)
-    cooked_facts = dict(original_facts, stats=facts_of_tensor(stats), dbias=None, dsink=None, rope=None)
     with _torch_stream_context(stream, device):
         # The byte workspace may be an aligned slice and may have an odd extra
         # byte. Views use its current storage origin, with only the planned
@@ -192,3 +213,112 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
                 core_workspace = workspace[layout.staging_bytes :]
                 src = _view_from_region(core_workspace, region, torch.float32)
                 original[role].copy_(src.view(original[role].shape))
+
+
+def _entry(artifact):
+    from cudnn.frost.compiled_cache import positional_entry
+
+    fn = positional_entry(artifact)
+    if fn is None:
+        raise NotImplementedError("SM80 backward staging requires a positional tvm-ffi entry")
+    return artifact, fn
+
+
+def _compile_copies(api):
+    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
+    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
+    from .kernels.sm80.staged_copy import compile_cast
+
+    copies = []
+    for output in (False, True):
+        group = tuple(c for c in api._staged_layout.copies if (c[0] in ("dq", "dk", "dv")) == output)
+        if not group:
+            copies.append(None)
+            continue
+        shapes = tuple((b, s, h, getattr(api, role + "_desc").shape[-1]) for role, _, (b, h, s, _) in group)
+        if api.thd:
+            shapes = tuple((b, -2 if c[0] in ("k", "v") else -1, h, d) for (b, s, h, d), c in zip(shapes, group))
+        artifact = (
+            compile_copy(shapes, (2,) * len(group)) if output else compile_gather(tuple((*shape, c[2][-1]) for shape, c in zip(shapes, group)), packed=api.thd)
+        )
+        # Disjoint outputs share one launch. Runtime aliases retain the old
+        # ordered copy-back semantics through prepared single-role entries.
+        serial = tuple(_entry(compile_copy((shape,), (2,))) for shape in shapes) if output and len(group) > 1 else ()
+        copies.append((*_entry(artifact), group, serial))
+    auxiliary = []
+    for role, region in (("dbias", api._staged_layout.regions[5]), ("dsink", api._staged_layout.regions[6])):
+        if region is None:
+            continue
+        desc = getattr(api, role + "_desc")
+        dtypes = (desc.dtype,) if desc is not None else (torch.float32, api.dtype) if role == "dbias" else (torch.float32,)
+        shape = tuple(n for n in region[1] if n != 1)
+        shape = (1,) * (4 - len(shape)) + shape
+        entries = tuple((str(dtype).split(".")[-1], *_entry(compile_cast(shape, str(dtype).split(".")[-1]))) for dtype in dtypes)
+        auxiliary.append((role, api._staged_layout.staging_bytes + region[0], entries))
+    return tuple(copies), tuple(auxiliary)
+
+
+def _copy(entry, frame, stream):
+    entry[1](*frame, stream)
+
+
+def _run_copies(api, original, cooked, base, stream, scale):
+    from cudnn._device import ensure_current_context
+    from cudnn.sdpa.fwd.prepared import _covering
+
+    spec, layout = api._staged_prepared, api._staged_layout
+    copies, auxiliary = api._staged_copies
+    frames = []
+    for output, entry in enumerate(copies):
+        if entry is None:
+            frames.append(None)
+            continue
+        srcs, dsts, src_strides, dst_strides = [], [], [], []
+        for role, offset, shape in entry[2]:
+            b, h, s, d = shape
+            f = original[role]
+            if not f.ptr or f.ptr % 2:
+                raise ValueError(f"sdpa_bwd_sm80: {role} requires an aligned live address")
+            if output and not _covering(f.shape, f.strides):
+                raise ValueError(f"sdpa_bwd_sm80: {role} must have non-overlapping strides")
+            temp = BufferFacts(base + offset, f.dtype, f.device, math.prod(shape), shape, (s * h * d, d, h * d, 1))
+            cooked[role] = temp
+            src, dst = (temp, f) if output else (f, temp)
+            srcs.append(src.ptr)
+            dsts.append(dst.ptr)
+            src_strides.append(tuple(src.strides[i] for i in (0, 2, 1, 3)))
+            dst_strides.append(tuple(dst.strides[i] for i in (0, 2, 1, 3)))
+        frames.append((tuple(srcs), tuple(dsts), tuple(src_strides), tuple(dst_strides)) if output else (tuple(srcs), tuple(dsts), tuple(src_strides)))
+    if api.thd and frames[0] is not None:
+        frames[0] += (api._t_q_cap, api._t_kv_cap)
+    outputs = [original[role] for role, _, _ in copies[1][2]] if copies[1] is not None else []
+    serial_scatter = any(a.ptr < b.ptr + b.span * 2 and b.ptr < a.ptr + a.span * 2 for i, a in enumerate(outputs) for b in outputs[i + 1 :])
+    aux_frames = []
+    for role, offset, entries in auxiliary:
+        f = original[role]
+        if f is None:
+            continue
+        width = 4 if f.dtype == "float32" else 2
+        if not f.ptr or f.ptr % width or not _covering(f.shape, f.strides):
+            raise ValueError(f"sdpa_bwd_sm80: {role} requires aligned non-overlapping storage")
+        strides = tuple(st for n, st in zip(f.shape, f.strides) if n != 1)
+        strides = (0,) * (4 - len(strides)) + strides
+        entry = next(e for e in entries if e[0] == f.dtype)
+        aux_frames.append((entry[2], base + offset, f.ptr, strides))
+    # All original operands, auxiliary outputs and core bindings are checked
+    # before the first gather writes workspace. No tensor or pointer is cached.
+    frame = bind(spec, cooked, base + layout.staging_bytes, stream, scale=scale)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        if frames[0] is not None:
+            _copy(copies[0], frames[0], stream)
+        spec.fn(*frame)
+        if frames[1] is not None:
+            if serial_scatter:
+                for i, entry in enumerate(copies[1][3]):
+                    _copy(entry, tuple((leaves[i],) for leaves in frames[1]), stream)
+            else:
+                _copy(copies[1], frames[1], stream)
+        for fn, src, dst, strides in aux_frames:
+            fn(src, dst, strides, stream)
