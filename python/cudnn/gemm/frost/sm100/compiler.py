@@ -3984,6 +3984,11 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     )
     if slices <= 1:
         return config
+    # For matched FP4 operands, a two-way split does not amortize the
+    # partial-output traffic and reduction launch. Keep the unsplit tile;
+    # larger automatic splits and explicitly supplied knobs remain available.
+    if slices == 2 and chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1":
+        return config
     return replace(config, split_k_slices=slices)
 
 
