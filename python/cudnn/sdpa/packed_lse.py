@@ -69,12 +69,13 @@ def _execute(lse, cu_seqlens, max_seqlen):
         return padded
 
 
-@torch.library.custom_op("cudnn::_packed_lse_to_padded", mutates_args=())
-def _compiled_repad(lse: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
-    return _execute(lse, cu_seqlens, max_seqlen)
+_lib = torch.library.Library("cudnn", "FRAGMENT")
+_lib.define("_packed_lse_to_padded(Tensor lse, Tensor cu_seqlens, SymInt max_seqlen) -> Tensor")
+_lib.impl("_packed_lse_to_padded", _execute, "CompositeExplicitAutograd")
+_compiled_repad = torch.ops.cudnn._packed_lse_to_padded.default
 
 
-@_compiled_repad.register_fake
+@torch.library.register_fake("cudnn::_packed_lse_to_padded")
 def _fake_repad(lse, cu_seqlens, max_seqlen):
     return torch.empty((cu_seqlens.numel() - 1, lse.shape[1], max_seqlen, 1), dtype=torch.float32, device=lse.device)
 
