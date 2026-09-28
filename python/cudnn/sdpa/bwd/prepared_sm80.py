@@ -20,8 +20,8 @@ def native_layouts(api):
         if not dense_layout_ok(desc.shape, desc.stride) or any(n > 1 and st % 8 for n, st in zip(desc.shape[:-1], desc.stride[:-1])):
             return False
     # Older direct adapters declared only has_bias or omitted auxiliary gradient
-    # descriptors. Their optional runtime-output contract remains on the tensor
-    # path until it can be represented by a complete immutable declaration.
+    # descriptors. Their optional runtime-output contract uses the staged
+    # prepared recipe, which validates and binds auxiliary outputs per call.
     if api._has_bias:
         if api.bias_desc is None or api.dbias_desc is None:
             return False

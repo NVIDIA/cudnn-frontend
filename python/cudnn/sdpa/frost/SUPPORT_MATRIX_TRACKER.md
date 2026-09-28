@@ -996,13 +996,13 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. Other admitted non-RoPE head dimensions and layouts use prepared bitwise
+width. Other admitted head dimensions and layouts use prepared bitwise
 gather/pad and scatter kernels in caller workspace around the same native GQA
 host. Q/K padding preserves the original attention scale; sink conversion remains
 inside attention. Native operands bind directly without redundant copies. The
 standalone dense wrapper keys plans by input strides and supplies current scratch.
 The capability envelope is unchanged; standalone RoPE retains its angle-table
-and tensor staging. All forward entries share prepared host lowering;
+preprocessing and uses prepared data copies. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
@@ -1050,7 +1050,8 @@ scatter and auxiliary cast recipes around the same pointer chain. These replace
 the existing tensor copies within the same caller-workspace budget. Packed copy
 capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
 share one scatter launch, while overlapping storage ranges retain ordered copy-back.
-Standalone RoPE keeps its angle-table preprocessing and tensor staging.
+Standalone RoPE uses the same prepared data-copy recipes and keeps its
+existing angle-table preprocessing on the launch stream.
 Packed output casts and folds truncate flavor padding on device and leave capacity
 tails untouched. The obsolete generic and d64 tensor compilers and fake builders
 are removed. Standalone adapters require caller workspace, as native prepared
@@ -1060,9 +1061,11 @@ The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-All SM80 forward tensor-fake construction is removed. Non-RoPE dense conversion
-copies are prepared too; RoPE retains tensor staging before its pointer host. The forward graph row still
-declines THD, so this changes no graph eligibility.
+All SM80 forward tensor-fake construction is removed. Dense conversion copies,
+including standalone RoPE, share prepared gather/scatter plans with native GQA
+and natural-unit sinks. RoPE retains its existing angle-table preprocessing;
+its obsolete tensor-staging executor and dedicated host compiler are removed.
+The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a

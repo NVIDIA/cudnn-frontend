@@ -84,7 +84,9 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
     _check(tensors, _run(tensors, cq, ck, **kw), lq, lk, **kw)
     fresh = _inputs(d, dv, dtype, seed=81)
     # A return to tensor launch plumbing must fail even if numerics agree.
-    monkeypatch.setattr(api_dsl, "_sm80_call", lambda *a, **k: pytest.fail("legacy tensor launch"))
+    import cutlass.cute.runtime as runtime
+
+    monkeypatch.setattr(runtime, "from_dlpack", lambda *a, **k: pytest.fail("legacy tensor launch"))
     _check(fresh, _run(fresh, cq, ck, **kw), lq, lk, **kw)
     graph = torch.cuda.CUDAGraph()
     try:
@@ -194,7 +196,7 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
     calls = []
     from cudnn.sdpa.fwd import prepared_staged_sm80
 
-    module, entry = (api_dsl, "_sm80_call") if rope else (prepared_staged_sm80, "_copy")
+    module, entry = prepared_staged_sm80, "execute" if rope else "_copy"
     original = getattr(module, entry)
 
     def staged_call(*args, **kwargs):
@@ -312,16 +314,13 @@ assert torch.cuda.get_device_capability() == (8, 0)
 sys.path.insert(0, tests)
 from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
 from cudnn.sdpa.fwd import prepared_staged_sm80
-module, entry = (prepared_host, "compile_staged_host") if rope == "1" else (prepared_staged_sm80, "compile_plan")
+module, entry = prepared_staged_sm80, "compile_plan"
 original = getattr(module, entry)
 artifacts = []
 def record(*args):
     result = original(*args)
-    if rope == "1":
-        artifacts.append(result[0])
-    else:
-        artifacts.append(result.core.artifact)
-        artifacts.extend(c[0] for c in result.copies if c is not None)
+    artifacts.append(result.core.artifact)
+    artifacts.extend(c[0] for c in result.copies if c is not None)
     return result
 with pytest.MonkeyPatch.context() as patch:
     patch.setattr(module, entry, record)
@@ -360,13 +359,12 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache
     from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache
-    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
 
     from cudnn.sdpa.fwd.prepared_staged_sm80 import _compile_core
     from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
     from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
 
-    for cached in (compile_staged_host, _compile_core, compile_gather, compile_copy):
+    for cached in (_compile_core, compile_gather, compile_copy):
         cached.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     if cache_mode == "disabled":
