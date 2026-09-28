@@ -248,6 +248,7 @@ def write_thd_live_and_ctr(
     unit_rows: cutlass.Int32,
     n_ctas: cutlass.Int32,
     tidx: cutlass.Int32,
+    splits: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Publish the live-unit total and seed the persistent claim counter.
 
@@ -272,7 +273,7 @@ def write_thd_live_and_ctr(
             if n_batch == cutlass.Int32(1):
                 s_b = cutlass.Int32(meta[n_batch + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch])
                 live = ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
-            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
     elif tidx < cutlass.Int32(32):
         live = cutlass.Int32(0)
@@ -282,7 +283,7 @@ def write_thd_live_and_ctr(
         for i in cutlass.range_constexpr(5):
             live = live + cute.arch.shuffle_sync_bfly(live, 1 << i)
         if tidx == cutlass.Int32(0):
-            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
 
 

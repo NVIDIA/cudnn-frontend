@@ -120,6 +120,7 @@ class SdpaFwdKnobs:
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
     cga_policy: Optional[int] = None  # runtime width policy, mutually exclusive with cga
+    split_kv_policy: Optional[int] = None  # runtime split policy, mutually exclusive with split_kv
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -131,6 +132,7 @@ class SdpaFwdKnobs:
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
         ("cga_policy", "CGA_POLICY"),
+        ("split_kv_policy", "SPLIT_KV_POLICY"),
     )
 
     def to_public(self) -> dict:
@@ -318,6 +320,7 @@ class Capabilities:
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
     cga_policies: frozenset[int] = frozenset()
+    split_kv_policies: frozenset[int] = frozenset()
     # Shape-specific CGA domains for rows that lower several native flavors.
     # ``cgas`` remains the default. A split-specific entry further narrows the
     # domain for split-KV plans without changing the unsplit public domain.
@@ -683,6 +686,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
             (knobs.cga_policy, capabilities.cga_policies, "cga_policy"),
+            (knobs.split_kv_policy, capabilities.split_kv_policies, "split_kv_policy"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
             if value is not None and value not in domain:
@@ -692,6 +696,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # leg: a ragged graph rides it only as the ragged-Q-over-paged-KV leg
         # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
+        if knobs.split_kv_policy is not None:
+            if not runtime_cga_choices(capabilities, facts) or facts.h_q != 16 or facts.h_kv != 16:
+                return "runtime split policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv=16"
+            if knobs.split_kv is not None:
+                return "split_kv and split_kv_policy are mutually exclusive, including split_kv=1"
+            if knobs.cga_policy not in (1, 2):
+                return "runtime split policy requires an explicit cga_policy for its unsplit members"
         if knobs.cga_policy is not None:
             if not runtime_cga_choices(capabilities, facts):
                 return "runtime CGA policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph"
@@ -1064,6 +1075,7 @@ def _sm100_spec() -> EngineSpec:
             sm_hi=106,
             phase="prefill",
             cga_policies=frozenset({1, 2}),
+            split_kv_policies=frozenset({1}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1823,20 +1835,43 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if reason is not None:
         raise ValueError(reason)
     if knobs is not None and knobs.cga_policy in (1, 2):
-        from cudnn.sdpa.fwd.prepared import PreparedThdChoices
+        from copy import copy
+        from cudnn.sdpa.fwd.prepared import PreparedThdChoices, build_thd_split_spec
 
         variants = [
             spec.lower(
                 spec,
                 facts,
-                replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False),
+                replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False, split_kv_policy=None),
                 thd_pair_acquire=knobs.cga_policy == 2 and cga == 2,
             )
             for cga in (1, 2)
         ]
         selected = variants[0]
-        selected.prepared = PreparedThdChoices(tuple(v.prepared for v in variants), facts.device_sm_count, knobs.cga_policy)
-        selected.workspace_bytes = max(v.workspace_bytes for v in variants)
+        prepared = [v.prepared for v in variants]
+        workspace = max(v.workspace_bytes for v in variants)
+        if knobs.split_kv_policy == 1:
+            from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+            from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+            km = _load_sm100_kernel_module(
+                (192, 128),
+                TemplateParams(
+                    dtype_qkv=2 if facts.dtype == cudnn.data_type.BFLOAT16 else 3,
+                    cta_mma=1,
+                    split_kv=8,
+                    thd_varlen=True,
+                    seq_kv_lens_present=True,
+                    stats_log2=facts.has_stats_log2,
+                    sched_policy=knobs.sched_policy or 0,
+                ),
+            )
+            split = copy(prepared[0])
+            split.spec = build_thd_split_spec(split.spec, km, capacity=128, resident_units=facts.device_sm_count)
+            prepared.append(split)
+            workspace = max(workspace, split.spec.scratch_bytes)
+        selected.prepared = PreparedThdChoices(tuple(prepared), facts.device_sm_count, knobs.cga_policy, knobs.split_kv_policy)
+        selected.workspace_bytes = workspace
         return selected
     return spec.lower(spec, facts, knobs)
 

@@ -371,6 +371,7 @@ class ThdLaunchSpec:
         "lens_form",
         "off_o_desc",
         "scratch_bytes",
+        "split_workspace",
         "neg_inf",
         "device_index",
         "_geometry_cache",
@@ -420,20 +421,24 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     NotImplementedError when the artifact has no positional entry or the host is not the expected shape."""
     km = api._k_mod
     compiled = api._compiled_kernel
+    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
+    return _artifact_positional_order(compiled, host, km.__name__)
+
+
+def _artifact_positional_order(compiled, host, name):
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
     order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
     if order[-1] != "stream":
-        raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
+        raise NotImplementedError(f"{name}: the host entry does not end with the stream parameter: {order[-3:]}")
     wrapper_sig = getattr(compiled, "_kwargs_wrapper", None) or compiled
     try:
         seen = list(inspect.signature(wrapper_sig).parameters)
     except (TypeError, ValueError):
         seen = None
     if seen is not None and seen != order:
-        raise NotImplementedError(f"{km.__name__}: positional ABI {order} disagrees with the compiled wrapper {seen}")
+        raise NotImplementedError(f"{name}: positional ABI {order} disagrees with the compiled wrapper {seen}")
     return raw, compiled, order
 
 
@@ -463,6 +468,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
     s.off_o_desc, s.scratch_bytes = int(plan.off_o_desc), int(plan.scratch_bytes)
+    s.split_workspace = None
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._geometry_cache = None
@@ -519,6 +525,55 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         from cudnn import _pybind_module
 
         s.native = _pybind_module._SdpaThdBinder(s)
+    return s
+
+
+class ThdSplitWorkspace(NamedTuple):
+    splits: int
+    capacity: int
+    off_o: int
+    off_lse: int
+
+
+def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_units: int) -> ThdLaunchSpec:
+    """Prepare a bounded packed-split member without changing its graph contract.
+
+    This is internal lowering, not admission: the owning engine must select a
+    supported module and persist its split policy. The ordinary binder still
+    validates every invocation, including the reserved packed-Q capacity.
+    """
+    from cudnn import _pybind_module
+
+    if not getattr(_pybind_module._SdpaThdBinder, "supports_packed_split", False):
+        raise NotImplementedError("packed split requires the matching native cuDNN Frontend extension")
+    if (base.d_qk, base.d_v) != (192, 128) or base.paged or base.has_sink or base.lse_padded or base.quant is not None:
+        raise ValueError("prepared packed split requires nonpaged half D192/V128 with packed Stats")
+    if capacity <= 0 or capacity > _I32_MAX or resident_units <= 0 or resident_units > _I32_MAX or km.CFG.SPLIT_KV <= 1:
+        raise ValueError("packed split requires positive Int32 capacity and split_kv > 1")
+    dtype = "bfloat16" if km.CFG.DTYPE_QKV == 2 else "float16"
+    if set(base.expect.values()) != {dtype}:
+        raise ValueError("prepared packed split operand dtypes must match the compiled module")
+    if getattr(base, "split_workspace", None) is not None:
+        raise ValueError("prepare a split member from the unsplit graph contract")
+    s = copy(base)
+    compiled = km.compile_thd_split(has_lse=s.has_lse, lse_kind="head" if s.lse_head_major else "token")
+    s.fn, s.owner, s.order = _artifact_positional_order(compiled, km._host_thd_split, km.__name__)
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = [base.template[base.index[name]] if name in base.index else None for name in s.order]
+    s.template[s.index["n_thd_units"]] = resident_units
+    unbound = set(s.order) - set(base.order) - {"lse_partial_ptr", "partial_o_strides"}
+    if unbound:
+        raise NotImplementedError(f"packed split host slots are not bound: {sorted(unbound)}")
+    # Regions remain fixed across calls. The compiled host uses compact actual
+    # token strides inside them, avoiding a batch*max_sequence allocation.
+    splits = int(km.CFG.SPLIT_KV)
+    off_o = (s.scratch_bytes + 255) // 256 * 256
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = (off_lse + splits * capacity * s.qh * 4 + 255) // 256 * 256
+    s.cga_tile_m = int(km.CGA_TILE_M)
+    s._geometry_cache = None
+    s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
 
@@ -901,6 +956,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             seed_padded()
         return None
 
+    split = getattr(spec, "split_workspace", None)
+    if split is not None and t_q > split.capacity:
+        raise ValueError("cudnn.sdpa: packed Q capacity exceeds the prepared split workspace")
+
     if spec.paged:
         t_kv = _bind_paged_kv(spec, frame, ix, facts, k, v, geo.b)
     else:
@@ -925,6 +984,8 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     # device lengths may change during replay within this captured bound.
     # Keep a persistent kernel's smaller resident-cluster limit as well.
     units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    if split is not None:
+        units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
 
     sinks = facts.get("sinks")
@@ -944,6 +1005,12 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
     frame[ix["meta_ptr"]] = workspace_ptr
     frame[ix["o_desc_ptr"]] = workspace_ptr + spec.off_o_desc
+    if split is not None:
+        if workspace_ptr <= 0:
+            raise ValueError("cudnn.sdpa: packed split requires a non-null workspace")
+        frame[ix["o_partial_ptr"]] = workspace_ptr + split.off_o
+        frame[ix["lse_partial_ptr"]] = workspace_ptr + split.off_lse
+        frame[ix["partial_o_strides"]] = (t_q * spec.qh * spec.d_v, spec.qh * spec.d_v, spec.d_v)
     frame[ix["stream"]] = stream
     if spec.has_lse and spec.lse_padded:
         seed_padded()  # declared per-call operation: rows past each length read -inf
@@ -951,19 +1018,21 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
 
 class PreparedThdChoices:
-    """Two immutable THD artifacts selected from current host binding metadata.
+    """Immutable THD artifacts selected from current host binding metadata.
 
     ``spec`` supplies the common device contract to the graph plan; ``variants``
     retain the concrete launch geometry and artifacts. A CUDA capture records
     the selected launch. Device length changes during replay do not reselect.
     """
 
-    def __init__(self, variants, sm_count: int, policy: int = 1):
+    def __init__(self, variants, sm_count: int, policy: int = 1, split_policy=None):
         from cudnn import _pybind_module
 
         self.variants = variants
-        single, pair = variants
-        if single._uids != pair._uids or single._roles != pair._roles:
+        single, pair = variants[:2]
+        if len(variants) != (3 if split_policy is not None else 2):
+            raise ValueError("THD plan choices need two width members and one member for an explicit split policy")
+        if any(single._uids != member._uids or single._roles != member._roles for member in variants[1:]):
             raise ValueError("THD plan choices must bind the same graph operands")
         self.spec = single.spec
         self._roles, self._uids = single._roles, single._uids
@@ -971,7 +1040,7 @@ class PreparedThdChoices:
         factory = getattr(_pybind_module, "_SdpaThdPlanChoices", None)
         if factory is None:
             raise NotImplementedError("THD plan choices require the matching native cuDNN Frontend extension")
-        self.native = factory(single.spec, pair.spec, sm_count, policy)
+        self.native = factory(single.spec, pair.spec, sm_count, policy, variants[2].spec if split_policy is not None else None, split_policy or 0)
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         if self._native_indices is None:

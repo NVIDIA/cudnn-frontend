@@ -755,6 +755,18 @@ only to decline is why `closed_under` existed.
   pointers, and CUDA Graph capture fixes the selected launch; replay does not
   reconsider changing device lengths. No execution-time compilation or
   device-to-host length read is involved.
+- `SPLIT_KV_POLICY=1` explicitly adds a third, eight-way packed split artifact
+  to `CGA_POLICY=1` or `2`, for the same graph domain with `H_q=H_kv=16`.
+  At binding, it selects that artifact only for one sequence, host-observed
+  packed Q capacity in `[1, 128]`, and KV capacity at least 32768; otherwise
+  the recorded CGA policy selects its unsplit artifact. This experimental
+  policy is not proposed by normal heuristics. Any fixed `SPLIT_KV` request,
+  including `1` (off), conflicts with it. The plan reserves partial O/LSE for
+  128 packed rows in caller workspace and compiles setup, attention and combine
+  together. It does not allocate, compile or read lengths back during execution.
+  Padded capacities may choose a different artifact from exact-length buffers.
+  CUDA Graph replay retains the artifact selected during capture even when
+  device prefixes change. A different selection rule needs a new policy value.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's

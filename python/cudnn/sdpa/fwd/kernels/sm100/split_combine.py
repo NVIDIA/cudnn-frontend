@@ -94,11 +94,19 @@ def _combine_kernel(
     # short buffer or a bad offset can never store outside the caller's bytes.
     ragged_o_cap: cutlass.Int32 = 0,
     ragged_lse_cap: cutlass.Int32 = 0,
+    # Packed THD partials use batch=1 and SQ as their token capacity. The
+    # setup kernel supplies the live packed total; never read unwritten tail
+    # partials or overwrite the caller's output padding.
+    total_q: Optional[cute.Tensor] = None,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     q_row = cute.arch.block_idx()[0]
     head = cute.arch.block_idx()[1]
     batch = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(total_q is not None):
+        if q_row >= cutlass.make_array_view(total_q)[0]:
+            nvvm.exit()
 
     op = cutlass.make_array_view(o_partial)
     lp = cutlass.make_array_view(lse_partial)
@@ -252,6 +260,7 @@ def _launch_combine(
     ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stream: _cuda_driver.CUstream = None,
+    total_q: Optional[cute.Tensor] = None,
 ) -> None:
     """One launch for both ABIs: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
@@ -276,6 +285,7 @@ def _launch_combine(
         cutlass.Int32(ragged_divs[2]),
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
+        total_q,
     ).launch(
         grid=(SQ, H, B),
         block=[THREADS, 1, 1],
@@ -307,6 +317,30 @@ def _host_ptr(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _host_ptr_packed(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    total_q_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Combine compact [split, packed token, head, D] partials (B must be 1)."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    total_q = cute.make_tensor(total_q_ptr, cute.make_layout((1,), stride=(1,)))
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream, total_q
+    )
 
 
 @cute.jit
@@ -413,6 +447,7 @@ def compile_ptr(
     has_amax: bool = False,
     has_scale_o: bool = False,
     has_scale_o_input: bool = True,
+    packed: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -435,6 +470,8 @@ def compile_ptr(
         raise ValueError("scaled combine requires a scale_o input")
     if quantized and ragged:
         raise ValueError("the quantized pointer entry serves dense split launches")
+    if packed and (ragged or quantized):
+        raise ValueError("packed THD partials require the half pointer entry without ragged final placement")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
@@ -453,7 +490,9 @@ def compile_ptr(
         (cutlass.Int64(0),) * 4,
         (cutlass.Int64(0),) * 3,
     )
-    if quantized:
+    if packed:
+        entry, extra = _host_ptr_packed, (P(cutlass.Int32),)
+    elif quantized:
         entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o))
     elif ragged:
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the

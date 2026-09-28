@@ -308,7 +308,7 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.split_kv > 1:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
-        if k.thd_varlen:
+        if k.thd_varlen and not (flavor == "d128" and k.single_q_head_dim == 192 and k.cta_mma == 1 and not fp8 and not k.paged_kv):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
             # The sink logit is folded into the softmax denominator in the
@@ -1711,7 +1711,7 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (not cfg.THD_VARLEN or (cfg.TILE_K == 192 and not cfg.PAGED_KV and cfg.SPLIT_KV == 1), "single-Q THD: unsplit, nonpaged D192 only"),
+        (not cfg.THD_VARLEN or (cfg.TILE_K == 192 and not cfg.PAGED_KV), "single-Q THD: nonpaged D192 only"),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
             "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
@@ -1743,8 +1743,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     d_qk = params.single_q_head_dim
     if d_qk not in (128, 192):
         raise ValueError("single-Q tile: QK width must be 128 or 192")
-    if params.thd_varlen and (d_qk != 192 or params.paged_kv or params.split_kv != 1):
-        raise ValueError("single-Q THD: unsplit, nonpaged D192 only")
+    if params.thd_varlen and (d_qk != 192 or params.paged_kv):
+        raise ValueError("single-Q THD: nonpaged D192 only")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)

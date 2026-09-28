@@ -82,6 +82,9 @@ enum class KnobType_t : int64_t {
     // Selection among precompiled CTA-group widths from host-known geometry.
     // The engine declares the policy values; distinct from a fixed TILE_CGA_M.
     CGA_POLICY = 1010,
+    // Selection among precompiled KV-split strategies from host geometry;
+    // distinct from a fixed SPLIT_KV count.
+    SPLIT_KV_POLICY = 1011,
     // Knobs are performance-only: a plan must compute the same function
     // whichever knob values it runs with, so an autotuner may pick any of
     // them. Anything that changes numerics (e.g. a reduced-precision softmax
@@ -102,6 +105,7 @@ static_assert(static_cast<int64_t>(KnobType_t::TILE_CGA) == 32, "backend-mirror 
 static_assert(static_cast<int64_t>(KnobType_t::SCHED_POLICY) == FRONTEND_KNOB_TYPE_BASE,
               "frontend-only knobs start at FRONTEND_KNOB_TYPE_BASE");
 static_assert(static_cast<int64_t>(KnobType_t::CGA_POLICY) == 1010, "frontend-only knob values are append-only");
+static_assert(static_cast<int64_t>(KnobType_t::SPLIT_KV_POLICY) == 1011, "frontend-only knob values are append-only");
 
 class Knob {
    public:

@@ -488,7 +488,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         ``qh_per_kh`` / ``seqlen_kv`` are the LPT_L2 cost-model inputs; they are
         opaque here and forwarded to the flavor's dispatcher unchanged.
         """
-        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT and not getattr(CFG, "THD_VARLEN", 0)):
             raw, split = _lpt_split_of(bidx, n_q_supers, n_qh, n_batch)
             q, h, b = dispatch_decode_initial(raw, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
             return q, h, b, split
@@ -500,7 +500,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     @cute.jit
     def _decode_payload_split(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         """decode_payload + split index; ``t0`` is the try_cancel cluster-base id."""
-        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT and not getattr(CFG, "THD_VARLEN", 0)):
             raw, split = _lpt_split_of(t0, n_q_supers, n_qh, n_batch)
             q, h, b = dispatch_decode_payload(raw, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
             return q, h, b, split
@@ -816,6 +816,12 @@ def make_sdpa_helpers(
     @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        split = cutlass.Int32(0)
+        if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
+            # Split is the low digit of the live ragged work list. Both
+            # initial admission and persistent claims use this same mapping.
+            split = u % cutlass.Int32(CFG.SPLIT_KV)
+            u = u // cutlass.Int32(CFG.SPLIT_KV)
         cu = cutlass.make_array_view(seq_kv_lens_t)
         cuq0 = n_batch
         acc = cutlass.Int32(0)
@@ -876,7 +882,7 @@ def make_sdpa_helpers(
             done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
             acc = acc + units_b
         q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
-        return q_super, f_head, f_batch
+        return q_super, f_head, f_batch + split * n_batch
 
     @cute.jit
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
@@ -1189,7 +1195,8 @@ def sdpa_operand_tensors(
     "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
     B, QH, KH, SQ, SKV, _ = problem_size
     q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
-    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd)
+    packed_split = thd and split_kv > 1
+    o = _bshd(o_ptr, split_kv if packed_split else B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd and not packed_split)
     if paged:
         k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
         v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)
@@ -1207,7 +1214,7 @@ def sdpa_operand_tensors(
         lse = cute.make_tensor(lse_ptr, cute.make_layout((B, QH, lse_ext, 1), stride=(l0, l1, l2, 1)))
     else:
         l0, l1, l2 = lse_strides
-        lse = cute.make_tensor(lse_ptr, cute.make_layout((B * split_kv, QH, SQ), stride=(l0, l1, l2)))
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((split_kv if packed_split else B * split_kv, QH, SQ), stride=(l0, l1, l2)))
     sinks = _vec(sinks_ptr, QH)
     if thd:
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots

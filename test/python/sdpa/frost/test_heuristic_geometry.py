@@ -77,6 +77,33 @@ def test_runtime_cga_policy_records_remain_rebuildable(policy):
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
 
 
+@pytest.mark.parametrize("cga_policy", [1, 2])
+def test_runtime_split_policy_record_is_explicit_and_not_implicitly_recommended(cga_policy):
+    facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    knobs = heur.SdpaFwdKnobs(cga_policy=cga_policy, split_kv_policy=1)
+    assert mismatch(SPEC.capabilities, facts, knobs) is None
+    record = knobs.to_public()
+    assert record[cudnn.knob_type.SPLIT_KV_POLICY] == 1
+    assert cudnn.knob_type.SPLIT_KV not in record
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in record.items()}) == knobs
+    assert all(k.split_kv_policy is None for k in heur._knob_sets(SPEC, facts))
+
+
+@pytest.mark.parametrize(
+    "bad", [{"split_kv": 1}, {"split_kv": 2}, {"cga_policy": None}, {"cga": 1}, {"pack_gqa": True}, {"split_kv_policy": 0}, {"split_kv_policy": 2}]
+)
+def test_runtime_split_policy_preserves_fixed_requests(bad):
+    facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    knobs = heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=1)
+    assert mismatch(SPEC.capabilities, facts, replace(knobs, **bad)) is not None
+
+
+@pytest.mark.parametrize("bad", [{"h_q": 32}, {"h_kv": 2}, {"has_paged_kv": True}, {"causal": True}, {"device_cc": (10, 7)}, {"shape_overrides": False}])
+def test_runtime_split_policy_declines_unmeasured_graph_domains(bad):
+    facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    assert mismatch(SPEC.capabilities, replace(facts, **bad), heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=1)) is not None
+
+
 @pytest.mark.parametrize("overrides", [{}, {"cta_mma": 1}, {"split_kv": 2}, {"thd_varlen": False}, {"paged_kv": True, "page_size": 128}, {"dtype_qkv": 0}])
 def test_thd_pair_acquire_lowering_is_bounded(overrides):
     from cudnn.sdpa.fwd import config_sm100, config_sm107

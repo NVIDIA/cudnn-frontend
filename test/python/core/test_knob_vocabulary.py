@@ -81,6 +81,7 @@ def test_frontend_only_band():
         "WARPS_M": 1008,
         "WARPS_N": 1009,
         "CGA_POLICY": 1010,
+        "SPLIT_KV_POLICY": 1011,
     }
     # The frontend band is persisted too: append-only, frozen here like the backend band.
     assert {name: int(member) for name, member in kt.__members__.items() if cudnn.is_frontend_knob_type(member)} == fe_only
@@ -90,7 +91,7 @@ def test_frontend_only_band():
     assert kt(1002) == kt.SPLIT_KV and int(kt(1002)) == 1002
 
 
-@pytest.mark.parametrize("knob", ["SPLIT_KV", "CGA_POLICY"])
+@pytest.mark.parametrize("knob", ["SPLIT_KV", "CGA_POLICY", "SPLIT_KV_POLICY"])
 def test_frontend_only_knob_is_refused_by_a_backend_plan(knob):
     """A frontend-only knob has no backend counterpart; handing one to a
     backend engine must fail loudly rather than silently mis-map."""
