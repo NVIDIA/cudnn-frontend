@@ -564,7 +564,7 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     compile_kwargs = dict(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
     if not mx:
         compile_kwargs.update(d_qk=d_qk, d_v=d_v)
-    fn = mod.compile(**compile_kwargs)
+    fn = mod.compile(**compile_kwargs) if mx else mod.compile_prepared(d_qk=d_qk, d_v=d_v, has_lse=True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(splits, torch.float16))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
@@ -582,32 +582,53 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
 
         q, k, v = mk(B, SQ, H, d_qk), mk(B, SKV, H, d_qk), mk(B, SKV, H, d_v)
 
-        # The FP8 entry takes four 1-element fp32 DEVICE scale tensors
-        # (descale_q/k/v, scale_o) — the scales fold in-kernel — and no Amax_S.
-        def one():
-            return torch.ones(1, dtype=torch.float32, device=dev)
+        # Bind the pointer ABI directly to preserve inspection of partial O/LSE
+        # before combine. Keep every scalar owner alive until the final sync.
+        import cutlass.cute as cute
 
-        # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
+        scales = [torch.ones(1, dtype=torch.float32, device=dev) for _ in range(4)]
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
+        storage_dtype = cutlass.Float8E5M2 if dtype_qkv == DTYPE_E5M2 else cutlass.Float8E4M3FN
+
+        def ptr(t, dtype, align=16):
+            return cute.runtime.make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+        def strides(t):
+            return tuple(cutlass.Int64(n) for n in t.stride()[:3])
+
         fn(
-            q,
-            k,
-            v,
-            o_p,
-            lse_p,
-            zH,
-            zB,
-            o_desc,
+            ptr(q, storage_dtype),
+            ptr(k, storage_dtype),
+            ptr(v, storage_dtype),
+            ptr(o_p, cutlass.Float32 if splits > 1 else cutlass.Float16),
+            ptr(lse_p, cutlass.Float32, 4),
+            ptr(zH, cutlass.Float32),
+            ptr(zB, cutlass.Int32),
+            ptr(o_desc, cutlass.Int64),
             ps,
+            strides(q),
+            strides(k),
+            strides(v),
+            strides(o_p),
+            strides(lse_p),
+            cutlass.Int32(SQ),
             log2e,
-            cutlass.Float32(1.0),
             cutlass.Int32(0),
-            one(),
-            one(),
-            one(),
-            one(),
-            amax_o,
-            **_partial_kwargs(splits, o_p),
+            cutlass.Int64(0),
+            None,
+            None,
+            None,
+            ptr(o_p, cutlass.Float32) if splits > 1 else None,
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0)),
+            cutlass.Int32(0),
+            *(ptr(t, cutlass.Float32, 4) for t in scales),
+            ptr(amax_o, cutlass.Float32, 4),
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+            None,
             stream=stream,
         )
         qf, kf, vf = (t.float().permute(0, 2, 1, 3) for t in (q, k, v))
@@ -1512,7 +1533,9 @@ def test_quantized_split_reduces_in_half_not_in_the_output_type(out_dtype):
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        return api.scratch_workspace_bytes()
+        # Conversion O belongs to caller scratch now. Remove that separately
+        # sized final-output region when comparing the partial reservations.
+        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
 
     assert carved(out_dtype) == carved(torch.float16) > 0
 
@@ -1586,7 +1609,9 @@ def test_api_d256_quantized_split_reduces_in_half():
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        return api.scratch_workspace_bytes()
+        # Conversion O belongs to caller scratch now. Remove that separately
+        # sized final-output region when comparing the partial reservations.
+        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
 
     assert carved(torch.float8_e4m3fn) == carved(torch.float16) > 0
 
@@ -1659,7 +1684,9 @@ def test_split_workspace_is_sized_for_fp32_partials(split):
     run past the end of the O slab, over the LSE slab that follows it and then
     over whatever the caller placed after the workspace."""
     b, h_q, s_q, d = 1, 8, 512, 128
-    _api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
+    api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
+    assert {region[0] for region in api._staged_spec.regions} == {"q", "o"}
+    wsb -= b * h_q * s_q * d * (1 + torch.float16.itemsize)  # gathered FP8 Q and final half O
     o_bytes = split * b * s_q * h_q * d * 4
     lse_bytes = split * b * h_q * s_q * 4
     assert wsb >= o_bytes + lse_bytes, f"workspace {wsb} cannot hold fp32 partials ({o_bytes} O + {lse_bytes} LSE)"
@@ -1675,12 +1702,12 @@ def test_fp32_partials_compile_the_combine_for_f32():
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     seen = []
-    orig = comb.compile
+    orig = comb.compile_ptr
     try:
-        comb.compile = lambda **kw: (seen.append(kw), orig(**kw))[1]
+        comb.compile_ptr = lambda **kw: (seen.append(kw), orig(**kw))[1]
         _fp32_partials_api(4)
     finally:
-        comb.compile = orig
+        comb.compile_ptr = orig
     assert seen, "the combine was never compiled"
     assert seen[0]["dtype_partial"] == "f32", f"combine partial dtype is {seen[0]['dtype_partial']!r}"
 
@@ -1691,7 +1718,9 @@ def test_fp32_partials_fold_off_without_a_split():
     fold away and leave the single-pass SMEM/TMA epilogue byte-identical."""
     api, _got, _ref, wsb = _fp32_partials_api(1)
     assert not api._fp32_partial_split()
-    assert wsb == 0
+    assert api._staged_spec.core.combine is None
+    # Dense conversion still owns Q/O scratch and the core scalar dummies.
+    assert wsb == 1 * 8 * 512 * 128 * (1 + torch.float16.itemsize) + 128
 
 
 # --- narrow head dims under a split -----------------------------------------

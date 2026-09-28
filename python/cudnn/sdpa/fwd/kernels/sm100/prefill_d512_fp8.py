@@ -41,7 +41,7 @@ them is derived from ``CFG`` rather than spelled as a literal:
 MXFP8 (block-scale) is NOT served by this file — d512 has no MXFP8 kernel.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
 from dataclasses import dataclass
@@ -2240,7 +2240,7 @@ def _host(
     # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None (and
     # absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT. Directly
     # after amax_o, then the THD slots: the quantized adapter paths pass both
-    # positionally in that order (api_dsl._execute_fp8 / _execute_thd).
+    # positionally in that order through the shared prepared host.
     seq_q_lens_addr: cutlass.Int64 = 0,
     # THD device metadata build (issue #552): the CALLER's Q/KV length
     # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
@@ -2379,119 +2379,6 @@ def _host(
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CGA_M, CFG.CGA_N, 1),
         stream=stream,
-    )
-
-
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    d_qk: int = CFG.TILE_K,
-    d_v: int = CFG.TILE_O,
-    has_lse: bool = True,
-    lse_head_major: bool = False,
-    lse_head_stride: int = 0,
-    lse_padded_rows: int = 0,
-    lse_padded_order: tuple = (3, 2, 1, 0),
-    dynamic_bhk: bool = False,
-    q_stride: Optional[tuple] = None,
-    k_stride: Optional[tuple] = None,
-    v_stride: Optional[tuple] = None,
-    o_stride: Optional[tuple] = None,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-) -> Callable:
-    """Compile the remaining dense tensor entry (split, paged, or conversions).
-
-    THD uses compile_prepared for every supported output dtype. Its former
-    fake token/head/Stats layouts are intentionally absent from this entry.
-    Dense dimensions and declared strides remain compile-time metadata;
-    paged pool and table capacities, where supported, remain dynamic.
-    """
-    _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise ValueError("SM100 FP8 THD uses compile_prepared; the tensor entry is dense-only")
-    if dynamic_bhk or lse_head_major or lse_head_stride or lse_padded_rows:
-        raise ValueError("THD layout parameters belong to compile_prepared")
-    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
-        raise ValueError(f"d512 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
-    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
-        raise ValueError(f"d512 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
-    if SPLIT_KV > 1 and not has_lse:
-        raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if lse_stride is not None and SPLIT_KV > 1:
-        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
-    _fake_batch = b
-    _o_batch = _fake_batch * SPLIT_KV
-    _lse_batch = b * SPLIT_KV
-
-    def _fake_bshd(shape, stride, dtype=STORAGE_DTYPE, bpe=CFG.BPE):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if stride[3] != 1:
-            raise ValueError(f"declared stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-        for axis in (1, 2):  # seq/head global strides feed TMA: 16-byte rule
-            if (stride[axis] * bpe) % 16 != 0:
-                raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
-        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
-
-    fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
-    fake_k = _fake_bshd((_fake_batch, skv, kh, d_qk), k_stride)
-    fake_v = _fake_bshd((_fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd(
-        (_o_batch, sq, qh, d_v), o_stride, dtype=cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE, bpe=4 if _FP32_PARTIALS else CFG.BPE_O
-    )
-    if lse_padded_rows:
-        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
-    if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
-        fake_lse = None
-    else:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only")
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (_lse_batch, qh, sq),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
-        )
-    from cudnn.sdpa.fwd.kernels._fp8_host import make_fake_aux
-
-    aux = make_fake_aux(b, qh, amax_align=4)
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        aux.sinks,
-        aux.kv_lens,
-        aux.o_desc,
-        (b, qh, kh, sq, skv, 0),
-        cutlass.Float32(0.0),  # scale_softmax_log2 base (traced value only)
-        cutlass.Float32(0.0),  # o_scale_fused base (traced value only)
-        cutlass.Int32(0),
-        *aux.scales,
-        aux.amax_o,
-        aux.seq_q_lens,
-        None,
-        None,
-        None,
-        *((fake_o,) if _FP32_PARTIALS else ()),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
     )
 
 

@@ -182,6 +182,50 @@ def test_staged_first_capture_rebinds_current_storage_and_stream(d, fp8, monkeyp
 
 
 @pytest.mark.parametrize("fp8", [False, True])
+def test_staged_default_stream_is_resolved_for_q_device(fp8, monkeypatch):
+    from cudnn import _torch_stream
+
+    api, tensors, storage = _case(fp8=fp8)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    target = torch.cuda.Stream(device=api.q_desc.device)
+    target.wait_stream(torch.cuda.current_stream())
+    original = _torch_stream._raw_current_stream
+    devices = []
+
+    def resolve(torch_module, device):
+        assert device == api.q_desc.device
+        devices.append(device)
+        return original(torch_module, device)
+
+    monkeypatch.setattr(_torch_stream, "_raw_current_stream", resolve)
+    monkeypatch.setattr(api, "_get_default_stream", lambda *_: pytest.fail("default stream resolved from ambient device"))
+    with torch.cuda.stream(target):
+        _execute(api, tensors, workspace)
+    torch.cuda.current_stream().wait_stream(target)
+    assert devices
+    _check(tensors, storage)
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_staged_default_stream_with_another_device_current(fp8):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    device = torch.cuda.current_device()
+    api, tensors, storage = _case(fp8=fp8)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    target = torch.cuda.Stream(device=device)
+    target.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(target):
+        with torch.cuda.device((device + 1) % torch.cuda.device_count()):
+            _execute(api, tensors, workspace)
+            assert torch.cuda.current_device() != device
+    torch.cuda.current_stream(device).wait_stream(target)
+    _check(tensors, storage)
+
+
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "bad",
     [
@@ -237,6 +281,19 @@ def test_staged_amax_alias_checks_original_operand(role, monkeypatch):
     monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased Amax reached staging"))
     with pytest.raises(ValueError, match="amax_o overlaps"):
         _execute(api, tensors, workspace)
+
+
+@pytest.mark.parametrize("block", [16, 32])
+@pytest.mark.parametrize("role", ["q", "o"])
+def test_staged_sf_alias_checks_original_operand(block, role, monkeypatch):
+    from test_sdpa_prepared_block_output import _fp8_case
+
+    g, vp, ws, _, sf, _, ts = _fp8_case(block, stats=True, staged=True)
+    source = vp[ts[role]].view(torch.uint8)
+    vp[ts["sf_o"]] = source.as_strided((sf.numel(),), (1,)).view(sf.shape)
+    monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("aliased SF output reached staging"))
+    with pytest.raises(ValueError, match="sf_o overlaps"):
+        g.execute(vp, ws)
 
 
 @pytest.mark.gpu_exclusive
