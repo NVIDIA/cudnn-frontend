@@ -1818,7 +1818,9 @@ def test_gate_check_support_declines_typed(monkeypatch):
         api = _gate_api(dtype=dt)
         assert api.check_support()
         assert api.gate_desc is not None and api.gate_desc.dtype == dt
-        assert api._gate_declared is None, "a compact G declares no stride"
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        assert dense_bind_strides(tuple(api.gate_desc.shape), tuple(api.gate_desc.stride), dt.itemsize) is not None
         assert api.template_params().epilogue_gate is True
     assert _gate_api(with_gate=False).template_params().epilogue_gate is False
     assert _gate_api(fp8=True).check_support(), "bf16 G on the per-tensor FP8 path"
@@ -2096,7 +2098,19 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
     dt = torch.bfloat16
     q, k, v, gate = _gate_problem(b, h, h, s, d, dt)
     api_c, out_c, lse_c = _run_gated(q, k, v, gate, causal=True)
-    assert api_c._gate_declared is None
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+
+    def check_binding(api, values, output, stats, expected):
+        spec = api._dense_spec
+        facts = {name: facts_of_tensor(t) for name, t in zip(("q", "k", "v", "gate", "o", "lse"), (*values, output, stats))}
+        stream = torch.cuda.current_stream().cuda_stream
+        frame = bind_dense(spec, facts, driver.CUstream(stream), stream)
+        for role, strides in expected.items():
+            assert frame[spec.index[role + "_ptr"]] == facts[role].ptr
+            assert frame[spec.index[role + "_strides"]] == strides
+
+    check_binding(api_c, (q, k, v, gate), out_c, lse_c, {"gate": (s * h * d, h * d, d)})
 
     n = 4 * h * d  # a [B, S, N] slab: q | k | v | gate column blocks
     slab = torch.zeros(b, s, n, device="cuda", dtype=dt)
@@ -2107,13 +2121,11 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
 
     # G strided alone.
     api_g, out_g, lse_g = _run_gated(q, k, v, sliced[3], causal=True)
-    assert api_g._gate_declared == (s * n, n, d, 1), api_g._gate_declared
-    assert api_g._bshd_zero_copy_stride(api_g.gate_desc, 2) == (s * n, n, d, 1)
+    check_binding(api_g, (q, k, v, sliced[3]), out_g, lse_g, {"gate": (s * n, n, d)})
     assert torch.equal(out_g, out_c) and torch.equal(lse_g, lse_c), "a strided G must read bitwise as the compact one"
     # Everything strided (the block's layout).
     api_s, out_s, lse_s = _run_gated(*sliced, causal=True)
-    assert api_s._gate_declared == (s * n, n, d, 1)
-    assert all(st == (s * n, n, d, 1) for st in api_s._bshd_declared[:3]), api_s._bshd_declared
+    check_binding(api_s, sliced, out_s, lse_s, dict.fromkeys(("q", "k", "v", "gate"), (s * n, n, d)))
     assert torch.equal(out_s, out_c) and torch.equal(lse_s, lse_c), "strided Q/K/V/G must read bitwise as compact"
 
 
@@ -2955,3 +2967,20 @@ def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spi
     for name, want in (("SYNCS_PHASECHK", n_syncs), ("USYNCS_PHASECHK", n_usyncs), ("NANOSLEEP", n_sleep)):
         slack = _WAIT_FORM_SLACK[name]
         assert abs(stats[name] - want) <= slack, f"{name} = {stats[name]}, pinned {want} +- {slack} for SPIN_RING_WAITS={spin}"
+
+
+# The CI arch targets select this module explicitly; imported tests need L0.
+import test_sdpa_staged_forward_half as _staged_half_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestStagedHalf:
+    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
+    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
+    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
+    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
