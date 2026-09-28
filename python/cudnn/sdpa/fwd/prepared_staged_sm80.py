@@ -21,6 +21,7 @@ class StagedLaunch:
     regions: tuple
     workspace_bytes: int
     copies: tuple
+    rope: object
 
 
 def _layout(api):
@@ -60,6 +61,7 @@ def _compile_core(device_index, *args):
 
 def compile_plan(api):
     from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.rope_table_sm80 import compile_plan as compile_rope
     from .kernels.sm80.staged_copy import compile_gather
     from .kernels.staged_copy import compile_copy
 
@@ -79,7 +81,8 @@ def compile_plan(api):
         if fn is None:
             raise NotImplementedError("SM80 staged copy requires a positional tvm-ffi entry")
         copies.append((artifact, fn, group))
-    return StagedLaunch(core, operands, regions, required, tuple(copies))
+    rope = compile_rope(api._rope_max_s, api.flavor_d_qk // 2, api.q_desc.device) if api._rope_max_s else None
+    return StagedLaunch(core, operands, regions, required, tuple(copies), rope)
 
 
 def _copy(entry, frame, stream_int):
@@ -140,12 +143,9 @@ def execute(api, tensors, workspace, stream, scale, *, rope_freqs=None):
             # temporary table alive through the core launch.
             rope = None
             if rope_freqs is not None:
-                d2 = api.flavor_d_qk // 2
-                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
-                api._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
-                api._value_error_if(rf.shape[0] != api._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({api._rope_max_s})")
-                angles = rf[:, :d2]
-                rope = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+                from cudnn.sdpa.rope_table_sm80 import prepare as prepare_rope
+
+                rope = prepare_rope(staged.rope, rope_freqs, device, stream_int)
                 facts["rope"] = facts_of_tensor(rope)
             # All core/auxiliary validation precedes the first workspace write.
             frame = bind(staged.core, facts, stream_int, scale=scale)
