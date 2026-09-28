@@ -229,7 +229,7 @@ def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     what the adapter would reject:
 
       * head dim innermost-contiguous (stride 1);
-      * seq and head strides 16-byte multiples (they are TMA global strides);
+      * every stepped batch, seq and head stride is a 16-byte multiple;
       * the declaration COVERS the tensor (head >= d, seq >= h*head,
         batch >= s*seq) -- an overlapping declaration aliases distinct rows.
 
@@ -240,18 +240,10 @@ def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     """
     if len(dim) != 4 or len(stride) != 4:
         return False
-    b, h, s, d = (int(x) for x in dim)
-    bs, hs, ss, es = (int(x) for x in stride)  # BHSD-logical strides
-    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return True  # BSHD-compact
-    if es != 1:
-        return False
-    per16 = 16 // max(1, int(elem_bytes))
-    if ss % per16 or hs % per16:
-        return False
-    if hs < d or ss < h * hs or bs < s * ss:
-        return False
-    return True
+    from cudnn.sdpa.fwd.config_sm100 import bshd_compact, bshd_zero_copy_stride
+
+    dim, stride = tuple(int(x) for x in dim), tuple(int(x) for x in stride)
+    return bshd_compact(dim, stride) or bshd_zero_copy_stride(dim, stride, max(1, int(elem_bytes))) is not None
 
 
 @dataclass(frozen=True)

@@ -426,3 +426,8 @@ does not follow it. A subprocess-based GPU test must check architecture in the
 parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
 Keep genuine child failures failing on supported devices. The half SDPA artifact
 reload detector is re-exported through `TestStagedHalf` and covers this boundary.
+
+Gate layout admission must share the adapter's TMA predicate, including batch
+stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
+an unaligned batch pitch. `test_gate_batch_stride_alignment` covers FP8, half
+and float element widths and the non-stepped singleton-batch control.
