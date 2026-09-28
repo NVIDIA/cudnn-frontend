@@ -802,9 +802,13 @@ def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
     recipe against their OWN oracle (``check()``, the fixture-parametrized accept cases); against EACH OTHER they differ by
     exactly the e4m3 rounding of dS (3 mantissa bits, 2^-4 relative per element, an e4m3 midpoint flip per value) -- a
     per-element flip budget cannot hold between them and is not claimed.  What is pinned: the dequantized dQ / dK of the two
-    chains agree within the fp8 recipe (atol 0.08 / rtol 0.2) on all but the near-cancelling elements the dS rounding moves
-    (<= 1 % of elements; MEASURED on c05 2026-09-28: see the printed line), with no single element off by more than 0.5, and
-    nothing non-finite.  The numbers are printed so a drift shows up in the log before it crosses the pin."""
+    chains disagree (outside the fp8 recipe, atol 0.08 / rtol 0.2) on NO MORE elements than the two fp64 ORACLES do under the
+    same two dS roundings (``refs``: the quantized-dS oracle behind the e4m3 run, the fp32-dS oracle behind the bf16 run --
+    sdpa-invariants s8, the reference composes the same conditions), and no single element is farther apart than the oracle
+    pair's farthest (or 0.5).  The fraction is a property of the CASE, not of the kernels: MEASURED on c05 2026-09-28 (kernel
+    pair / oracle pair) dQ 0.25 / 0.25 % on every case; dK 0.25 / 0.25 % dense, <= 1 % causal (MHA), but 5.519 / 5.521 % on
+    gqa-causal (four q-heads' partials summed into one dK, more near-cancelling elements) -- a fixed 1 % pin failed there while
+    each chain was 0 % outside its own oracle.  The numbers are printed so a drift shows up in the log before it crosses the pin."""
     e4m3 = _run_on_knob(monkeypatch, DTYPE_E4M3, **case).check()
     bf16 = _run_on_knob(monkeypatch, DTYPE_BF16, **case).check()
     assert e4m3.ds_knob == DTYPE_E4M3 and bf16.ds_knob == DTYPE_BF16
@@ -818,11 +822,23 @@ def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
         diff = (a - b).abs()
         outside = diff > _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * b.abs()
         frac = outside.float().mean().item()
+        # The same metric on the two fp64 oracles (each run's ``refs`` is the oracle with ITS dS rounding, dequantized by ITS
+        # descale): what the e4m3 rounding of dS alone moves on this case.
+        ref_q = e4m3.refs[name].float() * e4m3.descales[name]
+        ref_f = bf16.refs[name].float() * bf16.descales[name]
+        diff_ref = (ref_q - ref_f).abs()
+        frac_ref = (diff_ref > _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * ref_f.abs()).float().mean().item()
         print(
             f"\n{name} e4m3-dS vs bf16-dS chain ({case}): {int(outside.sum())} of {a.numel()} outside the recipe ({100 * frac:.3f} %), max |diff| {diff.max().item():.4f}"
+            f" -- the oracle pair under the same two dS roundings: {100 * frac_ref:.3f} %, max |diff| {diff_ref.max().item():.4f}"
         )
-        assert frac <= 0.01, f"{name}: the two chains disagree on {100 * frac:.2f} % of elements -- more than the e4m3 dS rounding noise explains"
-        assert diff.max().item() <= 0.5, f"{name}: max |diff| {diff.max().item():.3f} between the chains exceeds the dS-rounding bound"
+        assert frac <= frac_ref + 1e-3, (
+            f"{name}: the two chains disagree on {100 * frac:.3f} % of elements, the two oracles on {100 * frac_ref:.3f} % -- "
+            "more than the e4m3 dS rounding explains (each chain still passed the recipe against its own oracle above)"
+        )
+        assert diff.max().item() <= max(
+            0.5, diff_ref.max().item() + _FP8_GRAD_TOL["atol"]
+        ), f"{name}: max |diff| {diff.max().item():.3f} between the chains exceeds the oracle pair's {diff_ref.max().item():.3f} (+ atol) / 0.5"
 
 
 @requires_rubin
@@ -1269,11 +1285,19 @@ def test_kernel_level_e4m3_ds_workspace_is_the_scaled_quantized_ds(stem):
     got = ds.cpu()
     want_codes = (ref_ds * dp_scale).to(_T_E4M3)
     assert torch.isfinite(got.float()).all(), "e4m3 dS: non-finite code (a NaN residue or a saturated scale)"
-    exact = (got.view(torch.int8) == want_codes.view(torch.int8)).float().mean().item()
+    # VALUE-exact, not int8-exact: e4m3 has a signed zero, and the two sides spell a masked cell's zero differently -- the kernel
+    # leaves a skipped causal tile at the zero fill's +0 while the fp64 oracle's ``P * (dP - delta)`` is ``-0.0`` wherever
+    # ``dP - delta < 0`` (44 % of the skipped cells on the causal dump, 2026-09-28 c05: 21.9 % of ALL codes read "different" on an
+    # int8 compare with every unmasked cell exact).  -0 and +0 are one value to the fp8 GEMM; the count is reported, never pinned.
+    exact = (got.float() == want_codes.float()).float().mean().item()
+    n_signed_zero = int(((got.view(torch.int8) != want_codes.view(torch.int8)) & (got.float() == want_codes.float())).sum())
     step = (got.float() - want_codes.float()).abs()
     ulp = torch.maximum(want_codes.float().abs() * 2.0**-3, torch.full_like(step, 2.0**-9))  # one e4m3 code spacing at |x| (subnormal floor 2^-9)
     n_far = int((step > ulp * 1.0001).sum())
-    print(f"\n{stem}: e4m3 dS codes: {100 * exact:.3f} % bitwise the fp64 dS's code, {n_far} of {got.numel()} more than one code apart; scale_dP={dp_scale}")
+    print(
+        f"\n{stem}: e4m3 dS codes: {100 * exact:.3f} % value-exact the fp64 dS's code ({n_signed_zero} differ only in the sign of zero), "
+        f"{n_far} of {got.numel()} more than one code apart; scale_dP={dp_scale}"
+    )
     assert n_far == 0, "an e4m3 dS code more than one step from the fp64 dS's code: a scrambled chunk, not a midpoint flip"
     assert exact >= 0.99, f"only {100 * exact:.2f} % of the e4m3 dS codes match the fp64 dS's -- midpoint flips are rare, this is not them"
     torch.testing.assert_close(
