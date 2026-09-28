@@ -30,6 +30,7 @@ add_executable(
     tensor.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
+    shared_memory_limit.cpp
 )
 
 if (MSVC)

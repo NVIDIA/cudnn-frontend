@@ -68,7 +68,8 @@ inline error_t
 create_engine(backend_descriptor& engine,
               int64_t const engine_id,
               cudnnBackendDescriptor_t op_graph,
-              std::shared_ptr<const DeviceProperties> device_properties = nullptr) {
+              std::shared_ptr<const DeviceProperties> device_properties = nullptr,
+              int64_t shared_memory_limit                               = -1) {
     _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
         engine.get_ptr(), CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &op_graph));
 
@@ -92,18 +93,28 @@ create_engine(backend_descriptor& engine,
 #endif
     }
 
+#if (CUDNN_VERSION >= 92700)
+    _CUDNN_CHECK_CUDNN_ERROR(detail::set_shared_memory_limit_if_supported(
+        engine.get_ptr(), CUDNN_ATTR_ENGINE_SHARED_MEMORY_LIMIT, shared_memory_limit));
+#else
+    (void)shared_memory_limit;
+#endif
+
     _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(engine.get_ptr()));
 
     return {error_code_t::OK, ""};
 }
 
 inline error_t
-query_knobs(int64_t const engine_id, cudnnBackendDescriptor_t op_graph, std::vector<Knob>& knobs) {
+query_knobs(int64_t const engine_id,
+            cudnnBackendDescriptor_t op_graph,
+            std::vector<Knob>& knobs,
+            int64_t shared_memory_limit = -1) {
     detail::backend_descriptor engine(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     RETURN_CUDNN_FRONTEND_ERROR_IF(engine.get_status() != CUDNN_STATUS_SUCCESS,
                                    error_code_t::CUDNN_BACKEND_API_FAILED,
                                    "Failed to create engine's backend descriptor.");
-    CHECK_CUDNN_FRONTEND_ERROR(detail::create_engine(engine, engine_id, op_graph));
+    CHECK_CUDNN_FRONTEND_ERROR(detail::create_engine(engine, engine_id, op_graph, nullptr, shared_memory_limit));
 
     // Initialize a backend descriptor for each knob type
     // The size of the array should be CUDNN_KNOB_TYPE_COUNTS, as currently we dont know how many knobs the engine will
