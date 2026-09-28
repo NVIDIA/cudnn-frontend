@@ -100,10 +100,16 @@ def _code_lines(src):
 
 def _code_only(src):
     """Source with EVERY string literal and comment blanked (spans replaced by spaces, newlines kept): the pins that look
-    for a literal keyword value (``k_dim=1``) must not see the docstrings and error messages that discuss it."""
+    for a literal keyword value (``k_dim=1``) must not see the docstrings and error messages that discuss it.  Python 3.12
+    (PEP 701) tokenizes an f-string as ``FSTRING_START`` / ``FSTRING_MIDDLE`` / ``FSTRING_END`` instead of one ``STRING``, so
+    those kinds are blanked too -- otherwise the fp8 body's ``k_dim=1`` tripwire MESSAGE reaches the ``k_dim=`` pin on a
+    3.12 venv while a 3.10 venv passes (c05 vs the A100 box, 2026-09-28)."""
     import io
     import tokenize
 
+    blank = {tokenize.STRING, tokenize.COMMENT} | {
+        getattr(tokenize, name) for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END") if hasattr(tokenize, name)
+    }
     lines = src.splitlines(keepends=True)
     offs, acc = [], 0
     for ln in lines:
@@ -111,7 +117,7 @@ def _code_only(src):
         acc += len(ln)
     out = list(src)
     for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type in (tokenize.STRING, tokenize.COMMENT):
+        if tok.type in blank:
             a = offs[tok.start[0] - 1] + tok.start[1]
             b = offs[tok.end[0] - 1] + tok.end[1]
             for i in range(a, b):
