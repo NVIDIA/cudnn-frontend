@@ -499,6 +499,22 @@ operand device. Packed wrappers must guard that device for both compilation and
 pointer launch and restore the caller. Test a foreign current device on both
 operand GPUs, with default and explicit streams; validate outputs after the call.
 
+Same-dtype `to(dtype)` preserves a sliced input's strides, and `reshape` can
+preserve them too. When a wrapper declares compact lengths or sinks to the
+graph, explicitly normalize both layout and pointer alignment before binding.
+`sdpa/torch/test_aux_metadata.py` pins backend and FROST plans with strided
+native metadata and checks changed-input replay; the old backend silently read
+gap values while FROST rejected the inconsistent declaration. Performance
+comparisons must use a numerically valid baseline, such as dtype-converting
+inputs or an explicit compact-copy control, rather than time the wrong result.
+
+Metadata fusion also needs a single-input timing control. A compact half sink
+alone already requires one Torch cast; general prepared dispatch can improve
+GPU time while increasing CPU enqueue cost. Pin backend and FROST separately
+and measure that case alongside mixed conversions and native views.
+`test_forward_metadata_compact_sink_needs_no_compiler` guards the cheap cast,
+including unaligned source offsets and changed-input replay.
+
 A saved Stats tensor can have `requires_grad=True` inside an ordinary provider
 backward where grad mode is disabled. Route assertions must exercise that caller;
 only an active differentiable helper call needs the Torch autograd fallback.
