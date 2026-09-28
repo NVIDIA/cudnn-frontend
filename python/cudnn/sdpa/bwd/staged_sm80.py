@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared launches after the existing SM80 wrapper's staging operations."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import math
 from types import SimpleNamespace
@@ -307,15 +308,17 @@ def _run_copies(api, original, cooked, base, stream, scale):
     # All original operands, auxiliary outputs and core bindings are checked
     # before the first gather writes workspace. No tensor or pointer is cached.
     frame = bind(spec, cooked, base + layout.staging_bytes, stream, scale=scale)
-    ensure_current_context(stream, spec.device_index)
-    if frames[0] is not None:
-        _copy(copies[0], frames[0], stream)
-    spec.fn(*frame)
-    if frames[1] is not None:
-        if serial_scatter:
-            for i, entry in enumerate(copies[1][3]):
-                _copy(entry, tuple((leaves[i],) for leaves in frames[1]), stream)
-        else:
-            _copy(copies[1], frames[1], stream)
-    for fn, src, dst, strides in aux_frames:
-        fn(src, dst, strides, stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        if frames[0] is not None:
+            _copy(copies[0], frames[0], stream)
+        spec.fn(*frame)
+        if frames[1] is not None:
+            if serial_scatter:
+                for i, entry in enumerate(copies[1][3]):
+                    _copy(entry, tuple((leaves[i],) for leaves in frames[1]), stream)
+            else:
+                _copy(copies[1], frames[1], stream)
+        for fn, src, dst, strides in aux_frames:
+            fn(src, dst, strides, stream)
