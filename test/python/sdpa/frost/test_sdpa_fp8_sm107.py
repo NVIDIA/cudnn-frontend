@@ -1412,3 +1412,11 @@ class TestStagedSm107Mxfp8:
     test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
     test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
     test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestMixedStagedFp8:
+    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
+
+    test_mixed_layout = staticmethod(_mixed_layout)
