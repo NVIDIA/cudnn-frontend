@@ -12,7 +12,7 @@ import math
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.fwd.prepared import facts_of_roles
 
-ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias")
+ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope")
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,8 @@ def build_spec(api, *, compiler=None):
     else:
         operands.append(None)
         geometry.append(None)
+    if api._rope_max_s:
+        add((api._rope_max_s, api.flavor_d_qk // 2, 2), (api.flavor_d_qk, 2, 1), "float32", 4)
     geometry = tuple(geometry)
     key = template_key(
         vars(api._k_mod),

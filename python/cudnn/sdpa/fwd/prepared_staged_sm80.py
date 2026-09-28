@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Plan existing non-RoPE SM80 conversions around the native pointer host."""
+"""Plan existing SM80 conversions around the native pointer host."""
 
 from contextlib import nullcontext
 from copy import copy
@@ -86,7 +86,7 @@ def _copy(entry, frame, stream_int):
     entry[1](*frame, stream_int)
 
 
-def execute(api, tensors, workspace, stream, scale):
+def execute(api, tensors, workspace, stream, scale, *, rope_freqs=None):
     from cudnn._device import ensure_current_context
     from cudnn._torch_stream import _raw_current_stream
     from cuda.bindings import driver
@@ -95,9 +95,9 @@ def execute(api, tensors, workspace, stream, scale):
 
     staged = api._sm80_copy_spec
     device = api.q_desc.device
-    if workspace is None or workspace.device != device or not workspace.is_contiguous():
+    if (workspace is None and staged.workspace_bytes) or (workspace is not None and (workspace.device != device or not workspace.is_contiguous())):
         raise ValueError("SM80 staged forward requires contiguous workspace on the Q device")
-    base = api._scratch_base(workspace, "SM80 staged forward", staged.workspace_bytes)
+    base = api._scratch_base(workspace, "SM80 staged forward", staged.workspace_bytes) if staged.workspace_bytes else 0
     facts = {role: facts_of_tensor(t) for role, t in zip(ROLES, tensors)}
     for role, shape, dtype in staged.operands:
         f = facts[role]
@@ -135,6 +135,18 @@ def execute(api, tensors, workspace, stream, scale):
         stream_int = int(stream)
         ensure_current_context(stream_int, device.index)
         with context:
+            # Preserve the standalone-only angle-table conversion on its
+            # consuming stream; the graph rows do not admit RoPE. Keep the
+            # temporary table alive through the core launch.
+            rope = None
+            if rope_freqs is not None:
+                d2 = api.flavor_d_qk // 2
+                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
+                api._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+                api._value_error_if(rf.shape[0] != api._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({api._rope_max_s})")
+                angles = rf[:, :d2]
+                rope = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+                facts["rope"] = facts_of_tensor(rope)
             # All core/auxiliary validation precedes the first workspace write.
             frame = bind(staged.core, facts, stream_int, scale=scale)
             if frames[0] is not None:

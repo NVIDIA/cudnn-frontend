@@ -11,7 +11,7 @@ import torch
 
 from cudnn.sdpa.fwd.api_dsl import _torch_stream_context, ws_align
 from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
-from .prepared import ROLES, bind, execute
+from .prepared import ROLES, bind
 from .prepared_sm80 import build_spec
 from .kernels.sm80.prepared_host import workspace_regions
 
@@ -73,13 +73,8 @@ def compile_staged(api, d64_module):
     plan = api._staged_layout.declaration
     plan._kmod, plan._params = api._kmod, api._params
     spec = build_spec(plan, d64_module, staged=True)
-    api._staged_copies = None if api._has_rope else _compile_copies(api)
+    api._staged_copies = _compile_copies(api)
     return spec
-
-
-def _view_from_region(workspace, region, dtype):
-    offset, shape, strides = region
-    return workspace[offset : offset + math.prod(shape) * dtype.itemsize].view(dtype).view(shape)
 
 
 def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
@@ -172,25 +167,7 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
     if not api._has_rope:
         _run_copies(api, original_facts, cooked_facts, ws.ptr, int(stream), scale)
         return
-    cooked = dict(original, stats=stats, dbias=None, dsink=None, rope=None)
     with _torch_stream_context(stream, device):
-        # The byte workspace may be an aligned slice and may have an odd extra
-        # byte. Views use its current storage origin, with only the planned
-        # extent reinterpreted; the plan never retains this tensor or pointer.
-        typed_workspace = workspace[: layout.workspace_bytes].view(api.dtype)
-        storage_offset = typed_workspace.storage_offset()
-        dtype_name = spec.operands[0].dtype
-        for role, offset, shape in layout.copies:
-            b, h, s, d = shape
-            strides = (s * h * d, d, h * d, 1)
-            view = typed_workspace.as_strided(shape, strides, storage_offset + offset // 2)
-            cooked[role] = view
-            cooked_facts[role] = BufferFacts(ws.ptr + offset, dtype_name, ws.device, math.prod(shape), shape, strides)
-            if role in ROLES[:5]:
-                width = original[role].shape[-1]
-                view[..., :width].copy_(original[role])
-                if width != d:
-                    view[..., width:].zero_()
         if rope_freqs is not None:
             # Existing standalone RoPE preprocessing; the graph never admits
             # this feature. Preserve its table values and launch ordering.
@@ -199,20 +176,12 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             if rf.shape[0] != api._rope_max_s or rf.shape[1] < d2:
                 raise ValueError("rope_freqs must match the compiled row count and cover d_qk//2")
             angles = rf[:, :d2]
-            cooked["rope"] = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
-            cooked_facts["rope"] = facts_of_tensor(cooked["rope"])
-        # Original I/O geometry was checked above. Every replacement view has
-        # the prepared geometry by construction, so no second tensor metadata
-        # walk is needed. The common binder still checks pointer/operand bounds.
-        execute(spec, cooked_facts, ws.ptr + layout.staging_bytes, int(stream), scale=scale)
-        for role, offset, shape in layout.copies:
-            if role in ("dq", "dk", "dv"):
-                original[role].copy_(cooked[role][..., : original[role].shape[-1]])
-        for role, region in (("dbias", layout.regions[5]), ("dsink", layout.regions[6])):
-            if original[role] is not None and region is not None:
-                core_workspace = workspace[layout.staging_bytes :]
-                src = _view_from_region(core_workspace, region, torch.float32)
-                original[role].copy_(src.view(original[role].shape))
+            rope = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+            cooked_facts["rope"] = facts_of_tensor(rope)
+        # The angle table retains its existing numerical preprocessing and is
+        # allocated on this launch stream. All data copies use the same
+        # prepared entries, validation and alias ordering as non-RoPE calls.
+        _run_copies(api, original_facts, cooked_facts, ws.ptr, int(stream), scale)
 
 
 def _entry(artifact):

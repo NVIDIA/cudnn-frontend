@@ -287,6 +287,8 @@ def test_staged_auxiliary_outputs_validate_before_writes(role, problem, monkeypa
         from cudnn.sdpa.bwd import staged_sm80
 
         guards.setattr(staged_sm80, "_copy", forbidden)
-        guards.setattr(staged_sm80, "execute", forbidden)
+        from dataclasses import replace
+
+        guards.setattr(api, "_staged_prepared", replace(api._staged_prepared, fn=forbidden))
         with pytest.raises(ValueError, match=role):
             api.execute(q, q, v, v, v, stats, *outputs, workspace=workspace, bias_tensor=bias, sink_tensor=sink, **{role + "_tensor": aux})
