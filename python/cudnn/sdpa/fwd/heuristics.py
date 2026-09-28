@@ -9,7 +9,7 @@ import-light. For every offered cell whose capability row admits the facts,
 the cell's rule emits an ORDERED list of knob assignments. Axes are concrete
 except the CGA width of a runtime-choice plan: an override-enabled SM100 half
 D192/V128 THD plan may retain both compiled widths, explicitly recording
-``CGA_POLICY=1`` instead of a fixed width. Every assignment is re-validated through ``mismatch(caps, facts, knobs)``
+``CGA_POLICY=2`` instead of a fixed width. Every assignment is re-validated through ``mismatch(caps, facts, knobs)``
 — a set is honored or never listed. The same engine appears once per
 surviving set. Standalone callers (wrappers, autotuners) invoke this directly
 with a hand-built :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing

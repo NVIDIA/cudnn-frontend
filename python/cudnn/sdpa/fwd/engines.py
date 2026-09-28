@@ -105,7 +105,8 @@ class SdpaFwdKnobs:
     ``cga_policy=1`` retains both compiled cluster widths on eligible SM100
     half D192/V128 THD override plans: one CTA when the bound fits one wave,
     two otherwise. ``cga_policy=2`` instead compares resident wave counts,
-    preferring one CTA on a tie. The public record carries ``CGA_POLICY``
+    preferring one CTA on a tie; its pair acquires the immutable runtime K/V
+    descriptors once before the persistent loop. The public record carries ``CGA_POLICY``
     instead of ``TILE_CGA_M``. A fixed width and a runtime policy are mutually exclusive;
     omitting both retains ordinary plan-time default selection.
     """
@@ -1824,7 +1825,15 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if knobs is not None and knobs.cga_policy in (1, 2):
         from cudnn.sdpa.fwd.prepared import PreparedThdChoices
 
-        variants = [spec.lower(spec, facts, replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False)) for cga in (1, 2)]
+        variants = [
+            spec.lower(
+                spec,
+                facts,
+                replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False),
+                thd_pair_acquire=knobs.cga_policy == 2 and cga == 2,
+            )
+            for cga in (1, 2)
+        ]
         selected = variants[0]
         selected.prepared = PreparedThdChoices(tuple(v.prepared for v in variants), facts.device_sm_count, knobs.cga_policy)
         selected.workspace_bytes = max(v.workspace_bytes for v in variants)
@@ -1883,6 +1892,8 @@ def lower_dsl_prefill(
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
     api_type: str = _SM100,
+    *,
+    thd_pair_acquire: bool = False,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -1998,7 +2009,13 @@ def lower_dsl_prefill(
         reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
         if reason is not None:
             raise NotImplementedError(reason)
-    api.compile()
+    # The wave policy retains a pair variant for larger launches, where the
+    # one-time descriptor acquire is measured to help. Do not change fixed
+    # two-CTA requests or policy 1: their low-parallelism populations differ.
+    if thd_pair_acquire:
+        api.compile(thd_pair_acquire=True)
+    else:
+        api.compile()
     # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
     # decode-shaped "decode_d256_f16"), when the adapter records one.
     kernel_template = getattr(api, "kernel_template", None)

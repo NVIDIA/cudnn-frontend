@@ -198,11 +198,24 @@ def test_thd_runtime_cga_record_rebind_and_capture(dtype, stats, policy, h, monk
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("runtime CGA policy is measured on SM100")
     torch.manual_seed(1617)
+    from cudnn.sdpa.fwd import api_dsl
+
+    loaded = []
+    load_module = api_dsl._load_sm100_kernel_module
+
+    def record_module(flavor, params, **kwargs):
+        module = load_module(flavor, params, **kwargs)
+        loaded.append((params.cta_mma, bool(getattr(module.CFG, "THD_PAIR_ACQUIRE", False))))
+        return module
+
+    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", record_module)
     g, _ = _cga_policy_graph(dtype, stats, h=h)
+    assert loaded[-2:] == [(1, False), (2, True)]
     record = g.get_engine_and_knobs_at_index(g._plan_index)
     assert record[1][cudnn.knob_type.CGA_POLICY] == 2 and cudnn.knob_type.TILE_CGA_M not in record[1]
     record[1][cudnn.knob_type.CGA_POLICY] = policy
     rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h)
+    assert loaded[-2:] == [(1, False), (2, policy == 2)]
     assert rebuilt.get_engine_and_knobs_at_index(rebuilt._plan_index) == record
     family = _plan(rebuilt)._prepared
     assert isinstance(family, prep_mod.PreparedThdChoices)

@@ -2351,10 +2351,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         return params
 
-    def compile(self) -> None:
+    def compile(self, *, thd_pair_acquire: bool = False) -> None:
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         params = self.template_params()
+        if thd_pair_acquire:
+            if self._device_cc != (10, 0):
+                raise ValueError("thd_pair_acquire is measured on SM100 only")
+            params = replace(params, thd_pair_acquire=True)
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so

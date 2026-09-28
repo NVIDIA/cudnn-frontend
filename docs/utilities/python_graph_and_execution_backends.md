@@ -744,7 +744,9 @@ only to decline is why `closed_under` existed.
   front and chooses CGA1 when its host-known Q tile bound fits one SM wave,
   CGA2 otherwise. `CGA_POLICY=2` compares the bounded resident wave counts
   instead: CGA1 uses up to one cluster per SM, CGA2 one per pair of SMs, and
-  CGA1 wins a tie. Both policies are unsplit and unpacked. Their integers
+  CGA1 wins a tie. Its two-CTA artifact acquires the setup kernel's immutable
+  K/V tensor maps once before the persistent loop; fixed widths and policy 1
+  retain their existing acquire schedule. Both policies are unsplit and unpacked. Their integers
   identify these rules; a different rule needs a different policy value. A fixed
   `TILE_CGA_M` and `CGA_POLICY` are mutually exclusive, and omitting both does
   not opt into runtime selection. The record round-trips through

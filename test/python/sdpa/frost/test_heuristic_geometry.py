@@ -77,6 +77,24 @@ def test_runtime_cga_policy_records_remain_rebuildable(policy):
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
 
 
+@pytest.mark.parametrize("overrides", [{}, {"cta_mma": 1}, {"split_kv": 2}, {"thd_varlen": False}, {"paged_kv": True, "page_size": 128}, {"dtype_qkv": 0}])
+def test_thd_pair_acquire_lowering_is_bounded(overrides):
+    from cudnn.sdpa.fwd import config_sm100, config_sm107
+
+    params = config_sm100.TemplateParams(dtype_qkv=2, cta_mma=2, thd_varlen=True, seq_kv_lens_present=True, thd_pair_acquire=True)
+    params = replace(params, **overrides)
+    if overrides:
+        with pytest.raises(ValueError, match="thd_pair_acquire"):
+            config_sm100.make_cfg_d192(params)
+    else:
+        cfg, _ = config_sm100.make_cfg_d192(params)
+        assert cfg.THD_PAIR_ACQUIRE
+    with pytest.raises(ValueError, match="thd_pair_acquire"):
+        config_sm100.make_cfg_d128(params)
+    with pytest.raises(ValueError, match="thd_pair_acquire"):
+        config_sm107.make_cfg_d192(params)
+
+
 def _visible_tile_oracle(facts, token_span, tile_n):
     # Enumerate actual key indices independently of the optimized floor/ceil
     # formula. Include the full last cluster's padded Q span: the kernel's

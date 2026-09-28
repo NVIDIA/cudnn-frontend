@@ -196,6 +196,10 @@ class TemplateParams:
     # QK width of the shared one-Q-tile half-precision pipeline. Internal
     # lowering fact; the public cluster knob and graph dimensions select it.
     single_q_head_dim: int = 128
+    # Internal lowering of CGA_POLICY=2's retained pair. The setup kernel
+    # publishes immutable K/V descriptors, so this variant acquires them once
+    # before its persistent loop. Fixed widths keep their measured schedule.
+    thd_pair_acquire: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -278,6 +282,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError("SCHED_LPT_IF_FULL requires half D256 paged THD bottom-right causal attention without a left window")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
+    if k.thd_pair_acquire and not (flavor == "d192" and not fp8 and k.thd_varlen and not k.paged_kv and k.cta_mma == 2 and k.split_kv == 1):
+        raise ValueError("thd_pair_acquire requires nonpaged half D192 THD with cta_mma=2 and split_kv=1")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm100/decode_d256_f16.py
         # (make_cfg_d256_decode); a prefill template must never consume one.
@@ -1795,6 +1801,7 @@ class CfgD192(CfgD128):
     QO_ALIAS: int = 1
     SOFTMAX_REGS: int = 192
     CORRECTION_REGS: int = 88
+    THD_PAIR_ACQUIRE: bool = False
 
 
 def _d192_smem_bytes(cfg) -> int:
@@ -1975,6 +1982,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     b_v = 2 if params.pv_bf16 else b
     stages_kv = (3 if params.cta_mma == 2 else 1) if params.pv_bf16 else (2 if fp8 else 1) * params.cta_mma
     cfg = CfgD192(
+        THD_PAIR_ACQUIRE=params.thd_pair_acquire,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
