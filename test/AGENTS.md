@@ -479,3 +479,12 @@ A `stream_context(None, device)` is deliberately a no-op; it does not select the
 operand device. Packed wrappers must guard that device for both compilation and
 pointer launch and restore the caller. Test a foreign current device on both
 operand GPUs, with default and explicit streams; validate outputs after the call.
+
+
+Preserving packed metadata storage requires both a native element type and a
+wide address product. Test Int32/Int64 prefixes and FP16/BF16/FP32 sinks with
+changed strides, broadcast views and fresh buffers; widen before multiplying
+the sequence/head index by the element stride. A metadata value may retain
+an Int32 sequence-length contract while its storage address requires Int64.
+`test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
+changed-value replay and zero-copy token-major backward Stats.
