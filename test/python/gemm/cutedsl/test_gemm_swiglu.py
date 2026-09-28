@@ -14,6 +14,7 @@ from gemm.cutedsl.test_gemm_swiglu_utils import (
     with_gemm_swiglu_quant_params_fp4,
     with_gemm_swiglu_quant_params_fp8,
     check_ref_gemm_swiglu_quant,
+    run_gemm_swiglu_ref,
 )
 
 """
@@ -99,6 +100,74 @@ def test_gemm_swiglu_compile_execute(
         alpha=cfg["alpha"],
         skip_ref=cfg["skip_ref"],
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("persistent", [False, True], ids=["multi_group_tile", "persistent_tiles"])
+def test_gemm_swiglu_retained_outputs_replay(dtype, persistent):
+    """Retain every launch's outputs so a later correct store cannot hide a race."""
+    from cudnn import GemmSwigluSm100
+    from cuda.bindings import driver as cuda
+
+    m = n = 2048 if persistent else 256
+    tile = (128, 128) if persistent else (256, 256)
+    cluster = (1, 1) if persistent else (2, 2)
+    a, _, b, *_ = allocate_input_tensors(m, n, 512, 2, dtype, "m", "n" if dtype == torch.float8_e4m3fn else "k")
+    ab12, c, *_ = allocate_output_tensors(m, n, 2, torch.float32, torch.bfloat16, "n")
+    plan = GemmSwigluSm100(
+        sample_a=a,
+        sample_b=b,
+        sample_ab12=ab12,
+        sample_c=c,
+        alpha=1.0,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=tile,
+        cluster_shape_mn=cluster,
+    )
+    try:
+        supported = plan.check_support()
+    except (ValueError, NotImplementedError) as error:
+        pytest.skip(str(error))
+    if not supported:
+        pytest.skip("GemmSwigluSm100 is unsupported")
+    plan.compile()
+    slots = 4 if persistent else 16
+    outputs = [(ab12, c)] + [
+        (
+            torch.empty_strided(ab12.shape, ab12.stride(), dtype=ab12.dtype, device=ab12.device),
+            torch.empty_strided(c.shape, c.stride(), dtype=c.dtype, device=c.device),
+        )
+        for _ in range(slots - 1)
+    ]
+
+    def run():
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        for intermediate, result in outputs:
+            plan.execute(a_tensor=a, b_tensor=b, ab12_tensor=intermediate, c_tensor=result, alpha=1.0, current_stream=stream)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        for phase in range(2):
+            if phase:
+                a.copy_((a.float() * 0.5).to(dtype))
+            ref_ab12, ref_c = run_gemm_swiglu_ref(a.float(), b.float(), 1.0)
+            ref_ab12, ref_c = ref_ab12.to(ab12.dtype), ref_c.to(c.dtype)
+            for intermediate, result in outputs:
+                intermediate.fill_(float("nan"))
+                result.fill_(float("nan"))
+            for _ in range(8):
+                graph.replay()
+                for intermediate, result in outputs:
+                    torch.testing.assert_close(intermediate.cpu(), ref_ab12, atol=0.01, rtol=9e-3)
+                    torch.testing.assert_close(result.cpu(), ref_c, atol=0.01, rtol=9e-3)
+    finally:
+        graph.reset()
 
 
 """

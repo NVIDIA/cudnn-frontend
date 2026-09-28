@@ -383,6 +383,14 @@ SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
 halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
 bounded failure output, and preservation of the original assertion.
 
+Count TMA store stages in committed groups, not individual output subtiles.
+If one group reads two AB12 slots and one C slot, four AB12 slots and two C
+slots permit only two outstanding groups. Rotate each output ring by its
+own consumed-slot count across persistent tiles. A replay that repeatedly
+overwrites one output can hide an earlier corrupted store; retain distinct
+outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
+covers both multiple groups within a tile and persistent tile transitions.
+
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
 rebind allocations and mutate table values under capture replay. Preserve the
