@@ -3754,7 +3754,11 @@ def _main():
     parser.add_argument("--iters", type=int, default=0)
     args = parser.parse_args()
 
-    print(f"[d512_mxfp8_sm100] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
+    print(
+        f"[d512_mxfp8_sm100] compile shape-generic prepared host; CLI shape (not specialized): b={args.b} qh={args.hq} kh={args.hk} "
+        f"sq={args.sq} skv={args.skv}",
+        flush=True,
+    )
     fn = compile_prepared()
     print(f"[d512_mxfp8_sm100] compile OK: {fn}", flush=True)
     if args.validate:
