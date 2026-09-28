@@ -1001,8 +1001,10 @@ gather/pad and scatter kernels in caller workspace around the same native GQA
 host. Q/K padding preserves the original attention scale; sink conversion remains
 inside attention. Native operands bind directly without redundant copies. The
 standalone dense wrapper keys plans by input strides and supplies current scratch.
-The capability envelope is unchanged; standalone RoPE retains its angle-table
-preprocessing and uses prepared data copies. All forward entries share prepared host lowering;
+The capability envelope is unchanged; standalone RoPE uses prepared angle-table
+preprocessing and data copies. Its shared forward/backward table host fuses
+full-precision FP32 sin/cos and interleaving, retaining the existing CPU/dtype/layout
+normalization and launch-stream allocation. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
@@ -1050,8 +1052,8 @@ scatter and auxiliary cast recipes around the same pointer chain. These replace
 the existing tensor copies within the same caller-workspace budget. Packed copy
 capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
 share one scatter launch, while overlapping storage ranges retain ordered copy-back.
-Standalone RoPE uses the same prepared data-copy recipes and keeps its
-existing angle-table preprocessing on the launch stream.
+Standalone RoPE uses the same prepared data-copy recipes and the shared prepared
+angle-table host on the launch stream, preserving the existing FP32 trigonometry.
 Packed output casts and folds truncate flavor padding on device and leave capacity
 tails untouched. The obsolete generic and d64 tensor compilers and fake builders
 are removed. Standalone adapters require caller workspace, as native prepared
@@ -1063,7 +1065,7 @@ runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
 All SM80 forward tensor-fake construction is removed. Dense conversion copies,
 including standalone RoPE, share prepared gather/scatter plans with native GQA
-and natural-unit sinks. RoPE retains its existing angle-table preprocessing;
+and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
 its obsolete tensor-staging executor and dedicated host compiler are removed.
 The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
 

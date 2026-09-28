@@ -70,10 +70,13 @@ def layout_for(api):
 
 
 def compile_staged(api, d64_module):
+    from cudnn.sdpa.rope_table_sm80 import compile_plan as compile_rope
+
     plan = api._staged_layout.declaration
     plan._kmod, plan._params = api._kmod, api._params
     spec = build_spec(plan, d64_module, staged=True)
     api._staged_copies = _compile_copies(api)
+    api._staged_rope = compile_rope(api._rope_max_s, api.flavor_d_qk // 2, api.q_desc.device) if api._has_rope else None
     return spec
 
 
@@ -169,14 +172,11 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
         return
     with _torch_stream_context(stream, device):
         if rope_freqs is not None:
+            from cudnn.sdpa.rope_table_sm80 import prepare as prepare_rope
+
             # Existing standalone RoPE preprocessing; the graph never admits
             # this feature. Preserve its table values and launch ordering.
-            rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
-            d2 = api.flavor_d_qk // 2
-            if rf.shape[0] != api._rope_max_s or rf.shape[1] < d2:
-                raise ValueError("rope_freqs must match the compiled row count and cover d_qk//2")
-            angles = rf[:, :d2]
-            rope = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+            rope = prepare_rope(api._staged_rope, rope_freqs, device, stream)
             cooked_facts["rope"] = facts_of_tensor(rope)
         # The angle table retains its existing numerical preprocessing and is
         # allocated on this launch stream. All data copies use the same
