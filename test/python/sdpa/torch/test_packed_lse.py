@@ -293,6 +293,7 @@ def test_packed_lse_missing_execution_entry_falls_back(monkeypatch):
     try:
         actual = packed_lse.prepare_padded_lse(lse, prefix, 4)
         torch.testing.assert_close(actual, original(lse, prefix, 4), atol=0, rtol=0)
+        monkeypatch.setattr(torch, "empty", lambda *a, **k: pytest.fail("unsupported entry allocated unused prepared output"))
         with torch.cuda.graph(graph):
             captured = packed_lse.prepare_padded_lse(lse, prefix, 4)
         lse.add_(3)

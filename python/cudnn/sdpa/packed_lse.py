@@ -60,9 +60,8 @@ def _execute(lse, cu_seqlens, max_seqlen):
     context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
     with context:
         batch, (tokens, heads) = cu_seqlens.numel() - 1, lse.shape
-        padded = torch.empty((batch, heads, max_seqlen, 1), dtype=torch.float32, device=device)
-        if padded.numel() == 0:
-            return padded
+        if batch * heads * max_seqlen == 0:
+            return torch.empty((batch, heads, max_seqlen, 1), dtype=torch.float32, device=device)
         stream = _raw_current_stream(torch, device)
         if stream is None:
             stream = torch.cuda.current_stream(device).cuda_stream
@@ -70,6 +69,7 @@ def _execute(lse, cu_seqlens, max_seqlen):
         plan = _plan(str(cu_seqlens.dtype), device.index)
         if plan is None:
             return _torch_repad(lse, cu_seqlens, max_seqlen)
+        padded = torch.empty((batch, heads, max_seqlen, 1), dtype=torch.float32, device=device)
         plan[1](lse.data_ptr(), cu_seqlens.data_ptr(), padded.data_ptr(), batch, tokens, heads, max_seqlen, lse.stride(), cu_seqlens.stride(0), stream)
         return padded
 
