@@ -62,7 +62,7 @@ carries).  Gated, the epilogue folds |h| with h = o*(inv_sum/2) -- EXACTLY half
 the ungated value -- and doubles the running max once per tile (corr_release).
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -2808,211 +2808,6 @@ def _host(
     )
 
 
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    total_q_sf_tiles: int = 0,
-    total_kv_sf_tiles: int = 0,
-    d_qk: int = CFG.TILE_K,
-    d_v: int = CFG.TILE_O,
-    has_lse: bool = True,
-    lse_stride: Optional[tuple] = None,
-    # == EPILOGUE_FUSION_SEAM(compile) ==
-    # APPEND-ONLY.  gate_stride: the DECLARED BSHD stride of the bf16 gate
-    # tensor (D innermost-contiguous, seq/head strides 16-byte multiples); None
-    # = COMPACT bf16 [B, S, H_q, D_v] -- never "O's stride".  Only legal on an
-    # EPILOGUE_GATE module (the gate fake is built iff CFG.EPILOGUE_GATE; a
-    # stride on an ungated module raises).  has_amax: True = the legacy Amax_O
-    # output slot; False None-specializes amax_o_tensor and folds the fold +
-    # atomic out.  Both are part of the compile key (_template_key hashes locals()).
-    gate_stride: Optional[tuple] = None,
-    has_amax: bool = True,
-) -> Callable:
-    """Compile the retained dense tensor entry for conversion and fused-output paths."""
-    # THD/varlen is NOT ported for this kernel yet.  The setup-kernel call site
-    # below still speaks the pre-upstream 7-arg contract, while FROST's
-    # thd_helpers.build_thd_meta_o_descs_kernel takes 14 args and a different
-    # metadata layout (4B+4 with batch_remap + a claim counter, vs the 3B+2
-    # here), and the scheduler decode differs to match.  Raise here rather than
-    # let it fail as an arity error deep in the trace -- and so no engine row
-    # can advertise thd=True for this kernel and appear to work.  The dense
-    # path is unaffected: CFG.THD_VARLEN is 0 and every THD branch folds out.
-    _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise NotImplementedError(f"{__name__}: THD/varlen not ported to the FROST setup-kernel contract")
-    # ---- FROST adapter ABI ------------------------------------------------
-    # lower_dsl_prefill calls EVERY kernel with the full forward signature.
-    # This body carries only what the port brought over, so anything
-    # it cannot honor RAISES rather than being silently ignored: a raise here
-    # means the engine's Capabilities row is lying, which is the failure we
-    # want loud.  (Capabilities: lse_optional=False, no strided Stats.)
-    if lse_stride is not None:
-        raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
-    if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
-        raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")
-
-    # Q SF tiles TILE_M-row wide → num_tiles = SQ/TILE_M; K/V SF TILE_N-row wide → num_tiles = SKV/TILE_N.
-    sq_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
-    skv_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
-    _q_sf_tiles = sq_tiles
-    _kv_sf_tiles = skv_tiles
-
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (b, sq, qh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (b, skv, kh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (b, skv, kh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        OUT_STORAGE_DTYPE,
-        (b, sq, qh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-
-    # Epilogue gate: the gate fake is ALWAYS bf16 at the gate's own BPE -- never
-    # O's dtype/strides -- and exists iff the module was loaded with
-    # TemplateParams.epilogue_gate (CFG.EPILOGUE_GATE).  None = compact; a
-    # declared stride obeys the TMA global-stride rules (the head dim
-    # innermost-contiguous, seq/head strides 16-byte multiples at GATE_BPE),
-    # exactly the _fake_bshd contract of the f16/fp8 siblings.  Q/K/V/O stay
-    # compact fakes on this kernel (no declared-stride path here).
-    if gate_stride is not None and not CFG.EPILOGUE_GATE:
-        raise ValueError(
-            f"{__name__}: gate_stride given but this module was loaded with epilogue_gate=False (CFG.EPILOGUE_GATE=0); load it with TemplateParams(epilogue_gate=True)"
-        )
-
-    def _fake_gate_bshd(shape, stride):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(GATE_STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if stride[3] != 1:
-            raise ValueError(f"declared gate stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-        for axis in (1, 2):
-            if (stride[axis] * CFG.GATE_BPE) % 16 != 0:
-                raise ValueError(f"declared gate stride {stride} axis {axis} must be a 16-byte multiple at GATE_BPE={CFG.GATE_BPE} (TMA global-stride rule)")
-        return cute.runtime.make_fake_tensor(GATE_STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
-
-    fake_gate = _fake_gate_bshd((b, sq, qh, d_v), gate_stride) if CFG.EPILOGUE_GATE else None
-
-    fake_sf_q = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (b, qh, _q_sf_tiles, SF_SMEM_SIZE_Q),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_sf_k = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (b, kh, _kv_sf_tiles, SF_SMEM_SIZE_K),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_sf_v = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (b, kh, _kv_sf_tiles, SF_SMEM_SIZE_V),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-
-    # has_lse=False (no Stats output): the LSE argument is None-specialized and
-    # the store is compiled out entirely -- no dummy buffer exists at any level,
-    # which is what lets the dense graph report get_workspace_size() == 0.
-    # Mirrors the shipped sm107/prefill_d128_fp8.py.
-    fake_lse = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (b, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        if has_lse
-        else None
-    )
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (qh,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # has_amax=False (no Amax_O output): the amax argument is None-specialized
-    # and the |o| fold + atomicMax compile out -- no dummy buffer at any level,
-    # exactly the has_lse=False shape above.  None is legal in the positional
-    # slot (the lse_tensor precedent).
-    fake_amax_o = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (1,),
-            stride_order=(0,),
-            assumed_align=16,
-        )
-        if has_amax
-        else None
-    )
-    # Dense per-batch lengths; THD remains rejected before compilation.
-    _skv_len = b
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (_skv_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    # Unread descriptor slot on the dense-only tensor entry.
-    _odesc_len = 1
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (_odesc_len,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
-    fake_seq_q_lens = cutlass.Int64(0)  # device address of the (B,) int32 Q lengths; 0 (unread) when the flag is off
-
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_sf_q,
-        fake_sf_k,
-        fake_sf_v,
-        fake_lse,
-        fake_amax_o,
-        fake_sinks,
-        fake_seq_kv_lens,
-        fake_o_desc,
-        (b, qh, kh, sq, skv, 0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        fake_seq_q_lens,
-        # BY KEYWORD, not position: the SF totals sit AFTER seq_q_lens_addr in
-        # _host's signature (the adapter fills that slot positionally on the
-        # quantized ABI); passed positionally they would land in the Q-length slot.
-        total_q_sf_tiles=cutlass.Int32(_q_sf_tiles),
-        total_kv_sf_tiles=cutlass.Int32(_kv_sf_tiles),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        # KEYWORD: gate_tensor is the LAST _host parameter, after `stream`.
-        gate_tensor=fake_gate,
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
-    )
-
-
 def _main():
     """Minimal CLI for compile-check / perf bring-up."""
     import argparse
@@ -3028,20 +2823,18 @@ def _main():
     args = parser.parse_args()
 
     print(f"[d256_mxfp8] compile b={args.b} qh={args.hq} kh={args.hk} " f"sq={args.sq} skv={args.skv}", flush=True)
-    fn = compile(args.b, args.hq, args.hk, args.sq, args.skv)
+    fn = compile_prepared()
     print(f"[d256_mxfp8] compile OK: {fn}", flush=True)
     if args.validate:
         print("[d256_mxfp8] --validate: see tests/run_python_sweep.py")
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(_main())
-
 from cudnn.sdpa.fwd.kernels._mxfp8_host import host as _host_prepared
 
 
 @lru_cache(maxsize=None)
+# == EPILOGUE_FUSION_SEAM(compile) ==
 def compile_prepared(
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
@@ -3084,3 +2877,7 @@ def compile_prepared(
         has_amax=has_amax,
         optional_amax=True,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

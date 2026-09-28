@@ -823,6 +823,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
 
 # ============================================================================
+
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
 # ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
@@ -835,6 +836,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 # test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
 # declines (CPU) and the Rubin e2e behind them.
 # ============================================================================
+
 
 _D256 = (256, 256)
 # The d256 O bound of the shared fp8 suite (test_sdpa_fwd_fp8_sm100._half_atol at
@@ -1396,6 +1398,23 @@ def test_fp8_d256_compile_cli_uses_prepared_entry(rubin, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["compile-probe", "--b", "2", "--sq", "512", "--validate"])
     assert mod._main() == 0
     assert calls == [True]
+
+
+# Retain staged conversion coverage in the explicitly selected architecture CI entry.
+import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestStagedSm107Mxfp8:
+    test_mixed_layout = staticmethod(_staged_mxfp8_checks.test_sm107_d256_mxfp8_staging_preserves_each_native_operand)
+    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
+    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
 
 
 @pytest.mark.L0

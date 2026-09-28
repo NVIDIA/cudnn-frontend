@@ -15,7 +15,10 @@ import math
 from typing import NamedTuple, Optional
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import requires_blackwell_geforce, requires_dsl
 
@@ -441,8 +444,10 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
     if splits > 1:
         output = torch.full((b, sq, h, d), float("nan"), device="cuda", dtype=torch.float16)
         lse = torch.full((b, h, sq), float("nan"), device="cuda")
-        combine = split_combine.compile(b, h, sq, d, splits, has_lse=True, stats_log2=stats_log2)
-        combine(partial_o, partial_lse, output, lse, None, None, (b, h, sq, d), cutlass.Int32(splits), stream=stream)
+        combine = positional_entry(split_combine.compile_ptr(has_lse=True, stats_log2=stats_log2, dtype_partial="f16"))
+        combine(
+            partial_o.data_ptr(), partial_lse.data_ptr(), output.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, output.stride(), lse.stride(), int(stream)
+        )
         torch.cuda.synchronize()
         torch.testing.assert_close(output.double(), (scores.softmax(-1) @ values).transpose(1, 2), atol=3e-3, rtol=3e-3)
         torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0), atol=2e-4, rtol=2e-5)
