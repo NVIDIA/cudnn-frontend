@@ -227,7 +227,7 @@ def test_shared_metadata_serves_both_forward_providers(provider, return_lse, mon
     _require_prepared()
     import cudnn
     from cudnn.sdpa.fwd import torch_op
-    from test_torch_ops import TestSdpaVarlen, TOL
+    from sdpa.torch.test_torch_ops import TestSdpaVarlen, TOL
 
     if provider == "frost" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("pinned THD FROST forward requires SM100/SM103; SM80 only serves the standalone THD wrapper")
