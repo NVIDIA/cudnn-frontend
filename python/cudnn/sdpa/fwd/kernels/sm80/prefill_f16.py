@@ -6,9 +6,9 @@
 This file is a TEMPLATE: ``frost.template_loader.load_template`` re-executes
 it as a fresh module per ``config_sm80.TemplateParams`` (injected as the
 ``FROST_TEMPLATE_PARAMS`` module global), so the feature/config axes fold at
-trace time; the remaining SHAPE axes compile through the module's own
-``compile()`` (per-shape ``@lru_cache``; THD packed token totals are DYNAMIC
-via ``cute.sym_int`` — plan-time-only keys, Hard Rule 4).  The adapter
+trace time. All launch entries are pointer hosts in ``prepared_host``;
+packed THD binds runtime Int64 geometry.
+The adapter
 (``api_dsl.SdpaFwdDslSm80``) owns validation, operand binding and launch.
 
 Online flash-attention with rowwise max / sum tracked per warp lane
@@ -93,25 +93,12 @@ Layout choices:
       matching mma B col-major b0 at (K=2p..2p+1, N=g).
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
-from functools import lru_cache
 from typing import Optional
 
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
-
-
-def from_dlpack(t, **kw):
-    """Vendoring shim: the kernels compile with --enable-tvm-ffi, so host-side
-    conversions must produce TVM-FFI tensors regardless of the
-    CUTE_DSL_ENABLE_TVM_FFI environment latch."""
-    kw.setdefault("enable_tvm_ffi", True)
-    return _from_dlpack_raw(t, **kw)  # was from_dlpack pre-DSL-bump
-
-
 from cutlass.base_dsl.typing import Pointer  # was the DSL's Pointer pre-DSL-bump
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
@@ -151,7 +138,7 @@ SCHED_DEFAULT = SCHED_NATURAL  # the kernel's plain 3-D grid (q_tile, head, batc
 # default keeps a direct import (tests, tooling) importable at the
 # llama-flavor baseline.  Tile geometry, head-dim envelope, dtype, mask
 # family, operand presence, scheduler policy and LSE presence all live here
-# and fold at trace time — ``compile()`` below carries only shape axes.
+# and fold at trace time; prepared_host carries the shape axes.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 validate_params(PARAMS)
 
@@ -451,7 +438,7 @@ def _sdpa_kernel(
 
     # Use the declared layout in element units. Cast BEFORE every product:
     # both a single stride and an index*stride product may exceed signed Int32.
-    # The tensor entry supplies compact layouts; the pointer host preserves
+    # The staged entry supplies compact layouts; the native host preserves
     # B/H/S permutations and padded strides without a gather or scatter.
     Q_ROW_STRIDE_E = cutlass.Int64(Q.stride[1])
     K_ROW_STRIDE_E = cutlass.Int64(K.stride[1])
@@ -1658,213 +1645,4 @@ def _sdpa_host(
         grid=grid,
         block=(threads, 1, 1),
         stream=stream,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-shape compile cache.
-# ---------------------------------------------------------------------------
-# ``cute.compile`` is expensive (trace + MLIR + NVVM + PTX → SASS, ~1-2 s on
-# A100).  The FEATURE / config axes are module identity — one loaded template
-# module per ``TemplateParams`` via ``frost.template_loader`` — so this cache
-# covers the remaining SHAPE axes only.  Every key component is PLAN-TIME
-# data (AGENTS.md Hard Rule 4): under ``PARAMS.thd_varlen`` the packed token
-# totals compile DYNAMIC (``cute.sym_int``) and are never part of the key —
-# callers pass ``sq = skv = 0`` there (a stray runtime total must not be
-# passed: it would only mint a redundant cache entry for the same artifact).
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001 — the template contract's entry point (matches the SM100 kernels)
-    b: int,
-    h: int,
-    h_kv: int,
-    sq: int,
-    skv: int,
-    d: int,
-    swa_window: int = 0,
-    rope_max_s: int = 0,
-    n_batch_logical: int = 0,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-):
-    """Compile (or fetch) this template specialization for one shape.
-
-    ``d`` is the ACTUAL Q/K head dim and may be < ``PARAMS.d_qk``: the
-    SMEM/reg tile stays ``PARAMS.d_qk`` wide and the missing columns
-    zero-fill via cp.async predication.  V/O are always exactly
-    ``PARAMS.d_v`` wide.  ``swa_window`` is the left-window width W (keep
-    k in [q-W, q]) — plan-time graph data, baked exactly as the old
-    ``forward()`` did.  Dense evenness is derived here the same way the old
-    entry point derived it: ``is_even_mn = (sq % tile_m == 0) and
-    (skv % tile_n == 0)``; ``is_even_k = (d == PARAMS.d_qk)``.
-
-    THD (``PARAMS.thd_varlen``): q/k/v/o are packed ``[1, T, H, D]`` and the
-    LSE is packed ``[1, H, T]``; the token extents compile DYNAMIC — one
-    ``cute.sym_int`` symbol shared by the Q/O/LSE group and one for K/V — so
-    one artifact re-binds any packed totals (issue #604).  Pass ``b = 1``,
-    ``sq = skv = 0``; ``n_batch_logical`` (the logical sequence count) sizes
-    the ``cu_seqlens`` ABI and IS plan-time.  THD always takes the
-    predicated-store path (``is_even_mn = False``) and the over-provisioned
-    SCHED_DEFAULT grid, driven by the runtime ``thd_q_tiles``/``thd_n_batch``
-    launch arguments.
-
-    ``PARAMS.has_lse = False`` compiles the LSE store out entirely (the LSE
-    argument is None-specialized) — no buffer and no dummy at any level.
-    """
-    _cache_key = _template_key(globals(), locals(), "compile")
-    p = PARAMS
-    if p.thd_varlen and p.has_bias:
-        raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
-    io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
-    mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
-    sched_l2_bytes = p.sched_l2_mib * 1024 * 1024
-    is_even_k = d == p.d_qk
-    if p.thd_varlen:
-        # One symbol per ragged group: Q/O (and the LSE's T axis) share t_q,
-        # K/V share t_kv — a new packed total re-binds the same artifact.
-        is_even_mn = False
-        t_q = cute.sym_int(divisibility=1)
-        t_kv = cute.sym_int(divisibility=1)
-        _b, _sq, _skv = 1, t_q, t_kv
-    else:
-        is_even_mn = (sq % p.tile_m == 0) and (skv % p.tile_n == 0)
-        _b, _sq, _skv = b, sq, skv
-
-    # Q and K share the QK head dim (= d, possibly < PARAMS.d_qk when
-    # ~is_even_k); V and O follow PARAMS.d_v (DSv3: d_qk != d_v).
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        io_dtype,
-        (_b, _sq, h, d),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        io_dtype,
-        (_b, _skv, h_kv, d),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        io_dtype,
-        (_b, _skv, h_kv, p.d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        io_dtype,
-        (_b, _sq, h, p.d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    # LSE: dense [B, H, SQ]; THD packed [1, H, T] (shares the Q/O token
-    # symbol, which is exactly what the kernel's LSE.shape[2] read needs).
-    if p.has_lse:
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
-            if lse_stride is not None and not p.thd_varlen
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (_b, h, _sq),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
-        )
-    else:
-        fake_lse = None
-    # Per-batch KV / Q lengths [B] int32 (or a 1-elem dummy when unused).
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b if p.has_seq_kv_lens else 1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    fake_seq_len_q = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b if p.has_seq_q_lens else 1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    # Per-Q-head sink logit [H] fp32 (log2 units) (or a 1-elem dummy when unused).
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (h if p.has_sink else 1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    # Additive bias [1, H, SQ, SKV] in io_dtype or fp32 (or a 1-elem dummy).
-    bias_io_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype
-    fake_bias = cute.runtime.make_fake_compact_tensor(
-        bias_io_dtype,
-        ((1, h, sq, skv) if p.has_bias else (1,)),
-        stride_order=((3, 2, 1, 0) if p.has_bias else (0,)),
-        assumed_align=16,
-    )
-    # THD cumulative seqlens [B_logical + 1] int32 (or 1-elem dummies).
-    _cu_len = (n_batch_logical + 1) if p.thd_varlen else 1
-    fake_cu_q = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
-    fake_cu_k = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)
-    # RoPE (cos, sin) table [max_s, d_qk//2, 2] fp32 (or a 1-elem dummy).
-    fake_rope_cs = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        ((rope_max_s, p.d_qk // 2, 2) if p.has_rope else (1,)),
-        stride_order=((2, 1, 0) if p.has_rope else (0,)),
-        assumed_align=16,
-    )
-    fake_n_kv_tiles = cutlass.Int32(0)
-    fake_scale = cutlass.Float32(0.0)
-    fake_sq_rt = cutlass.Int32(0)
-    fake_skv_rt = cutlass.Int32(0)
-    fake_d_rt = cutlass.Int32(0)
-    fake_band_rt = cutlass.Int32(0)
-    fake_inv_scale = cutlass.Float32(0.0)
-    fake_thd_qt = cutlass.Int32(0)
-    fake_thd_nb = cutlass.Int32(0)
-    # Stream not used during trace; passed through to launch().  Use a
-    # null stream sentinel — cute.compile only inspects type, not value.
-    fake_stream = cuda.CUstream(0)
-    return _compile_cached(
-        _sdpa_host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_seq_kv_lens,
-        fake_seq_len_q,
-        fake_sinks,
-        fake_bias,
-        fake_cu_q,
-        fake_cu_k,
-        fake_rope_cs,
-        p.tile_m,
-        p.num_warps,
-        p.tile_n,
-        p.d_qk,
-        p.d_v,
-        io_dtype,
-        is_even_mn,
-        is_even_k,
-        mask_flags,
-        swa_window,
-        p.causal_bottom_right,
-        p.has_seq_kv_lens,
-        p.has_seq_q_lens,
-        p.has_sink,
-        p.has_bias,
-        p.bias_is_fp32,
-        p.thd_varlen,
-        p.has_rope,
-        p.sched_policy,
-        sched_l2_bytes,
-        fake_n_kv_tiles,
-        fake_scale,
-        fake_sq_rt,
-        fake_skv_rt,
-        fake_d_rt,
-        fake_band_rt,
-        fake_inv_scale,
-        fake_thd_qt,
-        fake_thd_nb,
-        fake_stream,
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
     )

@@ -42,9 +42,9 @@ head shapes. Its D128 flavor also prepares
 existing paged KV graphs and split plans with NHD or HND pools and separate K/V
 page tables. Page counts, table and pool strides bind at execution time; the
 compiled pool layout and page size stay fixed.
-K/V tables on this prepared FP8 path use the same batch/page strides. Distinct
-declared table strides retain the existing static tensor executor and decline
-shape/stride override plans before compilation. Device scales rebind each call; requested
+K/V page tables on this prepared FP8 path bind independent Int64 batch/page
+strides, including distinct declared layouts and runtime stride overrides.
+Each table retains its own observed storage bound. Device scales rebind each call; requested
 Amax_O is reset and unscaled on the launch stream. SM120/SM121 FP16/BF16 also
 supports prepared dense, dense split-KV and unsplit THD launches, with native
 KV-tail masking and bounded runtime geometry. Split partials retain the input
@@ -56,7 +56,10 @@ for its four existing flavors, plus its existing D128 split-KV path. Int64
 strides reach descriptor setup; D256 keeps its optional Amax specialization.
 The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
-Epilogue-gate, block-scaled-output and conversion routes retain tensor execution.
+The existing D256 quantized epilogue gate also uses prepared launches, with
+runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
+output's maximum. Conversion routes retain tensor execution.
+Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
@@ -66,8 +69,10 @@ SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or 
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
-Block-scaled FP8 outputs, MXFP8 gate/PV-BF16 paths, synthesized KV-tail padding
-and bias retain their tensor executor and decline overrides;
+SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
+D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
+operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
+layouts and bias retain their tensor executor and decline overrides;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -498,7 +503,10 @@ stride and positive outer strides aligned to eight half-precision elements.
 Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
 bindings are rejected before launch. Dense layouts outside the native stride
 requirements retain workspace staging (one copy in, and one back out for a
-gradient).
+gradient). That existing staging path now calls the same prepared pointer
+chain after the copies. It retains no tensor-ABI compiler or per-call DLPack
+wrapping; current pointers, workspace storage origins and stream bind on each
+call. Native dense and packed layout admission is unchanged.
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
@@ -985,8 +993,9 @@ declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
 width. The served capability envelope is unchanged: other head dimensions and
-layouts retain their existing tensor-entry staging, as do the standalone
-RoPE and THD callers. Those remaining callers still require the tensor compiler.
+layouts and standalone RoPE retain their existing adapter staging, then
+launch through a pointer host. All forward entries share prepared host lowering;
+the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
@@ -1020,9 +1029,28 @@ do-dot, optional dSink, the selected backward kernel, dQ conversion, GQA
 reductions and auxiliary output copies. All stages use the current caller
 stream; graph and standalone execution share the binding validator. Native
 plans require caller workspace and do not build tensor views at execute.
-Off-flavor widths, unaligned strides, RoPE, THD and older direct adapters
-without complete optional-output declarations retain the tensor entry and
-its reachable compiler/fake construction. This does not change eligibility.
+Native-flavor THD graph/direct-adapter plans use the same binder and a packed
+host chain, including device length-to-prefix setup. Packed capacities are
+runtime host arguments; workspace views and offsets are formed from those
+capacities without specializing the artifact on them. A fresh plan with the
+same specialization and stepped strides reuses the process-local artifact for
+different totals and bounds, even without persistent caching. The standalone
+THD wrapper pads to the native flavor width and uses this prepared packed chain.
+Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
+without complete optional-output declarations retain their existing staging and
+optional-gradient copy-backs, followed by the same prepared pointer chain.
+Packed output casts and folds truncate flavor padding on device and leave capacity
+tails untouched. The obsolete generic and d64 tensor compilers and fake builders
+are removed. Standalone adapters require caller workspace, as native prepared
+adapters do; convenience wrappers continue to provide it. No eligibility changes.
+
+The standalone SM80 packed forward wrapper also uses a cached pointer host.
+Packed capacities, Q/K/V token and head strides, and launch bounds bind as
+runtime Int64 arguments; Sink logits remain in natural units. The wrapper
+preserves its output allocation, capacity-tail zeroing and off-flavor padding.
+All SM80 forward tensor-fake construction is removed. Dense off-flavor/RoPE
+also use a pointer host after their existing staging. The forward graph row still
+declines THD, so this changes no graph eligibility.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a
@@ -1034,8 +1062,8 @@ PACKED `[1, T, H, D]` **BSHD rows, each at its own token stride**: head stride
 (16-byte rows for the `cp.async` loads). A compact port is the common case; a
 K/V view into an interleaved `[T, 2, H, D]` record (token stride `2*H*D`, the
 fused-KV slicing layout) is served at that stride, the gap columns never read or
-written. The strides are plan-time (the compiled fakes carry them); a compact
-port keeps the compact fake, byte-identical codegen.
+written. Stepped strides are plan-time specialization; packed token capacities
+remain dynamic in the compiled host.
 Lengths arrive as the graph's per-batch `seq_len_q/kv` (`use_padding_mask=True`)
 and become `cu_seqlens` on device in a one-warp setup launch. Like every FROST
 THD row, the packed addressing is `prefix(lengths) × token stride`: the bound
@@ -1109,7 +1137,20 @@ plan-specific. SF storage may be any dense physical-axis permutation and is
 validated against the producer's observed byte span. Packed SF tile totals are
 runtime metadata, never read from device lengths or used as compile keys.
 D512 retains half split partials; the other three flavors use FP32 partials.
-Gate, block-scaled O and standalone PV-BF16 keep their tensor entries. SM107
-MXFP8 also prepares its existing dense scalar-output paths as described above.
+D128 block-scaled O and the existing direct-only D128/D192 PV-BF16
+specializations also use prepared launches for native layouts. SM107 MXFP8
+prepares its existing dense scalar-output and D256 gate paths as described above.
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
+
+### Prepared block-scaled output launch contract
+
+Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
+SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
+MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
+current O, SF_O, optional Amax and device scales with observed storage checks.
+FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
+SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
+their existing admission boundaries. Remaining conversion layouts retain their
+tensor entries. Standalone prepared calls require caller-owned workspace.

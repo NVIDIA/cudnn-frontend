@@ -38,44 +38,23 @@ _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 
 
-def test_stage3_compile_cache_is_arch_specific(monkeypatch):
-    import cudnn.sdpa.bwd.kernels.bprop_matmul_blackwell as stage3
+def test_prepared_chain_codegen_targets(monkeypatch):
+    import cutlass
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
 
-    options = []
-    capabilities = {
-        0: (10, 0),
-        1: (10, 3),
-        2: (10, 7),
-        3: (11, 0),
-        4: (10, 1),
-    }
+    calls = []
 
     def fake_compile(*args, **kwargs):
-        options.append(kwargs["options"])
+        calls.append(kwargs["options"])
         return object()
 
-    monkeypatch.setattr(stage3, "compute_capability", capabilities.__getitem__)
-    monkeypatch.setattr(stage3.cute, "compile", fake_compile)
-    stage3.compile.cache_clear()
-    try:
-        b200 = stage3.compile(0)
-        assert stage3.compile(0) is b200
-        b300 = stage3.compile(1)
-        assert b300 is not b200
-        rubin = stage3.compile(2)
-        assert rubin is not b300
-        thor = stage3.compile(3)
-        assert thor is not rubin
-        with pytest.raises(ValueError, match="got SM101"):
-            stage3.compile(4)
-        assert options == [
-            "--enable-tvm-ffi --gpu-arch sm_100a",
-            "--enable-tvm-ffi --gpu-arch sm_103a",
-            "--enable-tvm-ffi --gpu-arch sm_107a",
-            "--enable-tvm-ffi --gpu-arch sm_110a",
-        ]
-    finally:
-        stage3.compile.cache_clear()
+    monkeypatch.setattr(prepared_host, "compile_cached", fake_compile)
+    params = prepared_host.Params(1, 2, 2, 512, 128, 128, 256, 128, 2, False, False, 0, 256)
+    for sm in (100, 103, 107, 110):
+        prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, sm, "target-probe")
+    with pytest.raises(ValueError, match="got SM101"):
+        prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, 101, "target-probe")
+    assert calls == [f"--enable-tvm-ffi --gpu-arch sm_{sm}a" for sm in (100, 103, 107, 110)]
 
 
 def _io_dtype(dt):
@@ -835,3 +814,11 @@ def test_prepared_sm100_raw_storage_and_explicit_overrides(role, ordered, monkey
     with pytest.raises(ValueError, match="runtime geometry"):
         case.graph.execute(pack, case.workspace, **kwargs)
     assert not launches
+
+
+@pytest.mark.parametrize("route", ["dense", "thd"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm100", route, dtype, tmp_path)

@@ -10,7 +10,7 @@ from cuda.bindings import driver as _cuda_driver
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 from cudnn.sdpa.fwd.kernels._common_blackwell import sdpa_operand_tensors
-from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel
+from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
 
 LSE_KINDS = ("dense", "token", "head", "padded")
 
@@ -41,11 +41,15 @@ def _launch(
     o_partial_ptr: Optional[cute.Pointer],
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
-    sf_v_ptr: cute.Pointer,
+    sf_v_ptr: Optional[cute.Pointer],
     sf_tiles: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     amax_o_ptr: cute.Pointer,
+    sf_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: Optional[cute.Pointer],
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     kernel_host: cutlass.Constexpr,
-    cfg: cutlass.Constexpr,
+    config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -54,8 +58,10 @@ def _launch(
     thd_slots: cutlass.Constexpr[bool],
     has_amax: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
+    sfo_geometry: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    thd, split_kv, o_block_scale, epilogue_gate, pv_bf16 = config
     operands = sdpa_operand_tensors(
         q_ptr,
         k_ptr,
@@ -79,9 +85,10 @@ def _launch(
         d_qk=d_qk,
         d_v=d_v,
         lse_kind=lse_kind,
-        thd=cfg.THD_VARLEN,
-        split_kv=cfg.SPLIT_KV,
+        thd=thd,
+        split_kv=split_kv,
         tensor_map_qwords=16,
+        o_pack=2 if o_block_scale == 16 else 1,
     )
     b, qh, kh, _, _, _ = problem_size
 
@@ -93,18 +100,31 @@ def _launch(
         return cute.make_tensor(
             ptr,
             cute.make_layout(
-                (1 if cutlass.const_expr(cfg.THD_VARLEN) else b, heads, tiles, size),
+                (1 if cutlass.const_expr(thd) else b, heads, tiles, size),
                 stride=(batch_stride, head_stride, size, 1),
             ),
         )
 
     sf_q = scale_tensor(sf_q_ptr, qh, sf_tiles[0], sf_smem_sizes[0])
     sf_k = scale_tensor(sf_k_ptr, kh, sf_tiles[1], sf_smem_sizes[1])
-    sf_v = scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
+    sf_v = None if cutlass.const_expr(pv_bf16) else scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
     amax = None if cutlass.const_expr(optional_amax and not has_amax) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
-    if cutlass.const_expr(cfg.SPLIT_KV == 1 and (has_amax or not optional_amax)):
+    if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict()
+    if cutlass.const_expr(epilogue_gate):
+        _, _, _, sq, _, _ = problem_size
+        kwargs.update(gate_tensor=cute.make_tensor(gate_ptr, cute.make_layout((b, sq, qh, d_v), stride=(*gate_strides, 1))))
+    if cutlass.const_expr(sfo_geometry is not None):
+        kwargs.update(
+            sf_o_tensor=cute.make_tensor(sf_o_ptr, cute.make_layout((1,), stride=(1,))),
+            scale_o_t=None if cutlass.const_expr(scale_o_ptr is None) else cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,))),
+            sfo_plane_stride=cutlass.Int64(sfo_geometry[0]),
+            sfo_row_off_b=cutlass.Int64(sfo_geometry[1]),
+            sfo_col_off_h=cutlass.Int64(sfo_geometry[2]),
+            sfo_cols=cutlass.Int64(sfo_geometry[3]),
+            prepared_sfo_geometry=sfo_geometry,
+        )
     if cutlass.const_expr(thd_slots):
         kwargs.update(prepared=True)
     if cutlass.const_expr(partial_slot):
@@ -130,6 +150,10 @@ def _launch(
     if cutlass.const_expr(thd_slots):
         args += (operands.thd_q_lens, operands.thd_kv_lens, thd_lens_form)
     kernel_host(*args, stream=stream, **kwargs)
+    if cutlass.const_expr(has_amax and sfo_geometry is not None and scale_o_ptr is not None):
+        # Block-output epilogues reduce after the optional global scale, as
+        # the tensor adapter did; Amax_O describes the unscaled attention.
+        _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -158,11 +182,15 @@ def host(
     o_partial_ptr: Optional[cute.Pointer],
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
-    sf_v_ptr: cute.Pointer,
+    sf_v_ptr: Optional[cute.Pointer],
     sf_tiles: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     amax_o_ptr: cute.Pointer,
+    sf_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: Optional[cute.Pointer],
+    gate_ptr: Optional[cute.Pointer],
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     kernel_host: cutlass.Constexpr,
-    cfg: cutlass.Constexpr,
+    config: cutlass.Constexpr,
     sf_smem_sizes: cutlass.Constexpr[tuple],
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -171,6 +199,7 @@ def host(
     thd_slots: cutlass.Constexpr[bool],
     has_amax: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
+    sfo_geometry: cutlass.Constexpr,
     static_lse_strides: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -203,8 +232,12 @@ def host(
         sf_v_ptr,
         sf_tiles,
         amax_o_ptr,
+        sf_o_ptr,
+        scale_o_ptr,
+        gate_ptr,
+        gate_strides,
         kernel_host,
-        cfg,
+        config,
         sf_smem_sizes,
         d_qk,
         d_v,
@@ -213,6 +246,7 @@ def host(
         thd_slots,
         has_amax,
         optional_amax,
+        sfo_geometry,
     )
     if cutlass.const_expr(static_lse_strides is None):
         _launch(*leading, lse_strides, *trailing, stream=stream)
@@ -242,6 +276,8 @@ def compile_host(
     has_amax=True,
     optional_amax=False,
     static_lse_strides=None,
+    sfo_geometry=None,
+    has_scale_o=False,
 ):
     if static_lse_strides is not None:
         if not has_lse or cfg.THD_VARLEN or cfg.SPLIT_KV != 1:
@@ -263,7 +299,7 @@ def compile_host(
         host,
         pointer(storage_dtype),
         pointer(storage_dtype),
-        pointer(storage_dtype),
+        pointer(cutlass.BFloat16 if getattr(cfg, "PV_BF16", False) else storage_dtype),
         pointer(cutlass.Float32 if fp32_partial else output_dtype),
         pointer(cutlass.Float32, 4) if has_lse else None,
         pointer(cutlass.Float32),
@@ -285,11 +321,21 @@ def compile_host(
         pointer(cutlass.Float32) if fp32_partial else None,
         pointer(cutlass.Int8),
         pointer(cutlass.Int8),
-        pointer(cutlass.Int8),
+        None if getattr(cfg, "PV_BF16", False) else pointer(cutlass.Int8),
         (i32, i32, i32),
         pointer(cutlass.Float32, 4),
+        pointer(cutlass.Int8) if sfo_geometry is not None else None,
+        pointer(cutlass.Float32, 4) if has_scale_o else None,
+        pointer(cutlass.BFloat16) if getattr(cfg, "EPILOGUE_GATE", False) else None,
+        strides,
         kernel_host,
-        cfg,
+        (
+            bool(cfg.THD_VARLEN),
+            int(cfg.SPLIT_KV),
+            int(getattr(cfg, "O_BLOCK_SCALE", 0)),
+            bool(getattr(cfg, "EPILOGUE_GATE", False)),
+            bool(getattr(cfg, "PV_BF16", False)),
+        ),
         sf_smem_sizes,
         d_qk,
         d_v,
@@ -298,6 +344,7 @@ def compile_host(
         thd_slots,
         has_amax,
         optional_amax,
+        sfo_geometry,
         static_lse_strides,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

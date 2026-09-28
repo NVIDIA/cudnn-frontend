@@ -35,6 +35,7 @@ def _case(
     hq=4,
     hk=2,
     explicit_plan=False,
+    gate=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -104,6 +105,12 @@ def _case(
         torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
         torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
     }[output_dtype]
+    if gate is not None:
+        assert not thd
+        o.set_data_type(out_type).set_dim([b, hq, sq, dv]).set_stride([sq * hq * dv, dv, hq * dv, 1])
+        gate_t = g.tensor_like(gate)
+        buffers["gate"], tensors["gate"], vp[gate_t] = gate, gate_t, gate
+        o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sigmoid_gate"), name="gated_o")
     o.set_output(True).set_data_type(out_type).set_dim([b, hq, sq, dv]).set_stride([sq * hq * dv, dv, hq * dv, 1])
     out = torch.empty((b * sq, hq, dv) if thd else (b, sq, hq, dv), device="cuda", dtype=output_dtype)
     if not thd:
@@ -185,6 +192,8 @@ def _check(bufs, *, thd, b=2, sq=128, skv=128):
     scores = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
     ref, stats = scores.softmax(-1) @ v, scores.logsumexp(-1)
     am = ref.abs().amax()
+    if "gate" in bufs:
+        ref *= torch.sigmoid(bufs["gate"].float())
     if thd:
         ref = ref.transpose(1, 2).reshape(b * sq, q.shape[1], -1)
         stats = stats.transpose(1, 2).reshape(b * sq, q.shape[1])

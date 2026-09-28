@@ -2455,7 +2455,8 @@ def _run_gated_mxfp8(ops, gate, *, causal, out_dtype, seq_kv_lens=None, with_lse
     assert api.check_support()
     assert api.template_params().epilogue_gate is gate_on
     api.compile()
-    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=q8.device, dtype=torch.uint8)
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
     if gate_on:
         kw["gate"] = gate
     if amax is not None:

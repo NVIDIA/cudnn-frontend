@@ -47,7 +47,9 @@ def test_only_cudnn_ops_exports_the_semantic_api(tmp_path):
 
     source = Path(__file__).resolve().parents[4] / "python" / "cudnn"
     probe = tmp_path / "cudnn"
-    shutil.copytree(source, probe)
+    # Other pytest workers may atomically replace bytecode while this tree is
+    # copied. The fresh interpreter needs source, not another process's cache.
+    shutil.copytree(source, probe, ignore=shutil.ignore_patterns("__pycache__", "*.py[co]"))
     compiled_modules = list(Path(cudnn.__file__).resolve().parent.glob("_compiled_module*.so"))
     if len(compiled_modules) != 1:
         pytest.skip(f"expected one compiled module next to {cudnn.__file__}, " f"found {len(compiled_modules)}")

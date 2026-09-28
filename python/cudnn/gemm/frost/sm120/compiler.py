@@ -1015,11 +1015,11 @@ def _quant_device_imports(chain: FusionChain) -> list[str]:
     Both round UP: a scale rounded DOWN makes ``amax / scale`` exceed the output
     format's max, clamping the block's largest element.
 
-    ``ue8m0`` needs no widening helper — it is a bare exponent, so ``byte << 23``
-    IS the fp32. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
+    ``ue8m0`` needs no widening helper — its exponent bits are widened directly,
+    with byte 0 handled as the FP32 subnormal 2**-127. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
     :func:`_check_block_quant_supported`.
 
-    Both take ``x == 0`` to byte 0, which the readback turns back into 0.0."""
+    Both take ``x == 0`` to byte 0: 2**-127 for ue8m0, 0.0 for ue5m3."""
     kinds = {q.scale_dtype for q in chain.quants}
     lines: list[str] = []
     if "fp8_e8m0" in kinds:

@@ -195,6 +195,7 @@ def _split_fixture(stats):
         seq_q_present=False,
         seq_kv_present=False,
         gate_expect=None,
+        quant=None,
         shape_fixed=False,
         lpt_grid_fixed=False,
         kv_tail_admitted=lambda q, kv: True,

@@ -24,6 +24,11 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### conftest.py landmines — read before editing
 
+- Source-package subprocess probes must exclude `__pycache__` and bytecode
+  when copying a tree shared by xdist workers. Python atomically renames its
+  temporary `.pyc` files, so `copytree` can enumerate a file that disappears
+  before it is copied (the causal-conv1d import-contract probe hit this in CI).
+
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
 - Crash isolation (`# Crash isolation` block in `conftest.py`): `pytest_cmdline_main` injects `-n1 --max-worker-restart=100000`, so a segfault, a poisoned CUDA context, or a hang kills only one xdist worker, which the controller replaces before continuing. After every test `pytest_runtest_logfinish` probes the context with `torch.cuda.synchronize()`; a per-test `faulthandler.dump_traceback_later(exit=True)` deadline (`CUDNN_TEST_TIMEOUT`, default 1500 s, `0` disables) covers the probe too. It is faulthandler's C watchdog, not a Python thread or `SIGALRM`, because a hung CUDA driver call holds the GIL and parks the main thread. Not injected under `-n<N>`, `-s`, `--pdb`, `--collect-only`, or `CUDNN_TEST_NO_ISOLATION=1`; without a worker to restart, a dead context stops the run via `pytest.exit` and a hang still hard-exits. Killing a worker does **not** stop a kernel it left running -- the driver keeps that context until the kernel ends, and the next worker can block behind it.
@@ -127,6 +132,10 @@ module's `__file__` after conftest setup, not only `cudnn.__file__`.
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
 the selected package/source setup into each child and verify its loaded path.
+Children that import test helpers need both the helper directory and
+`test/python` on their own `sys.path`; pytest's parent-process path setup is
+not inherited. Run fresh-process cache probes from their temporary directory
+so launching pytest from `test/python` cannot hide missing child imports.
 
 ### Pending-consumer lifetime probes
 
@@ -159,12 +168,26 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+When testing a retained staging path, choose a declaration that the graph
+validator accepts but the native pointer layout declines. A nonunit D stride
+is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
+the existing dense conversion path. `test_staged_rebind_stream_capture` in
+`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay.
+
+Optional gradients copied from accumulators after a prepared launch still need
+presence, dtype and extent checks before any staging write. They can be absent
+from the pointer ABI, so the common binder cannot validate them. The detector
+is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
+
 Test both graph prepared-plan admission and the standalone adapter's compiler
 selection when retaining a tensor fallback. Declining the graph attachment alone
 can still compile a prepared artifact inside the adapter and fail at execution.
 `test_fp8_paged_prepared_table_stride_admission` checks both decisions for distinct
-K/V page-table strides; `test_fp8_paged_distinct_table_strides_keep_tensor_executor`
-checks the retained tensor path numerically and under CUDA Graph replay.
+K/V page-table strides; `test_fp8_paged_distinct_table_strides_prepared`
+checks both routes numerically with the tensor compiler forbidden, changed
+allocations and CUDA Graph replay.
 
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
@@ -258,3 +281,111 @@ before the byte address is formed even without a wide declared stride.
 Int32 boundary for both backward SF layouts. Its source and destination
 prefixes keep the old negative offsets inside allocated storage, so the old
 implementation fails numerically rather than through an invalid access.
+
+### Packed SM80 forward launch migration
+
+After moving a wrapper to a prepared host, forbid the old tensor launcher
+after warmup and check fresh bindings plus changed-input graph replay. Keep
+physical stride and product-overflow probes on every native flavor, with
+wrapped addresses poisoned inside allocated guard storage.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
+THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+
+
+### SM80 staged pointer launches
+
+A pointer host can follow existing layout staging without changing that
+staging's numerical contract. Keep off-flavor and RoPE references, mutate
+angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
+after warmup so a return to tensor launch plumbing fails independently of
+numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
+RED on the old tensor launcher for both dtypes and both template families.
+
+Trailing-dimension and contiguity checks do not prove that a broadcast input
+has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
+it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
+case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+RED-then-green detector. A compiler-memo test must also rebuild the wrapper
+on its second call: clear the wrapper cache while retaining the compiler memo,
+then forbid JIT. Reusing the same adapter cannot test compiler reuse.
+
+SM80's standalone packed wrapper preserves cumulative tensors as row offsets
+into the supplied storage. Do not substitute graph API cumulative-length
+normalization: that changes which Q/K/V rows the standalone call addresses.
+`test_thd_wrapper_preserves_packed_row_origins` checks different Q/KV origins,
+empty sequences and changed origins after capture, including zeroed output
+capacity outside those origins. Keep baseline compatibility evidence.
+
+
+Prepared THD artifact reuse must survive a disabled persistent cache and an
+unknown environment manifest. Change packed capacities and launch bounds with
+JIT forbidden, then check numerical output and graph replay. Keep workspace
+sizing per plan and exclude tensors, pointers and streams from the artifact
+memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
+SM80 detector. When asserting disk-artifact hits, clear the process memo before
+both cache population and reload: otherwise an earlier test can prevent the
+temporary cache from being populated, or a memo hit can bypass the disk counter.
+
+A `None` compile sample may still occupy a positional TVM-FFI argument slot.
+When extending a prepared host with a staged-only operand, retain the native
+entry signature and delegate internally; do not assume the absent operand is
+removed from the exported call ABI. Exercise both native and staged routes,
+including a fresh-process artifact reload. For staged THD output padding,
+test the bounded cast/fold with physical wide output strides as well as the
+input staging; `test_staged_packed_physical_stride` covers both stride and
+index-product overflow with allocated guard storage.
+
+Prepared host migrations must preserve persistent compiled artifacts as well as
+warm execution. A dataclass passed as a `Constexpr` compile argument can prevent
+artifact export even though its runtime slots disappear. Carry only the immutable
+primitive configuration facts the host needs, or read the template module's
+configuration internally. `test_block_output_artifact_reloads_in_fresh_process`
+builds in one process, forbids JIT in another, and checks O/SF/Stats/Amax after
+execution and poisoned-output CUDA Graph replay. A same-process cache hit alone
+does not establish cross-process reuse.
+
+Compute `template_key(globals(), locals(), ...)` before local imports or other
+local assignments. Including a helper function in `locals()` makes the key
+uncacheable even when the graph's specialization is fully static; all eight
+SM100/SM107 MXFP8 prepared entries must obey this ordering.
+
+### Prepared gate pointer regressions
+
+Auxiliary TMA inputs need the same physical Int64 stride coverage as Q/O.
+`test_quantized_gate_batch_stride_above_int32` steps two live BF16 gate batches
+across an 8-GiB gap. A valid decoy island at the truncated offset makes its
+Int32 negative control fail numerically without launching an invalid access.
+After graph capture, swap the gates between sigmoid saturation at zero and one:
+O must change, while Stats and requested Amax still describe ungated SDPA.
+
+Optional-output flags and sample descriptors must agree at every host boundary.
+Cover an explicit disabled flag with a retained sample descriptor as well as
+an absent descriptor: compilation, argument validation, scratch initialization
+and tensor-operand elision must use the same effective presence decision.
+`test_pv_bf16_no_amax_flag_with_sample_descriptor` checks prepared and retained
+tensor entries; inconsistent decisions caused a D192 `None.iterator` compile
+failure and an output that was simultaneously required and forbidden.
+
+For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
+and all auxiliary bindings before workspace carving or any copy/fill. A tensor
+compiler previously checked some of these at dispatch; raw addresses cannot.
+The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
+replaces the workspace carver with a tripwire so an invalid short buffer fails
+safely before it can reach a GPU launch.
+
+For a GEMM+GLU failure, compare the final output with both the stored GEMM
+intermediate and an independent dot product before attributing it to GEMM.
+SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
+halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
+bounded failure output, and preservation of the original assertion.
+
+Independent page tables need independent observed-span checks and Int64 stride
+slots in the prepared host. Test distinct K/V page values and layouts, then
+rebind allocations and mutate table values under capture replay. Preserve the
+shared-stride constraint for a host whose ABI still has only one stride pair.
+
+A shared kernel imported as an ordinary module has no template-loader digest.
+Calling `template_key` there otherwise returns `None` and silently bypasses
+persistent caching. Give the module a source identity and require fresh-process
+reload of the whole chain, including split combine and both pointer/tensor
+calling conventions; forbidding JIT only around the attention kernel misses it.

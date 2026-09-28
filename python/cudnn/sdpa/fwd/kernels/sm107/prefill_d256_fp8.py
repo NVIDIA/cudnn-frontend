@@ -768,6 +768,9 @@ def _kernel(
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === TMA-LDG warp group ===
 
 
@@ -2486,8 +2489,6 @@ def compile_prepared(
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
-    if CFG.EPILOGUE_GATE:
-        raise NotImplementedError("prepared FP8 epilogue gate is not wired")
     if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
         raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):

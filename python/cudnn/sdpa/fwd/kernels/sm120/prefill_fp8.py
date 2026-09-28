@@ -232,6 +232,7 @@ class SM120FusedMultiHeadAttentionForward:
         qh_per_kh: int = 1,
         stats_log2: bool = False,
         o_block_scale: int = 0,
+        sfo_geometry: Optional[tuple[int, int, int, int]] = None,
     ):
         """Initialize the FMHA prefill kernel configuration.
 
@@ -337,6 +338,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
         self.o_block_scale = o_block_scale
+        self.sfo_geometry = sfo_geometry
 
         # Warp roles
         if self.q_tile == 128:
@@ -1501,7 +1503,7 @@ class SM120FusedMultiHeadAttentionForward:
                         # Token-major (sfo_row_off_b != 0) has no kernel-owned pad.
                         c = cutlass.Int32(p0 // npairs) + q_head_base * sfo_col_off_h
                         r = row_q + batch_idx * sfo_row_off_b
-                        plane = (batch_idx * cutlass.Int32(num_heads_q) + q_head_base) * sfo_plane_stride
+                        plane = (cutlass.Int64(batch_idx) * num_heads_q + q_head_base) * sfo_plane_stride
                         sf_ptr = sfo_base_ptr + _sfo_atom_offset(plane, r, c, sfo_cols)
                         if row_valid:
                             sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(sf_byte),), cutlass.Int8), alignment=1)
@@ -1569,8 +1571,8 @@ class SM120FusedMultiHeadAttentionForward:
             # over partials over-reports the output amax.  split_combine_sm100
             # computes it over the recombined O instead; this write has to stay
             # out of the way, since atomicMax only grows.
-            amax_o_arr = cutlass.make_array_view(amax_o)
-            if cutlass.const_expr(self.split_kv == 1):
+            if cutlass.const_expr(self.split_kv == 1 and amax_o is not None):
+                amax_o_arr = cutlass.make_array_view(amax_o)
                 prims.atomicrmw(
                     prims.AtomicOp.MAX,
                     amax_o_arr,
@@ -1636,7 +1638,7 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
@@ -1651,10 +1653,10 @@ class SM120FusedMultiHeadAttentionForward:
         descale_v_t: cute.Tensor,
         scale_o_t: Optional[cute.Tensor],
         sf_o: Optional[cute.Tensor] = None,
-        sfo_plane_stride: cutlass.Int32 = 0,
-        sfo_row_off_b: cutlass.Int32 = 0,
-        sfo_col_off_h: cutlass.Int32 = 0,
-        sfo_cols: cutlass.Int32 = 0,
+        sfo_plane_stride: cutlass.Int64 = 0,
+        sfo_row_off_b: cutlass.Int64 = 0,
+        sfo_col_off_h: cutlass.Int64 = 0,
+        sfo_cols: cutlass.Int64 = 0,
     ) -> None:
         """SM120 per-tensor FP8 FMHA prefill kernel.
 
@@ -1684,7 +1686,15 @@ class SM120FusedMultiHeadAttentionForward:
             descale_v_t / scale_o_t): loaded and folded in-kernel — Rule 3,
             no host readback.
         """
-        if cutlass.const_expr(self.split_kv > 1):
+        # A prepared block-output plan fixes the SF atom geometry. Keeping these
+        # Int64 values constant lets the compiler simplify byte addressing
+        # without narrowing large physical plane strides.
+        if cutlass.const_expr(self.sfo_geometry is not None):
+            sfo_plane_stride = cutlass.Int64(self.sfo_geometry[0])
+            sfo_row_off_b = cutlass.Int64(self.sfo_geometry[1])
+            sfo_col_off_h = cutlass.Int64(self.sfo_geometry[2])
+            sfo_cols = cutlass.Int64(self.sfo_geometry[3])
+        if cutlass.const_expr(self.split_kv > 1 and amax_o is not None):
             _initialize_split_amax(amax_o)
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % cute.arch.WARP_SIZE
@@ -1887,7 +1897,7 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
         descale_q_t: cute.Tensor,
@@ -1901,10 +1911,10 @@ class SM120FusedMultiHeadAttentionForward:
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
         sf_o: Optional[cute.Tensor] = None,
-        sfo_plane_stride: cutlass.Int32 = 0,
-        sfo_row_off_b: cutlass.Int32 = 0,
-        sfo_col_off_h: cutlass.Int32 = 0,
-        sfo_cols: cutlass.Int32 = 0,
+        sfo_plane_stride: cutlass.Int64 = 0,
+        sfo_row_off_b: cutlass.Int64 = 0,
+        sfo_col_off_h: cutlass.Int64 = 0,
+        sfo_cols: cutlass.Int64 = 0,
         prepared: cutlass.Constexpr[bool] = False,
     ) -> None:
         """Launch the SM120 per-tensor FP8 FMHA kernel.
@@ -2150,15 +2160,18 @@ def compile(  # noqa: A001
     persistent_ctas: int = 0,
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
+    sfo_geometry: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     """Compile the prepared dense/THD entry or a remaining dense tensor entry.
 
     Packed capacities and Int64 strides bind at execution. Head geometry and
     Stats packing specialize the pointer host; THD no longer creates tensor fakes.
-    Block-scaled output and conversion layouts retain the tensor entry.
+    Conversion layouts retain the tensor entry; block outputs use fixed SF geometry.
     """
 
     _cache_key = _template_key(globals(), locals(), "compile")
+    if prepared and bool(O_BLOCK_SCALE) != (sfo_geometry is not None):
+        raise ValueError("prepared block-output geometry must match the specialization")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=IN_DTYPE,
         out_dtype=OUT_DTYPE,
@@ -2183,6 +2196,7 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
         o_block_scale=O_BLOCK_SCALE,
+        sfo_geometry=sfo_geometry if prepared else None,
     )
     if prepared:
         return _compile_prepared_host(
@@ -2199,6 +2213,7 @@ def compile(  # noqa: A001
             output_dtype=OUT_DTYPE,
             has_amax=has_amax,
             scale_o_in_combine=scale_o_in_combine,
+            sfo_geometry=sfo_geometry,
         )
     if PARAMS.thd_varlen:
         raise ValueError("SM120 FP8 THD uses prepared=True; the tensor entry is dense-only")
@@ -2308,11 +2323,11 @@ def compile(  # noqa: A001
         # geometry scalars; folded out (None / defaults) otherwise.
         *(
             (
-                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
+                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(64, divisibility=1),), stride_order=(0,), assumed_align=16),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
             )
             if O_BLOCK_SCALE
             else ()

@@ -542,7 +542,7 @@ def _kernel(
     tma_k_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     lse_tensor: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -561,13 +561,21 @@ def _kernel(
     # None / 0 when the mode is off.
     scale_o_t: Optional[cute.Tensor] = None,
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
+    # The prepared plan fixes this byte geometry; retain Int64 while allowing
+    # constant folding of the SF atom's offset arithmetic.
+    if cutlass.const_expr(prepared_sfo_geometry is not None):
+        sfo_plane_stride = cutlass.Int64(prepared_sfo_geometry[0])
+        sfo_row_off_b = cutlass.Int64(prepared_sfo_geometry[1])
+        sfo_col_off_h = cutlass.Int64(prepared_sfo_geometry[2])
+        sfo_cols = cutlass.Int64(prepared_sfo_geometry[3])
 
-    if cutlass.const_expr(SPLIT_KV > 1):
+    if cutlass.const_expr(SPLIT_KV > 1 and amax_o_tensor is not None):
         _initialize_split_amax(amax_o_tensor)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -2378,7 +2386,7 @@ def _correction_warp_group(
     bars,
     sched,
     lse_tensor: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
     seq_q_lens_addr,
@@ -2643,7 +2651,7 @@ def _correction_warp_group(
                 )
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
-                if cutlass.const_expr(CFG.EMIT_AMAX_O):
+                if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
                     _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
                     _amax_o_local = opaque_f32_zero()  # not a constant: it feeds fmax_f32's inline_ptx (frost-tile-dsl s7)
 
@@ -2670,7 +2678,7 @@ def _correction_warp_group(
 
                     _sfo_r = q_row_global + batch_idx * sfo_row_off_b
                     _sfo_c0 = head_idx * sfo_col_off_h
-                    _sfo_plane = (batch_idx * n_qh + head_idx) * sfo_plane_stride
+                    _sfo_plane = (cutlass.Int64(batch_idx) * n_qh + head_idx) * sfo_plane_stride
                     _sfo_row_part = (
                         _sfo_plane
                         + (_sfo_r >> cutlass.Int32(7)) * (sfo_cols << cutlass.Int32(7))
@@ -2710,7 +2718,7 @@ def _correction_warp_group(
                         for _i in cutlass.range_constexpr(_GROUP):
                             _e = o_elems[_i]
                             g_amax = fmax_f32(g_amax, cute.math.abs(_e))
-                        if cutlass.const_expr(CFG.EMIT_AMAX_O):
+                        if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
                             _amax_o_local = fmax_f32(_amax_o_local, g_amax)
 
                         if cutlass.const_expr(CFG.DTYPE_O == 4):
@@ -2773,7 +2781,7 @@ def _correction_warp_group(
                             tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
                             cutlass.Float32,
                         )
-                        if cutlass.const_expr(CFG.EMIT_AMAX_O):
+                        if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
                             for _i in cutlass.range_constexpr(O_CHUNK):
                                 _e = o_scaled[_i]
                                 _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))  # FMNMX3, not compare+select (see _E2E_FREQ block)
@@ -2797,7 +2805,7 @@ def _correction_warp_group(
                 # over partials over-reports the output amax.  split_combine_sm100
                 # computes it over the recombined O instead; this write has to stay
                 # out of the way, since atomicMax only grows.
-                if cutlass.const_expr(SPLIT_KV == 1 and CFG.EMIT_AMAX_O):
+                if cutlass.const_expr(SPLIT_KV == 1 and CFG.EMIT_AMAX_O and amax_o_tensor is not None):
                     if _row_valid:
                         nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
@@ -2848,9 +2856,9 @@ def _host(
     o_tensor: cute.Tensor,
     sf_q_tensor: cute.Tensor,
     sf_k_tensor: cute.Tensor,
-    sf_v_tensor: cute.Tensor,
+    sf_v_tensor: Optional[cute.Tensor],
     lse_tensor: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -2876,12 +2884,13 @@ def _host(
     # None / 0 when the mode is off.
     scale_o_t: Optional[cute.Tensor] = None,
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
     stream: _cuda_driver.CUstream = None,
     prepared: cutlass.Constexpr[bool] = False,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
 
@@ -2991,7 +3000,12 @@ def _host(
 
     tma_q_sf_desc = _build_sf_desc(sf_q_tensor, _q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
     tma_k_sf_desc = _build_sf_desc(sf_k_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K // CFG.CTA_MMA, KH)
-    tma_v_sf_desc = _build_sf_desc(sf_v_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_V, SF_NUM_ROWS_V // CFG.CTA_MMA, KH)
+    # The BF16 PV specialization never issues an SF_V transaction. Reuse a
+    # valid descriptor for the dead kernel slot; no dummy buffer is needed.
+    if cutlass.const_expr(CFG.PV_BF16):
+        tma_v_sf_desc = tma_k_sf_desc
+    else:
+        tma_v_sf_desc = _build_sf_desc(sf_v_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_V, SF_NUM_ROWS_V // CFG.CTA_MMA, KH)
 
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
     q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster
@@ -3068,6 +3082,7 @@ def _host(
         sfo_row_off_b,
         sfo_col_off_h,
         sfo_cols,
+        prepared_sfo_geometry=prepared_sfo_geometry,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -3135,8 +3150,10 @@ def compile(  # noqa: A001
         cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K), stride_order=(3, 2, 1, 0), assumed_align=16
     )
 
-    fake_sf_v = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V), stride_order=(3, 2, 1, 0), assumed_align=16
+    fake_sf_v = (
+        None
+        if CFG.PV_BF16
+        else cute.runtime.make_fake_compact_tensor(cutlass.Int8, (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V), stride_order=(3, 2, 1, 0), assumed_align=16)
     )
 
     if not has_lse:
@@ -3152,7 +3169,9 @@ def compile(  # noqa: A001
             else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_lse_batch, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
         )
 
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+    fake_amax_o = (
+        None if CFG.PV_BF16 and not CFG.EMIT_AMAX_O else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+    )
 
     fake_seq_q_lens = cutlass.Int64(0)
 
@@ -3199,11 +3218,11 @@ def compile(  # noqa: A001
             else (
                 None,
                 cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None,
-                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
+                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(64, divisibility=1),), stride_order=(0,), assumed_align=16),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
             )
         ),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
@@ -3225,13 +3244,17 @@ def compile_prepared(
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
     static_lse_strides: Optional[tuple[int, int, int]] = None,
+    sfo_geometry: Optional[tuple[int, int, int, int]] = None,
+    has_scale_o: bool = False,
 ) -> Callable:
     """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
 
-    cache_key = _template_key(globals(), locals(), "compile_prepared")
-    if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False):
-        raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
+    if bool(getattr(CFG, "O_BLOCK_SCALE", 0)) != (sfo_geometry is not None):
+        raise ValueError("prepared block-output geometry must match the specialization")
+    if sfo_geometry is not None and (CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA):
+        raise NotImplementedError("prepared block outputs require dense unsplit, unpacked plans")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
         raise ValueError("prepared MXFP8 keeps the native head-dimension contract")
     if scale_o_in_combine:
@@ -3253,5 +3276,8 @@ def compile_prepared(
         lse_kind,
         has_amax=has_amax,
         static_lse_strides=static_lse_strides,
+        sfo_geometry=sfo_geometry,
+        optional_amax=True,
+        has_scale_o=has_scale_o,
         partial_slot=True,
     )

@@ -784,9 +784,12 @@ def test_graph_thd_sinks(causal, stats_layout):
     torch.testing.assert_close(dsink.double(), dsink_ref, rtol=2e-2, atol=1e-4)
 
 
-def test_thd_rejects_prefix_sum_lengths():
-    """The backward node carries per-batch lengths only; a (B+1,) prefix sum at
-    execute is a contract violation the adapter names, not a silent mis-read."""
+def test_native_thd_direct_accepts_prefixes_and_rejects_bad_counts():
+    """Native standalone plans accept B lengths or B+1 prefixes explicitly.
+
+    The graph node still declares B lengths. The shared raw graph binding
+    retains that interpretation; this direct tensor API can observe B+1.
+    """
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     lens_q = lens_kv = (256, 128)
@@ -804,7 +807,8 @@ def test_thd_rejects_prefix_sum_lengths():
     ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     dq, dk, dv = torch.zeros_like(case.q), torch.zeros_like(case.k), torch.zeros_like(case.v)
     cu = torch.tensor(case.cu_q, dtype=torch.int32, device=dev)
-    with pytest.raises(ValueError, match="per-batch lengths"):
+
+    def execute(lengths):
         api.execute(
             view(case.q),
             view(case.k),
@@ -816,9 +820,15 @@ def test_thd_rejects_prefix_sum_lengths():
             view(dk),
             view(dv),
             workspace=ws,
-            seq_q_lens=cu,
-            seq_kv_lens=cu,
+            seq_q_lens=lengths,
+            seq_kv_lens=lengths,
         )
+
+    execute(cu)
+    _check(case, dq, dk, dv)
+    bad = torch.zeros(b + 2, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="per-batch lengths"):
+        execute(bad)
 
 
 @pytest.mark.parametrize(
@@ -867,30 +877,36 @@ def test_graph_thd_execute_does_not_sync():
     torch.cuda.synchronize()
 
 
-def test_graph_thd_compile_key_is_plan_time_only():
-    """Issue #604 on the graph path: two ragged graphs with the same envelope,
-    sequence count and Stats packing but different packed totals share ONE
-    compiled artifact (the bprop template's per-shape lru sees a hit, no miss).
+def test_graph_thd_compile_key_is_plan_time_only(tmp_path, monkeypatch):
+    """Different packed totals reuse one prepared artifact for the same envelope.
 
-    Token-major Stats on purpose: the head-major packing's head stride is
-    plan-time tensor geometry that legitimately keys the artifact (it is the
-    fake's extent), and the 64-rounded capacity differs between the two runs.
+    Token-major Stats keeps every stepped stride unchanged. Head-major Stats
+    legitimately specializes its declared head stride. A fresh persistent-cache
+    directory, cleared process memo and a forbidden compiler make a second
+    shape-specific JIT fail at the persistent artifact boundary.
     """
-    from cudnn.frost import template_loader
+    import cutlass.cute as cute
+    from cudnn.frost import compiled_cache, template_loader
+    from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
 
-    def cache_totals():
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
-
-    _run_graph((300, 128), (300, 128), stats_layout="token_major")
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    _compile_thd_artifact.cache_clear()
+    before = compiled_cache.stats()
+    _, graph, _, _, _ = _run_graph((300, 128), (300, 128), stats_layout="token_major")
+    assert graph._compiled_plans[graph._plan_index]._prepared is not None
     n_modules = len(template_loader._MODULES)
-    misses_0, hits_0 = cache_totals()
-    # Same S_max envelope (300) and B (2), different totals and lengths.
+    first = compiled_cache.stats()
+    assert first["misses"] > before["misses"], "the empty cache must be populated before testing reload"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("different packed totals minted a compile")
+
+    monkeypatch.setattr(cute, "compile", forbidden)
+    _compile_thd_artifact.cache_clear()
     _run_graph((300, 64), (300, 64), stats_layout="token_major")
-    misses_1, hits_1 = cache_totals()
-    assert misses_1 == misses_0, "different packed totals minted a compile (runtime data leaked into the key)"
-    assert hits_1 > hits_0, "expected the same-envelope re-plan to cache-hit"
+    second = compiled_cache.stats()
+    assert second["misses"] == first["misses"], "runtime packed totals leaked into the compile key"
+    assert second["hits"] > first["hits"], "expected the same-envelope prepared artifact to cache-hit"
     assert len(template_loader._MODULES) == n_modules
 
 

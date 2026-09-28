@@ -2375,10 +2375,7 @@ def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
     if entry == "graph":
         reason = engines._prepared_decline_reason(caps, facts, split)
-        if v_stride == (8, 1):
-            assert reason is None
-        else:
-            assert reason is not None and "table strides" in reason
+        assert reason is None
         return
 
     q = SimpleNamespace(shape=(B, H, 1, 128), stride=(H * 128, 128, H * 128, 1), dtype=torch.float8_e4m3fn)
@@ -2398,7 +2395,8 @@ def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
         paged_table_stride=(8, 1),
         paged_table_v_stride=v_stride,
     )
-    assert SdpaFwdDslSm100._can_prepare_fp8(api) == (v_stride == (8, 1))
+    api._prepared_operand_layout = lambda desc: SdpaFwdDslSm100._prepared_operand_layout(api, desc)
+    assert SdpaFwdDslSm100._can_prepare_fp8(api)
 
 
 @pytest.mark.parametrize(

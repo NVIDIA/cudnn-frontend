@@ -1176,6 +1176,8 @@ def sdpa_operand_tensors(
     block_table_v_ptr=None,
     table_strides=(0, 0),
     n_pages=0,
+    o_pack=1,
+    table_v_strides=None,
 ) -> SdpaOperandTensors:
     """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
     host traces, so the branches below are static).
@@ -1187,7 +1189,7 @@ def sdpa_operand_tensors(
     "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
     B, QH, KH, SQ, SKV, _ = problem_size
     q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
-    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v, o_strides, thd)
+    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd)
     if paged:
         k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
         v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)
@@ -1221,7 +1223,8 @@ def sdpa_operand_tensors(
         max_pages = SKV // cutlass.Int32(page_size)
         t_bs, t_ps = table_strides
         table = cute.make_tensor(block_table_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
-        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
+        v_bs, v_ps = table_strides if table_v_strides is None else table_v_strides
+        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((B, max_pages), stride=(v_bs, v_ps)))
     return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
 
 

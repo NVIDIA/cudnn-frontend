@@ -1046,6 +1046,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,
@@ -3570,9 +3573,9 @@ def compile_prepared(
     static_lse_strides: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
 
-    cache_key = _template_key(globals(), locals(), "compile_prepared")
     if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False):
         raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
     if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):

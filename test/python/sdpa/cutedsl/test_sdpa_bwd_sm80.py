@@ -256,7 +256,6 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     TemplateParams template with no standalone entry point)."""
     try:
         from cudnn.sdpa.bwd import api_dsl as api_sm80
-        from cudnn.sdpa.bwd.kernels.sm80 import bprop_d64_f16 as d64
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -283,12 +282,13 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     # Generic path: build the adapter directly (BHSD-logical views of the same
     # BSHD storage) with the d64 gate forced off, so it compiles + launches
     # the generic TemplateParams module.
+    eligible = api_sm80._sm80_d64_fast_path_eligible
     monkeypatch.setattr(api_sm80, "_sm80_d64_fast_path_eligible", lambda **kw: False)
     qb, kb, vb, ob, dob = (t.transpose(1, 2) for t in (q, k, v, o, do))
     dq_g = torch.empty(b, s, h, d, dtype=q.dtype, device="cuda").transpose(1, 2)
     dk_g = torch.empty_like(dq_g)
     dv_g = torch.empty_like(dq_g)
-    eng = api_sm80.SdpaBwdDslSm80(
+    ctor = dict(
         sample_q=qb,
         sample_k=kb,
         sample_v=vb,
@@ -301,6 +301,7 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
         is_causal=False,
         scale_softmax=scale,
     )
+    eng = api_sm80.SdpaBwdDslSm80(**ctor)
     assert eng.check_support()
     eng.compile()
     assert not eng._use_d64
@@ -318,11 +319,15 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
         scale_softmax=scale,
         workspace=workspace,
     )
-    dq_g, dk_g, dv_g = (t.transpose(1, 2) for t in (dq_g, dk_g, dv_g))  # back to BSHD
-    dq_d, dk_d, dv_d = d64.backward(q, k, v, do, o, lse, scale=scale)
-    torch.testing.assert_close(dq_d.float(), dq_g.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(dk_d.float(), dk_g.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(dv_d.float(), dv_g.float(), rtol=2e-2, atol=2e-2)
+    generic = tuple(t.clone() for t in (dq_g, dk_g, dv_g))
+    monkeypatch.setattr(api_sm80, "_sm80_d64_fast_path_eligible", eligible)
+    fast = api_sm80.SdpaBwdDslSm80(**ctor)
+    fast.compile()
+    assert fast._use_d64 and fast._prepared is not None
+    workspace = torch.empty(fast.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    fast.execute(qb, kb, vb, ob, dob, lse, dq_g, dk_g, dv_g, workspace=workspace)
+    for got, expected in zip((dq_g, dk_g, dv_g), generic):
+        torch.testing.assert_close(got.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1, sinks=None, deterministic=False, max_s_q=None):
@@ -398,12 +403,31 @@ def test_sm80_bwd_thd_flavor_envelope_dims(d_qk, d_v):
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
 
+def _prepared_bwd_cache_totals():
+    """Observe backward artifact reuse at the process memo, excluding forward JIT.
+
+    Disk reload has separate tests that explicitly clear this memo. A warm
+    memo hit correctly avoids entering the persistent cache at all.
+    """
+    from cudnn.sdpa.bwd.api_dsl import _sm80_thd_plan
+    from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
+
+    _sm80_thd_plan.cache_clear()
+    _compile_thd_artifact.cache_clear()
+
+    def totals():
+        info = _compile_thd_artifact.cache_info()
+        return info.misses, info.hits
+
+    return totals
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sm80_bwd_thd_compile_key_plan_time_only():
     """Issue #604 regression (backward): the packed THD token totals are
     RUNTIME values, so two varlen backward calls with different totals must
-    re-bind ONE compiled artifact (the bprop template's per-shape lru sees a
+    re-bind ONE compiled artifact (the prepared artifact cache sees a
     single miss) — never mint a compile per step, the continuous-batching
     pathology no correctness test catches."""
     from cudnn.frost import template_loader
@@ -434,13 +458,7 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
             cum_seqlen_k_tensor=cu,
         )
 
-    def cache_totals():
-        # Count ONLY the bprop template's per-shape lru (the fwd wrapper runs
-        # too, and its counters are covered by the forward's twin test); the
-        # counters are session-global, so assert on DELTAS across our calls.
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+    cache_totals = _prepared_bwd_cache_totals()
 
     varlen([96, 160])  # first call: one compile
     n_modules_before = len(template_loader._MODULES)
@@ -540,7 +558,7 @@ def test_sm80_bwd_strided_stats_native_reads():
 @torch_fork_set_rng(seed=0)
 def test_sm80_bwd_thd_max_s_kv_hint():
     """The THD wrapper's max_s_kv grid hint must (a) produce bitwise the same
-    grads as the hint-less host-read path, including when over-provisioned
+    grads as the hint-less capacity-bound path, including when over-provisioned
     (short kv-tiles early-out), and (b) be rejected on the dense path."""
     import itertools
 
@@ -860,13 +878,7 @@ def test_sm80_bwd_thd_sinks_deterministic_compile_key():
     re-bind across different token totals — and, for deterministic, a
     different max_s_q — without a new compile: neither T_q nor the relay
     counter's size is part of the key."""
-    from cudnn.frost import template_loader
-
-    def cache_totals():
-        """(misses, hits) summed over the loaded bprop template modules' compile caches."""
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+    cache_totals = _prepared_bwd_cache_totals()
 
     sinks = torch.randn(4, dtype=torch.float32, device="cuda")
     try:
