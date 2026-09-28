@@ -4514,11 +4514,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
-        if not self._can_prepare_layout():
+        compiled = self._compiled_kernel is not None
+        staged = getattr(self, "_staged_spec", None)
+        if staged is not None:
+            return staged.workspace_bytes
+        if not compiled and not self._can_prepare_layout():
             from .prepared_staged_sm120 import workspace_bytes
 
             return workspace_bytes(self)
-        if self._can_prepare_fp8():
+        if self._prepared_fp8 if compiled else self._can_prepare_fp8():
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].

@@ -1944,4 +1944,5 @@ import test_sdpa_staged_forward_sm120 as _staged_forward_checks
 @pytest.mark.L0
 @requires_dsl
 class TestStagedSm120Wrapper:
+    test_compiled_workspace_budget = staticmethod(_staged_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
     test_conversion_workspace = staticmethod(_staged_forward_checks.test_sm120_wrapper_supplies_conversion_workspace)

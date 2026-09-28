@@ -471,3 +471,19 @@ def test_sm120_wrapper_supplies_conversion_workspace(layout, d, side_stream, mon
             torch.testing.assert_close(result["lse_tensor"].double(), scores.logsumexp(-1), atol=3e-4, rtol=3e-4)
     torch.cuda.current_stream().wait_stream(launch_stream)
     assert len(seen) == 2 and seen[0] is seen[1]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("staged", [False, True])
+def test_compiled_workspace_query_uses_prepared_budget(fp8, staged, monkeypatch):
+    api, tensors, _ = _case(fp8=fp8)
+    if not staged:
+        for name in ("q", "k", "v", "o"):
+            tensors[name] = tensors[name].transpose(1, 2).contiguous().transpose(1, 2)
+        api = SdpaFwdDslSm120(**{"sample_" + n: tensors[n] for n in ("q", "k", "v", "o", "lse")}, pertensor_fp8=fp8)
+        assert api.check_support()
+    required = api.scratch_workspace_bytes()
+    api.compile()
+    monkeypatch.setattr(api, "_can_prepare_layout", lambda: pytest.fail("compiled workspace query rebuilt layout"))
+    monkeypatch.setattr(api, "_can_prepare_fp8", lambda: pytest.fail("compiled workspace query repeated admission"))
+    assert api.scratch_workspace_bytes() == required
