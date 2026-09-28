@@ -561,10 +561,7 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         params,
         tag=f"t_{d_qk}_{d_v}_{dtype_qkv}_{splits}_{cta_mma}_{int(causal)}",
     )
-    compile_kwargs = dict(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
-    if not mx:
-        compile_kwargs.update(d_qk=d_qk, d_v=d_v)
-    fn = mod.compile(**compile_kwargs) if mx else mod.compile_prepared(d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile_prepared(d_qk=d_qk, d_v=d_v, has_lse=True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=_partial_o_dtype(splits, torch.float16))
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
@@ -573,6 +570,16 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
     zB = torch.zeros(B, dtype=torch.int32, device=dev)
     ps = (B, H, H, SQ, SKV, 0)
     log2e = cutlass.Float32(scale * _math.log2(_math.e))
+
+    import cutlass.cute as cute
+
+    storage_dtype = cutlass.Float8E5M2 if dtype_qkv == DTYPE_E5M2 else cutlass.Float8E4M3FN
+
+    def ptr(t, dtype, align=16):
+        return cute.runtime.make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+    def strides(t):
+        return tuple(cutlass.Int64(n) for n in t.stride()[:3])
 
     if not mx:
         fp8_dtype = torch.float8_e5m2 if dtype_qkv == DTYPE_E5M2 else torch.float8_e4m3fn
@@ -584,17 +591,8 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
 
         # Bind the pointer ABI directly to preserve inspection of partial O/LSE
         # before combine. Keep every scalar owner alive until the final sync.
-        import cutlass.cute as cute
-
         scales = [torch.ones(1, dtype=torch.float32, device=dev) for _ in range(4)]
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
-        storage_dtype = cutlass.Float8E5M2 if dtype_qkv == DTYPE_E5M2 else cutlass.Float8E4M3FN
-
-        def ptr(t, dtype, align=16):
-            return cute.runtime.make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
-
-        def strides(t):
-            return tuple(cutlass.Int64(n) for n in t.stride()[:3])
 
         fn(
             ptr(q, storage_dtype),
@@ -659,7 +657,40 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
         v8 = v8.reshape(B, H, SKV, d_v).permute(0, 2, 1, 3).contiguous()
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
-        fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, o_desc, ps, log2e, cutlass.Int32(0), **_partial_kwargs(splits, o_p), stream=stream)
+        fn(
+            ptr(q8, storage_dtype),
+            ptr(k8, storage_dtype),
+            ptr(v8, storage_dtype),
+            ptr(o_p, cutlass.Float32 if splits > 1 else cutlass.Float16),
+            ptr(lse_p, cutlass.Float32, 4),
+            ptr(zH, cutlass.Float32),
+            ptr(zB, cutlass.Int32),
+            ptr(o_desc, cutlass.Int64),
+            ps,
+            strides(q8),
+            strides(k8),
+            strides(v8),
+            strides(o_p),
+            strides(lse_p),
+            cutlass.Int32(SQ),
+            log2e,
+            cutlass.Int32(0),
+            cutlass.Int64(0),
+            None,
+            None,
+            None,
+            ptr(o_p, cutlass.Float32) if splits > 1 else None,
+            ptr(sfq, cutlass.Int8),
+            ptr(sfk, cutlass.Int8),
+            ptr(sfv, cutlass.Int8),
+            tuple(cutlass.Int32(t.shape[2]) for t in (sfq, sfk, sfv)),
+            ptr(amax_o, cutlass.Float32, 4),
+            None,
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+            stream=stream,
+        )
 
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
     if causal:
@@ -764,8 +795,8 @@ def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d192_d128_mxfp8.py")
     params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
     mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
-    with pytest.raises(ValueError, match="dense LSE strides"):
-        mod.compile(b=1, qh=2, kh=2, sq=128, skv=256, has_lse=True, lse_stride=(256, 128, 1))
+    with pytest.raises(ValueError, match="dense unsplit Stats"):
+        mod.compile_prepared(d_qk=192, d_v=128, has_lse=True, static_lse_strides=(256, 128, 1))
 
 
 @pytest.mark.L0

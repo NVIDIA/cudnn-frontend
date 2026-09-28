@@ -454,20 +454,15 @@ def test_sm107_fp8_pack_gqa_is_d128_only():
     assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
 
-# MXFP8 retains its legacy tensor compiler; per-tensor FP8 binds Stats strides
-# dynamically through the shared pointer host for every flavor.
-_SM107_STRIDED_STATS_NOT_PORTED = {
-    "fp8": set(),
-    "mxfp8": {(128, 128), (192, 128), (256, 256), (512, 512)},
-}
-
-
-def test_sm107_fp8_strided_stats_is_ported_for_all_flavors(monkeypatch):
+@pytest.mark.parametrize("family", ["fp8", "mxfp8"])
+def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeypatch):
     """Invert the previous D256/D512 gap detector; runtime Stats strides are
     accepted by each prepared entry, with native numerics in the FP8 suite."""
-    from cudnn.sdpa.fwd.kernels import _fp8_host
+    from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
 
-    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    host_module = _fp8_host if family == "fp8" else _mxfp8_host
+    load_kw = _DTYPE_FAMILIES[1 if family == "fp8" else 2][1]
+    caps = _caps("sdpa_fwd_prefill_sm107_" + family)
     assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     captured = []
     sentinel = object()
@@ -476,19 +471,15 @@ def test_sm107_fp8_strided_stats_is_ported_for_all_flavors(monkeypatch):
         captured.append((args, kwargs))
         return sentinel
 
-    monkeypatch.setattr(_fp8_host, "compile_host", compile_host)
+    monkeypatch.setattr(host_module, "compile_host", compile_host)
     for flavor in _FLAVORS:
-        mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[1][1])
-        assert not hasattr(mod, "compile"), "per-tensor FP8 must use the pointer compiler"
+        mod = _load(flavor, rubin=True, **load_kw)
+        assert not hasattr(mod, "compile"), "quantized attention must use the pointer compiler"
         with open(mod.__file__, encoding="utf-8") as fh:
             assert "strided Stats not ported" not in _code_lines(fh.read())
         # Bypass the memoized result so the real entry forwards its metadata.
         assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
     assert len(captured) == len(_FLAVORS)
-    for flavor in _FLAVORS:
-        mod = _load(flavor, rubin=True, **_DTYPE_FAMILIES[2][1])
-        with open(mod.__file__, encoding="utf-8") as fh:
-            assert ("strided Stats not ported" in _code_lines(fh.read())) == (flavor in _SM107_STRIDED_STATS_NOT_PORTED["mxfp8"]), mod.__name__
 
 
 def test_sm107_rows_carry_the_padded_stats_trim():
@@ -1676,10 +1667,9 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     """The f16 kernel is an explicit pointer/int host: the gate is a MODULE specialization
     (TemplateParams.epilogue_gate -> CFG.EPILOGUE_GATE), its slot (``gate_ptr`` + runtime
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
-    MXFP8 keeps the tensor entry, where signatures evolve append-only
-    (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
-    ``gate_tensor`` immediately after ``stream``; prepared flags may follow.  A ``gate_stride`` handed to an UNGATED tensor-entry
-    module is a ValueError, not a silently ignored kwarg."""
+    Both quantized families use prepared pointer hosts with runtime gate strides.
+    Their internal tensor host signatures remain append-only: ``gate_tensor``
+    immediately follows ``stream``; prepared flags may follow."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
@@ -1696,13 +1686,12 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     fp8_host = inspect.signature(fp8._host_prepared).parameters
     assert {"gate_ptr", "gate_strides"} <= fp8_host.keys()
     assert list(fp8_host)[-1] == "stream"
-    mx_c = list(inspect.signature(mxfp8.compile).parameters)
-    assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
-    assert mx_c.index("lse_stride") < mx_c.index("gate_stride")
-    assert mx_c[: mx_c.index("gate_stride")] == [p for p in mx_c if p not in ("gate_stride", "has_amax")]
-    sig = inspect.signature(mxfp8.compile).parameters
-    assert sig["gate_stride"].default is None
-    assert sig["has_amax"].default is True
+    mx_c = inspect.signature(mxfp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & mx_c.keys()
+    assert mx_c["has_amax"].default is True
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    assert {"gate_ptr", "gate_strides"} <= inspect.signature(_mxfp8_host.host).parameters.keys()
     for mod in (fp8, mxfp8):
         host = list(inspect.signature(mod._host).parameters)
         stream_slot = host.index("stream")
@@ -1719,11 +1708,6 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
     assert off.CFG.EPILOGUE_GATE == 0 and "gate_ptr" in inspect.signature(off._host).parameters
-    # The remaining MXFP8 tensor compiler rejects ungated gate metadata.
-    for kw in _QUANT_LOAD_KWS[1:]:
-        off = _load(_D256, rubin=True, **kw)
-        with pytest.raises(ValueError, match="epilogue_gate"):
-            off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
 
 
 def test_sm107_gate_seams_are_named_once():
@@ -1746,9 +1730,10 @@ def test_sm107_gate_seams_are_named_once():
             assert not re.search(rf"^{knob}\b\s*[:=]", code, re.M), f"{mod.__name__}: fork-era module knob {knob} survived"
             assert not re.search(rf"\b{knob}\b", code), f"{mod.__name__}: fork-era knob {knob} is still referenced"
         if not hasattr(mod, "compile"):
-            from cudnn.sdpa.fwd.kernels import _fp8_host
+            from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
 
-            code = Path(_fp8_host.__file__).read_text()
+            host_module = _mxfp8_host if "mxfp8" in mod.__file__ else _fp8_host
+            code = Path(host_module.__file__).read_text()
         assert 'options="--enable-tvm-ffi"' in code, f"{mod.__name__}: compile options must stay the production ones"
 
 
@@ -2568,7 +2553,7 @@ def test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel(tmp_path):
     assert getattr(api_p, "_amax_folded_out", None) is False
 
     shipped = load_template(str(shipped_file), params, tag="shipped_sm107_mxfp8_d256")
-    if "gate_stride" in inspect.signature(shipped.compile).parameters:
+    if hasattr(shipped, "compile_prepared") or "gate_stride" in inspect.signature(shipped.compile).parameters:
         # Post-merge: develop itself carries the gate, so there is no PRE-gate
         # reference left to compare against.  A SKIP, not a failure -- a test
         # must not depend on its own branch not having landed (it would turn the
@@ -2736,10 +2721,7 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
     # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
-    if quant == "fp8":
-        mod.compile_prepared(d_qk=d, d_v=d, has_lse=True)
-    else:
-        mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
+    mod.compile_prepared(d_qk=d, d_v=d, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2909,7 +2891,7 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
     mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
-    entry = mod.compile_prepared if quant == "fp8" else mod.compile
+    entry = mod.compile_prepared
     kw = {k: v for k, v in kw.items() if k in inspect.signature(entry).parameters}
     entry(**kw)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)

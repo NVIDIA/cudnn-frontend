@@ -2169,7 +2169,7 @@ _SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
     print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
-    mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
+    mod.compile_prepared(d_qk=128, d_v=128, has_lse=True)
     """)
 
 # sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
@@ -2475,5 +2475,5 @@ import test_sdpa_prepared_pv_bf16 as _prepared_pv_bf16_checks
 
 class TestPreparedPvBf16:
     test_rebind_and_replay = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_prepared_rebind_and_replay)
-    test_retained_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_retained_conversion_omits_dead_operands)
+    test_staged_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_staged_conversion_omits_dead_operands)
     test_explicit_no_amax = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_no_amax_flag_with_sample_descriptor)

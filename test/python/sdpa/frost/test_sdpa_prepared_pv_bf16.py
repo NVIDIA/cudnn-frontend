@@ -112,7 +112,8 @@ def test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
 
         import cutlass.cute as cute
 
-        guards.setattr(api, "_execute_mxfp8", forbidden)
+        guards.setattr(cute.runtime, "make_fake_tensor", forbidden)
+        guards.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
         guards.setattr(api, "_dummy", forbidden)
         guards.setattr(api, "_can_prepare_fp8", forbidden)
         guards.setattr(api, "_can_prepare_mxfp8", forbidden)
@@ -178,7 +179,7 @@ def test_pv_bf16_v_batch_stride_above_int32(d):
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("amax", [False, True])
-def test_pv_bf16_retained_conversion_omits_dead_operands(d, amax, monkeypatch):
+def test_pv_bf16_staged_conversion_omits_dead_operands(d, amax, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("PV-BF16 needs pre-Rubin SM100")
     gen = torch.Generator(device="cuda").manual_seed(587)
@@ -186,17 +187,21 @@ def test_pv_bf16_retained_conversion_omits_dead_operands(d, amax, monkeypatch):
     storage = torch.randn((2, 128, 2, 129), device="cuda", dtype=torch.bfloat16, generator=gen)
     v = storage[..., :128].transpose(1, 2)
     api, bufs, ws, scales = _case(d=d, amax=amax, v=v)
-    assert not api._prepared_mxfp8  # The existing conversion route stays reachable.
-    original = api._compiled_kernel
+    assert not api._prepared_mxfp8 and api._staged_spec is not None
+    core = api._staged_spec.core
+    original = core.fn
     seen = []
 
     def launch(*args, **kwargs):
-        assert args[6] is None, "hybrid tensor entry constructed unused SF_V"
-        assert (args[8] is None) == (not amax)
+        assert args[core.index["sf_v_ptr"]] is None, "hybrid pointer entry constructed unused SF_V"
+        assert args[core.index["scale_o_ptr"]] is None
+        assert core.quant.has_amax == amax
+        if amax:
+            assert args[core.index["amax_o_ptr"]] == bufs["amax_o"].data_ptr()
         seen.append(True)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(api, "_compiled_kernel", launch)
+    monkeypatch.setattr(core, "fn", launch)
     api.execute(**bufs, workspace=ws)
     _check(bufs, scales)
     assert seen

@@ -57,7 +57,10 @@ def _layout(api):
         physical_d = shape[-1]
         if not pool and any(n > 1 and st != want for n, st, want in zip(shape, strides, (s * h * physical_d, physical_d, h * physical_d, 1))):
             regions.append((role, (b, s, h, physical_d), dtype))
-    ready = compact._can_prepare_layout() if _cc(api)[0] == 12 else compact._can_prepare_fp8()
+    if _cc(api)[0] == 12:
+        ready = compact._can_prepare_layout()
+    else:
+        ready = compact._can_prepare_fp8() if api._pertensor else compact._can_prepare_mxfp8()
     if not ready:
         raise NotImplementedError("compact conversion geometry has no prepared host")
     offset = compact.scratch_workspace_bytes()
@@ -173,8 +176,10 @@ def execute(api, tensors, workspace, stream, scale):
                 execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
                 if label.startswith("SM12"):
                     api._logger.debug("execute (SM120 FP8 per-tensor) completed")
-                else:
+                elif api._pertensor:
                     api._logger.debug("execute (FP8 per-tensor) completed")
+                else:
+                    api._logger.debug("execute (MXFP8) completed")
             else:
                 combine = None
                 if spec.combine is not None:
