@@ -128,11 +128,11 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.pointwise import (
     exp2_mixed,
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.0: the MASK_NONE fast path uses manual tcgen05_ld + row_max_reduction.
+    # cc10.3+ (FUSED_LDTM_STAT) fuses load + row-max into tmem_load_max_reduction_x64.
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
     fp32_to_e2m1_pack,
@@ -211,6 +211,11 @@ _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
 _E2E_CHUNK = CFG.TILE_N // CFG.N_BMM2_CHUNKS
 _E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# LDTM.STAT -- fused ``tcgen05.ld.red.f32.max`` (S_acc load + row-max in one op) --
+# is a cc10.3+ capability; cc10.0 lacks it and keeps the manual tcgen05_ld +
+# software row_max_reduction (default 0).  api_dsl sets it from the device
+# capability at compile time; a distinct value is a distinct specialization.
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off): the MUFU.EX2 the softmax
 # still issues per row per KV step is the alpha exp2 plus the non-emulated columns (97 on, 129 off).
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
@@ -1718,8 +1723,21 @@ def _softmax_kv_body(
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3+: fused HW row-max -- one tcgen05.ld.red.f32.max per 64-col chunk
+        # does the S_acc load AND the row-max in one op, returning 64 data regs
+        # plus the max at index CHUNK, dropping the software max tree.
+        # Unmasked tiles only: the fused .max reduces before a mask could be
+        # applied, so masked tiles keep the software path above.
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(N_CHUNKS)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
-        # SM100: manual row-max (no LDTM.STAT / tmem_load_max_reduction_tile) —
+        # cc10.0: manual row-max (no LDTM.STAT / tmem_load_max_reduction_x64) --
         # the masked path's pattern sans mask.  S_acc is FP32 regardless of dtype.
         raw_chunks = [
             nvvm.tcgen05_ld(
