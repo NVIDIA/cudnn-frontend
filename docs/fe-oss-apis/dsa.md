@@ -700,3 +700,46 @@ result = DSA.dense_indexer_backward_wrapper(
   (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
   microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
   causal offsets.
+
+
+## Native PyTorch training composition
+
+`DSA.sparse_attention` composes the existing native forward and backward
+wrappers, without FlashMLA. It accepts contiguous BF16 `q[S_q,H,D]`,
+`kv[S_kv,D]`, INT32 `indices[S_q,K]`, optional FP32 `attn_sink[H]`, and
+optional INT32 `topk_length[S_q]`, on one SM100 device. Supported pairs are
+H16/H32/H64 with D512/D576 and H128 with D512; output V dimension is 512.
+H16/H32 forward explicitly pads heads to 64 and slices the result. This cost
+belongs to the semantic adapter and is included when benchmarking the call.
+Physical K and sequence extents must be positive. K is padded to 128 for launch.
+
+```python
+from cudnn import DSA
+result = DSA.sparse_attention(q, kv, indices, attn_sink, topk_length=lengths)
+result["out"].float().square().mean().backward()
+score = DSA.sparse_attention_score_recompute(
+    q.detach(), kv.detach(), result["lse"], indices, topk_length=lengths,
+)
+```
+
+Only `out` is differentiable (Q, KV and sink, first order). `lse` is KV-only
+natural-log LSE, excluding sink; `max_logits` and LSE are non-differentiable.
+No sink means an effective all-`-inf` sink vector. Launches and adapter tensor
+operations use the current PyTorch stream. First use compiles the kernels;
+warm before CUDA graph capture. This allocating convenience composition is
+not a new allocation-free APIBase `execute` implementation.
+
+Safe mode maps all out-of-range indices to -1, bounds lengths to [0,K], masks
+inactive suffixes, and compacts valid entries when lengths are supplied. Both
+passes use the same normalized metadata. Duplicate indices remain distinct
+slots. `trusted_compact_metadata=True` is an explicit producer contract:
+bounded valid active prefixes, negative inactive suffixes, bounded lengths;
+without lengths every nonnegative index is in range. It skips normalization,
+not launch padding. Violating that contract is unsafe.
+
+Score recompute preserves original slots, including holes, and returns both
+`target` and effective `indices`. It sums per-head probabilities, masks invalid
+slots, then normalizes across the retained slots; all-masked rows return zeros.
+Targets are detached. Indexer training needs its own loss; discrete Top-K
+selection is not differentiated. This contract uses the existing native `out`
+return key, not the old unmerged bridge's `output` key.

@@ -900,6 +900,9 @@ def _kernel(
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ============================================================================
 # sg0 softmax-iter helper — per-iter body for the 3-segment kv loop
 # (LEFT-masked / unmasked center / RIGHT-masked).  Mirrors canonical
@@ -2594,7 +2597,7 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CGA_TILE_M),
             n_thd_units,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)

@@ -1156,6 +1156,10 @@ def _run_graph_fp8(
     window_left=None,
     pin=True,
     return_graph=False,
+    return_case=False,
+    override=False,
+    explicit_split=None,
+    v_table_layout=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1188,9 +1192,21 @@ def _run_graph_fp8(
     def _sc(val):
         return torch.tensor([[[[val]]]], dtype=torch.float32, device=dev)
 
-    g = cudnn.pygraph(io_data_type=_fp8_cudnn_dtype(_FP8[in_key]), intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=_fp8_cudnn_dtype(_FP8[in_key]),
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=override,
+    )
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
-    tk, tv = g.tensor_like(bt), g.tensor_like(bt)
+    bt_v = bt
+    if v_table_layout == "strided":
+        raw = torch.full((B, 1, max_pages * 2 + 1, 1), -1, device=dev, dtype=torch.int32)
+        bt_v = raw[:, :, 1::2, :]
+        bt_v.copy_(bt)
+    elif v_table_layout == "batch_inner":
+        bt_v = bt.transpose(0, 2).contiguous().transpose(0, 2)
+    tk, tv = g.tensor_like(bt), g.tensor_like(bt_v)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
 
     def _stns():
@@ -1234,6 +1250,13 @@ def _run_graph_fp8(
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
+    if explicit_split is not None:
+        from dataclasses import replace
+
+        selected = g.plans[g._plan_index]
+        knobs = replace(selected.knobs, split_kv=explicit_split, sched_policy=0)
+        g.create_execution_plan(selected.engine_id, knobs)
+        g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
     plan = g.plans[g._plan_index]  # the entry that built: the pin, or the walk's first success
@@ -1243,7 +1266,7 @@ def _run_graph_fp8(
         k: k_c,
         v: v_c,
         tk: bt,
-        tv: bt,
+        tv: bt_v,
         sq_t: slq,
         sk_t: slk,
         o: o_gpu,
@@ -1304,6 +1327,13 @@ def _run_graph_fp8(
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
         if (~live).any():
             assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+    if return_case:
+        tensors = dict(
+            q=q, k=k, v=v, k_table=tk, v_table=tv, seq_q=sq_t, seq_kv=sk_t, o=o, amax_o=amx_o, descale_q=dqn, descale_k=dkn, descale_v=dvn, scale_o=son
+        )
+        if stats:
+            tensors["lse"] = st
+        return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
     return (plan, g) if return_graph else plan
 
 
@@ -1608,6 +1638,11 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
         )
 
     _api().check_support()  # the real SM100 device: accepted
+    # Model compiler support for this synthetic device independently of the
+    # worker's release DSL; this test checks the paged capability boundary.
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
     with pytest.raises(NotImplementedError, match="SM107 sibling"):
         _api().check_support()

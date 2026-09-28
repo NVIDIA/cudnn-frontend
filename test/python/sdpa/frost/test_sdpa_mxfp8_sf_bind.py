@@ -12,8 +12,8 @@ mxfp8 benchmark harness builds).  On such a view the two orders differ, so
 binding through ``.contiguous()`` would both copy and hand the kernel a
 *different byte stream* than its descriptors read.
 
-These tests pin the binding helper both adapter paths (``_reshape_sf`` and
-``_reshape_sf_packed``) go through.  They are CPU-only: no GPU, no DSL, no
+These tests pin physical-order binding in the retained dense tensor adapter
+and the shared prepared pointer binder.  They are CPU-only: no GPU, no DSL, no
 compile -- everything here is tensor metadata.
 """
 
@@ -123,8 +123,8 @@ def test_a_gapped_slice_is_rejected_by_name():
         _sf_storage_order_bytes(gapped, "sf_v")
 
 
-@pytest.mark.parametrize("method", ["_reshape_sf", "_reshape_sf_packed"])
-def test_both_adapter_paths_bind_through_the_helper(method):
+def test_legacy_dense_adapter_binds_through_the_helper():
+    method = "_reshape_sf"
     """Regression guard: neither reshape path may reintroduce ``.contiguous()``.
 
     The copy is invisible in results -- it is correct for the contiguous inputs
@@ -137,3 +137,83 @@ def test_both_adapter_paths_bind_through_the_helper(method):
 
     assert "_sf_storage_order_bytes(" in code
     assert "contiguous" not in code
+
+
+def test_prepared_sf_preserves_storage_order_and_rejects_copies():
+    from cudnn.sdpa.fwd.prepared import _sf_byte_count
+
+    view = _harness_view(_reordered_bytes())
+    assert _sf_byte_count(tuple(view.shape), tuple(view.stride()), "int8") == _ATOM_BYTES
+    wide = _reordered_bytes().view(torch.int32)
+    assert _sf_byte_count(tuple(wide.shape), tuple(wide.stride()), "int32") == _ATOM_BYTES
+    for shape, strides in (((4, 4), (1, 1)), ((4, 4), (8, 1)), ((4, 4), (-4, 1))):
+        with pytest.raises(ValueError):
+            _sf_byte_count(shape, strides, "int8")
+
+
+def _prepared_sf_facts(thd=False):
+    from cudnn.sdpa.fwd.prepared import BufferFacts, DenseLaunchSpec, ThdLaunchSpec, QuantizedLaunchSpec
+
+    spec = ThdLaunchSpec() if thd else DenseLaunchSpec()
+    spec.device_index, spec.qh, spec.kh = 0, 2, 2
+    if not thd:
+        spec.b, spec.s_q_max, spec.s_k_max = 1, 256, 256
+    spec.quant = QuantizedLaunchSpec(True, 0, (512, 512, 512))
+    facts = {
+        name: BufferFacts(0x10000 + i * 0x10000, "uint8", (2, 0), 2048, (1, 2, 2, 512), (2048, 1024, 512, 1)) for i, name in enumerate(("sf_q", "sf_k", "sf_v"))
+    }
+    facts.update(
+        {name: BufferFacts(0x100000 + i * 0x10000, "float8_e4m3fn", (2, 0), 65536, (256, 2, 128), (256, 128, 1)) for i, name in enumerate(("q", "k", "v"))}
+    )
+    return spec, facts
+
+
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("name", ["sf_q", "sf_k", "sf_v"])
+@pytest.mark.parametrize("bad", ["short", "alignment", "device", "gapped", "overlap", "missing", "whole_tiles"])
+def test_prepared_sf_rejects_invalid_runtime_facts(thd, name, bad):
+    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+
+    spec, facts = _prepared_sf_facts(thd)
+    f = facts[name]
+    if bad == "short":
+        f = f._replace(span=1024)
+    elif bad == "alignment":
+        f = f._replace(ptr=f.ptr + 1)
+    elif bad == "device":
+        f = f._replace(device=(1, 0))
+    elif bad == "gapped":
+        f = f._replace(strides=(4096, 2048, 1024, 1))
+    elif bad == "overlap":
+        f = f._replace(strides=(2048, 512, 512, 1))
+    elif bad == "missing":
+        f = None
+    else:
+        f = f._replace(shape=(2047,), strides=(1,))
+    facts[name] = f
+    with pytest.raises(ValueError):
+        _bind_mxfp8_scales(spec, facts)
+
+
+@pytest.mark.parametrize("thd", [False, True])
+def test_prepared_sf_cache_rechecks_pointer_and_observed_span(thd):
+    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+
+    spec, facts = _prepared_sf_facts(thd)
+    assert _bind_mxfp8_scales(spec, facts)["sf_tiles"] == (2, 2, 2)
+    original = facts["sf_q"]
+    for replacement in (original._replace(span=0), original._replace(ptr=original.ptr + 4)):
+        facts["sf_q"] = replacement
+        with pytest.raises(ValueError):
+            _bind_mxfp8_scales(spec, facts)
+    facts["sf_q"] = original._replace(span=-1)
+    assert _bind_mxfp8_scales(spec, facts)["sf_q_ptr"] == original.ptr
+
+
+def test_prepared_sf_rejects_different_packed_kv_tile_counts():
+    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+
+    spec, facts = _prepared_sf_facts(True)
+    facts["sf_v"] = facts["sf_v"]._replace(shape=(1024,), strides=(1,), span=1024)
+    with pytest.raises(ValueError, match="same packed tile count"):
+        _bind_mxfp8_scales(spec, facts)

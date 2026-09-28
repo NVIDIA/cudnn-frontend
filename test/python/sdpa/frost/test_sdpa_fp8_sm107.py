@@ -24,6 +24,37 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
+    # device with a fake compiler target; actual Rubin tests use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
+@pytest.mark.parametrize("dsl_version", ["4.7.0", "0.3.0+internal"])
+def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_version):
+    import torch
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import engines
+
+    dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    caps = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
+    error = engines.mismatch(caps[engines.engine_name(arch="sm107", fp8=True)], _fp8_facts(device_cc=(10, 7)))
+    assert "sm_107a" in error and dsl_version in error
+    assert engines.mismatch(caps[engines.engine_name(arch="sm100", fp8=True)], _fp8_facts()) is None
+    with pytest.raises(NotImplementedError, match="sm_107a") as exc:
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None).check_support()
+    assert dsl_version in str(exc.value)
+
+
 def _load(rubin, **params):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
@@ -977,7 +1008,9 @@ def _run_fp8_gated(q8, k8, v8, descales, gate, *, dtype_o, causal, sched_policy=
     assert api.check_support()
     api.compile()
     dq, dk, dv = descales
-    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv)
+    size = api.scratch_workspace_bytes()
+    workspace = torch.empty(size, dtype=torch.uint8, device=q8.device) if size else None
+    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
     if gate_on:
         kw["gate"] = gate
     if amax_o is not None:
@@ -1091,3 +1124,243 @@ def test_fp8_d256_amax_is_the_pre_gate_value():
         f"Amax_O must be G-independent and equal the ungated kernel's: -1e4 {amax_neg:.6f}, +1e4 {amax_pos:.6f}, "
         f"random {amax_rand:.6f}, ungated {amax_ungated_kernel:.6f}"
     )
+
+
+# Keep prepared-runtime probes in the explicit SM107 CI entry point.
+import torch
+import test_sdpa_prepared_fp8 as _prepared_fp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestPreparedSm107Fp8:
+    @pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (192, 128, 1), (256, 256, 1), (512, 512, 1), (128, 128, 4)])
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_prepared_fp8_routes(self, d, dv, split, thd, dtype):
+        if thd and split > 1:
+            pytest.skip("THD split is not served")
+        g, vp, ws, bufs, tensors = _prepared_fp8_checks._case(d=d, dv=dv, split_kv=split, thd=thd, output_dtype=dtype, arch="sm107")
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=thd)
+        with _prepared_fp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            bufs["descale_v"].fill_(0.3)
+            bufs["scale_o"].fill_(1.9)
+            bufs["o"].fill_(float("nan"))
+            bufs["amax_o"].fill_(999)
+            graph.replay()
+            _prepared_fp8_checks._check(bufs, thd=thd)
+
+    @pytest.mark.parametrize("d", [256, 512])
+    def test_sm107_fp8_stats_nonunit_row_stride(self, d):
+        g, vp, ws, bufs, tensors = _prepared_fp8_checks._case(d=d, dv=d)
+        b, h, sq = bufs["lse"].shape
+        storage = torch.full((b, h, sq, 2), 12345.0, device="cuda")
+        bufs["lse"] = storage[..., 0]
+        vp[tensors["lse"]] = bufs["lse"].unsqueeze(-1)
+        bufs["lse"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=False)
+        assert (storage[..., 1] == 12345).all()
+        with _prepared_fp8_checks._cuda_graph() as captured:
+            with torch.cuda.graph(captured):
+                g.execute(vp, ws)
+            bufs["lse"].fill_(float("nan"))
+            captured.replay()
+            _prepared_fp8_checks._check(bufs, thd=False)
+            assert (storage[..., 1] == 12345).all()
+
+    @pytest.fixture(autouse=True)
+    def _sm107_case(self, monkeypatch):
+        original = _prepared_fp8_checks._case
+
+        def case(**kwargs):
+            kwargs.setdefault("arch", "sm107")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_prepared_fp8_checks, "_case", case)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_fp8_rebind(self, thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch):
+        _prepared_fp8_checks.test_prepared_fp8_rebind_scales_and_buffers(thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_fp8_capture(self, thd, d, dv, dtype, monkeypatch):
+        _prepared_fp8_checks.test_prepared_fp8_capture_replay_reads_current_scales(thd, monkeypatch, d, dv, dtype)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_physical_thd_stride_int64(self, dtype, d, dv):
+        _prepared_fp8_checks.test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_override_and_adapter(self, thd, d, dv, monkeypatch):
+        with monkeypatch.context() as patch:
+            _prepared_fp8_checks.test_prepared_fp8_bounded_batch_override(thd, patch, d, dv)
+        _prepared_fp8_checks.test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d, dv)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_kv_and_input_strides(self, d, dv, monkeypatch):
+        with monkeypatch.context() as patch:
+            _prepared_fp8_checks.test_prepared_fp8_dense_kv_override(d, dv, patch)
+        _prepared_fp8_checks.test_prepared_fp8_dense_input_strides(d, dv)
+        _prepared_fp8_checks.test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch)
+
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("splits", [2, 4])
+    def test_sm107_fp8_split_rebind(self, dtype, output_dtype, splits, monkeypatch):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_rebind("sm107", 128, 128, dtype, output_dtype, splits, monkeypatch)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_fp8_split_capture(self, stats, amax, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_capture("sm107", 128, 128, stats, amax, dtype)
+
+    def test_sm107_fp8_split_overrides(self, monkeypatch):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_runtime_kv_and_strides("sm107", 128, 128, monkeypatch)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_fp8_split_physical_stride_int64(self, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_output_stride_int64("sm107", 128, 128, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_fp8_split_omitted_scales(self, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        # The shared SM100 API owns both arch lines and selects SM107 at runtime.
+        split.test_prepared_fp8_split_standalone_default_scales("sm100", 128, 128, dtype)
+
+    @pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_fp8_dense_envelopes(self, d, dv, dtype):
+        g, vp, ws, bufs, _ = _prepared_fp8_checks._case(d=d, dv=dv, sq=16, skv=256, output_dtype=dtype, override=True)
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=False, sq=16, skv=256)
+
+
+# MXFP8 probes share fixtures but are collected by the SM107 CI entry point.
+import test_sdpa_prepared_mxfp8 as _prepared_mxfp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestPreparedSm107Mxfp8:
+    @pytest.fixture(autouse=True)
+    def _sm107_mxfp8_case(self, monkeypatch):
+        original = _prepared_mxfp8_checks._case
+
+        def case(**kwargs):
+            kwargs.setdefault("arch", "sm107")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_prepared_mxfp8_checks, "_case", case)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_mxfp8_rebind(self, stats, amax, dtype, d, dv, output_dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_rebind_scales_and_buffers(False, stats, amax, dtype, d, dv, output_dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_capture(self, d, dv, dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_capture_reads_current_scales(False, 1, d, dv, dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("carrier", [torch.uint8, torch.int32])
+    def test_sm107_mxfp8_sf_storage(self, d, dv, carrier):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_sf_physical_permutation(False, d, dv, carrier)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_mxfp8_strides_and_adapter(self, d, dv, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_strided_dense_inputs(d, dv)
+        _prepared_mxfp8_checks.test_prepared_mxfp8_graph_and_adapter_bind_same_frame(False, d, dv, monkeypatch)
+
+    def test_sm107_mxfp8_no_allocation_or_sync(self, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_execute_has_no_allocation_or_sync(False, 1, monkeypatch)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("layout", ["padded", "batch_inner"])
+    def test_sm107_mxfp8_runtime_stats_layout(self, d, dv, layout):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_runtime_stats_layout_keeps_generic_branch(d, dv, layout)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_physical_output_stride_int64(self, d, dv, dtype):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < 18 * 2**30:
+            pytest.skip("physical output-stride regression needs 18 GiB free")
+        try:
+            g, vp, ws, bufs, _ = _prepared_mxfp8_checks._case(
+                d=d,
+                dv=dv,
+                b=1,
+                hq=1,
+                hk=1,
+                sq=2,
+                skv=128,
+                output_dtype=dtype,
+                output_padding=2**32,
+                explicit_plan=True,
+            )
+        except torch.OutOfMemoryError:
+            pytest.skip("physical output-stride storage unavailable")
+        assert bufs["o"].stride(2) > 2**32
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        bufs["o"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)
+        with _prepared_mxfp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            _prepared_mxfp8_checks._change_scales(bufs)
+            bufs["o"].fill_(float("nan"))
+            graph.replay()
+            _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)
+
+
+import test_sdpa_prepared_block_output as _prepared_block_output_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific block-output CI entry")
+class TestPreparedBlockOutput:
+    test_artifact_reload = staticmethod(_prepared_block_output_checks.test_block_output_artifact_reloads_in_fresh_process)
+    test_rebind_and_replay = staticmethod(_prepared_block_output_checks.test_block_scaled_prepared_rebind_and_replay)
+    test_invalid_storage = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup)
+    test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)
+    test_graph_adapter_parity = staticmethod(_prepared_block_output_checks.test_block_scaled_graph_and_adapter_bind_same_frame)
+    test_scale_presence = staticmethod(_prepared_block_output_checks.test_block_scaled_mxfp8_scale_presence_matches_compilation)
+
+
+import test_sdpa_prepared_quantized_gate as _prepared_quantized_gate_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific quantized-gate CI entry")
+class TestPreparedQuantizedGate:
+    from test_sdpa_prepared_quantized_artifact_cache import test_quantized_variant_artifact_reloads_in_fresh_process as _cache_reload
+
+    test_artifact_reload = staticmethod(_cache_reload)
+    test_rebind_and_replay = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_prepared_rebind_and_replay)
+    test_batch_override = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_bounded_batch_override)

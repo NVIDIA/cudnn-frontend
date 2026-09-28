@@ -192,4 +192,4 @@ pip install nvidia-cudnn-frontend
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_proj_rope_mxfp8.py`.
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_gemm_proj_rope_mxfp8.py`.

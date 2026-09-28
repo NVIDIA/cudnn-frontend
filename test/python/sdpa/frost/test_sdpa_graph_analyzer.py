@@ -39,6 +39,10 @@ DTYPE = cudnn.data_type.HALF
 def _fake_sm100(monkeypatch):
     """Fake an SM100 device so the device-family gate passes without a real GPU."""
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    # Pure capability tests also construct Rubin facts on non-Rubin DSL builds.
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
 
 
 def _mk_graph(**kwargs) -> cudnn.pygraph:
@@ -149,8 +153,8 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
 
 @pytest.mark.parametrize("d", [128, 256, 512])
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_sm120_override_admits_prepared_dense_and_declines_legacy_routes(monkeypatch, d, opt_in):
-    """Explicit SM120 dense plans admit overrides; unmigrated routes still decline."""
+def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, d, opt_in):
+    """SM120 half and per-tensor FP8 plans admit overrides; legacy routes decline."""
     from dataclasses import replace
     from unittest.mock import Mock
 
@@ -172,8 +176,12 @@ def test_sm120_override_admits_prepared_dense_and_declines_legacy_routes(monkeyp
     lower.assert_not_called()
     facts = _facts(graph)
     assert engines._prepared_decline_reason(spec.capabilities, facts, 1) is None
-    assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is not None
-    for change in (dict(thd=True), dict(has_paged_kv=True), dict(is_fp8=True), dict(is_mxfp8=True)):
+    assert engines._prepared_decline_reason(spec.capabilities, facts, 2) is None
+    assert engines._prepared_decline_reason(spec.capabilities, replace(facts, thd=True), 1) is None
+    fp8 = replace(facts, is_fp8=True)
+    assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
+    assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
+    for change in (dict(has_paged_kv=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
 
 
@@ -223,36 +231,80 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
 
 
-@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
-@pytest.mark.parametrize("feature", ["supported", "head_dim", "fp8_output", "paged", "split", "block_scaled_output", "gate", "sm107"])
-def test_prepared_fp8_override_capability_envelope(dtype_o, feature):
-    """D128 FP8-to-half is eligible; the other quantized routes retain their tensor entry."""
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+@pytest.mark.parametrize("feature", ["supported", "head_dim", "paged", "split", "block_scaled_output", "gate", "sm107", "sm108", "sm119"])
+@pytest.mark.parametrize("arch", ["sm100", "sm120"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)])
+def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, arch):
+    """Prepared binding supports existing FP8 head envelopes and SM100 page pools."""
     from dataclasses import replace
 
     graph = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(graph, d=128)
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
-    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=dtype_o, d_qk=d_qk, d_v=d_v)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch=arch, fp8=True))
     changed = dict(
         supported={},
-        head_dim=dict(d_qk=256, d_v=256),
-        fp8_output=dict(dtype_o=cudnn.data_type.FP8_E4M3),
+        head_dim=dict(d_qk=112, d_v=112),
         paged=dict(has_paged_kv=True),
         split={},
         block_scaled_output=dict(o_block_scale=32),
         gate=dict(has_epilogue_gate=True),
-        sm107={},
+        sm107=dict(device_cc=(10, 7)),
+        sm108=dict(device_cc=(10, 8)),
+        sm119=dict(device_cc=(11, 9)),
     )[feature]
-    if feature == "sm107":
+    if feature in ("sm107", "sm108", "sm119"):
         caps = replace(caps, sm_lo=107, sm_hi=119)
+    if feature == "paged":
+        table = graph.tensor(dim=(B, 1, 8, 1), stride=(8, 8, 1, 1), data_type=cudnn.data_type.INT32)
+        changed.update(paged_k_table_t=table, paged_v_table_t=table)
     reason = engines._prepared_decline_reason(caps, replace(facts, **changed), 2 if feature == "split" else 1)
-    if feature == "supported":
+    if feature in ("supported", "split", "head_dim", "sm107") or (arch == "sm100" and feature == "paged"):
         assert reason is None
     else:
         assert reason is not None
-        assert "prepared FP8" in reason
+        assert "prepared" in reason
+
+
+@pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
+def test_prepared_fp8_dense_envelopes_do_not_expand_thd(d, dv):
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, d_qk=d, d_v=dv, thd=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    assert "packed native-tile leg" in engines.mismatch(caps, facts)
+
+
+@pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+@pytest.mark.parametrize("padding", [8, 16])
+def test_prepared_fp8_output_stride_uses_output_element_width(dtype_o, padding):
+    """Eight-element padding meets half TMA alignment, but not FP8 alignment."""
+    fp8 = cudnn.data_type.FP8_E4M3
+    graph = _mk_graph(is_override_shape_enabled=True)
+    q, k, v, dims, _ = _mk_qkv(graph, d=128)
+    for tensor in (q, k, v):
+        tensor.set_data_type(fp8)
+    scales = {
+        name: graph.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name=name)
+        for name in ("descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o")
+    }
+    o, _, _, _ = graph.sdpa_fp8(q=q, k=k, v=v, attn_scale=0.1, generate_stats=False, **scales)
+    pitch = 128 + padding
+    _finish_output(o, dims, (S * H * pitch, pitch, H * pitch, 1), dtype=dtype_o)
+    facts = _facts(graph)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
+    supported = padding == 16 or dtype_o in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+    reason = engines._prepared_decline_reason(spec.capabilities, facts, 1)
+    assert (reason is None) == supported
+    assert (engines.analyze_for(spec, graph, knobs)[1] is None) == supported
 
 
 def test_probe_accepts_bf16():
@@ -2306,6 +2358,70 @@ def test_override_admission_does_not_load_tensor_or_compiler(monkeypatch):
     for split in (1, 2):
         knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=split)
         assert engines.mismatch(spec.capabilities, facts, knobs) is None
+
+
+@pytest.mark.parametrize("entry", ["graph", "standalone"])
+@pytest.mark.parametrize("v_stride", [(8, 1), (17, 2), (1, B)])
+@pytest.mark.parametrize("split", [1, 4])
+def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    graph = _mk_paged_graph()
+    facts = _facts(graph)
+    facts.paged_v_table_t.set_stride((v_stride[0], 1, v_stride[1], 1))
+    facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, shape_overrides=True)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    if entry == "graph":
+        reason = engines._prepared_decline_reason(caps, facts, split)
+        assert reason is None
+        return
+
+    q = SimpleNamespace(shape=(B, H, 1, 128), stride=(H * 128, 128, H * 128, 1), dtype=torch.float8_e4m3fn)
+    o = SimpleNamespace(shape=q.shape, stride=q.stride, dtype=torch.bfloat16)
+    api = SimpleNamespace(
+        _fp8=True,
+        _pertensor=True,
+        _device_cc=(10, 0),
+        _o_dtype=lambda: torch.bfloat16,
+        o_block_scale=0,
+        gate_desc=None,
+        paged=True,
+        thd=False,
+        split_kv=split,
+        q_desc=q,
+        o_desc=o,
+        paged_table_stride=(8, 1),
+        paged_table_v_stride=v_stride,
+    )
+    api._prepared_operand_layout = lambda desc: SdpaFwdDslSm100._prepared_operand_layout(api, desc)
+    assert SdpaFwdDslSm100._can_prepare_fp8(api)
+
+
+@pytest.mark.parametrize(
+    "thd,override,split,accepted",
+    [(False, False, 1, True), (False, False, 4, True), (False, True, 1, False), (True, True, 1, True), (True, False, 1, True), (True, True, 4, False)],
+)
+@pytest.mark.parametrize("rubin_cc", [(10, 7), (10, 8), (11, 9)])
+def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_cc):
+    from dataclasses import replace
+
+    graph = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(graph, d=128)
+    o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    facts = replace(_facts(graph), is_mxfp8=True, thd=thd, shape_overrides=override)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(mxfp8=True))
+    reason = engines._prepared_decline_reason(caps, facts, split)
+    assert (reason is None) == accepted, reason
+    if accepted:
+        for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
+            assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
+        rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
+        rubin_facts = replace(facts, device_cc=rubin_cc)
+        assert (engines._prepared_decline_reason(rubin, rubin_facts, split) is None) == (rubin_cc == (10, 7) and not thd and not override and split == 1)
 
 
 # --- paged MXFP8 (block-scale pools behind the block tables) ------------------

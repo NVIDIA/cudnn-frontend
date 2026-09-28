@@ -990,6 +990,9 @@ def _kernel(
         scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === TMA-LDG warp group ===
 
 
@@ -2349,8 +2352,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < q_row_limit:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, head_idx, q_row_global] = lse_val
 
         parity_last_rt = cutlass.Int32(0)
         if bounds.right > bounds.left:
@@ -2702,8 +2704,8 @@ def _host(
             global_strides=[
                 SF_TMA_ROW_BYTES // 16,
                 tile_stride_16,
-                num_tiles * tile_stride_16,
-                num_heads * num_tiles * tile_stride_16,
+                cutlass.Int64(num_tiles) * tile_stride_16,
+                cutlass.Int64(num_heads) * cutlass.Int64(num_tiles) * tile_stride_16,
             ],
             box_dims=[SF_TMA_ROW_BYTES, num_rows_box, 1, 1, 1],
             swizzle=tmap.TensorMapSwizzle.none,
@@ -2725,7 +2727,7 @@ def _host(
     # is why the d128 MXFP8 sibling passes with the per-tile form, and why d256
     # was correct at S=128 (one KV tile => one group) and wrong from S=256 on.
     # Mirrors sm100/prefill_d256_mxfp8.py's dense/THD stride split.
-    _v_sf_groups = _B_SF * KH * _kv_sf_num_tiles
+    _v_sf_groups = cutlass.Int64(_B_SF) * cutlass.Int64(KH) * _kv_sf_num_tiles
     if cutlass.const_expr(CFG.THD_VARLEN):
         # THD packs both D-planes of a (head, sequence tile) contiguously.
         _v_plane_stride_16 = SF_BYTES_PER_BLOCK // 16
@@ -2747,7 +2749,7 @@ def _host(
             SF_TMA_ROW_BYTES // 16,
             _v_plane_stride_16,
             _v_tile_stride_16,
-            _kv_sf_num_tiles * _v_tile_stride_16,
+            cutlass.Int64(_kv_sf_num_tiles) * _v_tile_stride_16,
         ],
         box_dims=[SF_TMA_ROW_BYTES, SF_BYTES_PER_BLOCK // SF_TMA_ROW_BYTES, V_SF_PLANES_PER_PEER, 1, 1],
         swizzle=tmap.TensorMapSwizzle.none,
@@ -2830,14 +2832,7 @@ def compile(  # noqa: A001
     gate_stride: Optional[tuple] = None,
     has_amax: bool = True,
 ) -> Callable:
-    """Compile a kernel with concrete dims.
-
-    THD/varlen: q/k/v/o/lse + SF tensors are PACKED with batch dim 1; ``b`` is the
-    LOGICAL batch (sequence count).  The SF tensors are per-sequence-TILE-padded so
-    their packed tile extent is ``total_q_sf_tiles`` / ``total_kv_sf_tiles`` (=
-    Σ_b ceil(S/TILE)); pass those (they vary with the cu_seqlens partition, hence
-    part of the lru_cache key).  Default 0 → fall back to the dense per-batch tile
-    counts so the dense path is unaffected."""
+    """Compile the retained dense tensor entry for conversion and fused-output paths."""
     # THD/varlen is NOT ported for this kernel yet.  The setup-kernel call site
     # below still speaks the pre-upstream 7-arg contract, while FROST's
     # thd_helpers.build_thd_meta_o_descs_kernel takes 14 args and a different
@@ -2859,40 +2854,34 @@ def compile(  # noqa: A001
         raise NotImplementedError(f"{__name__}: strided Stats not ported (contiguous [B, H, S] only)")
     if d_qk > CFG.TILE_K or d_v > CFG.TILE_O or d_qk <= 0 or d_v <= 0:
         raise ValueError(f"{__name__}: envelope is 0 < d_qk <= {CFG.TILE_K}, 0 < d_v <= {CFG.TILE_O}; " f"got ({d_qk}, {d_v})")
-    _fake_batch = 1 if CFG.THD_VARLEN else b
 
     # Q SF tiles TILE_M-row wide → num_tiles = SQ/TILE_M; K/V SF TILE_N-row wide → num_tiles = SKV/TILE_N.
-    # THD: packed (batch dim 1) + per-sequence-TILE-padded → total_*_sf_tiles tiles.
     sq_tiles = (sq + CFG.TILE_M - 1) // CFG.TILE_M
     skv_tiles = (skv + CFG.TILE_N - 1) // CFG.TILE_N
-    if CFG.THD_VARLEN:
-        _q_sf_tiles = total_q_sf_tiles if total_q_sf_tiles > 0 else b * sq_tiles
-        _kv_sf_tiles = total_kv_sf_tiles if total_kv_sf_tiles > 0 else b * skv_tiles
-    else:
-        _q_sf_tiles = sq_tiles
-        _kv_sf_tiles = skv_tiles
+    _q_sf_tiles = sq_tiles
+    _kv_sf_tiles = skv_tiles
 
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_qk),
+        (b, sq, qh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_qk),
+        (b, skv, kh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_v),
+        (b, skv, kh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_v),
+        (b, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -2919,23 +2908,23 @@ def compile(  # noqa: A001
                 raise ValueError(f"declared gate stride {stride} axis {axis} must be a 16-byte multiple at GATE_BPE={CFG.GATE_BPE} (TMA global-stride rule)")
         return cute.runtime.make_fake_tensor(GATE_STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
 
-    fake_gate = _fake_gate_bshd((_fake_batch, sq, qh, d_v), gate_stride) if CFG.EPILOGUE_GATE else None
+    fake_gate = _fake_gate_bshd((b, sq, qh, d_v), gate_stride) if CFG.EPILOGUE_GATE else None
 
     fake_sf_q = cute.runtime.make_fake_compact_tensor(
         cutlass.Int8,
-        (_fake_batch, qh, _q_sf_tiles, SF_SMEM_SIZE_Q),
+        (b, qh, _q_sf_tiles, SF_SMEM_SIZE_Q),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_sf_k = cute.runtime.make_fake_compact_tensor(
         cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_K),
+        (b, kh, _kv_sf_tiles, SF_SMEM_SIZE_K),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_sf_v = cute.runtime.make_fake_compact_tensor(
         cutlass.Int8,
-        (_fake_batch, kh, _kv_sf_tiles, SF_SMEM_SIZE_V),
+        (b, kh, _kv_sf_tiles, SF_SMEM_SIZE_V),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -2947,7 +2936,7 @@ def compile(  # noqa: A001
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
-            (_fake_batch, qh, sq),
+            (b, qh, sq),
             stride_order=(2, 1, 0),
             assumed_align=16,
         )
@@ -2974,18 +2963,16 @@ def compile(  # noqa: A001
         if has_amax
         else None
     )
-    # seq_kv_lens always part of the ABI; THD overloads it as the
-    # [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)] metadata buffer (length 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # Dense per-batch lengths; THD remains rejected before compilation.
+    _skv_len = b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),
         stride_order=(0,),
         assumed_align=16,
     )
-    # Per-batch O TMA-descriptor array (TENSOR_MAP_QWORDS int64 = 128 B each) + 1
-    # pad slot; dummy 1-elem when THD off (kernel never reads it).
-    _odesc_len = (b * _TENSOR_MAP_QWORDS + _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
+    # Unread descriptor slot on the dense-only tensor entry.
+    _odesc_len = 1
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
         (_odesc_len,),
@@ -3050,3 +3037,50 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+from cudnn.sdpa.fwd.kernels._mxfp8_host import host as _host_prepared
+
+
+@lru_cache(maxsize=None)
+def compile_prepared(
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_kind: str = "dense",
+    has_amax: bool = True,
+    scale_o_in_combine: bool = False,
+    static_lse_strides: Optional[tuple[int, int, int]] = None,
+) -> Callable:
+    """Compile the pointer host for existing native scalar-output MXFP8 shapes."""
+    cache_key = _template_key(globals(), locals(), "compile_prepared")
+    from cudnn.sdpa.fwd.kernels._mxfp8_host import LSE_KINDS, compile_host
+
+    if CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA:
+        raise NotImplementedError("prepared SM107 MXFP8 serves existing dense unsplit, unpacked plans")
+    if getattr(CFG, "O_BLOCK_SCALE", 0) or getattr(CFG, "PV_BF16", False):
+        raise NotImplementedError("prepared MXFP8 serves FP8 Q/K/V and scalar outputs")
+    if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
+        raise ValueError("prepared MXFP8 keeps the native head-dimension contract")
+    if scale_o_in_combine:
+        raise ValueError("MXFP8 has no per-tensor output scale")
+    if lse_kind not in LSE_KINDS:
+        raise ValueError(f"invalid prepared MXFP8 Stats layout: {lse_kind}")
+    if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):
+        raise ValueError("prepared MXFP8 Stats layout must match dense or THD")
+    return compile_host(
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        OUT_STORAGE_DTYPE,
+        (SF_SMEM_SIZE_Q, SF_SMEM_SIZE_K, SF_SMEM_SIZE_V),
+        cache_key,
+        d_qk,
+        d_v,
+        has_lse,
+        lse_kind,
+        static_lse_strides=static_lse_strides,
+        partial_slot=False,
+        thd_slots=False,
+        has_amax=has_amax,
+        optional_amax=True,
+    )
