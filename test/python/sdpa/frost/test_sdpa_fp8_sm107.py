@@ -823,6 +823,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
 
 # ============================================================================
+
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
 # ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
@@ -835,6 +836,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 # test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
 # declines (CPU) and the Rubin e2e behind them.
 # ============================================================================
+
 
 _D256 = (256, 256)
 # The d256 O bound of the shared fp8 suite (test_sdpa_fwd_fp8_sm100._half_atol at
@@ -1404,6 +1406,7 @@ import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
 class TestStagedSm107Mxfp8:
+    test_mixed_layout = staticmethod(_staged_mxfp8_checks.test_sm107_d256_mxfp8_staging_preserves_each_native_operand)
     test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
     test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
     test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
