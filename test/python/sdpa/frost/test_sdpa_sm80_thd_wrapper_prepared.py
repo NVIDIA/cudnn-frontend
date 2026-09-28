@@ -48,7 +48,9 @@ def test_wrapper_rebind_capture_and_capacity_tails(d, d_v, dtype, monkeypatch):
     kwargs = dict(deterministic=True, max_s_q=160, max_s_kv=128)
     first = _wrapper(cases[0], cu_q, cu_k, **kwargs)
     _check(cases[0], *(first[n] for n in ("dq_tensor", "dk_tensor", "dv_tensor")))
-    monkeypatch.setattr(api_dsl, "_fd_tvm", lambda *a, **kw: pytest.fail("THD wrapper reached legacy tensor plumbing"), raising=False)
+    import cutlass.cute.runtime as runtime
+
+    monkeypatch.setattr(runtime, "from_dlpack", lambda *a, **kw: pytest.fail("THD wrapper reached legacy tensor plumbing"))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -156,7 +158,7 @@ def test_wrapper_zero_capacity(empty, hkv):
 
 
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
-@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(64, 64), (96, 80), (128, 128), (192, 128), (256, 256)])
 def test_wrapper_capacity_reuses_artifact_without_disk_cache(d, dv, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache

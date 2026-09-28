@@ -109,7 +109,8 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("cache_mode", ["disk", "disabled", "unknown_manifest"])
-def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, tmp_path, monkeypatch):
+@pytest.mark.parametrize("d,dv", [(128, 128), (96, 80)])
+def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
     from cudnn.frost import compiled_cache
@@ -120,7 +121,7 @@ def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, tmp_path, mon
         monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
     elif cache_mode == "unknown_manifest":
         monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: {"cuda_driver": "unknown"})
-    a = _inputs(128, 128, torch.float16)
+    a = _inputs(d, dv, torch.float16)
     lq, lk = (96, 129), (65, 193)
     cq, ck = _prefix(lq), _prefix(lk)
     _check(a, _run(a, cq, ck), lq, lk)
@@ -128,7 +129,7 @@ def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, tmp_path, mon
     if cache_mode == "disk":
         compile_thd_host.cache_clear()
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("artifact was not reloadable"))
-    b = _inputs(128, 128, torch.float16, capq=512, capkv=640, seed=93)
+    b = _inputs(d, dv, torch.float16, capq=512, capkv=640, seed=93)
     lq, lk = (129, 201), (80, 289)
     _check(b, _run(b, _prefix(lq), _prefix(lk), maxq=256), lq, lk)
     if cache_mode == "disk":
