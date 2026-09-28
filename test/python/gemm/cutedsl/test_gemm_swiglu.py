@@ -108,6 +108,8 @@ def test_gemm_swiglu_compile_execute(
 @pytest.mark.parametrize("persistent", [False, True], ids=["multi_group_tile", "persistent_tiles"])
 def test_gemm_swiglu_retained_outputs_replay(dtype, persistent):
     """Retain every launch's outputs so a later correct store cannot hide a race."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100 or newer")
     from cudnn import GemmSwigluSm100
     from cuda.bindings import driver as cuda
 
