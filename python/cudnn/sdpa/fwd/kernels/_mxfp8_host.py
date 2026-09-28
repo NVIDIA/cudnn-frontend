@@ -39,6 +39,11 @@ def _launch(
     thd_kv_lens_ptr: Optional[cute.Pointer],
     thd_lens_form: Optional[cutlass.Int32],
     o_partial_ptr: Optional[cute.Pointer],
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    n_pages: cutlass.Int32,
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
     sf_v_ptr: Optional[cute.Pointer],
@@ -61,7 +66,7 @@ def _launch(
     sfo_geometry: cutlass.Constexpr,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    thd, split_kv, o_block_scale, epilogue_gate, pv_bf16 = config
+    thd, split_kv, o_block_scale, epilogue_gate, pv_bf16, paged, page_size = config
     operands = sdpa_operand_tensors(
         q_ptr,
         k_ptr,
@@ -88,11 +93,18 @@ def _launch(
         thd=thd,
         split_kv=split_kv,
         tensor_map_qwords=16,
+        paged=paged,
+        page_size=page_size,
+        block_table_ptr=block_table_ptr,
+        block_table_v_ptr=block_table_v_ptr,
+        table_strides=table_strides,
+        n_pages=n_pages,
         o_pack=2 if o_block_scale == 16 else 1,
+        table_v_strides=table_v_strides,
     )
     b, qh, kh, _, _, _ = problem_size
 
-    def scale_tensor(ptr, heads, tiles, size):
+    def scale_tensor(ptr, batch, heads, tiles, size):
         # F8_128x4 bytes are opaque, dense storage. Widen before every stride
         # product; an Int64 cast after an Int32 multiplication is too late.
         head_stride = cutlass.Int64(tiles) * size
@@ -100,14 +112,16 @@ def _launch(
         return cute.make_tensor(
             ptr,
             cute.make_layout(
-                (1 if cutlass.const_expr(thd) else b, heads, tiles, size),
+                (1 if cutlass.const_expr(thd) else batch, heads, tiles, size),
                 stride=(batch_stride, head_stride, size, 1),
             ),
         )
 
-    sf_q = scale_tensor(sf_q_ptr, qh, sf_tiles[0], sf_smem_sizes[0])
-    sf_k = scale_tensor(sf_k_ptr, kh, sf_tiles[1], sf_smem_sizes[1])
-    sf_v = None if cutlass.const_expr(pv_bf16) else scale_tensor(sf_v_ptr, kh, sf_tiles[2], sf_smem_sizes[2])
+    # K/V SF pools page with K/V: one batch entry per page.
+    kv_batch = n_pages if cutlass.const_expr(paged) else b
+    sf_q = scale_tensor(sf_q_ptr, b, qh, sf_tiles[0], sf_smem_sizes[0])
+    sf_k = scale_tensor(sf_k_ptr, kv_batch, kh, sf_tiles[1], sf_smem_sizes[1])
+    sf_v = None if cutlass.const_expr(pv_bf16) else scale_tensor(sf_v_ptr, kv_batch, kh, sf_tiles[2], sf_smem_sizes[2])
     amax = None if cutlass.const_expr(optional_amax and not has_amax) else cute.make_tensor(amax_o_ptr, cute.make_layout((1,), stride=(1,)))
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
@@ -129,6 +143,8 @@ def _launch(
         kwargs.update(prepared=True)
     if cutlass.const_expr(partial_slot):
         kwargs.update(o_partial_f32=operands.o_partial)
+    if cutlass.const_expr(paged):
+        kwargs.update(block_table_tensor=operands.block_table, block_table_v_tensor=operands.block_table_v)
     args = (
         operands.q,
         operands.k,
@@ -180,6 +196,11 @@ def host(
     thd_kv_lens_ptr: Optional[cute.Pointer],
     thd_lens_form: Optional[cutlass.Int32],
     o_partial_ptr: Optional[cute.Pointer],
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    n_pages: cutlass.Int32,
     sf_q_ptr: cute.Pointer,
     sf_k_ptr: cute.Pointer,
     sf_v_ptr: Optional[cute.Pointer],
@@ -227,6 +248,11 @@ def host(
         thd_kv_lens_ptr,
         thd_lens_form,
         o_partial_ptr,
+        block_table_ptr,
+        block_table_v_ptr,
+        table_strides,
+        table_v_strides,
+        n_pages,
         sf_q_ptr,
         sf_k_ptr,
         sf_v_ptr,
@@ -294,6 +320,7 @@ def compile_host(
     i32 = cutlass.Int32(0)
     strides = (cutlass.Int64(0),) * 3
     thd = bool(cfg.THD_VARLEN)
+    paged = bool(getattr(cfg, "PAGED_KV", False))
     fp32_partial = cfg.SPLIT_KV > 1 and partial_slot
     return _compile_cached(
         host,
@@ -319,6 +346,11 @@ def compile_host(
         pointer(cutlass.Int32, 4) if thd else None,
         i32 if thd else None,
         pointer(cutlass.Float32) if fp32_partial else None,
+        pointer(cutlass.Int32, 4) if paged else None,
+        pointer(cutlass.Int32, 4) if paged else None,
+        (cutlass.Int64(0), cutlass.Int64(0)),
+        (cutlass.Int64(0), cutlass.Int64(0)) if paged else None,
+        i32,
         pointer(cutlass.Int8),
         pointer(cutlass.Int8),
         None if getattr(cfg, "PV_BF16", False) else pointer(cutlass.Int8),
@@ -335,6 +367,8 @@ def compile_host(
             int(getattr(cfg, "O_BLOCK_SCALE", 0)),
             bool(getattr(cfg, "EPILOGUE_GATE", False)),
             bool(getattr(cfg, "PV_BF16", False)),
+            paged,
+            int(getattr(cfg, "PAGE_SIZE", 0)),
         ),
         sf_smem_sizes,
         d_qk,

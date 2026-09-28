@@ -476,6 +476,14 @@ stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
 an unaligned batch pitch. `test_gate_batch_stride_alignment` covers FP8, half
 and float element widths and the non-stepped singleton-batch control.
 
+Fusing standalone RoPE table preprocessing must preserve the FP32 conversion
+before sin/cos and full-range trigonometry. Approximate PTX sin/cos is not a
+replacement for Torch's large-angle range reduction. The exact-output detector
+`test_rope_table_large_angles_and_special_values` includes large/small finite
+angles, signed zero and nonfinite inputs. Keep real Int64 stride and product
+overflow checks on the angle input, with wrapped addresses inside allocated
+guard storage, plus changed-angle replay and fresh-process artifact reload.
+
 ### Single-CTA persistent SDPA validation
 
 Numerical success does not establish that a one-CTA launch may use DSMEM async

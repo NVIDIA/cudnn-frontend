@@ -213,6 +213,11 @@ def _bind_mxfp8_scales(spec, facts):
             operand = facts[name[-1]]
             if count == 0 and operand.numel and operand.span != 0:
                 raise ValueError(f"cudnn.sdpa: empty {name} requires zero-capacity {name[-1]}")
+        elif getattr(spec, "paged", False) and name != "sf_q":
+            # K/V SF pools page with K/V: page_size / 128 tiles per (page, head).
+            count = spec.page_size // 128
+            if nbytes != int(facts["k"].shape[0]) * row * count:
+                raise ValueError(f"cudnn.sdpa: {name} size does not match the {int(facts['k'].shape[0])}-page pool")
         else:
             count = ((spec.s_q_max if name == "sf_q" else spec.s_k_max) + 127) // 128
             if nbytes != spec.b * row * count:
@@ -1255,6 +1260,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
     if s.quant is not None and (s.quant.sf_sizes or s.quant.block_output is not None):
         s.shape_fixed = s.lpt_grid_fixed = True  # dense SF batch/head pitches are plan-fixed
+        if s.paged:
+            # K/V SF pools page with K/V, so S_kv follows the block table. Batch and S_q stay pinned.
+            s.shape_fixed = False
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))

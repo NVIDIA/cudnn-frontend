@@ -1667,8 +1667,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "the d128 decode tile's ragged-Q leg rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2",
         )
         self._not_implemented_error_if(
-            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1),
-            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD and split-KV are not wired)",
+            self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1 or self.paged),
+            "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD, split-KV and paged KV are not wired)",
         )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -1695,21 +1695,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d128 per-tensor FP8 kernel; every kernel file without it (MXFP8,
+            # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
             self._not_implemented_error_if(self._device_cc == (10, 7), "paged KV is not wired on the SM107 sibling kernels (SM100 line only)")
             self._not_implemented_error_if(
-                self._fp8 and not self._pertensor,
-                "paged KV is not wired for MXFP8 (the F8_128x4 block-scale atoms bundle 128 rows of one head and cannot be assembled from sub-tile pages)",
-            )
-            self._not_implemented_error_if(
                 self._fp8 and self.thd,
                 "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
             )
             self._not_implemented_error_if(
-                self._fp8 and self.has_sink,
+                self._pertensor and self.has_sink,
                 "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)",
             )
             self._not_implemented_error_if(
@@ -1717,11 +1713,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._fp8 and self.flavor != (128, 128),
+                self._pertensor and self.flavor != (128, 128),
                 f"paged KV for per-tensor FP8 is wired on the d128 flavor only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
-                f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,  # config_sm100 tags flavors by d_qk (d192 = the d192x128 kernel)
+                not self._fp8 and f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,
                 f"paged KV is wired on the {sorted(_SM100_PAGED_KV_FLAVORS)} flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._value_error_if(not self.seq_kv_lens_present, "paged KV requires per-batch KV lengths (seq_kv_lens_present)")
@@ -1731,6 +1727,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._value_error_if(
                 p % 8 != 0 or (p < _SM100_TILE_N and _SM100_TILE_N % p != 0) or (p > _SM100_TILE_N and p % _SM100_TILE_N != 0),
                 f"page_size {p} must be a multiple of 8 that divides {_SM100_TILE_N} or is a multiple of it",
+            )
+            self._not_implemented_error_if(
+                self._fp8 and not self._pertensor and p % _SM100_TILE_N != 0,
+                f"paged MXFP8 KV needs page_size to be a multiple of {_SM100_TILE_N} (whole F8_128x4 SF atoms per page); got {p}",
             )
         if self.split_kv > 1:
             # Split-KV: partials weighted by the per-split LSE, recombined by
@@ -2226,7 +2226,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None
-            for desc in (self.q_desc, self.k_desc, self.v_desc)
+            for desc in (self.q_desc,)
+            + (() if self.paged else (self.k_desc, self.v_desc))
             + (() if self.split_kv > 1 else (self.o_desc,))
             + (() if self.gate_desc is None else (self.gate_desc,))
         )
@@ -2700,6 +2701,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 scale_val,
                 workspace,
                 current_stream,
+                block_table=block_table,
+                block_table_v=block_table_v,
             )
             return
         if self.thd and not self.thd_decode_leg:
