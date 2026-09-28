@@ -142,6 +142,8 @@ def test_packed_backward_reuses_token_major_stats(d, dtype, monkeypatch):
 @pytest.mark.parametrize("role", ["q_prefix", "kv_prefix", "sink"])
 @pytest.mark.parametrize("product", [False, True])
 def test_packed_metadata_physical_wide_addresses(d, role, product):
+    import gc
+
     lengths = (1, 1, 1, 1) if product else (2,)
     inputs = _inputs(d, d, torch.float16, capq=8, capkv=8)
     cq, ck = _prefix(lengths).to(torch.int64), _prefix(lengths)
@@ -153,6 +155,7 @@ def test_packed_metadata_physical_wide_addresses(d, role, product):
     elements = (source.numel() - 1) * stride + 64
     # Previous wide tests can leave reusable allocations in Torch's cache;
     # mem_get_info counts that memory as busy until the cache is released.
+    gc.collect()
     torch.cuda.empty_cache()
     if torch.cuda.mem_get_info()[0] < elements * source.element_size() + 2**30:
         pytest.skip("physical wide metadata stride needs more free GPU memory")
