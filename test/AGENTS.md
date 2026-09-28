@@ -379,3 +379,28 @@ Calling `template_key` there otherwise returns `None` and silently bypasses
 persistent caching. Give the module a source identity and require fresh-process
 reload of the whole chain, including split combine and both pointer/tensor
 calling conventions; forbidding JIT only around the attention kernel misses it.
+
+For staged pointer launches, validate aliases against the original caller operands
+before replacing them with workspace views. The core binder only sees gathered
+buffers and otherwise misses an Amax scalar or block-scale SF output aliasing
+the original Q or O. `test_staged_amax_alias_checks_original_operand` and
+`test_staged_sf_alias_checks_original_operand` intercept copies to detect these
+aliases before any kernel is launched. Reuse the SF binder on original facts
+so its full atom span and output/input alias rules remain consistent.
+
+For staged copies on multiple GPUs, resolve an omitted launch stream on Q's
+device and keep that device context active through gather, launch and scatter.
+A nondefault stream on Q's device must remain authoritative even when another
+CUDA device is current; restore the caller's device after execution.
+
+### Wrapper coverage after workspace migrations
+
+When a prepared adapter starts requiring caller workspace for an existing
+layout, test every public convenience wrapper that constructs it. Adapter
+checks with explicit workspace cannot detect a wrapper that still omits it.
+Exercise BHSD-contiguous and padded conversion inputs plus the compact control,
+including plan-cache reuse and a non-default current stream. The allocating
+wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
+the input device; a zero-workspace plan should keep its allocation-free path.
+The SM120 detector is `TestStagedSm120Wrapper` in
+`test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.

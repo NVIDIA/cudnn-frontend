@@ -98,7 +98,10 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
     # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
-    fns = (api_cls.execute, api_cls._execute_fp8) + ((api_cls._execute_mxfp8,) if hasattr(api_cls, "_execute_mxfp8") else ())
+    # Prepared per-tensor routes carry auxiliary buffers in their binding map;
+    # only retained tensor lowerings have individual sf_o keyword arguments.
+    required = ("_execute_fp8", "_execute_mxfp8") if api_cls is SdpaFwdDslSm100 else ()
+    fns = (api_cls.execute,) + tuple(getattr(api_cls, name) for name in required)
     for fn in fns:
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"

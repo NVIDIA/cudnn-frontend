@@ -129,13 +129,16 @@ def test_sm120_splits_a_decode_shape():
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
-def test_sm120_does_not_split_a_full_part():
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_sm120_does_not_split_a_full_part(zero_copy):
     """A launch that fills the part is left alone. Whether 1024x64 fills it
     depends on the SM count, so the expectation comes from the chooser rather
     than a fixed 1 that only holds on one device."""
-    result = _sm120_case(64, 8, 1024, 16384)
+    result = _sm120_case(64, 8, 1024, 16384, zero_copy=zero_copy)
     assert result.split == result.expected_split
-    assert (result.workspace_bytes > 0) == (result.split > 1), "workspace is needed exactly when we split"
+    conversion_bytes = 0 if zero_copy else 2 * (64 * 1024 + 8 * 16384) * 128 * 2
+    assert result.workspace_bytes >= conversion_bytes
+    assert (result.workspace_bytes > conversion_bytes) == (result.split > 1), "only splits add partial slabs beyond the conversion buffers"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
@@ -208,7 +211,7 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
 # the O dtype, applying scale_o there. Nothing above exercises the FP8 arm.
 
 
-def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0):
+def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0, zero_copy=False):
     """FP8 through the SM120 adapter; returns (split, O, amax)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -222,6 +225,8 @@ def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0):
 
     q, k, v = mk(b, h_q, s_q, d), mk(b, h_kv, s_kv, d), mk(b, h_kv, s_kv, d)
     o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=out_dtype)
+    if zero_copy:
+        q, k, v, o = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q, k, v, o))
     amax = torch.zeros(1, dtype=torch.float32, device=dev)
 
     def one():
@@ -278,12 +283,21 @@ def test_sm120_fp8_split_matches_unsplit(out_dtype):
     assert abs(amax_split - amax_one) <= 0.03, "amax must describe the recombined output at either split"
 
 
-def test_sm120_quantized_split_reduces_in_half():
-    """Partials are sized by the PARTIAL dtype, so an FP8 O carves the same
-    workspace as a half one -- sizing from O would under-allocate by half."""
-    _, _, _, ws_fp8 = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4)
-    _, _, _, ws_half = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float16, split_kv=4)
-    assert ws_fp8 == ws_half > 0
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_sm120_quantized_split_reduces_in_half(zero_copy):
+    """Partials stay half; only the staged final-O buffer follows O's dtype."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    _, _, _, ws_fp8 = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4, zero_copy=zero_copy)
+    _, _, _, ws_half = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float16, split_kv=4, zero_copy=zero_copy)
+    partials = ws_align(4 * 8 * 128 * 128 * 2) + ws_align(4 * 8 * 128 * 4)
+    core = partials + ws_align(8)  # Amax scratch and the identity scalar
+    # Q needs a compact copy on the staged path; the one-head K/V already
+    # have compact physical storage. The final O copy has its own dtype.
+    q_bytes = 0 if zero_copy else ws_align(8 * 128 * 128)
+    o_elements = 0 if zero_copy else 8 * 128 * 128
+    assert ws_fp8 == core + q_bytes + ws_align(o_elements)
+    assert ws_half == core + q_bytes + ws_align(o_elements * 2)
 
 
 @pytest.mark.parametrize("scale", [0.5, 2.0])
@@ -350,6 +364,7 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
     import cutlass
     import cuda.bindings.driver as cuda
 
+    from cudnn.frost.compiled_cache import positional_entry
     from cudnn.sdpa.fwd.api_dsl import _load_sm120_kernel_module
     from cudnn.sdpa.fwd.config_sm120 import DTYPE_E4M3, DTYPE_FP16, TemplateParams
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine
@@ -377,15 +392,38 @@ def test_sm120_direct_template_stats_base(fp8, splits, stats_log2):
     module = _load_sm120_kernel_module(None, params, fp8=fp8)
     kernel = module.compile(torch.cuda.get_device_capability(), b=b, qh=h, kh=1, sq=sq, skv=skv, d_qk=d, d_v=d)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    args = [q, k, v, partial_o, partial_lse, None, seq_q, seq_kv]
-    scale = cutlass.Float32(math.log2(math.e) / math.sqrt(d))
+    # Compile PARAMS.stats_log2 directly, including split > 1. The adapter
+    # clears that bit and would hide the kernel-entry regression this probes.
+    args = [
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        partial_o.data_ptr(),
+        partial_lse.data_ptr(),
+        0,
+        seq_kv.data_ptr(),
+        0,
+        (b, h, 1, sq, skv, 0),
+        tuple(q.stride()[:3]),
+        tuple(k.stride()[:3]),
+        tuple(v.stride()[:3]),
+        tuple(partial_o.stride()[:3]),
+        tuple(partial_lse.stride()),
+        0,
+        math.log2(math.e) / math.sqrt(d),
+        seq_q.data_ptr(),
+        None,
+        None,
+        None,
+        0,
+    ]
     if fp8:
         amax = torch.zeros(1, device="cuda", dtype=torch.int32)
         unit_scale = torch.ones(1, device="cuda")
-        args += [amax, scale, cutlass.Float32(1.0), unit_scale, unit_scale, unit_scale, unit_scale]
-    else:
-        args += [scale]
-    kernel(*args, cutlass.Int32(0), None, None, None, cutlass.Int32(0), stream)
+        args += [unit_scale.data_ptr()] * 4 + [amax.data_ptr(), None]
+    raw = positional_entry(kernel)
+    assert raw is not None
+    raw(*args, stream)
     torch.cuda.synchronize()
 
     scores = torch.einsum("bqhd,bknd->bhqk", q.double(), k.double()) / math.sqrt(d)
