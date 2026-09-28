@@ -4,10 +4,12 @@
 """Model inputs follow candidate geometry; no timing/rank golden assertions."""
 
 from dataclasses import replace
+from itertools import product
 
 import pytest
 
 import cudnn
+from frost_test_utils import requires_blackwell, requires_dsl
 from cudnn.sdpa.fwd import heuristics as heur
 from cudnn.sdpa.fwd.config_sm100 import CfgD512, cga_ctas
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, mismatch
@@ -21,6 +23,58 @@ def _facts(**kw):
     base = dict(b=1, h_q=32, h_kv=4, s_q=33, s_kv=512, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(10, 0), device_sm_count=148)
     base.update(kw)
     return SdpaGraphFacts(**base)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"shape_overrides": False},
+        {"thd": False},
+        {"causal": True},
+        {"window_left": 31},
+        {"has_paged_kv": True},
+        {"has_sink": True},
+        {"has_epilogue_gate": True},
+        {"right_band_widening": True},
+        {"device_cc": (10, 3)},
+        {"device_cc": (10, 7)},
+        {"d_qk": 128},
+    ],
+)
+def test_runtime_cga_policy_has_explicit_record_and_bounded_domain(overrides):
+    facts = _facts(h_q=16, h_kv=16, s_q=65536, s_kv=65536, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    facts = replace(facts, **overrides)
+    knobs = heur._knob_sets(SPEC, facts)
+    policies = [k for k in knobs if k.cga_policy is not None]
+    if overrides:
+        assert not policies
+        return
+    assert len(policies) == 1
+    policy = policies[0]
+    record = policy.to_public()
+    assert record[cudnn.knob_type.CGA_POLICY] == 2
+    assert cudnn.knob_type.TILE_CGA_M not in record
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in record.items()}) == policy
+    assert any(k.cga in (1, 2) and k.cga_policy is None for k in knobs)
+    assert len(knobs) == len(set(knobs)) <= heur._MAX_SETS_PER_ENGINE
+    assert heur._fallback_knobs(SPEC, facts).cga_policy is None
+
+
+@pytest.mark.parametrize("bad", [{"cga": 1}, {"cga": 2}, {"split_kv": 2}, {"pack_gqa": True}, {"cga_policy": 0}, {"cga_policy": 3}])
+def test_runtime_cga_policy_rejects_conflicting_or_unknown_requests(bad):
+    facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    knobs = heur.SdpaFwdKnobs(cga_policy=1)
+    reason = mismatch(SPEC.capabilities, facts, replace(knobs, **bad))
+    assert reason is not None and ("CGA" in reason or "cga" in reason)
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_runtime_cga_policy_records_remain_rebuildable(policy):
+    facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    knobs = heur.SdpaFwdKnobs(cga_policy=policy)
+    assert mismatch(SPEC.capabilities, facts, knobs) is None
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
 
 
 def _visible_tile_oracle(facts, token_span, tile_n):
@@ -146,3 +200,86 @@ def test_swa_split_model_receives_live_cluster_work(monkeypatch):
     assert seen[0]["kv_tiles"] == 2  # full 64-token packed cluster plus its aligned band
     assert seen[0]["unsplit_launch"].kv_tiles == 2
     assert seen[0]["q_tiles"] == 4 and seen[0]["heads_q"] == 4
+
+
+@pytest.mark.parametrize(
+    "thd,paged,cga,rubin", [(True, False, 1, False), (True, False, 2, False), (False, False, 1, False), (True, True, 1, False), (True, False, 2, True)]
+)
+def test_d192_model_rows_match_selected_kernel(thd, paged, cga, rubin):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    params = TemplateParams(dtype_qkv=DTYPE_BF16, cta_mma=cga, thd_varlen=thd, paged_kv=paged, seq_kv_lens_present=thd or paged, page_size=128 if paged else 0)
+    module = _load_sm100_kernel_module((192, 128), params, rubin=rubin)
+    caps = replace(SPEC.capabilities, sm_lo=107, sm_hi=119) if rubin else SPEC.capabilities
+    facts = _facts(d_qk=192, d_v=128, thd=thd, has_paged_kv=paged, device_cc=(10, 7) if rubin else (10, 0))
+    rows = heur._pack_gqa_tile_q(caps, facts, 128, cga)
+    assert rows == module.CGA_TILE_M
+    launch = heur._split_launch(caps, facts, 128, 128, cga, 1)
+    assert launch.q_tiles == (facts.s_q + module.CGA_TILE_M - 1) // module.CGA_TILE_M
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
+@pytest.mark.parametrize("s_q", [0, 1, 3, 6])
+@pytest.mark.parametrize("tile_rows", [1, 2, 4])
+def test_packed_query_tile_bound_matches_length_distributions(batch_size, s_q, tile_rows):
+    distributions = list(product(range(s_q + 1), repeat=batch_size))
+    for capacity in range(batch_size * s_q + 2):
+        expected = max(sum((length + tile_rows - 1) // tile_rows for length in lengths) for lengths in distributions if sum(lengths) <= capacity)
+        assert heur._thd_q_tile_bound(batch_size, s_q, tile_rows, capacity) == expected
+    assert heur._thd_q_tile_bound(batch_size, s_q, tile_rows) == batch_size * ((s_q + tile_rows - 1) // tile_rows)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("total_q", [None, 1024])
+@pytest.mark.parametrize("b,h,q,sm_count", [(1, 16, 1024, 148), (2, 16, 1024, 148), (3, 4, 129, 132)])
+def test_d192_selector_receives_declared_launch_geometry(monkeypatch, paged, total_q, b, h, q, sm_count):
+    # Spy on the chooser inputs, not the performance policy's winning rank.
+    # The optional capacity is a graph fact; device lengths remain unavailable.
+    seen = []
+    choose = heur.select_d192_auto_knobs
+
+    def recording(params, **kwargs):
+        seen.append((params, kwargs))
+        return choose(params, **kwargs)
+
+    monkeypatch.setattr(heur, "select_d192_auto_knobs", recording)
+    facts = _facts(b=b, h_q=h, h_kv=h, s_q=q, s_kv=8192, d_qk=192, d_v=128, thd=True, has_paged_kv=paged, device_sm_count=sm_count, max_total_seq_len_q=total_q)
+    heur._auto_sched_cga(SPEC, facts, split_kv=1, sched_policy=0, pack_gqa=False)
+    assert len(seen) == 1
+    params, args = seen[0]
+    assert params.thd_varlen and params.paged_kv == paged
+    assert (args["batch_size"], args["h_q"], args["s_q"], args["s_kv"]) == (b, h, q, 8192)
+    assert args["device_sm_count"] == sm_count and args["device_cc"] == facts.device_cc
+    assert args["max_total_seq_len_q"] == total_q
+
+
+@requires_blackwell
+@requires_dsl
+def test_d192_standalone_and_graph_share_launch_facts(monkeypatch):
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, q, k = 3, 4, 129, 513
+    q_tensor = torch.empty(b, q, h, 192, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k_tensor = torch.empty(b, k, h, 192, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    v_tensor = torch.empty(b, k, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    out = torch.empty(b, q, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    seen = []
+    choose = heur.select_d192_auto_knobs
+
+    def recording(params, **kwargs):
+        seen.append(kwargs)
+        return choose(params, **kwargs)
+
+    monkeypatch.setattr(heur, "select_d192_auto_knobs", recording)
+    api = SdpaFwdDslSm100(q_tensor, k_tensor, v_tensor, out, thd=True)
+    api.check_support()
+    params = api.template_params()
+    cc = torch.cuda.get_device_capability(q_tensor.device)
+    sm_count = torch.cuda.get_device_properties(q_tensor.device).multi_processor_count
+    facts = _facts(b=b, h_q=h, h_kv=h, s_q=q, s_kv=k, d_qk=192, d_v=128, thd=True, device_cc=cc, device_sm_count=sm_count)
+    _, cga = heur._auto_sched_cga(SPEC, facts, split_kv=1, sched_policy=0, pack_gqa=False)
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert params.cta_mma == cga

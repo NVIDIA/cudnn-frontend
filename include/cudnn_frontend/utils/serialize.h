@@ -699,6 +699,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::CTA_GROUP, "CTA_GROUP"},
                                  {KnobType_t::WARPS_M, "WARPS_M"},
                                  {KnobType_t::WARPS_N, "WARPS_N"},
+                                 {KnobType_t::CGA_POLICY, "CGA_POLICY"},
                              })
 
 #endif

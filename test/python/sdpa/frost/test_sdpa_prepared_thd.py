@@ -143,6 +143,198 @@ def _plan(g):
     return g._compiled_plans[g._plan_index]
 
 
+def _cga_policy_graph(dtype, stats, record=None, h=16):
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    b, qcap, kcap = 4, 4096, 128
+    g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
+    t = {
+        name: g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name=name)
+        for name in ("cq", "ck", "oq", "ok", "ov", "oo", "os")
+    }
+    for name, dim, cap, offset in (("q", 192, qcap, "oq"), ("k", 192, kcap, "ok"), ("v", 128, kcap, "ov")):
+        t[name] = g.tensor(dim=[b, h, cap, dim], stride=[cap * h * dim, dim, h * dim, 1], data_type=dt, name=name).set_ragged_offset(t[offset])
+    t["o"], stat = g.sdpa(
+        q=t["q"],
+        k=t["k"],
+        v=t["v"],
+        generate_stats=stats is not None,
+        attn_scale=192**-0.5,
+        use_padding_mask=True,
+        cu_seq_len_q=t["cq"],
+        cu_seq_len_kv=t["ck"],
+        max_total_seq_len_q=b * qcap,
+        max_total_seq_len_kv=b * kcap,
+    )
+    t["o"].set_output(True).set_dim([b, h, qcap, 128]).set_stride([qcap * h * 128, 128, h * 128, 1]).set_ragged_offset(t["oo"])
+    if stats is not None:
+        t["s"] = stat.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, h, qcap, 1]).set_ragged_offset(t["os"])
+        t["s"].set_stride([qcap * h, 1, h, 1] if stats == "NH" else [b * qcap * h, b * qcap, 1, 1])
+    g.validate()
+    g.build_operation_graph()
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        index = next(i for i in range(g.get_execution_plan_count()) if g.get_plan_name_at_index(i).startswith(engine_name() + "["))
+    else:
+        engine, knobs = record
+        g.create_execution_plan(engine, {int(k): v for k, v in knobs.items()})
+        index = g.get_execution_plan_count() - 1
+    g.select_plan(index)
+    g.build_plan_at_index(index)
+    return g, t
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("stats", [None, "NH", "HN"])
+@pytest.mark.parametrize("policy", [1, 2])
+@pytest.mark.parametrize("h", [16, 32])
+def test_thd_runtime_cga_record_rebind_and_capture(dtype, stats, policy, h, monkeypatch):
+    """Public policy records keep both artifacts, independent frames and old captures."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import cutlass.cute as cute
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("runtime CGA policy is measured on SM100")
+    torch.manual_seed(1617)
+    g, _ = _cga_policy_graph(dtype, stats, h=h)
+    record = g.get_engine_and_knobs_at_index(g._plan_index)
+    assert record[1][cudnn.knob_type.CGA_POLICY] == 2 and cudnn.knob_type.TILE_CGA_M not in record[1]
+    record[1][cudnn.knob_type.CGA_POLICY] = policy
+    rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h)
+    assert rebuilt.get_engine_and_knobs_at_index(rebuilt._plan_index) == record
+    family = _plan(rebuilt)._prepared
+    assert isinstance(family, prep_mod.PreparedThdChoices)
+    assert _plan(rebuilt).get_workspace_size() >= max(v.spec.scratch_bytes for v in family.variants)
+    seen, held = set(), []
+    actual_execute = family.execute
+
+    def record_choice(pack, workspace_ptr, stream, stream_int):
+        actual_execute(pack, workspace_ptr, stream, stream_int)
+        seen.add(family.native.select_index(pack.native, family._native_indices))
+
+    monkeypatch.setattr(family, "execute", record_choice)
+
+    def verify(buf, lengths):
+        qbase = kbase = 0
+        for nq in lengths:
+            q = buf["q"][qbase : qbase + nq].float().transpose(0, 1)
+            k = buf["k"][kbase : kbase + 65].float().transpose(0, 1)
+            v = buf["v"][kbase : kbase + 65].float().transpose(0, 1)
+            score = q @ k.transpose(1, 2) * 192**-0.5
+            torch.testing.assert_close(buf["o"][qbase : qbase + nq].float(), (score.softmax(-1) @ v).transpose(0, 1), atol=0.012, rtol=0.012)
+            if stats is not None:
+                got = buf["s"][qbase : qbase + nq] if stats == "NH" else buf["s"][:, qbase : qbase + nq].T
+                torch.testing.assert_close(got, score.logsumexp(-1).T, atol=1e-3, rtol=1e-3)
+            qbase += nq
+            kbase += 65
+
+    try:
+        for lengths in ([127], [2048], [513, 127], [65, 0, 192]):
+            b, total = len(lengths), sum(lengths)
+            cq = torch.tensor([0, *accumulate(lengths)], device=DEV, dtype=torch.int32)
+            ck = torch.arange(b + 1, device=DEV, dtype=torch.int32) * 65
+            buf = dict(
+                q=torch.randn(total, h, 192, device=DEV, dtype=dtype),
+                k=torch.randn(b * 65, h, 192, device=DEV, dtype=dtype),
+                v=torch.randn(b * 65, h, 256, device=DEV, dtype=dtype)[..., 128:],
+                o=torch.empty(total, h, 128, device=DEV, dtype=dtype),
+                cq=cq,
+                ck=ck,
+            )
+            buf.update(oq=cq * h * 192, ok=ck * h * 192, ov=ck * h * 256, oo=cq * h * 128, os=cq * (h if stats == "NH" else 1))
+            if stats is not None:
+                buf["s"] = torch.empty((total, h) if stats == "NH" else (h, total), device=DEV)
+            shapes, strides, uids = [], [], []
+            for name, tensor in t.items():
+                # With cu_seq_len present the prepared plan reads prefixes,
+                # not the ragged-offset declarations' otherwise-unused ports.
+                if name.startswith("o") and name != "o":
+                    continue
+                x = buf[name]
+                if name in ("q", "k", "v", "o"):
+                    cap = max(lengths) if name in ("q", "o") else 65
+                    shape, stride = [b, h, cap, x.shape[2]], [cap * x.stride(0), x.stride(1), x.stride(0), 1]
+                elif name == "s":
+                    shape, stride = [b, h, max(lengths), 1], ([total * h, 1, h, 1] if stats == "NH" else [h * total, total, 1, 1])
+                else:
+                    shape, stride = [b + 1, 1, 1, 1], [1, 1, 1, 1]
+                uids.append(tensor.get_uid())
+                shapes.append(shape)
+                strides.append(stride)
+            pack = {tensor: buf[name] for name, tensor in t.items()}
+            ws = torch.empty(max(rebuilt.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+
+            def run():
+                rebuilt.execute(pack, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
+
+            run()
+            torch.cuda.synchronize()
+            verify(buf, lengths)
+            graph = torch.cuda.CUDAGraph()
+            with monkeypatch.context() as guard:
+                guard.setattr(cute, "compile", lambda *a, **kw: pytest.fail("execute must not JIT"))
+                with torch.cuda.graph(graph):
+                    previous = torch.cuda.get_sync_debug_mode()
+                    try:
+                        torch.cuda.set_sync_debug_mode("error")
+                        run()
+                    finally:
+                        torch.cuda.set_sync_debug_mode(previous)
+            held.append((buf, lengths, ws, graph, pack, uids, shapes, strides))
+            for old, old_lengths, old_ws, capture, *_ in held:
+                old["q"].mul_(-0.5)
+                old["o"].fill_(float("nan"))
+                if stats is not None:
+                    old["s"].fill_(float("nan"))
+                capture.replay()
+                torch.cuda.synchronize()
+                verify(old, old_lengths)
+        assert seen == {0, 1}
+        # Both modules were warmed serially above. Exercise two different
+        # members of the same plan concurrently with independent workspaces.
+        streams = [torch.cuda.Stream() for _ in range(2)]
+        handles = [cudnn.create_handle() for _ in streams]
+        for handle, stream in zip(handles, streams):
+            cudnn.set_stream(handle, stream.cuda_stream)
+        torch.cuda.synchronize()
+
+        def run_concurrent(i):
+            old, old_lengths, old_ws, _, old_pack, old_uids, old_shapes, old_strides = held[i]
+            for _ in range(3):
+                rebuilt.execute(old_pack, old_ws, handle=handles[i], override_uids=old_uids, override_shapes=old_shapes, override_strides=old_strides)
+            streams[i].synchronize()
+
+        try:
+            with ThreadPoolExecutor(2) as pool:
+                list(pool.map(run_concurrent, range(2)))
+            for old, old_lengths, *_ in held[:2]:
+                verify(old, old_lengths)
+        finally:
+            for stream in streams:
+                stream.synchronize()
+            for handle in handles:
+                cudnn.destroy_handle(handle)
+        with pytest.raises(ValueError, match="needs|workspace"):
+            rebuilt.execute(pack, ws[:1], override_uids=uids, override_shapes=shapes, override_strides=strides)
+        for cga in (1, 2):
+            explicit = {k: v for k, v in record[1].items() if k != cudnn.knob_type.CGA_POLICY}
+            explicit[cudnn.knob_type.TILE_CGA_M] = cga
+            rebuilt.create_execution_plan(record[0], explicit)
+            index = rebuilt.get_execution_plan_count() - 1
+            rebuilt.select_plan(index)
+            rebuilt.build_plan_at_index(index)
+            assert isinstance(_plan(rebuilt)._prepared, prep_mod.PreparedThdLaunch)
+            assert _plan(rebuilt)._prepared.spec.cga_tile_m == (128 if cga == 1 else 512)
+            run()
+            torch.cuda.synchronize()
+            verify(buf, lengths)
+    finally:
+        for _, _, _, graph, *_ in held:
+            graph.reset()
+
+
 class _Recorder:
     """Records every frame the prepared launch hands to the positional entry."""
 

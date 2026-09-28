@@ -6,9 +6,10 @@
 :func:`recommend` is the family's ENTIRE heuristic surface — the PURE core:
 ``(kind, facts, offered) -> [PlanConfig]``. Backend-blind, graph-blind,
 import-light. For every offered cell whose capability row admits the facts,
-the cell's rule emits an ORDERED list of COMPLETE knob assignments (every
-axis the row declares a domain for carries a concrete value; ``None`` only on
-undeclared axes), each re-validated through ``mismatch(caps, facts, knobs)``
+the cell's rule emits an ORDERED list of knob assignments. Axes are concrete
+except the CGA width of a runtime-choice plan: an override-enabled SM100 half
+D192/V128 THD plan may retain both compiled widths, explicitly recording
+``CGA_POLICY=1`` instead of a fixed width. Every assignment is re-validated through ``mismatch(caps, facts, knobs)``
 — a set is honored or never listed. The same engine appears once per
 surviving set. Standalone callers (wrappers, autotuners) invoke this directly
 with a hand-built :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing
@@ -75,6 +76,7 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
+    runtime_cga_choices,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -604,12 +606,31 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     return [chosen, *runners]
 
 
+def _thd_q_tile_bound(batch_size: int, s_q: int, tile_rows: int, total_q: Optional[int] = None) -> int:
+    """Bound the sum of per-sequence tiles without reading device lengths.
+
+    A nonempty sequence needs one token for its first tile, then ``tile_rows``
+    more tokens for each additional tile. Both the per-sequence maximum and
+    the optional packed capacity constrain the number of live tiles.
+    """
+    tiles = batch_size * _ceil_div(s_q, tile_rows)
+    if total_q is not None:
+        tokens = max(int(total_q), 0)
+        tiles = min(tiles, tokens, (tokens + batch_size * (tile_rows - 1)) // tile_rows)
+    return tiles
+
+
 def select_d192_auto_knobs(
     params: Sm100TemplateParams,
     *,
     pertensor: bool,
     s_q: int,
     s_kv: int,
+    batch_size: int = 0,
+    h_q: int = 0,
+    device_sm_count: int = 0,
+    device_cc: Optional[tuple[int, int]] = None,
+    max_total_seq_len_q: Optional[int] = None,
 ) -> tuple[int, int]:
     """Select the measured D192 scheduler and CGA defaults.
 
@@ -663,7 +684,23 @@ def select_d192_auto_knobs(
         elif masked:
             mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
     mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
-    return sched_policy, 1 if pt_cga1 or mx_cga1 else 2
+    # The half THD cga1 pipeline carries 128 Q rows instead of cga2's 512.
+    # It wins when its finer grid still fits in one resident wave. Use the
+    # declared per-sequence bound, not packed capacity or live device lengths;
+    # rebinding lengths must not choose another tile or trigger compilation.
+    # Masked and other-architecture crossovers have not been measured here.
+    half_thd_cga1 = (
+        params.dtype_qkv in (DTYPE_FP16, DTYPE_BF16)
+        and params.thd_varlen
+        and not params.paged_kv
+        and not params.pack_gqa
+        and window_left is None
+        and window_right is None
+        and device_cc == (10, 0)
+        and min(batch_size, h_q, s_q, s_kv, device_sm_count) > 0
+        and h_q * _thd_q_tile_bound(batch_size, s_q, 128, max_total_seq_len_q) <= device_sm_count
+    )
+    return sched_policy, 1 if pt_cga1 or mx_cga1 or half_thd_cga1 else 2
 
 
 def select_d256_auto_knobs(
@@ -727,6 +764,7 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
         sched_policy=sched_policy,
         thd_varlen=facts.thd,
         split_kv=split_kv,
+        paged_kv=facts.has_paged_kv,
     )
 
 
@@ -794,7 +832,17 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-    selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+    selected_sched, selected_cga = select_d192_auto_knobs(
+        params,
+        pertensor=facts.is_fp8,
+        s_q=facts.s_q,
+        s_kv=facts.s_kv,
+        batch_size=facts.b,
+        h_q=facts.h_q,
+        device_sm_count=facts.device_sm_count or 0,
+        device_cc=facts.device_cc,
+        max_total_seq_len_q=facts.max_total_seq_len_q,
+    )
     if selected_cga not in domain:
         raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
     return selected_sched, selected_cga
@@ -825,6 +873,10 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     if facts.d_qk <= 128 and facts.d_v <= 128:
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
+        if cga == 1 and _sm100_f16(caps, facts) and facts.thd and not facts.has_paged_kv:
+            # Nonpaged half THD uses the shared one-Q-tile pipeline. Dense,
+            # paged, quantized and Rubin D192 keep their prefill geometry.
+            return _D128_DECODE_TILE_ROWS
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
@@ -1117,7 +1169,7 @@ def _split_points(
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
-    """The cell's ordered COMPLETE knob assignments.
+    """The cell's ordered concrete assignments and eligible runtime choice.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
     geometry at a time (tiles, sched, pack_gqa, split), recomputing split for
@@ -1250,6 +1302,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if knobs not in seen:
             seen.add(knobs)
             unique.append(knobs)
+    if base.split_kv == 1 and base.pack_gqa is False and runtime_cga_choices(caps, facts):
+        # Keep the concrete choice as a runner-up/fallback. Persist the policy
+        # itself; a missing width alone must not silently opt into new behavior.
+        unique.insert(0, replace(base, cga=None, cga_policy=2))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
@@ -1295,7 +1351,7 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     ``kind`` is ``"A"`` (candidates worth timing, best guess first) or
     ``"FALLBACK"`` (least-demanding configs). Every returned entry carries a
-    complete knob assignment validated through ``mismatch(caps, facts, knobs)``
+    knob assignment validated through ``mismatch(caps, facts, knobs)``
     — honored-or-never-listed — and NO mode. Standalone callers (wrappers,
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.

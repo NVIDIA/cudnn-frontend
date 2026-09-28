@@ -108,7 +108,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     scheduler_warp_loop,
     scheduler_warp_loop_persistent,
     read_tile_id_arrive,
-    read_clc_payload,
+    read_clc_payload as _read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -399,6 +399,15 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 # The adapter uses a machine-sized THD grid; the setup kernel publishes the
 # live work-unit total and the first unit not covered by the initial grid.
 THD_PERSISTENT = True
+
+
+@cute.jit
+def read_clc_payload(sched, base_word):
+    # A local persistent producer may recycle the slot once this warp returns
+    # its credit. Broadcast from one reader so no lagging lane retains a load.
+    return _read_clc_payload(sched, base_word, warp_broadcast=bool(CFG.THD_VARLEN and CGA_SIZE == 1 and not _PREDECODE_THD_COORDS))
+
+
 _SWA_ONE_SIDED_GEOMETRY = bool(
     (CFG.MASK_FLAGS & MASK_SWA)
     and (CFG.MASK_FLAGS & MASK_CAUSAL)

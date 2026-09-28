@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -101,6 +101,13 @@ class SdpaFwdKnobs:
     is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
     into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
     ``Capabilities.softmax_precisions`` in :func:`mismatch`.
+
+    ``cga_policy=1`` retains both compiled cluster widths on eligible SM100
+    half D192/V128 THD override plans: one CTA when the bound fits one wave,
+    two otherwise. ``cga_policy=2`` instead compares resident wave counts,
+    preferring one CTA on a tie. The public record carries ``CGA_POLICY``
+    instead of ``TILE_CGA_M``. A fixed width and a runtime policy are mutually exclusive;
+    omitting both retains ordinary plan-time default selection.
     """
 
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
@@ -111,6 +118,7 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
+    cga_policy: Optional[int] = None  # runtime width policy, mutually exclusive with cga
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -121,6 +129,7 @@ class SdpaFwdKnobs:
         ("cga", "TILE_CGA_M"),
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
+        ("cga_policy", "CGA_POLICY"),
     )
 
     def to_public(self) -> dict:
@@ -307,6 +316,7 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    cga_policies: frozenset[int] = frozenset()
     # Shape-specific CGA domains for rows that lower several native flavors.
     # ``cgas`` remains the default. A split-specific entry further narrows the
     # domain for split-KV plans without changing the unsplit public domain.
@@ -671,6 +681,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
+            (knobs.cga_policy, capabilities.cga_policies, "cga_policy"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
             if value is not None and value not in domain:
@@ -680,6 +691,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # leg: a ragged graph rides it only as the ragged-Q-over-paged-KV leg
         # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
+        if knobs.cga_policy is not None:
+            if not runtime_cga_choices(capabilities, facts):
+                return "runtime CGA policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph"
+            if knobs.cga is not None:
+                return "cga and cga_policy are mutually exclusive"
+            if knobs.split_kv not in (None, 1) or knobs.pack_gqa not in (None, False):
+                return "runtime CGA policy requires unsplit, unpacked execution"
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         if knobs.cga == 1 and facts.thd and not ragged_decode and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
             return (
@@ -1044,6 +1062,7 @@ def _sm100_spec() -> EngineSpec:
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
+            cga_policies=frozenset({1, 2}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1777,12 +1796,39 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     return facts, mismatch(spec.capabilities, facts, knobs)
 
 
+def runtime_cga_choices(capabilities: Capabilities, facts) -> bool:
+    """The measured graph domain whose live geometry may outgrow its first tile.
+
+    This changes the lowering strategy, not graph eligibility. Both concrete
+    widths are already served by this engine; all masks and other targets
+    retain their existing concrete plans until separately measured.
+    """
+    return (
+        1 in capabilities.cga_policies
+        and facts.device_cc == (10, 0)
+        and facts.shape_overrides
+        and facts.thd
+        and (facts.d_qk, facts.d_v) == (192, 128)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.has_paged_kv or facts.has_sink or facts.has_epilogue_gate or facts.causal or facts.right_band_widening)
+        and facts.window_left is None
+    )
+
+
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     """Lower ``spec`` for ``graph``, or raise the bare ineligibility reason (the
     caller — the engine — names itself in the message)."""
     facts, reason = analyze_for(spec, graph, knobs)
     if reason is not None:
         raise ValueError(reason)
+    if knobs is not None and knobs.cga_policy in (1, 2):
+        from cudnn.sdpa.fwd.prepared import PreparedThdChoices
+
+        variants = [spec.lower(spec, facts, replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False)) for cga in (1, 2)]
+        selected = variants[0]
+        selected.prepared = PreparedThdChoices(tuple(v.prepared for v in variants), facts.device_sm_count, knobs.cga_policy)
+        selected.workspace_bytes = max(v.workspace_bytes for v in variants)
+        return selected
     return spec.lower(spec, facts, knobs)
 
 

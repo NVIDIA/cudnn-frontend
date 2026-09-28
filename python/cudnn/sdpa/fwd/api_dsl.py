@@ -497,6 +497,10 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
+    elif flavor == (192, 128) and params.cta_mma == 1 and params.thd_varlen and not params.paged_kv:
+        params = replace(params, single_q_head_dim=192)
+        filename = _SM100_DECODE_KERNEL_FILE
+        tag = f"sdpa_fwd_sm100_{tag}_single_q"
     elif flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen:
         # TILE_CGA_M=1 on the d128 f16/bf16 flavor IS the decode tile (see
         # config_sm100.CfgD128Decode).  Dense only: THD at cga1 is declined
@@ -2285,6 +2289,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 pertensor=self._pertensor,
                 s_q=self.s_q_max,
                 s_kv=self.s_k_max,
+                batch_size=self.batch_size,
+                h_q=self.h_q,
+                device_sm_count=_device_sm_count(self.q_desc.device) if self.cga is None else 0,
+                device_cc=self._device_cc,
+                max_total_seq_len_q=self.max_total_seq_len_q,
             )
             params = replace(
                 params,

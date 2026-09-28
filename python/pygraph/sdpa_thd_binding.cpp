@@ -126,6 +126,7 @@ enum HostSlot : size_t {
     VTablePtr,
     TableStrides,
     NumPages,
+    VTableStrides,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {
@@ -136,7 +137,7 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {
     "problem_size",    "sinks_ptr",       "meta_ptr",
     "o_desc_ptr",      "stream",          "scale_softmax_log2",
     "n_thd_units",     "block_table_ptr", "block_table_v_ptr",
-    "table_strides",   "n_pages"};
+    "table_strides",   "n_pages",         "table_v_strides"};
 constexpr std::array<HostSlot, 4> pointer_slots = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots  = {QStrides, KStrides, VStrides, OStrides};
 
@@ -186,6 +187,12 @@ class SdpaThdBinder {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+            if (slot == VTableStrides && found == order.end()) {
+                // Existing half hosts share one K/V table-stride pair. Newer
+                // hosts may expose a separate V pair; retain that ABI choice.
+                index_[slot] = template_.size();
+                continue;
+            }
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -201,6 +208,14 @@ class SdpaThdBinder {
          py::object scale) const {
         if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
         const auto facts = read_native_operand_views(pack, indices);
+        return bind_facts(facts, workspace, std::move(stream), std::move(scale));
+    }
+
+    py::object
+    bind_facts(const std::vector<NativeOperandView> &facts,
+               int64_t workspace,
+               py::object stream,
+               py::object scale) const {
         std::array<Geometry, 4> geometry;
         for (size_t i = Q; i <= O; ++i) {
             const auto &f = required(facts, i);
@@ -306,6 +321,11 @@ class SdpaThdBinder {
             py::object stream,
             py::object scale) const {
         py::object frame = bind(pack, indices, workspace, std::move(stream), std::move(scale));
+        return launch(frame);
+    }
+
+    bool
+    launch(const py::object &frame) const {
         if (frame.is_none()) return false;
         // Retain the official Python tvm-ffi entry: it owns error conversion and
         // the stable tuple/stream ABI. No private TVM object layouts or new build
@@ -313,6 +333,26 @@ class SdpaThdBinder {
         py::object result = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::error_already_set();
         return true;
+    }
+
+    std::array<int64_t, 2>
+    choice_units(const std::vector<NativeOperandView> &facts) const {
+        // Selection observes only current host metadata. The selected binder
+        // still performs all ordinary dtype, pointer, device and span checks.
+        const auto &q = required(facts, Q), &o = required(facts, O);
+        const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
+        if (b <= 0 || b > b_) invalid("plan-choice Q lengths exceed the declared batch capacity");
+        int64_t tokens = std::min(capacity(q, resolve(q, Q, b), "q"), capacity(o, resolve(o, O, b), "o"));
+        if (total_q_ >= 0) tokens = std::min(tokens, total_q_);
+        const int64_t max_q = q.shape.size() == 4 ? q.shape[2] : tokens;
+        std::array<int64_t, 2> units;
+        for (size_t i = 0; i < units.size(); ++i) {
+            const int64_t tile         = i == 0 ? 128 : 512;
+            const int64_t per_sequence = max_q / tile + (max_q % tile != 0);
+            const int64_t packed       = add(tokens, multiply(b, tile - 1)) / tile;
+            units[i]                   = multiply(qh_, std::min({multiply(b, per_sequence), tokens, packed}));
+        }
+        return units;
     }
 
    private:
@@ -465,8 +505,10 @@ class SdpaThdBinder {
     bind_paged(py::tuple &frame, const std::vector<NativeOperandView> &facts, int64_t b) const {
         const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
         const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
-        if (kg.pages != vg.pages || kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)
-            invalid("paged K/V tables must share max_pages and strides");
+        if (kg.pages != vg.pages) invalid("paged K/V tables must share max_pages");
+        const bool separate_v_strides = index_[VTableStrides] < template_.size();
+        if (!separate_v_strides && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride))
+            invalid("this prepared host requires matching K/V table strides");
         const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
         if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
         put(frame, KStrides, py::make_tuple(ks[0], ks[1], ks[2]));
@@ -474,6 +516,7 @@ class SdpaThdBinder {
         put(frame, KTablePtr, py::int_(kt.pointer));
         put(frame, VTablePtr, py::int_(vt.pointer));
         put(frame, TableStrides, py::make_tuple(kg.batch_stride, kg.page_stride));
+        if (separate_v_strides) put(frame, VTableStrides, py::make_tuple(vg.batch_stride, vg.page_stride));
         put(frame, NumPages, py::int_(facts[K].shape[0]));
         return multiply(kg.pages, page_size_);
     }
@@ -491,6 +534,84 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_;
     bool has_lse_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
+};
+
+class SdpaThdPlanChoices {
+   public:
+    SdpaThdPlanChoices(const py::object &single, const py::object &pair, int64_t sm_count, int64_t policy)
+        : binders_{SdpaThdBinder(single), SdpaThdBinder(pair)}, sm_count_(sm_count), policy_(policy) {
+        if (policy != 1 && policy != 2) invalid("unknown native THD CGA policy");
+        if (sm_count < 2 || single.attr("cga_tile_m").cast<int64_t>() != 128 ||
+            pair.attr("cga_tile_m").cast<int64_t>() != 512 || single.attr("paged").cast<bool>() ||
+            single.attr("d_qk").cast<int64_t>() != 192 || single.attr("d_v").cast<int64_t>() != 128 ||
+            !single.attr("quant").is_none() || !pair.attr("quant").is_none())
+            invalid("native plan choices require unsplit nonpaged half D192/V128 tiles of 128 and 512 rows");
+        // A plan family changes only launch geometry. Each member owns its
+        // immutable host frame, compiled artifact and workspace layout.
+        for (const char *name : {"b",
+                                 "qh",
+                                 "kh",
+                                 "d_qk",
+                                 "d_v",
+                                 "paged",
+                                 "device_index",
+                                 "lens_form",
+                                 "has_lse",
+                                 "has_sink",
+                                 "lse_padded",
+                                 "lse_head_major",
+                                 "lse_head_stride",
+                                 "lse_stride_override",
+                                 "total_q",
+                                 "total_kv",
+                                 "s_q_max",
+                                 "decl",
+                                 "expect"}) {
+            const int equal = PyObject_RichCompareBool(single.attr(name).ptr(), pair.attr(name).ptr(), Py_EQ);
+            if (equal < 0) throw py::error_already_set();
+            if (!equal) invalid(std::string("plan choices must share ") + name);
+        }
+    }
+
+    int
+    select_index(const py::handle &pack, const std::vector<int64_t> &indices) const {
+        return select(read(pack, indices));
+    }
+
+    py::tuple
+    bind(const py::handle &pack, const std::vector<int64_t> &indices, int64_t workspace, py::object stream) const {
+        const auto facts = read(pack, indices);
+        const int index  = select(facts);
+        return py::make_tuple(index, binders_[index].bind_facts(facts, workspace, std::move(stream), py::none()));
+    }
+
+    bool
+    execute(const py::handle &pack, const std::vector<int64_t> &indices, int64_t workspace, py::object stream) const {
+        const auto facts   = read(pack, indices);
+        const auto &binder = binders_[select(facts)];
+        auto frame         = binder.bind_facts(facts, workspace, std::move(stream), py::none());
+        return binder.launch(frame);
+    }
+
+   private:
+    static std::vector<NativeOperandView>
+    read(const py::handle &pack, const std::vector<int64_t> &indices) {
+        if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
+        return read_native_operand_views(pack, indices);
+    }
+
+    int
+    select(const std::vector<NativeOperandView> &facts) const {
+        const auto units = binders_[0].choice_units(facts);
+        if (policy_ == 1) return units[0] <= sm_count_ ? 0 : 1;
+        const auto waves = [](int64_t work, int64_t resident) { return work / resident + (work % resident != 0); };
+        // Each two-CTA cluster consumes two SMs. Prefer one CTA when both
+        // geometries need the same bounded number of resident waves.
+        return waves(units[0], sm_count_) <= waves(units[1], sm_count_ / 2) ? 0 : 1;
+    }
+
+    std::array<SdpaThdBinder, 2> binders_;
+    int64_t sm_count_, policy_;
 };
 
 }  // namespace
@@ -514,6 +635,25 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("workspace"),
              py::arg("stream"),
              py::arg("scale") = py::none());
+    py::class_<SdpaThdPlanChoices>(m, "_SdpaThdPlanChoices")
+        .def(py::init<const py::object &, const py::object &, int64_t, int64_t>(),
+             py::arg("single"),
+             py::arg("pair"),
+             py::arg("sm_count"),
+             py::arg("policy") = 1)
+        .def("select_index", &SdpaThdPlanChoices::select_index, py::arg("pack"), py::arg("indices"))
+        .def("bind",
+             &SdpaThdPlanChoices::bind,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("workspace"),
+             py::arg("stream"))
+        .def("execute",
+             &SdpaThdPlanChoices::execute,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("workspace"),
+             py::arg("stream"));
 }
 
 }  // namespace python_bindings

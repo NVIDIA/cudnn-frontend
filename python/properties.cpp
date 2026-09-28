@@ -272,7 +272,8 @@ init_properties(py::module_& m) {
         .value("MMA_TILE_K", cudnn_frontend::KnobType_t::MMA_TILE_K)
         .value("CTA_GROUP", cudnn_frontend::KnobType_t::CTA_GROUP)
         .value("WARPS_M", cudnn_frontend::KnobType_t::WARPS_M)
-        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N);
+        .value("WARPS_N", cudnn_frontend::KnobType_t::WARPS_N)
+        .value("CGA_POLICY", cudnn_frontend::KnobType_t::CGA_POLICY);
     m.attr("FRONTEND_KNOB_TYPE_BASE") = py::int_(cudnn_frontend::FRONTEND_KNOB_TYPE_BASE);
     m.def(
         "is_frontend_knob_type",

@@ -104,7 +104,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     scheduler_warp_loop,
     scheduler_warp_loop_persistent,
     read_tile_id_arrive,
-    read_clc_payload,
+    read_clc_payload as _read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -271,6 +271,13 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 # envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
 # and the setup kernel publishes the live unit total it stops at.
 THD_PERSISTENT = True
+
+
+@cute.jit
+def read_clc_payload(sched, base_word):
+    # A local persistent producer may recycle the slot once this warp returns
+    # its credit. Broadcast from one reader so no lagging lane retains a load.
+    return _read_clc_payload(sched, base_word, warp_broadcast=bool(CFG.THD_VARLEN and CGA_SIZE == 1))
 
 
 # LPT q-tile accounting is expressed in CGA-tile units; make_cfg_d192 has

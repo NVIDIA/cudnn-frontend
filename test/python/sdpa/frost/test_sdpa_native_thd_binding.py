@@ -7,6 +7,7 @@ production fallback for native plans. No test pins a heuristic or timing.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 
 import pytest
 
@@ -64,6 +65,121 @@ def _equal(s, facts, **kwargs):
     if actual is not None:
         assert list(actual) == reference
     return actual
+
+
+def _choice_fixture(dtype="bfloat16", layout="HN", qh=16):
+    base, _, _ = _fixture(dtype, layout)
+    base.b, base.qh, base.kh, base.d_qk, base.d_v = 8, qh, 2, 192, 128
+    base.total_q, base.total_kv, base.quant = None, None, None
+    base.s_q_max, base.lse_head_stride, base.lse_stride_override = 65536, 0, True
+    base.decl = {role: (h, d, h * d, d, 1, h * d) for role, h, d in (("q", qh, 192), ("k", 2, 192), ("v", 2, 128), ("o", qh, 128))}
+    variants, launches = [], []
+    for i, tile in enumerate((128, 512)):
+        spec = copy(base)
+        spec.cga_tile_m = tile
+        spec.template = list(base.template)
+        spec.template[spec.index["n_thd_units"]] = 1024
+        spec.fn = lambda *frame, index=i: launches.append((index, frame))
+        spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+        variants.append(spec)
+    return variants, launches
+
+
+def _choice_facts(spec, batch, max_q, total):
+    facts = {}
+    for i, role in enumerate(("q", "k", "v", "o")):
+        h, d = spec.decl[role][:2]
+        sq = max_q if role in ("q", "o") else 64
+        tokens = total if role in ("q", "o") else batch * sq
+        facts[role] = prep.BufferFacts(0x1000 * (i + 1), spec.expect[role], (2, 0), tokens * h * d, (batch, h, sq, d), (sq * h * d, d, h * d, 1))
+    for i, role in enumerate(("q_lens", "kv_lens")):
+        facts[role] = prep.BufferFacts(0x10000 + i * 0x1000, "int32", (2, 0), batch + 1, (batch + 1,), (1,))
+    if spec.has_lse:
+        strides = (spec.qh * total, total, 1, 1) if spec.lse_head_major else (spec.qh * max_q, 1, spec.qh, 1)
+        facts["lse"] = prep.BufferFacts(0x20000, "float32", (2, 0), spec.qh * total, (batch, spec.qh, max_q, 1), strides)
+    return facts
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_plan_choices_keep_frames_and_explicit_artifacts_independent(dtype, layout, policy):
+    variants, launches = _choice_fixture(dtype, layout)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    saved = []
+    for batch, maximum, total, expected in ((1, 1024, 1024, 0), (2, 513, 640, 0), (1, 2048, 2048, 1), (4, 128, 319, 0), (8, 512, 4096, 1)):
+        facts = _choice_facts(variants[0], batch, maximum, total)
+        workspace, stream = 0x30000 + len(saved) * 0x1000, 17 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        reference = _reference(variants[index], facts, workspace, stream)
+        assert list(frame) == reference
+        saved.append((frame, tuple(frame)))
+        choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(reference))
+        assert all(tuple(old) == unchanged for old, unchanged in saved)
+    empty = dict(facts, q=facts["q"]._replace(span=0))
+    before = len(launches)
+    assert not choices.execute(prep._native_pack_from_facts(empty), prep._NATIVE_THD_INDICES, workspace, stream)
+    assert len(launches) == before
+
+
+@pytest.mark.parametrize(
+    "role,updates",
+    [
+        ("q", {"device": (1, 0)}),
+        ("q", {"dtype": "float32"}),
+        ("o", {"ptr": 0x4001}),
+        ("q_lens", {"span": 0}),
+        ("kv_lens", {"shape": (3,)}),
+        ("lse", {"dtype": "bfloat16"}),
+        ("lse", {"span": 3}),
+        ("k", {"ptr": 0x2001}),
+    ],
+)
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_plan_choices_preserve_runtime_rejections(role, updates, policy):
+    variants, launches = _choice_fixture()
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    for total in (1024, 2048):
+        facts = _choice_facts(variants[0], 1, total, total)
+        facts[role] = facts[role]._replace(**updates)
+        for variant in variants:
+            with pytest.raises(ValueError):
+                _native(variant, facts)
+        with pytest.raises(ValueError):
+            choices.execute(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, 0x30000, 17)
+    assert launches == []
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_cga_policy_preserves_one_wave_and_equal_wave_rules(policy):
+    variants, _ = _choice_fixture(qh=32)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    # Two packed sequences fit in two waves of either geometry. Policy1
+    # preserves its original pair choice; policy2 selects single on this tie.
+    facts = _choice_facts(variants[0], 2, 513, 640)
+    assert choices.select_index(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES) == (1 if policy == 1 else 0)
+    # One sequence with 1024 rows needs two single waves but one pair wave.
+    facts = _choice_facts(variants[0], 1, 1024, 1024)
+    assert choices.select_index(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES) == 1
+
+
+@pytest.mark.parametrize("policy", [0, 3])
+def test_native_cga_policy_rejects_unknown_values(policy):
+    variants, _ = _choice_fixture()
+    with pytest.raises(ValueError, match="unknown native THD CGA policy"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+
+
+def test_native_plan_choices_reject_incompatible_specializations():
+    variants, _ = _choice_fixture()
+    for name, value in (("qh", 32), ("total_q", 2048), ("device_index", 1), ("lse_stride_override", False)):
+        changed = copy(variants[1])
+        setattr(changed, name, value)
+        with pytest.raises(ValueError, match="plan choices must share"):
+            cudnn._pybind_module._SdpaThdPlanChoices(variants[0], changed, 148)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -413,3 +529,28 @@ def test_native_nonpaged_host_does_not_require_paged_slots():
     s.index = {n: i for i, n in enumerate(s.order)}
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
+
+
+@pytest.mark.parametrize("separate_v_strides", [False, True])
+def test_native_paged_table_stride_slots_match_the_compiled_host(separate_v_strides):
+    s, facts, _ = _paged_fixture()
+    if not separate_v_strides:
+        kept = [(name, value) for name, value in zip(s.order, s.template) if name != "table_v_strides"]
+        s.order = [name for name, _ in kept]
+        s.template = [value for _, value in kept]
+        s.index = {name: i for i, name in enumerate(s.order)}
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    _equal(s, facts)
+    changed = dict(facts, block_table_v=facts["block_table_v"]._replace(strides=(8, 8, 2, 1), span=32))
+    if separate_v_strides:
+        frame = _equal(s, changed)
+        assert frame[s.index["table_strides"]] == (4, 1)
+        assert frame[s.index["table_v_strides"]] == (8, 2)
+        short = dict(changed, block_table_v=changed["block_table_v"]._replace(span=30))
+        for fn in (_native, _reference):
+            with pytest.raises(ValueError, match="storage|spans"):
+                fn(s, short)
+    else:
+        for fn in (_native, _reference):
+            with pytest.raises(ValueError, match="matching K/V table strides"):
+                fn(s, changed)

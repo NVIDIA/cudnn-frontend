@@ -193,6 +193,9 @@ class TemplateParams:
     # decode_d256_q_tile); 0 = the prefill tile.  Plan-time only (S_q is a
     # declared shape).
     decode_q_tile: int = 0
+    # QK width of the shared one-Q-tile half-precision pipeline. Internal
+    # lowering fact; the public cluster knob and graph dimensions select it.
+    single_q_head_dim: int = 128
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -1670,7 +1673,7 @@ class CfgD128Decode(CfgD128):
 
 
 def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
-    """Consistency checks on the d128 decode-tile geometry."""
+    """Consistency checks on the shared one-Q-tile geometry."""
     checks = (
         (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d128 decode: f16/bf16 only (the fp8 families keep the prefill tile)"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d128 decode: DTYPE_O must equal DTYPE_QKV"),
@@ -1678,10 +1681,13 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d128 decode: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d128 decode: per-role regs must be multiples of 8"),
         (cfg.CGA_M == 1 and cfg.CTA_MMA == 1, "d128 decode: one independent CTA per tile (cga1)"),
-        (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
+        (cfg.QO_ALIAS == 1, "single-Q tile: Q and O share one SMEM slab"),
         (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
-        (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K == 128 and cfg.TILE_O == 128, "d128 decode: 128x128 tiles, d_qk = d_v = 128"),
-        (cfg.STAGES_KV == 3, "d128 decode: STAGES_KV must be 3"),
+        (
+            cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128,
+            "single-Q tile: 128x128 tiles, d_qk in {128, 192}, d_v = 128",
+        ),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
@@ -1699,7 +1705,7 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d128 decode: no THD_VARLEN leg (ragged Q over paged K/V rides RAGGED_Q; other THD keeps the prefill tile)"),
+        (not cfg.THD_VARLEN or (cfg.TILE_K == 192 and not cfg.PAGED_KV and cfg.SPLIT_KV == 1), "single-Q THD: unsplit, nonpaged D192 only"),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
             "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
@@ -1715,34 +1721,39 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
 
 
 def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIters]:
-    """Config for ``sm100/decode_d128_f16.py`` -- the d128 flavor at ``cta_mma=1``.
+    """Config for the shared D128 decode / D192 THD tile at ``cta_mma=1``.
 
     Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
     cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
     S_q(max) == 1), and the adapter routes exactly those combinations here;
-    anything else raising below is a gap in those gates.
+    D192 THD uses the same pipeline with two KV stages and unsplit nonpaged
+    inputs. Anything else raising below is a gap in those gates.
     """
     _validate_params("d128", params)
     if params.cta_mma != 1:
         raise ValueError(f"d128 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen:
-        raise ValueError(
-            "d128 decode: the THD_VARLEN leg is not wired on the decode tile (ragged Q over paged K/V rides ragged_q; other THD keeps the prefill tile)"
-        )
+    d_qk = params.single_q_head_dim
+    if d_qk not in (128, 192):
+        raise ValueError("single-Q tile: QK width must be 128 or 192")
+    if params.thd_varlen and (d_qk != 192 or params.paged_kv or params.split_kv != 1):
+        raise ValueError("single-Q THD: unsplit, nonpaged D192 only")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
+        TILE_K=d_qk,
+        STAGES_KV=3 if d_qk == 128 else 2,
+        THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_V=b,
         BPE_O=bpe(dtype_o),
-        Q_SWZ_BYTES=q_swz_bytes(128, b),
-        K_SWZ_BYTES=q_swz_bytes(128, b),
+        Q_SWZ_BYTES=q_swz_bytes(d_qk, b),
+        K_SWZ_BYTES=q_swz_bytes(d_qk, b),
         V_SWZ_BYTES=v_swz_bytes(128, 1, b),
         O_SWZ_BYTES=o_swz_bytes(128, bpe(dtype_o)),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),

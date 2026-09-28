@@ -383,7 +383,7 @@ class ThdLaunchSpec:
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
@@ -488,6 +488,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         put("lse_ext", s.lse_head_stride)  # compact head-major: the token capacity, written per call
     put("scale_softmax_log2", scale * math.log2(math.e))
     put("n_thd_units", int(plan.units))
+    put("ragged_q_addr", 0)
+    put("ragged_q_div", 1)
     put("seq_q_lens_addr", 0)
     put("thd_lens_form", s.lens_form)
     put("o_partial_ptr", None)
@@ -946,6 +948,39 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     if spec.has_lse and spec.lse_padded:
         seed_padded()  # declared per-call operation: rows past each length read -inf
     return frame
+
+
+class PreparedThdChoices:
+    """Two immutable THD artifacts selected from current host binding metadata.
+
+    ``spec`` supplies the common device contract to the graph plan; ``variants``
+    retain the concrete launch geometry and artifacts. A CUDA capture records
+    the selected launch. Device length changes during replay do not reselect.
+    """
+
+    def __init__(self, variants, sm_count: int, policy: int = 1):
+        from cudnn import _pybind_module
+
+        self.variants = variants
+        single, pair = variants
+        if single._uids != pair._uids or single._roles != pair._roles:
+            raise ValueError("THD plan choices must bind the same graph operands")
+        self.spec = single.spec
+        self._roles, self._uids = single._roles, single._uids
+        self._native_indices = None
+        factory = getattr(_pybind_module, "_SdpaThdPlanChoices", None)
+        if factory is None:
+            raise NotImplementedError("THD plan choices require the matching native cuDNN Frontend extension")
+        self.native = factory(single.spec, pair.spec, sm_count, policy)
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        if self._native_indices is None:
+            try:
+                roles = {role: pack.index_of(uid) for role, uid in zip(self._roles, self._uids)}
+            except KeyError as exc:
+                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+            self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_THD_ROLES)
+        self.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
 
 class PreparedThdLaunch:

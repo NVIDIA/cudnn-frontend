@@ -164,7 +164,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     scheduler_warp_loop,
     scheduler_warp_loop_persistent,
     read_tile_id_arrive,
-    read_clc_payload,
+    read_clc_payload as _read_clc_payload,
     SCHED_NATURAL,
     SCHED_LPT,
     SCHED_LPT_L2,
@@ -250,6 +250,13 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+
+
+@cute.jit
+def read_clc_payload(sched, base_word):
+    # Match the local persistent producer's slot lifetime on single-CTA THD.
+    return _read_clc_payload(sched, base_word, warp_broadcast=bool(CFG.THD_VARLEN and CGA_SIZE == 1))
+
 
 # lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
 # the LPT linearization needs q_tiles in CGA units (n_q_supers // CTA_MMA).

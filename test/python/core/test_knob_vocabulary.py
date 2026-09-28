@@ -80,6 +80,7 @@ def test_frontend_only_band():
         "CTA_GROUP": 1007,
         "WARPS_M": 1008,
         "WARPS_N": 1009,
+        "CGA_POLICY": 1010,
     }
     # The frontend band is persisted too: append-only, frozen here like the backend band.
     assert {name: int(member) for name, member in kt.__members__.items() if cudnn.is_frontend_knob_type(member)} == fe_only
@@ -89,7 +90,8 @@ def test_frontend_only_band():
     assert kt(1002) == kt.SPLIT_KV and int(kt(1002)) == 1002
 
 
-def test_frontend_only_knob_is_refused_by_a_backend_plan():
+@pytest.mark.parametrize("knob", ["SPLIT_KV", "CGA_POLICY"])
+def test_frontend_only_knob_is_refused_by_a_backend_plan(knob):
     """A frontend-only knob has no backend counterpart; handing one to a
     backend engine must fail loudly rather than silently mis-map."""
     handle = cudnn.create_handle()
@@ -101,11 +103,12 @@ def test_frontend_only_knob_is_refused_by_a_backend_plan():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    backend_id, _ = g.get_engine_and_knobs_at_index(0)
+    records = [g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())]
+    backend_id = next(engine_id for engine_id, _ in records if engine_id < PYTHON_ENGINE_ID_BASE)
     # convert_to_backend_knob_type answers CUDNN_STATUS_NOT_SUPPORTED for the
     # frontend-only band; the binding surfaces that as a RuntimeError at replay.
     with pytest.raises(RuntimeError, match=r"convert_to_backend_knob_type.*CUDNN_STATUS_NOT_SUPPORTED"):
-        g.create_execution_plan(backend_id, {cudnn.knob_type.SPLIT_KV: 2})
+        g.create_execution_plan(backend_id, {getattr(cudnn.knob_type, knob): 1})
 
 
 def test_backend_plan_knobs_are_a_dict_never_none():
@@ -118,12 +121,16 @@ def test_backend_plan_knobs_are_a_dict_never_none():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    backend_count = 0
     for i in range(g.get_execution_plan_count()):
         engine_id, knobs = g.get_engine_and_knobs_at_index(i)
+        if engine_id >= PYTHON_ENGINE_ID_BASE:
+            continue
+        backend_count += 1
         assert isinstance(knobs, dict), (i, knobs)
         assert all(isinstance(k, cudnn.knob_type) for k in knobs), knobs
         assert all(isinstance(v, int) for v in knobs.values()), knobs
-        assert engine_id < PYTHON_ENGINE_ID_BASE
+    assert backend_count, "the graph must offer a backend plan"
 
 
 # ---------------------------------------------------------------------------

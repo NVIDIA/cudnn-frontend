@@ -738,6 +738,21 @@ only to decline is why `closed_under` existed.
   kernels take no tuning decision (linear attention) lists `{}`, which IS its
   complete record. A knob-less plan whose engine picks inside `build_plan` is a
   bug: the record would replay a different kernel after the pick changes.
+- A runtime selection strategy is recorded explicitly too. On SM100 (CC10.0),
+  half/BF16 nonpaged, unmasked D192/V128 THD graphs with shape overrides may
+  use `CGA_POLICY=1` instead of `TILE_CGA_M`. The plan compiles both widths up
+  front and chooses CGA1 when its host-known Q tile bound fits one SM wave,
+  CGA2 otherwise. `CGA_POLICY=2` compares the bounded resident wave counts
+  instead: CGA1 uses up to one cluster per SM, CGA2 one per pair of SMs, and
+  CGA1 wins a tie. Both policies are unsplit and unpacked. Their integers
+  identify these rules; a different rule needs a different policy value. A fixed
+  `TILE_CGA_M` and `CGA_POLICY` are mutually exclusive, and omitting both does
+  not opt into runtime selection. The record round-trips through
+  `get_engine_and_knobs_at_index` / `create_execution_plan`, including JSON
+  integer keys. Workspace covers either artifact, each invocation binds fresh
+  pointers, and CUDA Graph capture fixes the selected launch; replay does not
+  reconsider changing device lengths. No execution-time compilation or
+  device-to-host length read is involved.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's
