@@ -44,6 +44,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 import cudnn
+from cudnn.sdpa.varlen_metadata import prepare_varlen_metadata
 
 _logger = logging.getLogger(__name__)
 
@@ -181,12 +182,6 @@ def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torc
 def _int32_col(t: torch.Tensor) -> torch.Tensor:
     """View a 1-D int tensor as the (N, 1, 1, 1) INT32 column cuDNN expects."""
     return t.to(torch.int32).reshape(-1, 1, 1, 1)
-
-
-def _int64_col(t: torch.Tensor) -> torch.Tensor:
-    """(N, 1, 1, 1) INT64 column: ragged offsets are int64 so element offsets
-    (token prefix sums x token stride) cannot overflow."""
-    return t.to(torch.int64).reshape(-1, 1, 1, 1)
 
 
 def _round64(n: int) -> int:
@@ -475,21 +470,13 @@ def _sdpa_fwd_impl(
     if has_sinks:
         variant[int(_UIDs.SINKS)] = sinks.to(torch.float32).reshape(1, H_q, 1, 1)
     if is_thd:
-        # cuDNN ragged offsets are int64 ELEMENT offsets per tensor, so each
-        # scales its token prefix sums by that tensor's OWN token stride —
-        # widened BEFORE the multiply (an int32 product would wrap before
-        # _int64_col ever sees it). Small on-stream int ops — CUDA-graph-
-        # capture safe.
-        cu_q64 = cu_seqlens_q.to(torch.int64)
-        cu_kv64 = cu_seqlens_kv.to(torch.int64)
-        variant[int(_UIDs.RAGGED_Q)] = _int64_col(cu_q64 * q.stride(0))
-        variant[int(_UIDs.RAGGED_KV)] = _int64_col(cu_kv64 * k.stride(0))
-        variant[int(_UIDs.RAGGED_V)] = _int64_col(cu_kv64 * v.stride(0))
-        variant[int(_UIDs.RAGGED_O)] = _int64_col(cu_q64 * (H_q * D_v))
-        variant[int(_UIDs.SEQ_LEN_Q)] = _int32_col(cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-        variant[int(_UIDs.SEQ_LEN_KV)] = _int32_col(cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])
-        if return_lse:
-            variant[int(_UIDs.RAGGED_STATS)] = _int64_col(cu_q64 * H_q)
+        # Each ragged offset is an int64 ELEMENT offset using its own tensor's
+        # token stride. The shared producer widens prefixes before multiplying.
+        q_roles = (_UIDs.RAGGED_Q, _UIDs.RAGGED_O) + ((_UIDs.RAGGED_STATS,) if return_lse else ())
+        q_strides = (q.stride(0), H_q * D_v) + ((H_q,) if return_lse else ())
+        roles = (_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV, *q_roles, _UIDs.RAGGED_KV, _UIDs.RAGGED_V)
+        metadata = prepare_varlen_metadata(cu_seqlens_q, cu_seqlens_kv, q_strides, (k.stride(0), v.stride(0)))
+        variant.update((int(role), value) for role, value in zip(roles, metadata))
     elif has_seq_lens:
         variant[int(_UIDs.SEQ_LEN_Q)] = _int32_col(seq_len_q)
         variant[int(_UIDs.SEQ_LEN_KV)] = _int32_col(seq_len_kv)
@@ -986,17 +973,25 @@ def _sdpa_bwd_impl(
         int(_UIDs.DQ): dq,
         int(_UIDs.DK): dk,
         int(_UIDs.DV): dv,
-        # Widened BEFORE the multiply: int32 products wrap before _int64_col.
-        int(_UIDs.RAGGED_Q): _int64_col(cu_seqlens_q.to(torch.int64) * q.stride(0)),
-        int(_UIDs.RAGGED_KV): _int64_col(cu_seqlens_kv.to(torch.int64) * k.stride(0)),
-        int(_UIDs.RAGGED_V): _int64_col(cu_seqlens_kv.to(torch.int64) * v.stride(0)),
-        int(_UIDs.RAGGED_O): _int64_col(cu_seqlens_q.to(torch.int64) * o.stride(0)),
-        int(_UIDs.RAGGED_DQ): _int64_col(cu_seqlens_q.to(torch.int64) * (H_q * D_qk)),
-        int(_UIDs.RAGGED_DK): _int64_col(cu_seqlens_kv.to(torch.int64) * (H_k * D_qk)),
-        int(_UIDs.RAGGED_DV): _int64_col(cu_seqlens_kv.to(torch.int64) * (H_v * D_v)),
-        int(_UIDs.SEQ_LEN_Q): _int32_col(cu_seqlens_q[1:] - cu_seqlens_q[:-1]),
-        int(_UIDs.SEQ_LEN_KV): _int32_col(cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]),
     }
+    roles = (
+        _UIDs.SEQ_LEN_Q,
+        _UIDs.SEQ_LEN_KV,
+        _UIDs.RAGGED_Q,
+        _UIDs.RAGGED_O,
+        _UIDs.RAGGED_DQ,
+        _UIDs.RAGGED_KV,
+        _UIDs.RAGGED_V,
+        _UIDs.RAGGED_DK,
+        _UIDs.RAGGED_DV,
+    )
+    metadata = prepare_varlen_metadata(
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        (q.stride(0), o.stride(0), H_q * D_qk),
+        (k.stride(0), v.stride(0), H_k * D_qk, H_v * D_v),
+    )
+    variant.update((int(role), value) for role, value in zip(roles, metadata))
 
     g.execute(variant, workspace, handle=handle)
     return dq, dk, dv
