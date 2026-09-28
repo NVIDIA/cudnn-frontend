@@ -484,6 +484,15 @@ angles, signed zero and nonfinite inputs. Keep real Int64 stride and product
 overflow checks on the angle input, with wrapped addresses inside allocated
 guard storage, plus changed-angle replay and fresh-process artifact reload.
 
+A CuTeDSL `cutlass.Array` scalar index is a flat element offset; even a
+one-element tuple takes that path. For non-contiguous rank-one prefixes,
+form the element offset explicitly in Int64 before indexing. A contiguous-only
+metadata test misses this. `sdpa/torch/test_varlen_metadata.py` checks strided
+prefixes, changed prefixes under replay, physical prefix strides above `2**32`,
+and smaller strides whose index product overflows. Its provider tests pin real
+backend and FROST graph plans; SM80 standalone THD support is not evidence of
+SM80 THD graph eligibility.
+
 Packed wrapper initialization belongs in the existing compiled host: a separate
 Python launch can erase the host savings from fusing device clears. Preserve the
 wrapper's zeroed capacity holes/tails separately from direct graph outputs and
