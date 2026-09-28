@@ -15,6 +15,7 @@ from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_PADDED, MASK_
 from cudnn.frost.tile_dsl.tma import st_global_v4
 from cudnn.frost.tile_dsl.thd import THD_META_WORDS
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_meta_host
+from cudnn.sdpa.fwd.kernels.sm80.packed_init import zero_outputs
 
 
 def launch_bounds(api):
@@ -213,6 +214,7 @@ def _staged_host(
     right_bound: cutlass.Constexpr[int],
     n_seq: cutlass.Constexpr[int],
     lse_token_major: cutlass.Constexpr[bool],
+    initialize_outputs: cutlass.Constexpr[bool],
     stream: driver.CUstream,
 ):
     # The template module already owns the immutable configuration. Passing its
@@ -258,7 +260,15 @@ def _staged_host(
         if cutlass.const_expr(dsink_acc is not None):
             if max_words < cute.size(dsink_acc):
                 max_words = cutlass.Int64(cute.size(dsink_acc))
-        _zero_packed(dq_acc, sem, dsink_acc, max_words).launch(grid=((max_words + 1023) // 1024, 1, 1), block=(256, 1, 1), stream=stream)
+        if cutlass.const_expr(initialize_outputs):
+            # Only the allocating wrapper owns these compact output capacities.
+            # Direct/graph plans preserve their existing tail-write contract.
+            outputs = (dq_acc, sem, dsink_acc, dq)
+            if cutlass.const_expr(h != hk):
+                outputs += (dk, dv)
+            zero_outputs(outputs, stream)
+        else:
+            _zero_packed(dq_acc, sem, dsink_acc, max_words).launch(grid=((max_words + 1023) // 1024, 1, 1), block=(256, 1, 1), stream=stream)
         thd_meta_host(meta, seq_q, seq_kv, length_form, cutlass.Int32(n_seq), stream)
         cu_q = cute.make_tensor(meta.iterator + n_seq, cute.make_layout((n_seq + 1,), stride=(1,)))
         cu_k = cute.make_tensor(meta.iterator + 2 * n_seq + 1, cute.make_layout((n_seq + 1,), stride=(1,)))
@@ -386,6 +396,7 @@ def host(
     right_bound: cutlass.Constexpr[int],
     n_seq: cutlass.Constexpr[int],
     lse_token_major: cutlass.Constexpr[bool],
+    initialize_outputs: cutlass.Constexpr[bool],
     stream: driver.CUstream,
 ):
     _staged_host(
@@ -425,6 +436,7 @@ def host(
         right_bound,
         n_seq,
         lse_token_major,
+        initialize_outputs,
         stream,
     )
 
@@ -452,6 +464,7 @@ def compile_host(api, geometry, d64_module, cache_key):
         api.right_bound_runtime,
         api.batch_size,
         api._thd_lse_token_major if api.thd else False,
+        bool(api.thd and getattr(api, "_initialize_packed_outputs", False)),
         cache_key,
         int(api.q_desc.device.index or 0),
     )
@@ -459,7 +472,20 @@ def compile_host(api, geometry, d64_module, cache_key):
 
 
 def _compile_artifact(
-    module, d64_module, geometry, regions, zeros, dtype, dbias_dtype, swa_window, right_bound, n_seq, thd_lse_token_major, cache_key, device_index
+    module,
+    d64_module,
+    geometry,
+    regions,
+    zeros,
+    dtype,
+    dbias_dtype,
+    swa_window,
+    right_bound,
+    n_seq,
+    thd_lse_token_major,
+    initialize_outputs,
+    cache_key,
+    device_index,
 ):
     types = (
         [dtype] * 5
@@ -500,6 +526,7 @@ def _compile_artifact(
         right_bound,
         n_seq,
         thd_lse_token_major,
+        initialize_outputs,
         driver.CUstream(0),
         options="--enable-tvm-ffi",
         cache_key=cache_key,
