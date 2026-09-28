@@ -4389,8 +4389,9 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     _artifact, fn = compile_thd_host(mod, h_q, h_kv, n_seqs, int(max(0, wl)) if wl is not None else 0)
 
     t_q = q.shape[1]
-    o_buf = torch.zeros(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
-    lse_buf = torch.zeros(1, h_q, t_q, dtype=torch.float32, device=device)
+    # The prepared host initializes both complete capacities before attention.
+    o_buf = torch.empty(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
+    lse_buf = torch.empty(1, h_q, t_q, dtype=torch.float32, device=device)
     sinks_b = sinks.to(dtype=torch.float32, device=device).reshape(h_q).contiguous() if sinks is not None else None
     for name, tensor in (("Q", q), ("K", k), ("V", v)):
         if tensor.stride(-1) != 1 or tensor.data_ptr() % 16 or any(n > 1 and st % 8 for n, st in zip(tensor.shape[1:3], tensor.stride()[1:3])):

@@ -848,6 +848,7 @@ def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtyp
     # Preserve their physical capacity/Stats pitch while separately bounding
     # the launch grid and deterministic counters from the caller's hints.
     api._thd_launch_bounds = (max_sq, max_skv)
+    api._initialize_packed_outputs = True
     api.compile()
     return api
 
@@ -892,8 +893,8 @@ def _sm80_thd_backward(
     sinks_t = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous() if sinks is not None else None
     # The cast/fold only writes live rows. Keep the established zeroed dQ and
     # GQA output tails; MHA dK/dV remain direct kernel outputs.
-    dq = torch.zeros_like(q)
-    dk, dv = (torch.zeros_like(k), torch.zeros_like(v)) if h_q != h_kv else (torch.empty_like(k), torch.empty_like(v))
+    # The wrapper specialization folds this into workspace initialization.
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     dsink = torch.empty(h_q, dtype=torch.float32, device=dev) if sinks is not None else None
     wl, wr = window_size
     wl = None if wl is None or wl < 0 else int(wl)
