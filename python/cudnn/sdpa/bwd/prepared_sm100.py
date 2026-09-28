@@ -128,7 +128,9 @@ class StagedPlan:
 def _copy_entry(shapes):
     from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
 
-    artifact = compile_copy(shapes, (2,) * len(shapes))
+    # Large half-precision staging amortizes block scheduling and address math
+    # across four coalesced element groups while retaining Int64 addresses.
+    artifact = compile_copy(shapes, (2,) * len(shapes), items_per_thread=4)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM100 backward staging requires a positional tvm-ffi entry")
