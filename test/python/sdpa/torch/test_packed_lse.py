@@ -270,3 +270,38 @@ def test_prepared_metadata_explicit_operand_target(helper, monkeypatch, tmp_path
         result = varlen_metadata.prepare_varlen_metadata(prefix, prefix, (2**32 + 16,), (32,))
         torch.testing.assert_close(result[2].flatten(), prefix.long() * (2**32 + 16), atol=0, rtol=0)
     assert options
+
+
+def test_packed_lse_missing_execution_entry_falls_back(monkeypatch):
+    _require_prepared()
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa import packed_lse
+
+    packed_lse._plan.cache_clear()
+    calls = []
+    original = packed_lse._torch_repad
+
+    def fallback(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(compiled_cache, "positional_entry", lambda artifact: None)
+    monkeypatch.setattr(packed_lse, "_torch_repad", fallback)
+    prefix = torch.tensor([0, 3, 7], dtype=torch.int32, device="cuda")
+    lse = torch.arange(21, dtype=torch.float32, device="cuda").reshape(7, 3)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        actual = packed_lse.prepare_padded_lse(lse, prefix, 4)
+        torch.testing.assert_close(actual, original(lse, prefix, 4), atol=0, rtol=0)
+        with torch.cuda.graph(graph):
+            captured = packed_lse.prepare_padded_lse(lse, prefix, 4)
+        lse.add_(3)
+        captured.fill_(-19)
+        graph.replay()
+        torch.testing.assert_close(captured, original(lse, prefix, 4), atol=0, rtol=0)
+        assert len(calls) == 2
+        assert packed_lse._plan.cache_info().misses == 1
+        assert packed_lse._plan.cache_info().hits == 1
+    finally:
+        graph.reset()
+        packed_lse._plan.cache_clear()

@@ -492,3 +492,10 @@ checks this alongside execution. For packed-to-padded conversion, include highly
 uneven lengths and heavy padding in correctness and performance comparisons;
 measure multiple calls per captured graph so host replay submission cannot hide
 a device regression.
+
+An explicit compiler target still does not guarantee a runnable execution entry.
+Some DSL versions compare it with device zero's runtime architecture and leave
+the entry absent on heterogeneous hosts. Optional shared producers must preserve
+their Torch fallback in that case. Exercise the actual compiler-to-entry boundary
+with a missing entry, repeat with changed inputs and graph replay, and verify that
+ordinary compiler/launch errors still propagate rather than broadly catching them.

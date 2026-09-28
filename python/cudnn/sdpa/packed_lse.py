@@ -20,9 +20,9 @@ def _plan(prefix_dtype, device_index):
     major, minor = torch.cuda.get_device_capability(device_index)
     artifact = compile_packed_lse(prefix_dtype, device_index, f"sm_{major}{minor}")
     entry = positional_entry(artifact)
-    if entry is None:
-        raise NotImplementedError("SDPA Stats preparation requires a positional tvm-ffi entry")
-    return artifact, entry
+    # Some DSL versions compile a foreign architecture without producing a
+    # runnable entry. Keep the established Torch path for that environment.
+    return None if entry is None else (artifact, entry)
 
 
 def _torch_repad(lse, cu_seqlens, max_seqlen):
@@ -68,6 +68,8 @@ def _execute(lse, cu_seqlens, max_seqlen):
             stream = torch.cuda.current_stream(device).cuda_stream
         ensure_current_context(stream, device.index)
         plan = _plan(str(cu_seqlens.dtype), device.index)
+        if plan is None:
+            return _torch_repad(lse, cu_seqlens, max_seqlen)
         plan[1](lse.data_ptr(), cu_seqlens.data_ptr(), padded.data_ptr(), batch, tokens, heads, max_seqlen, lse.stride(), cu_seqlens.stride(0), stream)
         return padded
 
