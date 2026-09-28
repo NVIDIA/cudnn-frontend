@@ -105,16 +105,16 @@ def test_gemm_swiglu_compile_execute(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("persistent", [False, True], ids=["multi_group_tile", "persistent_tiles"])
-def test_gemm_swiglu_retained_outputs_replay(dtype, persistent):
+@pytest.mark.parametrize("tile", [(256, 256), (128, 128), (128, 64)], ids=["multi_group_tile", "persistent_tiles", "persistent_single_group"])
+def test_gemm_swiglu_retained_outputs_replay(dtype, tile):
     """Retain every launch's outputs so a later correct store cannot hide a race."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("Requires SM100 or newer")
     from cudnn import GemmSwigluSm100
     from cuda.bindings import driver as cuda
 
+    persistent = tile[0] == 128
     m = n = 2048 if persistent else 256
-    tile = (128, 128) if persistent else (256, 256)
     cluster = (1, 1) if persistent else (2, 2)
     a, _, b, *_ = allocate_input_tensors(m, n, 512, 2, dtype, "m", "n" if dtype == torch.float8_e4m3fn else "k")
     ab12, c, *_ = allocate_output_tensors(m, n, 2, torch.float32, torch.bfloat16, "n")

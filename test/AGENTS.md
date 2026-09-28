@@ -389,7 +389,8 @@ slots permit only two outstanding groups. Rotate each output ring by its
 own consumed-slot count across persistent tiles. A replay that repeatedly
 overwrites one output can hide an earlier corrupted store; retain distinct
 outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
-covers both multiple groups within a tile and persistent tile transitions.
+covers multiple groups within a tile and persistent tile transitions, including
+one-group tiles that must advance the C ring at every tile boundary.
 
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
