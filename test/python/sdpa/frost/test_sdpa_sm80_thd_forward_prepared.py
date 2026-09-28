@@ -350,6 +350,7 @@ print(json.dumps(compiled_cache.stats()))
 def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache
+    from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
 
     compile_staged_host.cache_clear()
@@ -359,6 +360,7 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
     else:
         monkeypatch.setattr(compiled_cache, "environment_manifest", lambda: {"cuda_driver": "unknown"})
     for reload in (0, 1):
+        _sm80_wrapper_cache.clear()
         with pytest.MonkeyPatch.context() as patch:
             if reload:
                 patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("staged forward lost process-local artifact reuse"))
@@ -369,7 +371,8 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
 @pytest.mark.parametrize(
     "role,invalid",
     [(role, invalid) for role in ("q", "k", "v", "o") for invalid in ("shape", "dtype", "device")]
-    + [(role, invalid) for role in ("lse", "sinks", "seq_q_lens", "seq_kv_lens", "bias_tensor") for invalid in ("dtype", "device")],
+    + [(role, invalid) for role in ("lse", "sinks", "seq_q_lens", "seq_kv_lens", "bias_tensor") for invalid in ("dtype", "device")]
+    + [("bias_tensor", "empty_batch")],
 )
 def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, monkeypatch):
     from types import SimpleNamespace
@@ -404,6 +407,8 @@ def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, mon
         values[role] = tensor[:, :, :-1]
     elif invalid == "dtype":
         values[role] = torch.empty_like(tensor, dtype=torch.float64)
+    elif invalid == "empty_batch":
+        values[role] = tensor[:0]
     else:
         values[role] = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
     with pytest.raises(ValueError):

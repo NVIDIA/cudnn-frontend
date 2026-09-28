@@ -5437,6 +5437,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
                 f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
             )
+            self._value_error_if(bias_tensor.shape[0] == 0, "bias must contain at least one batch slice")
             bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
             self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
         else:
