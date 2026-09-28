@@ -54,6 +54,49 @@ def _expected_split(api):
     )
 
 
+def _sm120_reference(q, k, v, *, causal=False, stats_log2=False):
+    """Keep the FP32 oracle's score matrix bounded to one query head."""
+    b, h_q, s_q, d = q.shape
+    h_kv, s_kv = k.shape[1:3]
+    output = torch.empty((b, h_q, s_q, v.shape[-1]), device=q.device, dtype=torch.float32)
+    stats = torch.empty((b, h_q, s_q), device=q.device, dtype=torch.float32)
+    mask = None
+    if causal:
+        i = torch.arange(s_q, device=q.device).view(s_q, 1)
+        j = torch.arange(s_kv, device=q.device).view(1, s_kv)
+        mask = j > i
+    for head in range(h_q):
+        kv_head = head // (h_q // h_kv)
+        qb = q[:, head : head + 1].float()
+        kb = k[:, kv_head : kv_head + 1].float()
+        vb = v[:, kv_head : kv_head + 1].float()
+        scores = torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d)
+        if mask is not None:
+            scores.masked_fill_(mask, float("-inf"))
+        p = torch.softmax(scores, dim=-1)
+        output[:, head : head + 1] = torch.matmul(p, vb)
+        stats[:, head : head + 1] = torch.logsumexp(scores, dim=-1) * (math.log2(math.e) if stats_log2 else 1.0)
+    return output, stats
+
+
+@pytest.mark.parametrize("h_kv", [1, 2, 4])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("stats_log2", [False, True])
+def test_sm120_split_reference_matches_dense(h_kv, causal, stats_log2):
+    """Head chunking preserves GQA mapping, strided inputs, masks and Stats."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 17, 4, 16, device="cuda", dtype=torch.float16).transpose(1, 2)
+    k = torch.randn(2, 23, h_kv, 16, device="cuda", dtype=torch.float16).transpose(1, 2)
+    v = torch.randn(2, 23, h_kv, 32, device="cuda", dtype=torch.float16).transpose(1, 2)
+    output, stats = _sm120_reference(q, k, v, causal=causal, stats_log2=stats_log2)
+    kb, vb = (x.float().repeat_interleave(4 // h_kv, dim=1) for x in (k, v))
+    scores = torch.matmul(q.float(), kb.transpose(-1, -2)) / math.sqrt(q.shape[-1])
+    if causal:
+        scores.masked_fill_(torch.arange(23, device="cuda")[None, :] > torch.arange(17, device="cuda")[:, None], float("-inf"))
+    torch.testing.assert_close(output, torch.matmul(torch.softmax(scores, dim=-1), vb), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(stats, torch.logsumexp(scores, dim=-1) * (math.log2(math.e) if stats_log2 else 1.0), rtol=1e-5, atol=1e-6)
+
+
 def _sm120_case(
     h_q, h_kv, s_q, s_kv, *, d=128, with_lse=False, workspace=True, causal=False, lse_layout="contiguous", split_kv=None, stats_log2=False, zero_copy=False
 ):
@@ -103,23 +146,14 @@ def _sm120_case(
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=ws)
     torch.cuda.synchronize()
 
-    qb, kb, vb = q.float(), k.float(), v.float()
-    if h_q != h_kv:
-        kb = kb.repeat_interleave(h_q // h_kv, dim=1)
-        vb = vb.repeat_interleave(h_q // h_kv, dim=1)
-    scores = torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d)
-    if causal:
-        i = torch.arange(s_q, device=scores.device).view(s_q, 1)
-        j = torch.arange(s_kv, device=scores.device).view(1, s_kv)
-        scores = scores.masked_fill(j > i, float("-inf"))
-    p = torch.softmax(scores, dim=-1)
+    reference, reference_stats = _sm120_reference(q, k, v, causal=causal, stats_log2=stats_log2)
     if lse is not None:
-        torch.testing.assert_close(lse, torch.logsumexp(scores, dim=-1) * (math.log2(math.e) if stats_log2 else 1.0), rtol=3e-2, atol=5e-2)
+        torch.testing.assert_close(lse, reference_stats, rtol=3e-2, atol=5e-2)
     if lse_storage is not None:
         gaps = torch.ones_like(lse_storage, dtype=torch.bool)
         gaps[:s_q, :h_q, :] = False
         assert torch.all(lse_storage[gaps] == -12345.0), "the combine LSE store touched padding outside its declared view"
-    return _ApiCaseResult(split, o.float(), torch.matmul(p, vb), ws_bytes, expected, None if lse is None else lse.clone())
+    return _ApiCaseResult(split, o.float(), reference, ws_bytes, expected, None if lse is None else lse.clone())
 
 
 def test_sm120_splits_a_decode_shape():
