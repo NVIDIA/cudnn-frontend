@@ -67,6 +67,7 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **Every randomized SDPA input uses the per-test generator.** A seeded Q/K/V tuple is not a reproducible case if its block mask comes from the process-global CUDA RNG. Pass `generator=rng_data_gen` to auxiliary draws too; `test_block_mask_uses_the_per_test_data_generator` perturbs global RNG while holding the case seed fixed. Before attributing an order-dependent failure to an earlier engine, compare the actual masks as well as Q/K/V.
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
+- **A compiled-helper test does not cover AOT backward.** `torch.compiler.is_compiling()` can be false while AOT traces a custom op's backward with FakeTensor/FunctionalTensor inputs. Keep raw-pointer helpers behind a registered custom op with a fake implementation even in that context. Run the enclosing op's `torch.library.opcheck`, including dynamic AOT dispatch; `sdpa/torch/test_torch_ops.py::TestOpContract::test_opcheck` detects this for packed Stats preparation.
 - **Pointer-ABI stride fakes must preserve Int64, including page tables.** Annotating a host stride as Int64 is insufficient if its compile-time fake uses a plain Python `0`, which can infer Int32. A singleton axis can legally have a stride above `2**31` without requiring a large allocation; use that layout to catch narrowing at binding time. `test_graph_decode_prepared_keeps_int64_page_table_batch_stride` is the decode detector.
 - **A native binder must keep observed storage separate from effective geometry.** Graph declarations and overrides can enlarge logical shapes without enlarging the caller's allocation. Derive ragged capacity from the producer's observed byte span in the effective element width; for fixed-size length/Stats reads validate known observed spans as well as logical numel. Keep the bare-pointer unknown-span contract explicit. `test_sdpa_native_thd_binding.py` checks these rules against the Python binder, including misaligned int32 lengths and overrides that claim more storage than the producer owns.
 - **Paged overrides retain the producer's storage bound.** Validate each pool's effective TMA byte strides and observed span, and page-table element alignment, before launch. A larger override does not enlarge the allocation. Use host-only malformed-fact probes instead of launching an invalid tensor; `test_sdpa_paged_binding.py` covers short pools, misaligned strides/tables, and valid wide-stride or unknown-span bindings.
@@ -488,6 +489,25 @@ native metadata and checks changed-input replay; the old backend silently read
 gap values while FROST rejected the inconsistent declaration. Performance
 comparisons must use a numerically valid baseline, such as dtype-converting
 inputs or an explicit compact-copy control, rather than time the wrong result.
+
+A saved Stats tensor can have `requires_grad=True` inside an ordinary provider
+backward where grad mode is disabled. Route assertions must exercise that caller;
+only an active differentiable helper call needs the Torch autograd fallback.
+`test_varlen_backward_uses_prepared_stats` guards the real provider route.
+Selecting an operand CUDA context does not necessarily change CuTe DSL's default
+compiler target on heterogeneous hosts. Pass the operand architecture explicitly
+to the compiler and include it in the artifact key; the metadata target detector
+checks this alongside execution. For packed-to-padded conversion, include highly
+uneven lengths and heavy padding in correctness and performance comparisons;
+measure multiple calls per captured graph so host replay submission cannot hide
+a device regression.
+
+An explicit compiler target still does not guarantee a runnable execution entry.
+Some DSL versions compare it with device zero's runtime architecture and leave
+the entry absent on heterogeneous hosts. Optional shared producers must preserve
+their Torch fallback in that case. Exercise the actual compiler-to-entry boundary
+with a missing entry, repeat with changed inputs and graph replay, and verify that
+ordinary compiler/launch errors still propagate rather than broadly catching them.
 
 Preserving packed metadata storage requires both a native element type and a
 wide address product. Test Int32/Int64 prefixes and FP16/BF16/FP32 sinks with
