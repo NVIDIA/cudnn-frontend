@@ -2477,3 +2477,18 @@ class TestPreparedPvBf16:
     test_rebind_and_replay = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_prepared_rebind_and_replay)
     test_staged_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_staged_conversion_omits_dead_operands)
     test_explicit_no_amax = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_no_amax_flag_with_sample_descriptor)
+
+
+# Retain staged conversion coverage in the explicitly selected architecture CI entry.
+import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+
+
+class TestStagedMxfp8:
+    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
+    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
