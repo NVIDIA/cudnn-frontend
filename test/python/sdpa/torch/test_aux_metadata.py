@@ -296,7 +296,7 @@ import cutlass.cute as cute
 from cudnn.frost import compiled_cache
 folder, package, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve()
-sys.path.insert(0, folder)
+sys.path[:0] = [folder, str(Path(folder).parents[1])]
 from test_aux_metadata import test_forward_metadata_rebind_geometry_and_replay
 with pytest.MonkeyPatch.context() as patch:
     if reload == "1":
@@ -309,7 +309,12 @@ print(json.dumps(compiled_cache.stats()))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(reload)], env=env, capture_output=True, text=True, timeout=180
+            [sys.executable, "-c", child, str(Path(__file__).resolve().parent), cudnn.__file__, str(reload)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
         )
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))
