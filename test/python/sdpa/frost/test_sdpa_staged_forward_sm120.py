@@ -428,3 +428,46 @@ def test_staged_block_output_matches_native_graph(block, dtype):
         check()
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "padded", "compact"])
+@pytest.mark.parametrize("d", [128, 384])
+@pytest.mark.parametrize("side_stream", [False, True])
+def test_sm120_wrapper_supplies_conversion_workspace(layout, d, side_stream, monkeypatch):
+    from cudnn.sdpa.fwd.api_dsl import sdpa_fwd_wrapper_dsl_sm120
+
+    _, tensors, _ = _case(d)
+    if layout == "bhsd":
+        tensors.update({n: tensors[n].contiguous() for n in ("q", "k", "v")})
+    elif layout == "compact":
+        tensors.update({n: tensors[n].transpose(1, 2).contiguous().transpose(1, 2) for n in ("q", "k", "v")})
+    launch_stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    original_execute = SdpaFwdDslSm120.execute
+    seen = []
+
+    def execute(api, **kwargs):
+        workspace = kwargs.get("workspace")
+        required = api.scratch_workspace_bytes()
+        if layout == "compact":
+            assert required == 0 and workspace is None
+        else:
+            assert required > 0 and workspace is not None
+            assert workspace.device == tensors["q"].device
+            assert workspace.dtype == torch.uint8 and workspace.numel() == required
+        seen.append(api)
+        return original_execute(api, **kwargs)
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "execute", execute)
+    with torch.cuda.stream(launch_stream):
+        # The cached plan must also supply fresh caller-owned scratch on reuse.
+        for factor in (1.0, 0.5):
+            tensors["v"].mul_(factor)
+            result = sdpa_fwd_wrapper_dsl_sm120(*(tensors[n] for n in ("q", "k", "v")))
+            q, k, v = (tensors[n].double() for n in ("q", "k", "v"))
+            scores = q @ k.repeat_interleave(2, 1).transpose(-1, -2) / math.sqrt(d)
+            ref = scores.softmax(-1) @ v.repeat_interleave(2, 1)
+            torch.testing.assert_close(result["o_tensor"].double(), ref, atol=3e-3, rtol=4e-2)
+            torch.testing.assert_close(result["lse_tensor"].double(), scores.logsumexp(-1), atol=3e-4, rtol=3e-4)
+    torch.cuda.current_stream().wait_stream(launch_stream)
+    assert len(seen) == 2 and seen[0] is seen[1]
