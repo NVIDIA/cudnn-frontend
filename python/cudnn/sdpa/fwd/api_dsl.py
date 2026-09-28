@@ -4489,7 +4489,12 @@ def sdpa_fwd_wrapper_sm80(
         ):
             if present:
                 raise NotImplementedError(f"SM80 SDPA THD (cum_seqlen_*) path does not support {label}; the dense path serves it")
-        with _torch_stream_context(current_stream, q_tensor.device):
+        # A missing/current stream handle does not switch CUDA devices.
+        # Compile and launch on the operand device, then restore the caller.
+        device_context = (
+            nullcontext() if q_tensor.device.type != "cuda" or torch.cuda.current_device() == q_tensor.device.index else torch.cuda.device(q_tensor.device)
+        )
+        with device_context, _torch_stream_context(current_stream, q_tensor.device):
             return _sm80_thd_forward(
                 q_tensor,
                 k_tensor,
