@@ -24,6 +24,10 @@ except ImportError as exc:
 
 
 def _check_device_support(device):
+    if isinstance(device, str):
+        device = torch.device(device)
+    if isinstance(device, torch.device) and device.type != "cuda":
+        raise NotImplementedError("Aligned HCA requires a CUDA device")
     capability = torch.cuda.get_device_capability(device)
     if capability not in ((10, 3), (10, 7)):
         raise NotImplementedError("Aligned HCA requires GB300 or Rubin")

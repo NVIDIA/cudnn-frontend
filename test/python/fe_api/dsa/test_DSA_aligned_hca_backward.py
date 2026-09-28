@@ -281,6 +281,15 @@ def test_unsupported_geometry(local_tokens, cp_size):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("device", ["cpu", torch.device("cpu")])
+def test_cpu_device_support(device):
+    from cudnn import AlignedHCABackward
+
+    with patch.object(torch.cuda, "get_device_capability", side_effect=AssertionError("CPU support queried CUDA")):
+        assert not AlignedHCABackward.supports_configuration(4096, 16, device)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "capability,version,supported",
     [
