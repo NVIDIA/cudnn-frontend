@@ -441,3 +441,59 @@ def test_mxfp8_unrequested_amax_o_validates_natively(frost_candidate):
     g.validate()
     assert g._is_validated and g._lowered_graph is None
     assert not amax_o.is_virtual and amax_o.dim_assigned and list(amax_o.dim) == [1, 1, 1, 1]
+
+
+def _paged_mxfp8_graph(*, sf_k_pages=None, sf_v_s_scale=None, page=128):
+    """sdpa_mxfp8 over page pools with pool-shaped descales; the overrides mis-size a descale."""
+    b, h, kh, d, max_pages = 2, 4, 2, 256, 6
+    num_pages = b * max_pages
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q = g.tensor(name="q", dim=[b, h, 1, d], stride=[h * d, d, h * d, 1])
+    k = g.tensor(name="k", dim=[num_pages, kh, page, d], stride=[kh * page * d, page * d, d, 1])
+    v = g.tensor(name="v", dim=[num_pages, kh, page, d], stride=[kh * page * d, page * d, d, 1])
+
+    def sf(sd, which):
+        return g.tensor(
+            dim=sd,
+            stride=[sd[1] * sd[2] * sd[3], sd[2] * sd[3], sd[3], 1],
+            data_type=cudnn.data_type.FP8_E8M0,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+
+    i32 = cudnn.data_type.INT32
+    o, _, amax_o = g.sdpa_mxfp8(
+        q,
+        k,
+        v,
+        sf([b, h, 128, d // 32], "q"),
+        sf([sf_k_pages or num_pages, kh, page, d // 32], "k"),
+        sf([num_pages, kh, sf_v_s_scale or page // 32, d], "v"),
+        attn_scale=1.0 / math.sqrt(d),
+        generate_stats=False,
+        use_padding_mask=True,
+        seq_len_q=g.tensor(name="sq", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32),
+        seq_len_kv=g.tensor(name="sk", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32),
+        paged_attention_k_table=g.tensor(name="tk", dim=[b, 1, max_pages, 1], stride=[max_pages, max_pages, 1, 1], data_type=i32),
+        paged_attention_v_table=g.tensor(name="tv", dim=[b, 1, max_pages, 1], stride=[max_pages, max_pages, 1, 1], data_type=i32),
+        paged_attention_max_seq_len_kv=max_pages * page,
+    )
+    o.set_output(True).set_dim([b, h, 1, d]).set_stride([h * d, d, h * d, 1]).set_data_type(cudnn.data_type.BFLOAT16)
+    amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+def test_paged_mxfp8_pool_descales_validate_natively(frost_candidate):
+    """descale_k / descale_v are page pools: their leading dims follow the K/V containers, not (B, H)."""
+    g = _paged_mxfp8_graph()
+    g.validate()
+    assert g._is_validated and g._lowered_graph is None
+
+
+def test_paged_mxfp8_descale_k_must_match_the_pool(frost_candidate):
+    with pytest.raises(ValueError, match="Descale_K batch/head dimensions must match K"):
+        _paged_mxfp8_graph(sf_k_pages=7).validate()
+
+
+def test_paged_mxfp8_descale_v_scales_the_page_rows(frost_candidate):
+    with pytest.raises(ValueError, match="Descale_V s_scale dimension too small"):
+        _paged_mxfp8_graph(sf_v_s_scale=2).validate()
