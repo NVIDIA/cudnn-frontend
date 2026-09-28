@@ -79,7 +79,9 @@ def execute(api, tensors, workspace, stream, scale):
     import torch
     from cudnn._device import ensure_current_context as _ensure_current_context
     from .api_dsl import _torch_stream_context
-    from .prepared import BufferFacts, bind_dense, bind_dense_split, execute_quantized, facts_of_tensor
+    from cudnn._torch_stream import _raw_current_stream
+    from cuda.bindings import driver as cuda
+    from .prepared import BufferFacts, _bind_block_output, bind_dense, bind_dense_split, execute_quantized, facts_of_tensor
 
     staged = api._staged_spec
     spec = staged.core
@@ -112,6 +114,10 @@ def execute(api, tensors, workspace, stream, scale):
             facts[role] = BufferFacts(t.data_ptr(), "float32", plan_device, 1, (1,), (1,))
         else:
             facts[role] = facts_of_tensor(t)
+    if spec.quant is not None and spec.quant.block_output is not None:
+        # SF output must not alias the original Q/K/V/O either: after gather,
+        # the core binder sees only their workspace replacements.
+        _bind_block_output(spec, facts)
     amax = facts.get("amax_o")
     for role, f in facts.items():
         if f is None:
@@ -123,10 +129,6 @@ def execute(api, tensors, workspace, stream, scale):
         # check against the caller's original operands as well.
         if amax is not None and role != "amax_o" and amax.device == f.device and amax.ptr < end and f.ptr < amax.ptr + 4:
             raise ValueError(f"SM120 staged amax_o overlaps {role}")
-    context = nullcontext() if stream is None else _torch_stream_context(stream, device)
-    stream = api._get_default_stream(stream)
-    stream_int = int(stream)
-    _ensure_current_context(stream_int, device.index)
     # Slice byte storage before dtype viewing: an odd excess capacity is legal,
     # and the caller's current view origin is the workspace origin.
     raw = workspace if workspace.dtype == torch.uint8 and workspace.ndim == 1 else workspace.view(torch.uint8).view(-1)
@@ -143,21 +145,31 @@ def execute(api, tensors, workspace, stream, scale):
             if role != "o":
                 bound[role].copy_(tensors[role])
 
-    with context:
-        if spec.quant is not None:
-            execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
-            api._logger.debug("execute (SM120 FP8 per-tensor) completed")
-        else:
-            combine = None
-            if spec.combine is not None:
-                frame, combine = bind_dense_split(spec, facts, base, stream, stream_int)
+    # Resolve the Q device's current stream, even if another GPU is ambient.
+    # Keep that device active through both the torch copies and driver launches.
+    device_context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
+    with device_context:
+        context = nullcontext() if stream is None else _torch_stream_context(stream, device, verify_current=True)
+        if stream is None:
+            raw_stream = _raw_current_stream(torch, device)
+            stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream if raw_stream is None else raw_stream)
+        stream_int = int(stream)
+        _ensure_current_context(stream_int, device.index)
+        with context:
+            if spec.quant is not None:
+                execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
+                api._logger.debug("execute (SM120 FP8 per-tensor) completed")
             else:
-                frame = bind_dense(spec, facts, stream, stream_int)
-            frame[spec.index["scale_softmax_log2"]] = scale * math.log2(math.e)
-            gather()
-            spec.fn(*frame)
-            if combine is not None:
-                spec.combine.fn(*combine)
-        if any(role == "o" for role, *_ in staged.regions):
-            target = tensors["o"].view(torch.uint8) if api.o_block_scale == 16 else tensors["o"]
-            target.copy_(bound["o"])
+                combine = None
+                if spec.combine is not None:
+                    frame, combine = bind_dense_split(spec, facts, base, stream, stream_int)
+                else:
+                    frame = bind_dense(spec, facts, stream, stream_int)
+                frame[spec.index["scale_softmax_log2"]] = scale * math.log2(math.e)
+                gather()
+                spec.fn(*frame)
+                if combine is not None:
+                    spec.combine.fn(*combine)
+            if any(role == "o" for role, *_ in staged.regions):
+                target = tensors["o"].view(torch.uint8) if api.o_block_scale == 16 else tensors["o"]
+                target.copy_(bound["o"])

@@ -345,6 +345,13 @@ calling conventions; forbidding JIT only around the attention kernel misses it.
 
 For staged pointer launches, validate aliases against the original caller operands
 before replacing them with workspace views. The core binder only sees gathered
-buffers and otherwise misses an Amax scalar aliasing the original Q or O.
-`test_staged_amax_alias_checks_original_operand` intercepts copies to detect this
-before any kernel is launched.
+buffers and otherwise misses an Amax scalar or block-scale SF output aliasing
+the original Q or O. `test_staged_amax_alias_checks_original_operand` and
+`test_staged_sf_alias_checks_original_operand` intercept copies to detect these
+aliases before any kernel is launched. Reuse the SF binder on original facts
+so its full atom span and output/input alias rules remain consistent.
+
+For staged copies on multiple GPUs, resolve an omitted launch stream on Q's
+device and keep that device context active through gather, launch and scatter.
+A nondefault stream on Q's device must remain authoritative even when another
+CUDA device is current; restore the caller's device after execution.
