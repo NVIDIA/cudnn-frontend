@@ -488,3 +488,11 @@ native metadata and checks changed-input replay; the old backend silently read
 gap values while FROST rejected the inconsistent declaration. Performance
 comparisons must use a numerically valid baseline, such as dtype-converting
 inputs or an explicit compact-copy control, rather than time the wrong result.
+
+Preserving packed metadata storage requires both a native element type and a
+wide address product. Test Int32/Int64 prefixes and FP16/BF16/FP32 sinks with
+changed strides, broadcast views and fresh buffers; widen before multiplying
+the sequence/head index by the element stride. A metadata value may retain
+an Int32 sequence-length contract while its storage address requires Int64.
+`test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
+changed-value replay and zero-copy token-major backward Stats.

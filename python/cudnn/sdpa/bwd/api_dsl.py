@@ -809,7 +809,25 @@ def _sm80_bwd_pick_flavor(d_qk: int, d_v: int) -> str:
 
 
 @lru_cache(maxsize=128)
-def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtype, device, is_causal, window_size, bottom_right, has_sink, deterministic):
+def _sm80_thd_plan(
+    n_seq,
+    h_q,
+    h_kv,
+    d_qk,
+    d_v,
+    t_q,
+    t_kv,
+    max_sq,
+    max_skv,
+    dtype,
+    device,
+    is_causal,
+    window_size,
+    bottom_right,
+    has_sink,
+    deterministic,
+    stats_token_major=False,
+):
     """Cache immutable wrapper plans without retaining tensors or runtime pointers.
 
     Capacities and bounds size each plan's workspace; the prepared compiler
@@ -843,6 +861,7 @@ def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtyp
         thd=True,
         max_total_seq_len_q=t_q,
         max_total_seq_len_kv=t_kv,
+        thd_stats_token_major=stats_token_major,
     )
     assert api.check_support(), "Unsupported configuration"
     # Wrapper buffers may have capacity beyond B * max_sequence_length.
@@ -888,7 +907,18 @@ def _sm80_thd_backward(
 
     q, k, v, o, do = map(packed, (q, k, v, o, do))
     tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
-    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous() if t_q else torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
+    stats_token_major = False
+    if t_q:
+        lse_t = lse if lse.dtype == torch.float32 and lse.device == dev else lse.to(dtype=torch.float32, device=dev)
+        if tuple(lse_t.shape) == (1, h_q, t_q) and lse_t.stride(1) == 1 and lse_t.stride(2) == h_q:
+            # Reuse the graph chain's existing compact token-major Stats ABI.
+            # This is a view of the caller's storage, not a layout conversion.
+            lse_t = lse_t[0].transpose(0, 1)
+            stats_token_major = True
+        else:
+            lse_t = lse_t.contiguous()
+    else:
+        lse_t = torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
     cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
     cu_k_t = cu_k.to(dtype=torch.int32, device=dev).contiguous()
     sinks_t = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous() if sinks is not None else None
@@ -917,6 +947,7 @@ def _sm80_thd_backward(
         bool(causal_bottom_right) and (bool(is_causal) or wl is not None),
         sinks is not None,
         bool(deterministic),
+        stats_token_major,
     )
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     api.execute(

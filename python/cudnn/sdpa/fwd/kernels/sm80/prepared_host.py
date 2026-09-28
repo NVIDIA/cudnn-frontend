@@ -180,6 +180,7 @@ def thd_host(
     scale_log2: cutlass.Float32,
     inv_scale: cutlass.Float32,
     right_bound: cutlass.Int32,
+    aux_strides: tuple,
     module: cutlass.Constexpr,
     h: cutlass.Constexpr,
     h_kv: cutlass.Constexpr,
@@ -204,10 +205,10 @@ def thd_host(
         _view(stats, ((1, h, t_q), (0, t_q, 1))),
         None,
         None,
-        _view(sink, ((h,), (1,))),
+        _view(sink, ((h,), (aux_strides[2],))),
         None,
-        _view(cu_q, ((n_seq + 1,), (1,))),
-        _view(cu_k, ((n_seq + 1,), (1,))),
+        _view(cu_q, ((n_seq + 1,), (aux_strides[0],))),
+        _view(cu_k, ((n_seq + 1,), (aux_strides[1],))),
         None,
         p.tile_m,
         p.num_warps,
@@ -243,15 +244,27 @@ def thd_host(
 
 
 @lru_cache(maxsize=128)
-def compile_thd_host(module, h, h_kv, n_seq, swa_window):
+def compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.int32", "torch.int32"), sink_dtype="torch.float32"):
     """One pointer artifact per immutable flavor/head/mask contract."""
     p = module.PARAMS
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
-    types = [dtype] * 4 + [cutlass.Float32, cutlass.Int32, cutlass.Int32, cutlass.Float32]
+    aux_types = {
+        "torch.int32": cutlass.Int32,
+        "torch.int64": cutlass.Int64,
+        "torch.float32": cutlass.Float32,
+        "torch.float16": cutlass.Float16,
+        "torch.bfloat16": cutlass.BFloat16,
+    }
+    types = [dtype] * 4 + [cutlass.Float32, *(aux_types[t] for t in prefix_dtypes), aux_types[sink_dtype]]
     pointers = [
-        cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else 4) if i != 7 or p.has_sink else None for i, t in enumerate(types)
+        cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else t.width // 8) if i != 7 or p.has_sink else None
+        for i, t in enumerate(types)
     ]
-    key = template_key(vars(module), dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window, packed_init=_INIT_DIGEST), "prepared_thd")
+    key = template_key(
+        vars(module),
+        dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window, packed_init=_INIT_DIGEST, prefix_dtypes=prefix_dtypes, sink_dtype=sink_dtype),
+        "prepared_thd",
+    )
     artifact = compile_cached(
         thd_host,
         *pointers,
@@ -259,6 +272,7 @@ def compile_thd_host(module, h, h_kv, n_seq, swa_window):
         cutlass.Float32(0),
         cutlass.Float32(0),
         cutlass.Int32(0),
+        (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
         module,
         h,
         h_kv,
