@@ -4028,8 +4028,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
     Dense vector-aligned declarations with a native V width use one prepared
     pointer host, including native GQA and strided Q/K/V/O/Stats. Other layouts,
-    off-flavor V widths and RoPE retain their existing tensor-entry staging.
-    Only that legacy path rescales sink logits with a separate torch operation.
+    off-flavor widths use prepared bitwise copies and native GQA. RoPE retains
+    its existing tensor staging and separate sink-logit rescale.
     """
 
     def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
@@ -4058,6 +4058,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._k_mod = None
         self._params = None
         self._sm80_spec = None
+        self._sm80_copy_spec = None
         self._lse_stride: Optional[tuple[int, int, int]] = None
 
     # ------------------------------------------------------------------
@@ -4273,12 +4274,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sched_policy=_sm80_sched_policy_int(self.sched_token),
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
-            sink_natural=prepared,
+            sink_natural=not self._rope_max_s,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if prepared:
             self._sm80_spec = build_spec(self)
             self._compiled_kernel = self._sm80_spec.artifact
+            self._logger.debug("compile completed")
+            return
+        if not self._rope_max_s:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import compile_plan
+
+            self._sm80_copy_spec = compile_plan(self)
+            self._compiled_kernel = self._sm80_copy_spec.core.artifact
             self._logger.debug("compile completed")
             return
         from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
@@ -4317,6 +4325,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         if native_layouts(self):
             return 0
+        if not self._rope_max_s:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import workspace_bytes
+
+            return self._sm80_copy_spec.workspace_bytes if self._sm80_copy_spec is not None else workspace_bytes(self)
         if self.thd:
             return 0  # engine rows never lower THD; the wrapper path allocates
         elem = 2  # fp16/bf16 — check_support admits no other input dtype
@@ -4363,6 +4375,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
         p = self._params
+        if self._sm80_copy_spec is not None:
+            from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
+
+            self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
+            execute(self, buffers, workspace, current_stream, scale_softmax)
+            self._logger.debug("execute completed")
+            return
         if self._sm80_spec is not None:
             from cudnn.sdpa.fwd.prepared import facts_of_tensor
             from cudnn.sdpa.fwd.prepared_sm80 import ROLES, execute
@@ -4759,6 +4779,9 @@ def sdpa_fwd_wrapper_sm80(
         q_tensor.shape,
         k_tensor.shape,
         v_tensor.shape,
+        q_tensor.stride(),
+        k_tensor.stride(),
+        v_tensor.stride(),
         q_tensor.dtype,
         bool(is_causal),
         (wl, wr),
@@ -4797,6 +4820,8 @@ def sdpa_fwd_wrapper_sm80(
         api.check_support()
         api.compile()
         _sm80_wrapper_cache[cache_key] = api
+    required = api.scratch_workspace_bytes()
+    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
     api.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -4810,5 +4835,6 @@ def sdpa_fwd_wrapper_sm80(
         current_stream=current_stream,
         bias_tensor=bias_tensor,
         rope_freqs=rope_freqs,
+        workspace=workspace,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)

@@ -420,3 +420,12 @@ wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
 the input device; a zero-workspace plan should keep its allocation-free path.
 The SM120 detector is `TestStagedSm120Wrapper` in
 `test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.
+
+
+A fixed-layout wrapper cache must include every input stride used by the prepared
+plan. Same-shape calls can alternate compact, padded and permuted storage; a
+shape-only cache reuses an incompatible native plan.
+`test_wrapper_cache_distinguishes_current_input_strides` exercises three SM80
+layouts and returns to the first one to verify both separation and reuse.
+When padding Q/K to a vector width, retain the original attention scale and
+check non-multiple-of-eight widths against an independent reference.

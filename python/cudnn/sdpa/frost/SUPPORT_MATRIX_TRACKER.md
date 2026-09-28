@@ -994,9 +994,13 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. The served capability envelope is unchanged: other head dimensions and
-layouts and standalone RoPE retain their existing adapter staging, then
-launch through a pointer host. All forward entries share prepared host lowering;
+width. Other admitted non-RoPE head dimensions and layouts use prepared bitwise
+gather/pad and scatter kernels in caller workspace around the same native GQA
+host. Q/K padding preserves the original attention scale; sink conversion remains
+inside attention. Native operands bind directly without redundant copies. The
+standalone dense wrapper keys plans by input strides and supplies current scratch.
+The capability envelope is unchanged; standalone RoPE retains its angle-table
+and tensor staging. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
@@ -1050,8 +1054,8 @@ The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-All SM80 forward tensor-fake construction is removed. Dense off-flavor/RoPE
-also use a pointer host after their existing staging. The forward graph row still
+All SM80 forward tensor-fake construction is removed. Non-RoPE dense conversion
+copies are prepared too; RoPE retains tensor staging before its pointer host. The forward graph row still
 declines THD, so this changes no graph eligibility.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
