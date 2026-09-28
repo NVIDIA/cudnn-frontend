@@ -89,3 +89,25 @@ def test_paged_cached_geometry_checks_current_storage(role, defect):
         args = (spec, ix, pool, pool, bad if role == "k" else table, bad if role == "v" else table)
     with pytest.raises(ValueError):
         _bind(*args)
+
+
+@pytest.mark.parametrize("role", ["k", "v"])
+def test_independent_table_strides_keep_their_own_storage_bounds(role):
+    spec, ix, pool, table = _fixture()
+    ix["table_v_strides"] = len(ix)
+    stride = 2**32 + 8
+    wide = table._replace(strides=(stride, stride, 2, 1), span=stride + 7)
+    k, v = (wide, table) if role == "k" else (table, wide)
+    frame, _ = _bind(spec, ix, pool, pool, k, v)
+    assert frame[ix["table_strides"]] == (k.strides[0], k.strides[2])
+    assert frame[ix["table_v_strides"]] == (v.strides[0], v.strides[2])
+    bad = wide._replace(span=wide.span - 1)
+    with pytest.raises(ValueError, match="paged_attention_" + role + "_table spans"):
+        _bind(spec, ix, pool, pool, bad if role == "k" else table, bad if role == "v" else table)
+
+
+def test_single_stride_host_still_declines_distinct_tables():
+    spec, ix, pool, table = _fixture("bfloat16")
+    other = table._replace(strides=(8, 8, 2, 1), span=15)
+    with pytest.raises(ValueError, match="matching K/V table strides"):
+        _bind(spec, ix, pool, pool, table, other)

@@ -18,6 +18,8 @@ from cudnn.frost.compiled_cache import compile_cached as _compile_cached, templa
 from typing import Callable, Optional, Tuple
 
 from functools import lru_cache
+import hashlib
+from pathlib import Path
 
 from cudnn.sdpa.fwd.kernels._quantized import _unscale_amax_kernel
 
@@ -27,6 +29,11 @@ from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
+
+# This helper is imported normally, outside the parameterized template loader.
+# Supply its source identity so template_key can persist both entry points;
+# the cache environment manifest also covers all transitive Python sources.
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 # One block per (q_row, head, batch); 128 lanes stride over d_v, including
 # the wider d256/d512 flavors.

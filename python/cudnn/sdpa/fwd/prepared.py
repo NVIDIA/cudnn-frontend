@@ -380,11 +380,11 @@ class ThdLaunchSpec:
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
-    "block_table_ptr block_table_v_ptr table_strides stream".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides stream".split()
 )
 
 
@@ -489,6 +489,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("block_table_ptr", None)
     put("block_table_v_ptr", None)
     put("table_strides", (0, 0))
+    put("table_v_strides", (0, 0) if s.paged else None)
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
@@ -740,17 +741,15 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
         raise ValueError(f"cudnn.sdpa: paged_attention_v_table {error}") from error
     if tb < b or tbv < b:
         raise ValueError(f"cudnn.sdpa: " + (f"the page tables describe {tb} / {tbv} sequences; this call runs {b}"))
-    if max_pages_v != max_pages or table_strides_v != table_strides:
-        raise ValueError(
-            f"cudnn.sdpa: "
-            + ("paged_attention_k_table and paged_attention_v_table must share (max_pages) and strides: the host walks both with one stride pair")
-        )
-    # the host addresses rows 0..B-1 and pages 0..max_pages-1 of BOTH tables
-    need = (b - 1) * table_strides[0] + (max_pages - 1) * table_strides[1] + 1
-    if bt.span >= 0 and bt.span < need:
-        raise ValueError(f"cudnn.sdpa: " + (f"paged_attention_k_table spans {bt.span} elements; ({b}, {max_pages}) with strides {table_strides} needs {need}"))
-    if btv.span >= 0 and btv.span < need:
-        raise ValueError(f"cudnn.sdpa: " + (f"paged_attention_v_table spans {btv.span} elements; ({b}, {max_pages}) with strides {table_strides} needs {need}"))
+    if max_pages_v != max_pages:
+        raise ValueError("cudnn.sdpa: paged_attention_k_table and paged_attention_v_table must share max_pages")
+    if "table_v_strides" not in ix and table_strides_v != table_strides:
+        raise ValueError("cudnn.sdpa: this prepared host requires matching K/V table strides")
+    # Each table keeps its own observed storage bound and physical geometry.
+    for name, table, strides in (("k", bt, table_strides), ("v", btv, table_strides_v)):
+        need = (b - 1) * strides[0] + (max_pages - 1) * strides[1] + 1
+        if table.span >= 0 and table.span < need:
+            raise ValueError(f"cudnn.sdpa: paged_attention_{name}_table spans {table.span} elements; ({b}, {max_pages}) with strides {strides} needs {need}")
     # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V,
     # and the in-page layout kind the artifact was compiled for (its TMA descriptors order (row, head) by it)
     pool_strides = {}
@@ -768,6 +767,8 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     frame[ix["k_strides"]], frame[ix["v_strides"]] = pool_strides["k"], pool_strides["v"]
     frame[ix["block_table_ptr"]], frame[ix["block_table_v_ptr"]] = bt.ptr, btv.ptr
     frame[ix["table_strides"]] = (int(table_strides[0]), int(table_strides[1]))
+    if "table_v_strides" in ix:
+        frame[ix["table_v_strides"]] = (int(table_strides_v[0]), int(table_strides_v[1]))
     frame[ix["n_pages"]] = int(k.shape[0])
     return t_kv
 
@@ -988,11 +989,11 @@ class PreparedThdLaunch:
 # Constants written at build, and slots bind_dense writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
     "lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
     "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr o_desc_ptr problem_size seq_q_lens_addr "
-    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides ragged_q_addr stream".split()
+    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr stream".split()
 )
 
 
@@ -1181,6 +1182,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("block_table_ptr", None)
     put("block_table_v_ptr", None)
     put("table_strides", (0, 0))
+    put("table_v_strides", (0, 0) if s.paged else None)
     put("n_pages", 0)
     put("gate_ptr", None)
     put("gate_strides", (0, 0, 0))
