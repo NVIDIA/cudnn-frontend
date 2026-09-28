@@ -5,16 +5,19 @@
 
 Two rows share this module -- ``sdpa_bwd_sm107`` (bf16 / fp16, :class:`SdpaBwdDslSm107`)
 and ``sdpa_bwd_sm107_fp8`` (per-tensor FP8 E4M3, :class:`SdpaBwdDslSm107Fp8`) -- because
-they share one chain shape.  Each is a TWO-kernel backward around a bf16 / fp16 dS
-workspace, followed by the two gradient GEMMs and a fold:
+they share one chain shape.  Each is a TWO-kernel backward around a dS workspace
+(bf16 / fp16 on the half row; e4m3 -- or bf16, the A/B twin -- on the fp8 row),
+followed by the two gradient GEMMs and a fold:
 
     stage 1  delta = rowsum(dO * O)                      bprop_chain_common.dot_do_o{,_scaled}_host
     stage 2  dV (in TMEM, stored per Q head) + dS -> a   sm107/bprop_d256_{f16,fp8}.py
              [B, H_chunk, S_kv, S_q] GMEM workspace
     stage 3  dK = dS . Q,  dQ = dS^T . K                 bprop_matmul_blackwell.py (two renderings at the
-                                                          d = 256 cluster tile: 2x1, 256 x 256, no N padding)
+                                                          d = 256 cluster tile: 2x1, 256 x 256, no N padding;
+                                                          the fp8 row renders its K64 fp8 arm with a descale /
+                                                          quantize epilogue)
     stage 4  GQA fold of the per-Q-head dK / dV partials  dkv_reduce_host (half) /
-             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host (fp8)
+             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host (fp8: dV always, dK under GQA)
 
 The workspace is KV-MAJOR (``[.., S_kv, S_q]``, q contiguous) -- the layout the stage-2
 kernel writes without a transpose -- so the stage-3 operand majors are the OPPOSITE of
@@ -58,9 +61,9 @@ row declines it at eligibility (``Capabilities.bottom_right_s_q_multiple``) and
 both rows.  Follow-up: thread ``seqlen_q_real`` through the fp8 body like the f16 one
 and drop the decline.
 
-The dS workspace is the dominant allocation (``B * H * S_kv * S_q * 2`` bytes): heads
-(and, on the half row, batches -- the fp8 body has no ``batch_base``) are chunked to
-fit ``_SM107_WS_BUDGET_BYTES`` and the chain loops over chunks with ``head_base`` /
+The dS workspace is the dominant allocation (``B * H * S_kv * S_q * bpe_ds`` bytes):
+heads (and, on the half row, batches -- the fp8 body has no ``batch_base``) are chunked
+to fit ``_SM107_WS_BUDGET_BYTES`` and the chain loops over chunks with ``head_base`` /
 ``batch_base``.
 
 Both rows are PREPARED launches (``bwd/prepared.py``; ``bwd/prepared_sm107.py`` +
@@ -74,14 +77,19 @@ the standalone twin over torch tensors.  No torch op runs on the execute path.
 
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
-descale_q/k/v/dO/s and scale_s, publishes dS in TRUE units (attn_scale folded) to the
-bf16 workspace and its per-Q-head dV in bf16 (``dtype_o = BF16``: the pre-quantization
-value), and folds ``amax_dP`` in-kernel.  The GEMMs run at bf16 over Q / K upcast EXACTLY
-from e4m3, so their outputs still carry the operand's descale: stage 4 applies
-``descale_q`` (dK) / ``descale_k`` (dQ), folds ``amax_dQ / dK / dV`` over the fp32
-value, applies ``scale_dQ / dK / dV`` and casts to the graph's gradient dtype (E4M3,
-or bf16 / fp16 with scale 1.0).  ``descale_dP`` / ``scale_dP`` are accepted and unused:
-dS is never quantized to fp8 on this chain (plan Q2(b)).
+descale_q/k/v/dO/s, scale_s and scale_dP, publishes ``dS_q = e4m3(dS * scale_dP)`` (dS
+in TRUE units, attn_scale folded) to the e4m3 workspace and its per-Q-head dV in bf16
+(``dtype_o = BF16``: the pre-quantization value), and folds ``amax_dP`` in-kernel over the
+fp32 dS BEFORE the scale and the cast.  The GEMMs render the template's fp8 K64 arm over
+the e4m3 dS and the e4m3 Q / K payloads (no upcast copies) and undo both scalings in their
+epilogue: dQ = ``QUANT`` straight into the caller's dQ (``acc * descale_dP * descale_k``
+-> ``amax_dQ`` -> ``* scale_dQ`` -> the gradient dtype); dK likewise into the caller's dK
+at MHA, or ``DESCALE`` to bf16 per-Q-head TRUE-unit partials under GQA, which stage 4 sums
+in fixed order BEFORE it folds ``amax_dK``, applies ``scale_dK`` and casts.  dV always
+goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast).  ``FP8_DS_DTYPE = BF16``
+restores the pre-quantized chain end to end (bf16 dS, bf16 GEMMs over EXACT e4m3 -> bf16
+upcasts of Q / K, three fold + quantize passes; ``descale_dP`` / ``scale_dP`` unused) --
+the A/B and oracle twin.
 """
 
 from __future__ import annotations
@@ -98,7 +106,7 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _SM100_WS_BUDGET_BYTES, _sm100_kernel_path
-from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, vec_bytes_epi_for
+from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, vec_bytes_epi_for
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
 _SM107_D = 256
@@ -128,6 +136,13 @@ STAGE3_D256_TILE: bool = True
 _STAGE3_TILE_D256 = (256, 256)
 _STAGE3_TILE_PADDED = (512, 512)
 _DTYPE_CODE = {torch.bfloat16: DTYPE_BF16, torch.float16: DTYPE_FP16, torch.float8_e4m3fn: DTYPE_E4M3}
+_TORCH_DTYPE = {code: dt for dt, code in _DTYPE_CODE.items()}
+# The fp8 row's dS workspace dtype (plan Q2(a)).  DTYPE_E4M3 = what ships: dS_q = e4m3(dS * scale_dP), the stage-3 GEMMs
+# render the fp8 K64 arm with the descale_dP / descale_{q|k} epilogue (dQ and MHA dK quantized in the GEMM, no Q / K
+# upcast copies, half the workspace bytes).  DTYPE_BF16 = the pre-quantized chain (bf16 dS, bf16 GEMMs over exact e4m3
+# -> bf16 upcasts, three fold + quantize passes): the A/B base and the twin the fp8 suite runs every accept case on.
+# A module constant read when the adapter is built, not a knob: it must never differ per plan.
+FP8_DS_DTYPE: int = DTYPE_E4M3
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -162,7 +177,17 @@ def _stage3_cgrp_tile_mn(sm: int, d: int, d256_tile: Optional[bool] = None) -> t
     return _STAGE3_TILE_D256 if (d256_tile and 107 <= sm <= 119 and d == _SM107_D) else _STAGE3_TILE_PADDED
 
 
-def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: Optional[bool] = None, *, cgrp_tile_mn: tuple):
+def _stage3_params(
+    dtype_code: int,
+    causal: bool,
+    shift: int,
+    gran: int,
+    trim: Optional[bool] = None,
+    *,
+    cgrp_tile_mn: tuple,
+    epi_modes: tuple = (EPI_NONE, EPI_NONE),
+    dtype_out: int = -1,
+):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
     dK = dS . Q  : A = dS[kv, q]   -- M = kv, K = q, q contiguous -> K-major; K starts at kv's block (LO)
@@ -172,7 +197,11 @@ def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: O
     (bottom-right: ``S_kv - S_q``); ``gran`` the kernel's kv write block (256).  ``trim``
     defaults to the module constant, read at CALL time so the bitwise pin can flip it.
     ``cgrp_tile_mn`` is the cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a
-    caller cannot fall into the padded rendering by omission.
+    caller cannot fall into the padded rendering by omission.  ``dtype_code`` is the dS
+    WORKSPACE dtype (the GEMMs' A operand): E4M3 selects the template's fp8 K64 arm, whose
+    epilogue each rendering names in ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16
+    true-unit partials, ``EPI_QUANT`` -> the quantized gradient in ``dtype_out`` + amax);
+    the half row's bf16 / fp16 records keep ``EPI_NONE`` and the inherited output dtype.
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
@@ -186,9 +215,10 @@ def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: O
         dtype_qkv=dtype_code,
         cgrp_tile_mn=tuple(cgrp_tile_mn),
     )
+    dk_mode, dq_mode = epi_modes
     return (
-        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, **common),
-        MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, **common),
+        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=dtype_out if dk_mode == EPI_QUANT else -1, **common),
+        MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, **common),
     )
 
 
@@ -216,9 +246,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self.dtype = self.q_desc.dtype
         self.grad_dtype = self.dq_desc.dtype
         self._bpe = self.dtype.itemsize
-        # dS workspace dtype: the io dtype on the half chain, bf16 on the fp8 chain (plan Q2(b)).
-        self._ds_dtype = self.dtype if self._FAMILY == _cfg.FAMILY_F16 else torch.bfloat16
-        self._bpe_ds = 2
+        # dS workspace dtype: the io dtype on the half chain; e4m3 (shipped) or bf16 (the twin) on the fp8 chain (`_ds_torch_dtype`).
+        self._ds_dtype = self._ds_torch_dtype()
+        self._bpe_ds = self._ds_dtype.itemsize
         # attn_scale is OPTIONAL on the graph (see the SM100 adapter for the story).
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
@@ -289,6 +319,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _check_support_family(self) -> None:
         self._value_error_if(self.grad_dtype != self.dtype, f"{self._NAME}: dQ/dK/dV dtype {self.grad_dtype} must match the io dtype {self.dtype}")
 
+    def _ds_torch_dtype(self):
+        """The dS workspace dtype: the io dtype (the bf16 / fp16 GEMM renderings read it as the io dtype)."""
+        return self.dtype
+
     # --- workspace: ONE ordered plan, carved identically by the prepared host ----------
     def _scratch_shapes(self):
         """``[(name, shape, dtype)]`` in carve order -- every buffer the chain touches that is
@@ -350,10 +384,19 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # stay out of the amax folds).  Dense otherwise: the arm folds out.
             seq_kv_lens_present=self._kv_padded,
             dtype_o=self._dtype_o_code(),
+            **self._template_params_family(),
         )
+
+    def _template_params_family(self) -> dict:
+        return {}  # the half row's record inherits its dS dtype (the io dtype)
 
     def _dtype_o_code(self) -> int:
         return -1  # inherit the io dtype
+
+    def _stage3_records(self, mod, tile_mn):
+        """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
+        shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+        return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn)
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
         return _prepared.compile_plan(self, mod, mm_dk, mm_dq)
@@ -368,14 +411,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         mod = load_template(_sm100_kernel_path(_SM107_KERNEL_FILES[self._FAMILY]), self._template_params(), tag=_SM107_TEMPLATE_TAGS[self._FAMILY])
         # The bodies' own geometry guards (tile multiples, chunk divisors) -- cheap, and the plan is wrong if they fire.
         _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk)
-        # Stage 3 reads the dS workspace in ITS dtype and writes the io dtype of the GEMM
-        # outputs -- the io dtype on the half chain, bf16 on the fp8 chain (upcast Q / K,
-        # bf16 dK / dQ partials for stage 4).
-        shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+        # Stage 3 reads the dS workspace in ITS dtype (`_stage3_records`: the io dtype on the half chain; on the fp8 chain the
+        # e4m3 workspace through the fp8 K64 arm + its epilogue, or the bf16 twin through the bf16 renderings).
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
         tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
-        p_dk, p_dq = _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn)
+        p_dk, p_dq = self._stage3_records(mod, tile_mn)
         mm_dk = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dk, tag=_SM107_MM_TAGS["dk"])
         mm_dq = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dq, tag=_SM107_MM_TAGS["dq"])
         self._prepared = self._compile_plan(mod, mm_dk, mm_dq)
@@ -470,16 +511,49 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         # Stage 2 publishes dV in bf16 (the pre-quantization value) for the fold + quantize pass.
         return DTYPE_BF16
 
+    def _ds_torch_dtype(self):
+        """e4m3 (``FP8_DS_DTYPE = DTYPE_E4M3``, shipped: dS_q = e4m3(dS * scale_dP) for the fp8 GEMM arm) or bf16 (the twin)."""
+        if FP8_DS_DTYPE not in (DTYPE_E4M3, DTYPE_BF16):
+            raise ValueError(f"{self._NAME}: FP8_DS_DTYPE must be DTYPE_E4M3 or DTYPE_BF16; got {FP8_DS_DTYPE}")
+        return _TORCH_DTYPE[FP8_DS_DTYPE]
+
+    @property
+    def _ds_fp8(self) -> bool:
+        return self._ds_dtype == torch.float8_e4m3fn
+
+    def _template_params_family(self) -> dict:
+        return dict(dtype_ds=_DTYPE_CODE[self._ds_dtype])
+
+    def _stage3_records(self, mod, tile_mn):
+        """e4m3 dS: the fp8 K64 arm -- dQ ``EPI_QUANT`` into the caller's dQ (amax_dQ in the epilogue); dK ``EPI_QUANT``
+        into the caller's dK at MHA, ``EPI_DESCALE`` (bf16 true-unit per-Q-head partials, quantized AFTER the GQA fold)
+        otherwise.  bf16 dS: the bf16 renderings, no epilogue (stage 4 folds + quantizes all three)."""
+        shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+        gran = _cfg.kv_pad_rows(mod.CFG)
+        if not self._ds_fp8:
+            return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn)
+        dk_mode = EPI_QUANT if self._gqa_group == 1 else EPI_DESCALE
+        return _stage3_params(
+            DTYPE_E4M3, bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn, epi_modes=(dk_mode, EPI_QUANT), dtype_out=_DTYPE_CODE[self.grad_dtype]
+        )
+
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
         b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
-        return [
-            ("dv_part", (b, kv_rows, h, d), torch.bfloat16),  # stage 2's per-Q-head dV_true, bf16
-            ("dk_part", (b, kv_rows, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)
-            ("dq_ws", (b, sq, h, d), torch.bfloat16),  # stage 3's dS^T . K8 (descale_k pending)
-            ("q_bf16", (b, sq, h, d), torch.bfloat16),  # Q8 upcast EXACTLY (the bf16 GEMM's B operand)
-            ("k_bf16", (b, skv, hkv, d), torch.bfloat16),  # K8 upcast EXACTLY
-            ("amax_scratch", (8,), torch.float32),  # stage 2's dV amax (recomputed by stage 4) + any amax the graph left virtual
-        ]
+        plan = [("dv_part", (b, kv_rows, h, d), torch.bfloat16)]  # stage 2's per-Q-head dV_true, bf16
+        if self._ds_fp8:
+            # e4m3 dS: the GEMMs read the e4m3 payloads directly and quantize dQ (and MHA dK) in their epilogue; only the
+            # GQA dK partials (bf16, TRUE units: EPI_DESCALE) go through stage 4.
+            if gqa:
+                plan.append(("dk_part", (b, kv_rows, h, d), torch.bfloat16))
+        else:
+            plan += [
+                ("dk_part", (b, kv_rows, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)
+                ("dq_ws", (b, sq, h, d), torch.bfloat16),  # stage 3's dS^T . K8 (descale_k pending)
+                ("q_bf16", (b, sq, h, d), torch.bfloat16),  # Q8 upcast EXACTLY (the bf16 GEMM's B operand)
+                ("k_bf16", (b, skv, hkv, d), torch.bfloat16),  # K8 upcast EXACTLY
+            ]
+        plan.append(("amax_scratch", (8,), torch.float32))  # stage 2's dV amax (recomputed by stage 4) + any amax the graph left virtual
+        return plan
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
         return _prepared.compile_plan_fp8(self, mod, mm_dk, mm_dq)
@@ -554,4 +628,4 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE"]
+__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE"]

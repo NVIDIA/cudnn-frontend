@@ -3,8 +3,16 @@
 
 """SM100 batched GEMM with a 2-D ``(batch, head)`` batch — SDPA-backward stage 3.
 
-Computes dV = S^T.dO, dK = dS^T.Q and dQ = dS.K.  All three are plain batched
-bf16 GEMMs; at bf16 there is no descale epilogue, so nothing is fused here.
+Computes dV = S^T.dO, dK = dS^T.Q and dQ = dS.K.  On the bf16 / fp16 rows all
+three are plain batched GEMMs with no epilogue.  The sm107 d256 fp8 chain renders
+the FP8 ARM (``MatmulTemplateParams.dtype_qkv = DTYPE_E4M3``): e4m3 A (the dS
+workspace, ``dS_q = e4m3(dS * scale_dP)``) and B (the Q / K payload) through
+Rubin's dense-FP8 K64 MMA (``256x256x64``, idesc ``k_dim=1``, ``F8F6F4``) into
+an fp32 accumulator, with a DESCALE (``acc * descale_dP * descale_{q|k}`` -> bf16,
+the GQA fold's per-Q-head partial) or QUANT (``+ amax fold, * scale_{dQ|dK} ->
+the gradient dtype``) epilogue -- ``config_sm100.MatmulTemplateParams`` carries
+the story.  Everything fp8 is a ``const_expr`` off ``PARAMS``; the bf16 / fp16
+renderings are byte-identical to what they were before the arm existed.
 
 WHY THIS EXISTS -- the one thing the generic GEMM cannot express
 ---------------------------------------------------------------
@@ -43,7 +51,7 @@ without making the same change upstream.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
@@ -60,18 +68,45 @@ import cutlass.cute as cute
 from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
-from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+from cutlass.base_dsl.typing import Pointer
+
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, opaque_f32_zero
 from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
-from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
+from cudnn.sdpa.bwd.config_sm100 import (
+    CAUSAL_K_HI,
+    CAUSAL_K_LO,
+    CAUSAL_K_NONE,
+    EPI_DESCALE,
+    EPI_NONE,
+    EPI_QUANT,
+    MatmulTemplateParams,
+    matmul_out_dtype,
+    validate_matmul_params,
+)
 
 PARAMS = globals().get("FROST_TEMPLATE_PARAMS", MatmulTemplateParams())
 validate_matmul_params(PARAMS)
 
-# A/B/D io dtype.  BF16 and FP16 are both 2 B/element and both take the
-# Tcgen05MMAKind.F16 path, so this is a token swap: nothing byte-sized below
-# changes.  It must agree with the stage-2 template's `dtype_qkv` -- stage 3
-# reads the S/dS workspace stage 2 wrote.
-_IO_DTYPE = cutlass.Float16 if int(PARAMS.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
+# A/B io dtype.  BF16 and FP16 are both 2 B/element and both take the
+# Tcgen05MMAKind.F16 path, so between them this is a token swap: nothing
+# byte-sized below changes.  E4M3 is the fp8 ARM: 1 B/element, the K64 dense-FP8
+# MMA (`mma_inst_shape_mnk` / `mma_k_dim` / `mma_kind` below), and a descale or
+# quantize epilogue (`epi_mode`).  It must agree with the stage-2 template's dS
+# workspace dtype -- stage 3 reads the S/dS workspace stage 2 wrote.
+_DSL_DTYPES = {DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16, DTYPE_E4M3: cutlass.Float8E4M3FN}
+_IO_DTYPE = _DSL_DTYPES[int(PARAMS.dtype_qkv)]
+_IS_FP8 = int(PARAMS.dtype_qkv) == DTYPE_E4M3
+_AB_BPE = _IO_DTYPE.width // 8
+# D dtype: the io dtype on the bf16 / fp16 rows; bf16 (DESCALE) or the gradient dtype (QUANT) on the fp8 arm.
+_OUT_DTYPE = _DSL_DTYPES[matmul_out_dtype(PARAMS)]
+_CD_BPE = _OUT_DTYPE.width // 8
+epi_mode = int(getattr(PARAMS, "epi_mode", EPI_NONE))
+# The K64 dense-FP8 MMA form (idesc k_dim=1, K=64 e4m3 per instruction) is RUBIN's: on Blackwell it is silently WRONG
+# (uniform ~0.4 |O-ref|, no crash -- rules/mma-tma-matrix.md S1).  This module has no arch at load time, so the guard is
+# the caller's: only the sm107 adapter renders the fp8 arm (`api_dsl_sm107._stage3_params`) and
+# `kernels/sm107/prepared_host._check_target` (107 <= sm <= 119) is the runtime backstop; `validate_matmul_params` pins
+# the arm to the (256, 256) row whose upstream Rubin rendering the constants below are lifted from.
 
 
 class _TileRow(NamedTuple):
@@ -87,8 +122,8 @@ class _TileRow(NamedTuple):
     """
 
     config: str
-    cgrp_tile_mnk: tuple  # the CLUSTER's (M, N, K) output tile; `_host` covers the problem in these
-    cta_tile_mnk: tuple  # per-CTA (A rows, B cols, K) per stage
+    cgrp_tile_mn: tuple  # the CLUSTER's (M, N) output tile; `_host` covers the problem in these (K per stage: `_K_STAGE_ELEMS`)
+    cta_tile_mn: tuple  # per-CTA (A rows, B cols) per stage
     cluster_shape_mnk: tuple
     ab_stages: int  # operand ring depth at the 227 KiB opt-in budget: stages x (A + B per CTA) + 32 KiB staging
     multicast_a: bool  # A is TMA-multicast along the cluster's N only when cluster_n > 1
@@ -107,8 +142,8 @@ _TILE_ROWS = {
     # S=8192 d=512 bf16, +3.5 % no_mask / +7.8 % causal -- `_causal_k_range`).  N = 512 fills its 512-wide tile.
     (512, 512): _TileRow(
         config="CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma",
-        cgrp_tile_mnk=(512, 512, 64),
-        cta_tile_mnk=(256, 128, 64),
+        cgrp_tile_mn=(512, 512),
+        cta_tile_mn=(256, 128),
         cluster_shape_mnk=(2, 2, 1),
         ab_stages=4,
         multicast_a=True,
@@ -128,8 +163,8 @@ _TILE_ROWS = {
     # stage-2 kv write block, which is what makes the causal K-trim TIGHT (`_causal_k_range`).
     (256, 256): _TileRow(
         config="CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-        cgrp_tile_mnk=(256, 256, 64),
-        cta_tile_mnk=(128, 128, 64),
+        cgrp_tile_mn=(256, 256),
+        cta_tile_mn=(128, 128),
         cluster_shape_mnk=(2, 1, 1),
         ab_stages=6,
         multicast_a=False,
@@ -145,8 +180,8 @@ _TILE_ROWS = {
     # question (twice the tiles vs 25 % less L2 -> SMEM traffic per FLOP) is a one-constant A/B, not a rewrite.
     (512, 256): _TileRow(
         config="CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",
-        cgrp_tile_mnk=(512, 256, 64),
-        cta_tile_mnk=(256, 128, 64),
+        cgrp_tile_mn=(512, 256),
+        cta_tile_mn=(256, 128),
         cluster_shape_mnk=(2, 1, 1),
         ab_stages=4,
         multicast_a=False,
@@ -160,11 +195,19 @@ _TILE_ROWS = {
 _ROW = _TILE_ROWS[tuple(getattr(PARAMS, "cgrp_tile_mn", (512, 512)))]
 
 # Tile config: _ROW.config -- every constant below is lifted verbatim from the upstream rendering of that config (the
-# row-independent ones from any of the three; they agree) -- do not hand-derive.
-mma_inst_shape_mnk = (256, 256, 16)
+# row-independent ones from any of the three; they agree) -- do not hand-derive.  The fp8 arm's values are the upstream
+# arch-107 rendering of CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma (the same (256, 256) row at 1-byte operands).
+#
+# K per operand stage is ONE 128-byte swizzle row per operand row (the config family's `x128` K_BYTES): 64 bf16 / fp16
+# elements, 128 e4m3.  The MMA instruction reads K = 16 (bf16 / fp16, F16) or K = 64 (e4m3, Rubin's dense-FP8 K64 form,
+# idesc k_dim=1, F8F6F4) of it per step, so a stage is 4 (bf16) / 2 (e4m3) MMA k-blocks.
+_K_STAGE_BYTES = 128
+_K_STAGE_ELEMS = _K_STAGE_BYTES // _AB_BPE
+mma_inst_shape_mnk = (256, 256, 64) if _IS_FP8 else (256, 256, 16)
+mma_k_dim = 1 if _IS_FP8 else 0
 cta_group = 2
-cgrp_tile_mnk = _ROW.cgrp_tile_mnk
-cta_tile_mnk = _ROW.cta_tile_mnk
+cgrp_tile_mnk = (_ROW.cgrp_tile_mn[0], _ROW.cgrp_tile_mn[1], _K_STAGE_ELEMS)
+cta_tile_mnk = (_ROW.cta_tile_mn[0], _ROW.cta_tile_mn[1], _K_STAGE_ELEMS)
 epi_tile_mn = (128, 64)
 threads_per_cta = 256
 cluster_shape_mnk = _ROW.cluster_shape_mnk
@@ -246,14 +289,15 @@ multicast_b = False
 a_mcast_slices, ab_empty_full_mask = _ROW.a_mcast_m_major if a_is_m_major else _ROW.a_mcast_k_major
 b_mcast_slices = 1
 ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B
-# MN-major packs 64 elements per TMA group and walks K in 2048-byte steps;
-# K-major loads one group and steps 32 bytes.  Values lifted verbatim from the
-# upstream renderings of the same tile config -- do not hand-derive them.
+# MN-major packs one 128-byte swizzle row of elements per TMA group (64 bf16 / fp16, 128 e4m3) and walks K in
+# whole-MMA-K-row steps (16 x 128 B = 2048, 64 x 128 B = 8192); K-major loads one group and steps one MMA K in bytes
+# (32 / 64).  Values lifted verbatim from the upstream renderings of the same tile config at each operand width -- do
+# not hand-derive them.
 _MAJOR_CONSTS = {
-    # is_mn_major: (desc_leading_byte_offset, k_step_bytes, tma_group_elems)
-    False: (16, 32, 1),
-    True: (8192, 2048, 64),
-}
+    # bytes per element -> is_mn_major -> (desc_leading_byte_offset, k_step_bytes, tma_group_elems)
+    2: {False: (16, 32, 1), True: (8192, 2048, 64)},
+    1: {False: (16, 64, 1), True: (16384, 8192, 128)},
+}[_AB_BPE]
 a_smem_desc_leading_byte_offset, a_smem_k_step_bytes, a_tma_group_elems = _MAJOR_CONSTS[a_is_m_major]
 b_smem_desc_leading_byte_offset, b_smem_k_step_bytes, b_tma_group_elems = _MAJOR_CONSTS[b_is_n_major]
 a_smem_desc_stride_byte_offset = 1024
@@ -261,21 +305,28 @@ b_smem_desc_stride_byte_offset = 1024
 a_smem_m_step_bytes = 16384
 mma_size_m = _ROW.mma_size_m
 mma_size_n = 1
-mma_size_k = 4
+mma_size_k = _K_STAGE_BYTES // (mma_inst_shape_mnk[2] * _AB_BPE)  # MMA k-blocks per stage: 4 (bf16 / fp16), 2 (e4m3)
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
 
-# Dtype family: A=f16->MMAf16, B=f16->MMAf16, out=f16 (K_BYTES=128).
-# `_IO_DTYPE` is BF16 or FP16 per PARAMS.dtype_qkv; the MMA kind is the same.
+# Dtype family: A=f16->MMAf16, B=f16->MMAf16, out=f16 (K_BYTES=128) on the bf16 / fp16 rows (`_IO_DTYPE` is BF16 or FP16
+# per PARAMS.dtype_qkv; the MMA kind is the same); A=e4m3->MMAe4m3, B=e4m3->MMAe4m3, out=bf16 | the gradient dtype
+# (K_BYTES=128) on the fp8 arm.
 ab_dtype = _IO_DTYPE
-cd_dtype = _IO_DTYPE
+cd_dtype = _OUT_DTYPE
 mma_a_dtype = _IO_DTYPE
 mma_b_dtype = _IO_DTYPE
 mma_c_dtype = cutlass.Float32
 acc_widen_to_fp32 = False
 ab_tma_dtype = _IO_DTYPE
-mma_kind = nvvm.Tcgen05MMAKind.F16
+mma_kind = nvvm.Tcgen05MMAKind.F8F6F4 if _IS_FP8 else nvvm.Tcgen05MMAKind.F16
 epi_n = 64
 epi_row_elems = 64
+# The epilogue staging row is `epi_row_elems` x the D element: 128 B (bf16 / fp16) or 64 B (e4m3 out).  The lane store's
+# swizzle and the TMA-store descriptor's are ONE unit (rules/frost-tile-dsl.md S5): Swizzle(3, 4, 3) + s128b for the
+# 128-B row, Swizzle(2, 4, 3) + s64b for the 64-B one -- and the lane stride IS the row, so the same XOR spreads the banks.
+_EPI_ROW_BYTES = epi_row_elems * _CD_BPE
+_EPI_SWIZZLE = {128: cutlass.Swizzle(3, 4, 3), 64: cutlass.Swizzle(2, 4, 3)}[_EPI_ROW_BYTES]
+_EPI_TMA_SWIZZLE = {128: _tma.TensorMapSwizzle.s128b, 64: _tma.TensorMapSwizzle.s64b}[_EPI_ROW_BYTES]
 tile_swizzle_n = 1
 swizzle_l2_budget_bytes = 44214954
 num_gemms = 1
@@ -579,6 +630,13 @@ def _bprop_matmul_bh_sm100_kernel(
     meta_t: cute.Tensor,
     desc_words: cute.Tensor,
     n_batch: cutlass.Int32,
+    # The fp8 arm's epilogue operands (fp32 [1] device tensors; None-specialized away at EPI_NONE): the two descales whose
+    # product undoes the operands' scaling (descale_dP of the dS workspace, descale_{q|k} of the payload), the output scale
+    # and the amax target of EPI_QUANT (an amax the graph left virtual is None: its fold and atomic fold out).
+    epi_descale_0: Optional[cute.Tensor],
+    epi_descale_1: Optional[cute.Tensor],
+    epi_scale_out: Optional[cute.Tensor],
+    epi_amax: Optional[cute.Tensor],
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -832,6 +890,7 @@ def _bprop_matmul_bh_sm100_kernel(
         m_dim=mma_inst_shape_mnk[0],
         a_major=mma_a_major,
         b_major=mma_b_major,
+        k_dim=mma_k_dim,
     )
 
     # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
@@ -1495,6 +1554,18 @@ def _bprop_matmul_bh_sm100_kernel(
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
 
+        # The fp8 arm's launch constants, read ONCE per epilogue warp after the PDL wait (the caller writes them on the
+        # stream this launch may overlap): the folded descale of DESCALE / QUANT, the output scale of QUANT, and the
+        # per-thread amax accumulator of QUANT (an opaque zero: a folded constant into `fmax_f32`'s inline PTX ICEs libNVVM).
+        epi_d = (
+            cutlass.Float32(cutlass.make_array_view(epi_descale_0)[0]) * cutlass.Float32(cutlass.make_array_view(epi_descale_1)[0])
+            if cutlass.const_expr(epi_mode != EPI_NONE)
+            else None
+        )
+        epi_s = cutlass.Float32(cutlass.make_array_view(epi_scale_out)[0]) if cutlass.const_expr(epi_mode == EPI_QUANT) else None
+        _epi_fold_amax = epi_mode == EPI_QUANT and epi_amax is not None
+        epi_amax_tile = opaque_f32_zero() if cutlass.const_expr(_epi_fold_amax) else None
+
         tile_iter = cutlass.Int32(0)
         acc_full_phase_bit = cutlass.Int32(0)
         tile_m = init_tile_m
@@ -1641,8 +1712,19 @@ def _bprop_matmul_bh_sm100_kernel(
                     col_j = col
                     linear_idx = tile_b * out_stride_b_0 + tile_h * out_stride_h_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
-                    _r_mm = (vec_f32).to(cd_dtype)
-                    vec_out = (_r_mm).to(cd_dtype)
+                    if cutlass.const_expr(epi_mode == EPI_NONE):
+                        _r_mm = (vec_f32).to(cd_dtype)
+                        vec_out = (_r_mm).to(cd_dtype)
+                    elif cutlass.const_expr(epi_mode == EPI_DESCALE):
+                        # The TRUE-unit gradient: acc * descale_dP * descale_{q|k}, rounded once into bf16.
+                        vec_out = (vec_f32 * epi_d).to(cd_dtype)
+                    else:
+                        # EPI_QUANT: true value -> amax fold (ternary abs-max tree on max.f32, FMNMX3; never cute.math.max) ->
+                        # * scale_{dQ|dK} -> the gradient dtype.  TMA-OOB rows past M carry acc == 0, so no row gate is needed.
+                        _t = vec_f32 * epi_d
+                        if cutlass.const_expr(_epi_fold_amax):
+                            epi_amax_tile = fmax_f32(epi_amax_tile, abs_max_tree([_t[_i] for _i in range(subtile_w)]))
+                        vec_out = (_t * epi_s).to(cd_dtype)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                     _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
@@ -1652,11 +1734,11 @@ def _bprop_matmul_bh_sm100_kernel(
                     # on a sync.
                     if cutlass.const_expr(_THD_MM):
                         if _thd_k_len > cutlass.Int32(0):
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                         else:
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                     else:
-                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:
@@ -1730,6 +1812,17 @@ def _bprop_matmul_bh_sm100_kernel(
 
             tile_iter += 1
 
+        if cutlass.const_expr(_epi_fold_amax):
+            # amax_{dQ|dK}: warp butterfly on max.f32, then ONE int32-bit-pattern atomicMax per epilogue warp (non-negative
+            # fp32 orders like int32; the caller ZEROES the target on this stream before the launch, the fp8 body's idiom).
+            for _sh in cutlass.range_constexpr(5):
+                epi_amax_tile = fmax_f32(
+                    epi_amax_tile,
+                    nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=epi_amax_tile, offset=1 << (4 - _sh), mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY),
+                )
+            if lane == 0:
+                nvvm.atomicrmw(nvvm.AtomicOp.MAX, Pointer(epi_amax.iterator.raw_ptr(), dtype=cutlass.Int32), epi_amax_tile.bitcast(cutlass.Int32))
+
         if warp_idx == 0:
             nvvm.cp_async_bulk_wait_group(0, read=True)
 
@@ -1790,6 +1883,17 @@ def _thd_patch_descs_kernel(
 _thd_patch_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+def _require_epi_operands(d0, d1, s_out) -> None:
+    """Trace-time check that the epilogue the rendering carries has its operands (plain Python: the DSL rejects a raise under
+    a staged `if`).  A missing scalar would otherwise surface as a None-specialized load deep in the kernel trace."""
+    if epi_mode != EPI_NONE and (d0 is None or d1 is None):
+        raise TypeError(f"{__name__}: epi_mode={epi_mode} needs epi_descale_0 and epi_descale_1 (fp32 [1] device tensors); got None")
+    if epi_mode == EPI_QUANT and s_out is None:
+        raise TypeError(f"{__name__}: EPI_QUANT needs epi_scale_out (the gradient's fp32 [1] scale); got None")
+    if epi_mode == EPI_NONE and (d0 is not None or d1 is not None or s_out is not None):
+        raise TypeError(f"{__name__}: this rendering has no epilogue (EPI_NONE) but epilogue operands were passed")
+
+
 @cute.jit
 def _host(
     problem_size: tuple,
@@ -1801,7 +1905,15 @@ def _host(
     meta_t: cute.Tensor,
     desc_words: cute.Tensor,
     stream: _cuda.CUstream,
+    # The fp8 arm's epilogue operands, TRAILING and defaulted so the SM100 chain's positional 7-argument call is unchanged:
+    # fp32 [1] device tensors descale_dP (0) and descale_{q|k} (1) for EPI_DESCALE / EPI_QUANT, the output scale and the
+    # amax target for EPI_QUANT (None = the graph left that amax virtual; its fold and atomic fold out).
+    epi_descale_0: Optional[cute.Tensor] = None,
+    epi_descale_1: Optional[cute.Tensor] = None,
+    epi_scale_out: Optional[cute.Tensor] = None,
+    epi_amax: Optional[cute.Tensor] = None,
 ) -> None:
+    _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out)
     _a_operands = [a_0]
     _b_operands = [b_0]
     m = problem_size[0]
@@ -1956,7 +2068,7 @@ def _host(
             out_stride_b_0 * cd_dtype.width // 128,
         ],
         box_dims=[64, epi_tile_mn[0], 1, 1],
-        swizzle=_tma.TensorMapSwizzle.s128b,
+        swizzle=_EPI_TMA_SWIZZLE,
     )
     tma_c_desc_list = [tma_c_desc_0]
 
@@ -1997,6 +2109,10 @@ def _host(
         meta_t,
         desc_words,
         n_batch,
+        epi_descale_0,
+        epi_descale_1,
+        epi_scale_out,
+        epi_amax,
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does

@@ -81,7 +81,7 @@ is a build-time function of the shape).  Both rows are **prepared launches**
 (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`): the plan compiles
 ONE pointer-host artifact that runs the whole chain from device pointers, and
 every stage below -- the padding copies, the `seq_kv` fill and the dS zero-fill
-included, plus the fp8 upcast / fold + quantize passes -- is a kernel of that
+included, plus the fp8 row's fold + quantize passes -- is a kernel of that
 artifact.  No torch op runs on the execute path; the graph binds its variant pack
 straight into the artifact, follows the handle's stream and captures into a CUDA
 graph.
@@ -91,13 +91,18 @@ dot     delta = rowsum(dO ∘ O)                        (fp8: × descale_o · de
 main    per (kv block, head, batch), one 2-CTA cluster: walks the q tiles that
         attend the block; dV accumulates in TMEM and is stored per Q head;
         dS = attn_scale · P ∘ (dP − delta) is written to a kv-major
-        [B, H_chunk, S_kv, S_q] GMEM workspace (fp8: bf16 workspace, amax_dP)
+        [B, H_chunk, S_kv, S_q] GMEM workspace (fp8: e4m3 dS_q = e4m3(dS · scale_dP),
+        amax_dP over the fp32 dS before the scale)
 mm_dk   dK = dS · Q          batched GEMM over the workspace (bprop_matmul_blackwell,
-                             the d = 256 cluster tile: 2x1, 256 × 256 per pair, no N padding)
-mm_dq   dQ = dSᵀ · K         same GEMM, the other operand major
+                             the d = 256 cluster tile: 2x1, 256 × 256 per pair, no N padding;
+                             fp8: the K64 fp8 arm over the e4m3 dS and the e4m3 Q payload,
+                             epilogue · descale_dP · descale_q — then · scale_dK → e4m3 dK +
+                             amax_dK at MHA, or bf16 true-unit per-Q-head partials under GQA)
+mm_dq   dQ = dSᵀ · K         same GEMM, the other operand major (fp8: · descale_dP · descale_k,
+                             amax_dQ, · scale_dQ → the gradient dtype, straight into dQ)
 fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
-        per-Q-head partials.  fp8 row, always: fold + descale (dK: descale_q,
-        dQ: descale_k) + amax + scale_dX + cast to the gradient dtype
+        per-Q-head partials.  fp8 row: dV always (fold + amax_dV + scale_dV + cast);
+        dK under GQA (the bf16 partials are summed BEFORE the amax, scale and cast)
 ```
 
 The workspace is head-chunked (and batch-chunked on the half row) to a 4 GiB
@@ -163,12 +168,19 @@ fold. `S = S_acc · descale_q · descale_k`; `P` is recomputed from the forward'
 exact fp32 Stats and quantized to E4M3 with `scale_s` for the dV MMA;
 `dV = dV_acc · descale_s · descale_dO`; `dP = dP_acc · descale_v · descale_dO`;
 `dS = attn_scale · P ∘ (dP − delta)` in fp32 (`amax_dP` is its amax before the
-cast, as the C++ node reduces it). dS travels through a **bf16** workspace and
-the gradient GEMMs run at bf16 over Q / K upcast exactly from E4M3, so the
-fold pass applies the pending `descale_q` (dK) / `descale_k` (dQ), folds
-`amax_dQ/dK/dV` over the fp32 value, multiplies by `scale_dQ/dK/dV` and casts
-to the graph's gradient dtype. `descale_dP` / `scale_dP` are accepted and never
-applied (dS is not quantized to fp8 on this chain).
+scale and the cast, as the C++ node reduces it), then `dS_q = e4m3(dS · scale_dP)`
+into an **E4M3** workspace — the cuDNN recipe (delayed scaling: feed the previous
+step's `amax_dP`). The gradient GEMMs run Rubin's dense-FP8 K64 MMA over the
+e4m3 dS and the e4m3 Q / K payloads and undo both scalings in their epilogue:
+`acc · descale_dP · descale_k` (dQ) / `· descale_q` (dK), then `amax_dQ` / `amax_dK`
+over that true-unit value, `· scale_dQ` / `scale_dK` and the cast to the graph's
+gradient dtype — written straight into dQ, and into dK at MHA; under GQA the dK
+partials leave the GEMM in bf16 (true units) and the fold pass sums them in
+fixed order before it folds `amax_dK`, applies `scale_dK` and casts. dV always
+takes the fold pass (`amax_dV`, `scale_dV`, cast). `api_dsl_sm107.FP8_DS_DTYPE =
+DTYPE_BF16` selects the pre-quantized twin used for A/B and oracle work: bf16 dS,
+bf16 GEMMs over exact E4M3 → bf16 upcasts of Q / K, three fold + quantize passes,
+`descale_dP` / `scale_dP` bound and unused.
 
 ## Support surface and constraints
 
@@ -187,7 +199,8 @@ applied (dS is not quantized to fp8 on this chain).
   shapes (`S_q == 1`), `use_deterministic_algorithm` (the chain has no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap
 - Workspace (carved from the caller's buffer): fp32 `delta`, one head/batch
-  chunk of the dS workspace (`B_chunk · H_chunk · S_kv · S_q · 2` bytes), padded
-  staging copies when S_q / S_kv are not tile multiples, per-Q-head dK/dV
-  partials under GQA; the fp8 row adds bf16 copies of Q / K, the bf16 dQ / dK /
-  dV partials and an amax scratch. Use `graph.get_workspace_size()`.
+  chunk of the dS workspace (`B_chunk · H_chunk · S_kv · S_q` bytes at e4m3 on
+  the fp8 row, `· 2` on the half row), padded staging copies when S_q / S_kv are
+  not tile multiples, per-Q-head dK/dV partials under GQA; the fp8 row adds the
+  bf16 dV partials (and dK partials under GQA) and an amax scratch. Use
+  `graph.get_workspace_size()`.

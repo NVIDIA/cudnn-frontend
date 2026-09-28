@@ -34,10 +34,15 @@ from dataclasses import dataclass
 CAUSAL_K_NONE = 0
 CAUSAL_K_LO = 1
 CAUSAL_K_HI = 2
+# Stage-3 epilogue modes (see MatmulTemplateParams.epi_mode).
+EPI_NONE = 0
+EPI_DESCALE = 1
+EPI_QUANT = 2
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
     DTYPE_BF16,
+    DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
     MASK_CAUSAL,
@@ -147,11 +152,20 @@ class MatmulTemplateParams:
     # bodies are textually identical), which is why it is a plain knob here.
     # Use `vec_bytes_epi_for(d, bpe)` rather than setting it by hand.
     vec_bytes_epi: int = 32
-    # IO dtype of A/B/D, as a DTYPE_* code.  Must match the stage-2 template's
-    # `dtype_qkv`: stage 3 reads the S/dS workspace stage 2 wrote and stores the
-    # gradients in the graph's io dtype.  Both are 2 B/element, so this changes
-    # only the dtype TOKENS in the rendered body -- every byte-size constant
-    # (swizzle, box dims, SMEM staging) is width-driven and unaffected.
+    # IO dtype of A/B (and, at the default `dtype_out`, D), as a DTYPE_* code.
+    # Must match the stage-2 template's dS workspace dtype: stage 3 reads the
+    # S/dS workspace stage 2 wrote.  BF16 / FP16 are both 2 B/element and both
+    # take the Tcgen05MMAKind.F16 path, so between them this changes only the
+    # dtype TOKENS in the rendered body -- every byte-size constant (swizzle,
+    # box dims, SMEM staging) is width-driven and unaffected.  E4M3 selects the
+    # fp8 ARM (the sm107 d256 fp8 chain: an e4m3 dS workspace scaled by scale_dP
+    # against the e4m3 Q / K payloads): Rubin's dense-FP8 K64 MMA form
+    # (256x256x64, idesc k_dim=1, Tcgen05MMAKind.F8F6F4), 128 e4m3 per K stage
+    # in the same 128-B swizzle row, the (256, 256) row's tile, and one of the
+    # epilogues below -- NEVER EPI_NONE (an undescaled fp8 accumulator has no
+    # consumer).  The K64 form is silently WRONG on Blackwell (rules/
+    # mma-tma-matrix.md S1); only the sm107 adapter renders it and
+    # `kernels/sm107/prepared_host._check_target` is the runtime backstop.
     dtype_qkv: int = DTYPE_BF16
     # The CLUSTER's output tile ``(M, N)``, selecting one row of the template's
     # tile-constants table (``bprop_matmul_blackwell._TILE_ROWS``).  The N tile
@@ -171,10 +185,43 @@ class MatmulTemplateParams:
     # Append-only, defaulted: the SM100 adapter never sets it, so its records
     # render exactly the constants they always did.
     cgrp_tile_mn: tuple = (512, 512)
+    # The fp8 arm's EPILOGUE (dtype_qkv == DTYPE_E4M3 only; the bf16 / fp16 rows
+    # round the fp32 accumulator once into the io dtype and nothing else):
+    #   EPI_NONE     acc.to(out)                          bf16 / fp16 rows only
+    #   EPI_DESCALE  (acc * d0 * d1).to(out)              the TRUE-unit gradient in
+    #                bf16: d0 * d1 = descale_dP * descale_{q|k} (the e4m3 dS
+    #                workspace carries scale_dP, the e4m3 Q / K payload its own
+    #                descale) -- the per-Q-head dK partial the GQA fold sums
+    #                BEFORE quantizing
+    #   EPI_QUANT    t = acc * d0 * d1; amax = max |t| (one int32-bit-pattern
+    #                atomicMax per epilogue warp onto a caller-ZEROED fp32 [1]);
+    #                (t * s_out).to(out) -- the quantized gradient straight into
+    #                the caller's dQ / dK (e4m3 with scale_dQ / dK, or bf16 /
+    #                fp16 with scale 1.0) plus its amax_dQ / dK
+    # The four scalars ride as TRAILING `Optional[cute.Tensor] = None` arguments
+    # of the template's `_host` (descale_0, descale_1, scale_out, amax); at
+    # EPI_NONE every use folds out, so the SM100 chain's positional 7-argument
+    # call renders exactly what it always did.
+    epi_mode: int = EPI_NONE
+    # Output (D) dtype code.  -1 = inherit: dtype_qkv on the bf16 / fp16 rows,
+    # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT.
+    dtype_out: int = -1
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
 STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
+# The fp8 arm is rendered at this row only (see ``MatmulTemplateParams.dtype_qkv``).
+STAGE3_FP8_CGRP_TILE = (256, 256)
+STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)
+
+
+def matmul_out_dtype(params: MatmulTemplateParams) -> int:
+    """The stage-3 output (D) dtype code ``dtype_out`` resolves to: itself when set, else the io dtype on the bf16 / fp16
+    rows and BF16 on the fp8 arm (the DESCALE epilogue's true-unit value)."""
+    out = int(getattr(params, "dtype_out", -1))
+    if out >= 0:
+        return out
+    return DTYPE_BF16 if int(params.dtype_qkv) == DTYPE_E4M3 else int(params.dtype_qkv)
 
 
 def validate_matmul_params(params: MatmulTemplateParams) -> None:
@@ -187,8 +234,36 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"SDPA bwd stage 3: cgrp_tile_mn must be one of {STAGE3_CGRP_TILES} (the template's tile-constants rows; the N tile "
             f"must not exceed the head dim or the cluster computes padding); got {params.cgrp_tile_mn!r}."
         )
-    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3):
+        raise ValueError(
+            f"SDPA bwd stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}), DTYPE_FP16 ({DTYPE_FP16}) or DTYPE_E4M3 ({DTYPE_E4M3}, the fp8 arm); "
+            f"got {params.dtype_qkv}."
+        )
+    fp8 = params.dtype_qkv == DTYPE_E4M3
+    epi_mode = int(getattr(params, "epi_mode", EPI_NONE))
+    if epi_mode not in STAGE3_EPI_MODES:
+        raise ValueError(f"SDPA bwd stage 3: epi_mode must be one of {STAGE3_EPI_MODES} (EPI_NONE / EPI_DESCALE / EPI_QUANT); got {epi_mode}.")
+    if fp8 and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
+        raise ValueError(
+            f"SDPA bwd stage 3: the fp8 arm (dtype_qkv=DTYPE_E4M3) is rendered at the {STAGE3_FP8_CGRP_TILE} row only -- its constants are lifted "
+            f"from the upstream Rubin rendering of that config (cluster 2x1, 128 x 128 x 128 e4m3 per CTA, K64 MMA) and no other row was validated; "
+            f"got cgrp_tile_mn={params.cgrp_tile_mn!r}."
+        )
+    if fp8 and params.thd_varlen:
+        raise ValueError("SDPA bwd stage 3: the fp8 arm has no THD / varlen leg (the sm107 d256 chain is dense BSHD only).")
+    if (epi_mode != EPI_NONE) != fp8:
+        raise ValueError(
+            f"SDPA bwd stage 3: the descale / quantize epilogue (epi_mode={epi_mode}) belongs to the fp8 arm and the fp8 arm requires one: an e4m3 dS "
+            f"workspace carries scale_dP and the e4m3 Q / K payloads their descale, so the accumulator must be descaled (EPI_DESCALE) or descaled + "
+            f"quantized (EPI_QUANT) before it is stored; the bf16 / fp16 rows store the accumulator as is (EPI_NONE); got dtype_qkv={params.dtype_qkv}."
+        )
+    out = matmul_out_dtype(params)
+    if out not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3):
+        raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16 or DTYPE_E4M3; got {params.dtype_out}.")
+    if out == DTYPE_E4M3 and epi_mode != EPI_QUANT:
+        raise ValueError("SDPA bwd stage 3: an E4M3 output needs EPI_QUANT (an unscaled fp8 store of the accumulator has no consumer).")
+    if not fp8 and out != params.dtype_qkv:
+        raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")
     if params.vec_bytes_epi not in (16, 32):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
     if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:

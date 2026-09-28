@@ -4,7 +4,9 @@
 
 One ``@cute.jit`` host per row runs the WHOLE chain from device pointers and the caller's workspace: the padding
 copies, the ``seq_kv`` fill and the dS zero-fill (kernels of this artifact, not torch ops), ``dot`` (delta), the
-per-chunk main kernel + the two stage-3 GEMMs, and the GQA fold (half) / the fold + FP8 epilogue (fp8).  Every tensor
+per-chunk main kernel + the two stage-3 GEMMs, and the GQA fold (half) / the fold + FP8 epilogue (fp8: dV always, dK
+under GQA; with the e4m3 dS workspace the GEMMs' own epilogue descales -- and quantizes dQ / MHA dK -- so no Q / K
+upcast and no dQ / dK fold pass runs; the bf16-dS twin keeps the upcasts and all three fold passes).  Every tensor
 the chain touches is a view built here from a pointer + a plan-time geometry (``_view``) or from a workspace region
 (``_scratch``); nothing is allocated, nothing synchronizes, so the compiled artifact rebinds per call, follows the
 handle's stream and captures into a CUDA graph.  ``prepared_sm107.compile_plan`` builds the geometry / regions and
@@ -209,15 +211,20 @@ def _permuted(tensor: cute.Tensor, order: cutlass.Constexpr):
 
 
 @cute.jit
-def _matmul(entry: cutlass.Constexpr, a, b, output, heads: cutlass.Constexpr, batches: cutlass.Constexpr, meta, desc, stream):
+def _matmul(entry: cutlass.Constexpr, a, b, output, heads: cutlass.Constexpr, batches: cutlass.Constexpr, meta, desc, stream, epi: cutlass.Constexpr = None):
     """One ``(batch, head)``-batched stage-3 GEMM: ``a`` / ``b`` / ``output`` already in the template's ``(M|N, K, H, B)`` / ``(M, N, H, B)``
     order.  The problem tuple is the retired ``matmul_bh``'s, widened to Int64 before the descriptor's byte products; the grid's M
-    is A's M (dense: the operands' shared extent)."""
+    is A's M (dense: the operands' shared extent).  ``epi`` = the fp8 arm's ``(descale_0, descale_1, scale_out, amax)`` fp32 [1]
+    tensors (``scale_out`` / ``amax`` None outside EPI_QUANT / for an unrequested amax); None = a rendering without an epilogue,
+    called with the SM100 chain's positional seven arguments."""
     problem = tuple(
         cutlass.Int64(x)
         for x in (a.shape[0], b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
     )
-    entry(problem, a, b, output, meta, desc, stream)
+    if cutlass.const_expr(epi is None):
+        entry(problem, a, b, output, meta, desc, stream)
+    else:
+        entry(problem, a, b, output, meta, desc, stream, epi[0], epi[1], epi[2], epi[3])
 
 
 @cute.jit
@@ -253,7 +260,7 @@ def _stage2_inputs(
 ):
     """The kernel-facing Q / dO / K / V / LSE (zero- / +inf-padded staging copies when the graph's extents are not tile multiples),
     the per-batch kv lengths and the (zero-filled under a mask) dS workspace -- as launches of this artifact."""
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
     q_k, do_k, lse_k, k_k, v_k = q, do, stats, k, v
     if cutlass.const_expr(regions[R_Q_PAD] is not None):
         q_k = _scratch(workspace, regions[R_Q_PAD], dtype)
@@ -274,7 +281,7 @@ def _stage2_inputs(
     # stage-3 GEMMs read them (the trim is an optimization, SWA has none); the skipped set is the same for every chunk.
     ds_full = _scratch(workspace, regions[R_DS], ds_dtype)
     if cutlass.const_expr(zero_ws):
-        n16 = bc * hc * skvp * sqp * 2 // 16
+        n16 = bc * hc * skvp * sqp * bpe_ds // 16
         _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
     return q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full
 
@@ -296,14 +303,17 @@ def _stage3(
     meta,
     desc,
     stream,
+    dk_epi: cutlass.Constexpr = None,
+    dq_epi: cutlass.Constexpr = None,
 ):
     """dK = dS . Q into ``dk_out[bb:bb+bc, :, hb:hb+hc]`` and dQ = dS^T . K into ``dq_out[bb:bb+bc, :, hb:hb+hc]`` for one (batch, head)
     chunk; ``ds`` is the chunk's REAL-extent ``[bc, hc, S_kv, S_q]`` workspace view, ``q`` / ``k`` the full ``[B, S, H, D]`` operands,
-    ``dk_out`` a ``[B, S_kv, H_q, D]`` real-row view.  Every operand is a view; nothing is copied."""
+    ``dk_out`` a ``[B, S_kv, H_q, D]`` real-row view.  ``dk_epi`` / ``dq_epi`` are the fp8 arm's epilogue operands (``_matmul``).
+    Every operand is a view; nothing is copied."""
     q_c = _window(_window(q, 0, bb, bc), 2, hb, hc)  # [bc, S_q, hc, D]
     dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
     # dK = dS . Q: A = dS[kv, q] (M, K, H, B) K-major; B = Q (D, q, H, B); out (kv, D, H, B).
-    _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream)
+    _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream, dk_epi)
     # dQ = dS^T . K: A = dS^T[q, kv] (M, K, H, B) M-major; B = K (D, kv, H_kv, B); out (q, D, H, B).  Under GQA the K head is
     # shared by `group` Q heads, so the GEMM runs once per group MEMBER over every `group`-th Q head.
     kv_n = hc // group
@@ -311,7 +321,7 @@ def _stage3(
     for member in range(group):
         a_g = _window(ds, 1, member, kv_n, group)  # ds[:, member::group] -> [bc, kv_n, S_kv, S_q]
         o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, kv_n, group)  # dq[bs, :, hb+member::group] -> [bc, S_q, kv_n, D]
-        _matmul(mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), kv_n, bc, meta, desc, stream)
+        _matmul(mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), kv_n, bc, meta, desc, stream, dq_epi)
 
 
 # --- the half row --------------------------------------------------------------------------------------------------------
@@ -339,7 +349,7 @@ def host_f16(
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -427,7 +437,7 @@ def host_fp8(
     grad_dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -441,72 +451,122 @@ def host_fp8(
     descale_q, descale_k, descale_v = _view(descale_q_ptr, scalar), _view(descale_k_ptr, scalar), _view(descale_v_ptr, scalar)
     descale_s, scale_s = _view(descale_s_ptr, scalar), _view(scale_s_ptr, scalar)
     descale_o, descale_do = _view(descale_o_ptr, scalar), _view(descale_do_ptr, scalar)
+    descale_dp, scale_dp = _view(descale_dp_ptr, scalar), _view(scale_dp_ptr, scalar)
     scale_dq, scale_dk, scale_dv = _view(scale_dq_ptr, scalar), _view(scale_dk_ptr, scalar), _view(scale_dv_ptr, scalar)
-    # descale_dP / scale_dP are bound (the contract) and never applied: dS is never quantized to fp8 on this chain.
+    # The dS workspace dtype decides the chain shape (api_dsl_sm107.FP8_DS_DTYPE): e4m3 = dS_q = e4m3(dS * scale_dP) into the fp8
+    # K64 GEMM arm, whose epilogue applies descale_dP * descale_{q|k} (and, for dQ / MHA dK, amax + scale + the gradient cast);
+    # bf16 = the pre-quantized twin (bf16 GEMMs over exact e4m3 -> bf16 upcasts; descale_dP / scale_dP bound and never applied).
+    ds_fp8 = bpe_ds == 1
+    ds_dtype = cutlass.Float8E4M3FN if cutlass.const_expr(ds_fp8) else cutlass.BFloat16
     delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)
     desc = _scratch(workspace, regions[R_DESC], cutlass.Int64)
-    q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, dtype, cutlass.BFloat16, stream)
+    q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, dtype, ds_dtype, stream)
     group = h // hk
     dv_part = _scratch(workspace, regions[R_FP8_DV_PART], cutlass.BFloat16)  # [B, kv_rows, H, D] stage 2's per-Q-head dV_true
-    dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [B, kv_rows, H, D] stage 3's per-Q-head dS . Q8 (descale_q pending)
-    dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [B, S_q, H, D] stage 3's dS^T . K8 (descale_k pending)
-    q_bf16 = _scratch(workspace, regions[R_Q_BF16], cutlass.BFloat16)  # [B, S_q, H, D]
-    k_bf16 = _scratch(workspace, regions[R_K_BF16], cutlass.BFloat16)  # [B, S_kv, H_kv, D]
     amax_scratch = _scratch(workspace, regions[R_AMAX_SCRATCH], cutlass.Float32)  # [8]
     # amax targets: the graph's outputs where requested (Operand), scratch otherwise (None pointer) -- all reset here, then
     # atomicMax'd.  The main kernel's dV amax is over the per-Q-head partials, so the fold pass recomputes it over the folded
-    # value; the kernel's copy lands in scratch.  An unrequested amax_dQ / dK / dV folds its atomics out of the fold pass.
+    # value; the kernel's copy lands in scratch.  An unrequested amax_dQ / dK / dV folds its atomics out of the pass that
+    # owns it (the GEMM epilogue for dQ and MHA dK on the e4m3 chain, the fold pass otherwise).
     amax_dq = _view(amax_dq_ptr, scalar)
     amax_dk = _view(amax_dk_ptr, scalar)
     amax_dv = _view(amax_dv_ptr, scalar)
     amax_dp = _view(amax_dp_ptr, scalar) if cutlass.const_expr(amax_dp_ptr is not None) else _slot(amax_scratch, AMAX_SLOT_DP)
     amax_dv_kernel = _slot(amax_scratch, AMAX_SLOT_DV_KERNEL)
     _zero_amax(amax_dq, amax_dk, amax_dv, amax_dp, amax_dv_kernel).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
-    # The bf16 GEMM operands: e4m3 -> bf16 is exact; coalesced, one pass each.
-    _cast_fp8_to_bf16(q, q_bf16, b * sq * h * d).launch(grid=_grid_16b(q_bf16, 2), block=(_THREADS, 1, 1), stream=stream)
-    _cast_fp8_to_bf16(k, k_bf16, b * skv * hk * d).launch(grid=_grid_16b(k_bf16, 2), block=(_THREADS, 1, 1), stream=stream)
 
     # STAGE 1: delta in TRUE units = rowsum(dO8 * O8) * descale_o * descale_dO.
     dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d, DOT_CHUNK_ELEMS, stream)
 
-    dk_real = _extent(dk_part, (b, skv, h, d))
     ds = _extent(ds_full, (b, hc, skv, sq))
-    for ci in range(h // hc):
-        hb = ci * hc
-        # STAGE 2 (whole batch in-grid; head_base walks the chunks).  The kernel's seqlen_kv is the REAL length: the padded
-        # arm's mask bound and the amax row gate.
-        main(
-            q_k,
-            do_k,
-            k_k,
-            v_k,
-            dv_part,
-            ds_full,
-            lse_k,
-            delta,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_do,
-            descale_s,
-            scale_s,
-            scale_dv,
-            amax_dv_kernel,
-            amax_dp,
-            (b, h, hk, sqp, skvp, hc),
-            scale,
-            scale_log2,
-            hb,
-            skv,
-            stream,
-        )
-        # STAGE 3 at bf16 over the exact upcasts; the partials still carry descale_q / descale_k.
-        _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream)
-
-    # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue (descale, amax, scale, cast) into the caller's gradients.
-    fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
-    fold_quant_host(dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, stream)
-    fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, stream)
+    if cutlass.const_expr(ds_fp8):
+        # The GEMMs' B operands are the caller's e4m3 payloads; dQ lands in the caller's dQ (EPI_QUANT); dK in the caller's dK
+        # at MHA (EPI_QUANT, real rows) or in the bf16 TRUE-unit per-Q-head partials under GQA (EPI_DESCALE, folded below).
+        dk_tgt = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16) if cutlass.const_expr(group > 1) else dk
+        dk_real = _extent(dk_tgt, (b, skv, h, d))
+        dk_epi = (descale_dp, descale_q, None, None) if cutlass.const_expr(group > 1) else (descale_dp, descale_q, scale_dk, amax_dk)
+        dq_epi = (descale_dp, descale_k, scale_dq, amax_dq)
+        for ci in range(h // hc):
+            hb = ci * hc
+            # STAGE 2 (whole batch in-grid; head_base walks the chunks): dS_q = e4m3(dS * scale_dP).  The kernel's seqlen_kv is the
+            # REAL length: the padded arm's mask bound and the amax row gate.
+            main(
+                q_k,
+                do_k,
+                k_k,
+                v_k,
+                dv_part,
+                ds_full,
+                lse_k,
+                delta,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                descale_s,
+                scale_s,
+                scale_dv,
+                scale_dp,
+                amax_dv_kernel,
+                amax_dp,
+                (b, h, hk, sqp, skvp, hc),
+                scale,
+                scale_log2,
+                hb,
+                skv,
+                stream,
+            )
+            # STAGE 3: the fp8 K64 arm over the e4m3 dS and the e4m3 Q / K payloads; the epilogue undoes scale_dP and the payload's scale.
+            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, 0, b, hb, hc, group, seq_kv, desc, stream, dk_epi, dq_epi)
+        # STAGE 4: dV always folds + quantizes here (the kernel publishes bf16 per-Q-head dV_true); dK only under GQA, where the
+        # bf16 true-unit partials are summed in fixed order BEFORE the amax fold, the scale and the cast (the backend's order).
+        fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
+        if cutlass.const_expr(group > 1):
+            fold_quant_host(dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, stream)
+    else:
+        dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [B, kv_rows, H, D] stage 3's per-Q-head dS . Q8 (descale_q pending)
+        dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [B, S_q, H, D] stage 3's dS^T . K8 (descale_k pending)
+        q_bf16 = _scratch(workspace, regions[R_Q_BF16], cutlass.BFloat16)  # [B, S_q, H, D]
+        k_bf16 = _scratch(workspace, regions[R_K_BF16], cutlass.BFloat16)  # [B, S_kv, H_kv, D]
+        # The bf16 GEMM operands: e4m3 -> bf16 is exact; coalesced, one pass each.
+        _cast_fp8_to_bf16(q, q_bf16, b * sq * h * d).launch(grid=_grid_16b(q_bf16, 2), block=(_THREADS, 1, 1), stream=stream)
+        _cast_fp8_to_bf16(k, k_bf16, b * skv * hk * d).launch(grid=_grid_16b(k_bf16, 2), block=(_THREADS, 1, 1), stream=stream)
+        dk_real = _extent(dk_part, (b, skv, h, d))
+        for ci in range(h // hc):
+            hb = ci * hc
+            # STAGE 2 (whole batch in-grid; head_base walks the chunks); the bf16 dS: scale_dP is read and never applied.
+            main(
+                q_k,
+                do_k,
+                k_k,
+                v_k,
+                dv_part,
+                ds_full,
+                lse_k,
+                delta,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                descale_s,
+                scale_s,
+                scale_dv,
+                scale_dp,
+                amax_dv_kernel,
+                amax_dp,
+                (b, h, hk, sqp, skvp, hc),
+                scale,
+                scale_log2,
+                hb,
+                skv,
+                stream,
+            )
+            # STAGE 3 at bf16 over the exact upcasts; the partials still carry descale_q / descale_k.
+            _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream)
+        # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue (descale, amax, scale, cast) into the caller's gradients.
+        fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
+        fold_quant_host(dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, stream)
+        fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, stream)
 
 
 # --- compilation -----------------------------------------------------------------------------------------------------------

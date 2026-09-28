@@ -694,7 +694,13 @@ skipped tile reads as zero; rendered at the d = 256 cluster tile
 `MatmulTemplateParams.cgrp_tile_mn = (256, 256)` — cluster 2x1, 256 × 256 per pair,
 no N padding at d = 256, accumulator double-buffered — selected by the sm107 adapter
 only, the SM100 d512 renderings byte-identical: `test_stage3_tile_rows_render_their_upstream_constants`,
-`test_stage3_d256_rendering_is_bitwise_the_padded_one`, `test_stage3_d256_rendering_sass_pins`)
+`test_stage3_d256_rendering_is_bitwise_the_padded_one`, `test_stage3_d256_rendering_sass_pins`;
+the fp8 row writes `dS_q = e4m3(dS · scale_dP)` and renders the template's fp8 K64 arm
+(`MatmulTemplateParams.dtype_qkv = DTYPE_E4M3`, 256x256x64 `F8F6F4`, idesc `k_dim=1`)
+whose epilogue applies `descale_dP · descale_{q|k}` and quantizes dQ / MHA dK with
+`scale_{dQ|dK}` + `amax` in place — no Q / K upcasts, half the dS bytes; the bf16-dS twin
+`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16` is the A/B and oracle base, every fp8 accept case
+runs on both: `test_sdpa_bwd_fp8_sm107.py::ds_knob`)
 → the GQA fold of the per-Q-head partials
 (`dkv_reduce`, fixed order). Served: dense, top-left and bottom-right causal,
 sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
@@ -1249,8 +1255,9 @@ The two Rubin d=256 backward rows (`sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8`) use o
 prepared pointer launch per plan (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`):
 dense BSHD-physical operands and contiguous Stats at the plan's fixed geometry (no
 runtime shape overrides; a mismatching override or a changed layout is refused
-before any stage launches), padding copies / fills / the fp8 upcast and fold passes
-as kernels of the artifact, the caller-owned workspace carved in a fixed order that
+before any stage launches), padding copies / fills / the fp8 fold passes (and, on
+the bf16-dS twin, the Q / K upcasts) as kernels of the artifact, the caller-owned
+workspace carved in a fixed order that
 reproduces `get_workspace_size()` exactly.  The fp8 row binds its twelve scalar
 descales / scales as 1-element fp32 device operands and ONLY the amax outputs the
 graph requested (an unrequested amax is compiled out of the artifact).  Standalone

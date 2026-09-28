@@ -777,9 +777,9 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
     """Plan s5: the kv-major [S_kv, S_q] workspace flips the operand majors relative to the SM100 chain (dK reads dS
     K-major, dQ reads dS^T M-major) but NOT the causal trim modes (dK trims the low q tiles, dQ the high kv blocks).
     Untrimmed / dense renderings carry CAUSAL_K_NONE on both; the shift and the 256-row kv block ride along."""
-    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
-    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT
 
     dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, trim=True, cgrp_tile_mn=(256, 256))
     assert (dk.a_is_m_major, dk.causal_mode) == (False, CAUSAL_K_LO)
@@ -787,12 +787,20 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
     assert dk.causal_shift == dq.causal_shift == 512 and dk.causal_gran == dq.causal_gran == 256
     assert dk.b_is_n_major and dq.b_is_n_major and dk.dtype_qkv == DTYPE_BF16
     assert dk.cgrp_tile_mn == dq.cgrp_tile_mn == (256, 256), "the cluster tile rides on BOTH records"
+    assert dk.epi_mode == dq.epi_mode == EPI_NONE and dk.dtype_out == dq.dtype_out == -1, "the half row's records carry no epilogue"
     for causal, trim in ((True, False), (False, True), (False, False)):
         dk, dq = _stage3_params(DTYPE_BF16, causal=causal, shift=0, gran=256, trim=trim, cgrp_tile_mn=(256, 256))
         assert dk.causal_mode == dq.causal_mode == CAUSAL_K_NONE, (causal, trim)
         assert (dk.a_is_m_major, dq.a_is_m_major) == (False, True), "the majors are a layout fact, not a mask fact"
     with pytest.raises(TypeError):
         _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256)  # the cluster tile is REQUIRED: no padded rendering by omission
+    # The fp8 row's records (an e4m3 dS workspace): the GQA shape -- dK DESCALE to bf16 true-unit partials (dtype_out stays
+    # inherited), dQ QUANT into the gradient dtype -- and the MHA shape (both QUANT).
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_E4M3)
+    assert (dk.dtype_qkv, dk.epi_mode, dk.dtype_out, dk.causal_mode) == (DTYPE_E4M3, EPI_DESCALE, -1, CAUSAL_K_LO)
+    assert (dq.dtype_qkv, dq.epi_mode, dq.dtype_out, dq.causal_mode) == (DTYPE_E4M3, EPI_QUANT, DTYPE_E4M3, CAUSAL_K_HI)
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_BF16)
+    assert (dk.epi_mode, dk.dtype_out, dq.epi_mode, dq.dtype_out) == (EPI_QUANT, DTYPE_BF16, EPI_QUANT, DTYPE_BF16)
 
 
 def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
@@ -819,6 +827,44 @@ def test_stage3_rejects_a_cluster_tile_the_template_has_no_row_for():
         with pytest.raises(ValueError, match="cgrp_tile_mn"):
             validate_matmul_params(MatmulTemplateParams(cgrp_tile_mn=bad))
     validate_matmul_params(MatmulTemplateParams())  # the default row
+
+
+def test_stage3_fp8_arm_records_are_validated_together():
+    """The fp8 arm (``dtype_qkv=DTYPE_E4M3``) is admitted only as the rendering that was validated: the (256, 256) row, a
+    descale or quantize epilogue (an undescaled fp8 accumulator has no consumer), an e4m3 output only under QUANT, no THD;
+    and the bf16 / fp16 rows take no epilogue and no foreign output dtype.  Each raise names the reason."""
+    import re
+
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
+
+    fp8 = dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 256))
+    for ok in (
+        dict(**fp8, epi_mode=EPI_DESCALE),
+        dict(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_E4M3),
+        dict(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_BF16),
+        dict(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP16),
+        dict(**fp8, epi_mode=EPI_QUANT),
+    ):
+        validate_matmul_params(MatmulTemplateParams(**ok))
+    assert matmul_out_dtype(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE)) == DTYPE_BF16, "the fp8 arm's inherited output is the bf16 true-unit value"
+    assert matmul_out_dtype(MatmulTemplateParams(dtype_qkv=DTYPE_FP16)) == DTYPE_FP16
+    for bad, needle in (
+        (dict(dtype_qkv=DTYPE_E4M3, epi_mode=EPI_QUANT), "(256, 256) row only"),
+        (dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(512, 256), epi_mode=EPI_QUANT), "(256, 256) row only"),
+        (dict(**fp8), "the fp8 arm requires one"),
+        (dict(**fp8, epi_mode=EPI_NONE), "the fp8 arm requires one"),
+        (dict(**fp8, epi_mode=EPI_DESCALE, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),
+        (dict(**fp8, epi_mode=EPI_QUANT, thd_varlen=True), "no THD"),
+        (dict(**fp8, epi_mode=7), "epi_mode must be one of"),
+        (dict(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), epi_mode=EPI_QUANT), "belongs to the fp8 arm"),
+        (dict(dtype_qkv=DTYPE_BF16, epi_mode=EPI_DESCALE), "belongs to the fp8 arm"),
+        (dict(dtype_qkv=DTYPE_BF16, dtype_out=DTYPE_FP16), "store the io dtype"),
+        (dict(dtype_qkv=DTYPE_BF16, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),
+        (dict(dtype_qkv=1), "dtype_qkv must be"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(needle)):
+            validate_matmul_params(MatmulTemplateParams(**bad))
 
 
 # Every module-level tile constant of the stage-3 rendering, per operand major.  The (512, 512) values ARE develop's
@@ -942,6 +988,80 @@ def test_stage3_tile_rows_render_their_upstream_constants(tile, a_is_m_major):
         assert layout["smem_d"] + 2 * 128 * 64 * 2 == layout["total"]
 
 
+# The fp8 arm's constants: the upstream arch-107 rendering of CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma at
+# e4m3 operands (the (256, 256) row at 1-byte operands), with the fork's pins (epi_n 64 -> a 64-B staging row at e4m3 out).
+_STAGE3_FP8_ARM = dict(
+    cgrp_tile_mnk=(256, 256, 128),
+    cta_tile_mnk=(128, 128, 128),
+    mma_inst_shape_mnk=(256, 256, 64),
+    mma_k_dim=1,
+    mma_size_k=2,
+    mma_size_m=1,
+    ab_stages=6,
+    acc_stages=2,
+    cluster_shape_mnk=(2, 1, 1),
+    b_smem_desc_leading_byte_offset=16384,  # B n-major at 1 B/elem: 128 e4m3 per 128-B swizzle row
+    b_smem_k_step_bytes=8192,  # 64 K rows x 128 B per MMA k-block
+    b_tma_group_elems=128,
+)
+_STAGE3_FP8_A_MAJOR = {
+    False: dict(a_smem_desc_leading_byte_offset=16, a_smem_k_step_bytes=64, a_tma_group_elems=1),  # dK: dS[kv, q] K-major, 64 B per K64 block
+    True: dict(a_smem_desc_leading_byte_offset=16384, a_smem_k_step_bytes=8192, a_tma_group_elems=128),  # dQ: dS^T[q, kv] M-major
+}
+
+
+@pytest.mark.parametrize("a_is_m_major", (False, True), ids=("dK-Kmajor", "dQ-Mmajor"))
+@pytest.mark.parametrize("epi", ("descale", "quant-e4m3", "quant-bf16"))
+def test_stage3_fp8_arm_renders_the_upstream_k64_constants(a_is_m_major, epi):
+    """The fp8 arm renders Rubin's dense-FP8 K64 form (256x256x64, idesc k_dim=1, F8F6F4; 128 e4m3 per K stage in the same
+    128-B swizzle row, so a stage is TWO MMA k-blocks) with the (256, 256) row's tile and the 1-byte operand-major constants
+    lifted from the upstream rendering; its epilogue staging row follows the OUTPUT dtype (128 B / Swizzle(3,4,3) / s128b at
+    bf16, 64 B / Swizzle(2,4,3) / s64b at e4m3 -- store swizzle and store-descriptor swizzle move together), both operand
+    ring roots stay under the version-0 descriptor window and the layout fits the 227 KiB opt-in."""
+    import cutlass
+    import cutlass.experimental.cuda.tensor_map as _tma
+    import cutlass.experimental.primitives as nvvm
+
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, EPI_DESCALE, EPI_QUANT
+
+    mode, out = {"descale": (EPI_DESCALE, -1), "quant-e4m3": (EPI_QUANT, DTYPE_E4M3), "quant-bf16": (EPI_QUANT, DTYPE_BF16)}[epi]
+    mod = _load_stage3(
+        a_is_m_major=a_is_m_major,
+        b_is_n_major=True,
+        causal_mode=CAUSAL_K_HI if a_is_m_major else CAUSAL_K_LO,
+        causal_gran=256,
+        causal_shift=0,
+        vec_bytes_epi=32,
+        dtype_qkv=DTYPE_E4M3,
+        cgrp_tile_mn=(256, 256),
+        epi_mode=mode,
+        dtype_out=out,
+    )
+    expect = dict(_STAGE3_FP8_ARM, **_STAGE3_FP8_A_MAJOR[a_is_m_major])
+    got = {name: getattr(mod, name) for name in expect}
+    assert got == expect, {k: (got[k], expect[k]) for k in expect if got[k] != expect[k]}
+    assert mod._TILE_ROWS[(256, 256)] is mod._ROW and mod._IS_FP8 and mod.epi_mode == mode
+    assert mod.ab_dtype is cutlass.Float8E4M3FN and mod.mma_kind == nvvm.Tcgen05MMAKind.F8F6F4
+    assert mod.cd_dtype is (cutlass.Float8E4M3FN if epi == "quant-e4m3" else cutlass.BFloat16)
+    if epi == "quant-e4m3":
+        assert (mod._EPI_ROW_BYTES, mod._EPI_TMA_SWIZZLE) == (64, _tma.TensorMapSwizzle.s64b) and str(mod._EPI_SWIZZLE) == str(cutlass.Swizzle(2, 4, 3))
+    else:
+        assert (mod._EPI_ROW_BYTES, mod._EPI_TMA_SWIZZLE) == (128, _tma.TensorMapSwizzle.s128b) and str(mod._EPI_SWIZZLE) == str(cutlass.Swizzle(3, 4, 3))
+    # ... and the bf16 rows keep the F16 form untouched by the arm's existence.
+    bf16 = _load_stage3(
+        a_is_m_major=a_is_m_major, b_is_n_major=True, causal_gran=256, causal_shift=0, vec_bytes_epi=32, dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256)
+    )
+    assert (bf16.mma_inst_shape_mnk, bf16.mma_k_dim, bf16.mma_size_k, bf16.mma_kind, bf16.epi_mode) == ((256, 256, 16), 0, 4, nvvm.Tcgen05MMAKind.F16, 0)
+    assert (bf16._EPI_ROW_BYTES, bf16._EPI_TMA_SWIZZLE) == (128, _tma.TensorMapSwizzle.s128b)
+    layout = mod._smem_layout_bytes()
+    print(f"\nstage-3 fp8 {epi} a_is_m_major={a_is_m_major}: SMEM layout {layout}")
+    assert layout["smem_a_0"] < _SMEM_DESC_V0_LIMIT and layout["smem_b_0"] < _SMEM_DESC_V0_LIMIT, layout
+    assert layout["total"] <= _SM100_OPTIN_SMEM, layout
+    # 6 x (16 + 16) KiB of e4m3 operands = the bf16 rows' footprint; the e4m3-out staging is 2 x 8 KiB instead of 2 x 16.
+    assert layout["total"] == (215040 if epi == "quant-e4m3" else 231424), layout
+
+
 @pytest.mark.parametrize(
     "kw",
     [
@@ -996,21 +1116,45 @@ def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
         _adapter(SdpaBwdDslSm107, **kw).check_support()
 
 
-def test_fp8_adapter_backstop_and_workspace():
+def test_fp8_adapter_backstop_and_workspace(monkeypatch):
     """The fp8 row's twin: E4M3 payloads with e4m3 / bf16 / fp16 gradients pass; E5M2, a mixed gradient triple, a half
-    O payload and an off-contract gradient dtype raise.  Its workspace adds the bf16 Q / K copies, the three bf16
-    partials and the amax scratch, and never chunks the batch."""
+    O payload and an off-contract gradient dtype raise.  Its workspace (the shipped e4m3 dS): the e4m3 dS chunk, the bf16
+    dV partials, bf16 dK partials under GQA only, the amax scratch -- no Q / K upcasts, no dQ / dK scratch (the GEMM
+    epilogue quantizes them in place); the bf16-dS twin (``FP8_DS_DTYPE = DTYPE_BF16``) adds the bf16 Q / K copies and the
+    three bf16 partials, at twice the dS bytes.  Neither chunks the batch."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_QUANT
 
     e4m3 = torch.float8_e4m3fn
+    assert sm107.FP8_DS_DTYPE == DTYPE_E4M3, "the e4m3 dS chain is what ships"
     for grad in (e4m3, torch.bfloat16, torch.float16):
         api = _adapter(SdpaBwdDslSm107Fp8, b=2, hq=8, hkv=2, sq=257, skv=129, dt=e4m3, grad_dt=grad, is_causal=True)
         assert api.check_support()
         names = [n for n, _n, _d in api._scratch_plan()]
-        for n in ("dv_part", "dk_part", "dq_ws", "q_bf16", "k_bf16", "amax_scratch", "q_pad", "k_pad", "lse_pad"):
+        for n in ("dv_part", "dk_part", "amax_scratch", "q_pad", "k_pad", "lse_pad"):
             assert n in names, n
+        for n in ("dq_ws", "q_bf16", "k_bf16"):
+            assert n not in names, f"{n}: the e4m3 chain reads the e4m3 payloads directly and quantizes dQ / dK in the GEMM epilogue"
+        assert api._ds_dtype == e4m3 and api._bpe_ds == 1
+        assert {n: (sh, dt) for n, sh, dt in api._scratch_shapes()}["ds_ws"] == ((2, 8, 256, 384), e4m3), "the dS chunk is e4m3 at the padded extents"
         assert api._b_chunk == 2, "the fp8 body has no batch_base: the whole batch is in-grid"
         assert api.scratch_workspace_bytes() == api.scratch_workspace_bytes() > 0
+        assert api._template_params().dtype_ds == DTYPE_E4M3
+    # MHA: the GEMM writes the caller's dK straight -- no dk_part either.
+    mha = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=2, hkv=2, sq=512, skv=512, dt=e4m3, grad_dt=e4m3)
+    assert mha.check_support() and [n for n, _n, _d in mha._scratch_plan()] == ["delta", "ds_ws", "seq_kv", "desc_words", "dv_part", "amax_scratch"]
+    e4m3_bytes = mha.scratch_workspace_bytes()
+    # The bf16-dS twin: today's chain end to end.
+    monkeypatch.setattr(sm107, "FP8_DS_DTYPE", DTYPE_BF16)
+    twin = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=2, hkv=2, sq=512, skv=512, dt=e4m3, grad_dt=e4m3)
+    assert twin.check_support() and twin._ds_dtype == torch.bfloat16 and twin._bpe_ds == 2
+    names = [n for n, _n, _d in twin._scratch_plan()]
+    assert names == ["delta", "ds_ws", "seq_kv", "desc_words", "dv_part", "dk_part", "dq_ws", "q_bf16", "k_bf16", "amax_scratch"]
+    assert twin._template_params().dtype_ds == DTYPE_BF16 and twin.scratch_workspace_bytes() > e4m3_bytes
+    assert twin._qh_chunk <= mha._qh_chunk, "the e4m3 dS chunk doubles the heads per launch at the same budget"
+    monkeypatch.setattr(sm107, "FP8_DS_DTYPE", DTYPE_E4M3)
     with pytest.raises(ValueError, match="not served"):
         _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e5m2, grad_dt=e4m3).check_support()
     with pytest.raises(ValueError, match="not in"):
@@ -1822,7 +1966,7 @@ def test_sm107_every_mask_site_is_the_bit_word_arm(family):
 # device cubin is the artifact's.  One sm_107a trace-compile per row (~5-10 s).
 _GEMM_SASS_PROBE = textwrap.dedent(r"""
     import glob, os, subprocess, sys
-    dump, major, mask, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+    dump, major, mask, arm, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "cubin"
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"
@@ -1830,23 +1974,32 @@ _GEMM_SASS_PROBE = textwrap.dedent(r"""
     import cutlass
     import cutlass.cute as cute
     from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
     from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_cgrp_tile_mn, _stage3_params
-    p_dk, p_dq = _stage3_params(DTYPE_BF16, causal=(mask == "causal"), shift=0, gran=256, trim=True, cgrp_tile_mn=_stage3_cgrp_tile_mn(107, 256))
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT
+    # The fp8 arm's records exactly as the fp8 adapter builds them (GQA: dK DESCALE, dQ QUANT; MHA: both QUANT).
+    ARMS = {"bf16": (DTYPE_BF16, (EPI_NONE, EPI_NONE), -1), "fp8-descale": (DTYPE_E4M3, (EPI_DESCALE, EPI_QUANT), DTYPE_E4M3),
+            "fp8-quant-e4m3": (DTYPE_E4M3, (EPI_QUANT, EPI_QUANT), DTYPE_E4M3), "fp8-quant-bf16": (DTYPE_E4M3, (EPI_QUANT, EPI_QUANT), DTYPE_BF16)}
+    ds_code, epi_modes, dtype_out = ARMS[arm]
+    p_dk, p_dq = _stage3_params(ds_code, causal=(mask == "causal"), shift=0, gran=256, trim=True, cgrp_tile_mn=_stage3_cgrp_tile_mn(107, 256), epi_modes=epi_modes, dtype_out=dtype_out)
     params = p_dq if major == "dq" else p_dk
-    mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="sass_probe_stage3_" + major)
+    mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="sass_probe_stage3_" + major + "_" + arm)
     print("PARAMS", repr(params))
-    for name in ("cgrp_tile_mnk", "cta_tile_mnk", "cluster_shape_mnk", "ab_stages", "acc_stages", "mma_size_m", "multicast_a", "a_mcast_slices", "ab_empty_full_mask"):
+    for name in ("cgrp_tile_mnk", "cta_tile_mnk", "cluster_shape_mnk", "ab_stages", "acc_stages", "mma_size_m", "multicast_a", "a_mcast_slices", "ab_empty_full_mask",
+                 "mma_inst_shape_mnk", "mma_k_dim", "mma_size_k", "epi_mode", "_EPI_ROW_BYTES"):
         print("CONST", name, repr(getattr(mod, name)))
+    print("CONST mma_kind", str(mod.mma_kind))
     layout = mod._smem_layout_bytes()
     for name in ("smem_a_0", "smem_b_0", "smem_d", "total"):
         print("SMEM", name, layout[name])
     S_Q, S_KV, H, B, D = 1024, 1024, 8, 1, 256
     a_m_major = bool(params.a_is_m_major)
+    epi = int(params.epi_mode)
 
     @cute.jit
-    def probe(entry: cutlass.Constexpr, a_ptr: cute.Pointer, b_ptr: cute.Pointer, c_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer, stream):
+    def probe(entry: cutlass.Constexpr, a_ptr: cute.Pointer, b_ptr: cute.Pointer, c_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer,
+              d0_ptr: cute.Pointer, d1_ptr: cute.Pointer, s_ptr: cute.Pointer, amax_ptr: cute.Pointer, stream):
         if cutlass.const_expr(a_m_major):
             a = cute.make_tensor(a_ptr, cute.make_layout((S_Q, S_KV, H, B), stride=(1, S_Q, S_KV * S_Q, H * S_KV * S_Q)))
             b = cute.make_tensor(b_ptr, cute.make_layout((D, S_KV, H, B), stride=(1, H * D, D, S_KV * H * D)))
@@ -1858,12 +2011,19 @@ _GEMM_SASS_PROBE = textwrap.dedent(r"""
         meta = cute.make_tensor(meta_ptr, cute.make_layout((1,), stride=(1,)))
         desc = cute.make_tensor(desc_ptr, cute.make_layout((1,), stride=(1,)))
         problem = tuple(cutlass.Int64(x) for x in (a.shape[0], b.shape[0], a.shape[1], H, B, *a.stride, *b.stride, *c.stride, b.shape[1], a.shape[0], c.shape[0]))
-        entry(problem, a, b, c, meta, desc, stream)
+        if cutlass.const_expr(epi == EPI_NONE):
+            entry(problem, a, b, c, meta, desc, stream)  # the SM100 chain's positional seven arguments
+        else:
+            sc = cute.make_layout((1,), stride=(1,))
+            s_out = cute.make_tensor(s_ptr, sc) if cutlass.const_expr(epi == EPI_QUANT) else None
+            entry(problem, a, b, c, meta, desc, stream, cute.make_tensor(d0_ptr, sc), cute.make_tensor(d1_ptr, sc), s_out, cute.make_tensor(amax_ptr, sc) if cutlass.const_expr(epi == EPI_QUANT) else None)
 
     def ptr(t, align=16):
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
-    cute.compile(probe, mod._host, ptr(cutlass.BFloat16), ptr(cutlass.BFloat16), ptr(cutlass.BFloat16), ptr(cutlass.Int32, 4), ptr(cutlass.Int64, 8),
+    ab_dt, cd_dt = mod.ab_dtype, mod.cd_dtype
+    cute.compile(probe, mod._host, ptr(ab_dt), ptr(ab_dt), ptr(cd_dt), ptr(cutlass.Int32, 4), ptr(cutlass.Int64, 8),
+                 ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4),
                  cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
@@ -1887,58 +2047,91 @@ _GEMM_SASS_PROBE = textwrap.dedent(r"""
     print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
     print("SASS CGAERRBAR", cnt("CGAERRBAR"))
     print("SASS UTCMMA", cnt("UTCMMA") + cnt("UTCHMMA"))
+    print("SASS UTCQMMA", cnt("UTCQMMA"))
+    print("SASS FMNMX3", cnt("FMNMX3"))
+    print("SASS FSEL", cnt(" FSEL"))
+    print("SASS REDG_MAX", cnt("REDG.E.MAX"))
+    print("SASS F2FP", cnt("F2FP"))
     print("SASS LINES", len(sass))
     """)
 
 _GEMM_SASS_ROWS = [
-    pytest.param("dk", "dense", id="dk-dense"),
-    pytest.param("dq", "dense", id="dq-dense"),
-    pytest.param("dk", "causal", id="dk-causal"),
-    pytest.param("dq", "causal", id="dq-causal"),
+    pytest.param("dk", "dense", "bf16", id="dk-dense"),
+    pytest.param("dq", "dense", "bf16", id="dq-dense"),
+    pytest.param("dk", "causal", "bf16", id="dk-causal"),
+    pytest.param("dq", "causal", "bf16", id="dq-causal"),
+    # The fp8 arm as the fp8 adapter renders it: the GQA records (dK DESCALE -> bf16 partials, dQ QUANT -> e4m3 dQ), the MHA
+    # records (both QUANT -> e4m3) and the half-gradient variant (QUANT -> bf16 with scale 1.0).
+    pytest.param("dk", "causal", "fp8-descale", id="dk-causal-fp8-descale"),
+    pytest.param("dq", "causal", "fp8-descale", id="dq-causal-fp8-quant-e4m3"),
+    pytest.param("dk", "dense", "fp8-quant-e4m3", id="dk-dense-fp8-quant-e4m3"),
+    pytest.param("dq", "dense", "fp8-quant-bf16", id="dq-dense-fp8-quant-bf16"),
 ]
-# MEASURED on the branch's toolchain (cutlass-dsl 4.8.0 + the internal CUDA 13.5 ptxas, 2026-09-28): 0 / 0 on all four rows.
+# MEASURED on the branch's toolchain (cutlass-dsl 4.8.0 + the internal CUDA 13.5 ptxas, 2026-09-28): 0 / 0 on every row
+# (the fp8 arm's epilogue warps read REG 90-116 with the amax fold in registers).
 _GEMM_SPILL_PINS = {"STL": 0, "LDL": 0}
 _GEMM_SASS_CACHE = {}
 
 
-def _gemm_sass_probe(tmp_path, major, mask):
-    if (major, mask) in _GEMM_SASS_CACHE:
-        return _GEMM_SASS_CACHE[(major, mask)]
+def _gemm_sass_probe(tmp_path, major, mask, arm="bf16"):
+    if (major, mask, arm) in _GEMM_SASS_CACHE:
+        return _GEMM_SASS_CACHE[(major, mask, arm)]
     if not arch_known_to_the_dsl("sm_107a"):
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"sm107a_bwd_stage3_{major}_{mask}"
+    dump = tmp_path / f"sm107a_bwd_stage3_{major}_{mask}_{arm}"
     dump.mkdir()
     # From a FILE, not `-c`: the probe defines a `@cute.jit` wrapper and the DSL needs its source (`UNSUP_NO_SOURCE` otherwise).
     script = dump / "gemm_sass_probe.py"
     script.write_text(_GEMM_SASS_PROBE)
-    proc = subprocess.run([sys.executable, str(script), str(dump), major, mask, *cands], capture_output=True, text=True, timeout=900)
-    assert proc.returncode == 0, f"sm_107a trace-compile of the d256 stage-3 {major} {mask} rendering failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    proc = subprocess.run([sys.executable, str(script), str(dump), major, mask, arm, *cands], capture_output=True, text=True, timeout=900)
+    assert (
+        proc.returncode == 0
+    ), f"sm_107a trace-compile of the d256 stage-3 {major} {mask} {arm} rendering failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
     consts = {ln.split()[1]: ln.split(maxsplit=2)[2] for ln in out if ln.startswith("CONST ")}
     smem = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SMEM ")}
-    print(f"\nsm107 bwd stage-3 {major} {mask} sm_107a SASS: {stats}; {consts}; SMEM {smem}")
-    _GEMM_SASS_CACHE[(major, mask)] = (stats, consts, smem)
+    print(f"\nsm107 bwd stage-3 {major} {mask} {arm} sm_107a SASS: {stats}; {consts}; SMEM {smem}")
+    _GEMM_SASS_CACHE[(major, mask, arm)] = (stats, consts, smem)
     return stats, consts, smem
 
 
-@pytest.mark.parametrize("major, mask", _GEMM_SASS_ROWS)
-def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask):
-    """The shipped d256 rendering (what `_stage3_cgrp_tile_mn(107, 256)` selects), trace-compiled for sm_107a: the
-    (256, 256) row's constants reached the module, no stack spills, no GPU-scope drain on a per-tile path, and both
-    MMA-operand ring roots sit below 256 KiB -- so the version-0 tcgen05 SMEM descriptor is the right one at this
+@pytest.mark.parametrize("major, mask, arm", _GEMM_SASS_ROWS)
+def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask, arm):
+    """The shipped d256 renderings (what `_stage3_cgrp_tile_mn(107, 256)` selects, bf16 and the fp8 arm), trace-compiled
+    for sm_107a: the (256, 256) row's constants reached the module, no stack spills, no GPU-scope drain on a per-tile path,
+    and both MMA-operand ring roots sit below 256 KiB -- so the version-0 tcgen05 SMEM descriptor is the right one at this
     ring depth (a 9-stage Rubin row would put the B ring's UPPER stages past 256 KiB while its root stays below: the
-    per-stage advance is a bare add on the root, which is exactly why the ROOT is what is pinned)."""
-    stats, consts, smem = _gemm_sass_probe(tmp_path, major, mask)
-    assert consts["cgrp_tile_mnk"] == "(256, 256, 64)" and consts["cluster_shape_mnk"] == "(2, 1, 1)", consts
+    per-stage advance is a bare add on the root, which is exactly why the ROOT is what is pinned).  The fp8 arm additionally:
+    the K64 form (256x256x64, k_dim 1, two `UTCQMMA` k-blocks per stage -- the dense-FP8 MMA mnemonic), its QUANT epilogue's
+    amax fold on `FMNMX3` (never compare + select: no FSEL in any epilogue) with ONE per-warp `REDG.E.MAX` atomic site, and
+    the fp8 / bf16 output converts (`F2FP`)."""
+    stats, consts, smem = _gemm_sass_probe(tmp_path, major, mask, arm)
+    fp8 = arm != "bf16"
+    quant = arm.startswith("fp8-quant") or (arm == "fp8-descale" and major == "dq")
+    assert consts["cgrp_tile_mnk"] == ("(256, 256, 128)" if fp8 else "(256, 256, 64)") and consts["cluster_shape_mnk"] == "(2, 1, 1)", consts
     assert consts["ab_stages"] == "6" and consts["acc_stages"] == "2" and consts["mma_size_m"] == "1", consts
     assert consts["multicast_a"] == "False" and consts["a_mcast_slices"] == "1" and consts["ab_empty_full_mask"] == "False", consts
-    assert_no_new_spills(stats, _GEMM_SPILL_PINS, tag=f"stage-3 {major} {mask}: ")
+    if fp8:
+        assert consts["mma_inst_shape_mnk"] == "(256, 256, 64)" and consts["mma_k_dim"] == "1" and consts["mma_size_k"] == "2", consts
+        assert "f8f6f4" in consts["mma_kind"].lower(), consts
+        assert stats["UTCQMMA"] == 2 and stats["UTCMMA"] == 0, "the fp8 arm issues the dense-FP8 MMA (two K64 blocks per stage)"
+        assert stats["F2FP"] > 0, "the epilogue converts the descaled fp32 accumulator to the output dtype"
+        if quant:
+            assert stats["FMNMX3"] > 0 and stats["REDG_MAX"] == 1, "the QUANT epilogue's amax fold (max.f32 -> FMNMX3) and its ONE per-warp atomicMax site"
+        else:
+            assert stats["FMNMX3"] == 0 and stats["REDG_MAX"] == 0, "DESCALE has no amax fold and no atomic"
+        assert consts["_EPI_ROW_BYTES"] == ("64" if arm == "fp8-quant-e4m3" or (arm == "fp8-descale" and major == "dq") else "128"), consts
+    else:
+        assert consts["mma_inst_shape_mnk"] == "(256, 256, 16)" and consts["mma_k_dim"] == "0" and consts["mma_size_k"] == "4", consts
+        assert stats["UTCQMMA"] == 0 and stats["FMNMX3"] == 0 and stats["REDG_MAX"] == 0, "the bf16 rows carry no fp8 MMA, no amax fold, no atomicMax"
+    assert stats["FSEL"] == 0, "no compare + select in an epilogue (a cute.math.max would show as FSEL)"
+    assert_no_new_spills(stats, _GEMM_SPILL_PINS, tag=f"stage-3 {major} {mask} {arm}: ")
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
     assert smem["smem_a_0"] < _SMEM_DESC_V0_LIMIT and smem["smem_b_0"] < _SMEM_DESC_V0_LIMIT, smem
     assert smem["total"] <= _SM100_OPTIN_SMEM, smem

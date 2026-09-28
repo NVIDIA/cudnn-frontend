@@ -113,6 +113,7 @@ def _config(api):
         api._qh_chunk,
         bool(api._zero_ws),
         api.dtype.itemsize,
+        api._bpe_ds,  # the dS workspace's bytes per element (fp8 row: 1 = e4m3, 2 = the bf16 twin)
     )
 
 

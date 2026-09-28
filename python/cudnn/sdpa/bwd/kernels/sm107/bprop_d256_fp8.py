@@ -1,13 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM107 (Rubin) SDPA backward, d_qk = d_v = 256, per-tensor FP8 E4M3: dV in-kernel + bf16 dS workspace.
+"""SM107 (Rubin) SDPA backward, d_qk = d_v = 256, per-tensor FP8 E4M3: dV in-kernel + e4m3 (or bf16) dS workspace.
 
 One cga2 pair (CGA_M=2, CGA_N=1, CTA_MMA=2) owns one 256-row kv block of one (batch, head) and walks the q tiles that
 attend it.  It computes **dV in-kernel** (TMEM accumulator over the q loop, stored per Q-head) and writes **dS** to a
-GMEM workspace ``[B, H_chunk, S_kv, S_q]`` in **bf16**; the adapter runs the dK = dS.Q and dQ = dS^T.K GEMMs over that
-workspace (``kernels/bprop_matmul_blackwell.py``), folds GQA (``bprop_chain_common.dkv_reduce``) and quantizes the
-gradients.  lane = kv row (S = [kv, q]).  Twelve warps per CTA, ONE warp-specialized body:
+GMEM workspace ``[B, H_chunk, S_kv, S_q]`` as **e4m3** ``dS_q = e4m3(dS * scale_dP)`` (``CFG.DTYPE_DS = E4M3``, the cuDNN
+``sdpa_fp8_backward`` recipe; the adapter's dK = dS.Q / dQ = dS^T.K GEMMs run the fp8 K64 arm of
+``kernels/bprop_matmul_blackwell.py`` with the ``descale_dP`` epilogue) or as **bf16** (``DTYPE_DS = BF16``: the
+pre-quantized dS the bf16 GEMM renderings read unchanged -- the A/B twin, ``api_dsl_sm107.FP8_DS_DTYPE``).  lane = kv
+row (S = [kv, q]).  Twelve warps per CTA, ONE warp-specialized body:
 
     MMA leader (lookahead order, perf-critical):
         Q.K[q_lo] -> { dO.V[i] ; Q.K[i+1] ; P.dO[i] } -> dO.V[last] ; P.dO[last]
@@ -18,7 +20,7 @@ gradients.  lane = kv row (S = [kv, q]).  Twelve warps per CTA, ONE warp-special
         softmax : P_s = exp2(S * scale_log2 - lse_s)         (lse_s = lse*log2e - log2(scale_s), so P_s = P * scale_s)
                   -> transposed per-cell mask -> e4m3 -> TMEM P ring slot -> mb_p_ready (the dV BMM2 starts NOW)
         dsoftmax: dS = (dP * dp_scale - delta_s) * P_s        (= attn_scale * P * (dP_true - delta), fp32)
-                  -> amax_dP fold -> bf16 -> sdS SMEM ring -> TMASTG -> GMEM workspace
+                  -> amax_dP fold -> (* scale_dP -> e4m3 | bf16) -> sdS SMEM ring -> TMASTG -> GMEM workspace
     per kv tile (post q loop): dV epilogue = dV_acc * descale_s * descale_dO -> amax_dV fold -> (* scale_dV -> e4m3 |
         bf16 / fp16) -> sdV SMEM (aliases K+V, dead by then) -> TMASTG -> GMEM dV
     TMALDG: K, V once per kv tile; Q, dO (dP view) and dO_dv (dV view, second load of the SAME dO) per q iteration.
@@ -29,11 +31,13 @@ FP8 contract (cuDNN ``sdpa_fp8_backward``; every scale is a 1-element fp32 DEVIC
 host fold):  S_true = S_acc * descale_q * descale_k;  P_s = e4m3(P * scale_s) is the BMM2 A operand;
 dV_true = dV_acc * descale_s * descale_dO;  dP_true = dP_acc * descale_v * descale_dO;  dS = attn_scale * P *
 (dP_true - delta) with delta = rowsum(dO * O) in TRUE units (the adapter's fp8 ``dot_do_o`` arm applies
-descale_o * descale_dO);  amax_dV = max |dV_true|;  amax_dP = max |dS| over the fp32 value the bf16 workspace
-holds (attn_scale folded, pre-cast).  ``DTYPE_O`` = E4M3 (default: dV_q = e4m3(dV_true * scale_dV)) or BF16 / FP16
-(the pre-quantization output for the bitwise A/B against the pre-port kernel; ``scale_dV`` is then not applied).
+descale_o * descale_dO);  dS_q = e4m3(dS * scale_dP) is the stage-3 A operand (``DTYPE_DS`` = E4M3; at BF16 the
+workspace holds dS itself and ``scale_dP`` is not applied);  amax_dV = max |dV_true|;  amax_dP = max |dS| over the
+fp32 value BEFORE the scale and the cast (attn_scale folded -- what the C++ node's reduction sits on).  ``DTYPE_O`` =
+E4M3 (default: dV_q = e4m3(dV_true * scale_dV)) or BF16 / FP16 (the pre-quantization output for the bitwise A/B
+against the pre-port kernel; ``scale_dV`` is then not applied).
 
-Workspace head-chunking: the dS workspace is the dominant allocation (B * H * S_kv * S_q * 2 bytes).  ``compile(...,
+Workspace head-chunking: the dS workspace is the dominant allocation (B * H * S_kv * S_q * BPE_DS bytes).  ``compile(...,
 qh_chunk=)`` sizes the dS descriptor + the grid head axis to a chunk of heads; the runtime ``head_base`` offsets ALL
 full-tensor I/O (Q / K / V / dO / dV / lse / delta -> head_idx + head_base) while dS stays chunk-local.  The adapter
 loops ``H_q // qh_chunk`` launches (per batch entry when B > 1, or over the full batch when it fits).
@@ -45,7 +49,8 @@ TMEM (one ``tcgen05.alloc.cta_group::2`` of TOTAL_COLS = 576 per CTA, ``is_exclu
     [256, 512)  dV_acc  fp32 [kv, d_v]   BMM2 dV (accumulate=(q_iter > q_lo)) -> epilogue
     [512, 576)  fp8 P ring, 2 x P_COLS=32 (= TILE_N * BPE / 4)   softmax ``tcgen05_st`` -> BMM2 A operand (``mma_ts``)
 
-SMEM (declaration order == ``config_sm107.smem_layout``; every slab 1024-B aligned; byte offsets for the fp8 body)
+SMEM (declaration order == ``config_sm107.smem_layout``; every slab 1024-B aligned; byte offsets for the fp8 body at the
+default e4m3 dS -- the bf16-dS twin's sdS is 3 x 32 KiB = 96 KiB @210 and the slabs total 306 KiB)
     #  buffer      dtype x elems               KiB @off   writer (how)            reader (how)           lane stride     swizzle + WHY
     1  sQ          e4m3 x 3 x (64 x 256)        48 @  0   TMA (box 1,64,1,128 x2)  MMA desc, B of BMM1 S  --              128 B s128b: TMA write + MMA desc read (job 1)
     2  sdO         e4m3 x 3 x (64 x 256)        48 @ 48   TMA (box 1,64,1,128 x2)  MMA desc, B of BMM1 dP --              128 B, job 1
@@ -56,9 +61,13 @@ SMEM (declaration order == ``config_sm107.smem_layout``; every slab 1024-B align
     4c sdV (=4a+4b post-loop) OUT x 128 x 256   32|64@144 compute lanes store_swizzled(Swizzle(3,4,3))  TMA store  64 elems = 128 B (bf16) / 64 B (e4m3) per lane per block
                                                                                                                           Swizzle(3,4,3): row 128 B -> banks spread (job 2) AND matches the s128b store descriptor (job 1)
     5  sStats      fp32 x 2 x 256                2 @208   scheduler lanes (4 B stride, conflict-free)  compute lanes, same address on 32 lanes (broadcast)  LINEAR (job 2 by arithmetic; no descriptor)
-    6  sdS         bf16 x 3 x (128 x 128)       96 @210   compute lanes store_swizzled(Swizzle(3,4,3)) at slot + wg*8192 + tid*64   TMA store box (1,1,128,64) x2 subtiles
-                                                                                                          128 B per lane   Swizzle(3,4,3) row 128 B: job 2 spread + job 1 matches s128b
-    ~0.6 KiB scaffolding (mbarriers, scheduler slots, TMEM pointer) -> 306 KiB slabs + 2 KiB budget < 327 KiB (Rubin
+    6  sdS         e4m3 x 3 x (128 x 128)       48 @210   compute lanes store_swizzled(Swizzle(3,4,3)) at slot + tid*128 + wg*64 (each wg's 64 q cols =
+                                                          64 B = HALF of the lane's 128-B row; the XOR permutes 16-B chunks within the row, so the two
+                                                          halves stay disjoint)   TMA store box (1,1,128,128) x1 subtile   128 B per lane
+                                                          Swizzle(3,4,3) row 128 B: job 2 spread + job 1 matches s128b.  bf16 dS: 3 x 32 KiB, two
+                                                          64-col subtiles per row, wg w stores subtile w at slot + w*8192 + tid*64 (the SAME formula:
+                                                          blk = q_half // P_D_BLOCK, col_in_blk = q_half % P_D_BLOCK)
+    ~0.6 KiB scaffolding (mbarriers, scheduler slots, TMEM pointer) -> 258 KiB slabs + 2 KiB budget < 327 KiB (Rubin
     oversized cap; the launcher sets ALLOW_OVERSIZED_SHARED_MEMORY).  Every tcgen05 descriptor ROOT (sQ / sdO / sdOdv
     stages, sK, sV) is < 256 KiB -> DESC_VERSION = 0 (derived, never a literal).
 
@@ -110,7 +119,7 @@ arms and the K/V release commits are value-predicated (P16); dead knobs and the 
 ``qh``) returns a callable taking, POSITIONALLY (torch tensors bind through tvm-ffi):
 
     fn(q, do, k, v, dv, ds_ws, lse, delta,
-       descale_q, descale_k, descale_v, descale_do, descale_s, scale_s, scale_dv,
+       descale_q, descale_k, descale_v, descale_do, descale_s, scale_s, scale_dv, scale_dp,
        amax_dv | None, amax_dp | None,
        (b, qh, kh, sq, skv, qh_chunk),          # the compile-time problem_size tuple, repeated at the call
        attn_scale, attn_scale_log2e,            # cutlass.Float32: softmax scale, and attn_scale * log2(e)
@@ -121,7 +130,8 @@ arms and the K/V release commits are value-predicated (P16); dead knobs and the 
     v           e4m3  [B, S_kv, H_kv, 256]
     do          e4m3  [B, S_q, H_q, 256]                          (loaded twice: dP view and dV view)
     dv          OUT   [B, S_kv, H_q, 256]   per Q-HEAD partial (GQA fold is the adapter's dkv_reduce); e4m3 by default
-    ds_ws       bf16  [B, qh_chunk, S_kv, S_q]   chunk-local head axis; holds attn_scale * P * (dP_true - delta)
+    ds_ws       DS    [B, qh_chunk, S_kv, S_q]   chunk-local head axis; e4m3(dS * scale_dP) (DTYPE_DS = E4M3, default) or
+                                                 the fp32 dS = attn_scale * P * (dP_true - delta) rounded to bf16 (DTYPE_DS = BF16)
     lse         fp32  [B, H_q, S_q]  NATURAL-log LSE of the forward (the kernel applies log2e); rows past the real
                                      S_q must read +inf (P = 0) when the adapter pads S_q up to a multiple of 128
     delta       fp32  [B, H_q, S_q]  rowsum(dO * O) in TRUE units (fp8 inputs: * descale_o * descale_dO), UNSCALED
@@ -198,7 +208,10 @@ SPIN_RING_WAITS: bool = False
 # --- dtype dispatch (the config validated the codes; these are the DSL types they name) ---------------------------------
 STORAGE_DTYPE = cutlass.Float8E4M3FN  # CFG.DTYPE_QKV == DTYPE_E4M3 (the fp8 body is E4M3-only)
 MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
-DS_STORAGE_DTYPE = cutlass.BFloat16  # CFG.DTYPE_DS == DTYPE_BF16: the bf16 stage-3 GEMMs read the workspace unchanged
+# dS workspace storage: E4M3 (dS_q = e4m3(dS * scale_dP), the fp8 K64 GEMM arm's A operand) or BF16 (the pre-quantized dS the
+# bf16 GEMM renderings read unchanged; the A/B twin).  The config validated the code; every dS-ring constant below is BPE_DS-driven.
+DS_STORAGE_DTYPE = {DTYPE_BF16: cutlass.BFloat16, DTYPE_E4M3: cutlass.Float8E4M3FN}[CFG.DTYPE_DS]
+DS_IS_FP8: bool = CFG.DTYPE_DS == DTYPE_E4M3
 _OUT_DTYPES = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16}
 OUT_STORAGE_DTYPE = _OUT_DTYPES[CFG.DTYPE_O]
 OUT_IS_FP8: bool = CFG.DTYPE_O == DTYPE_E4M3
@@ -232,8 +245,8 @@ TMA_VO_SG1_GRANU_ELEMS = _B.TMA_VO_SG1_GRANU_ELEMS
 DV_D_BLOCK = _B.DV_D_BLOCK  # d_v elems per 128-B store subtile: 128 at e4m3 out, 64 at bf16 / fp16 out
 TMA_DV_ITERS = _B.TMA_DV_ITERS  # 2 (e4m3) / 4 (bf16) subtiles per dV row
 DV_BLOCK_SLAB = _B.DV_BLOCK_SLAB  # TILE_M x DV_D_BLOCK: one store subtile's slab
-P_TMA_ITERS = _B.P_TMA_ITERS  # 2: a 128-col bf16 dS row is two 128-B subtiles
-P_D_BLOCK = _B.P_D_BLOCK  # 64 q cols per dS subtile == one warpgroup's q half
+P_TMA_ITERS = _B.P_TMA_ITERS  # dS store subtiles per 128-col row: 1 at e4m3 (one 128-B row), 2 at bf16
+P_D_BLOCK = _B.P_D_BLOCK  # q cols per dS subtile: 128 at e4m3 (both warpgroups' halves in one row), 64 at bf16 (one half)
 P_BLOCK_ELEMS = _B.P_BLOCK_BYTES  # TILE_M x P_D_BLOCK elems per dS subtile (the pre-port misnomer is the config's)
 STATS_SLOT_ELEMS = _B.STATS_SLOT_ELEMS
 STATS_LSE_OFF = _B.STATS_LSE_OFF
@@ -267,8 +280,10 @@ if (CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS) % _DV_EPI_CHUNK or DV_D_BLOCK % _DV_EP
     raise ValueError(
         f"{__name__}: the dV epilogue walks {_DV_EPI_CHUNK}-col chunks; TILE_O/WGS={CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS}, DV_D_BLOCK={DV_D_BLOCK}"
     )
-if P_D_BLOCK != _SMX_CHUNK:
-    raise ValueError(f"{__name__}: a dS store subtile ({P_D_BLOCK} q cols) must be exactly one warpgroup's q half ({_SMX_CHUNK})")
+if P_D_BLOCK % _SMX_CHUNK:
+    raise ValueError(
+        f"{__name__}: a dS store subtile ({P_D_BLOCK} q cols) must be whole warpgroup q halves ({_SMX_CHUNK}); each wg stores its half at col_in_blk = q_half % P_D_BLOCK"
+    )
 
 # log2(e): the softmax uses exp2, so P * scale_s = exp2(S_acc * (attn_scale * descale_q * descale_k * log2e) - (lse * log2e
 # - log2(scale_s))).  attn_scale * log2e rides in the `attn_scale_log2e` scalar; the lse fold happens IN-KERNEL in the
@@ -489,7 +504,7 @@ def _kernel(
     tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
     # TMA descriptors -- stores
     tma_dv_desc: cutlass.GridConstant[tmap.TensorMap],  # dV -> [B, S_kv, H_q, d_v] OUT
-    tma_ds_desc: cutlass.GridConstant[tmap.TensorMap],  # dS -> workspace [B, H_chunk, S_kv, S_q] bf16
+    tma_ds_desc: cutlass.GridConstant[tmap.TensorMap],  # dS -> workspace [B, H_chunk, S_kv, S_q] (DS_STORAGE_DTYPE)
     # GMEM vectors
     lse_tensor: cute.Tensor,  # [B, H_q, S_q] fp32, natural log
     do_dot_tensor: cute.Tensor,  # [B, H_q, S_q] fp32 delta = rowsum(dO * O), true units, unscaled
@@ -501,6 +516,7 @@ def _kernel(
     descale_s_t: cute.Tensor,
     scale_s_t: cute.Tensor,
     scale_dv_t: cute.Tensor,
+    scale_dp_t: cute.Tensor,  # dS_q = e4m3(dS * scale_dP) at DTYPE_DS = E4M3; read, never applied at BF16
     amax_dv_tensor: Optional[cute.Tensor],
     amax_dp_tensor: Optional[cute.Tensor],
     # Scalars
@@ -527,6 +543,7 @@ def _kernel(
     _dsc_s = cutlass.Float32(cutlass.make_array_view(descale_s_t)[0])
     _scl_s = cutlass.Float32(cutlass.make_array_view(scale_s_t)[0])
     _scl_dv = cutlass.Float32(cutlass.make_array_view(scale_dv_t)[0])
+    _scl_dp = cutlass.Float32(cutlass.make_array_view(scale_dp_t)[0])
     # S_acc -> P * scale_s in ONE exp2: exp2(S_acc * s_scale_log2 - (lse * log2e - log2(scale_s))).
     s_scale_log2 = attn_scale_log2e * _dsc_q * _dsc_k
     lse_log2_shift = cute.math.log2(_scl_s)
@@ -537,6 +554,8 @@ def _kernel(
     # dV_true = dV_acc * descale_s * descale_dO (P_s and dO_q both dequantize); the e4m3 output then applies scale_dV.
     dv_scale = _dsc_s * _dsc_do
     dv_out_scale = _scl_dv
+    # dS_q = e4m3(dS * scale_dP): the stage-3 GEMMs undo it with descale_dP (their epilogue).  Dead at DTYPE_DS = BF16.
+    ds_out_scale = _scl_dp
 
     # --- SharedStorage: DECLARATION ORDER == config_sm107.smem_layout (the desc-root tally describes this layout) ------
     # Q ring (3 stages): B operand of BMM1 S (q-split, 64 q x 256 d_qk per CTA).
@@ -557,8 +576,8 @@ def _kernel(
     sdV_raw = cutlass.Array(sExcl_raw.data_ptr(), shape=dVBufferElems, dtype=OUT_STORAGE_DTYPE)
     # lse / delta prefetch ring (fp32, ~2 KiB).  K + V are live through the whole q loop, so it has its own backing.
     sStats_raw = cutlass.Array(cutlass.Float32, CFG.STATS_STAGES * STATS_SLOT_ELEMS, alignment=1024, space=cutlass.AddressSpace.smem)
-    # dS SMEM ring (bf16, XFER_STAGES deep): compute lanes store_swizzled dS[kv, q], the TMASTG TMA-stores each slot to
-    # the GMEM workspace.  LOCAL to each CTA (each CTA owns its 128 kv rows of the pair's block).
+    # dS SMEM ring (DS_STORAGE_DTYPE, XFER_STAGES deep): compute lanes store_swizzled dS[kv, q], the TMASTG TMA-stores each
+    # slot to the GMEM workspace.  LOCAL to each CTA (each CTA owns its 128 kv rows of the pair's block).
     sdS_raw = cutlass.Array(DS_STORAGE_DTYPE, CFG.XFER_STAGES * dSBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     # --- SmemTile wrappers (every one takes desc_version=DESC_VERSION) --------------------------------------------------
@@ -623,7 +642,7 @@ def _kernel(
         desc_version=DESC_VERSION,
     )
     # dS staging: TMA-store source only (no MMA reads it -> leading / stride are irrelevant, kept at the dS constants).
-    # A 128-col bf16 row is P_TMA_ITERS = 2 subtiles of P_D_BLOCK = 64 cols; subtile s of stage k starts at
+    # A 128-col row is P_TMA_ITERS subtiles of P_D_BLOCK cols (e4m3: 1 x 128, bf16: 2 x 64); subtile s of stage k starts at
     # k * dSBufferElems + s * P_BLOCK_ELEMS.
     sdS = SmemTile(
         base=sdS_raw,
@@ -742,6 +761,7 @@ def _kernel(
             dp_scale=dp_scale,
             dv_scale=dv_scale,
             dv_out_scale=dv_out_scale,
+            ds_out_scale=ds_out_scale,
             amax_dv_tensor=amax_dv_tensor,
             amax_dp_tensor=amax_dp_tensor,
             cta_in_pair=cta_in_pair,
@@ -849,6 +869,7 @@ def _softmax_warp_group(
     dp_scale,
     dv_scale,
     dv_out_scale,
+    ds_out_scale,
     amax_dv_tensor: Optional[cute.Tensor],
     amax_dp_tensor: Optional[cute.Tensor],
     cta_in_pair,
@@ -860,8 +881,8 @@ def _softmax_warp_group(
                 P_s = exp2(S * s_scale_log2 - lse_s); mask; e4m3 -> TMEM P ring slot; tcgen05_wait(STORE); arrive mb_p_ready
                 (EARLY, before dsoftmax, so the dV BMM2 overlaps the whole dsoftmax below).
       dsoftmax: wait mb_dp_full; tmem_load dP[q half]; tcgen05_wait(LOAD); arrive mb_dp_empty (frees dP for dO.V[i+1]);
-                dS = (dP * dp_scale - delta_s) * P_s; amax_dP fold; bf16 -> sdS ring slot (this wg's 64-col subtile);
-                fence_proxy; arrive mb_ds_smem_full; arrive mb_stats_empty.
+                dS = (dP * dp_scale - delta_s) * P_s; amax_dP fold (pre-scale, pre-cast); (* scale_dP -> e4m3 | bf16) ->
+                sdS ring slot (this wg's 64 q cols inside the lane's row); fence_proxy; arrive mb_ds_smem_full; arrive mb_stats_empty.
     Post q loop (per kv tile): wait mb_dv_ready; per 64-col chunk of this wg's d_v half: tmem_load dV; tcgen05_wait(LOAD);
     dV_true = acc * dv_scale; amax_dV fold; (* scale_dV ->) OUT dtype -> sdV (store_swizzled); fence_proxy; arrive
     mb_dv_stg_full; arrive mb_dv_acc_empty (frees dV TMEM for the next tile's P.dO[0], accumulate=False); the two amax
@@ -876,7 +897,11 @@ def _softmax_warp_group(
     wg_id = (warp_idx - cutlass.Int32(CFG.SOFTMAX_WG0_BASE)) // cutlass.Int32(CFG.SOFTMAX_WG_WARPS)
     q_half_off = wg_id * cutlass.Int32(_SMX_CHUNK)  # 0 or 64 q cols
     p_col_off = wg_id * cutlass.Int32(_SMX_CHUNK * CFG.BPE // 4)  # fp8 P TMEM col offset: 0 or 16
-    ds_wg_off = wg_id * cutlass.Int32(P_BLOCK_ELEMS)  # this wg's dS store subtile inside a ring slot
+    # This wg's 64 q cols inside a dS ring slot: subtile blk = q_half // P_D_BLOCK (its slab is blk * P_BLOCK_ELEMS), column
+    # col_in_blk = q_half % P_D_BLOCK inside the lane's 128-B swizzle row.  e4m3 (P_D_BLOCK = 128): blk 0, col 0 | 64 -- both
+    # halves in ONE row; bf16 (P_D_BLOCK = 64): blk = wg, col 0 -- one subtile per wg (the pre-port `wg * P_BLOCK_ELEMS`).
+    ds_blk = q_half_off // cutlass.Int32(P_D_BLOCK)
+    ds_wg_off = ds_blk * cutlass.Int32(P_BLOCK_ELEMS) + (q_half_off - ds_blk * cutlass.Int32(P_D_BLOCK))
     dv_col_base = wg_id * cutlass.Int32(CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS)  # this wg's d_v half
 
     is_valid_tile = cutlass.Int32(1)
@@ -967,14 +992,19 @@ def _softmax_warp_group(
                 # amax_dP = max |dS| of the fp32 value the workspace holds (attn_scale folded, pre-bf16-cast); masked cells
                 # are exact zeros.  Ternary abs-max tree on max.f32 (FMNMX3), never cute.math.max (compare + select).
                 _amax_dp_tile = fmax_f32(_amax_dp_tile, abs_max_tree([chunk_dS[i] for i in range(_SMX_CHUNK)]))
-            chunk_dS_bf16 = chunk_dS.to(DS_STORAGE_DTYPE)
+            # The workspace value: dS_q = e4m3(dS * scale_dP) (the fp8 GEMM arm undoes the scale with descale_dP) or the bf16 dS.
+            if cutlass.const_expr(DS_IS_FP8):
+                chunk_dS_ws = (chunk_dS * ds_out_scale).to(DS_STORAGE_DTYPE)
+            else:
+                chunk_dS_ws = chunk_dS.to(DS_STORAGE_DTYPE)
             ds_slot = ds_empty_state.idx
             bars.mb_ds_smem_empty[ds_slot].wait(ds_empty_state.phase, spin=SPIN_RING_WAITS)
             ds_empty_state = advance(ds_empty_state, CFG.XFER_STAGES)
-            # dS SMEM [kv, q] as two 128-B-row subtiles per slot: this wg's subtile, row = this lane's kv row (64 bf16 =
-            # 128 B under Swizzle(3, 4, 3) -- job 2 bank spread, job 1 the s128b store descriptor).
+            # dS SMEM [kv, q]: 128-B-row subtiles per slot under Swizzle(3, 4, 3) (job 2 bank spread, job 1 the s128b store
+            # descriptor); this lane's kv row at this wg's columns (ds_wg_off).  e4m3: 64 B = half the row (the XOR permutes
+            # the row's 16-B chunks, so the two wgs' halves stay disjoint); bf16: 64 x 2 B = the whole row of wg's own subtile.
             (sdS_raw.subview(ds_slot * cutlass.Int32(dSBufferElems) + ds_wg_off + tid_in_wg * cutlass.Int32(P_D_BLOCK))).data_ptr().store_swizzled(
-                chunk_dS_bf16, alignment=128, swizzle=STAGING_SMEM_SWIZZLE
+                chunk_dS_ws, alignment=_SMX_CHUNK * CFG.BPE_DS, swizzle=STAGING_SMEM_SWIZZLE
             )
             # Generic SMEM writes -> async-proxy TMA store: the real proxy fence (rules/frost-tile-dsl.md S1).
             nvvm.fence_proxy("async.shared", space="cta")
@@ -1266,8 +1296,8 @@ def _tmastg_warp(tma_dv_desc, tma_ds_desc, sdV, sdS, bars, sched, seqlen_q, seql
             ds_slot = ds_full_state.idx
             bars.mb_ds_smem_full[ds_slot].wait(ds_full_state.phase, spin=SPIN_RING_WAITS)
             ds_full_state = advance(ds_full_state, CFG.XFER_STAGES)
-            # Workspace [B, H_chunk, S_kv, S_q] -> coords innermost-first (S_q, S_kv, H, B); box (1, 1, TILE_M, P_D_BLOCK),
-            # walked over the P_TMA_ITERS subtiles by tma_store_tile.  dS stays CHUNK-local (grid head, no head_base).
+            # Workspace [B, H_chunk, S_kv, S_q] -> coords innermost-first (S_q, S_kv, H, B); box (1, 1, TILE_M, P_D_BLOCK) =
+            # 128-B rows, walked over the P_TMA_ITERS subtiles by tma_store_tile.  dS stays CHUNK-local (grid head, no head_base).
             tma_store_tile(sdS[ds_slot], tma_ds(q_col_base, kv_block_base + KV_ROW_OFFSET_PEER, head_idx, batch_idx))
             tma_store_commit()
             tma_store_wait(0)
@@ -1528,7 +1558,7 @@ def _host(
     k_tensor: cute.Tensor,  # [B, S_kv, H_kv, d_qk] e4m3
     v_tensor: cute.Tensor,  # [B, S_kv, H_kv, d_v]  e4m3
     dv_tensor: cute.Tensor,  # out [B, S_kv, H_q, d_v] OUT dtype (per Q-head partial)
-    ds_tensor: cute.Tensor,  # out [B, H_chunk, S_kv, S_q] bf16 workspace (the dK / dQ GEMM A operand)
+    ds_tensor: cute.Tensor,  # out [B, H_chunk, S_kv, S_q] DS_STORAGE_DTYPE workspace (the dK / dQ GEMM A operand)
     lse_tensor: cute.Tensor,  # [B, H_q, S_q] fp32 natural-log LSE
     do_dot_tensor: cute.Tensor,  # [B, H_q, S_q] fp32 delta, true units
     descale_q_t: cute.Tensor,
@@ -1538,6 +1568,7 @@ def _host(
     descale_s_t: cute.Tensor,
     scale_s_t: cute.Tensor,
     scale_dv_t: cute.Tensor,
+    scale_dp_t: cute.Tensor,
     amax_dv_tensor: Optional[cute.Tensor],
     amax_dp_tensor: Optional[cute.Tensor],
     problem_size: Tuple[int, int, int, int, int, int],  # (B, QH, KH, SQ, SKV, QH_CHUNK)
@@ -1556,7 +1587,7 @@ def _host(
     v_box = (1, CFG.TILE_M, 1, TMA_VO_GRANU_ELEMS)  # V   (M-split kv)
     do_dv_box = (1, CFG.TILE_N, 1, CFG.TILE_O // CFG.CTA_MMA)  # dO  (BMM2 dV B, BT): full TILE_N q x TILE_O / CTA_MMA d_v
     dv_box = (1, CFG.TILE_M, 1, DV_D_BLOCK)  # dV store subtile: TILE_M kv x DV_D_BLOCK d_v = 128 B rows
-    ds_box = (1, 1, CFG.TILE_M, P_D_BLOCK)  # dS store subtile: TILE_M kv x P_D_BLOCK q bf16 = 128 B rows
+    ds_box = (1, 1, CFG.TILE_M, P_D_BLOCK)  # dS store subtile: TILE_M kv x P_D_BLOCK q (x BPE_DS) = 128 B rows
     stride_order = (3, 2, 1, 0)
 
     def _tma_swz(byte_w: int):
@@ -1611,6 +1642,7 @@ def _host(
         descale_s_t,
         scale_s_t,
         scale_dv_t,
+        scale_dp_t,
         amax_dv_tensor,
         amax_dp_tensor,
         cutlass.Int32(SQ),
@@ -1666,7 +1698,7 @@ def compile(  # noqa: A001
     fake_k = _fake_bshd((b, skv, kh, CFG.TILE_K), STORAGE_DTYPE)
     fake_v = _fake_bshd((b, skv, kh, CFG.TILE_O), STORAGE_DTYPE)
     fake_dv = _fake_bshd((b, skv, qh, CFG.TILE_O), OUT_STORAGE_DTYPE)
-    # dS workspace [B, H_chunk, S_kv, S_q] bf16: the kv-major layout the dK = dS.Q GEMM reads un-permuted.
+    # dS workspace [B, H_chunk, S_kv, S_q] (e4m3 | bf16): the kv-major layout the dK = dS.Q GEMM reads un-permuted.
     fake_ds = _fake_bshd((b, qh_chunk, skv, sq), DS_STORAGE_DTYPE)
     fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
     fake_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
@@ -1690,6 +1722,7 @@ def compile(  # noqa: A001
         _fake_scale(),  # descale_s
         _fake_scale(),  # scale_s
         _fake_scale(),  # scale_dv
+        _fake_scale(),  # scale_dp
         fake_amax_dv,
         fake_amax_dp,
         (b, qh, kh, sq, skv, qh_chunk),

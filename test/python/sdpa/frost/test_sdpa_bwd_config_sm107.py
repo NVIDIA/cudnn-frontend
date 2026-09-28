@@ -83,19 +83,24 @@ def _validate(family, **overrides):
 
 
 @pytest.mark.parametrize(
-    "family, dtype_qkv, dtype_o, want_o, want_ds",
+    "family, dtype_qkv, dtype_o, dtype_ds, want_o, want_ds",
     [
-        (FAMILY_F16, DTYPE_BF16, -1, DTYPE_BF16, DTYPE_BF16),
-        (FAMILY_F16, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_FP16),
-        (FAMILY_F16, DTYPE_BF16, DTYPE_FP16, DTYPE_FP16, DTYPE_BF16),
-        # fp8: E4M3 io; grads default to E4M3 (the fp8 graph contract), dS is BF16 for the bf16 GEMMs
-        (FAMILY_FP8, DTYPE_E4M3, -1, DTYPE_E4M3, DTYPE_BF16),
-        (FAMILY_FP8, DTYPE_E4M3, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16),
-        (FAMILY_FP8, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP16, DTYPE_BF16),
+        (FAMILY_F16, DTYPE_BF16, -1, -1, DTYPE_BF16, DTYPE_BF16),
+        (FAMILY_F16, DTYPE_FP16, -1, -1, DTYPE_FP16, DTYPE_FP16),
+        (FAMILY_F16, DTYPE_BF16, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_BF16),
+        (FAMILY_F16, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_FP16, DTYPE_FP16),
+        # fp8: E4M3 io; grads default to E4M3 (the fp8 graph contract); dS defaults to E4M3 (dS_q = e4m3(dS * scale_dP) for the
+        # fp8 GEMM arm) and takes BF16 explicitly (the pre-quantized twin the bf16 GEMM renderings read)
+        (FAMILY_FP8, DTYPE_E4M3, -1, -1, DTYPE_E4M3, DTYPE_E4M3),
+        (FAMILY_FP8, DTYPE_E4M3, DTYPE_BF16, -1, DTYPE_BF16, DTYPE_E4M3),
+        (FAMILY_FP8, DTYPE_E4M3, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_E4M3),
+        (FAMILY_FP8, DTYPE_E4M3, -1, DTYPE_E4M3, DTYPE_E4M3, DTYPE_E4M3),
+        (FAMILY_FP8, DTYPE_E4M3, -1, DTYPE_BF16, DTYPE_E4M3, DTYPE_BF16),
+        (FAMILY_FP8, DTYPE_E4M3, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16),
     ],
 )
-def test_accepts_every_dtype_member(family, dtype_qkv, dtype_o, want_o, want_ds):
-    cfg = _cfg(family, dtype_qkv=dtype_qkv, dtype_o=dtype_o)
+def test_accepts_every_dtype_member(family, dtype_qkv, dtype_o, dtype_ds, want_o, want_ds):
+    cfg = _cfg(family, dtype_qkv=dtype_qkv, dtype_o=dtype_o, dtype_ds=dtype_ds)
     assert (cfg.DTYPE_QKV, cfg.DTYPE_O, cfg.DTYPE_DS) == (dtype_qkv, want_o, want_ds)
     assert (cfg.BPE, cfg.BPE_O, cfg.BPE_DS) == (cfgmod.bpe(dtype_qkv), cfgmod.bpe(want_o), cfgmod.bpe(want_ds))
     assert cfg.IS_FP8 == (family == FAMILY_FP8)
@@ -153,6 +158,10 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
         (FAMILY_FP8, dict(dtype_o=9), r"dtype_o must be -1 \(inherit -> E4M3"),
         (FAMILY_F16, dict(dtype_qkv=DTYPE_E4M3), r"f16 body takes DTYPE_BF16.*belongs to the fp8 body"),
         (FAMILY_F16, dict(dtype_o=DTYPE_E4M3), r"dtype_o must be -1 \(inherit the io dtype\)"),
+        (FAMILY_FP8, dict(dtype_ds=DTYPE_FP16), r"dtype_ds must be -1 \(inherit -> E4M3.*DTYPE_BF16 \(the pre-quantized dS"),
+        (FAMILY_FP8, dict(dtype_ds=DTYPE_E5M2), r"dtype_ds must be -1 \(inherit -> E4M3"),
+        (FAMILY_F16, dict(dtype_ds=DTYPE_E4M3), r"dtype_ds must be -1 or the io dtype"),
+        (FAMILY_F16, dict(dtype_qkv=DTYPE_BF16, dtype_ds=DTYPE_FP16), r"dtype_ds must be -1 or the io dtype \(2\)"),
         (FAMILY_F16, dict(window_left=0), r"SWA requires window_left > 0"),
         (FAMILY_FP8, dict(window_left=-5), r"SWA requires window_left > 0"),
         (FAMILY_F16, dict(window_right=64), r"window_right must be 0 when set.*Right-band widening"),
@@ -236,7 +245,9 @@ _FP8_CFG_REJECTS = [
     (dict(TILE_K_HW_BMM1=32, TILE_K_HW_BMM2=32), r"K=64 path and EVERY idesc must pass k_dim=1.*scrambles accumulator ROWS"),
     (dict(IDESC_K_DIM=0), r"EVERY idesc must pass k_dim=1"),
     (dict(N_BMM2_CHUNKS=4, BMM2_CHUNK_SIZE=32), r"BMM2_CHUNK_SIZE == TILE_K_HW_BMM2"),
-    (dict(DTYPE_DS=DTYPE_E4M3, BPE_DS=1), r"dS workspace as BF16.*fp8 GEMM arm"),
+    (dict(DTYPE_DS=DTYPE_FP16, BPE_DS=2), r"dS workspace is E4M3 .*or BF16 .*silent garbage gradients"),
+    # a dS subtile narrower than a warpgroup's q half: P_D_BLOCK = TILE_N * BPE_DS / dS_SWZ_BYTES = 32 at a 32-B swizzle row
+    (dict(dS_SWZ_BYTES=32, P_SWZ_BYTES=32), r"whole warpgroup q halves|ONE unit and must both be 128 B"),
     (dict(K_SPLIT_UTCCP=1), r"fp8 body has no BMM1 K-split"),
     (dict(STAGES_Q=2), r"Q / dO rings are 3-deep in this body"),
     (dict(STAGES_dO_DV=2), r"drives the dO_dv ring at STAGES_dO"),
@@ -272,8 +283,9 @@ def test_rejects_every_f16_cfg_predicate(overrides, match):
 @pytest.mark.parametrize("family", [FAMILY_F16, FAMILY_FP8])
 def test_rejects_a_slab_layout_over_the_rubin_cap(family, monkeypatch):
     """No field flip reaches the cap on a valid cfg (every depth is pinned), so
-    shrink the budget: the message must carry the per-slab tally."""
-    monkeypatch.setattr(cfgmod, "SMEM_USABLE_BYTES", 300 * _KiB)
+    shrink the budget below both bodies' slabs (f16 322 KiB, fp8 258 KiB at the e4m3 dS): the message must carry the
+    per-slab tally."""
+    monkeypatch.setattr(cfgmod, "SMEM_USABLE_BYTES", 250 * _KiB)
     with pytest.raises(ValueError, match=r"exceed the 327 KiB Rubin oversized per-CTA cap \(sQ .* \| sdS .*\)"):
         _cfg(family)
 
@@ -294,7 +306,7 @@ def test_rejects_scaffolding_over_its_budget(family, monkeypatch):
     "family, slab_kib, names",
     [
         (FAMILY_F16, 322, ["sQ", "sdO", "sCombined[sdOdv_s0|K|V](+sdV alias)", "sStats", "sdS"]),
-        (FAMILY_FP8, 306, ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "sdS"]),
+        (FAMILY_FP8, 258, ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "sdS"]),
     ],
 )
 def test_smem_tally_and_declaration_order(family, slab_kib, names):
@@ -337,10 +349,18 @@ def test_fp8_layout_offsets():
     assert [roots[f"sdO_dv[{s}]"] for s in range(3)] == [96 * _KiB, 112 * _KiB, 128 * _KiB]
     assert roots["sK"] == 144 * _KiB and roots["sV"] == 176 * _KiB
     by_name = {s.name: s for s in smem_layout(cfg)}
-    # bf16 dS: 3 x 32 KiB, and every dS figure follows BPE_DS, not BPE
-    assert by_name["sdS"].nbytes == 96 * _KiB
+    # e4m3 dS (the default): 3 x 16 KiB, ONE 128-col store subtile per 128-B row (both warpgroups' halves in it); every dS
+    # figure follows BPE_DS, not BPE
+    assert by_name["sdS"].nbytes == 48 * _KiB and by_name["sdS"].offset == 210 * _KiB
     b = buffer_elems(cfg)
-    assert (b.P_TMA_ITERS, b.P_D_BLOCK, b.pXferBytes) == (2, 64, 32 * _KiB)
+    assert (b.P_TMA_ITERS, b.P_D_BLOCK, b.pXferBytes) == (1, 128, 16 * _KiB)
+    assert b.P_D_BLOCK % b._SMX_CHUNK == 0
+    # the bf16-dS twin: 3 x 32 KiB, two 64-col subtiles per row (one per warpgroup), 306 KiB of slabs
+    cfg_bf16 = _cfg(FAMILY_FP8, dtype_ds=DTYPE_BF16)
+    b_bf16 = buffer_elems(cfg_bf16)
+    assert {s.name: s for s in smem_layout(cfg_bf16)}["sdS"].nbytes == 96 * _KiB and smem_bytes(cfg_bf16) == 306 * _KiB
+    assert (b_bf16.P_TMA_ITERS, b_bf16.P_D_BLOCK, b_bf16.pXferBytes) == (2, 64, 32 * _KiB)
+    assert dict(desc_roots(cfg_bf16)) == roots, "the dS dtype moves nothing a descriptor reads (sdS is TMA-only and last)"
     # e4m3 dV: 2 store subtiles of 128 d cols; a bf16 dV: 4 of 64
     assert (b.TMA_DV_ITERS, b.DV_D_BLOCK) == (2, 128)
     b2 = buffer_elems(_cfg(FAMILY_FP8, dtype_o=DTYPE_BF16))
@@ -428,8 +448,10 @@ def test_head_chunk_rejects(h_q, h_kv, chunk, match):
 def test_workspace_and_grid_helpers():
     cfg = _cfg(FAMILY_FP8)
     assert (cfgmod.q_pad_rows(cfg), cfgmod.kv_pad_rows(cfg)) == (128, 256)
-    # bf16 dS on the fp8 chain: 2 B per cell
-    assert ds_workspace_bytes(cfg, 1, 128, 8192, 8192) == 128 * 8192 * 8192 * 2
+    # e4m3 dS on the fp8 chain (the default): 1 B per cell; the bf16 twin: 2
+    assert ds_workspace_bytes(cfg, 1, 128, 8192, 8192) == 128 * 8192 * 8192
+    assert ds_workspace_bytes(_cfg(FAMILY_FP8, dtype_ds=DTYPE_BF16), 1, 128, 8192, 8192) == 128 * 8192 * 8192 * 2
+    assert ds_workspace_bytes(_cfg(FAMILY_F16), 1, 128, 8192, 8192) == 128 * 8192 * 8192 * 2
     with pytest.raises(ValueError, match=r"padded to q 128 / kv 256 rows"):
         ds_workspace_bytes(cfg, 1, 1, 8000, 8192)
     assert launch_grid(cfg, 2, 8, 8192) == ((32 * 2, 8, 2), (2, 1, 1))

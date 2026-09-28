@@ -218,6 +218,13 @@ class TemplateParams(_BwdTemplateParams):
     # the fp8 family is the pre-quantization output used for the bitwise A/B
     # against the pre-port kernel.
     dtype_o: int = -1
+    # dS GMEM-workspace storage dtype.  -1 = inherit: the io dtype on the f16
+    # family, E4M3 on the fp8 family (dS_q = e4m3(dS * scale_dP), the cuDNN
+    # ``sdpa_fp8_backward`` recipe -- the stage-3 GEMMs then run the fp8 K64
+    # arm over the e4m3 payloads).  BF16 on the fp8 family is the pre-quantized
+    # dS the bf16 stage-3 renderings consume unchanged (the A/B twin,
+    # ``api_dsl_sm107.FP8_DS_DTYPE``); the f16 family takes only its io dtype.
+    dtype_ds: int = -1
     # Informational only: the main kernel is sink-agnostic (dQ/dK/dV are already
     # sink-correct through the sink-aware LSE the forward wrote); it gates the
     # separate dsink reduction launch in the adapter.  No body effect.
@@ -261,7 +268,9 @@ class CfgBwdD256:
     IS_FP8: int = 0
     # FROST-only: dS GMEM-workspace dtype.  f16: the io dtype (the stage-3 GEMMs
     # read the workspace as the io dtype -- a mismatch is silent garbage).  fp8:
-    # BF16, so the bf16 GEMM renderings consume it unchanged.  EVERY dS-ring
+    # E4M3 by default (dS_q = e4m3(dS * scale_dP); the stage-3 GEMMs run the fp8
+    # K64 arm with a descale epilogue), or BF16 (the pre-quantized dS the bf16
+    # GEMM renderings consume unchanged -- the A/B twin).  EVERY dS-ring
     # constant (SMEM bytes, TMA box, subtile count, swizzle row) derives from
     # BPE_DS, never from BPE: with an e4m3 io and a bf16 dS the two geometries
     # differ, and a dS walk borrowed from BPE passes every f16 test and fails
@@ -823,9 +832,15 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
     """Guard the record a Rubin d256 backward body can express.  Every raise
     here must also be a Capabilities decline -- reaching it is an engine-row bug."""
     dtype_o = getattr(params, "dtype_o", -1)
+    dtype_ds = getattr(params, "dtype_ds", -1)
     if params.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be a tile_dsl DTYPE_* code (E4M3=0 E5M2=1 BF16=2 FP16=3); got {params.dtype_qkv}")
     if family == FAMILY_FP8:
+        if dtype_ds not in (-1, DTYPE_E4M3, DTYPE_BF16):
+            raise ValueError(
+                f"{flavor}: dtype_ds must be -1 (inherit -> E4M3: dS_q = e4m3(dS * scale_dP) for the fp8 K64 GEMM arm), DTYPE_E4M3 or "
+                f"DTYPE_BF16 (the pre-quantized dS the bf16 GEMM renderings read unchanged -- the A/B twin); got {dtype_ds}"
+            )
         if params.dtype_qkv != DTYPE_E4M3:
             raise ValueError(
                 f"{flavor}: the fp8 body is E4M3-only (dtype_qkv={DTYPE_E4M3}); got {params.dtype_qkv}"
@@ -843,6 +858,11 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
             )
         if dtype_o not in (-1, DTYPE_BF16, DTYPE_FP16):
             raise ValueError(f"{flavor}: dtype_o must be -1 (inherit the io dtype), DTYPE_BF16 or DTYPE_FP16 on the f16 body; got {dtype_o}")
+        if dtype_ds not in (-1, params.dtype_qkv):
+            raise ValueError(
+                f"{flavor}: dtype_ds must be -1 or the io dtype ({params.dtype_qkv}) on the f16 body -- its bf16 / fp16 stage-3 GEMMs read the workspace "
+                f"as the io dtype; got {dtype_ds}"
+            )
     # --- band -----------------------------------------------------------------
     if params.window_left is not None and params.window_left <= 0:
         raise ValueError(
@@ -1010,9 +1030,15 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                     f"{flavor}: the fp8 BMM2 P chunk must be the K=64 hardware k-step (BMM2_CHUNK_SIZE == TILE_K_HW_BMM2)",
                 ),
                 (
-                    cfg.DTYPE_DS == DTYPE_BF16,
-                    f"{flavor}: the fp8 chain writes its dS workspace as BF16 so the bf16 stage-3 GEMM renderings consume it unchanged (got DTYPE_DS={cfg.DTYPE_DS}); "
-                    f"an fp8 dS needs the fp8 GEMM arm (dequant epilogue + K64 idesc), which is a follow-up",
+                    cfg.DTYPE_DS in (DTYPE_E4M3, DTYPE_BF16),
+                    f"{flavor}: the fp8 chain's dS workspace is E4M3 (dS_q = e4m3(dS * scale_dP); the stage-3 GEMMs render the fp8 K64 arm with the "
+                    f"descale_dP epilogue, api_dsl_sm107 FP8_DS_DTYPE) or BF16 (the pre-quantized dS the bf16 renderings read unchanged); got "
+                    f"DTYPE_DS={cfg.DTYPE_DS} -- a workspace dtype the GEMM arm does not read is silent garbage gradients",
+                ),
+                (
+                    b.P_D_BLOCK % b._SMX_CHUNK == 0,
+                    f"{flavor}: a dS store subtile ({b.P_D_BLOCK} q cols = {cfg.dS_SWZ_BYTES} B at BPE_DS={cfg.BPE_DS}) must be whole warpgroup q halves "
+                    f"({b._SMX_CHUNK} cols): each warpgroup store_swizzled's its half at col_in_blk = q_half % P_D_BLOCK inside the 128-B swizzle row",
                 ),
                 (
                     cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16),
@@ -1186,7 +1212,9 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     dtype_o = getattr(params, "dtype_o", -1)
     if dtype_o < 0:
         dtype_o = DTYPE_E4M3 if is_fp8 else params.dtype_qkv
-    dtype_ds = DTYPE_BF16 if is_fp8 else params.dtype_qkv
+    dtype_ds = getattr(params, "dtype_ds", -1)
+    if dtype_ds < 0:
+        dtype_ds = DTYPE_E4M3 if is_fp8 else params.dtype_qkv
     mask_flags = _mask_flags_from(params)
     tile_k_hw = 64 if is_fp8 else 16
     # Register split.  The pool setmaxnreg redistributes is the LAUNCH allocation, 12 x 168 = 2016 (reg_entry_pool),
