@@ -996,13 +996,13 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. Other admitted non-RoPE head dimensions and layouts use prepared bitwise
+width. Other admitted head dimensions and layouts use prepared bitwise
 gather/pad and scatter kernels in caller workspace around the same native GQA
 host. Q/K padding preserves the original attention scale; sink conversion remains
 inside attention. Native operands bind directly without redundant copies. The
 standalone dense wrapper keys plans by input strides and supplies current scratch.
 The capability envelope is unchanged; standalone RoPE retains its angle-table
-and tensor staging. All forward entries share prepared host lowering;
+preprocessing and uses prepared data copies. All forward entries share prepared host lowering;
 the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
