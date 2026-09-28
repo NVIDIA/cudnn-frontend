@@ -479,3 +479,12 @@ A `stream_context(None, device)` is deliberately a no-op; it does not select the
 operand device. Packed wrappers must guard that device for both compilation and
 pointer launch and restore the caller. Test a foreign current device on both
 operand GPUs, with default and explicit streams; validate outputs after the call.
+
+Same-dtype `to(dtype)` preserves a sliced input's strides, and `reshape` can
+preserve them too. When a wrapper declares compact lengths or sinks to the
+graph, explicitly normalize both layout and pointer alignment before binding.
+`sdpa/torch/test_aux_metadata.py` pins backend and FROST plans with strided
+native metadata and checks changed-input replay; the old backend silently read
+gap values while FROST rejected the inconsistent declaration. Performance
+comparisons must use a numerically valid baseline, such as dtype-converting
+inputs or an explicit compact-copy control, rather than time the wrong result.
