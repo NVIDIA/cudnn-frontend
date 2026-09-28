@@ -13,9 +13,13 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell]
 
 
-def _case(d=128, dv=128, dtype=torch.bfloat16, converted=("q", "k", "v", "o"), split=1, b=2):
+def _require_half_arch():
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100/SM103/SM107 half conversion path")
+
+
+def _case(d=128, dv=128, dtype=torch.bfloat16, converted=("q", "k", "v", "o"), split=1, b=2):
+    _require_half_arch()
     if torch.cuda.get_device_capability() == (10, 7) and split > 1:
         pytest.skip("SM107 half split-KV remains unsupported")
     torch.manual_seed(751)
@@ -205,6 +209,7 @@ def test_half_staged_physical_wide_stride(d, role, product):
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
 def test_half_staged_artifact_reloads_without_jit(d, dv, tmp_path):
+    _require_half_arch()  # Module pytestmarks do not follow re-exported test methods.
     import json
     import os
     from pathlib import Path
