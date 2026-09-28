@@ -151,6 +151,9 @@ def test_packed_metadata_physical_wide_addresses(d, role, product):
     # must cross 2**32. Wrapped offsets remain allocated, with wrong safe data.
     stride = (2**31 - 16 if role == "sink" else 2**30 + 8) if product else 2**32 + 16
     elements = (source.numel() - 1) * stride + 64
+    # Previous wide tests can leave reusable allocations in Torch's cache;
+    # mem_get_info counts that memory as busy until the cache is released.
+    torch.cuda.empty_cache()
     if torch.cuda.mem_get_info()[0] < elements * source.element_size() + 2**30:
         pytest.skip("physical wide metadata stride needs more free GPU memory")
     try:
@@ -204,7 +207,7 @@ import cutlass.cute as cute
 from cudnn.frost import compiled_cache
 folder, package, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve()
-sys.path.insert(0, folder)
+sys.path[:0] = [folder, str(Path(folder) / "sdpa/frost")]
 from sdpa.frost.test_sdpa_sm80_packed_metadata import (
     test_packed_metadata_native_types_strides_and_replay,
     test_packed_backward_reuses_token_major_stats,
