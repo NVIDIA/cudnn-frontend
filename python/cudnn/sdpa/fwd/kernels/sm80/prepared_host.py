@@ -11,6 +11,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached, positional_entry, template_key
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_SWA
+from .packed_init import FROST_SOURCE_DIGEST as _INIT_DIGEST, zero_outputs
 
 
 @cute.jit
@@ -189,6 +190,10 @@ def thd_host(
     p = module.PARAMS
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
+    # Wrapper outputs retain zeroed holes/tails outside the live prefixes.
+    # Empty capacities do not launch initialization or step either pointer.
+    if t_q > 0:
+        zero_outputs((_view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
     # Packed capacity and Stats head pitch remain dynamic Int64 values. The
     # never-stepped batch stride is zero, so it cannot specialize on capacity.
     module._sdpa_host(
@@ -246,7 +251,7 @@ def compile_thd_host(module, h, h_kv, n_seq, swa_window):
     pointers = [
         cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else 4) if i != 7 or p.has_sink else None for i, t in enumerate(types)
     ]
-    key = template_key(vars(module), dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window), "prepared_thd")
+    key = template_key(vars(module), dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window, packed_init=_INIT_DIGEST), "prepared_thd")
     artifact = compile_cached(
         thd_host,
         *pointers,
