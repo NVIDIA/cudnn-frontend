@@ -647,6 +647,12 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
             None,
             None,
             ptr(o_p, cutlass.Float32) if splits > 1 else None,
+            # Paged-KV slots (block tables, table strides, page count), unused on a dense launch.
+            None,
+            None,
+            (cutlass.Int64(0), cutlass.Int64(0)),
+            None,
+            cutlass.Int32(0),
             ptr(sfq, cutlass.Int8),
             ptr(sfk, cutlass.Int8),
             ptr(sfv, cutlass.Int8),

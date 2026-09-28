@@ -396,6 +396,10 @@ For staged copies on multiple GPUs, resolve an omitted launch stream on Q's
 device and keep that device context active through gather, launch and scatter.
 A nondefault stream on Q's device must remain authoritative even when another
 CUDA device is current; restore the caller's device after execution.
+In multi-GPU tests, check the operand device's architecture before allocating or
+launching on it. A module-level marker only checks the initially current device;
+it cannot admit a second target on a heterogeneous machine. Allow a different
+architecture on the caller's current device when testing context restoration.
 
 When retiring a fake-tensor builder, move negative guards to the live
 `cute.runtime.make_fake_tensor` and `make_fake_compact_tensor` constructors.
@@ -446,3 +450,11 @@ Gate layout admission must share the adapter's TMA predicate, including batch
 stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
 an unaligned batch pitch. `test_gate_batch_stride_alignment` covers FP8, half
 and float element widths and the non-stepped singleton-batch control.
+
+Fusing standalone RoPE table preprocessing must preserve the FP32 conversion
+before sin/cos and full-range trigonometry. Approximate PTX sin/cos is not a
+replacement for Torch's large-angle range reduction. The exact-output detector
+`test_rope_table_large_angles_and_special_values` includes large/small finite
+angles, signed zero and nonfinite inputs. Keep real Int64 stride and product
+overflow checks on the angle input, with wrapped addresses inside allocated
+guard storage, plus changed-angle replay and fresh-process artifact reload.

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Plan existing non-RoPE SM80 conversions around the native pointer host."""
+"""Plan existing SM80 conversions around the native pointer host."""
 
 from contextlib import nullcontext
 from copy import copy
@@ -21,6 +21,7 @@ class StagedLaunch:
     regions: tuple
     workspace_bytes: int
     copies: tuple
+    rope: object
 
 
 def _layout(api):
@@ -60,6 +61,7 @@ def _compile_core(device_index, *args):
 
 def compile_plan(api):
     from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.rope_table_sm80 import compile_plan as compile_rope
     from .kernels.sm80.staged_copy import compile_gather
     from .kernels.staged_copy import compile_copy
 
@@ -79,14 +81,15 @@ def compile_plan(api):
         if fn is None:
             raise NotImplementedError("SM80 staged copy requires a positional tvm-ffi entry")
         copies.append((artifact, fn, group))
-    return StagedLaunch(core, operands, regions, required, tuple(copies))
+    rope = compile_rope(api._rope_max_s, api.flavor_d_qk // 2, api.q_desc.device) if api._rope_max_s else None
+    return StagedLaunch(core, operands, regions, required, tuple(copies), rope)
 
 
 def _copy(entry, frame, stream_int):
     entry[1](*frame, stream_int)
 
 
-def execute(api, tensors, workspace, stream, scale):
+def execute(api, tensors, workspace, stream, scale, *, rope_freqs=None):
     from cudnn._device import ensure_current_context
     from cudnn._torch_stream import _raw_current_stream
     from cuda.bindings import driver
@@ -95,9 +98,9 @@ def execute(api, tensors, workspace, stream, scale):
 
     staged = api._sm80_copy_spec
     device = api.q_desc.device
-    if workspace is None or workspace.device != device or not workspace.is_contiguous():
+    if (workspace is None and staged.workspace_bytes) or (workspace is not None and (workspace.device != device or not workspace.is_contiguous())):
         raise ValueError("SM80 staged forward requires contiguous workspace on the Q device")
-    base = api._scratch_base(workspace, "SM80 staged forward", staged.workspace_bytes)
+    base = api._scratch_base(workspace, "SM80 staged forward", staged.workspace_bytes) if staged.workspace_bytes else 0
     facts = {role: facts_of_tensor(t) for role, t in zip(ROLES, tensors)}
     for role, shape, dtype in staged.operands:
         f = facts[role]
@@ -135,6 +138,15 @@ def execute(api, tensors, workspace, stream, scale):
         stream_int = int(stream)
         ensure_current_context(stream_int, device.index)
         with context:
+            # Preserve the standalone-only angle-table conversion on its
+            # consuming stream; the graph rows do not admit RoPE. Keep the
+            # temporary table alive through the core launch.
+            rope = None
+            if rope_freqs is not None:
+                from cudnn.sdpa.rope_table_sm80 import prepare as prepare_rope
+
+                rope = prepare_rope(staged.rope, rope_freqs, device, stream_int)
+                facts["rope"] = facts_of_tensor(rope)
             # All core/auxiliary validation precedes the first workspace write.
             frame = bind(staged.core, facts, stream_int, scale=scale)
             if frames[0] is not None:
