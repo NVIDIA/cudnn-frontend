@@ -4768,7 +4768,7 @@ def sdpa_fwd_wrapper_sm80(
 
     # Tag per-call outputs and scratch with the stream that consumes them so
     # the allocator cannot recycle a block while an explicit stream is pending.
-    with _torch_stream_context(current_stream, q_tensor.device):
+    with stream_context(current_stream, q_tensor.device) if current_stream is not None else nullcontext():
         b, h_q, s_q, _ = q_tensor.shape
         d_v = v_tensor.shape[-1]
         o_tensor = torch.empty(
