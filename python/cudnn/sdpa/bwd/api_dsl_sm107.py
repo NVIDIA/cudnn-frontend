@@ -11,7 +11,8 @@ workspace, followed by the two gradient GEMMs and a fold:
     stage 1  delta = rowsum(dO * O)                      bprop_chain_common.dot_do_o{,_scaled}_host
     stage 2  dV (in TMEM, stored per Q head) + dS -> a   sm107/bprop_d256_{f16,fp8}.py
              [B, H_chunk, S_kv, S_q] GMEM workspace
-    stage 3  dK = dS . Q,  dQ = dS^T . K                 bprop_matmul_blackwell.py (two renderings)
+    stage 3  dK = dS . Q,  dQ = dS^T . K                 bprop_matmul_blackwell.py (two renderings at the
+                                                          d = 256 cluster tile: 2x1, 256 x 256, no N padding)
     stage 4  GQA fold of the per-Q-head dK / dV partials  dkv_reduce_host (half) /
              (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host (fp8)
 
@@ -24,6 +25,16 @@ output row): dK trims the low q tiles (``CAUSAL_K_LO``), dQ the high kv blocks
 (``CAUSAL_K_HI``), rounded to the kernel's 256-row kv block.  Under any mask the trim
 is an optimization only: the adapter zero-fills the workspace once, so a tile the
 stage-2 kernel skips reads as zero (``_zero_ws``).
+
+Both renderings take the d = 256 cluster tile (``MatmulTemplateParams.cgrp_tile_mn =
+(256, 256)``, ``_stage3_cgrp_tile_mn``): cluster 2x1, one 256-row x 256-col tile per
+2-CTA pair, six 32 KiB operand stages, the 256-column accumulator double-buffered in
+TMEM.  The SM100 chain's (512, 512) tile would spend the N-rank pair of every cluster
+on columns 256..511 that a d = 256 problem does not have -- half of every cluster's
+MMA work as TMA-OOB zeros and clipped stores (measured 23 % of the bf16 peak in
+useful work).  The rule is this adapter's only: the SM100 adapter never sets the
+field, so its d512 renderings are unchanged (``STAGE3_D256_TILE`` is the bitwise
+pin's twin).
 
 Shapes: the kernels compile with EVERY extent concrete and TMA-strided, and require
 ``S_q % 128 == 0`` and ``S_kv % 256 == 0``.  A graph that is not a multiple is served by
@@ -108,6 +119,14 @@ _SM107_WS_BUDGET_BYTES = _SM100_WS_BUDGET_BYTES
 # since the zero-filled workspace makes the trim an optimization) and the A/B for its
 # perf value on Rubin.  A module constant, not a knob: it must never differ per plan.
 STAGE3_CAUSAL_TRIM: bool = True
+# Stage-3 cluster tile.  True = the d = 256 rendering (``MatmulTemplateParams.cgrp_tile_mn = (256, 256)``: cluster 2x1,
+# 256 x 256 per pair, no N padding at d = 256, the accumulator double-buffered) -- what ships on the Rubin line.  False =
+# the SM100 chain's (512, 512) rendering, which at d = 256 computes 256 columns of padding per cluster tile: the bitwise
+# pin's twin (same k-tile walk, same 256x256x16 instruction, so identical bits) and the A/B base.  A module constant,
+# not a knob: it must never differ per plan.
+STAGE3_D256_TILE: bool = True
+_STAGE3_TILE_D256 = (256, 256)
+_STAGE3_TILE_PADDED = (512, 512)
 _DTYPE_CODE = {torch.bfloat16: DTYPE_BF16, torch.float16: DTYPE_FP16, torch.float8_e4m3fn: DTYPE_E4M3}
 
 
@@ -133,7 +152,17 @@ def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe
     return batches[-1], group
 
 
-def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: Optional[bool] = None):
+def _stage3_cgrp_tile_mn(sm: int, d: int, d256_tile: Optional[bool] = None) -> tuple:
+    """The stage-3 cluster tile for this arch and head dim: ``(256, 256)`` on the Rubin line at d = 256 (the tile whose
+    N equals the head dim, so no cluster computes padding), the SM100 chain's ``(512, 512)`` anywhere else.  The rule
+    lives HERE, in the sm107 adapter, so the SM100 adapter's records keep their default and render the constants they
+    always did.  ``d256_tile`` defaults to ``STAGE3_D256_TILE``, read at CALL time so the bitwise pin can flip it."""
+    if d256_tile is None:
+        d256_tile = STAGE3_D256_TILE
+    return _STAGE3_TILE_D256 if (d256_tile and 107 <= sm <= 119 and d == _SM107_D) else _STAGE3_TILE_PADDED
+
+
+def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: Optional[bool] = None, *, cgrp_tile_mn: tuple):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
     dK = dS . Q  : A = dS[kv, q]   -- M = kv, K = q, q contiguous -> K-major; K starts at kv's block (LO)
@@ -142,12 +171,21 @@ def _stage3_params(dtype_code: int, causal: bool, shift: int, gran: int, trim: O
     ``shift`` is how far the written band extends past the plain ``kv <= q`` diagonal
     (bottom-right: ``S_kv - S_q``); ``gran`` the kernel's kv write block (256).  ``trim``
     defaults to the module constant, read at CALL time so the bitwise pin can flip it.
+    ``cgrp_tile_mn`` is the cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a
+    caller cannot fall into the padded rendering by omission.
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
     lo = CAUSAL_K_LO if (causal and trim) else CAUSAL_K_NONE
     hi = CAUSAL_K_HI if (causal and trim) else CAUSAL_K_NONE
-    common = dict(b_is_n_major=True, causal_gran=gran, causal_shift=shift, vec_bytes_epi=vec_bytes_epi_for(_SM107_D, 2), dtype_qkv=dtype_code)
+    common = dict(
+        b_is_n_major=True,
+        causal_gran=gran,
+        causal_shift=shift,
+        vec_bytes_epi=vec_bytes_epi_for(_SM107_D, 2),
+        dtype_qkv=dtype_code,
+        cgrp_tile_mn=tuple(cgrp_tile_mn),
+    )
     return (
         MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, **common),
         MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, **common),
@@ -334,7 +372,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # outputs -- the io dtype on the half chain, bf16 on the fp8 chain (upcast Q / K,
         # bf16 dK / dQ partials for stage 4).
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
-        p_dk, p_dq = _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG))
+        # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
+        # prepared artifact is compiled for.
+        tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
+        p_dk, p_dq = _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn)
         mm_dk = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dk, tag=_SM107_MM_TAGS["dk"])
         mm_dq = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dq, tag=_SM107_MM_TAGS["dq"])
         self._prepared = self._compile_plan(mod, mm_dk, mm_dq)
@@ -513,4 +554,4 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "STAGE3_CAUSAL_TRIM"]
+__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE"]

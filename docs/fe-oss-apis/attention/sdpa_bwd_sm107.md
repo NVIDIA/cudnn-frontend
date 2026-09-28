@@ -92,7 +92,8 @@ main    per (kv block, head, batch), one 2-CTA cluster: walks the q tiles that
         attend the block; dV accumulates in TMEM and is stored per Q head;
         dS = attn_scale · P ∘ (dP − delta) is written to a kv-major
         [B, H_chunk, S_kv, S_q] GMEM workspace (fp8: bf16 workspace, amax_dP)
-mm_dk   dK = dS · Q          batched GEMM over the workspace (bprop_matmul_blackwell)
+mm_dk   dK = dS · Q          batched GEMM over the workspace (bprop_matmul_blackwell,
+                             the d = 256 cluster tile: 2x1, 256 × 256 per pair, no N padding)
 mm_dq   dQ = dSᵀ · K         same GEMM, the other operand major
 fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
         per-Q-head partials.  fp8 row, always: fold + descale (dK: descale_q,
@@ -102,6 +103,18 @@ fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
 The workspace is head-chunked (and batch-chunked on the half row) to a 4 GiB
 budget; the artifact's host loops over the chunks with `head_base` / `batch_base`,
 so one compiled artifact serves every launch of a plan.
+
+The two GEMMs render the shared template at its **d = 256 cluster tile**
+(`MatmulTemplateParams.cgrp_tile_mn = (256, 256)`: cluster 2x1, one 256-row ×
+256-column tile per 2-CTA pair, six 32 KiB operand stages, a double-buffered
+256-column TMEM accumulator so one tile's epilogue overlaps the next tile's
+mainloop).  The SM100 d512 chain's (512, 512) tile would put the N-rank pair of
+every cluster on columns 256..511 that a d = 256 gradient does not have — half of
+every cluster's MMA work as TMA-OOB zero loads and clipped stores.  The selection
+is the sm107 adapter's alone (Rubin line, d = 256); the SM100 chain's renderings
+are unchanged, and a bitwise pin (`test_stage3_d256_rendering_is_bitwise_the_padded_one`)
+holds the two tiles' dQ / dK / dV to identical bits (same k-tile walk, same
+256x256x16 instruction, same fp32 accumulation order).
 
 ### Main kernel
 

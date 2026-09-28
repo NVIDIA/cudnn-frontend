@@ -690,7 +690,12 @@ head, dS goes to a kv-major `[B, H_chunk, S_kv, S_q]` GMEM workspace) → dK = d
 and dQ = dSᵀ·K as the shared `bprop_matmul_blackwell` GEMMs over that workspace
 (operand majors flipped relative to the SM100 chain's `[S_q, S_kv]` workspace; the
 causal K-trim modes are not, and under any mask the workspace is zero-filled so a
-skipped tile reads as zero) → the GQA fold of the per-Q-head partials
+skipped tile reads as zero; rendered at the d = 256 cluster tile
+`MatmulTemplateParams.cgrp_tile_mn = (256, 256)` — cluster 2x1, 256 × 256 per pair,
+no N padding at d = 256, accumulator double-buffered — selected by the sm107 adapter
+only, the SM100 d512 renderings byte-identical: `test_stage3_tile_rows_render_their_upstream_constants`,
+`test_stage3_d256_rendering_is_bitwise_the_padded_one`, `test_stage3_d256_rendering_sass_pins`)
+→ the GQA fold of the per-Q-head partials
 (`dkv_reduce`, fixed order). Served: dense, top-left and bottom-right causal,
 sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
 128-row q tile / 256-row kv block is padded through zero-filled staging copies,

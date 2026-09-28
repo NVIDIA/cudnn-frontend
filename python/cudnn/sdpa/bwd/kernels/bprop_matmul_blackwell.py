@@ -43,6 +43,7 @@ without making the same change upstream.
 
 from __future__ import annotations
 
+from typing import NamedTuple
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
@@ -72,16 +73,101 @@ validate_matmul_params(PARAMS)
 # reads the S/dS workspace stage 2 wrote.
 _IO_DTYPE = cutlass.Float16 if int(PARAMS.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
 
-# Tile config: CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma
-# (was ...cluster2x1...; swapped on request. Every constant below is lifted
-# verbatim from the upstream rendering of THIS config -- do not hand-derive.)
+
+class _TileRow(NamedTuple):
+    """One row of the tile-constants table: exactly the constants that DIFFER between two upstream renderings of
+    this file's config family (``sm100_matmul`` at ``CONFIG_sm100_{cta_m}x256x128_128x256x32_cluster{m}x{n}_2ctamma``,
+    2-CTA MMA 256x256x16, bf16 / fp16, TMA-store epilogue).  Every value is lifted VERBATIM from the upstream
+    renderer's output for the named config (``gemm/frost/sm100/compiler._render_tile_constants``) -- do not
+    hand-derive; the fork pins ``epi_n = 64`` (its epilogue hardcodes the 128-byte staging row), 512 non-exclusive
+    TMEM columns and ``fallback_cluster_shape_mnk = None`` on every row, so those stay module constants below.
+
+    A ``NamedTuple``, not a ``@dataclass``: this module runs under ``frost.template_loader`` BEFORE it is registered in
+    ``sys.modules``, which a module-scope dataclass decorator needs (see ``MatmulTemplateParams``).
+    """
+
+    config: str
+    cgrp_tile_mnk: tuple  # the CLUSTER's (M, N, K) output tile; `_host` covers the problem in these
+    cta_tile_mnk: tuple  # per-CTA (A rows, B cols, K) per stage
+    cluster_shape_mnk: tuple
+    ab_stages: int  # operand ring depth at the 227 KiB opt-in budget: stages x (A + B per CTA) + 32 KiB staging
+    multicast_a: bool  # A is TMA-multicast along the cluster's N only when cluster_n > 1
+    a_mcast_k_major: tuple  # (a_mcast_slices, ab_empty_full_mask) for a K-major A
+    a_mcast_m_major: tuple  # ... for an M-major A (the two differ only under a multicast, i.e. at cluster_n > 1)
+    mma_size_m: int  # MMA-M blocks (128 rows each per CTA) per CTA tile
+    acc_stages: int  # TMEM accumulator stages of `mma_size_m x 256` columns each (2 x 256 fits the 512 columns)
+    mixed_a_pattern_pref: int  # the A multicast bit pattern of the preferred cluster (1 = self only)
+
+
+# Keyed by ``MatmulTemplateParams.cgrp_tile_mn`` (its docstring carries the story).  The N tile is the one that
+# matters at the head dim: `_host` sizes the grid as ``ceil(n / N)`` cluster tiles, so an N tile wider than the
+# head dim spends whole CTAs on columns that do not exist (TMA-OOB zero loads, clipped stores).
+_TILE_ROWS = {
+    # The SM100 d512 chain's rendering (swapped from cluster2x1 on request: measured faster BOTH ways at B=1 H=128
+    # S=8192 d=512 bf16, +3.5 % no_mask / +7.8 % causal -- `_causal_k_range`).  N = 512 fills its 512-wide tile.
+    (512, 512): _TileRow(
+        config="CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma",
+        cgrp_tile_mnk=(512, 512, 64),
+        cta_tile_mnk=(256, 128, 64),
+        cluster_shape_mnk=(2, 2, 1),
+        ab_stages=4,
+        multicast_a=True,
+        # Under a cluster with cga_n > 1 the A operand's MULTICAST also follows its major -- a K-major A is split
+        # across the cluster's N columns (2 slices) while an M-major A is broadcast whole.  Invisible at cluster2x1,
+        # where both are (1, False), and why this pair cannot be reused across cluster shapes unchanged.
+        a_mcast_k_major=(2, False),
+        a_mcast_m_major=(1, True),
+        mma_size_m=2,
+        acc_stages=1,
+        mixed_a_pattern_pref=5,
+    ),
+    # The d = 256 rendering (the sm107 d256 chain): upstream's DEFAULT_CONFIG and this fork's original config.  One
+    # 256-row x 256-col cluster tile per pair, so a head dim of 256 is covered with NO padding; the 256-column
+    # accumulator is double-buffered in the same 512 TMEM columns (the epilogue of tile i overlaps the mainloop of
+    # tile i+1); 6 x 32 KiB of operands in flight = the (512, 512) row's 4 x 48 KiB.  Its cluster M tile equals the
+    # stage-2 kv write block, which is what makes the causal K-trim TIGHT (`_causal_k_range`).
+    (256, 256): _TileRow(
+        config="CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+        cgrp_tile_mnk=(256, 256, 64),
+        cta_tile_mnk=(128, 128, 64),
+        cluster_shape_mnk=(2, 1, 1),
+        ab_stages=6,
+        multicast_a=False,
+        a_mcast_k_major=(1, False),
+        a_mcast_m_major=(1, False),
+        mma_size_m=1,
+        acc_stages=2,
+        mixed_a_pattern_pref=1,
+    ),
+    # A/B alternate (selected by no adapter): the (512, 512) row's per-CTA work at a 256-wide N tile -- no padding at
+    # d = 256 either, half the cluster tiles of the (256, 256) row, one 512-column accumulator (no double buffering:
+    # 2 x 512 exceeds the TMEM), and a 512-row cluster M tile that is NOT causal-tight.  Kept so the wave-quantization
+    # question (twice the tiles vs 25 % less L2 -> SMEM traffic per FLOP) is a one-constant A/B, not a rewrite.
+    (512, 256): _TileRow(
+        config="CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",
+        cgrp_tile_mnk=(512, 256, 64),
+        cta_tile_mnk=(256, 128, 64),
+        cluster_shape_mnk=(2, 1, 1),
+        ab_stages=4,
+        multicast_a=False,
+        a_mcast_k_major=(1, False),
+        a_mcast_m_major=(1, False),
+        mma_size_m=2,
+        acc_stages=1,
+        mixed_a_pattern_pref=1,
+    ),
+}
+_ROW = _TILE_ROWS[tuple(getattr(PARAMS, "cgrp_tile_mn", (512, 512)))]
+
+# Tile config: _ROW.config -- every constant below is lifted verbatim from the upstream rendering of that config (the
+# row-independent ones from any of the three; they agree) -- do not hand-derive.
 mma_inst_shape_mnk = (256, 256, 16)
 cta_group = 2
-cgrp_tile_mnk = (512, 512, 64)
-cta_tile_mnk = (256, 128, 64)
+cgrp_tile_mnk = _ROW.cgrp_tile_mnk
+cta_tile_mnk = _ROW.cta_tile_mnk
 epi_tile_mn = (128, 64)
 threads_per_cta = 256
-cluster_shape_mnk = (2, 2, 1)
+cluster_shape_mnk = _ROW.cluster_shape_mnk
 # Upstream carries the rendering's batch size here purely to detect a BROADCAST
 # operand (== 1 means "one batch element, reuse it for all"). No stage-3 GEMM
 # broadcasts, so both are simply "batched"; the real extents are runtime.
@@ -152,17 +238,12 @@ causal_gran = int(PARAMS.causal_gran)
 causal_shift = int(PARAMS.causal_shift)
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
-ab_stages = 4
+ab_stages = _ROW.ab_stages
 b_collector_ok = False
-multicast_a = True
+multicast_a = _ROW.multicast_a
 multicast_b = False
-# Under a cluster with cga_n > 1 the A operand's MULTICAST also follows its
-# major -- a K-major A is split across the cluster's N columns (2 slices) while
-# an M-major A is broadcast whole. That was invisible at cluster2x1, where both
-# are 1, and it is why this table cannot be reused across cluster shapes
-# unchanged. Values lifted from the two upstream renderings of this config.
-_A_MCAST = {False: (2, False), True: (1, True)}  # is_m_major: (slices, empty_full_mask)
-a_mcast_slices, ab_empty_full_mask = _A_MCAST[a_is_m_major]
+# (a_mcast_slices, ab_empty_full_mask) follow the A major only under a multicast (`_TileRow.a_mcast_*`).
+a_mcast_slices, ab_empty_full_mask = _ROW.a_mcast_m_major if a_is_m_major else _ROW.a_mcast_k_major
 b_mcast_slices = 1
 ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B
 # MN-major packs 64 elements per TMA group and walks K in 2048-byte steps;
@@ -178,7 +259,7 @@ b_smem_desc_leading_byte_offset, b_smem_k_step_bytes, b_tma_group_elems = _MAJOR
 a_smem_desc_stride_byte_offset = 1024
 b_smem_desc_stride_byte_offset = 1024
 a_smem_m_step_bytes = 16384
-mma_size_m = 2
+mma_size_m = _ROW.mma_size_m
 mma_size_n = 1
 mma_size_k = 4
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
@@ -204,7 +285,7 @@ gemm_a_idx = (0,)
 gemm_b_idx = (0,)
 num_tmem_alloc_cols = 512
 tmem_alloc_exclusive = False
-acc_stages = 1  # 512 acc cols/stage
+acc_stages = _ROW.acc_stages  # mma_size_m x 256 acc cols/stage
 vec_bytes_epi = int(PARAMS.vec_bytes_epi)
 n_tma_outputs = 1
 moe_aligned_offsets = False
@@ -213,7 +294,7 @@ epi_packed_lanes = False
 epi_dp22 = False
 epi_stage_rows = 128
 epi_chunk_elems = 64
-ab_stages = 4  # SMEM-D 32784B fixed + cast LOAD 0B/stage + multi-GEMM 0B/stage
+ab_stages = _ROW.ab_stages  # SMEM-D 32784B fixed + cast LOAD 0B/stage + multi-GEMM 0B/stage
 # Upstream renders (2, 1, 1) here -- a mixed-CGA fallback the driver may pick
 # per cluster when the preferred shape does not fit. Pinned to None in this
 # fork: `_host` always sizes the grid as a multiple of the preferred cluster, so
@@ -221,7 +302,7 @@ ab_stages = 4  # SMEM-D 32784B fixed + cast LOAD 0B/stage + multi-GEMM 0B/stage
 # coordinate/multicast logic that the 2-D (b, h) batch rewrite has never
 # exercised.
 fallback_cluster_shape_mnk = None
-mixed_a_pattern_pref = 5
+mixed_a_pattern_pref = _ROW.mixed_a_pattern_pref
 mixed_b_pattern_pref = 1
 mixed_a_pattern_fb = 1
 mixed_b_pattern_fb = 1
@@ -259,6 +340,59 @@ EPI_SYNC_BAR_ID = 1
 
 # Named barrier id for the TMEM-alloc handoff.
 TMEM_ALLOC_BARRIER_ID = 2
+
+
+def _smem_layout_bytes() -> dict:
+    """Byte offsets of the kernel's SMEM buffers, in DECLARATION order with each ``cutlass.Array``'s alignment
+    (the order and alignments of the allocations in ``_bprop_matmul_bh_sm100_kernel``; keep the two in step).
+
+    Why this exists: every tcgen05 SMEM descriptor here is built by ``Tcgen05SmemDesc.build()`` at its default
+    (version 0), whose 14-bit start address covers the first 256 KiB of SMEM only; per-stage / per-k-step
+    advances are bare adds on top of the ROOT (``smem_a_list[0]`` / ``smem_b_list[0]``), so a ring whose root sits
+    at or past 256 KiB wraps silently -- an accumulator of exactly zero, operands provably right in SMEM
+    (rules/mma-tma-matrix.md s6).  The import-time guard below turns that into a raise the moment a row (a deeper
+    ring under Rubin's 327 KiB carveout) needs a version-1 descriptor; the host pins read the same numbers.
+    """
+    off = 0
+    out = {}
+
+    def place(name, nbytes, align):
+        nonlocal off
+        off = (off + align - 1) // align * align
+        out[name] = off
+        off += nbytes
+
+    place("sys_reserved", 1024, 1)
+    place("ab_full_mbar", 8 * ab_stages, 8)
+    place("ab_empty_mbar", 8 * ab_stages, 8)
+    place("acc_empty_mbar", 8 * acc_stages, 8)
+    place("acc_full_mbar", 8 * acc_stages, 8)
+    if cta_group == 2:
+        place("tmem_dealloc_mbar", 8, 8)
+    place("tmem_ptr", 4, 4)
+    place("clc_response", 16 * CLC_SCHED_STAGES, 16)
+    place("clc_full_mbar", 8 * CLC_SCHED_STAGES, 8)
+    place("clc_empty_mbar", 8 * CLC_SCHED_STAGES, 8)
+    ab_bpe = ab_dtype.width // 8
+    for i in range(num_a_operands):
+        place(f"smem_a_{i}", cta_tile_mnk[0] * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
+    for j in range(num_b_operands):
+        place(f"smem_b_{j}", cta_tile_mnk[1] * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
+    place("smem_d", epi_stage_rows * epi_row_elems * epi_slot_widen * (cd_dtype.width // 8) * EPI_SMEM_STAGES, 1024)
+    out["total"] = off
+    return out
+
+
+_SMEM_DESC_V0_LIMIT = 1 << 18  # 256 KiB: the reach of a version-0 tcgen05 SMEM descriptor's start address
+_smem_layout = _smem_layout_bytes()
+if (
+    max(_smem_layout[f"smem_a_{i}"] for i in range(num_a_operands)) >= _SMEM_DESC_V0_LIMIT
+    or max(_smem_layout[f"smem_b_{j}"] for j in range(num_b_operands)) >= _SMEM_DESC_V0_LIMIT
+):
+    raise NotImplementedError(
+        f"{__name__}: an MMA-operand ring root sits at or past 256 KiB ({_smem_layout}); the version-0 tcgen05 SMEM descriptor "
+        f"`Tcgen05SmemDesc.build()` emits cannot address it (rules/mma-tma-matrix.md s6) -- this row needs a version-1 descriptor"
+    )
 
 
 @cute.jit
@@ -359,21 +493,28 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
 
         cgrp_tile_mnk[0] <= causal_gran
 
-    i.e. one cluster M tile fits inside one stage-2 write block. It HELD at the
-    2x1 cluster config (256 <= 256) and does NOT hold at the 2x2 config now in
-    use (512 > 256): a 512-row M tile straddles two 256-row stage-2 blocks, and
+    i.e. one cluster M tile fits inside one stage-2 write block.  It depends on
+    the tile row (``_TILE_ROWS``): it HOLDS on the (256, 256) row (256 <= 256,
+    the sm107 d256 chain) and does NOT hold on the (512, 512) and (512, 256)
+    rows (512 > 256): a 512-row M tile straddles two 256-row stage-2 blocks, and
     since the bounds below are per-tile, no range can cover the tile's live rows
     without also covering its neighbour's skipped ones.
 
-    So at 2x2 this is an OPTIMIZATION ONLY, and the caller's zero-fill is what
-    makes it correct -- `api_dsl` sets `_zero_ws` whenever the trim is active,
-    which is exactly the condition under which any of this runs. Do not weaken
-    that zero-fill to "only when shift != 0" on the theory that the trim
-    protects the aligned case; at 2x2 it does not.
+    So on a 512-row M tile this is an OPTIMIZATION ONLY, and the caller's
+    zero-fill is what makes it correct -- both adapters set `_zero_ws` whenever
+    a causal-family mask is active, which is exactly the condition under which
+    any of this runs.  Do not weaken that zero-fill to "only when shift != 0" on
+    the theory that the trim protects the aligned case; at 512 rows it does not.
+    On the tight (256, 256) row the zero-fill is still what covers the ONE
+    128-row q tile the dK (LO) bound over-reads under a bottom-right shift
+    (``causal_gran`` is stage 2's 256-row kv block, not its 128-row Q tile) and
+    the never-empty clamp below; dropping it there is a follow-up that passes
+    a per-mode granularity, gated on poisoned-workspace tests.
 
-    The 2x2 config is kept despite the looser trim because it measures faster
-    BOTH ways at B=1 H=128 S=8192 d=512 bf16: +3.5% no_mask, +7.8% causal (the
-    wider tile more than pays for the extra k-tiles it reads).
+    The SM100 d512 chain keeps the (512, 512) row despite the looser trim
+    because it measures faster BOTH ways at B=1 H=128 S=8192 d=512 bf16: +3.5%
+    no_mask, +7.8% causal (the wider tile more than pays for the extra k-tiles
+    it reads).
 
     Keyed on the CLUSTER's M tile base (``tile_m * cgrp_tile_m``), which is
     identical on both CTAs of a pair, and rounded to ``causal_gran`` -- stage

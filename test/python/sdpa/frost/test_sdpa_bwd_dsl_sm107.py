@@ -781,15 +781,165 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
     from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE
 
-    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, trim=True)
+    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, trim=True, cgrp_tile_mn=(256, 256))
     assert (dk.a_is_m_major, dk.causal_mode) == (False, CAUSAL_K_LO)
     assert (dq.a_is_m_major, dq.causal_mode) == (True, CAUSAL_K_HI)
     assert dk.causal_shift == dq.causal_shift == 512 and dk.causal_gran == dq.causal_gran == 256
     assert dk.b_is_n_major and dq.b_is_n_major and dk.dtype_qkv == DTYPE_BF16
+    assert dk.cgrp_tile_mn == dq.cgrp_tile_mn == (256, 256), "the cluster tile rides on BOTH records"
     for causal, trim in ((True, False), (False, True), (False, False)):
-        dk, dq = _stage3_params(DTYPE_BF16, causal=causal, shift=0, gran=256, trim=trim)
+        dk, dq = _stage3_params(DTYPE_BF16, causal=causal, shift=0, gran=256, trim=trim, cgrp_tile_mn=(256, 256))
         assert dk.causal_mode == dq.causal_mode == CAUSAL_K_NONE, (causal, trim)
         assert (dk.a_is_m_major, dq.a_is_m_major) == (False, True), "the majors are a layout fact, not a mask fact"
+    with pytest.raises(TypeError):
+        _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256)  # the cluster tile is REQUIRED: no padded rendering by omission
+
+
+def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
+    """The stage-3 cluster tile rule lives in the sm107 adapter: (256, 256) -- N = the head dim, no padding -- on the
+    Rubin line (SM107-SM119) at d = 256, the SM100 chain's (512, 512) anywhere else (so the SM100 adapter, which never
+    sets the field, renders the constants it always did).  ``STAGE3_D256_TILE = False`` is the bitwise pin's twin."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    for sm in (107, 110, 119):
+        assert sm107._stage3_cgrp_tile_mn(sm, 256) == (256, 256), sm
+    for sm, d in ((100, 256), (103, 256), (120, 256), (106, 256), (107, 512), (107, 128)):
+        assert sm107._stage3_cgrp_tile_mn(sm, d) == (512, 512), (sm, d)
+    assert sm107._stage3_cgrp_tile_mn(107, 256, d256_tile=False) == (512, 512)
+    monkeypatch.setattr(sm107, "STAGE3_D256_TILE", False)
+    assert sm107._stage3_cgrp_tile_mn(107, 256) == (512, 512), "the module constant is read at CALL time (the pin flips it)"
+    assert sm107._stage3_cgrp_tile_mn(107, 256, d256_tile=True) == (256, 256)
+
+
+def test_stage3_rejects_a_cluster_tile_the_template_has_no_row_for():
+    from cudnn.sdpa.bwd.config_sm100 import STAGE3_CGRP_TILES, MatmulTemplateParams, validate_matmul_params
+
+    assert (512, 512) in STAGE3_CGRP_TILES and (256, 256) in STAGE3_CGRP_TILES
+    for bad in ((256, 512), (128, 256), (256,), (512, 128)):
+        with pytest.raises(ValueError, match="cgrp_tile_mn"):
+            validate_matmul_params(MatmulTemplateParams(cgrp_tile_mn=bad))
+    validate_matmul_params(MatmulTemplateParams())  # the default row
+
+
+# Every module-level tile constant of the stage-3 rendering, per operand major.  The (512, 512) values ARE develop's
+# (`origin/develop` @ 704b511e renders exactly these -- the upstream arch-100 rendering of
+# CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma); the (256, 256) values are the upstream arch-107 rendering
+# of CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma with the fork's three pins (epi_n 64, 512 non-exclusive
+# TMEM columns, no fallback cluster).  A change to either dict is a change to the rendered kernel: for the SM100 chain
+# that is the byte-identity tripwire (its PTX must not move), for the d256 row it is the design (PERF_PARITY_DESIGN
+# section A.3).
+_STAGE3_ROW_INDEPENDENT = dict(
+    mma_inst_shape_mnk=(256, 256, 16),
+    cta_group=2,
+    epi_tile_mn=(128, 64),
+    threads_per_cta=256,
+    multicast_b=False,
+    b_mcast_slices=1,
+    b_collector_ok=False,
+    mma_size_n=1,
+    mma_size_k=4,
+    a_smem_m_step_bytes=16384,
+    a_smem_desc_stride_byte_offset=1024,
+    b_smem_desc_stride_byte_offset=1024,
+    b_smem_desc_leading_byte_offset=8192,  # B is n-major on every stage-3 GEMM (D is contiguous and is N): `_MAJOR_CONSTS[True]`
+    b_smem_k_step_bytes=2048,
+    b_tma_group_elems=64,
+    epi_n=64,
+    epi_row_elems=64,
+    epi_chunk_elems=64,
+    epi_stage_rows=128,
+    num_tmem_alloc_cols=512,
+    tmem_alloc_exclusive=False,
+    tile_swizzle_n=1,
+    fallback_cluster_shape_mnk=None,
+    mixed_b_pattern_pref=1,
+    mixed_a_pattern_fb=1,
+    mixed_b_pattern_fb=1,
+    num_gemms=1,
+    vec_bytes_epi=32,
+)
+_STAGE3_A_MAJOR = {  # a_is_m_major -> the `_MAJOR_CONSTS` of A
+    False: dict(a_smem_desc_leading_byte_offset=16, a_smem_k_step_bytes=32, a_tma_group_elems=1),
+    True: dict(a_smem_desc_leading_byte_offset=8192, a_smem_k_step_bytes=2048, a_tma_group_elems=64),
+}
+_STAGE3_ROWS = {
+    (512, 512): dict(
+        cgrp_tile_mnk=(512, 512, 64),
+        cta_tile_mnk=(256, 128, 64),
+        cluster_shape_mnk=(2, 2, 1),
+        ab_stages=4,
+        multicast_a=True,
+        mma_size_m=2,
+        acc_stages=1,
+        mixed_a_pattern_pref=5,
+        a_mcast={False: (2, False), True: (1, True)},  # a_is_m_major -> (a_mcast_slices, ab_empty_full_mask)
+    ),
+    (256, 256): dict(
+        cgrp_tile_mnk=(256, 256, 64),
+        cta_tile_mnk=(128, 128, 64),
+        cluster_shape_mnk=(2, 1, 1),
+        ab_stages=6,
+        multicast_a=False,
+        mma_size_m=1,
+        acc_stages=2,
+        mixed_a_pattern_pref=1,
+        a_mcast={False: (1, False), True: (1, False)},
+    ),
+    (512, 256): dict(
+        cgrp_tile_mnk=(512, 256, 64),
+        cta_tile_mnk=(256, 128, 64),
+        cluster_shape_mnk=(2, 1, 1),
+        ab_stages=4,
+        multicast_a=False,
+        mma_size_m=2,
+        acc_stages=1,
+        mixed_a_pattern_pref=1,
+        a_mcast={False: (1, False), True: (1, False)},
+    ),
+}
+_SMEM_DESC_V0_LIMIT = 1 << 18  # a version-0 tcgen05 SMEM descriptor addresses the first 256 KiB
+_SM100_OPTIN_SMEM = 227 * 1024  # the Blackwell per-CTA opt-in; every row must fit it (no oversized-mode dependency)
+
+
+def _load_stage3(**params):
+    from cudnn.frost.template_loader import load_template
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams
+
+    return load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), MatmulTemplateParams(**params), tag="test_sm107_stage3")
+
+
+@pytest.mark.parametrize("tile", sorted(_STAGE3_ROWS), ids=lambda t: f"{t[0]}x{t[1]}")
+@pytest.mark.parametrize("a_is_m_major", (False, True), ids=("dK-Kmajor", "dQ-Mmajor"))
+def test_stage3_tile_rows_render_their_upstream_constants(tile, a_is_m_major):
+    """Each row of the template's tile-constants table renders EXACTLY the frozen constants above, with the SM100
+    adapter's own records (default `cgrp_tile_mn`, both majors, dense and causal) hitting the (512, 512) dict -- the
+    no-GPU byte-identity tripwire for develop's d512 chain (the PTX proof is in
+    frost_dev/results/bwd_d256_sm107/perf/GEMM_D256.md).  Every row's SMEM layout (the template's declaration-order
+    mirror) keeps both MMA-operand ring roots below 256 KiB -- the reach of the version-0 tcgen05 SMEM descriptor
+    `Tcgen05SmemDesc.build()` emits (rules/mma-tma-matrix.md s6) -- and fits the 227 KiB opt-in budget."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    row = _STAGE3_ROWS[tile]
+    causal_mode = CAUSAL_K_HI if a_is_m_major else CAUSAL_K_LO  # the sm107 chain's pairing; the modes do not touch the tile constants
+    params = dict(a_is_m_major=a_is_m_major, b_is_n_major=True, causal_gran=256, causal_shift=0, vec_bytes_epi=32, dtype_qkv=DTYPE_BF16)
+    mods = [_load_stage3(causal_mode=causal_mode, cgrp_tile_mn=tile, **params), _load_stage3(causal_mode=CAUSAL_K_NONE, cgrp_tile_mn=tile, **params)]
+    if tile == (512, 512):
+        # The SM100 adapter's exact spelling: no `cgrp_tile_mn` at all (api_dsl.py `SdpaBwdDslSm100.compile`).
+        mods.append(_load_stage3(causal_mode=causal_mode, thd_varlen=False, **params))
+    expect = dict(_STAGE3_ROW_INDEPENDENT, **_STAGE3_A_MAJOR[a_is_m_major], **{k: v for k, v in row.items() if k != "a_mcast"})
+    expect["a_mcast_slices"], expect["ab_empty_full_mask"] = row["a_mcast"][a_is_m_major]
+    for mod in mods:
+        got = {name: getattr(mod, name) for name in expect}
+        assert got == expect, {k: (got[k], expect[k]) for k in expect if got[k] != expect[k]}
+        assert mod._ROW.config.startswith("CONFIG_sm100_") and mod._TILE_ROWS[tile] is mod._ROW
+        layout = mod._smem_layout_bytes()
+        print(f"\nstage-3 {tile} a_is_m_major={a_is_m_major}: SMEM layout {layout}")
+        assert layout["smem_a_0"] < _SMEM_DESC_V0_LIMIT and layout["smem_b_0"] < _SMEM_DESC_V0_LIMIT, layout
+        assert layout["total"] <= _SM100_OPTIN_SMEM, layout
+        assert layout["total"] == 231424, "every row spends the same 226 KiB: stages x (A + B) + 32 KiB staging + 2 KiB of barriers"
+        assert layout["smem_d"] + 2 * 128 * 64 * 2 == layout["total"]
 
 
 @pytest.mark.parametrize(
@@ -894,6 +1044,48 @@ def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq
     for name, x, y in zip(("dQ", "dK", "dV"), trimmed.outs[0], untrimmed.outs[0]):
         n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
         assert n_diff == 0, f"{name}: trimmed vs untrimmed stage 3 differ in {n_diff} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(sq=512, skv=512),
+        dict(sq=512, skv=512, causal=True),
+        dict(sq=512, skv=1024, causal=True, bottom_right=True),
+        dict(sq=500, skv=1024, causal=True, bottom_right=True),
+        dict(hq=8, hkv=2, sq=512, skv=768),
+        dict(hq=4, hkv=2, sq=256, skv=256, causal=True),
+        dict(b=1, hq=2, sq=1024, skv=2048),
+    ],
+    ids=["dense", "causal", "bottom-right", "bottom-right-ragged-sq", "gqa4", "one-kv-block-causal", "8-kv-blocks"],
+)
+def test_stage3_d256_rendering_is_bitwise_the_padded_one(monkeypatch, case):
+    """The d = 256 stage-3 rendering (``cgrp_tile_mn = (256, 256)``: cluster 2x1, one 256 x 256 tile per pair, the
+    accumulator double-buffered -- PERF_PARITY_DESIGN section A) must give the SAME BITS for dQ / dK / dV as the SM100
+    chain's (512, 512) rendering, which at d = 256 computes 256 columns of padding per cluster tile.  Bitwise is the
+    right gate: both walk the same 64-wide k tiles in the same order with the same 256x256x16 instruction into an fp32
+    accumulator, so every output element sees the identical reduction; a difference means the new row's tile / TMA
+    box / multicast constants disagree with each other, not rounding.  ``STAGE3_D256_TILE = False`` is the twin."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    case = dict(case)
+    causal, bottom_right = case.pop("causal", False), case.pop("bottom_right", False)
+    kw = {}
+    keep = None
+    if causal:
+        kw = dict(use_causal_mask_bottom_right=True) if bottom_right else dict(use_causal_mask=True)
+        keep = _causal_keep(case["sq"], case["skv"], bottom_right=bottom_right)
+    case.setdefault("b", 2)
+    case.setdefault("hq", 4)
+    case.setdefault("hkv", 2)
+    assert sm107.STAGE3_D256_TILE, "the d256 rendering is what ships; the pin flips it OFF for the twin"
+    d256 = _run(keep=keep, poison=float("nan"), **case, **kw).check()
+    monkeypatch.setattr(sm107, "STAGE3_D256_TILE", False)
+    padded = _run(keep=keep, poison=float("nan"), **case, **kw).check()
+    for name, x, y in zip(("dQ", "dK", "dV"), d256.outs[0], padded.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        assert n_diff == 0, f"{name}: d256 vs padded stage-3 rendering differ in {n_diff} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
 
 
 # --------------------------------------------------------------------------- the prepared launch (Rubin): the graph binds its pack into ONE artifact
@@ -1619,3 +1811,134 @@ def test_sm107_every_mask_site_is_the_bit_word_arm(family):
         assert gone not in code, f"{family}: {gone!r} is a retired mask-form spelling"
     assert "band_mask_words(" in code and "apply_mask_words(" in code, f"{family}: the masked arm must be the library's bit-word primitives"
     assert "arith.select(" in code, f"{family}: the padded arm's band bound is the only select left; a per-cell select loop is the old form"
+
+
+# =========================================================================== SASS pins: the d256 stage-3 GEMM rendering for sm_107a on ANY box
+# The rendering is a fork of the generic GEMM template at constants no other engine renders (cluster 2x1, 128 x 128 per
+# CTA, 6 stages, 2 accumulator stages), so the toolchain facts the stage-2 pins guard are re-checked on it: no stack
+# spill in the 24-register producer warps, no GPU-scope drain before a cluster arrive (every cluster-scope arrive here is
+# `relaxed`), and the version-0 tcgen05 SMEM descriptors reaching every operand ring root.  `mod._host` is wrapped in the
+# pointer-argument @cute.jit the prepared hosts use (`compile_host_f16` builds the same `make_ptr` operands), so the
+# device cubin is the artifact's.  One sm_107a trace-compile per row (~5-10 s).
+_GEMM_SASS_PROBE = textwrap.dedent(r"""
+    import glob, os, subprocess, sys
+    dump, major, mask, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_cgrp_tile_mn, _stage3_params
+    p_dk, p_dq = _stage3_params(DTYPE_BF16, causal=(mask == "causal"), shift=0, gran=256, trim=True, cgrp_tile_mn=_stage3_cgrp_tile_mn(107, 256))
+    params = p_dq if major == "dq" else p_dk
+    mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="sass_probe_stage3_" + major)
+    print("PARAMS", repr(params))
+    for name in ("cgrp_tile_mnk", "cta_tile_mnk", "cluster_shape_mnk", "ab_stages", "acc_stages", "mma_size_m", "multicast_a", "a_mcast_slices", "ab_empty_full_mask"):
+        print("CONST", name, repr(getattr(mod, name)))
+    layout = mod._smem_layout_bytes()
+    for name in ("smem_a_0", "smem_b_0", "smem_d", "total"):
+        print("SMEM", name, layout[name])
+    S_Q, S_KV, H, B, D = 1024, 1024, 8, 1, 256
+    a_m_major = bool(params.a_is_m_major)
+
+    @cute.jit
+    def probe(entry: cutlass.Constexpr, a_ptr: cute.Pointer, b_ptr: cute.Pointer, c_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer, stream):
+        if cutlass.const_expr(a_m_major):
+            a = cute.make_tensor(a_ptr, cute.make_layout((S_Q, S_KV, H, B), stride=(1, S_Q, S_KV * S_Q, H * S_KV * S_Q)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_KV, H, B), stride=(1, H * D, D, S_KV * H * D)))
+            c = cute.make_tensor(c_ptr, cute.make_layout((S_Q, D, H, B), stride=(H * D, 1, D, S_Q * H * D)))
+        else:
+            a = cute.make_tensor(a_ptr, cute.make_layout((S_KV, S_Q, H, B), stride=(S_Q, 1, S_KV * S_Q, H * S_KV * S_Q)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_Q, H, B), stride=(1, H * D, D, S_Q * H * D)))
+            c = cute.make_tensor(c_ptr, cute.make_layout((S_KV, D, H, B), stride=(H * D, 1, D, S_KV * H * D)))
+        meta = cute.make_tensor(meta_ptr, cute.make_layout((1,), stride=(1,)))
+        desc = cute.make_tensor(desc_ptr, cute.make_layout((1,), stride=(1,)))
+        problem = tuple(cutlass.Int64(x) for x in (a.shape[0], b.shape[0], a.shape[1], H, B, *a.stride, *b.stride, *c.stride, b.shape[1], a.shape[0], c.shape[0]))
+        entry(problem, a, b, c, meta, desc, stream)
+
+    def ptr(t, align=16):
+        return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+    cute.compile(probe, mod._host, ptr(cutlass.BFloat16), ptr(cutlass.BFloat16), ptr(cutlass.BFloat16), ptr(cutlass.Int32, 4), ptr(cutlass.Int64, 8),
+                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    print("SASS STL", cnt("STL"))
+    print("SASS LDL", cnt("LDL"))
+    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
+    print("SASS CGAERRBAR", cnt("CGAERRBAR"))
+    print("SASS UTCMMA", cnt("UTCMMA") + cnt("UTCHMMA"))
+    print("SASS LINES", len(sass))
+    """)
+
+_GEMM_SASS_ROWS = [
+    pytest.param("dk", "dense", id="dk-dense"),
+    pytest.param("dq", "dense", id="dq-dense"),
+    pytest.param("dk", "causal", id="dk-causal"),
+    pytest.param("dq", "causal", id="dq-causal"),
+]
+# MEASURED on the branch's toolchain (cutlass-dsl 4.8.0 + the internal CUDA 13.5 ptxas, 2026-09-28): 0 / 0 on all four rows.
+_GEMM_SPILL_PINS = {"STL": 0, "LDL": 0}
+_GEMM_SASS_CACHE = {}
+
+
+def _gemm_sass_probe(tmp_path, major, mask):
+    if (major, mask) in _GEMM_SASS_CACHE:
+        return _GEMM_SASS_CACHE[(major, mask)]
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_bwd_stage3_{major}_{mask}"
+    dump.mkdir()
+    # From a FILE, not `-c`: the probe defines a `@cute.jit` wrapper and the DSL needs its source (`UNSUP_NO_SOURCE` otherwise).
+    script = dump / "gemm_sass_probe.py"
+    script.write_text(_GEMM_SASS_PROBE)
+    proc = subprocess.run([sys.executable, str(script), str(dump), major, mask, *cands], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the d256 stage-3 {major} {mask} rendering failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    consts = {ln.split()[1]: ln.split(maxsplit=2)[2] for ln in out if ln.startswith("CONST ")}
+    smem = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SMEM ")}
+    print(f"\nsm107 bwd stage-3 {major} {mask} sm_107a SASS: {stats}; {consts}; SMEM {smem}")
+    _GEMM_SASS_CACHE[(major, mask)] = (stats, consts, smem)
+    return stats, consts, smem
+
+
+@pytest.mark.parametrize("major, mask", _GEMM_SASS_ROWS)
+def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask):
+    """The shipped d256 rendering (what `_stage3_cgrp_tile_mn(107, 256)` selects), trace-compiled for sm_107a: the
+    (256, 256) row's constants reached the module, no stack spills, no GPU-scope drain on a per-tile path, and both
+    MMA-operand ring roots sit below 256 KiB -- so the version-0 tcgen05 SMEM descriptor is the right one at this
+    ring depth (a 9-stage Rubin row would put the B ring's UPPER stages past 256 KiB while its root stays below: the
+    per-stage advance is a bare add on the root, which is exactly why the ROOT is what is pinned)."""
+    stats, consts, smem = _gemm_sass_probe(tmp_path, major, mask)
+    assert consts["cgrp_tile_mnk"] == "(256, 256, 64)" and consts["cluster_shape_mnk"] == "(2, 1, 1)", consts
+    assert consts["ab_stages"] == "6" and consts["acc_stages"] == "2" and consts["mma_size_m"] == "1", consts
+    assert consts["multicast_a"] == "False" and consts["a_mcast_slices"] == "1" and consts["ab_empty_full_mask"] == "False", consts
+    assert_no_new_spills(stats, _GEMM_SPILL_PINS, tag=f"stage-3 {major} {mask}: ")
+    assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
+    assert smem["smem_a_0"] < _SMEM_DESC_V0_LIMIT and smem["smem_b_0"] < _SMEM_DESC_V0_LIMIT, smem
+    assert smem["total"] <= _SM100_OPTIN_SMEM, smem

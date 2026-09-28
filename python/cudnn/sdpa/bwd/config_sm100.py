@@ -153,6 +153,28 @@ class MatmulTemplateParams:
     # only the dtype TOKENS in the rendered body -- every byte-size constant
     # (swizzle, box dims, SMEM staging) is width-driven and unaffected.
     dtype_qkv: int = DTYPE_BF16
+    # The CLUSTER's output tile ``(M, N)``, selecting one row of the template's
+    # tile-constants table (``bprop_matmul_blackwell._TILE_ROWS``).  The N tile
+    # is what matters: the grid covers ``ceil(n / N)`` cluster tiles along the
+    # head dim, so a rendering whose N exceeds the head dim computes PADDING --
+    # at d = 256 the default (512, 512) row (cluster 2x2, 512 x 512) spends the
+    # two N-rank CTAs of every cluster on columns 256..511 that do not exist
+    # (TMA-OOB zero loads, clipped stores): half of every cluster's MMA work.
+    #   (512, 512)  cluster (2,2,1), CTA tile 256 x 128, 4 stages, one 512-col
+    #               accumulator -- the SM100 d512 chain's rendering (N = 512
+    #               fills it; measured faster than 2x1 there, see the template).
+    #   (256, 256)  cluster (2,1,1), CTA tile 128 x 128, 6 stages, TWO 256-col
+    #               accumulator stages (the epilogue overlaps the next tile's
+    #               mainloop) -- no padding at d = 256; the sm107 d256 chain.
+    #   (512, 256)  cluster (2,1,1), CTA tile 256 x 128, 4 stages, one 512-col
+    #               accumulator -- an A/B alternate, selected by no adapter.
+    # Append-only, defaulted: the SM100 adapter never sets it, so its records
+    # render exactly the constants they always did.
+    cgrp_tile_mn: tuple = (512, 512)
+
+
+# The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
+STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
 
 
 def validate_matmul_params(params: MatmulTemplateParams) -> None:
@@ -160,6 +182,11 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
     for stage 2. Public because the template calls it; reaching a raise here
     means the adapter built a record the Capabilities row should not have
     admitted."""
+    if tuple(params.cgrp_tile_mn) not in STAGE3_CGRP_TILES:
+        raise ValueError(
+            f"SDPA bwd stage 3: cgrp_tile_mn must be one of {STAGE3_CGRP_TILES} (the template's tile-constants rows; the N tile "
+            f"must not exceed the head dim or the cluster computes padding); got {params.cgrp_tile_mn!r}."
+        )
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
     if params.vec_bytes_epi not in (16, 32):
