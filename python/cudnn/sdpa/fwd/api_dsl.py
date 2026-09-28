@@ -4898,13 +4898,9 @@ def sdpa_fwd_wrapper_dsl_sm120(
 # =============================================================================
 # SM80 (A100) adapter — SdpaFwdDslSm80 + the sdpa_fwd_wrapper_sm80 entry point.
 #
-# The SM80 kernels predate the TemplateParams/load_template pipeline: they
-# self-cache one cute.compile artifact per (shape, feature) key inside the
-# kernel module (``_compile_cached``'s lru_cache), and take their tile/mask
-# configuration as forward() kwargs. This adapter gives them the same
-# SdpaFwdDsl lifecycle and keyword contract as the SM100/SM120 adapters so
-# ``lower_dsl_prefill`` drives all three identically; converting the kernels
-# themselves to TemplateParams form is tracked as follow-up work.
+# SM80 templates specialize through TemplateParams/load_template. Native dense
+# and packed launches use prepared pointer hosts; the remaining dense/RoPE
+# routes keep their existing staging and then use the same pointer lowering.
 # =============================================================================
 
 from cudnn.sdpa.fwd import config_sm80 as _sm80_config
@@ -5028,64 +5024,10 @@ def _sm80_sched_policy_int(token: str) -> int:
     return {"default": SCHED_NATURAL, "lpt": SCHED_LPT, "lpt_l2": SCHED_LPT_L2}[token]
 
 
-def _sm80_call(
-    fn,
-    *,
-    q,
-    k,
-    v,
-    o,
-    lse,
-    seq_kv,
-    seq_q,
-    sinks_log2,
-    bias,
-    rope_cs,
-    n_kv_tiles,
-    scale_log2,
-    sq,
-    skv,
-    d,
-    right_bound,
-    inv_scale,
-    stream,
-):
-    """Invoke one compiled SM80 artifact (the traced ``_sdpa_host`` ABI:
-    12 operand slots — packed prefixes and optional LSE are None-specialized —
-    then 9 runtime scalars and the
-    launch stream)."""
-    import cutlass
-    from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
-
-    def from_dlpack(t):
-        # The kernels compile with --enable-tvm-ffi, so host-side conversions
-        # must produce TVM-FFI tensors regardless of the env latch.
-        return _from_dlpack_raw(t, enable_tvm_ffi=True)
-
-    fn(
-        from_dlpack(q),
-        from_dlpack(k),
-        from_dlpack(v),
-        from_dlpack(o),
-        from_dlpack(lse) if lse is not None else None,
-        from_dlpack(seq_kv),
-        from_dlpack(seq_q),
-        from_dlpack(sinks_log2),
-        from_dlpack(bias),
-        None,
-        None,
-        from_dlpack(rope_cs),
-        cutlass.Int32(n_kv_tiles),
-        cutlass.Float32(scale_log2),
-        cutlass.Int32(sq),
-        cutlass.Int32(skv),
-        cutlass.Int32(d),
-        cutlass.Int32(right_bound),
-        cutlass.Float32(inv_scale),
-        cutlass.Int32(0),
-        cutlass.Int32(1),
-        stream,
-    )
+def _sm80_call(fn, *, q, k, v, o, lse, seq_kv, seq_q, sinks_log2, bias, rope_cs, scale_log2, inv_scale, stream):
+    """Bind the adapter's already-staged buffers to the pointer-only host."""
+    buffers = (q, k, v, o, lse, seq_kv, seq_q, sinks_log2, bias, rope_cs)
+    fn(*(tensor.data_ptr() if tensor is not None else None for tensor in buffers), scale_log2, inv_scale, int(stream))
 
 
 class SdpaFwdDslSm80(SdpaFwdDsl):
@@ -5095,8 +5037,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     its SM100/SM120 siblings end to end: ``check_support`` resolves the
     flavor/mask/scheduler into a plan-time :class:`config_sm80.TemplateParams`,
     ``compile()`` loads the specialized template module and compiles the
-    per-shape artifact ONCE (THD packed token extents compile dynamic via
-    ``cute.sym_int`` — issue #604's key is gone), and ``execute()`` re-binds
+    artifact once (packed token capacities bind as runtime Int64 values), and ``execute()`` re-binds
     caller buffers to the cached artifact (a compile-cache miss at execute is
     a bug by contract).
 
@@ -5323,8 +5264,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         """Load the TemplateParams-specialized module and compile the artifact.
 
         Plan-time only (Hard Rule 4): every key component here is graph
-        declaration or capability data; execute()'s call into the module's
-        per-shape lru is a guaranteed hit.
+        declaration or capability data. execute() binds current buffers and
+        launches the compiled host without looking up a compiler cache.
         """
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
@@ -5362,20 +5303,20 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._compiled_kernel = self._sm80_spec.artifact
             self._logger.debug("compile completed")
             return
-        self._compiled_kernel = self._k_mod.compile(
-            b=self.batch_size,
-            # Dense GQA is served by adapter-side K/V head expansion until the
-            # kernels' native dense-GQA path is qualified (class docstring), so
-            # the artifact is compiled against the EXPANDED head count — the
-            # shapes execute() actually binds.
-            h=self.h_q,
-            h_kv=self.h_q,
-            sq=self.s_q_max,
-            skv=self.s_k_max,
-            d=self.head_dim_qk,
-            swa_window=int(self.swa_window_runtime),
-            rope_max_s=self._rope_max_s,
-            lse_stride=self._lse_stride,
+        from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_staged_host
+
+        self._compiled_kernel, self._sm80_staged_fn = compile_staged_host(
+            self._k_mod,
+            self.batch_size,
+            self.h_q,
+            self.s_q_max,
+            self.s_k_max,
+            self.head_dim_qk,
+            int(self.swa_window_runtime),
+            int(self.right_bound_runtime),
+            self._rope_max_s,
+            self._lse_stride,
+            int(self.q_desc.device.index or 0),
         )
         self._logger.debug("compile completed")
 
@@ -5464,6 +5405,44 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
         self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
         self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
+        # The staged host specializes compact geometry and binds raw pointers.
+        # Reject incompatible storage before any gather, fill or copy-back.
+        for name, tensor, desc in (("q", q_tensor, self.q_desc), ("k", k_tensor, self.k_desc), ("v", v_tensor, self.v_desc), ("o", o_tensor, self.o_desc)):
+            self._value_error_if(
+                tensor is None or tuple(tensor.shape) != tuple(desc.shape) or tensor.dtype != desc.dtype or tensor.device != desc.device,
+                f"{name} must match compiled shape {tuple(desc.shape)}, dtype {desc.dtype}, device {desc.device}",
+            )
+        for name, tensor in (
+            ("lse_tensor", lse_tensor),
+            ("sinks", sinks),
+            ("seq_q_lens", seq_q_lens),
+            ("seq_kv_lens", seq_kv_lens),
+            ("bias_tensor", bias_tensor),
+        ):
+            self._value_error_if(tensor is not None and tensor.device != self.q_desc.device, f"{name} must be on {self.q_desc.device}")
+        self._value_error_if(lse_tensor is not None and lse_tensor.dtype != torch.float32, "lse_tensor must be float32")
+        self._value_error_if(
+            workspace is not None and (workspace.device != self.q_desc.device or not workspace.is_contiguous()),
+            "SM80 staged workspace must be contiguous and on the Q device",
+        )
+        seq_kv_b = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
+        seq_q_b = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None
+        checked_sinks = self._checked_sinks_1d(sinks) if sinks is not None else None
+        if bias_tensor is not None:
+            self._value_error_if(
+                bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else self.dtype),
+                f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
+            )
+            self._value_error_if(
+                tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
+                f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
+            )
+            self._value_error_if(bias_tensor.shape[0] == 0, "bias must contain at least one batch slice")
+            bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
+            self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
+        else:
+            bias_b = None
+
         # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
         # [B, H, SQ] through the exact declared strides.
         if lse_tensor is not None:
@@ -5551,43 +5530,16 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 if lse_tensor is not None:
                     lse_tensor.zero_()
 
-            # Dummies fill compiled-out ABI slots (Rule 1); the kernel never
-            # dereferences them.  Base-class ``_dummy`` (key, device, factory).
-            seq_kv_b = (
-                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-                if seq_kv_lens is not None
-                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
-            )
-            seq_q_b = (
-                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-                if seq_q_lens is not None
-                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
-            )
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
                 # (the kernels consume log2 units), into carved scratch.
-                checked_sinks = self._checked_sinks_1d(sinks)
                 if carver is not None:
                     sinks_b = carver.take(self.h_q, torch.float32)
                     torch.mul(checked_sinks, _LOG2E, out=sinks_b)
                 else:
                     sinks_b = (checked_sinks * _LOG2E).contiguous()
             else:
-                sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
-            if bias_tensor is not None:
-                self._value_error_if(
-                    bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
-                    f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
-                )
-                self._value_error_if(
-                    tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
-                    f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
-                )
-                bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
-                self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
-            else:
-                bias_dt = q_tensor.dtype
-                bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
+                sinks_b = None
             if rope_freqs is not None:
                 # (cos, sin) table build — wrapper-only fusion (the engine row
                 # never admits RoPE); per-execute by contract, like the caller
@@ -5601,10 +5553,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 angles = rf[:, :d2]
                 rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
             else:
-                rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+                rope_b = None
 
             _sm80_call(
-                self._compiled_kernel,
+                self._sm80_staged_fn,
                 q=Q,
                 k=K,
                 v=V,
@@ -5615,12 +5567,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 sinks_log2=sinks_b,
                 bias=bias_b,
                 rope_cs=rope_b,
-                n_kv_tiles=(self.s_k_max + p.tile_n - 1) // p.tile_n,
                 scale_log2=scale_val * _LOG2E,
-                sq=self.s_q_max,
-                skv=self.s_k_max,
-                d=self.head_dim_qk,
-                right_bound=int(self.right_bound_runtime),
                 inv_scale=1.0 / float(scale_val),
                 stream=launch_stream,
             )
