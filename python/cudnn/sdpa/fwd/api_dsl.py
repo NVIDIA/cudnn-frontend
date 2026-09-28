@@ -44,7 +44,6 @@ from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epil
 from cudnn.sdpa.fwd.config_sm100 import (
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
-    bshd_zero_copy_stride as _bshd_zero_copy_stride_rule,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
@@ -647,7 +646,6 @@ class SdpaFwdDsl(APIBase):
         self.has_amax_o = bool(has_amax_o and (not pv_bf16 or sample_amax_o is not None))
         # The gate's BSHD strides the artifact is COMPILED at (None = compact),
         # decided by check_support exactly like the Q/K/V/O zero-copy strides.
-        self._gate_declared: Optional[tuple] = None
         self.sf_o_desc = self._make_tensor_desc(sample_sf_o, name="sf_o")
         # MXFP8 input: whether execute() binds scale_o (see the constructor doc);
         # False compiles the operand out and the kernel folds an identity.
@@ -764,108 +762,6 @@ class SdpaFwdDsl(APIBase):
     @abstractmethod
     def _initialize_implementation(self) -> None:
         """Initialize state private to specific implementations."""
-
-    @staticmethod
-    def _to_bshd(tensor: torch.Tensor, declared: Optional[tuple] = None) -> torch.Tensor:
-        """Return the kernel-facing BSHD tensor for logical BHSD.
-
-        Zero-copy in two cases now, not one. The tensor is already compact
-        (the common path), OR ``declared`` names the BSHD strides this
-        plan accepts for direct binding and the view matches them -- in which
-        case the strides ride in the TMA descriptor and no repack is needed. Any
-        other layout still takes the historical normalisation copy, so no
-        existing caller changes behaviour.
-
-        The second case is what lets a caller hand us Q/K/V sliced out of a
-        FUSED projection (token stride N, not h*d) with no gather. See
-        `_bshd_zero_copy_stride`.
-        """
-
-        view = tensor.transpose(1, 2)
-        if view.is_contiguous():
-            return view
-        if declared is not None and tuple(view.stride()) == tuple(declared):
-            return view
-        return view.contiguous()
-
-    @staticmethod
-    def _to_bshd_view(tensor: torch.Tensor, declared: Optional[tuple], name: str) -> torch.Tensor:
-        """The kernel-facing BSHD VIEW of a logical BHSD tensor -- never a copy.
-
-        Same two zero-copy cases as `_to_bshd` (already compact, or exactly the
-        declared zero-copy strides), but the third case is a
-        :class:`ValueError` instead of a hidden normalisation copy. Used for the
-        operands whose layout check_support already pinned (the epilogue gate):
-        a silent repack there would not be wrong, but it would be a per-execute
-        allocation the caller cannot see, which the contract forbids.
-        """
-        view = tensor.transpose(1, 2)
-        if view.is_contiguous():
-            return view
-        if declared is not None and tuple(view.stride()) == tuple(declared):
-            return view
-        raise ValueError(
-            f"{name} must be BSHD-compact or carry exactly the declared zero-copy strides "
-            f"({'compact' if declared is None else declared}); got BSHD strides {tuple(view.stride())} -- "
-            f"no hidden copy is made for {name}"
-        )
-
-    def _checked_gate_view(self, gate: torch.Tensor, o_tensor: torch.Tensor) -> torch.Tensor:
-        """Validate the execute-time gate against the sample it was compiled from and return its BSHD view."""
-        self._value_error_if(
-            not isinstance(gate, torch.Tensor) or gate.device.type != "cuda" or gate.device != o_tensor.device,
-            f"gate must be a CUDA tensor on O's device ({o_tensor.device}); got {getattr(gate, 'device', type(gate).__name__)}",
-        )
-        self._value_error_if(
-            tuple(gate.shape) != tuple(self.gate_desc.shape),
-            f"gate must have O's logical BHSD shape {tuple(self.gate_desc.shape)} (the sample_gate it was compiled from); got {tuple(gate.shape)}",
-        )
-        self._value_error_if(
-            gate.dtype != self.gate_desc.dtype,
-            f"gate dtype mismatch: this specialization was compiled for {self.gate_desc.dtype}; got {gate.dtype}",
-        )
-        return self._to_bshd_view(gate, self._gate_declared, "gate")
-
-    @staticmethod
-    def _bshd_strides_of(desc) -> tuple:
-        """BSHD (b, s, h, d) strides of a logical BHSD descriptor."""
-        st = desc.stride
-        return (int(st[0]), int(st[2]), int(st[1]), int(st[3]))
-
-    @classmethod
-    def _bshd_zero_copy_stride(cls, desc, elem_bytes: int) -> Optional[tuple]:
-        """The BSHD stride tuple to COMPILE this operand at, or None for compact.
-
-        Returns None when the operand is already BSHD-compact (nothing to
-        declare) or when its layout is one TMA cannot express, in which case
-        the caller keeps the normalisation copy. The rule itself is
-        `config_sm100.bshd_zero_copy_stride` -- ONE import-light function the
-        engine rows consume too (`config_sm107.epilogue_gate_layout_declarable`
-        in `mismatch()`), so the graph path and this adapter judge a layout
-        identically (rule 8b lockstep): head dim innermost-contiguous, seq and
-        head strides 16-byte multiples (they are handed to TMA as global
-        strides), token-major and COVERING (head >= d, seq >= h*head,
-        batch >= s*seq -- an overlapping declaration would alias distinct rows
-        onto one address, a write race on O; same reasoning as the THD arm's
-        `_thd_check_strides_native`).
-        """
-        return _bshd_zero_copy_stride_rule(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), elem_bytes)
-
-    @staticmethod
-    def _to_bshd_writable(tensor: torch.Tensor, declared: Optional[tuple] = None):
-        """Return a writable BSHD tensor and optional copy-back state.
-
-        Same two zero-copy cases as `_to_bshd`. The strided case matters more
-        here: O is WRITTEN, so the historical path costs a scratch buffer AND a
-        scatter copy back, not just a gather."""
-
-        view = tensor.transpose(1, 2)
-        if view.is_contiguous():
-            return view, False, None
-        if declared is not None and tuple(view.stride()) == tuple(declared):
-            return view, False, None
-        scratch = torch.empty_like(view, memory_format=torch.contiguous_format)
-        return view, True, scratch
 
     # -- THD declared-stride binding ------------------------------------------
     # A THD tensor may DECLARE a wider token stride than the packed h*d — e.g.
@@ -1405,17 +1301,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
             )
 
-        # Layout gate. DENSE: the kernels always consume canonical BSHD-compact
-        # buffers — execute() normalizes via _to_bshd / _to_bshd_writable
-        # (zero-copy when the tensor already is BSHD-compact, one gather /
-        # scatter copy otherwise) — so the only real requirements are the ones
-        # normalization itself needs: head dim innermost-contiguous (stride 1),
-        # no zero stride on a size>1 dim (broadcast), and non-overlapping
-        # strides (padded / oversized are fine; sub-dense would alias and make
-        # the O write-back ill-defined). Any B/H/S stride permutation is
-        # accepted. No TMA stride/alignment gate is needed here: the TMA
-        # descriptors are built over the normalized compact buffers, never
-        # over the caller's strides.
+        # Preserve the existing dense conversion domain. Native layouts bind
+        # directly; other accepted layouts receive prepared gather/scatter
+        # recipes and explicit caller workspace during compile().
         # THD (ragged) keeps the BSHD order over (H, S, D): the varlen path
         # rebuilds packed [1,T,H,D] views from the token, head and element
         # strides, and only that packing is defined. The batch stride is
@@ -1979,8 +1867,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"declaration (D innermost-contiguous, then heads, then tokens; seq and head strides 16-byte multiples; covering) "
                 f"-- a head-major or unaligned G is neither, and no hidden copy is made for the gate; got BHSD strides {tuple(self.gate_desc.stride)}",
             )
-            # None = compact (nothing to declare); the inexpressible case raised above.
-            self._gate_declared = self._bshd_zero_copy_stride(self.gate_desc, self.gate_desc.dtype.itemsize)
         self._value_error_if(
             not self.has_amax_o and not self._fp8,
             "has_amax_o=False is meaningful on the quantized (FP8 / MXFP8) path only (the half kernels produce no Amax_O)",
@@ -2220,7 +2106,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         self._staged_spec = None
-        if self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
+        if (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout()):
             from .prepared_staged_forward import compile_plan
 
             self._dense_spec = self._thd_spec = None
@@ -2261,35 +2147,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # (_explicit_compile_kwargs); a kernel without the knob keeps the legacy
         # dummy slot even at has_amax_o=False.
         self._amax_folded_out = ("has_amax" in _kc) and not self.has_amax_o
-        # ZERO-COPY STRIDED Q/K/V/O, for EVERY dense branch. When an operand is
-        # not BSHD-compact but IS TMA-expressible, compile the artifact AT the
-        # caller's declared strides instead of repacking into a compact buffer
-        # on every execute -- which is what lets Q/K/V come straight out of a
-        # fused QKV projection (token stride N, not h*d). None per operand means
-        # compact, i.e. byte-identical to before. Paged K/V descriptors are page
-        # POOLS (bound at their runtime strides), so their entries stay
-        # None; O is None under a split (the positional O slot then binds the
-        # compact o_partial slab, never the caller's O). The quantized branch
-        # declares strides on the Rubin d256 flavor ONLY: the SM100 fp8 kernels
-        # and the Rubin fp8 d512 kernel accept them too, but only their THD key
-        # ever exercised the strides -- validate a strided dense run on the
-        # node before widening (every other fp8 flavor keeps the copy).
-        _bpe_qkv = 1 if self._fp8 else 2
-        _bpe_o = self._o_dtype().itemsize
-        self._bshd_declared = (
-            (None, None, None, None)
-            if (
-                self.thd
-                or (not _explicit and "q_stride" not in _kc)
-                or (self._fp8 and not (self._prepared_fp8 or self._prepared_mxfp8) and (self._device_cc != (10, 7) or self.flavor != (256, 256)))
-            )
-            else (
-                self._bshd_zero_copy_stride(self.q_desc, _bpe_qkv),
-                None if self.paged else self._bshd_zero_copy_stride(self.k_desc, _bpe_qkv),
-                None if self.paged else self._bshd_zero_copy_stride(self.v_desc, _bpe_qkv),
-                None if self.split_kv > 1 else self._bshd_zero_copy_stride(self.o_desc, _bpe_o),
-            )
-        )
         if _explicit:
             # One artifact per layout kind: THD, dense and paged all compile HERE, at plan
             # time, and execute() only binds pointers. has_lse=False compiles the LSE store
@@ -2301,6 +2158,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             raise NotImplementedError("THD forward requires a prepared pointer host")
         self._combine_kernel = None
         self._logger.debug("compile completed")
+
+    def _can_prepare_dense_layout(self):
+        operands = (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
+        return self.thd or all(self._prepared_operand_layout(desc) is not None for desc in operands)
 
     def _can_prepare_fp8(self):
         if not (
@@ -2426,16 +2287,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ragged=None,
     ) -> None:
         """Dense (padded) launch through the prepared spec (``prepared.bind_dense``) from this call's
-        torch tensors. Operands whose layout TMA cannot bind zero-copy are repacked into compact BSHD
-        scratch (and O copied back), as the tensor path did; a split writes the partial slabs and
-        recombines through the plan-time-compiled combine pass. ``ragged`` (the decode tile's ragged-Q
+        torch tensors. Conversion plans use the shared staged entry instead; a split writes the
+        partial slabs and recombines through the plan-time-compiled combine pass.
+        ``ragged`` (the decode tile's ragged-Q
         leg): the (Q, O, Stats) ragged-offset tensors; Q / O / Stats then bind AS PASSED (packed, no
         repack) and the binder addresses their rows from the offsets."""
         spec = self._dense_spec
         device = q_tensor.device
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
         _ensure_current_context(stream_int, device.index)  # every CUDA call below runs on the CALLER's thread, which reads its own context stack
-        with _torch_stream_context(current_stream, device):  # repacks, launch, combine and copy-back all on the launch stream
+        with _torch_stream_context(current_stream, device):  # legacy split scratch, launch and combine use the launch stream
             self._execute_dense_prepared_on_stream(
                 spec,
                 q_tensor,
@@ -2478,41 +2339,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     ) -> None:
         from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, facts_of_tensor
 
-        _decl = getattr(self, "_bshd_declared", (None, None, None, None))
-        if ragged is not None:
-            # Ragged-Q decode leg: Q / O / Stats are the caller's PACKED buffers
-            # (the graph's (B, H, S_max, D) declaration or a (T, H, D) view);
-            # the binder reads their token / head strides and the ragged offsets
-            # place the rows, so nothing is repacked (Rule 1) -- a repack would
-            # also read the batch stride the THD contract says is never stepped.
-            Q, o_arg, o_needs_copy_back = q_tensor, o_tensor, False
-            q_facts = facts_of_tensor(Q)
-        else:
-            Q = self._to_bshd(q_tensor, _decl[0])
-            q_facts = facts_of_tensor(Q.transpose(1, 2))  # BSHD storage described as the (B, H, S, D) operand
-            if self.split_kv > 1:
-                # The combine stores the caller's layout directly, without an O scratch/copy-back.
-                o_arg, o_needs_copy_back = o_tensor, False
-            else:
-                O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor, _decl[3])
-                o_arg = (O_scratch if o_needs_copy_back else O_view).transpose(1, 2)
-        if self.paged:
-            K, V = k_tensor, v_tensor
-        else:
-            K, V = self._to_bshd(k_tensor, _decl[1]), self._to_bshd(v_tensor, _decl[2])
-        G = self._checked_gate_view(gate, o_tensor) if gate is not None else None
+        # Layout conversions are prepared separately at compile time. Native
+        # plans bind the caller's BHSD facts directly, including ragged buffers.
         facts = dict(
-            q=q_facts,
-            k=facts_of_tensor(k_tensor if self.paged else K.transpose(1, 2)),
-            v=facts_of_tensor(v_tensor if self.paged else V.transpose(1, 2)),
-            o=facts_of_tensor(o_arg),
+            q=facts_of_tensor(q_tensor),
+            k=facts_of_tensor(k_tensor),
+            v=facts_of_tensor(v_tensor),
+            o=facts_of_tensor(o_tensor),
             lse=facts_of_tensor(lse_tensor),
             sinks=facts_of_tensor(self._checked_sinks_1d(sinks) if sinks is not None else None),
             seq_kv_lens=facts_of_tensor(self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None),
             seq_q_lens=facts_of_tensor(self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None),
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
-            gate=facts_of_tensor(G.transpose(1, 2)) if G is not None else None,
+            gate=facts_of_tensor(gate),
         )
         if ragged is not None:
             facts.update(ragged_q=facts_of_tensor(ragged[0]), ragged_o=facts_of_tensor(ragged[1]), ragged_lse=facts_of_tensor(ragged[2]))
@@ -2538,8 +2378,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         spec.fn(*frame)
         if self.split_kv > 1:
             spec.combine.fn(*combine_args)
-        if o_needs_copy_back:
-            O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
 
     @staticmethod
@@ -2567,12 +2405,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         holds unused amax and identity-scale words as well as THD metadata.
         """
         self._ensure_support_checked()
+        staged = getattr(self, "_staged_spec", None)
+        if staged is not None:
+            return staged.workspace_bytes
         b, qh = self.batch_size, self.h_q
-        if self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
+        compiled = self._compiled_kernel is not None
+        if not compiled and (
+            (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout())
+        ):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if self._can_prepare_fp8() or self._can_prepare_mxfp8():
+        if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
             # [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
@@ -3211,6 +3055,9 @@ def sdpa_fwd_wrapper_dsl_sm100(
         scale_softmax=scale_softmax,
     )
 
+    required = sdpa_fwd.scratch_workspace_bytes()
+    workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device) if required else None
+
     sdpa_fwd.execute(
         q_tensor=q_tensor,
         k_tensor=k_tensor,
@@ -3221,6 +3068,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
         sinks=sinks,
         seq_kv_lens=seq_kv_lens,
         current_stream=current_stream,
+        workspace=workspace,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
@@ -3235,9 +3083,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     Q, K, V, and O use logical ``(B, H, S, D)`` shapes over any dense layout
     with the head dim innermost (``dense_flex``, same envelope as SM100):
-    ``execute()`` normalizes to the kernel's compact-BSHD storage via
-    ``_to_bshd`` / ``_to_bshd_writable`` — zero-copy when the tensor already
-    is BSHD-compact, one gather / scatter copy otherwise. The kernels support
+    Native layouts bind directly; conversion layouts use the plan's prepared
+    gather/scatter recipes and caller workspace. The kernels support
     FP16/BF16 MHA, GQA, and MQA; head dimensions in multiples of 8 through
     256 (ENVELOPE: the general template compiles at tiles rounded up to 16 and
     TMA zero-fills the pad columns; head dims inside the d256 flavor's envelope
@@ -3303,7 +3150,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # DECLARED token/head strides; _thd_check_strides_native declines
         # what TMA cannot express); dense graphs get the dense_flex
         # relaxation — execute() normalizes to the kernel's compact-BSHD
-        # storage via _to_bshd / _to_bshd_writable (zero-copy when already
+        # storage via the prepared staging plan (zero-copy when already
         # BSHD-compact, one gather / scatter copy otherwise), so only what
         # normalization needs is required: head dim innermost-contiguous
         # (stride 1), non-broadcast, non-overlapping strides, any B/H/S

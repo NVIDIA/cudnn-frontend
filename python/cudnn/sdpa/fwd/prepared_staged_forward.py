@@ -38,6 +38,7 @@ def _layout(api):
     compact._compiled_kernel = None
     compact._staged_spec = None
     operands, regions = [], []
+    half_sm100 = _cc(api)[0] == 10 and not api._fp8
     # The prior SM107 D256 quantized fallback preserved each bindable operand.
     native_quant = _cc(api) == (10, 7) and api._fp8 and api.flavor == (256, 256)
     for role in ("q", "k", "v", "o"):
@@ -45,7 +46,7 @@ def _layout(api):
         b, h, s, d = desc.shape
         stride = (s * h * d, d, h * d, 1)
         pool = getattr(api, "paged", False) and role in ("k", "v")
-        direct = pool or (native_quant and api._prepared_operand_layout(desc) is not None)
+        direct = pool or (half_sm100 and role == "o" and api.split_kv > 1) or ((half_sm100 or native_quant) and api._prepared_operand_layout(desc) is not None)
         if not direct:
             setattr(compact, role + "_desc", replace(desc, stride=stride, stride_order=(3, 1, 2, 0)))
         shape, strides, dtype = tuple(desc.shape), tuple(desc.stride), desc.dtype
@@ -65,6 +66,8 @@ def _layout(api):
             regions.append((role, (b, s, h, physical_d), dtype))
     if _cc(api)[0] == 12:
         ready = compact._can_prepare_layout()
+    elif half_sm100:
+        ready = compact._can_prepare_dense_layout()
     else:
         ready = compact._can_prepare_fp8() if api._pertensor else compact._can_prepare_mxfp8()
     if not ready:
@@ -237,3 +240,5 @@ def execute(api, tensors, workspace, stream, scale):
                     spec.combine.fn(*combine)
             if copy_frames[1] is not None:
                 _copy(staged.copies[1], copy_frames[1], stream_int)
+            if spec.quant is None:
+                api._logger.debug("execute completed")

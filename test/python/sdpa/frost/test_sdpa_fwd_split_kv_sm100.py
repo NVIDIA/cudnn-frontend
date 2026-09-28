@@ -1131,7 +1131,7 @@ def _expected_split(b, h_q, s_q, s_kv, *, rows_per_tile=512, ctas_per_tile=2, kv
     )
 
 
-def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_layout="contiguous", split_kv=None):
+def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_layout="contiguous", split_kv=None, native=False):
     """Drive SdpaFwdDslSm100 the way the graph path does — the chooser's value
     arrives as the explicit ``split_kv`` constructor knob, exactly as
     ``lower_dsl_prefill`` forwards a plan's knobs; return (split, O, ref)."""
@@ -1145,6 +1145,8 @@ def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_la
     q = torch.randn(b, h_q, s_q, d, device=dev, dtype=torch.float16)  # BHSD samples
     k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
     v = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
+    if native:
+        q, k, v = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q, k, v))
     o = torch.zeros_like(q)
     lse_storage = None
     if not with_lse:
@@ -1202,7 +1204,7 @@ def test_api_does_not_split_a_full_chip():
     so hard-coding split==1 would fail on a smaller SM100 part for a device
     reason rather than a policy one."""
     want = _expected_split(1, 16, 2048, 8192)
-    result = _api_case(1, 16, 16, 2048, 8192)
+    result = _api_case(1, 16, 16, 2048, 8192, native=True)
     assert result.split == want
     assert (result.workspace_bytes > 0) == (result.split > 1), "workspace is needed exactly when we split"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
@@ -1211,9 +1213,9 @@ def test_api_does_not_split_a_full_chip():
 @pytest.mark.L0
 @pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
 def test_api_split_with_and_without_workspace(workspace):
-    """With a workspace the partials are carved from it; without one they are
-    torch-allocated (standalone use). Same answer either way."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
+    """Native layouts retain the standalone split-scratch allocation fallback.
+    Conversion layouts require caller workspace, covered by the staged suite."""
+    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace, native=True)
     assert result.split > 1
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
