@@ -38,6 +38,7 @@ def native_layouts(api):
 def build_spec(api, d64_module, *, staged=False):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
     from .kernels.sm80.prepared_host import compile_host, launch_bounds
+    from cudnn.sdpa.fwd.kernels.sm80.packed_init import FROST_SOURCE_DIGEST as init_digest
 
     for role in ROLES:
         if role in ("seq_q", "seq_kv"):
@@ -129,6 +130,7 @@ def build_spec(api, d64_module, *, staged=False):
             swa_window=api.swa_window_runtime,
             right_bound=api.right_bound_runtime,
             thd=(api.batch_size, api._thd_lse_token_major) if api.thd else None,
+            packed_init=init_digest if getattr(api, "_initialize_packed_outputs", False) else None,
         ),
         "prepared_pointer",
     )

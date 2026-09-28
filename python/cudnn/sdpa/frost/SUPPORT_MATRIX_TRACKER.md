@@ -1086,8 +1086,14 @@ One fused copy handles the selected operands; native operands bind directly.
 The bounded wrapper allocation-recipe memo contains only host metadata, while
 compiled copy artifacts specialize on head/width geometry and bind Int64 token
 capacities, strides and addresses per call. The former Torch padding helpers
-are removed. CPU prefix/scalar conversion and zeroed output tails retain their
-existing convenience-wrapper contract; graph eligibility is unchanged.
+are removed. Packed forward initializes O and Stats together inside its prepared
+host; packed backward combines its existing dQ/GQA-gradient capacity zeroing with
+workspace initialization. MHA dK/dV and direct graph-output tails retain their
+previous write contract. Initialization capacities and offset products stay Int64.
+Both packed wrappers bind the operand device around compilation and execution,
+including the default-stream path, and restore the caller's current device.
+CPU prefix/scalar conversion retains its existing convenience-wrapper contract;
+graph eligibility is unchanged.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a

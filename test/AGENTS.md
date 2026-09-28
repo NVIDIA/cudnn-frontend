@@ -458,3 +458,15 @@ replacement for Torch's large-angle range reduction. The exact-output detector
 angles, signed zero and nonfinite inputs. Keep real Int64 stride and product
 overflow checks on the angle input, with wrapped addresses inside allocated
 guard storage, plus changed-angle replay and fresh-process artifact reload.
+
+
+Packed wrapper initialization belongs in the existing compiled host: a separate
+Python launch can erase the host savings from fusing device clears. Preserve the
+wrapper's zeroed capacity holes/tails separately from direct graph outputs and
+MHA dK/dV, whose unwritten storage must remain untouched. Check runtime word counts
+above `2**32`, including half-tensor extent-to-byte conversion, with physical guard
+storage and poisoned tail probes. `test_sdpa_sm80_packed_init.py` covers these cases.
+A `stream_context(None, device)` is deliberately a no-op; it does not select the
+operand device. Packed wrappers must guard that device for both compilation and
+pointer launch and restore the caller. Test a foreign current device on both
+operand GPUs, with default and explicit streams; validate outputs after the call.
