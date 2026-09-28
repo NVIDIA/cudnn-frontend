@@ -904,12 +904,6 @@ def _kernel(
                                 _sf_byte,
                                 nf % 4,
                             )
-
-                # Order this warp's generic-proxy SMEM reads (ldmatrix / ld.shared) before the
-                # producer's async-proxy TMA write that follows the last consumer's release.
-                # mbarrier release/acquire alone does not order accesses across proxies
-                # (PTX ISA 8.6, 8.9.5): without this fence the next TMA load may land while a
-                # read of this stage is still in flight (seen as FC1 corruption on large tiles).
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 if elect_one:

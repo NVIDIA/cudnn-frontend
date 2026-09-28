@@ -853,8 +853,10 @@ def _render_tile_constants(
     if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
         raise NotImplementedError(f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by the MoE template")
     if chain.is_multi_gemm:
-        # Sm120KernelTemplate owns the multi-GEMM feasibility rules (registers,
-        # SMEM); the funnel's _extra_reject asks the same methods, so both agree.
+        # Sm120KernelTemplate owns the multi-GEMM feasibility rule (SMEM); the
+        # funnel's _extra_reject asks the same method, so both agree. Register
+        # pressure is a perf trade-off, not a gate: a large tile still renders
+        # and ptxas spills its accumulators.
         _mg = tmpl.multi_gemm_reject(chain, cfg)
         if _mg is not None:
             raise NotImplementedError(f"{tmpl.file}: {_mg}")

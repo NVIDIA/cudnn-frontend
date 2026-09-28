@@ -43,9 +43,11 @@ Multi-GEMM (e.g. SwiGLU: ``silu(A @ B0) * (A @ B1)``)
 -------------------------------------------------------
 One SMEM tile per DISTINCT operand per stage, one register accumulator per
 GEMM (``gemm_a_idx`` / ``gemm_b_idx`` pick each GEMM's operands, as in the
-sm100 template). Every GEMM's accumulators stay resident for the whole tile,
-so the renderer caps ``num_gemms * _ACC_REGS`` and sizes the SMEM ring with
-the epilogue staging pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` /
+sm100 template). Every GEMM's accumulators stay resident for the whole tile
+(``num_gemms * _ACC_REGS`` fp32 per lane); past the compute warp's register
+grant ptxas spills them to local memory -- a perf trade-off, never a reject.
+The one hard gate is SMEM: the renderer sizes the ring with the epilogue
+staging pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` /
 ``.multi_gemm_ab_stages`` in kernel_registry). The STG epilogue stages the GEMMs' fragments
 through the same warp-private buffer one after another and hands the fused
 epilogue one fp32 vector per GEMM (``vec_f32``, ``vec_f32_1``, ...).
@@ -615,8 +617,8 @@ def _kernel(
         bt_ldm_k = (lane % 8) + 8 * ((lane // 8) % 2)
         bt_ldm_n8 = lane // 16
 
-        # One register accumulator per GEMM of the chain (multi-GEMM: the renderer
-        # caps num_gemms * _ACC_REGS so they all stay resident).
+        # One register accumulator per GEMM of the chain (multi-GEMM: past the
+        # warp's register grant ptxas spills -- a perf trade-off, never a gate).
         acc_list = [cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16) for _g in range(num_gemms)]
 
         ab_full_phase_bit = cutlass.Int32(0)
@@ -775,12 +777,6 @@ def _kernel(
                                             _acc_g[_o + 2],
                                             _acc_g[_o + 3],
                                         )
-
-                # Order this warp's generic-proxy SMEM reads (ldmatrix / ld.shared) before the
-                # producer's async-proxy TMA write that follows the last consumer's release.
-                # mbarrier release/acquire alone does not order accesses across proxies
-                # (PTX ISA 8.6, 8.9.5): without this fence the next TMA load may land while a
-                # read of this stage is still in flight (seen as FC1 corruption on large tiles).
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 if elect_one:

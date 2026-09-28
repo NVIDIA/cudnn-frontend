@@ -498,12 +498,14 @@ class Sm120KernelTemplate(KernelTemplate):
 
     # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
     # The MoE template keeps one register accumulator per GEMM resident for the
-    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each), next to the
-    # A / B fragments and the epilogue staging, inside the 232 registers a
-    # compute warp is granted; 128 accumulator registers leave room for the
-    # rest. With the templates' 8 compute warps the next warp tile up doubles to
-    # 128 per GEMM, so two GEMMs never fit past cta_tile_m * cta_tile_n = 16384.
-    MULTI_GEMM_ACC_REG_BUDGET = 128
+    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each). How many
+    # registers that takes is NOT a support question: past what the compute
+    # warp's grant holds, ptxas spills to local memory and the plan still
+    # computes the same function, only slower -- a perf trade-off left to the
+    # autotuner and the auto pick (tile_config.select_config's shared 256-wide
+    # N budget keeps the auto pick spill-free), never a reason to reject a plan.
+    # The one hard gate is SMEM: a stage of every distinct operand tile plus the
+    # epilogue staging has to fit.
     COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in both sm120 templates
 
     def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
@@ -524,20 +526,15 @@ class Sm120KernelTemplate(KernelTemplate):
         return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
 
     def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        """Why a multi-GEMM chain cannot run on this template with ``config``
-        (accumulator registers, then SMEM); ``None`` when it fits or the chain is
-        a single GEMM. Asked by the funnel (``_extra_reject``) and by the sm120
-        renderer (``_render_tile_constants``), so both agree."""
+        """Why a multi-GEMM chain CANNOT run on this template with ``config`` --
+        SMEM only: one stage of every distinct operand tile plus the epilogue
+        staging has to fit. ``None`` when it fits or the chain is a single GEMM.
+        Register pressure is deliberately not a reason here: spilling is a perf
+        trade-off, never grounds to disable a plan. Asked by the funnel
+        (``_extra_reject``) and by the sm120 renderer
+        (``_render_tile_constants``), so both agree."""
         if not chain.is_multi_gemm:
             return None
-        acc_regs = config.warp_tile_m * config.warp_tile_n // 32
-        if chain.num_gemms * acc_regs > self.MULTI_GEMM_ACC_REG_BUDGET:
-            return (
-                f"{chain.num_gemms} GEMMs x {acc_regs} accumulator registers per warp "
-                f"(warp tile {config.warp_tile_m}x{config.warp_tile_n}) exceed the "
-                f"{self.MULTI_GEMM_ACC_REG_BUDGET}-register budget of the sm120 multi-GEMM kernel; "
-                f"pick a config with cta_tile_m * cta_tile_n <= {self.MULTI_GEMM_ACC_REG_BUDGET * 32 * self.COMPUTE_WARPS // chain.num_gemms}"
-            )
         stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
         if stages < 1:
             return (
@@ -674,7 +671,8 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
         # Multi-GEMM (SwiGLU-style dual MoE) runs on the same kernel: one register
-        # accumulator per GEMM, bounded by `Sm120KernelTemplate.multi_gemm_reject`.
+        # accumulator per GEMM; SMEM feasibility is `Sm120KernelTemplate.multi_gemm_reject`
+        # (register pressure is a perf trade-off, never a gate).
         supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
