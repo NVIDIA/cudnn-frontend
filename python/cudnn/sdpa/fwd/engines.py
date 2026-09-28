@@ -34,7 +34,7 @@ from typing import Any, Callable, Optional
 import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
@@ -44,7 +44,8 @@ from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
 # modules) into every process that merely asks whether an engine could serve a
 # graph. ENGINE_SPECS therefore names its adapter, and _adapter() resolves it
-# at build time. Capabilities/mismatch below stay import-free.
+# at build time. The SM107 target gate lazily probes the DSL once; other
+# capability checks stay import-free.
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
 _SM80 = "SdpaFwdDslSm80"
@@ -516,8 +517,31 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     A complete assignment additionally checks the final O store's layout.
     Runtime geometry still has to fit the compiled binder's per-call contract.
     """
-    if capabilities.sm_lo not in (100, 107) or facts.is_fp8 or facts.is_mxfp8:
+    if capabilities.sm_lo not in (100, 107, 120):
         return "this engine has no prepared shape/stride override executor"
+    if (facts.is_fp8 or facts.is_mxfp8) and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
+        return "prepared SM107 FP8/MXFP8 requires device cc 10.7"
+    if facts.o_block_scale and (facts.sf_o_t is None or facts.dtype_o != {16: cudnn.data_type.FP4_E2M1, 32: cudnn.data_type.FP8_E4M3}.get(facts.o_block_scale)):
+        return "prepared block-scaled output requires the matching O and SF_O declarations"
+    if facts.o_block_scale and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1 or facts.shape_overrides or facts.has_epilogue_gate):
+        return "prepared block-scaled outputs require fixed dense unsplit plans"
+    if facts.is_mxfp8 and (
+        capabilities.sm_lo not in (100, 107)
+        or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
+        or not capabilities.is_mxfp8
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
+        or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
+        or (facts.shape_overrides and not facts.thd)
+    ):
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense scalar outputs"
+    if facts.is_fp8 and (
+        capabilities.sm_lo not in (100, 107, 120)
+        or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
+        or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
+    ):
+        return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
+    if capabilities.sm_lo == 120 and facts.has_paged_kv:
+        return "prepared SM120 does not serve paged KV"
     if _synth_kv_padding(capabilities, facts) or facts.has_bias:
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:
@@ -538,7 +562,13 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if split_kv is not None and split_kv <= 1:
         tensors.append(facts.o_t)
     for tensor in tensors:
-        if tensor is None or dense_bind_strides(tuple(tensor.get_dim()), tuple(tensor.get_stride()), 2) is None:
+        if tensor is None:
+            return "prepared overrides require declared operands"
+        from cudnn.graph_types import storage_geometry
+
+        geometry = storage_geometry(tensor.get_dim(), tensor.get_stride(), tensor.get_data_type())
+        width = 1 if tensor.get_data_type() in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1) else 2
+        if geometry is None or dense_bind_strides(*geometry, width) is None:
             return "prepared overrides require input and unsplit-output layouts that bind without a copy"
     if facts.o_t is None or not ga.dense_layout_ok(tuple(facts.o_t.get_dim()), tuple(facts.o_t.get_stride())):
         return "prepared overrides require a non-overlapping dense output layout"
@@ -707,6 +737,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if cutedsl_too_old(version):
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
+    arch_error = cutedsl_arch_requirement_error(cc)
+    if arch_error is not None:
+        return arch_error
     shapes = sorted(capabilities.d_shapes)
     if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         # Envelope family: native flavor shapes are upper bounds (TMA
@@ -850,16 +883,31 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        # Served by the f16/bf16 kernels' PAGED_KV specialization on the
-        # flavors in paged_d_shapes (config_sm100._validate_params mirrors
-        # these as its backstop). The attention sink composes with it: the
-        # sink is a per-row epilogue fold and PAGED_KV only changes the K/V
-        # TMA-LDG warp (validated together in test_sdpa_fwd_paged_sm100,
-        # S_q 1..4, PackGQA on/off, HND/NHD, with a left window, on the d128,
-        # d192x128 and d256 flavors). Sink + split-KV stays declined above
-        # (the combine is not sink-aware), so sink decode runs unsplit.
-        if facts.is_fp8 or facts.is_mxfp8:
-            return "paged KV is served by the f16/bf16 kernel only"
+        # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
+        # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
+        # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
+        # as its backstop and each unwired kernel file backstops with a
+        # module-scope guard on paged_kv). The attention sink composes with it
+        # on the f16/bf16 kernels: the sink is a per-row epilogue fold and
+        # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
+        # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
+        # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
+        # stays declined above (the combine is not sink-aware), so sink decode
+        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
+        # epilogue (sf_o) over pools are not validated, so those two pairs stay
+        # declined on the fp8 row.
+        if facts.is_mxfp8:
+            if facts.page_size % 128 != 0:
+                # A page must hold whole 128-row F8_128x4 SF atoms.
+                return f"paged MXFP8 KV needs page_size to be a multiple of 128; got {facts.page_size}"
+            if facts.thd:
+                return "paged MXFP8 KV with THD queries is not wired"
+        if facts.is_fp8 and facts.thd:
+            return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
+        if facts.is_fp8 and facts.has_sink:
+            return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
+        if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
+            return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
             return "paged KV requires use_padding_mask with seq_len_kv (the per-batch KV length bounds the block-table walk)"
         if capabilities.paged_d_shapes is not None:
@@ -1186,7 +1234,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
-    in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
+    in cu_seqlens order — see prepared._bind_mxfp8_scales); the graph's declared
     SF dims stay the dense capacity, like the ragged Q/K/V storage.
     """
 
@@ -1223,6 +1271,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd_padded_stats=True,
             padded_stats=True,
             cu_seq_len=True,
+            # The SF pools page with K/V. mismatch() gates page_size % 128.
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -1352,6 +1403,22 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
+            # Paged KV caches (issue #920) on the SM100 line only: the d128
+            # per-tensor FP8 kernel carries the PAGED_KV specialization (block
+            # table indirection on the K/V TMA loads, HND/NHD pools, per-batch
+            # lengths on device, KV split + combine with the recombined amax);
+            # d64 rides its envelope. paged_d_shapes keeps the fp8 paged
+            # selection to the d128 flavor (d_qk, d_v <= 128: the d192x128 /
+            # d256 / d512 FP8 kernels carry no PAGED_KV specialization) and
+            # mismatch() keeps it to dense, sink-free, plain-O Q (the fp8 THD path
+            # clamps runtime K/V descriptors to a packed total a pool does not
+            # have; neither the sink fold nor the block-scaled O epilogue (sf_o)
+            # over pools is validated on this kernel).
+            # The Rubin sibling kernel has no PAGED_KV specialization, so that
+            # row stays off (a module-scope guard in the kernel file backstops
+            # it).
+            paged_kv=not rubin_row,
+            paged_d_shapes=None if rubin_row else frozenset({(128, 128)}),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
@@ -2122,6 +2189,11 @@ def lower_dsl_prefill(
     _execute.kernel_template = kernel_template
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
+    if getattr(api, "_sm80_spec", None) is not None:
+        from cudnn.sdpa.fwd.prepared_sm80 import PreparedSm80Launch
+
+        _execute.prepared = PreparedSm80Launch(api._sm80_spec, binding)
+        _execute.default_stream = lambda: api._get_default_stream(None)
     if _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1)) is None:
         # The prepared launch (cudnn.sdpa.fwd.prepared): the plan binds the normalized VariantPack itself.
         # THD: the f16 ragged plan without a gate. Dense: the f16 plan whose declared Q/K/V/O layouts TMA

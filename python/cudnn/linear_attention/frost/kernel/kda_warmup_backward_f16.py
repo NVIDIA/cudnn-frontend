@@ -240,6 +240,30 @@ def warmup_backward_host(
     )
 
 
+def build_configs(io_dtype, state_dtype, gate_dtype, *, recompute, coarse, has_state_in, use_initial_state, use_dstate_in, use_dstate0, **flags):
+    recompute_cfg = None
+    if recompute:
+        recompute_cfg = kda_recompute_f16.build_cfg(
+            io_dtype,
+            state_dtype,
+            gate_dtype,
+            use_initial_state=has_state_in,
+            store_final_state=False,
+            enable_checkpoints=True,
+            seed_checkpoints=coarse,
+            **flags,
+        )
+    bprop_cfg = kda_bprop_f16.build_cfg(
+        io_dtype,
+        gate_dtype,
+        use_dstate_in=use_dstate_in,
+        use_dstate0=use_dstate0,
+        use_initial_state=use_initial_state,
+        **flags,
+    )
+    return recompute_cfg, bprop_cfg
+
+
 def build_warmup_backward(
     *,
     q,
@@ -357,7 +381,16 @@ def build_warmup_backward(
         bool(allow_neg_eigval),
     )
     if key not in warmup_backward_cache:
-        flags = dict(
+        recompute_cfg, bprop_cfg = build_configs(
+            io_dtype,
+            get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
+            gate_dtype,
+            recompute=recompute,
+            coarse=coarse,
+            has_state_in=state_in is not None,
+            use_dstate_in=dstate_in is not None,
+            use_dstate0=dstate0 is not None,
+            use_initial_state=use_initial_state,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
@@ -366,28 +399,7 @@ def build_warmup_backward(
             allow_neg_eigval=allow_neg_eigval,
             max_active_clusters=num_sm,
             d_k=DK,
-        )
-        recompute_cfg = None
-        if recompute:
-            recompute_cfg = kda_recompute_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
-                gate_dtype,
-                use_initial_state=state_in is not None,
-                store_final_state=False,
-                enable_checkpoints=True,
-                seed_checkpoints=coarse,
-                d_v=DV,
-                **flags,
-            )
-        bprop_cfg = kda_bprop_f16.build_cfg(
-            io_dtype,
-            gate_dtype,
-            use_dstate_in=dstate_in is not None,
-            use_dstate0=dstate0 is not None,
-            use_initial_state=use_initial_state,
             d_v=DV,
-            **flags,
         )
         gate_table_placeholder = None
         dt_bias_table_placeholder = None

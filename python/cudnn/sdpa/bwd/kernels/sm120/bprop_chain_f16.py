@@ -24,6 +24,7 @@ from cutlass.experimental import primitives as prims
 
 from cudnn.sdpa.bwd.config_sm120 import ROW_ROUND
 from cudnn.sdpa.bwd.kernels.sm120._common import (
+    wide_index,
     _COPY_ELEMS,
     ceil_div,
     copy16_smem_to_gmem,
@@ -375,7 +376,7 @@ def convert_dq_kernel(
 
     q_left = S_Q - q_block * Q_TILE
     dq_batch_stride, dq_seq_stride, dq_head_stride, _ = dq.stride
-    g_base = batch * dq_batch_stride + (q_block * Q_TILE) * dq_seq_stride + head * dq_head_stride
+    g_base = wide_index(batch, dq) * dq_batch_stride + wide_index(q_block, dq) * Q_TILE * dq_seq_stride + wide_index(head, dq) * dq_head_stride
     chunks_per_row = D_QK // _COPY_ELEMS
     for i in cutlass.range_constexpr(Q_TILE * chunks_per_row // 256):
         chunk = i * 256 + tidx
@@ -387,12 +388,12 @@ def convert_dq_kernel(
                 if col < dq.shape[3]:
                     copy16_smem_to_gmem(
                         tile_ptr(sdQ, row, col, chunk_elems=chunk_elems, rows=Q_TILE),
-                        dq_ptr + g_base + row * dq_seq_stride + col,
+                        dq_ptr + g_base + wide_index(row, dq) * dq_seq_stride + col,
                     )
             else:
                 copy16_smem_to_gmem(
                     tile_ptr(sdQ, row, col, chunk_elems=chunk_elems, rows=Q_TILE),
-                    dq_ptr + g_base + row * dq_seq_stride + col,
+                    dq_ptr + g_base + wide_index(row, dq) * dq_seq_stride + col,
                 )
 
 

@@ -55,7 +55,7 @@ not fit in device memory.
 """
 
 from cudnn._cutlass_compat import get_smem_capacity_in_bytes
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Optional, Type
@@ -65,13 +65,13 @@ import cutlass
 import cutlass.utils
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.sdpa.bwd.config_sm120 import DEFAULT_TILES, ROW_ROUND, SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
 from cudnn.sdpa.bwd.kernels.sm120._common import (
+    wide_index,
     _COPY_ELEMS,
     _LOG2E,
     ceil_div,
@@ -83,16 +83,7 @@ from cudnn.sdpa.bwd.kernels.sm120._common import (
     pack_half2,
     tile_ptr,
 )
-from cudnn.sdpa.bwd.kernels.bprop_chain_common import (
-    dkv_reduce_host,
-    dot_do_o_host,
-    dsink_host,
-)
-from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import (
-    SM120DetDqGemmKernel,
-    convert_dbias_host,
-    convert_dq_host,
-)
+from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import SM120DetDqGemmKernel
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
@@ -638,7 +629,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
         kv_head = q_head // GROUP
         if cutlass.const_expr(lse_strided):
-            lse_base = batch * lse_batch_stride + q_head * lse_head_stride
+            lse_base = wide_index(batch, lse) * lse_batch_stride + wide_index(q_head, lse) * lse_head_stride
         else:
             lse_base = (batch * H_Q + q_head) * S_Q
         delta_base = (batch * H_Q + q_head) * S_Q_R
@@ -756,7 +747,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     if cutlass.const_expr(PARTIAL_Q):
                         r_cl = cute.math.min(r_abs, S_Q - 1)
                         if cutlass.const_expr(lse_strided):
-                            val = (lse_ptr + lse_base + r_cl * lse_seq_stride).load()
+                            val = (lse_ptr + lse_base + wide_index(r_cl, lse) * lse_seq_stride).load()
                         else:
                             val = (lse_ptr + lse_base + r_cl).load()
                         inf = cutlass.Float32(float("inf"))
@@ -771,7 +762,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         if ok32 == 0:
                             val = inf
                     elif cutlass.const_expr(lse_strided):
-                        val = (lse_ptr + lse_base + r_abs * lse_seq_stride).load()
+                        val = (lse_ptr + lse_base + wide_index(r_abs, lse) * lse_seq_stride).load()
                     else:
                         val = (lse_ptr + lse_base + r_abs).load()
                     if cutlass.const_expr(FLIP_MASKED_LSE):
@@ -1157,7 +1148,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_sdp * 16 + row_blk * 16 * WM_SDP + g_lane + hf * 8
                                 if cutlass.const_expr(lse_strided):
-                                    val = (lse_ptr + lse_base + (nq0 + r_loc) * lse_seq_stride).load()
+                                    val = (lse_ptr + lse_base + wide_index(nq0 + r_loc, lse) * lse_seq_stride).load()
                                 else:
                                     val = (lse_ptr + lse_base + nq0 + r_loc).load()
                                 if cutlass.const_expr(FLIP_MASKED_LSE):
@@ -1218,7 +1209,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_sdp * 16 + row_blk * 16 * WM_SDP + g_lane + hf * 8
                                 if cutlass.const_expr(lse_strided):
-                                    val = (lse_ptr + lse_base + (nq0 + r_loc) * lse_seq_stride).load()
+                                    val = (lse_ptr + lse_base + wide_index(nq0 + r_loc, lse) * lse_seq_stride).load()
                                 else:
                                     val = (lse_ptr + lse_base + nq0 + r_loc).load()
                                 if cutlass.const_expr(FLIP_MASKED_LSE):
@@ -1267,7 +1258,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_sdp * 16 + row_blk * 16 * WM_SDP + g_lane + hf * 8
                                 if cutlass.const_expr(lse_strided):
-                                    val = (lse_ptr + lse_base + (nq0 + r_loc) * lse_seq_stride).load()
+                                    val = (lse_ptr + lse_base + wide_index(nq0 + r_loc, lse) * lse_seq_stride).load()
                                 else:
                                     val = (lse_ptr + lse_base + nq0 + r_loc).load()
                                 if cutlass.const_expr(FLIP_MASKED_LSE):
@@ -1374,7 +1365,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             else:
                 # D_QK != D_V, strided, or enveloped
                 k_chunks_per_row = D_QK // _COPY_ELEMS
-                base_k = batch * dk_batch_stride + kv_base * dk_seq_stride + q_head * dk_head_stride
+                base_k = wide_index(batch, dk_ws) * dk_batch_stride + wide_index(kv_base, dk_ws) * dk_seq_stride + wide_index(q_head, dk_ws) * dk_head_stride
                 for i in cutlass.range_constexpr(KV_TILE * k_chunks_per_row // 256):
                     chunk = i * 256 + math_tidx
                     row = chunk // k_chunks_per_row
@@ -1384,12 +1375,16 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             # dK is only d_qk_orig wide; the pad columns are zero anyway.
                             if col < self.d_qk_orig:
                                 copy16_smem_to_gmem(
-                                    tile_ptr(sdK, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE), dk_ws_ptr + base_k + row * dk_seq_stride + col
+                                    tile_ptr(sdK, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE),
+                                    dk_ws_ptr + base_k + wide_index(row, dk_ws) * dk_seq_stride + col,
                                 )
                         else:
-                            copy16_smem_to_gmem(tile_ptr(sdK, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE), dk_ws_ptr + base_k + row * dk_seq_stride + col)
+                            copy16_smem_to_gmem(
+                                tile_ptr(sdK, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE),
+                                dk_ws_ptr + base_k + wide_index(row, dk_ws) * dk_seq_stride + col,
+                            )
                 v_chunks_per_row = D_V // _COPY_ELEMS
-                base_v = batch * dv_batch_stride + kv_base * dv_seq_stride + q_head * dv_head_stride
+                base_v = wide_index(batch, dv_ws) * dv_batch_stride + wide_index(kv_base, dv_ws) * dv_seq_stride + wide_index(q_head, dv_ws) * dv_head_stride
                 for i in cutlass.range_constexpr(KV_TILE * v_chunks_per_row // 256):
                     chunk = i * 256 + math_tidx
                     row = chunk // v_chunks_per_row
@@ -1398,10 +1393,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         if cutlass.const_expr(self.v_envelope):
                             if col < self.d_v_orig:
                                 copy16_smem_to_gmem(
-                                    tile_ptr(sdV, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE), dv_ws_ptr + base_v + row * dv_seq_stride + col
+                                    tile_ptr(sdV, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE),
+                                    dv_ws_ptr + base_v + wide_index(row, dv_ws) * dv_seq_stride + col,
                                 )
                         else:
-                            copy16_smem_to_gmem(tile_ptr(sdV, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE), dv_ws_ptr + base_v + row * dv_seq_stride + col)
+                            copy16_smem_to_gmem(
+                                tile_ptr(sdV, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE),
+                                dv_ws_ptr + base_v + wide_index(row, dv_ws) * dv_seq_stride + col,
+                            )
         else:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
@@ -1535,104 +1534,48 @@ def compile(  # noqa: A001
     d_qk, d_v = bwd.d_qk, bwd.d_v
     sq_r = ceil_div(sq, ROW_ROUND) * ROW_ROUND
 
-    def _fake(dtype, shape, strides=None):
-        """Compact fake, or one carrying a port's declared (batch, seq, head)
-        strides (the TMA descriptors and pointer math then address that
-        layout natively)."""
-        if strides is None:
-            return make_fake_compact_tensor(
-                dtype,
-                shape,
-                stride_order=tuple(range(len(shape) - 1, -1, -1)),
-                assumed_align=16,
-            )
-        batch_stride, seq_stride, head_stride = strides
-        return make_fake_tensor(dtype, shape, (batch_stride, seq_stride, head_stride, 1), assumed_align=16)
+    from cudnn.sdpa.bwd.kernels.sm120.prepared_host import compact, compile_host
 
-    fake_q = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk_orig), q_strides)
-    fake_k = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk_orig), k_strides)
-    fake_v = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v_orig), v_strides)
-    fake_o = _fake(STORAGE_DTYPE, (b, sq, qh, d_v_orig), o_strides)
-    fake_do = _fake(STORAGE_DTYPE, (b, sq, qh, d_v_orig), do_strides)
-    fake_dq = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk_orig), dq_strides)
-    fake_dk = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk_orig), dk_strides)
-    fake_dv = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v_orig), dv_strides)
-    if lse_strides is not None:
-        # f32 scalars -> 4 B alignment
-        # A strided stats view can start at any fp32 element; the compact
-        # branch keeps the historical allocation-backed 16-byte assumption.
-        fake_lse = make_fake_tensor(cutlass.Float32, (b, qh, sq), tuple(lse_strides), assumed_align=4)
-    else:
-        fake_lse = _fake(cutlass.Float32, (b, qh, sq))
-    fake_delta = _fake(cutlass.Float32, (b, qh, sq_r))
-    if det_2k:
-        fake_dq_accum = None
-        fake_dq_sem = None
-        skv_r = ceil_div(skv, ROW_ROUND) * ROW_ROUND
-        fake_ds_ws = _fake(STORAGE_DTYPE, (b, qh, sq, skv_r))
-    else:
-        fake_dq_accum = _fake(cutlass.Float32, (b * sq_r * qh * d_qk,))
-        # Sized for the smallest legal q-tile (32) so one formula covers every
-        # tile choice; must match the adapter's carve (scratch_workspace_bytes).
-        fake_dq_sem = _fake(cutlass.Int32, (b * qh * ceil_div(sq, 32),))
-        fake_ds_ws = None
-    # Main-kernel dK/dV destinations, always H_Q-headed: alias dk/d_v for MHA
-    # (qh == kvh); per-q-head partials summed by dkv_reduce_kernel for GQA.
-    fake_dk_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_qk)) if has_gqa else fake_dk
-    fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_v)) if has_gqa else fake_dv
-    fake_seq_q_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_q_lens_present else None
-    fake_seq_kv_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_kv_lens_present else None
-    # bias / dBias: contiguous [1|B, H_Q, S_Q, S_KV]
-    bias_dtype = cutlass.Float32 if PARAMS.bias_is_fp32 else STORAGE_DTYPE
-    fake_bias = _fake(bias_dtype, (bias_batch, qh, sq, skv)) if PARAMS.bias_present else None
-    fake_dbias_accum = _fake(cutlass.Float32, (bias_batch, qh, sq, skv)) if PARAMS.dbias_present else None
-    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    options = "--enable-tvm-ffi"
+    def port(shape, strides):
+        return compact(shape) if strides is None else (shape, (*strides, 1))
 
-    compiled_dot = _compile_cached(
-        dot_do_o_host,
-        fake_o,
-        fake_do,
-        fake_delta,
-        fake_dq_accum,
-        fake_dq_sem,
-        bwd.q_tile,
-        d_qk,
-        d_v,
-        bwd.chunk_elems,
-        bwd.use_pdl,
-        bwd.deterministic,
-        fake_stream,
-        options=options,
-        cache_key=_cache_key,
-        symbol="frost_sdpa_bwd",
+    geometry = (
+        port((b, sq, qh, d_qk_orig), q_strides),
+        port((b, skv, kvh, d_qk_orig), k_strides),
+        port((b, skv, kvh, d_v_orig), v_strides),
+        port((b, sq, qh, d_v_orig), o_strides),
+        port((b, sq, qh, d_v_orig), do_strides),
+        compact((b, qh, sq)) if lse_strides is None else ((b, qh, sq), tuple(lse_strides)),
+        port((b, sq, qh, d_qk_orig), dq_strides),
+        port((b, skv, kvh, d_qk_orig), dk_strides),
+        port((b, skv, kvh, d_v_orig), dv_strides),
+        compact((b,)),
+        compact((b,)),
+        compact((qh,)),
+        compact((qh,)),
+        compact((bias_batch, qh, sq, skv)),
+        compact((bias_batch, qh, sq, skv)),
     )
-    compiled_main = _compile_cached(
-        bwd,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_do,
-        fake_lse,
-        fake_delta,
-        fake_dq_accum,
-        fake_dq_sem,
-        fake_ds_ws,
-        fake_dk_ws,
-        fake_dv_ws,
-        fake_seq_q_lens,
-        fake_seq_kv_lens,
-        fake_bias,
-        fake_dbias_accum,
-        cutlass.Float32(1.0),
-        cutlass.Float32(1.0),
-        fake_stream,
-        options=options,
-        cache_key=_cache_key,
-        symbol="frost_sdpa_bwd_1",
-    )
-    compiled_cvt = None
-    compiled_dq2k = None
+    offset = 0
+
+    def region(shape, itemsize):
+        nonlocal offset
+        shape, strides = compact(shape)
+        result = (offset, shape, strides)
+        elements = 1
+        for n in shape:
+            elements *= n
+        offset += (elements * itemsize + 127) // 128 * 128
+        return result
+
+    delta = region((b, qh, sq_r), 4)
+    skv_r = ceil_div(skv, ROW_ROUND) * ROW_ROUND
+    dq_scratch = region((b, qh, sq, skv_r), 2) if det_2k else region((b * sq_r * qh * d_qk,), 4)
+    dq_sem = None if det_2k else region((b * qh * ceil_div(sq, 32),), 4)
+    dbias = region((bias_batch, qh, sq, skv), 4) if PARAMS.dbias_present and not PARAMS.dbias_is_fp32 else None
+    dk_ws = region((b, skv, qh, d_qk), 2) if has_gqa else None
+    dv_ws = region((b, skv, qh, d_v), 2) if has_gqa else None
+    dq_gemm = None
     if det_2k:
         dq_gemm = SM120DetDqGemmKernel(
             in_dtype=STORAGE_DTYPE,
@@ -1645,89 +1588,5 @@ def compile(  # noqa: A001
             ws_q_tile=bwd.q_tile,
             use_pdl=PARAMS.use_pdl,
         )
-        compiled_dq2k = _compile_cached(
-            dq_gemm,
-            fake_k,
-            fake_ds_ws,
-            fake_dq,
-            cutlass.Float32(1.0),
-            fake_stream,
-            options=options,
-            cache_key=_cache_key,
-            symbol="frost_sdpa_bwd_2",
-        )
-    else:
-        compiled_cvt = _compile_cached(
-            convert_dq_host,
-            fake_dq_accum,
-            fake_dq,
-            bwd.q_tile,
-            d_qk,
-            bwd.chunk_elems,
-            bwd.warps_m_dq,
-            cutlass.Float32(1.0),
-            STORAGE_DTYPE,
-            bwd.use_pdl,
-            fake_stream,
-            options=options,
-            cache_key=_cache_key,
-            symbol="frost_sdpa_bwd_3",
-        )
-    compiled_reduce = None
-    if has_gqa:
-        compiled_reduce = _compile_cached(
-            dkv_reduce_host,
-            fake_dk_ws,
-            fake_dv_ws,
-            fake_dk,
-            fake_dv,
-            d_qk,
-            d_v,
-            qh // kvh,
-            STORAGE_DTYPE,
-            bwd.use_pdl,
-            fake_stream,
-            options=options,
-            cache_key=_cache_key,
-            symbol="frost_sdpa_bwd_4",
-        )
-    compiled_dbias_cvt = None
-    if PARAMS.dbias_present and not PARAMS.dbias_is_fp32:
-        dbias_total = bias_batch * qh * sq * skv
-        compiled_dbias_cvt = _compile_cached(
-            convert_dbias_host,
-            _fake(cutlass.Float32, (dbias_total,)),
-            _fake(STORAGE_DTYPE, (dbias_total,)),
-            STORAGE_DTYPE,
-            bwd.use_pdl,
-            fake_stream,
-            options=options,
-            cache_key=_cache_key,
-            symbol="frost_sdpa_bwd_5",
-        )
-    compiled_dsink = None
-    if PARAMS.dsink_present:
-        fake_sink = _fake(cutlass.Float32, (qh,))
-        fake_dsink = _fake(cutlass.Float32, (qh,))
-        compiled_dsink = _compile_cached(
-            dsink_host,
-            fake_lse,
-            fake_delta,
-            fake_sink,
-            fake_dsink,
-            fake_seq_q_lens,
-            bwd.use_pdl,
-            fake_stream,
-            options=options,
-            cache_key=_cache_key,
-            symbol="frost_sdpa_bwd_6",
-        )
-    return SimpleNamespace(
-        dot=compiled_dot,
-        main=compiled_main,
-        cvt=compiled_cvt,
-        dq2k=compiled_dq2k,
-        reduce=compiled_reduce,
-        dbias_cvt=compiled_dbias_cvt,
-        dsink=compiled_dsink,
-    )
+    entry = compile_host(bwd, dq_gemm, PARAMS, geometry, (delta, dq_scratch, dq_sem, dbias, dk_ws, dv_ws), STORAGE_DTYPE, qh // kvh, _cache_key)
+    return SimpleNamespace(entry=entry, workspace_bytes=offset)

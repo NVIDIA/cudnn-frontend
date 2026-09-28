@@ -1049,41 +1049,9 @@ def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
 
 
 @pytest.mark.L0
-def test_thd_padded_lse_order_is_cutes_stride_order_for_every_compact_layout():
-    """The dynamic THD plan hands the kernel a COMPACT LSE fake in the caller's
-    dim order instead of explicit strides. CuTe's ``stride_order`` is per axis
-    (the rank of its stride), the inverse of "axes sorted by stride"; the two
-    agree only on self-inverse orders such as FlashInfer's (b, s_max, h), so
-    every one of the six (b, h, s_max) storage orders is checked against the
-    strides CuTe derives. A gapped layout has no compact order."""
-    _require_dsl()
-    from itertools import permutations
-    from types import SimpleNamespace
-
-    import cutlass
-    import cutlass.cute as cute
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    b, h, s = 2, 3, 5
-    shape = (b, h, s, 1)
-    for storage_order in permutations(range(3)):  # slowest axis first
-        st, acc = [0, 0, 0], 1
-        for ax in reversed(storage_order):
-            st[ax] = acc
-            acc *= shape[ax]
-        api = SimpleNamespace(_lse_stride=tuple(st), batch_size=b, h_q=h, s_q_max=s)
-        order = SdpaFwdDslSm100._thd_padded_lse_order(api)
-        assert order is not None, (storage_order, st)
-        fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, stride_order=order, assumed_align=4)
-        got = tuple(fake.stride)
-        assert all(shape[i] == 1 or got[i] == st[i] for i in range(4)), f"storage order {storage_order}: declared {st}, order {order}, CuTe derived {got}"
-    gapped = SimpleNamespace(_lse_stride=(h * s * 2, s * 2, 2), batch_size=b, h_q=h, s_q_max=s)
-    assert SdpaFwdDslSm100._thd_padded_lse_order(gapped) is None
-
-
-@pytest.mark.L0
+@pytest.mark.parametrize("storage_order", [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0), None])
 @torch_fork_set_rng(seed=0)
-def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
+def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order):
     """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
     logical strides (1, s_max*b, b). The order and its inverse differ, and the
     wrong one pins the h axis to stride 1 in the compiled fake, so the kernel
@@ -1107,10 +1075,16 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout():
 
     ref = torch.full((b, h, s), float("nan"), dtype=torch.float32, device="cuda")
     run(ref)
-    hsb = torch.full((h, s, b), float("nan"), dtype=torch.float32, device="cuda").permute(2, 0, 1)  # (b, h, s) view, strides (1, s*b, b)
+    shape = (b, h, s)
+    strides, span = [0, 0, 0], 2 if storage_order is None else 1
+    for axis in reversed(storage_order or (0, 1, 2)):
+        strides[axis] = span
+        span *= shape[axis]
+    hsb = torch.empty_strided(shape, strides, dtype=torch.float32, device="cuda").fill_(float("nan"))
     api = run(hsb)
-    assert tuple(hsb.stride()) == (1, s * b, b)
-    assert SdpaFwdDslSm100._thd_padded_lse_order(api) == (1, 3, 2, 0)  # the axis list sorted by stride would be (3, 0, 2, 1)
+    # The prepared host carries the caller's actual strides, including gaps;
+    # no compact fake tensor or inverse permutation is left to infer them.
+    assert api._thd_spec.lse_stride == tuple(strides)
     for i, n in enumerate(lens.tolist()):
         torch.testing.assert_close(hsb[i, :, :n], ref[i, :, :n], atol=0, rtol=0)
         assert torch.isneginf(hsb[i, :, n:]).all(), f"batch {i}: rows past the length are not -inf"
@@ -2946,3 +2920,20 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
             probe.stats[key] <= pins[key] + _D192_F16_SASS_SLACK
         ), f"{key} {probe.stats[key]} > {pins[key]} + {_D192_F16_SASS_SLACK}: emulation instructions with the gate off: {probe.stats}"
     assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
+
+
+# The CI arch targets select this module explicitly; imported tests need L0.
+import test_sdpa_staged_forward_half as _staged_half_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestStagedHalf:
+    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
+    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
+    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
+    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)

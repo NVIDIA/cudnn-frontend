@@ -1350,8 +1350,19 @@ def test_sm107_masked_arm_lowers_to_the_bit_word_form(tmp_path, family, mask):
     """A masked softmax arm must be the bit-word form -- one keep-word per 32 columns, ``R2P`` + one ``FSEL`` per cell --
     never the per-cell compare + select (rules/frost-tile-dsl.md s10d: 2-3x the dense tile's instruction count; the f16
     body's causal build read ISETP 94 / FSEL 64 / R2P 0 before it took the fp8 body's ``band_mask_words`` arm, 54 / 64 / 8
-    after).  ``R2P == 0`` on a masked build is the detector the rule names; both bodies spell the form as ``MASK_FORM``."""
+    after).  ``R2P == 0`` on a masked build is the detector the rule names."""
     stats, _order = _sass_probe(tmp_path, family, mask)
     assert stats["R2P"] > 0, f"{family} {mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
-    mod = _load_kernel(family)
-    assert mod.MASK_FORM == "bits", f"{mod.__name__}: MASK_FORM must be the bit-word form"
+
+
+@pytest.mark.parametrize("family", _FAMILIES)
+def test_sm107_every_mask_site_is_the_bit_word_arm(family):
+    """The mask op has ONE form (PR #1209 retired ``MASK_FORM`` / ``apply_mask_chunk_form`` / ``apply_mask_chunk_bits``):
+    the kv-major bodies spell it as ``band_mask_words`` + ``apply_mask_words`` (the transpose of ``apply_mask_chunk``),
+    and carry none of the retired names -- a per-cell compare + select arm reintroduced under a local constant would
+    pass the SASS pin on the family it was not enabled for."""
+    code = _code_only(_kernel_source(family))
+    for gone in ("MASK_FORM", "apply_mask_chunk_form", "apply_mask_chunk_bits", "form="):
+        assert gone not in code, f"{family}: {gone!r} is a retired mask-form spelling"
+    assert "band_mask_words(" in code and "apply_mask_words(" in code, f"{family}: the masked arm must be the library's bit-word primitives"
+    assert "arith.select(" in code, f"{family}: the padded arm's band bound is the only select left; a per-cell select loop is the old form"

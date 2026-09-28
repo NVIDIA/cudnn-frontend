@@ -76,14 +76,8 @@ from cudnn.api_base import TensorDesc
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.sdpa.bwd import config_sm107 as _cfg
-from cudnn.sdpa.bwd.api_dsl import (
-    SdpaBwdDsl,
-    _SM100_DOT_CHUNK_ELEMS,
-    _SM100_DOT_Q_TILE,
-    _SM100_MATMUL_FILE,
-    _SM100_WS_BUDGET_BYTES,
-    _sm100_kernel_path,
-)
+from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _SM100_WS_BUDGET_BYTES, _sm100_kernel_path
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS as _SM100_DOT_CHUNK_ELEMS, DOT_Q_TILE as _SM100_DOT_Q_TILE
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, vec_bytes_epi_for
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 

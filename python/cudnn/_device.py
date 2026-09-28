@@ -52,7 +52,7 @@ def _device_handle(device: int):
     """``CUdevice`` for an ordinal. Needs only cuInit — creates no context."""
     drv = _driver()
     if drv is None:
-        raise RuntimeError("cudnn: no CUDA device visible")
+        raise NotImplementedError("cudnn: no CUDA device visible")
     count = int(_ck(*drv.cuDeviceGetCount()))
     if not 0 <= device < count:
         raise ValueError(f"cudnn: cuda:{device} does not exist ({count} device(s) visible)")

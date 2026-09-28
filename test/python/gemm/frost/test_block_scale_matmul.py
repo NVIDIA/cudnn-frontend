@@ -145,6 +145,67 @@ def _build_one_sided_block_scale_graph(*, fake_a, raw_dt, scaled_dt, sf_dt, bloc
     return g, A, B, SF, C
 
 
+def test_block_scale_matmul_rejects_virtual_quantizer_outputs():
+    """The GEMM consumes explicit packed inputs; it never hides a producer."""
+    m = n = k = 128
+    sf_k = k // 16
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    x = g.tensor(dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.BFLOAT16)
+    packed, scales = g.block_scale_quantize(input=x, block_size=16, axis=-1)
+    packed.set_dim([1, m, k]).set_stride([m * k, k, 1]).set_data_type(cudnn.data_type.FP4_E2M1)
+    scales.set_dim([1, m, sf_k]).set_stride([m * sf_k, sf_k, 1]).set_data_type(cudnn.data_type.FP8_E4M3).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    weight = g.tensor(dim=[1, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.FP4_E2M1)
+    weight_scales = g.tensor(
+        dim=[1, sf_k, n],
+        stride=[sf_k * n, 1, sf_k],
+        data_type=cudnn.data_type.FP8_E4M3,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    a = g.block_scale_dequantize(input=packed, descale=scales, block_size=[1, 16])
+    b = g.block_scale_dequantize(input=weight, descale=weight_scales, block_size=[16, 1])
+    g.matmul(A=a, B=b).set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    with pytest.raises(
+        NotImplementedError,
+        match=re.escape("call cudnn.ops.nvfp4_block_scale_quantize explicitly"),
+    ):
+        analyze_with_binding(g)
+
+
+@requires_sm100
+@pytest.mark.L1
+@pytest.mark.parametrize("k", [2048, 5376])
+def test_explicit_nvfp4_quantizer_output_composes_with_frost_matmul(k):
+    """The public materialized tensors are directly consumable by FROST."""
+    m = n = 128
+    graph = _build_nvfp4_graph(m, n, k)
+    compiled = _plan(graph)
+
+    torch.manual_seed(20260901)
+    x = torch.randn((1, m, k), device="cuda", dtype=torch.bfloat16)
+    one = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
+    packed, activation_scales = cudnn.ops.nvfp4_block_scale_quantize(x, one)
+
+    # E2M1 code 2 is +1.0, so 0x22 represents two +1.0 values.
+    weight_bytes = torch.full((1, n, k // 2), 0x22, device="cuda", dtype=torch.uint8)
+    weight = weight_bytes.view(torch.float4_e2m1fn_x2)
+    logical_weight_scales = torch.ones((n, k // 16), device="cuda", dtype=torch.float8_e4m3fn)
+    weight_scales = _to_blocked(logical_weight_scales).view(1, n, k // 16)
+    output = torch.empty((1, m, n), device="cuda", dtype=torch.float16)
+
+    compiled(_vp_bs(compiled, packed, weight, output, activation_scales, weight_scales))
+    restored = cudnn.ops.nvfp4_block_scale_dequantize(packed, activation_scales, one)
+    torch.cuda.synchronize()
+
+    expected_column = restored.float().sum(dim=-1, keepdim=True)
+    expected = expected_column.expand(1, m, n).to(torch.float16)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-1)
+
+
 def _build_block_scale_reduction_graph(
     M,
     N,

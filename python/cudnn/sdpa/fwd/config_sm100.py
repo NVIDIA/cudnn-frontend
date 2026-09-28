@@ -237,8 +237,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) requires FP8 inputs")
         if flavor != "d128":
             raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) is only supported on d128")
-        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa:
-            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense, unsplit, unpacked graphs only")
+        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense (unpaged), unsplit, unpacked graphs only")
     if not fp8 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires DTYPE_O == DTYPE_QKV; got dtype_o={dtype_o}")
     if k.window_left is not None and k.window_left < 0:
@@ -317,8 +317,12 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if fp8:
-            raise ValueError(f"{flavor}: paged_kv is wired for the f16/bf16 kernel only")
+        # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
+        # (wired on every native flavor), so
+        # the dtype family is NOT gated here: every kernel file WITHOUT the
+        # PAGED_KV specialization raises at module scope on paged_kv=True
+        # (next to its softmax_f16 guard), which is the backstop that cannot
+        # silently read a page pool as dense K/V.
         # A K/V tile is loaded as a stack of page-sized row boxes (or one box
         # inside a page when the page is taller than the tile). Either way a
         # box must never straddle a page, and the 128 B swizzle atom is 8 rows.
@@ -410,11 +414,10 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
     layout the kernels cannot bind zero-copy"; a caller that must tell the two
     apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback).  The rules are the kernels' own (``_fake_bshd`` in every
-    f16 / per-tensor-FP8 prefill kernel), restated here so the decision is made
-    BEFORE a compile rather than as a raise inside one -- and so the engine rows
+    copy fallback). The rules describe the kernels' TMA layout requirements,
+    checked before compilation so the engine rows
     (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter (``api_dsl.SdpaFwdDsl._bshd_zero_copy_stride``)
+    and the standalone adapter's admission and prepared binder
     judge a layout with ONE function (rule 8b lockstep):
 
       * the head dim is innermost-contiguous (stride 1);
@@ -1505,8 +1508,8 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             "d128: O_BLOCK_SCALE / O_PACK_DIV must follow DTYPE_O",
         ),
         (
-            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA),
-            "d128: block-scaled O serves dense, unsplit, unpacked graphs only",
+            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.PAGED_KV),
+            "d128: block-scaled O serves dense (unpaged), unsplit, unpacked graphs only",
         ),
     )
     for ok, msg in checks:
@@ -1864,11 +1867,11 @@ def canonicalize_d192_lowering(
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time
         # `window_right` at the kernel's mask sites, so it must sit INSIDE the
-        # bits mask form's Int32 domain: `apply_mask_chunk_bits` raises at trace
+        # bit-word mask op's Int32 domain: `apply_mask_chunk` raises at trace
         # time from MASK_BOUND_LIMIT (1 << 30) on, and a trace-time raise is a
         # typed decline at engine.build_plan -- the former `1 << 30` dropped the
         # FROST fp8 row out of every dense per-tensor d192 graph once the kernels
-        # masked in that form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
+        # masked in the bit-word form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
         # sequence that fits in SM100 memory while leaving signed-int32 headroom
         # for q + R, and keeps the module key independent of S_kv.  Imported here,
         # not at module level: tile_dsl.mask imports cutlass, which stays off the

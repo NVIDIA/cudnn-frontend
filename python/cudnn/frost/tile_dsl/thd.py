@@ -309,7 +309,7 @@ def emit_seq_descs(
     cu0: cutlass.Int32,
     base_ptr,
     n_batch: cutlass.Int32,
-    row_stride: cutlass.Int32,
+    row_stride: cutlass.Int64,
     seq_ord: cutlass.Constexpr[int],
     slot_base=0,
 ) -> None:
@@ -319,7 +319,9 @@ def emit_seq_descs(
     ``(B+1,)`` prefix inside it — so the same helper serves a standalone
     cu_seqlens tensor (``cu0 = 0``) and a prefix living inside the THD metadata
     buffer (``cu0 = THD cu_q / cu_k offset``).  ``row_stride`` is in ELEMENTS of
-    the tensor's dtype (``.raw_ptr()`` is element-addressed).  ``seq_ord`` is
+    the tensor's dtype (``.raw_ptr()`` is element-addressed). Keep it Int64
+    through the caller and setup-kernel ABI: widening after an Int32 cast
+    cannot recover a legal strided output's high bits.  ``seq_ord`` is
     innermost-first, so for ``[1, T, H, D]`` with D contiguous the sequence axis
     is **2**, not 1.  ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
     a compile-time constant) lets several arrays share one buffer.

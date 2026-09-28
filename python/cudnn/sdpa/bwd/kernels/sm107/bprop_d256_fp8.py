@@ -154,9 +154,6 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
-    MASK_FORM_BITS,
-    MASK_FORM_CELLS,
-    MASK_FORMS,
     MASK_NONE,
     MASK_PADDED,
     MASK_SWA,
@@ -197,10 +194,6 @@ DESC_VERSION: int = 1 if _needs_desc_v1(CFG) else 0
 # hint-less spin is a MEASURED per-kernel fact (rules/frost-tile-dsl.md S8b); False until this body has its own A/B/A.
 SPIN_RING_WAITS: bool = False
 
-# Per-cell mask lowering, ONE constant per kernel (the DESC_VERSION discipline): every masked site passes form=MASK_FORM.
-# "bits" = one keep-word per 32 q columns + register-to-predicate select (R2P + 1 FSEL per cell); "cells" = the per-cell
-# compare + select the pre-port body carried.  Same masked set, same zero -> bitwise identical dS / dV.
-MASK_FORM: str = MASK_FORM_BITS
 
 # --- dtype dispatch (the config validated the codes; these are the DSL types they name) ---------------------------------
 STORAGE_DTYPE = cutlass.Float8E4M3FN  # CFG.DTYPE_QKV == DTYPE_E4M3 (the fp8 body is E4M3-only)
@@ -217,8 +210,6 @@ if CFG.TILE_K_HW_BMM1 != 64 or CFG.TILE_K_HW_BMM2 != 64 or CFG.IDESC_K_DIM != 1:
     raise ValueError(
         f"{__name__}: Rubin dense FP8 needs TILE_K_HW=64 with idesc k_dim=1; got {CFG.TILE_K_HW_BMM1}/{CFG.TILE_K_HW_BMM2}, k_dim={CFG.IDESC_K_DIM}"
     )
-if MASK_FORM not in MASK_FORMS:
-    raise ValueError(f"{__name__}: MASK_FORM must be one of {MASK_FORMS}, got {MASK_FORM!r}")
 
 # --- per-CTA buffer geometry (config_sm107.buffer_elems; never re-derived here) ------------------------------------------
 _M_PER_CTA = _B._M_PER_CTA  # 64 q rows per CTA of the Q / dO N-split
@@ -413,42 +404,26 @@ def _mask_p_chunk(reg_P, kv_abs, q_col_base, seqlen_kv, causal_diag, N: int):
       causal : kv_abs > q + diag          (key past the query; diag = S_kv - S_q under bottom-right, else 0)
       SWA    : kv_abs < q + diag - W      (key left of the window; the same bottom-right anchor as the forward)
       padded : kv_abs >= seq_kv_len       (per-lane pad row -> the whole row is masked)
-    ``form=MASK_FORM``: "cells" is the per-cell compare + select; "bits" maps the terms onto ONE q band [lo, hi) per lane
-    -- causal lo = kv_abs - diag, SWA hi = kv_abs - diag + W + 1, padded hi = q_col_base (all masked) -- and reuses the
-    library's ``band_mask_words`` / ``apply_mask_words`` (keep-word + R2P + 1 FSEL per cell).  Same masked set, same zero,
-    so the two forms are bitwise identical.  MASK_NONE returns reg_P unchanged (no IR).
-    TODO(plan s13 PR-4): hoist this transposed arm into tile_dsl.mask as the kv-major twin of apply_mask_chunk_bits."""
+    The bit-word form (rules/frost-tile-dsl.md S10d): the terms map onto ONE q band [lo, hi) per lane -- causal lo =
+    kv_abs - diag, SWA hi = kv_abs - diag + W + 1, padded hi = q_col_base (all masked) -- and the library's
+    ``band_mask_words`` / ``apply_mask_words`` do the rest (one keep-word per 32 q columns, R2P + 1 FSEL per cell).  The
+    masked set is the per-cell compare's, so dS / dV are bitwise what the pre-port body produced.  MASK_NONE returns
+    reg_P unchanged (no IR).
+    TODO(plan s13 PR-4): hoist this transposed arm into tile_dsl.mask as the kv-major twin of apply_mask_chunk."""
     if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
         return reg_P
-    if cutlass.const_expr(MASK_FORM == MASK_FORM_BITS):
-        lo = None
-        hi = None
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
-            lo = kv_abs - causal_diag
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
-            hi = kv_abs - causal_diag + cutlass.Int32(CFG.SWA_WINDOW + 1)
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
-            row_dead = kv_abs >= seqlen_kv
-            hi_pad = cutlass.Int32(arith.select(row_dead.ir_value(), q_col_base.ir_value(), (q_col_base + cutlass.Int32(N)).ir_value()))
-            hi = hi_pad if hi is None else cute.math.min(hi, hi_pad)
-        words = band_mask_words(lo, hi, q_col_base, N)
-        return apply_mask_words(reg_P, words, mask_value=0.0, n_cols=N)
-    zero = cutlass.Float32(0.0)
-    elems = []
-    for i in range(N):
-        q_abs = q_col_base + cutlass.Int32(i)
-        masked = None
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
-            t = kv_abs >= seqlen_kv
-            masked = t if masked is None else (masked | t)
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
-            t = kv_abs > (q_abs + causal_diag)
-            masked = t if masked is None else (masked | t)
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
-            t = kv_abs < (q_abs + causal_diag - cutlass.Int32(CFG.SWA_WINDOW))
-            masked = t if masked is None else (masked | t)
-        elems.append(cutlass.Float32(arith.select(masked.ir_value(), zero.ir_value(), reg_P[i].ir_value())))
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+    lo = None
+    hi = None
+    if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+        lo = kv_abs - causal_diag
+    if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
+        hi = kv_abs - causal_diag + cutlass.Int32(CFG.SWA_WINDOW + 1)
+    if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
+        row_dead = kv_abs >= seqlen_kv
+        hi_pad = cutlass.Int32(arith.select(row_dead.ir_value(), q_col_base.ir_value(), (q_col_base + cutlass.Int32(N)).ir_value()))
+        hi = hi_pad if hi is None else cute.math.min(hi, hi_pad)
+    words = band_mask_words(lo, hi, q_col_base, N)
+    return apply_mask_words(reg_P, words, mask_value=0.0, n_cols=N)
 
 
 # === Tile decode (one cga2 cluster per (kv block, head, batch) tile) ===================================================

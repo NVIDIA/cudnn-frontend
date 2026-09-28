@@ -2832,7 +2832,8 @@ def test_m_major_scatter_covers_the_whole_chunk() -> None:
         assert sum(".store(" in line for line in lines) == vsize, vsize
 
 
-def test_tma_staged_values_reach_the_store_as_vectors() -> None:
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+def test_tma_staged_values_reach_the_store_as_vectors(family: str) -> None:
     """`store_swizzled` picks its path by sniffing whether the value's `.shape`
     is a tuple: a `cutlass.Vector` reports `(N,)` and gets the per-16-byte-granule
     scatter the SMEM swizzle needs, while `cute.make_rmem_tensor(N, ...).load()`
@@ -2840,19 +2841,26 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
     XORed once on the row base and written CONTIGUOUSLY, so each row's tail
     spills into the next. Every emitter that can reach the TMA arm must hand on
     a Vector."""
-    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    from importlib import import_module
+
+    codegen = import_module(f"cudnn.gemm.frost.{family}.epilogue_codegen")
+    src = pathlib.Path(codegen.__file__).read_text()
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
-    assert sites == 6, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 6. A new one either "
+    assert sites == 7, (
+        f"{family}.epilogue_codegen has {sites} make_rmem_tensor sites, expected 7. A new one either "
         f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
         f"then update this test."
     )
     assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
-    # Col quant's `_scale_mine` is the fifth rmem tensor. It is a one-byte-per-
+    # Col quant's `_scale_mine` is a one-byte-per-
     # block side-store carrier, not a dense value entering the TMA staging ring.
     assert src.count("_scale_mine = cute.make_rmem_tensor(") == 1
+    # Col quant's mutually exclusive E8M0 and other-scale branches each declare
+    # `_up4`. These reciprocal temporaries stay TensorSSA; only `_out` reaches
+    # the dense store, through the Vector conversion checked below.
+    assert src.count("_up4 = cute.make_rmem_tensor(") == 2
     # The two block-quantize emitters were the last holdouts: their result now
     # reaches a TMA-stored dense output, so they must convert like the rest.
     assert src.count("_out = cute.make_rmem_tensor(") == 2

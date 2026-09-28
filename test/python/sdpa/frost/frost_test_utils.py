@@ -103,13 +103,13 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def select_engine(graph, name, tiles=None, pack_gqa=None):
+def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
     """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
     The FIRST entry for that engine is the heuristics' own best guess for this
-    shape. ``tiles`` / ``pack_gqa`` pin a different one, so a test can run a
+    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` pin a different one, so a test can run a
     config the best guess would not choose. Filters match the STRUCTURED knobs,
     not the rendered plan name: substring matching a name would let a request
     for tile_n=128 select a tile_n=1280 plan, and the test would pass having
@@ -127,11 +127,11 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
             return False
         return all(
             want is None or getattr(graph.plans[i].knobs, field, None) == want
-            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa))
+            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv))
         )
 
     index = next((i for i in range(len(names)) if _wanted(i)), None)
-    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa}; plans={names}"
+    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv}; plans={names}"
     graph.select_plan(index)
     return graph.plans[index]
 
@@ -286,9 +286,9 @@ SASS_OPCODE_COUNTS = {
     "BSSY": ("BSSY",),
     "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
 }
-# The masked-softmax-arm pins (`tile_dsl/mask.py`, MASK_FORM): under the "bits" form every masked KV-tile body carries 4 R2P
-# per 32-column keep-word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and one ISETP per cell per mask term, and a
-# build that runs out of predicate registers spills them into GPRs through predicate-to-register moves.
+# The masked-softmax-arm pins (`tile_dsl.mask.apply_mask_chunk`, the bit-word form): every masked KV-tile body carries 4 R2P
+# per 32-column keep-word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced carried 0 R2P and one ISETP
+# per cell per mask term, and a build that ran out of predicate registers spilled them into GPRs through predicate-to-register moves.
 MASK_SASS_OPCODE_COUNTS = {
     **SASS_OPCODE_COUNTS,
     "R2P": (" R2P ",),
