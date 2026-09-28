@@ -3,6 +3,8 @@
 """Plan-time geometry and workspace for the large-head backward pointer host."""
 
 import math
+from copy import copy
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
@@ -112,3 +114,77 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
     execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
+
+
+@dataclass(frozen=True)
+class StagedPlan:
+    spec: BwdLaunchSpec
+    copies: tuple
+
+
+def compile_staged(api, stage2, mm_lo, mm_hi):
+    """Reuse the pointer chain after the already-advertised dense copies."""
+    plan = copy(api)
+    plan._stage_in = plan._stage_out = ()
+    names = {"dO": "do", "dQ": "dq", "dK": "dk", "dV": "dv"}
+    copies = []
+    for name in api._stage_in + api._stage_out:
+        role = names.get(name, name)
+        desc = getattr(api, role + "_desc")
+        b, h, s, d = desc.shape
+        strides = (s * h * d, d, h * d, 1)
+        setattr(plan, role + "_desc", replace(desc, stride=strides, stride_order=(3, 1, 2, 0)))
+        copies.append((role, tuple(desc.shape), strides))
+    spec = compile_plan(plan, stage2, mm_lo, mm_hi)
+    offset, regions = spec.workspace_bytes, []
+    for role, shape, strides in copies:
+        regions.append((role, offset, shape, strides))
+        offset += (math.prod(shape) * 2 + 127) // 128 * 128
+    if offset > api.scratch_workspace_bytes():
+        raise RuntimeError("SM100 backward staging exceeds its advertised workspace")
+    return StagedPlan(spec, tuple(regions))
+
+
+def execute_staged(api, tensors, workspace, current_stream, scale):
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
+    from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
+    from .prepared import _same_geometry, execute
+
+    staged = api._staged_prepared
+    spec = staged.spec
+    ws = facts_of_tensor(workspace)
+    total = api.scratch_workspace_bytes()
+    if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < total or ws.device != (2, spec.device_index):
+        raise ValueError(f"{spec.name} requires {total} bytes of contiguous uint8 caller workspace")
+    if ws.ptr % 16:
+        raise ValueError(f"{spec.name} workspace must be 16-byte aligned")
+    original = dict(zip(ROLES, tensors))
+    facts = {role: facts_of_tensor(tensor) for role, tensor in original.items()}
+    for role in ROLES[:9]:
+        f, desc = facts[role], getattr(api, role + "_desc")
+        if f is None or f.device != (2, spec.device_index) or f.dtype != str(desc.dtype).split(".")[-1]:
+            raise ValueError(f"{spec.name}: {role} must match the declared dtype and device")
+        if role == "stats":
+            if not f.contiguous or f.numel != math.prod(spec.operands[5].shape):
+                raise ValueError(f"{spec.name}: Stats must contain the declared contiguous elements")
+        elif not _same_geometry((f.shape, f.strides), (desc.shape, desc.stride)):
+            raise ValueError(f"{spec.name}: {role} must match the declared shape and strides")
+        if ws.ptr < f.ptr + f.span * desc.dtype.itemsize and f.ptr < ws.ptr + total:
+            raise ValueError(f"{spec.name}: caller workspace overlaps {role}")
+    if current_stream is None:
+        current_stream = torch.cuda.current_stream(api.q_desc.device).cuda_stream
+    with _torch_stream_context(current_stream, api.q_desc.device):
+        typed = workspace[:total].view(api.dtype)
+        origin = typed.storage_offset()
+        views = {}
+        for role, offset, shape, strides in staged.copies:
+            view = typed.as_strided(shape, strides, origin + offset // 2)
+            views[role] = view
+            facts[role] = BufferFacts(ws.ptr + offset, spec.operands[0].dtype, ws.device, math.prod(shape), shape, strides)
+            if role in ROLES[:5]:
+                view.copy_(original[role])
+        execute(spec, facts, ws.ptr, int(current_stream), scale=scale)
+        for role in ("dq", "dk", "dv"):
+            if role in views:
+                original[role].copy_(views[role])

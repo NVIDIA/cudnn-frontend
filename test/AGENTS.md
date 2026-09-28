@@ -168,6 +168,13 @@ fix ownership instead of disabling GC or treating a retry as validation.
 
 ### Prepared quantized launch probes
 
+When testing a retained staging path, choose a declaration that the graph
+validator accepts but the native pointer layout declines. A nonunit D stride
+is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
+the existing dense conversion path. `test_staged_rebind_stream_capture` in
+`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay.
+
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
 from the pointer ABI, so the common binder cannot validate them. The detector
