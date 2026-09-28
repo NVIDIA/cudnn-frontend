@@ -848,8 +848,19 @@ def _render_tile_constants(
     ``moe_aligned_offsets``.
     """
     _check_own_family(tmpl)
-    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_block_scale:
-        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM matmul chains only")
+    if chain.has_mainloop_fusion or chain.has_block_scale:
+        raise NotImplementedError(f"{tmpl.file} renders plain matmul chains only (no mainloop fusion, no block scaling)")
+    if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
+        raise NotImplementedError(f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by the MoE template")
+    if chain.is_multi_gemm:
+        from ..kernel_registry import multi_gemm_reject, sm120_multi_gemm_ab_stages
+
+        _mg = multi_gemm_reject(chain, cfg, smem_fixed_reserve=tmpl.smem_fixed_reserve)
+        if _mg is not None:
+            raise NotImplementedError(f"{tmpl.file}: {_mg}")
+        _ab_stages, _, _ = sm120_multi_gemm_ab_stages(chain, cfg, smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    else:
+        _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     if chain.has_moe and chain.matmul.a_major != "k":
         raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
@@ -901,9 +912,15 @@ def _render_tile_constants(
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"a_is_m_major = {chain.matmul.a_major == 'm'}",
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
-        # The AB pipeline depth; the template then funds its transposed-STG
-        # epilogue staging out of it.
-        f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)}",
+        # The AB pipeline depth. Single-GEMM: the template funds its transposed-STG
+        # epilogue staging out of it by giving up whole stages (the catalog's
+        # _sm120_smem_feasible sweep counts the same way). Multi-GEMM: one SMEM
+        # tile per DISTINCT operand per stage, with the staging taken off the
+        # budget in BYTES first (kernel_registry.sm120_multi_gemm_ab_stages) --
+        # a whole multi-operand stage may be all that fits, so the template is
+        # told not to deduct (stg_epi_prefunded).
+        f"ab_stages = {_ab_stages}",
+        f"stg_epi_prefunded = {chain.is_multi_gemm}",
         f"a_tma_group_elems = {a_tma_group_elems}",
         f"b_tma_group_elems = {b_tma_group_elems}",
         # Warp-MMA pairs per warp tile per axis -- the compute-warp grid falls
@@ -927,6 +944,10 @@ def _render_tile_constants(
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
         f"num_a_operands = {chain.num_a_operands}",
         f"num_b_operands = {chain.num_b_operands}",
+        # gemm_a_idx[g] / gemm_b_idx[g] pick GEMM g's operands (single GEMM: (0,), (0,)).
+        f"num_gemms = {chain.num_gemms}",
+        f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}",
+        f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
         f"split_k_slices = {cfg.split_k_slices}",
@@ -1567,7 +1588,9 @@ def _render_template(
     compile_ab_pass = ",\n".join([f"fake_a_{i}" for i in range(na)] + [f"fake_b_{j}" for j in range(nb)]) + ","
     # Per-GEMM register-vector bindings in the STG inner loop: GEMM 0 is bound by
     # the template (vec_f32); the rest (vec_f32_1, ...) are injected here.
-    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
+    # (The sm120 STG arm builds one vsize-wide fp32 vector per GEMM, so the binding
+    # is the whole vector -- no sub-slicing by chunk index as on the tcgen05 arm.)
+    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)) or "pass"
     # MoE multi-GEMM: the kernel also takes the raw A (token) tensor per distinct
     # A operand (for the per-group patched base address) — same tensors the host
     # uses to build the A descriptors.
