@@ -3934,21 +3934,6 @@ def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
     )
 
 
-def _sm80_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
-    """Zero-pad the trailing dim of a half tensor up to ``new_last``."""
-    old_last = t.shape[-1]
-    if old_last == new_last:
-        return t
-    if old_last > new_last:
-        raise ValueError(f"_sm80_pad_last_dim: tensor's last dim {old_last} exceeds target {new_last}")
-    pad = torch.zeros(
-        (*t.shape[:-1], new_last - old_last),
-        dtype=t.dtype,
-        device=t.device,
-    )
-    return torch.cat([t, pad], dim=-1).contiguous()
-
-
 def _sm80_resolve_scheduler(
     *,
     scheduler: str,
@@ -4367,12 +4352,11 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    if d_qk < fdqk:
-        q = _sm80_pad_last_dim(q, fdqk)
-        k = _sm80_pad_last_dim(k, fdqk)
     pad_v = d_v < fdv
-    if pad_v:
-        v = _sm80_pad_last_dim(v, fdv)
+    if d_qk < fdqk or pad_v:
+        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+
+        q, k, v = copy_packed_half((q, k, v), (fdqk, fdqk, fdv), (True, False, False))
     wl, wr = window_size
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
 
@@ -4436,7 +4420,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         int(stream),
     )
     if pad_v:
-        o_buf = o_buf[..., :d_v].contiguous()
+        (o_buf,) = copy_packed_half((o_buf,), (d_v,), (True,))
     return TupleDict(o_tensor=o_buf, lse_tensor=lse_buf)
 
 
