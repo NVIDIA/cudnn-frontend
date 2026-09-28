@@ -1079,7 +1079,7 @@ def _sm100_spec() -> EngineSpec:
             sm_hi=106,
             phase="prefill",
             cga_policies=frozenset({1, 2}),
-            split_kv_policies=frozenset({1}),
+            split_kv_policies=frozenset({1, 2}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1857,7 +1857,7 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
         selected = variants[0]
         prepared = [v.prepared for v in variants]
         workspace = max(v.workspace_bytes for v in variants)
-        if knobs.split_kv_policy == 1:
+        if knobs.split_kv_policy in (1, 2):
             from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
             from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -1874,7 +1874,8 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
                 ),
             )
             split = copy(prepared[0])
-            split.spec = build_thd_split_spec(split.spec, km, capacity=128, resident_units=facts.device_sm_count)
+            capacity = 128 if knobs.split_kv_policy == 1 else 256
+            split.spec = build_thd_split_spec(split.spec, km, capacity=capacity, resident_units=facts.device_sm_count)
             prepared.append(split)
             workspace = max(workspace, split.spec.scratch_bytes)
         selected.prepared = PreparedThdChoices(tuple(prepared), facts.device_sm_count, knobs.cga_policy, knobs.split_kv_policy)

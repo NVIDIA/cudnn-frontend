@@ -331,8 +331,9 @@ def test_thd_runtime_cga_record_rebind_and_capture(dtype, stats, policy, h, monk
 @requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype,stats", [(torch.bfloat16, "HN"), (torch.float16, "NH"), (torch.bfloat16, None)])
-def test_thd_runtime_split_record_rebind_and_capture(dtype, stats, monkeypatch):
-    _runtime_policy_record_rebind_and_capture(dtype, stats, 2, 16, monkeypatch, split_policy=1)
+@pytest.mark.parametrize("split_policy", [1, 2])
+def test_thd_runtime_split_record_rebind_and_capture(dtype, stats, split_policy, monkeypatch):
+    _runtime_policy_record_rebind_and_capture(dtype, stats, 2, 16, monkeypatch, split_policy=split_policy)
 
 
 def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypatch, split_policy=None):
@@ -371,6 +372,8 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
     family = _plan(rebuilt)._prepared
     assert isinstance(family, prep_mod.PreparedThdChoices)
     assert len(family.variants) == (3 if split_policy else 2)
+    if split_policy:
+        assert family.variants[2].spec.split_workspace.capacity == (128 if split_policy == 1 else 256)
     assert _plan(rebuilt).get_workspace_size() >= max(v.spec.scratch_bytes for v in family.variants)
     seen, held = set(), []
     actual_execute = family.execute
@@ -407,7 +410,8 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
     try:
         cases = [([127], 65), ([2048], 65), ([513, 127], 65), ([65, 0, 192], 65)]
         if split_policy:
-            cases = [([64], 32768), ([128], 32768), *cases]
+            capacity = 128 if split_policy == 1 else 256
+            cases = [([64], 32768), ([capacity], 32768), *cases, ([capacity + 1], 32768)]
         for lengths, nk in cases:
             b, total = len(lengths), sum(lengths)
             cq = torch.tensor([0, *accumulate(lengths)], device=DEV, dtype=torch.int32)

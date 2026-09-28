@@ -176,16 +176,16 @@ def test_cga_policy_cannot_silently_acquire_split_semantics():
         cudnn._pybind_module._SdpaThdPlanChoices(split, variants[1], 148, 2)
 
 
-def _split_policy_fixture(dtype="bfloat16", layout="HN"):
+def _split_policy_fixture(dtype="bfloat16", layout="HN", capacity=128):
     variants, launches = _choice_fixture(dtype, layout, kh=16)
     split = copy(variants[0])
     split.order = list(split.order) + ["lse_partial_ptr", "partial_o_strides"]
     split.index = {name: i for i, name in enumerate(split.order)}
     split.template = list(split.template) + [None, None]
     split.template[split.index["n_thd_units"]] = 148
-    off_lse = 8192 + 8 * 128 * 16 * 128 * 4
-    split.split_workspace = prep.ThdSplitWorkspace(8, 128, 8192, off_lse)
-    split.scratch_bytes = off_lse + 8 * 128 * 16 * 4
+    off_lse = 8192 + 8 * capacity * 16 * 128 * 4
+    split.split_workspace = prep.ThdSplitWorkspace(8, capacity, 8192, off_lse)
+    split.scratch_bytes = off_lse + 8 * capacity * 16 * 4
     split.fn = lambda *frame: launches.append((2, frame))
     split.native = cudnn._pybind_module._SdpaThdBinder(split)
     return [*variants, split], launches
@@ -193,12 +193,15 @@ def _split_policy_fixture(dtype="bfloat16", layout="HN"):
 
 @pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
 @pytest.mark.parametrize("cga_policy", [1, 2])
-def test_split_policy_binds_selected_artifact_without_mutating_old_frames(dtype, layout, cga_policy):
-    variants, launches = _split_policy_fixture(dtype, layout)
-    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, cga_policy, variants[2], 1)
+@pytest.mark.parametrize("split_policy", [1, 2])
+def test_split_policy_binds_selected_artifact_without_mutating_old_frames(dtype, layout, cga_policy, split_policy):
+    capacity = 128 if split_policy == 1 else 256
+    variants, launches = _split_policy_fixture(dtype, layout, capacity)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, cga_policy, variants[2], split_policy)
     saved = []
     # This pins the explicitly recorded policy contract, not heuristic ranking.
-    cases = [(1, 64, 32768, 2), (1, 128, 131072, 2), (1, 129, 32768, 0), (1, 64, 32767, 0), (2, 64, 32768, 0), (1, 2048, 32768, 1)]
+    cases = [(1, total, 32768, 2 if total <= capacity else 0) for total in (64, 128, 129, 255, 256, 257)]
+    cases += [(1, capacity, 131072, 2), (1, 64, 32767, 0), (2, 64, 32768, 0), (1, 2048, 32768, 1)]
     for batch, total, kv, expected in cases:
         facts = _choice_facts(variants[0], batch, total, total, kv)
         workspace, stream = 0x4000000 * (len(saved) + 1), 31 + len(saved)
@@ -228,23 +231,24 @@ def test_split_policy_preserves_selected_binder_validation(role, updates):
 
 
 @pytest.mark.parametrize("bad", ["unrecorded", "unknown", "missing", "capacity", "splits", "contract"])
-def test_split_policy_rejects_incompatible_or_unrecorded_members(bad):
-    variants, _ = _split_policy_fixture()
+@pytest.mark.parametrize("split_policy", [1, 2])
+def test_split_policy_rejects_incompatible_or_unrecorded_members(bad, split_policy):
+    variants, _ = _split_policy_fixture(capacity=128 if split_policy == 1 else 256)
     single, pair, split = variants
-    policy = 1
+    policy = split_policy
     if bad == "unrecorded":
         policy = 0
     elif bad == "unknown":
-        policy = 2
+        policy = 3
     elif bad == "missing":
         split = None
     elif bad == "capacity":
-        split.split_workspace = split.split_workspace._replace(capacity=512)
+        split.split_workspace = split.split_workspace._replace(capacity=256 if split_policy == 1 else 128)
     elif bad == "splits":
         split.split_workspace = split.split_workspace._replace(splits=4)
     else:
         split.total_q = 64
-    with pytest.raises(ValueError, match="split policy|plan choices must share|split member|policy1"):
+    with pytest.raises(ValueError, match="split policy|plan choices must share|split member"):
         cudnn._pybind_module._SdpaThdPlanChoices(single, pair, 148, 2, split, policy)
 
 

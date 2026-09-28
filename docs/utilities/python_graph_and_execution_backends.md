@@ -767,6 +767,11 @@ only to decline is why `closed_under` existed.
   Padded capacities may choose a different artifact from exact-length buffers.
   CUDA Graph replay retains the artifact selected during capture even when
   device prefixes change. A different selection rule needs a new policy value.
+- `SPLIT_KV_POLICY=2` keeps the same graph domain, eight-way split and KV
+  threshold, but extends the host-observed packed Q capacity through 256.
+  It reserves partial O/LSE for 256 packed rows. Policy 1 retains its 128-row
+  selection and workspace contract; neither policy is proposed by normal
+  heuristics. The selected artifact is still fixed at capture time.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's

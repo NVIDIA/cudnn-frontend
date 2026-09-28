@@ -386,15 +386,15 @@ class SdpaThdBinder {
     }
 
     bool
-    split_candidate(const std::vector<NativeOperandView> &facts) const {
-        // Policy1 is the measured short-Q/long-KV, single-sequence H16 region.
+    split_candidate(const std::vector<NativeOperandView> &facts, int64_t max_q_capacity) const {
+        // The recorded policy bounds the short-Q/long-KV, single-sequence H16 region.
         // Capacities are host observations, never reads of mutable device lengths.
         const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
         if (b != 1) return false;
         int64_t tq = std::min(capacity(required(facts, Q), resolve(facts[Q], Q, b), "q"),
                               capacity(required(facts, O), resolve(facts[O], O, b), "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
-        if (tq <= 0 || tq > 128) return false;
+        if (tq <= 0 || tq > max_q_capacity) return false;
         int64_t tkv = std::min(capacity(required(facts, K), resolve(facts[K], K, b), "k"),
                                capacity(required(facts, V), resolve(facts[V], V, b), "v"));
         if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
@@ -593,7 +593,7 @@ class SdpaThdPlanChoices {
                        int64_t split_policy)
         : binders_{SdpaThdBinder(single), SdpaThdBinder(pair)}, sm_count_(sm_count), policy_(policy) {
         if (policy != 1 && policy != 2) invalid("unknown native THD CGA policy");
-        if (split_policy != 0 && split_policy != 1) invalid("unknown native THD split policy");
+        if (split_policy != 0 && split_policy != 1 && split_policy != 2) invalid("unknown native THD split policy");
         if (split.is_none() != (split_policy == 0)) invalid("a split member requires its explicit split policy");
         for (const auto &member : {single, pair}) {
             if (py::hasattr(member, "split_workspace") && !member.attr("split_workspace").is_none())
@@ -637,9 +637,11 @@ class SdpaThdPlanChoices {
             if (!py::hasattr(split, "split_workspace") || split.attr("split_workspace").is_none())
                 invalid("split policy requires a prepared split member");
             const auto workspace = split.attr("split_workspace").cast<std::array<int64_t, 4>>();
-            if (workspace[0] != 8 || workspace[1] != 128 || single.attr("qh").cast<int64_t>() != 16 ||
+            split_q_capacity_    = split_policy == 1 ? 128 : 256;
+            if (workspace[0] != 8 || workspace[1] != split_q_capacity_ || single.attr("qh").cast<int64_t>() != 16 ||
                 single.attr("kh").cast<int64_t>() != 16)
-                invalid("split policy1 requires eight splits, packed capacity128 and H_q=H_kv=16");
+                invalid("split policy" + std::to_string(split_policy) + " requires eight splits, packed capacity" +
+                        std::to_string(split_q_capacity_) + " and H_q=H_kv=16");
             binders_.emplace_back(split);
         }
     }
@@ -673,7 +675,7 @@ class SdpaThdPlanChoices {
 
     int
     select(const std::vector<NativeOperandView> &facts) const {
-        if (binders_.size() == 3 && binders_[0].split_candidate(facts)) return 2;
+        if (binders_.size() == 3 && binders_[0].split_candidate(facts, split_q_capacity_)) return 2;
         const auto units = binders_[0].choice_units(facts);
         if (policy_ == 1) return units[0] <= sm_count_ ? 0 : 1;
         const auto waves = [](int64_t work, int64_t resident) { return work / resident + (work % resident != 0); };
@@ -684,6 +686,7 @@ class SdpaThdPlanChoices {
 
     std::vector<SdpaThdBinder> binders_;
     int64_t sm_count_, policy_;
+    int64_t split_q_capacity_ = 0;
 };
 
 }  // namespace
