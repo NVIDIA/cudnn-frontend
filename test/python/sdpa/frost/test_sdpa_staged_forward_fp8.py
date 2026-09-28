@@ -189,7 +189,10 @@ def test_staged_physical_wide_batch_stride(d, dv, role, product):
     required = ((original.shape[0] - 1) * batch_stride + original[0].numel() * 2) * original.element_size()
     if torch.cuda.mem_get_info()[0] < required + 2**30:
         pytest.skip("wide physical stride storage unavailable")
-    widened = torch.empty_strided(original.shape, (batch_stride, original.stride(1), original.stride(2), 1), device="cuda", dtype=original.dtype)
+    try:
+        widened = torch.empty_strided(original.shape, (batch_stride, original.stride(1), original.stride(2), 1), device="cuda", dtype=original.dtype)
+    except torch.OutOfMemoryError:
+        pytest.skip("wide physical stride allocation unavailable")
     widened.copy_(original)
     tensors[role] = widened
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
