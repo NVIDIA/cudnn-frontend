@@ -49,9 +49,9 @@ def _case(d=128, *, fp8=False, split=1, features=False, b=2):
 
 
 def _forbid_staging(monkeypatch):
-    from cudnn.sdpa.fwd import prepared_staged_sm120
+    from cudnn.sdpa.fwd import prepared_staged_forward
 
-    monkeypatch.setattr(prepared_staged_sm120, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
+    monkeypatch.setattr(prepared_staged_forward, "_copy", lambda *a, **k: pytest.fail("invalid operand reached a prepared staging copy"))
 
 
 def _execute(api, tensors, workspace, stream=None):
@@ -337,7 +337,10 @@ def test_staged_physical_wide_batch_stride(d, fp8, role, product):
     required = ((original.shape[0] - 1) * batch_stride + original[0].numel() * 2) * original.element_size()
     if torch.cuda.mem_get_info()[0] < required + 2**30:
         pytest.skip("wide physical stride storage unavailable")
-    widened = torch.empty_strided(original.shape, (batch_stride, original.stride(1), original.stride(2), 1), device="cuda", dtype=original.dtype)
+    try:
+        widened = torch.empty_strided(original.shape, (batch_stride, original.stride(1), original.stride(2), 1), device="cuda", dtype=original.dtype)
+    except torch.OutOfMemoryError:
+        pytest.skip("wide physical stride allocation unavailable")
     widened.copy_(original)
     tensors[role] = widened
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
@@ -546,7 +549,7 @@ def test_staged_copy_preserves_runtime_element_stride_and_broadcast(fp8, broadca
 @pytest.mark.parametrize("fp8", [False, True])
 def test_staged_explicit_stream_with_another_device_current(fp8, monkeypatch):
     from cuda.bindings import driver
-    from cudnn.sdpa.fwd import prepared_staged_sm120
+    from cudnn.sdpa.fwd import prepared_staged_forward
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
@@ -557,7 +560,7 @@ def test_staged_explicit_stream_with_another_device_current(fp8, monkeypatch):
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     target = torch.cuda.Stream(device=device)
     target.wait_stream(torch.cuda.current_stream(device))
-    original = prepared_staged_sm120._copy
+    original = prepared_staged_forward._copy
     streams = []
 
     def copy(entry, frame, stream):
@@ -565,7 +568,7 @@ def test_staged_explicit_stream_with_another_device_current(fp8, monkeypatch):
         streams.append(stream)
         return original(entry, frame, stream)
 
-    monkeypatch.setattr(prepared_staged_sm120, "_copy", copy)
+    monkeypatch.setattr(prepared_staged_forward, "_copy", copy)
     with torch.cuda.device(other_device):
         _execute(api, tensors, workspace, driver.CUstream(target.cuda_stream))
         assert torch.cuda.current_device() == other_device
