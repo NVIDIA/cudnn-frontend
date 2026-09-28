@@ -85,6 +85,7 @@ def prepare_padded_lse(lse, cu_seqlens, max_seqlen):
     # differentiable torch behavior for other direct callers of this helper.
     if lse.requires_grad:
         return _torch_repad(lse, cu_seqlens, max_seqlen)
-    if torch.compiler.is_compiling():
-        return _compiled_repad(lse, cu_seqlens, max_seqlen)
-    return _execute(lse, cu_seqlens, max_seqlen)
+    # AOT backward can trace FakeTensor/FunctionalTensor inputs while
+    # torch.compiler.is_compiling() is false. Always keep the pointer launch
+    # behind the custom-op boundary, including calls made from autograd.
+    return _compiled_repad(lse, cu_seqlens, max_seqlen)
