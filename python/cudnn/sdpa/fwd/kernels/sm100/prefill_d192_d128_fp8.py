@@ -20,6 +20,11 @@ d_qk=192/d_v=128 while preserving the FP8-on-Blackwell K-path:
      ``TILE_K_HW=32`` (config).  ``NUM_KPHASES_PV`` derives from
      ``CFG.TILE_K_HW_BMM2`` (→ 4 k-steps at TILE_K_HW=32).  Confirmed by the
      cuDNN f8 reference (UTCMMA_TILE_K=32, BMM_XMMAS_K=4, kind::f8f6f4).
+  5. **exp2 split MUFU / FMA** (``_E2E_ENABLED``, **cc 10.0 only**): a slice of
+     each P burst takes the FMA-pipe ``ex2_emulation_2`` instead of MUFU.EX2.
+     ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out
+     everywhere the split loses — cc 10.3's doubled MUFU.EX2 rate makes every
+     emulated exponential a net cost there.
 
 THD / varlen (``CFG.THD_VARLEN=1``) follows the device-built-metadata and
 persistent-grid design used by the d128 FP8 and d192 f16 siblings: packed
@@ -116,6 +121,13 @@ _REUSE_BMM2_ELECT = (not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_NONE) or (CFG
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
 MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
+# exp2 MUFU / FMA split — the ex2_emulation_2 mix in _exp2_chunk0_mask_aware /
+# _exp2_mixed_late / _exp2_emulated_scalar. Claimed per kernel and per arch by
+# api_dsl._exp2_fma_split_for: on for cc 10.0, where a few emulated exponentials
+# relieve a saturated MUFU.EX2; off elsewhere (cc 10.3's doubled MUFU.EX2 rate
+# turns the emulated ones into a net loss), when every element takes the plain
+# MUFU exp2. Folded at trace time; a distinct value is a distinct specialization.
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
 # LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
 # cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software
 # row_max_reduction (default 0). api_dsl sets this from the device capability at
@@ -164,10 +176,11 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
     E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
     exceed the output tolerance there. The repeated unmasked path retains its
     tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    With the split off (_E2E_ENABLED, cc != 10.0) every element takes native EXP2.
     """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if CFG.DTYPE_QKV == 1 and apply_mask:
+        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:
@@ -186,7 +199,7 @@ def _exp2_mixed_late(vec):
     tail_start = 36 if _FAST_E4_DENSE_MHA else 56
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if i >= tail_start:
+        if _E2E_ENABLED and i >= tail_start:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -196,6 +209,8 @@ def _exp2_mixed_late(vec):
 
 
 def _exp2_emulated_scalar(x):
+    if not _E2E_ENABLED:
+        return cute.math.exp2(x, fastmath=True)
     value, _ = ex2_emulation_2(x, x, poly_degree=2)
     return value
 
