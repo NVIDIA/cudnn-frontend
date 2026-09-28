@@ -7,9 +7,11 @@ import torch
 
 from frost_test_utils import _SM, requires_dsl
 
-pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
+pytestmark = [pytest.mark.L0, requires_dsl]
+requires_native_sm80 = pytest.mark.skipif(_SM != 80, reason="requires native SM80")
 
 
+@requires_native_sm80
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("backward", [False, True])
 def test_packed_wrapper_uses_prepared_half_copies(dtype, backward, monkeypatch):
@@ -49,6 +51,7 @@ def test_packed_wrapper_uses_prepared_half_copies(dtype, backward, monkeypatch):
         check(96, 96, dtype, True, monkeypatch)
 
 
+@requires_native_sm80
 @pytest.mark.parametrize("backward", [False, True])
 def test_packed_copy_artifacts_reload_in_fresh_process(backward, tmp_path):
     import json
@@ -125,6 +128,7 @@ def test_packed_copy_restores_caller_device(device_index):
         torch.cuda.set_device(original)
 
 
+@requires_native_sm80
 def test_packed_copy_rebinds_strides_and_keeps_captured_kernel_alive():
     import gc
     from cudnn.sdpa import packed_copy_sm80
@@ -159,6 +163,7 @@ def test_packed_copy_rebinds_strides_and_keeps_captured_kernel_alive():
             graph.reset()
 
 
+@requires_native_sm80
 @pytest.mark.parametrize("role", [0, 1])
 @pytest.mark.gpu_exclusive
 def test_packed_copy_physical_int64_stride_and_replay(role):
@@ -197,3 +202,27 @@ def test_packed_copy_physical_int64_stride_and_replay(role):
         check(outputs)
     finally:
         graph.reset()
+
+
+@requires_native_sm80
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_packed_backward_compacts_native_width_operands(dtype, monkeypatch):
+    from cudnn.sdpa import packed_copy_sm80
+    from sdpa.frost.test_sdpa_bwd_prepared_thd_sm80 import _check
+    from sdpa.frost.test_sdpa_bwd_thd_sm80 import _thd_case
+    from test_sdpa_sm80_thd_wrapper_prepared import _prefix, _wrapper
+
+    case = _thd_case((96, 160), (128, 96), 4, 128, dtype, hkv=2, d_v=128, cap_q=512, cap_kv=512, poison=True, causal=True)
+    for name in ("q", "k", "v", "o", "do"):
+        value = getattr(case, name)
+        setattr(case, name, value.transpose(-1, -2).contiguous().transpose(-1, -2))
+    original, calls = packed_copy_sm80.copy_packed_half, []
+
+    def record(tensors, *args, **kwargs):
+        calls.append(tuple(not tensor.is_contiguous() for tensor in tensors))
+        return original(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(packed_copy_sm80, "copy_packed_half", record)
+    output = _wrapper(case, _prefix(case.cu_q), _prefix(case.cu_k), deterministic=True, max_s_q=160, max_s_kv=128)
+    _check(case, *(output[name] for name in ("dq_tensor", "dk_tensor", "dv_tensor")))
+    assert calls == [(True,) * 5]
