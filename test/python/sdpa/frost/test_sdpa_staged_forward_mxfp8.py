@@ -335,3 +335,64 @@ def test_mxfp8_compile_cli_uses_prepared_entry(rubin, d, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["compile-probe", "--b", "2", "--validate"])
     assert mod._main() == 0
     assert calls == [True]
+
+
+@pytest.mark.parametrize("converted", ["q", "k", "v", "o"])
+def test_sm107_d256_mxfp8_staging_preserves_each_native_operand(converted, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 D256 mixed-layout contract")
+    from cudnn.sdpa.fwd import prepared_staged_forward
+
+    _, tensors, storage = _case(256, 256)
+    for role in ("q", "k", "v", "o"):
+        if role == converted:
+            continue
+        t = tensors[role]
+        b, h, s, d = t.shape
+        raw = torch.full((b, s, h, 2 * d), 11, dtype=t.dtype, device=t.device)
+        view = raw[..., :d].transpose(1, 2)
+        view.copy_(t)
+        tensors[role], storage[role] = view, raw
+    api = SdpaFwdDslSm100(
+        **{"sample_" + n: tensors[n] for n in ("q", "k", "v", "o", "lse")}, pertensor_fp8=False, sample_amax_o=tensors["amax_o"], has_amax_o=True
+    )
+    assert api.check_support()
+    compact, operands, regions, required = prepared_staged_forward._layout(api)
+    assert [r[0] for r in regions] == [converted], "native operands must not acquire conversion copies"
+    api.compile()
+    assert [r[0] for r in api._staged_spec.regions] == [converted]
+    assert api.scratch_workspace_bytes() == required
+    workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
+    from cudnn.sdpa.fwd import prepared
+
+    execute = prepared.execute_quantized
+    seen = []
+
+    def launch(spec, facts, *args, **kwargs):
+        for role in ("q", "k", "v", "o"):
+            assert (facts[role].ptr == tensors[role].data_ptr()) == (role != converted)
+        seen.append(True)
+        return execute(spec, facts, *args, **kwargs)
+
+    monkeypatch.setattr(prepared, "execute_quantized", launch)
+    _execute(api, tensors, workspace)
+    _check(tensors, thd=False)
+    for role in ("q", "k", "v", "o"):
+        old = tensors[role]
+        raw = torch.full_like(storage[role], 11)
+        view = raw[..., :256].transpose(1, 2)
+        view.copy_(old)
+        tensors[role], storage[role] = view, raw
+    _execute(api, tensors, workspace)
+    _check(tensors, thd=False)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            _execute(api, tensors, workspace)
+        _change_scales(tensors)
+        tensors["o"].fill_(float("nan"))
+        graph.replay()
+        _check(tensors, thd=False)
+    finally:
+        graph.reset()
+    assert len(seen) >= 3
