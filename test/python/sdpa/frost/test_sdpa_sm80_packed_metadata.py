@@ -147,7 +147,10 @@ def test_packed_metadata_physical_wide_addresses(d, role, product):
     lengths = (1, 1, 1, 1) if product else (2,)
     inputs = _inputs(d, d, torch.float16, capq=8, capkv=8)
     cq, ck = _prefix(lengths).to(torch.int64), _prefix(lengths)
-    compact_sink = torch.tensor([7.0, 8.0, 9.0, 10.0], dtype=torch.float16, device="cuda")
+    # Keep the softmax contribution large enough for a wrong prefix to fail
+    # the numerical tolerances; large sinks would hide a missing KV sequence.
+    sink_values = [7.0, 8.0, 9.0, 10.0] if role == "sink" else [-0.7, 0.4, 1.1, -0.2]
+    compact_sink = torch.tensor(sink_values, dtype=torch.float16, device="cuda")
     source = {"q_prefix": cq, "kv_prefix": ck, "sink": compact_sink}[role]
     # Both the stride itself and a product of individually Int32-sized factors
     # must cross 2**32. Wrapped offsets remain allocated, with wrong safe data.
