@@ -104,6 +104,111 @@ def test_wrapper_cache_distinguishes_current_input_strides():
     assert len(_sm80_wrapper_cache) == 3, "each layout needs its own plan; repeating one must reuse it"
 
 
+def test_wrapper_scratch_survives_explicit_stream_consumer(monkeypatch):
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "_sm80_wrapper_cache", {})
+    _, case = _case(128, 128, pad=1)
+    args = tuple(case.bufs[name] for name in ("q", "k", "v"))
+    # Warm the real wrapper before replacing only its scratch consumer. Never
+    # run attention with intentionally recycled storage in the negative control.
+    warm = api_dsl.sdpa_fwd_wrapper_sm80(*args)
+    case.bufs.update(o=warm["o_tensor"], stats=warm["lse_tensor"])
+    _check(case)
+    plan = next(iter(api_dsl._sm80_wrapper_cache.values()))
+    size = plan.scratch_workspace_bytes()
+    assert size > 0
+    producer, target = torch.cuda.current_stream(), torch.cuda.Stream()
+    done = torch.cuda.Event()
+    replacements, pointers, allocation_streams, outputs = [], [], [], [warm]
+    # Pre-fill the ambient allocator pool so churn never needs cudaMalloc,
+    # whose synchronization would destroy the intended overlap.
+    reserve = [torch.full((size,), 17, dtype=torch.uint8, device=args[0].device) for _ in range(32)]
+    torch.cuda.synchronize()
+    del reserve
+
+    def consume(**kwargs):
+        workspace = kwargs["workspace"]
+        assert workspace.numel() == size
+        assert int(kwargs["current_stream"]) == target.cuda_stream
+        pointers.append(workspace.data_ptr())
+        allocation_streams.append(torch.cuda.current_stream(workspace.device).cuda_stream)
+        with torch.cuda.stream(target):
+            torch.cuda._sleep(600000000)
+        result = driver.cuMemsetD8Async(workspace.data_ptr(), 165, size, driver.CUstream(target.cuda_stream))
+        assert result[0] == driver.CUresult.CUDA_SUCCESS
+        done.record(target)
+
+    monkeypatch.setattr(plan, "execute", consume)
+    try:
+        outputs.append(api_dsl.sdpa_fwd_wrapper_sm80(*args, current_stream=driver.CUstream(target.cuda_stream)))
+        assert torch.cuda.current_stream() == producer
+        assert not done.query(), "delayed workspace consumer must still be pending"
+        # Keep all replacements alive through the bounded byte write. The old
+        # wrapper releases ambient-stream scratch into this same allocator pool.
+        for _ in range(32):
+            replacements.append(torch.full((size,), 17, dtype=torch.uint8, device=args[0].device))
+        producer.synchronize()
+        assert not done.query(), "allocator churn must overlap the delayed consumer"
+        done.synchronize()
+        reused = [value for value in replacements if value.data_ptr() == pointers[0]]
+        print("wrapper scratch reused on ambient stream:", len(reused))
+        for value in replacements:
+            torch.testing.assert_close(value, torch.full_like(value, 17), rtol=0, atol=0)
+        assert allocation_streams == [target.cuda_stream]
+    finally:
+        # All owners remain live even if the RED control fails an assertion.
+        torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("d,dv,pad", [(128, 128, 0), (128, 128, 1), (63, 47, 1)])
+def test_wrapper_stream_outputs_and_replay(explicit, d, dv, pad):
+    from contextlib import nullcontext
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd.api_dsl import sdpa_fwd_wrapper_sm80
+
+    _, case = _case(d, dv, pad=pad, features=True)
+    target, ambient = torch.cuda.Stream(), torch.cuda.current_stream()
+    target.wait_stream(ambient)
+
+    def run():
+        tensors = case.bufs
+        with nullcontext() if explicit else torch.cuda.stream(target):
+            return sdpa_fwd_wrapper_sm80(
+                *(tensors[name] for name in ("q", "k", "v")),
+                seq_len_q=tensors["seq_q"],
+                seq_kv_lens=tensors["seq_kv"],
+                bias_tensor=tensors["bias"],
+                sinks=tensors["sink"],
+                current_stream=driver.CUstream(target.cuda_stream) if explicit else None,
+            )
+
+    out = run()
+    ambient.wait_stream(target)
+    case.bufs.update(o=out["o_tensor"], stats=out["lse_tensor"])
+    _check(case)
+    graph = torch.cuda.CUDAGraph()
+    mode = torch.cuda.get_sync_debug_mode()
+    try:
+        with torch.cuda.graph(graph, stream=target):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                captured = run()
+            finally:
+                torch.cuda.set_sync_debug_mode(mode)
+        case.bufs["v"].mul_(0.5)
+        captured["o_tensor"].fill_(float("nan"))
+        graph.replay()
+        case.bufs.update(o=captured["o_tensor"], stats=captured["lse_tensor"])
+        _check(case)
+        assert torch.cuda.current_stream() == ambient
+    finally:
+        torch.cuda.set_sync_debug_mode(mode)
+        graph.reset()
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch):
     from contextlib import nullcontext
