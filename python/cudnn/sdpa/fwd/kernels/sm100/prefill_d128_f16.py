@@ -152,7 +152,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -817,6 +817,10 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below stays branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes immutable packed-total descriptors before this kernel.
+        # Every loader warp, including both CTAs, acquires each map once.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     elif cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -960,6 +964,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
 
             mb_q_reload[1].wait(q_empty_phase)
@@ -1012,6 +1017,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1047,6 +1053,7 @@ def _tmaldg_warp_group(
                         bars.mb_k_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
@@ -1078,6 +1085,7 @@ def _tmaldg_warp_group(
                         bars.mb_v_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
