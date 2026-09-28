@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the norm cuDNN-graph engine layer (facts + probe logic).
 
 These exercise the pure, frontend-independent logic — ``graph_analyzer.analyze``
@@ -10,7 +12,7 @@ engine registration — using synthetic cuDNN norm nodes that mirror the real
 End-to-end graph execution (``select_engines`` -> ``execute``) requires a built
 cuDNN frontend and a real graph, and is not exercised here.
 
-    python cudnn/norm/tests/test_engines.py
+    pytest test/python/norm/graph/test_frost_norm_engines.py
 """
 
 import dataclasses
@@ -18,25 +20,19 @@ import os
 import sys
 import types
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CUDNN_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))
 
-# Stub cudnn with the norm-node attribute surface the analyzer imports.
-if "cudnn" not in sys.modules or not hasattr(sys.modules["cudnn"], "data_type"):
-    stub = types.ModuleType("cudnn")
-    stub.__path__ = [_CUDNN_DIR]
-    stub.pygraph = type("pygraph", (), {})
-    stub.data_type = types.SimpleNamespace(HALF="HALF", BFLOAT16="BFLOAT16", FLOAT="FLOAT")
-    sys.modules["cudnn"] = stub
-
+import cudnn
+import pytest
 import torch  # noqa: E402
+
+pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
 
 from cudnn.norm import graph_analyzer as ga  # noqa: E402
 from cudnn.norm.config_sm100 import NormVariant as NV  # noqa: E402
 from cudnn.norm.fprop import engines as fe  # noqa: E402
 from cudnn.norm.bprop import engines as be  # noqa: E402
 
-_DT = sys.modules["cudnn"].data_type
+_DT = cudnn.data_type
 
 
 class _T:
@@ -89,9 +85,7 @@ def main():
 
     D = 256
     # LayerNorm forward (real cuDNN spelling)
-    ln = _Node("LAYERNORM", {"epsilon": 1e-5},
-               {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])},
-               {"Y": _T([8, D]), "mean": _T([8]), "inv_var": _T([8])})
+    ln = _Node("LAYERNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])}, {"Y": _T([8, D]), "mean": _T([8]), "inv_var": _T([8])})
     f = _facts(ln)
     expect(f.variant == NV.LAYER_NORM and f.phase == "fprop", "LAYERNORM -> LN fprop")
     expect(f.normalized_shape == (D,) and f.has_beta and f.has_mean, "LN normalized_shape/flags")
@@ -101,35 +95,35 @@ def main():
     expect(fe.mismatch(fcap, f) is None, "fprop engine accepts LN")
 
     # RMSNorm forward (no bias, no mean output)
-    rms = _Node("RMSNORM", {"epsilon": 1e-5},
-                {"input": _T([8, D]), "scale": _T([D])},
-                {"Y": _T([8, D]), "inv_var": _T([8])})
+    rms = _Node("RMSNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D])}, {"Y": _T([8, D]), "inv_var": _T([8])})
     fr = _facts(rms)
     expect(fr.variant == NV.RMS_NORM and not fr.has_mean and not fr.has_beta, "RMSNORM flags")
     expect(fe.mismatch(fcap, fr) is None, "fprop engine accepts RMS (same engine)")
 
     # BatchNorm forward with running stats
-    bn = _Node("BATCHNORM", {"epsilon": 1e-5, "momentum": 0.1},
-               {"input": _T([16, 8, 4]), "scale": _T([8]), "bias": _T([8]),
-                "in_running_mean": _T([8]), "in_running_var": _T([8])},
-               {"Y": _T([16, 8, 4]), "mean": _T([8]), "inv_var": _T([8]),
-                "next_running_mean": _T([8]), "next_running_var": _T([8])})
+    bn = _Node(
+        "BATCHNORM",
+        {"epsilon": 1e-5, "momentum": 0.1},
+        {"input": _T([16, 8, 4]), "scale": _T([8]), "bias": _T([8]), "in_running_mean": _T([8]), "in_running_var": _T([8])},
+        {"Y": _T([16, 8, 4]), "mean": _T([8]), "inv_var": _T([8]), "next_running_mean": _T([8]), "next_running_var": _T([8])},
+    )
     fbn = _facts(bn)
     expect(fbn.variant == NV.BATCH_NORM and fbn.wants_running_stats and fbn.training, "BATCHNORM running-stats")
     expect(fe.mismatch(fcap, fbn) is None, "fprop engine accepts BatchNorm (same engine)")
 
     # BatchNorm inference -> training False
-    bni = _Node("BATCHNORM_INFERENCE", {},
-                {"input": _T([16, 8, 4]), "mean": _T([8]), "inv_variance": _T([8]),
-                 "scale": _T([8]), "bias": _T([8])},
-                {"Y": _T([16, 8, 4])})
+    bni = _Node(
+        "BATCHNORM_INFERENCE", {}, {"input": _T([16, 8, 4]), "mean": _T([8]), "inv_variance": _T([8]), "scale": _T([8]), "bias": _T([8])}, {"Y": _T([16, 8, 4])}
+    )
     expect(not _facts(bni).training, "BATCHNORM_INFERENCE -> training=False")
 
     # LayerNorm backward (mean/inv_variance are inputs; grad = DY)
-    lnb = _Node("LAYERNORM_BWD", {},
-                {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]),
-                 "mean": _T([8]), "inv_variance": _T([8])},
-                {"DX": _T([8, D]), "DScale": _T([D]), "DBias": _T([D])})
+    lnb = _Node(
+        "LAYERNORM_BWD",
+        {},
+        {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]), "mean": _T([8]), "inv_variance": _T([8])},
+        {"DX": _T([8, D]), "DScale": _T([D]), "DBias": _T([D])},
+    )
     fb = _facts(lnb)
     expect(fb.phase == "bprop" and fb.variant == NV.LAYER_NORM, "LAYERNORM_BWD -> LN bprop")
     expect(fb.dy_t is not None and fb.mean_t is not None and fb.dscale_t is not None, "LN bwd ports resolved")
@@ -140,11 +134,26 @@ def main():
     other = _Node("MATMUL", {}, {"a": _T([4, 4])}, {"c": _T([4, 4])})
     expect(ga.analyze(_Graph(other)) is None, "non-norm node -> analyze None")
 
-    # Registration: exactly two norm engines (one per phase).
-    from cudnn.frost.dispatch import _ENGINES
-    names = set(_ENGINES)
-    norm_engines = {n for n in names if n.startswith("norm_")}
-    expect(norm_engines == {"norm_fprop_sm100", "norm_bprop_sm100"}, f"2 norm engines: {sorted(norm_engines)}")
+    # Manifest: the norm families are on offer, one engine each, ids in their own
+    # block. The manifest is the ONLY way a python engine exists publicly -- there
+    # is no registration call -- so this asserts against it, not a registry.
+    from cudnn.engines import manifest as mf
+
+    fams = {fam.name: fam for fam in mf.MANIFEST if fam.name.startswith("frost_norm")}
+    expect(set(fams) == {"frost_norm_fwd", "frost_norm_bwd"}, f"2 norm families: {sorted(fams)}")
+    offered = {n: fam.offered_ids() for n, fam in fams.items()}
+    expect(set(offered["frost_norm_fwd"]) == {"norm_fprop_sm100"}, f"fwd slot: {offered['frost_norm_fwd']}")
+    expect(set(offered["frost_norm_bwd"]) == {"norm_bprop_sm100"}, f"bwd slot: {offered['frost_norm_bwd']}")
+    blocks = sorted((fam.engine_id, fam.engine_id + mf.FAMILY_BLOCK) for fam in mf.MANIFEST)
+    expect(all(a[1] <= b[0] for a, b in zip(blocks, blocks[1:])), "engine-id blocks do not overlap")
+    for node, fam in (
+        ("LAYERNORM", "frost_norm_fwd"),
+        ("RMSNORM", "frost_norm_fwd"),
+        ("BATCHNORM", "frost_norm_fwd"),
+        ("LAYERNORM_BWD", "frost_norm_bwd"),
+        ("BATCHNORM_BWD", "frost_norm_bwd"),
+    ):
+        expect(mf._ANCHOR_NODE_TO_FAMILY.get(node) == fam, f"{node} anchors to {fam}")
     expect(fe.mismatch(fcap, f, requested=object()) is not None, "wrong knob vocabulary rejected")
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
@@ -153,3 +162,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_frost_norm_engines():
+    """pytest entry point; this module also runs standalone via ``__main__``."""
+    try:
+        main()
+    except SystemExit as exc:
+        assert not exc.code, "checks failed -- see captured stdout"

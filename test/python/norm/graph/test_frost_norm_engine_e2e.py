@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """End-to-end drive of the norm cuDNN-graph engines: probe -> build -> lower ->
 execute, with synthetic cuDNN nodes + real torch buffers, validated vs PyTorch.
 
@@ -7,29 +9,25 @@ kernel launch, and the copy-into-output-buffers step — everything except the C
 ``cudnn.pygraph`` lifecycle (which needs a built cuDNN frontend). Complements
 ``test_engines.py`` (which covers facts/probe logic in isolation).
 
-    python cudnn/norm/tests/test_engine_e2e.py
+    pytest test/python/norm/graph/test_frost_norm_engine_e2e.py
 """
 
 import os
 import sys
 import types
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CUDNN_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))
-if "cudnn" not in sys.modules or not hasattr(sys.modules["cudnn"], "data_type"):
-    stub = types.ModuleType("cudnn")
-    stub.__path__ = [_CUDNN_DIR]
-    stub.pygraph = type("pygraph", (), {})
-    stub.data_type = types.SimpleNamespace(HALF="HALF", BFLOAT16="BFLOAT16", FLOAT="FLOAT")
-    sys.modules["cudnn"] = stub
 
+import cudnn
+import pytest
 import torch
 import torch.nn.functional as F
+
+pytest.importorskip("cudnn.norm", reason="frost norm engines require a built cudnn frontend")
 
 from cudnn.norm.fprop import engines as fe
 from cudnn.norm.bprop import engines as be
 
-_DT = sys.modules["cudnn"].data_type
+_DT = cudnn.data_type
 _TDT = {torch.float16: _DT.HALF, torch.bfloat16: _DT.BFLOAT16, torch.float32: _DT.FLOAT}
 
 _OK = True
@@ -99,11 +97,13 @@ def main():
         D, N = 256, 8
 
         # --- LayerNorm forward through the fprop engine ---
-        xt = _mk((N, D), dt); gt = _mk((D,), dt); bt = _mk((D,), dt)
-        yt = _T(torch.empty(N, D, device="cuda", dtype=dt)); mt = _mkf(N); ivt = _mkf(N)
-        node = _Node("LAYERNORM", {"epsilon": 1e-5},
-                     {"input": xt, "scale": gt, "bias": bt},
-                     {"Y": yt, "mean": mt, "inv_var": ivt})
+        xt = _mk((N, D), dt)
+        gt = _mk((D,), dt)
+        bt = _mk((D,), dt)
+        yt = _T(torch.empty(N, D, device="cuda", dtype=dt))
+        mt = _mkf(N)
+        ivt = _mkf(N)
+        node = _Node("LAYERNORM", {"epsilon": 1e-5}, {"input": xt, "scale": gt, "bias": bt}, {"Y": yt, "mean": mt, "inv_var": ivt})
         g = _Graph(node)
         _expect(fe.probe(fspec, g), "LAYERNORM: fprop probe True")
         fe.build(fspec, g)({xt: xt.buf, gt: gt.buf, bt: bt.buf, yt: yt.buf, mt: mt.buf, ivt: ivt.buf})
@@ -112,16 +112,18 @@ def main():
 
         # --- LayerNorm backward through the bprop engine (reuse mean/inv_var) ---
         dyt = _T(torch.randn(N, D, device="cuda", dtype=dt))
-        dxt = _T(torch.empty(N, D, device="cuda", dtype=dt)); dst = _mkf(D); dbt = _mkf(D)
-        mtin = _T(mt.buf); ivtin = _T(ivt.buf)
-        bnode = _Node("LAYERNORM_BWD", {},
-                      {"grad": dyt, "input": xt, "scale": gt, "mean": mtin, "inv_variance": ivtin},
-                      {"DX": dxt, "DScale": dst, "DBias": dbt})
+        dxt = _T(torch.empty(N, D, device="cuda", dtype=dt))
+        dst = _mkf(D)
+        dbt = _mkf(D)
+        mtin = _T(mt.buf)
+        ivtin = _T(ivt.buf)
+        bnode = _Node(
+            "LAYERNORM_BWD", {}, {"grad": dyt, "input": xt, "scale": gt, "mean": mtin, "inv_variance": ivtin}, {"DX": dxt, "DScale": dst, "DBias": dbt}
+        )
         bg = _Graph(bnode)
         _expect(be.probe(bspec, bg), "LAYERNORM_BWD: bprop probe True")
         _expect(fe.probe(fspec, bg) is False, "LAYERNORM_BWD: fprop probe False")
-        be.build(bspec, bg)({dyt: dyt.buf, xt: xt.buf, gt: gt.buf, mtin: mtin.buf,
-                             ivtin: ivtin.buf, dxt: dxt.buf, dst: dst.buf, dbt: dbt.buf})
+        be.build(bspec, bg)({dyt: dyt.buf, xt: xt.buf, gt: gt.buf, mtin: mtin.buf, ivtin: ivtin.buf, dxt: dxt.buf, dst: dst.buf, dbt: dbt.buf})
         xr = xt.buf.float().detach().requires_grad_(True)
         gr = gt.buf.float().detach().requires_grad_(True)
         br = bt.buf.float().detach().requires_grad_(True)
@@ -133,10 +135,13 @@ def main():
 
         # --- GroupNorm + BatchNorm forward through the SAME fprop engine (variant dispatch) ---
         torch.manual_seed(1)
-        xg = _mk((4, 8, 32), dt); gg = _mk((8,), dt); bg2 = _mk((8,), dt)
-        yg = _T(torch.empty(4, 8, 32, device="cuda", dtype=dt)); mg = _mkf(16); ig = _mkf(16)
-        gnode = _Node("GROUPNORM", {"epsilon": 1e-5, "num_groups": 4},
-                      {"input": xg, "scale": gg, "bias": bg2}, {"Y": yg, "mean": mg, "inv_var": ig})
+        xg = _mk((4, 8, 32), dt)
+        gg = _mk((8,), dt)
+        bg2 = _mk((8,), dt)
+        yg = _T(torch.empty(4, 8, 32, device="cuda", dtype=dt))
+        mg = _mkf(16)
+        ig = _mkf(16)
+        gnode = _Node("GROUPNORM", {"epsilon": 1e-5, "num_groups": 4}, {"input": xg, "scale": gg, "bias": bg2}, {"Y": yg, "mean": mg, "inv_var": ig})
         gG = _Graph(gnode)
         _expect(fe.probe(fspec, gG), "GROUPNORM: fprop probe True (same engine)")
         fe.build(fspec, gG)({xg: xg.buf, gg: gg.buf, bg2: bg2.buf, yg: yg.buf, mg: mg.buf, ig: ig.buf})
@@ -144,10 +149,13 @@ def main():
         _expect((yg.buf.float() - gref).abs().max().item() <= _tol(dt, 6e-2), "GROUPNORM: Y matches torch")
 
         torch.manual_seed(2)
-        xb = _mk((16, 8, 4), dt); gbt = _mk((8,), dt); bbt = _mk((8,), dt)
-        yb = _T(torch.empty(16, 8, 4, device="cuda", dtype=dt)); mb = _mkf(8); ib = _mkf(8)
-        bnnode = _Node("BATCHNORM", {"epsilon": 1e-5, "momentum": 0.1},
-                       {"input": xb, "scale": gbt, "bias": bbt}, {"Y": yb, "mean": mb, "inv_var": ib})
+        xb = _mk((16, 8, 4), dt)
+        gbt = _mk((8,), dt)
+        bbt = _mk((8,), dt)
+        yb = _T(torch.empty(16, 8, 4, device="cuda", dtype=dt))
+        mb = _mkf(8)
+        ib = _mkf(8)
+        bnnode = _Node("BATCHNORM", {"epsilon": 1e-5, "momentum": 0.1}, {"input": xb, "scale": gbt, "bias": bbt}, {"Y": yb, "mean": mb, "inv_var": ib})
         bnG = _Graph(bnnode)
         _expect(fe.probe(fspec, bnG), "BATCHNORM: fprop probe True (same engine)")
         fe.build(fspec, bnG)({xb: xb.buf, gbt: gbt.buf, bbt: bbt.buf, yb: yb.buf, mb: mb.buf, ib: ib.buf})
@@ -160,3 +168,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_frost_norm_engine_e2e():
+    """pytest entry point; this module also runs standalone via ``__main__``."""
+    try:
+        main()
+    except SystemExit as exc:
+        assert not exc.code, "checks failed -- see captured stdout"
