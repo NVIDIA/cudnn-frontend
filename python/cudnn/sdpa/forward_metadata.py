@@ -11,6 +11,8 @@ from cudnn._device import ensure_current_context
 from cudnn._torch_stream import _raw_current_stream
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 
+_DTYPE_NAMES = {dtype: str(dtype) for dtype in (torch.int32, torch.int64, torch.float16, torch.bfloat16, torch.float32)}
+
 
 @lru_cache(maxsize=16)
 def _can_prepare(device_index, installed, version):
@@ -43,19 +45,25 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
     Native compact inputs remain views. Other common CUDA inputs share one
     conversion launch; the Torch fallback preserves the same layout contract.
     """
+    q_native = seq_q is None or (seq_q.dtype == torch.int32 and seq_q.is_contiguous() and seq_q.data_ptr() % 16 == 0)
+    kv_native = seq_kv is None or (seq_kv.dtype == torch.int32 and seq_kv.is_contiguous() and seq_kv.data_ptr() % 16 == 0)
+    sink_native = sinks is None or (sinks.dtype == torch.float32 and sinks.is_contiguous() and sinks.data_ptr() % 16 == 0)
+    if q_native and kv_native and sink_native:
+        # reshape checks the element count without a separate metadata query.
+        return (
+            seq_q.reshape(batch, 1, 1, 1) if seq_q is not None else None,
+            seq_kv.reshape(batch, 1, 1, 1) if seq_kv is not None else None,
+            sinks.reshape(1, heads, 1, 1) if sinks is not None else None,
+        )
+
     values = (seq_q, seq_kv, sinks)
     counts = (batch, batch, heads)
     shapes = ((batch, 1, 1, 1), (batch, 1, 1, 1), (1, heads, 1, 1))
     types = (torch.int32, torch.int32, torch.float32)
-    outputs, pending = [], []
-    for tensor, count, shape, dtype in zip(values, counts, shapes, types):
+    pending = (not q_native, not kv_native, not sink_native)
+    for tensor, count in zip(values, counts):
         if tensor is not None and tensor.numel() != count:
             raise ValueError(f"SDPA forward metadata needs {count} elements; got {tensor.numel()}")
-        native = tensor is None or (tensor.dtype == dtype and tensor.is_contiguous() and tensor.data_ptr() % 16 == 0)
-        outputs.append(None if tensor is None or not native else tensor.reshape(shape))
-        pending.append(not native)
-    if not any(pending):
-        return tuple(outputs)
 
     device = next(tensor.device for tensor in values if tensor is not None)
     installed, version = cutedsl_state()
@@ -66,29 +74,35 @@ def prepare_forward_metadata(seq_q, seq_kv, sinks, batch, heads):
         and all(not copy or (tensor.device == device and tensor.ndim == 1 and tensor.dtype in dtypes) for tensor, copy, dtypes in zip(values, pending, allowed))
     )
     if not supported:
-        return tuple(
-            _torch_column(tensor, dtype, shape) if copy else output for tensor, dtype, shape, copy, output in zip(values, types, shapes, pending, outputs)
-        )
+        return tuple(_torch_column(tensor, dtype, shape) if tensor is not None else None for tensor, dtype, shape in zip(values, types, shapes))
 
     context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
     with context:
-        for index in range(3):
-            if pending[index]:
-                outputs[index] = torch.empty(shapes[index], dtype=types[index], device=device)
-        active_counts = tuple(count if copy else 0 for count, copy in zip(counts, pending))
+        out_q = (seq_q.reshape(shapes[0]) if seq_q is not None else None) if q_native else torch.empty(shapes[0], dtype=torch.int32, device=device)
+        out_kv = (seq_kv.reshape(shapes[1]) if seq_kv is not None else None) if kv_native else torch.empty(shapes[1], dtype=torch.int32, device=device)
+        out_sink = (sinks.reshape(shapes[2]) if sinks is not None else None) if sink_native else torch.empty(shapes[2], dtype=torch.float32, device=device)
+        active_counts = (0 if q_native else batch, 0 if kv_native else batch, 0 if sink_native else heads)
         if max(active_counts) == 0:
-            return tuple(outputs)
+            return out_q, out_kv, out_sink
         stream = _raw_current_stream(torch, device)
         if stream is None:
             stream = torch.cuda.current_stream(device).cuda_stream
         ensure_current_context(stream, device.index)
-        dtypes = tuple(str(tensor.dtype) if copy else None for tensor, copy in zip(values, pending))
+        dtypes = (
+            None if q_native else _DTYPE_NAMES[seq_q.dtype],
+            None if kv_native else _DTYPE_NAMES[seq_kv.dtype],
+            None if sink_native else _DTYPE_NAMES[sinks.dtype],
+        )
         plan = _plan(dtypes, device.index)
         plan[1](
-            *(tensor.data_ptr() if copy else None for tensor, copy in zip(values, pending)),
-            *(tensor.data_ptr() if copy else None for tensor, copy in zip(outputs, pending)),
+            None if q_native else seq_q.data_ptr(),
+            None if kv_native else seq_kv.data_ptr(),
+            None if sink_native else sinks.data_ptr(),
+            None if q_native else out_q.data_ptr(),
+            None if kv_native else out_kv.data_ptr(),
+            None if sink_native else out_sink.data_ptr(),
             active_counts,
-            tuple(tensor.stride(0) if copy else 0 for tensor, copy in zip(values, pending)),
+            (0 if q_native else seq_q.stride(0), 0 if kv_native else seq_kv.stride(0), 0 if sink_native else sinks.stride(0)),
             stream,
         )
-        return tuple(outputs)
+        return out_q, out_kv, out_sink
