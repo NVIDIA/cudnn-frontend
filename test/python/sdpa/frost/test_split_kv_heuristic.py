@@ -13,6 +13,7 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
+from frost_test_utils import requires_dsl
 from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
@@ -577,6 +578,7 @@ def test_quantized_and_half_outputs_choose_the_same_split():
     assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
 
 
+@requires_dsl
 @pytest.mark.parametrize("kind", ["dense", "ragged", "quantized"])
 @pytest.mark.parametrize("stats", [False, True])
 def test_every_combine_call_site_matches_the_compiled_arity(kind, stats):
