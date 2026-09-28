@@ -420,3 +420,9 @@ wrapper must obtain `scratch_workspace_bytes()` and pass per-call scratch on
 the input device; a zero-workspace plan should keep its allocation-free path.
 The SM120 detector is `TestStagedSm120Wrapper` in
 `test/python/sdpa/frost/test_sdpa_fwd_dsl_sm120.py`.
+
+When a test is re-exported from another module, the source module's `pytestmark`
+does not follow it. A subprocess-based GPU test must check architecture in the
+parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
+Keep genuine child failures failing on supported devices. The half SDPA artifact
+reload detector is re-exported through `TestStagedHalf` and covers this boundary.
