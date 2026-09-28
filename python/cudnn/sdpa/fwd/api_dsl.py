@@ -4403,8 +4403,19 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         raise ValueError("cu_seqlens_q must have >= 2 entries")
     if cu_k is None or cu_k.numel() != n_seqs + 1:
         raise ValueError("cu_seqlens_q / cu_seqlens_k length mismatch")
-    cu_q_t = cu_q.to(dtype=torch.int32, device=device).contiguous()
-    cu_k_t = cu_k.to(dtype=torch.int32, device=device).contiguous()
+
+    def prefix(tensor):
+        if tensor.device == device and tensor.ndim == 1 and tensor.dtype in (torch.int32, torch.int64):
+            return tensor
+        return tensor.to(dtype=torch.int32, device=device).contiguous().view(-1)
+
+    cu_q_t, cu_k_t = prefix(cu_q), prefix(cu_k)
+    sinks_b = sinks
+    if sinks is not None:
+        if sinks.numel() != h_q:
+            raise ValueError("SM80 THD sinks must contain H_q elements")
+        if sinks.device != device or sinks.ndim != 1 or sinks.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            sinks_b = sinks.to(dtype=torch.float32, device=device).reshape(h_q).contiguous()
 
     params = _sm80_cfg.TemplateParams(
         io_bf16=(q.dtype == torch.bfloat16),
@@ -4424,13 +4435,20 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     mod = _sm80_load_kernel_module(flavor, params)
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 
-    _artifact, fn = compile_thd_host(mod, h_q, h_kv, n_seqs, int(max(0, wl)) if wl is not None else 0)
+    _artifact, fn = compile_thd_host(
+        mod,
+        h_q,
+        h_kv,
+        n_seqs,
+        int(max(0, wl)) if wl is not None else 0,
+        (str(cu_q_t.dtype), str(cu_k_t.dtype)),
+        str(sinks_b.dtype) if sinks_b is not None else "torch.float32",
+    )
 
     t_q = q.shape[1]
     # The prepared host initializes both complete capacities before attention.
     o_buf = torch.empty(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
     lse_buf = torch.empty(1, h_q, t_q, dtype=torch.float32, device=device)
-    sinks_b = sinks.to(dtype=torch.float32, device=device).reshape(h_q).contiguous() if sinks is not None else None
     for name, tensor in (("Q", q), ("K", k), ("V", v)):
         if tensor.stride(-1) != 1 or tensor.data_ptr() % 16 or any(n > 1 and st % 8 for n, st in zip(tensor.shape[1:3], tensor.stride()[1:3])):
             raise ValueError(f"SM80 THD {name} requires D-contiguous, 16-byte aligned rows and heads")
@@ -4456,6 +4474,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         float(scale_softmax) * _LOG2E,
         1.0 / float(scale_softmax),
         int(right_bound),
+        (int(cu_q_t.stride(0)), int(cu_k_t.stride(0)), int(sinks_b.stride(0)) if sinks_b is not None else 1),
         int(stream),
     )
     if pad_v:

@@ -50,7 +50,7 @@ def _host(q, kv, offsets, lengths, n, prefix_strides, token_strides, offset_pitc
 
 
 @lru_cache(maxsize=128)
-def compile_metadata(q_dtype, kv_dtype, n_q, n_kv, device_index):
+def compile_metadata(q_dtype, kv_dtype, n_q, n_kv, device_index, arch):
     key = template_key(globals(), locals(), "compile_metadata")
     types = {"torch.int32": cutlass.Int32, "torch.int64": cutlass.Int64}
 
@@ -70,7 +70,7 @@ def compile_metadata(q_dtype, kv_dtype, n_q, n_kv, device_index):
         cutlass.Int64(0),
         n_q,
         driver.CUstream(0),
-        options="--enable-tvm-ffi",
+        options=f"--enable-tvm-ffi --gpu-arch {arch}",
         cache_key=key,
         symbol="cudnn_sdpa_varlen_metadata",
     )

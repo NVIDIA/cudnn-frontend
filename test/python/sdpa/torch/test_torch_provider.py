@@ -253,6 +253,29 @@ def test_varlen_backward_does_not_sync():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("case", ["causal", "gqa", "no_sync"])
+def test_varlen_backward_uses_prepared_stats(case, monkeypatch):
+    from cudnn.sdpa import packed_lse
+    from sdpa.torch.test_packed_lse import _require_prepared
+
+    _require_prepared()
+    calls = []
+    original = packed_lse._plan
+
+    def plan(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(packed_lse, "_plan", plan)
+    monkeypatch.setattr(packed_lse, "_torch_repad", lambda *a, **k: pytest.fail("ordinary provider backward used Torch Stats conversion"))
+    if case == "no_sync":
+        test_varlen_backward_does_not_sync()
+    else:
+        test_varlen_attn(*next(param.values for param in VARLEN_CASES if param.id == case))
+    assert calls, "provider backward did not launch the prepared Stats conversion"
+
+
+@pytest.mark.L0
 def test_d256_direct_aten_op():
     """d=256: torch's C++ fused_sdp_choice still gates cuDNN to head_dim<=128,
     so F.sdpa cannot reach it — but the python path serves it through the aten
