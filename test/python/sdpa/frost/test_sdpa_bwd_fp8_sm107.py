@@ -521,19 +521,24 @@ class _Fp8Run:
                 out_dtype=self.grad_dtype,
             )
         for name in ("dQ", "dK", "dV"):
+            if name not in self.amax[0]:
+                continue  # not requested on this graph
             a, r = self.amax[0][name].item(), self.ref_amax[name]
             assert math.isfinite(a), f"amax_{name} was not written (NaN poison survived)"
             assert abs(a - r) <= _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * r, f"amax_{name} {a:.5f} vs the oracle's pre-quant max {r:.5f}"
-        a, r = self.amax[0]["dP"].item(), self.ref_amax["dP"]
-        assert math.isfinite(a), "amax_dP was not written"
-        assert abs(a - r) <= _AMAX_DS_TOL["atol"] + _AMAX_DS_TOL["rtol"] * r, (
-            f"amax_dP {a:.6f} vs max|dS| {r:.6f}: the contract reduces the fp32 dS = P (dP - D) attn_scale right before its scale_dP cast "
-            f"(sdpa_fp8_bwd.h), not dO V^T (max {self.ref_amax['dP_raw']:.4f})"
-        )
+        if "dP" in self.amax[0]:
+            a, r = self.amax[0]["dP"].item(), self.ref_amax["dP"]
+            assert math.isfinite(a), "amax_dP was not written"
+            assert abs(a - r) <= _AMAX_DS_TOL["atol"] + _AMAX_DS_TOL["rtol"] * r, (
+                f"amax_dP {a:.6f} vs max|dS| {r:.6f}: the contract reduces the fp32 dS = P (dP - D) attn_scale right before its scale_dP cast "
+                f"(sdpa_fp8_bwd.h), not dO V^T (max {self.ref_amax['dP_raw']:.4f})"
+            )
         return self
 
 
-def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=False, left=None, seed=0, runs=1, poison=None, grad_dtype=_T_E4M3):
+def _run_fp8(
+    b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=False, left=None, seed=0, runs=1, poison=None, grad_dtype=_T_E4M3, request_amax=_AMAX
+):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
     scalars (delayed scaling: scale_dP / dQ / dK / dV from the oracle's amaxes, the recipe the backend suite feeds),
@@ -602,7 +607,18 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
     )
     cudnn_grad = {_T_E4M3: _FP8, torch.bfloat16: _BF16, torch.float16: cudnn.data_type.HALF}[grad_dtype]
     g, ts = _graph_and_ports(
-        b, hq, sq, _D, hkv=hkv, skv=skv, causal=causal, bottom_right=bottom_right, left_bound=left, grad_dtypes=(cudnn_grad,) * 3, scale=scale
+        b,
+        hq,
+        sq,
+        _D,
+        hkv=hkv,
+        skv=skv,
+        causal=causal,
+        bottom_right=bottom_right,
+        left_bound=left,
+        grad_dtypes=(cudnn_grad,) * 3,
+        scale=scale,
+        request_amax=request_amax,
     )
     g.validate()
     g.build_operation_graph()
@@ -612,7 +628,7 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     outs_t = {n: torch.empty(sh, device=dev, dtype=grad_dtype) for n, sh in (("dQ", (b, sq, hq, _D)), ("dK", (b, skv, hkv, _D)), ("dV", (b, skv, hkv, _D)))}
-    amax_t = {n: torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32) for n in ("dQ", "dK", "dV", "dP")}
+    amax_t = {n: torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32) for n in ("dQ", "dK", "dV", "dP") if f"amax_{n}" in request_amax}
     pack = {
         ts["q"]: _view_bhsd(q8),
         ts["k"]: _view_bhsd(k8),
@@ -623,7 +639,7 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
     }
     pack.update({ts[n]: _sc(v) for n, v in scalars.items()})
     pack.update({ts[n]: _view_bhsd(outs_t[n]) for n in ("dQ", "dK", "dV")})
-    pack.update({ts[f"amax_{n}"]: amax_t[n] for n in ("dQ", "dK", "dV", "dP")})
+    pack.update({ts[f"amax_{n}"]: amax_t[n] for n in amax_t})
     outs, amax = [], []
     for _ in range(runs):
         for x in outs_t.values():
@@ -635,7 +651,7 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
         outs.append({n: x.clone() for n, x in outs_t.items()})
         amax.append({n: x.clone() for n, x in amax_t.items()})
     deq = {n: (x8.float() * ds) for n, x8, ds in (("q", q8, q_ds), ("k", k8, k_ds), ("dO", do8, do_ds))}
-    return _Fp8Run(
+    run = _Fp8Run(
         outs,
         amax,
         refs=dict(dQ=dq_ref, dK=dk_ref, dV=dv_ref),
@@ -647,6 +663,10 @@ def _run_fp8(b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=Fa
         descales={n: 1.0 / s for n, s in grad_scale.items()},
         grad_dtype=grad_dtype,
     )
+    # The live graph state, for the prepared-launch pins (re-execute, replay, standalone twin).
+    run.graph, run.ts, run.pack, run.workspace, run.outs_t, run.amax_t, run.scale = g, ts, pack, ws, outs_t, amax_t, scale
+    run.inputs = dict(q=q8, k=k8, v=v8, o=o8, dO=do8, stats=stats.contiguous())
+    return run
 
 
 @requires_rubin
@@ -775,6 +795,159 @@ def test_workspace_is_build_time_honest():
     g.check_support()
     g.build_plans()
     assert g.get_workspace_size() == g.get_workspace_size() > 0
+
+
+# --------------------------------------------------------------------------- the prepared launch (Rubin): scalars + requested amax are roles of ONE artifact
+
+
+def _prepared_fp8_case(**kw):
+    kw.setdefault("hq", 4)
+    kw.setdefault("hkv", 2)
+    kw.setdefault("causal", True)
+    case = _run_fp8(**kw)
+    assert case.graph._compiled_plans[case.graph._plan_index]._prepared is not None, "the fp8 row must lower through the prepared-launch contract"
+    return case
+
+
+def _check_prepared_fp8(case):
+    """The live outputs are BITWISE the first run's (the chain is deterministic: two-launch pin) and every requested amax is."""
+    for name, t in case.outs_t.items():
+        assert torch.equal(t, case.outs[0][name]), f"{name}: a re-execute / replay of the prepared launch changed the bits"
+    for name, t in case.amax_t.items():
+        assert torch.equal(t, case.amax[0][name]), f"amax_{name}: a re-execute / replay changed the bits"
+
+
+@requires_rubin
+def test_prepared_fp8_execute_has_no_tensor_plumbing(monkeypatch):
+    """Warm execute rebuilds no tensor views, allocates nothing, compiles nothing, never synchronizes: the e4m3 -> bf16
+    upcast, the amax resets and the fold + quantize passes are launches of the artifact (the pin that proves the torch
+    path is gone on the fp8 row).  Bitwise the first run afterwards."""
+    import cutlass.cute as cute
+    import cutlass.cute.runtime as runtime
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+    case = _prepared_fp8_case(sq=500, skv=500)  # padded: every staging kernel runs
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared fp8 backward rebuilt tensor arguments, allocated or compiled on execute")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cute, "compile", forbidden)
+        patch.setattr(runtime, "from_dlpack", forbidden)
+        patch.setattr(WorkspaceCarver, "__init__", forbidden)
+        for name in ("view", "reshape", "permute", "contiguous", "as_strided", "copy_", "zero_", "fill_"):
+            patch.setattr(torch.Tensor, name, forbidden)
+        for name in ("empty", "empty_like", "zeros", "zeros_like", "full"):
+            patch.setattr(torch, name, forbidden)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for _ in range(3):
+                case.graph.execute(case.pack, case.workspace)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    _check_prepared_fp8(case)
+
+
+@requires_rubin
+@pytest.mark.parametrize("request_amax", [(), ("amax_dP",), ("amax_dQ", "amax_dK", "amax_dV")], ids=["none", "dP", "dQ-dK-dV"])
+def test_prepared_fp8_binds_only_the_requested_amax(request_amax):
+    """An amax the graph left virtual is None-specialized out of the artifact (``Operand`` None, no pointer bound): the
+    gradients are BITWISE the all-requested plan's and every requested amax equals its value there."""
+    full = _prepared_fp8_case()
+    case = _prepared_fp8_case(request_amax=request_amax)
+    spec = case.graph._compiled_plans[case.graph._plan_index]._prepared.spec
+    bound = {role for role, op in zip(spec.roles, spec.operands) if role.startswith("amax_") and op is not None}
+    assert bound == set(request_amax), f"the spec binds {sorted(bound)}; the graph requested {sorted(request_amax)}"
+    for name in ("dQ", "dK", "dV"):
+        assert torch.equal(case.outs[0][name], full.outs[0][name]), f"{name} depends on which amax outputs are requested"
+    for name, t in case.amax[0].items():
+        assert torch.equal(t, full.amax[0][name]), f"amax_{name} differs from the all-requested plan's"
+    case.check()
+
+
+@requires_rubin
+def test_prepared_fp8_rebind_stream_and_replay():
+    """The fp8 plan follows the handle's stream and captures into a CUDA graph; a replay over poisoned outputs / amax /
+    workspace reproduces the first run's bits."""
+    case = _prepared_fp8_case()
+    stream, ambient = torch.cuda.Stream(), torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    capture = torch.cuda.CUDAGraph()
+
+    def poison():
+        for t in list(case.outs_t.values()) + list(case.amax_t.values()):
+            t.fill_(float("nan"))
+        case.workspace.fill_(0xAD)
+
+    try:
+        poison()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(ambient):
+            case.graph.execute(case.pack, case.workspace, handle=handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        _check_prepared_fp8(case)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(capture, stream=stream):
+            case.graph.execute(case.pack, case.workspace, handle=handle)
+        poison()
+        capture.replay()
+        torch.cuda.synchronize()
+        _check_prepared_fp8(case)
+    finally:
+        capture.reset()
+        cudnn.destroy_handle(handle)
+
+
+@requires_rubin
+def test_prepared_fp8_standalone_twin_matches_the_graph_and_refuses_off_plan_operands():
+    """``SdpaBwdDslSm107Fp8.execute`` binds the SAME artifact from torch tensors: bitwise the graph's outputs and amax;
+    an amax tensor given for an unrequested output (or missing for a requested one) and an operand off the plan's
+    layout are refused before any stage launches."""
+    from dataclasses import replace
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+
+    case = _prepared_fp8_case(request_amax=("amax_dQ", "amax_dK", "amax_dV", "amax_dP"))
+    inp = case.inputs
+    samples = dict(q=_view_bhsd(inp["q"]), k=_view_bhsd(inp["k"]), v=_view_bhsd(inp["v"]), o=_view_bhsd(inp["o"]), do=_view_bhsd(inp["dO"]), stats=inp["stats"])
+    grads = {n: torch.empty_like(case.outs_t[n]) for n in ("dQ", "dK", "dV")}
+    samples.update(dq=_view_bhsd(grads["dQ"]), dk=_view_bhsd(grads["dK"]), dv=_view_bhsd(grads["dV"]))
+    api = SdpaBwdDslSm107Fp8(**{"sample_" + n: t for n, t in samples.items()}, is_causal=True, scale_softmax=case.scale, amax_requested=_AMAX)
+    api.check_support()
+    api.compile()
+    scalars = {n: case.pack[case.ts[n]] for n in _SCALARS}
+    amax = {n: torch.full_like(case.amax_t[k], float("nan")) for k, n in (("dQ", "amax_dQ"), ("dK", "amax_dK"), ("dV", "amax_dV"), ("dP", "amax_dP"))}
+    ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    args = {n + "_tensor": t for n, t in samples.items()}
+    api.execute(**args, workspace=ws, **scalars, **amax)
+    torch.cuda.synchronize()
+    for n in ("dQ", "dK", "dV"):
+        assert torch.equal(grads[n], case.outs[0][n]), f"standalone {n} differs from the graph's"
+    for k, n in (("dQ", "amax_dQ"), ("dK", "amax_dK"), ("dV", "amax_dV"), ("dP", "amax_dP")):
+        assert torch.equal(amax[n], case.amax[0][k]), f"standalone {n} differs from the graph's"
+    launches = []
+    api._prepared = replace(api._prepared, fn=lambda *a: launches.append(a))
+    with pytest.raises(ValueError, match="amax_dP"):
+        api.execute(**args, workspace=ws, **scalars, **{**amax, "amax_dP": None})
+    bad = dict(args)
+    bad["q_tensor"] = samples["q"].contiguous()
+    with pytest.raises(ValueError, match="runtime geometry"):
+        api.execute(**bad, workspace=ws, **scalars, **amax)
+    assert not launches
+    with pytest.raises(ValueError, match="unknown amax"):
+        SdpaBwdDslSm107Fp8(**{"sample_" + n: t for n, t in samples.items()}, is_causal=True, scale_softmax=case.scale, amax_requested=("amax_o",))
+
+
+@requires_rubin
+def test_prepared_fp8_artifact_reloads_in_fresh_process(tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm107", "fp8", "float8_e4m3fn", tmp_path)
 
 
 # --------------------------------------------------------------------------- vs the pre-port fp8 kernel (Rubin; dumps under frost_dev/results)

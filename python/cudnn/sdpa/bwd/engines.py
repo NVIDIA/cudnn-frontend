@@ -684,7 +684,9 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
-    if api_type in (_SM120, _SM100, _SM80) and getattr(api, "_prepared", None) is not None:
+    # Every adapter that records a prepared spec is launched through it (SM120, SM100, SM80 native, SM107); the
+    # torch closure below serves only an adapter without one (SM80's staged path executes through its own spec).
+    if getattr(api, "_prepared", None) is not None:
         from types import SimpleNamespace
         from .prepared import PreparedBwdLaunch
 
@@ -1125,6 +1127,10 @@ def _sm107_spec() -> EngineSpec:
     on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
     competitor (engine 17, which forces its own deterministic flag): pin the
     engine when validating or measuring this row.
+
+    A prepared launch: ``compile()`` builds one pointer-host artifact for the whole
+    chain (``bwd/prepared_sm107.py``, ``kernels/sm107/prepared_host.py``) and the graph
+    plan binds its variant pack straight into it.
     """
     return EngineSpec(
         name="sdpa_bwd_sm107",
@@ -1173,6 +1179,7 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
 
     fp8, grad = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
+    amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t, amax_dP=facts.amax_dp_t)
     api = _adapter(api_type)(
         sample_q=_desc(ports["q"], fp8, "q"),
         sample_k=_desc(ports["k"], fp8, "k"),
@@ -1193,6 +1200,8 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         tile_n=requested.tile_n if requested is not None else None,
         seq_kv_lens_present=facts.padded,
         seq_q_lens_present=facts.padded,
+        # A plan fact: which amax pointers the prepared artifact binds (None-specialized otherwise).
+        amax_requested=tuple(name for name, t in amaxes.items() if t is not None),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1215,7 +1224,6 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         scale_dV=facts.scale_dv_t,
         scale_dP=facts.scale_dp_t,
     )
-    amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t, amax_dP=facts.amax_dp_t)
     binding = ga.SdpaBinding(
         q=facts.q_t,
         k=facts.k_t,
@@ -1230,48 +1238,18 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         **{name: t for name, t in amaxes.items() if t is not None},
     )
 
-    def _view(buf, name):
-        """Reinterpret a variant-pack buffer through the port's geometry (see
-        lower_dsl_bwd._canonical_view); scalars are consumed as they come."""
-        if name not in ports:
-            return buf
-        dim, stride = ports[name]
-        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
-            return buf
-        return buf.as_strided(dim, stride)
+    # The prepared launch: the graph's normalized variant pack binds straight into the
+    # artifact by uid (PreparedBwdLaunch); the twelve scalars and the requested amax
+    # outputs are roles of the spec, so they ride the same one-crossing bind.
+    from types import SimpleNamespace
+    from .prepared import PreparedBwdLaunch
 
-    def _need(resolved, t, label):
-        buf = resolved.get(id(t))
-        if buf is None:
-            raise ValueError(f"cudnn.sdpa: {spec.name}: {label} is an input of sdpa_fp8_backward but no buffer was provided")
-        return buf
-
-    def _execute(variant_pack, workspace=None, stream=None):
-        r = ga.resolve_variant_pack(variant_pack, binding)
-        stats_buf = r[id(binding.stats)]
-        if tuple(stats_buf.shape) != stats_geom[0] or tuple(stats_buf.stride()) != stats_geom[1]:
-            stats_buf = stats_buf.as_strided(stats_geom[0], stats_geom[1])
-        api.execute(
-            q_tensor=_view(r[id(binding.q)], "q"),
-            k_tensor=_view(r[id(binding.k)], "k"),
-            v_tensor=_view(r[id(binding.v)], "v"),
-            o_tensor=_view(r[id(binding.o)], "o"),
-            do_tensor=_view(r[id(binding.do)], "dO"),
-            stats_tensor=stats_buf,
-            dq_tensor=_view(r[id(binding.dq)], "dQ"),
-            dk_tensor=_view(r[id(binding.dk)], "dK"),
-            dv_tensor=_view(r[id(binding.dv)], "dV"),
-            scale_softmax=facts.scale,
-            workspace=workspace,
-            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
-            **{name: _need(r, t, name) for name, t in scalars.items()},
-            **{name: (r.get(id(t)) if t is not None else None) for name, t in amaxes.items()},
-        )
-        return None
-
-    _execute.workspace_bytes = total_workspace_bytes
-    _execute.binding = binding
-    return _execute
+    return SimpleNamespace(
+        binding=binding,
+        workspace_bytes=total_workspace_bytes,
+        prepared=PreparedBwdLaunch(api._prepared, binding),
+        default_stream=lambda: _cuda_driver().CUstream(torch.cuda.current_stream(api.q_desc.device).cuda_stream),
+    )
 
 
 def _sm107_fp8_spec() -> EngineSpec:
@@ -1297,6 +1275,10 @@ def _sm107_fp8_spec() -> EngineSpec:
     served silently wrong by ``pad - S_q`` rows, so the row declines it
     (``bottom_right_s_q_multiple=128``; the adapter backstops).  A ragged S_kv is
     fine (the kernel's kv term is the runtime real length).
+
+    A prepared launch like the half row (``prepared_sm107.compile_plan_fp8``): the
+    scalars and the requested amax outputs are roles of the spec; an amax the graph
+    left virtual is None-specialized out of the artifact.
     """
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",

@@ -890,6 +890,247 @@ def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq
         assert n_diff == 0, f"{name}: trimmed vs untrimmed stage 3 differ in {n_diff} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
 
 
+# --------------------------------------------------------------------------- the prepared launch (Rubin): the graph binds its pack into ONE artifact
+
+
+def _prepared_case(dt=torch.bfloat16, causal=True, b=2, hq=4, hkv=2, sq=512, skv=512, seed=0):
+    """Build + PIN + execute one half-row graph and hand back everything a prepared-launch pin needs: the graph, its
+    port handles, the live tensors, the pack, the workspace and the fp64 oracle.  Inputs on a CPU generator (SM-count
+    independent).  Checks the first execute before returning."""
+    from types import SimpleNamespace
+
+    group = hq // hkv
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def draw(bb, s_, h):
+        return torch.randn(bb, s_, h, _D, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+
+    q, do, k, v = draw(b, sq, hq), draw(b, sq, hq), draw(b, skv, hkv), draw(b, skv, hkv)
+    keep = _causal_keep(sq, skv) if causal else None
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    o = _bshd_empty(b, sq, hq, _D, dt)
+    o.copy_(o64.to(dt))
+    lse = lse64.float()
+    if all_masked is not None:
+        lse = lse.masked_fill(all_masked, 0.0)
+    kw = dict(use_causal_mask=True) if causal else {}
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dt=dt, scale="default", **kw)
+    select_engine(g, _ENGINE)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    tensors.update(
+        dq=_bshd_empty(b, sq, hq, _D, dt, fill=float("nan")),
+        dk=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+        dv=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+    )
+    refs = dict(q=t["q"], k=t["k"], v=t["v"], o=t["o"], do=t["do"], stats=t["stats"], dq=dq_t, dk=dk_t, dv=dv_t)
+    pack = {refs[name]: value for name, value in tensors.items()}
+    g.execute(pack, ws)
+    torch.cuda.synchronize()
+    case = SimpleNamespace(
+        graph=g,
+        refs=refs,
+        tensors=tensors,
+        pack=pack,
+        workspace=ws,
+        keep=keep,
+        group=group,
+        dt=dt,
+        expected=(dq_r, dk_r, dv_r),
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        sq=sq,
+        skv=skv,
+        causal=causal,
+    )
+    assert g._compiled_plans[g._plan_index]._prepared is not None, "the sm107 row must lower through the prepared-launch contract"
+    _check_prepared(case)
+    return case
+
+
+def _check_prepared(case, tensors=None, expected=None):
+    tensors = case.tensors if tensors is None else tensors
+    expected = case.expected if expected is None else expected
+    for name, key, want in zip(("dQ", "dK", "dV"), ("dq", "dk", "dv"), expected):
+        _check(name, tensors[key], want, case.dt)
+
+
+@requires_rubin
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_prepared_sm107_rebind_stream_and_replay(dt, causal):
+    """The plan's prepared launch rebinds fresh buffers, follows the HANDLE's stream (not the ambient one) and captures
+    into a CUDA graph whose replay recomputes new inputs -- the contract every prepared backward shares (the sm100 pin)."""
+    case = _prepared_case(dt=dt, causal=causal)
+    tensors = {name: value.clone() for name, value in case.tensors.items()}
+    pack = {case.refs[name]: value for name, value in tensors.items()}
+    workspace = torch.empty_like(case.workspace).fill_(0xBD)
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    capture = torch.cuda.CUDAGraph()
+
+    def refresh():
+        tensors["q"].mul_(0.75)
+        tensors["do"].mul_(1.25)
+        o64, lse64, all_masked, dq, dk, dv = _reference64(tensors["q"], tensors["k"], tensors["v"], tensors["do"], case.keep, case.group)
+        tensors["o"].copy_(o64.to(dt))
+        lse = lse64.float()
+        if all_masked is not None:
+            lse = lse.masked_fill(all_masked, 0.0)
+        tensors["stats"].copy_(lse.unsqueeze(-1))
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        return dq, dk, dv
+
+    try:
+        expected = refresh()
+        stream.wait_stream(torch.cuda.current_stream())
+        other.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other):
+            case.graph.execute(pack, workspace, handle=handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        _check_prepared(case, tensors, expected)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(capture, stream=stream):
+            with torch.cuda.stream(other):
+                case.graph.execute(pack, workspace, handle=handle)
+        expected = refresh()
+        capture.replay()
+        torch.cuda.synchronize()
+        _check_prepared(case, tensors, expected)
+    finally:
+        capture.reset()
+        cudnn.destroy_handle(handle)
+
+
+@requires_rubin
+@pytest.mark.parametrize("hkv", [4, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize("sq,skv", [(512, 512), (500, 500)], ids=["aligned", "padded"])
+def test_prepared_sm107_execute_has_no_tensor_wrapping(hkv, sq, skv, monkeypatch):
+    """Execute rebuilds no tensor views, allocates nothing, compiles nothing and never synchronizes -- the padding copies,
+    the seq_kv fill and the dS zero-fill are launches of the artifact, not torch ops (the pin that proves the torch
+    path is gone; a padded shape exercises every staging kernel)."""
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+    case = _prepared_case(causal=True, hkv=hkv, sq=sq, skv=skv)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared backward rebuilt tensor operands, allocated, synchronized or compiled")
+
+    with monkeypatch.context() as patcher:
+        for name in ("view", "reshape", "as_strided", "permute", "transpose", "copy_", "zero_", "fill_", "contiguous"):
+            patcher.setattr(torch.Tensor, name, forbidden)
+        for name in ("empty", "empty_like", "zeros", "zeros_like", "full"):
+            patcher.setattr(torch, name, forbidden)
+        patcher.setattr(WorkspaceCarver, "__init__", forbidden)
+        patcher.setattr(cute, "compile", forbidden)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            case.graph.execute(case.pack, case.workspace)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    _check_prepared(case)
+
+
+@requires_rubin
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+def test_prepared_sm107_standalone_rejects_changed_layout(role):
+    """The standalone adapter binds the SAME fixed artifact: an operand whose strides differ from the plan's is refused
+    before any stage launches (a bare ValueError naming the geometry, never a wrong launch)."""
+    from dataclasses import replace
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    case = _prepared_case()
+    api = SdpaBwdDslSm107(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=_D**-0.5)
+    api.check_support()
+    api.compile()
+    launches = []
+    api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+    args = {name + "_tensor": value for name, value in case.tensors.items()}
+    args[role + "_tensor"] = case.tensors[role].contiguous()
+    assert args[role + "_tensor"].stride() != case.tensors[role].stride()
+    with pytest.raises(ValueError, match="runtime geometry"):
+        api.execute(**args, workspace=case.workspace)
+    assert not launches
+
+
+@requires_rubin
+@pytest.mark.parametrize("role", ["q", "stats", "dq"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_prepared_sm107_raw_storage_and_explicit_overrides(role, ordered, monkeypatch):
+    """Graph bindings are raw storage under the declared layout (a strided producer view binds); an explicit shape
+    override that matches passes, one that changes the operation is refused before launch."""
+    from dataclasses import replace
+
+    case = _prepared_case()
+    tensor = case.tensors[role]
+    backing = torch.empty(tensor.numel() + 2, dtype=tensor.dtype, device="cuda")
+    declared = backing.as_strided(tensor.shape, tensor.stride()).copy_(tensor)
+    case.pack[case.refs[role]] = backing[::2]
+    case.tensors[role] = declared
+    ref = case.refs[role]
+    kwargs = {}
+    pack = case.pack
+    if ordered:
+        items = list(reversed(list(pack.items())))
+        kwargs["tensor_uids"] = [t.get_uid() for t, _ in items]
+        pack = [buffer for _, buffer in items]
+    for name in ("dq", "dk", "dv"):
+        case.tensors[name].fill_(float("nan"))
+    case.graph.execute(pack, case.workspace, **kwargs)
+    torch.cuda.synchronize()
+    _check_prepared(case)
+    kwargs.update(override_uids=[ref.get_uid()], override_shapes=[list(ref.get_dim())], override_strides=[list(ref.get_stride())])
+    case.graph.execute(pack, case.workspace, **kwargs)
+    torch.cuda.synchronize()
+    _check_prepared(case)
+    plan = case.graph._compiled_plans[case.graph._plan_index]
+    launches = []
+    monkeypatch.setattr(plan._prepared, "spec", replace(plan._prepared.spec, fn=lambda *args: launches.append(args)))
+    kwargs["override_shapes"][0][2] //= 2
+    with pytest.raises(ValueError, match="runtime geometry"):
+        case.graph.execute(pack, case.workspace, **kwargs)
+    assert not launches
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(dtype, tmp_path):
+    """The artifact exports to the compiled-plan cache and a second process runs the plan from it without a JIT."""
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm107", "dense", dtype, tmp_path)
+
+
+def test_sm107_adapter_has_no_torch_execute_path():
+    """The adapter's execute is ``facts -> bind -> the artifact``: no torch view / copy / fill, no workspace carver, no
+    JIT at execute.  A static pin, so the torch path cannot creep back one helper at a time."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    code = _code_only(Path(sm107.__file__).read_text())
+    for needle in (
+        "WorkspaceCarver",
+        "_torch_stream_context",
+        "cute.compile(",
+        "from_dlpack",
+        ".copy_(",
+        ".zero_(",
+        ".fill_(",
+        ".view(",
+        ".permute(",
+        "matmul_bh",
+    ):
+        assert needle not in code, f"api_dsl_sm107: {needle!r} is a torch-path spelling"
+    assert "execute_standalone(" in code and "self._prepared = " in code
+
+
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
 
 

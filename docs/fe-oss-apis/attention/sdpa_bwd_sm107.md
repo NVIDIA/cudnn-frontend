@@ -77,7 +77,14 @@ fp32 tensors, `dQ/dK/dV` declared E4M3 (or bf16 / fp16), and any of
 
 One backward call is a fixed sequence of launches on the caller's stream, every
 scratch buffer carved from the caller's workspace (`graph.get_workspace_size()`
-is a build-time function of the shape):
+is a build-time function of the shape).  Both rows are **prepared launches**
+(`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`): the plan compiles
+ONE pointer-host artifact that runs the whole chain from device pointers, and
+every stage below -- the padding copies, the `seq_kv` fill and the dS zero-fill
+included, plus the fp8 upcast / fold + quantize passes -- is a kernel of that
+artifact.  No torch op runs on the execute path; the graph binds its variant pack
+straight into the artifact, follows the handle's stream and captures into a CUDA
+graph.
 
 ```text
 dot     delta = rowsum(dO ∘ O)                        (fp8: × descale_o · descale_dO)
@@ -93,8 +100,8 @@ fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
 ```
 
 The workspace is head-chunked (and batch-chunked on the half row) to a 4 GiB
-budget; the chain loops over chunks with runtime `head_base` / `batch_base`, so
-one compiled artifact serves every launch.
+budget; the artifact's host loops over the chunks with `head_base` / `batch_base`,
+so one compiled artifact serves every launch of a plan.
 
 ### Main kernel
 

@@ -15,7 +15,10 @@ covers every supported head dim (``sm80/bprop_f16.py``, ``sm120/bprop_f16.py``);
 ``sm120/bprop_chain_f16.py`` is the SM120-only part of the launch chain around
 that arch's fused main kernel (the deterministic dQ GEMM and the converts), and
 the ``_common.py`` / ``_bprop_mxfp8_*.py`` modules inside a package are that
-arch's private helpers.
+arch's private helpers.  A ``prepared_host.py`` inside a package is that arch's
+pointer host: the ONE ``@cute.jit`` entry that launches its whole backward chain
+from device pointers and the caller's workspace (the prepared-launch contract of
+``bwd/prepared.py``; ``sm100/``, ``sm107/``, ``sm120/``, ``sm80/``).
 
 Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:

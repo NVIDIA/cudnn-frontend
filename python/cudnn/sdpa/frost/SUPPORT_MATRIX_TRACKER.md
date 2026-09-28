@@ -1238,6 +1238,19 @@ prepares its existing dense scalar-output and D256 gate paths as described above
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
 
+### Prepared SM107 d256 backward launch contract
+
+The two Rubin d=256 backward rows (`sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8`) use one
+prepared pointer launch per plan (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`):
+dense BSHD-physical operands and contiguous Stats at the plan's fixed geometry (no
+runtime shape overrides; a mismatching override or a changed layout is refused
+before any stage launches), padding copies / fills / the fp8 upcast and fold passes
+as kernels of the artifact, the caller-owned workspace carved in a fixed order that
+reproduces `get_workspace_size()` exactly.  The fp8 row binds its twelve scalar
+descales / scales as 1-element fp32 device operands and ONLY the amax outputs the
+graph requested (an unrequested amax is compiled out of the artifact).  Standalone
+prepared calls require the declared caller workspace, like graph execution.
+
 ### Prepared block-scaled output launch contract
 
 Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
