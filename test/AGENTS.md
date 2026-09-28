@@ -284,6 +284,14 @@ after warmup so a return to tensor launch plumbing fails independently of
 numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
 RED on the old tensor launcher for both dtypes and both template families.
 
+Trailing-dimension and contiguity checks do not prove that a broadcast input
+has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
+it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
+case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+RED-then-green detector. A compiler-memo test must also rebuild the wrapper
+on its second call: clear the wrapper cache while retaining the compiler memo,
+then forbid JIT. Reusing the same adapter cannot test compiler reuse.
+
 SM80's standalone packed wrapper preserves cumulative tensors as row offsets
 into the supplied storage. Do not substitute graph API cumulative-length
 normalization: that changes which Q/K/V rows the standalone call addresses.
