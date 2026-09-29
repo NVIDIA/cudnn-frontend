@@ -78,6 +78,40 @@ class Graph : public ICudnn, public INode {
     mutable std::unordered_map<uid_t, pass_by_values_t> cached_pass_by_value;
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
 
+    // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
+    // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
+    // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
+    // reference to this storage (a CUDA user object), so it may outlive this Graph.
+    using host_copy_sources_t                                    = std::unordered_map<uid_t, std::vector<float>>;
+    std::shared_ptr<host_copy_sources_t const> host_copy_sources = std::make_shared<host_copy_sources_t const>();
+    mutable cudnn_frontend::detail::CudaGraphRetainedResource host_copy_sources_retention;
+
+    // Rebuild host_copy_sources from cached_workspace_modifications.
+    void
+    refresh_host_copy_sources_() {
+        auto sources = std::make_shared<host_copy_sources_t>();
+        for (auto const &[uid, data] : cached_workspace_modifications) {
+            if (std::get<0>(data) == 0) {
+                sources->emplace(uid, std::get<2>(data));
+            }
+        }
+        host_copy_sources = std::move(sources);
+        // CUDA graphs recorded against the previous storage keep their own references to it.
+        host_copy_sources_retention = cudnn_frontend::detail::CudaGraphRetainedResource{};
+    }
+
+    // The host source of the host-to-device copy for `uid`, or nullptr if there is none.
+    float const *
+    host_copy_source_(uid_t uid) const {
+        auto it = host_copy_sources->find(uid);
+        return it == host_copy_sources->end() ? nullptr : it->second.data();
+    }
+
+    std::shared_ptr<void>
+    host_copy_sources_payload_() const {
+        return std::const_pointer_cast<host_copy_sources_t>(host_copy_sources);
+    }
+
     // char: 'x'=hex, 'd'=decimal, 'b'=base64
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
@@ -325,12 +359,22 @@ class Graph : public ICudnn, public INode {
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
         char *workspace = static_cast<char *>(fe_workspace);
 
-        for (auto [uid, data] : workspace_modifications) {
-            (void)uid;
+        // If `stream` is being captured, the recorded host-to-device copies read their host sources on every
+        // replay; give the CUDA graph being recorded a reference to them first.
+        if (!host_copy_sources->empty()) {
+            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_capturing_stream(
+                stream, [this]() { return host_copy_sources_payload_(); }));
+        }
+
+        for (auto const &[uid, data] : workspace_modifications) {
             if (std::get<0>(data) == 0) {
-                auto &vec_data = std::get<2>(data);
+                auto const &vec_data = std::get<2>(data);
+                float const *source  = host_copy_source_(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
+                                               error_code_t::INVALID_VALUE,
+                                               "No host source for workspace uid " + std::to_string(uid));
                 _CUDNN_CHECK_CUDA_ERROR(detail::cuda_mem_cpy_async(workspace + std::get<1>(data),
-                                                                   vec_data.data(),
+                                                                   source,
                                                                    vec_data.size() * sizeof(float),
                                                                    cudaMemcpyHostToDevice,
                                                                    stream));
@@ -628,6 +672,11 @@ class Graph : public ICudnn, public INode {
         ////////////////////////////
         //// WORKSPACE HANDLING ////
         ////////////////////////////
+        // The memcpy nodes below read their host sources on every launch of the CUDA graph.
+        if (!host_copy_sources->empty()) {
+            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
+                cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
+        }
         // Using cached workspace modifications to avoid repeated tree traversal.
         for (auto const &[uid, data] : cached_workspace_modifications) {
             const auto &[operation_type, offset, vec_data] = data;
@@ -635,10 +684,14 @@ class Graph : public ICudnn, public INode {
 
             // 0 means memcpy
             if (operation_type == 0) {
+                float const *source = host_copy_source_(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
+                                               error_code_t::INVALID_VALUE,
+                                               "No host source for workspace uid " + std::to_string(uid));
                 _CUDNN_CHECK_CUDA_ERROR(
                     detail::cuda_graph_add_memcpy_node_set_params_1D(current_node,
                                                                      static_cast<char *>(workspace) + offset,
-                                                                     vec_data.data(),
+                                                                     source,
                                                                      vec_data.size() * sizeof(float),
                                                                      cudaMemcpyHostToDevice));
             }
@@ -780,6 +833,11 @@ class Graph : public ICudnn, public INode {
         /////////////////////////////////
         //// WORKSPACE HANDLING ////
         /////////////////////////////////
+        // The memcpy nodes below read their host sources on every launch of the CUDA graph.
+        if (!host_copy_sources->empty()) {
+            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
+                cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
+        }
         // Using cached workspace modifications to avoid repeated tree traversal.
         for (auto const &[uid, data] : cached_workspace_modifications) {
             const auto &[operation_type, offset, vec_data] = data;
@@ -789,12 +847,16 @@ class Graph : public ICudnn, public INode {
 
             // 0 means memcpy
             if (operation_type == 0) {
+                float const *source = host_copy_source_(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
+                                               error_code_t::INVALID_VALUE,
+                                               "No host source for workspace uid " + std::to_string(uid));
                 _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_memcpy_node_1D(&node,
                                                                               cudnn_cuda_graph,
                                                                               &last_node,
                                                                               last_node != nullptr,
                                                                               static_cast<char *>(workspace) + offset,
-                                                                              vec_data.data(),
+                                                                              source,
                                                                               vec_data.size() * sizeof(float),
                                                                               cudaMemcpyHostToDevice));
             }
@@ -970,6 +1032,7 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(
                 collect_tensors_in_workspace_subtree(cached_workspace_modifications, temp_offset));
         }
+        refresh_host_copy_sources_();
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
 
@@ -1808,6 +1871,7 @@ class Graph : public ICudnn, public INode {
         // Initialize the execution caches from deserialized data
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
+        refresh_host_copy_sources_();
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
         // eager prep below would early-return with the old slot layout.
