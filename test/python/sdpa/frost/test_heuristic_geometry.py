@@ -78,7 +78,7 @@ def test_runtime_cga_policy_records_remain_rebuildable(policy):
 
 
 @pytest.mark.parametrize("cga_policy", [1, 2])
-@pytest.mark.parametrize("split_policy", [1, 2, 3])
+@pytest.mark.parametrize("split_policy", [1, 2, 3, 4])
 def test_runtime_split_policy_record_remains_explicit_and_rebuildable(cga_policy, split_policy):
     facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
     knobs = heur.SdpaFwdKnobs(cga_policy=cga_policy, split_kv_policy=split_policy)
@@ -98,7 +98,7 @@ def test_adaptive_split_candidates_preserve_domain_and_concrete_fallback(heads, 
     assert len(split) == int(heads in (4, 8, 16))
     for knobs in split:
         assert knobs.split_kv is None and knobs.cga is None
-        assert knobs.split_kv_policy == 3 and knobs.cga_policy == 2
+        assert knobs.split_kv_policy == 4 and knobs.cga_policy == 2
         assert mismatch(SPEC.capabilities, facts, knobs) is None
         assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     assert any(k.cga_policy == 2 and k.split_kv_policy is None for k in candidates)
@@ -109,7 +109,7 @@ def test_adaptive_split_candidates_preserve_domain_and_concrete_fallback(heads, 
 
 
 @pytest.mark.parametrize(
-    "bad", [{"split_kv": 1}, {"split_kv": 2}, {"cga_policy": None}, {"cga": 1}, {"pack_gqa": True}, {"split_kv_policy": 0}, {"split_kv_policy": 4}]
+    "bad", [{"split_kv": 1}, {"split_kv": 2}, {"cga_policy": None}, {"cga": 1}, {"pack_gqa": True}, {"split_kv_policy": 0}, {"split_kv_policy": 5}]
 )
 def test_runtime_split_policy_preserves_fixed_requests(bad):
     facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
@@ -123,20 +123,21 @@ def test_runtime_split_policy_declines_unmeasured_graph_domains(bad):
     assert mismatch(SPEC.capabilities, replace(facts, **bad), heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=1)) is not None
 
 
-@pytest.mark.parametrize("policy", [1, 2, 3])
+@pytest.mark.parametrize("policy", [1, 2, 3, 4])
 @pytest.mark.parametrize("heads", [1, 2, 4, 8, 16, 32])
 def test_balanced_split_head_domain_preserves_older_records(policy, heads):
     facts = _facts(h_q=heads, h_kv=heads, d_qk=192, d_v=128, thd=True, shape_overrides=True)
     reason = mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=policy))
-    assert (reason is None) == (heads in (4, 8, 16) if policy == 3 else heads == 16)
+    assert (reason is None) == (heads in (4, 8, 16) if policy in (3, 4) else heads == 16)
 
 
 @pytest.mark.parametrize(
     "bad", [{"h_kv": 4}, {"has_paged_kv": True}, {"causal": True}, {"device_cc": (10, 3)}, {"device_cc": (10, 7)}, {"shape_overrides": False}]
 )
-def test_balanced_split_keeps_the_graph_contract(bad):
+@pytest.mark.parametrize("policy", [3, 4])
+def test_balanced_split_keeps_the_graph_contract(bad, policy):
     facts = _facts(h_q=8, h_kv=8, d_qk=192, d_v=128, thd=True, shape_overrides=True)
-    assert mismatch(SPEC.capabilities, replace(facts, **bad), heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=3)) is not None
+    assert mismatch(SPEC.capabilities, replace(facts, **bad), heur.SdpaFwdKnobs(cga_policy=2, split_kv_policy=policy)) is not None
 
 
 @pytest.mark.parametrize("overrides", [{}, {"cta_mma": 1}, {"split_kv": 2}, {"thd_varlen": False}, {"paged_kv": True, "page_size": 128}, {"dtype_qkv": 0}])

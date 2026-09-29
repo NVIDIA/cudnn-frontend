@@ -210,6 +210,14 @@ alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
 
+Packed storage capacity and per-sequence tile work are different bounds: one
+128-row sequence and two 64-row sequences have the same packed total, but use
+one and two 128-row tiles. Adaptive split families must bound both from host
+metadata without reading device prefixes. Check equal-total batch variants,
+workspace equality across members, and replay after moving live rows between
+previously empty sequences. `test_batched_split_policy_bounds_tiles_and_preserves_frames`
+and `test_thd_balanced_split_record_rebind_and_capture` are the detectors.
+
 ## Persistent THD launch admission
 
 A kernel using `scheduler_warp_loop_persistent` must declare `THD_PERSISTENT`

@@ -781,8 +781,23 @@ only to decline is why `closed_under` existed.
   covers their maximum rather than their sum. The graph builds all artifacts
   once, and each invocation independently binds its selected member.
   Capture retains that choice; device length changes during replay do not
-  reselect. This experimental policy is not proposed by normal heuristics.
+  reselect. Normal heuristics may propose a supported split policy alongside
+  the unsplit alternative; graph placement still determines whether a FROST plan leads.
   Policies 1 and 2 retain their original H16 selection and workspace contracts.
+- `SPLIT_KV_POLICY=4` retains those two members and adds `32/H_q` splits
+  with 512 reserved packed rows. It admits up to four sequences with total
+  observed KV capacity at least `8192 * batch`. It chooses the smallest
+  reserved Q capacity covering both packed Q storage and a host-visible
+  upper bound of one, two or four 128-row tiles across sequences. Thus two
+  64-row sequences select the second member, while four 32-row sequences
+  select the third. The first member additionally needs observed KV capacity
+  of at least `131072 / H_q`; below it the second member avoids excessive
+  partitioning. Larger capacities or tile bounds retain the recorded
+  unsplit CGA choice. All three split members reserve the same 16384 partial
+  head-rows, so the extra member does not enlarge caller workspace. This
+  experimental policy is proposed by normal heuristics. Policies 1–3
+  retain their previous selection rules; capture still fixes one launch,
+  with no execution-time compilation or device-to-host length read.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's

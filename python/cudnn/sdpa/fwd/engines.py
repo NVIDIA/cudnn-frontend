@@ -697,9 +697,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         if knobs.split_kv_policy is not None:
-            if knobs.split_kv_policy == 3:
+            if knobs.split_kv_policy in (3, 4):
                 if not runtime_cga_choices(capabilities, facts) or facts.h_q not in (4, 8, 16) or facts.h_kv != facts.h_q:
-                    return "runtime split policy3 requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv in {4, 8, 16}"
+                    return "runtime split policy3 or policy4 requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv in {4, 8, 16}"
             elif not runtime_cga_choices(capabilities, facts) or facts.h_q != 16 or facts.h_kv != 16:
                 return "runtime split policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv=16"
             if knobs.split_kv is not None:
@@ -1082,7 +1082,7 @@ def _sm100_spec() -> EngineSpec:
             sm_hi=106,
             phase="prefill",
             cga_policies=frozenset({1, 2}),
-            split_kv_policies=frozenset({1, 2, 3}),
+            split_kv_policies=frozenset({1, 2, 3, 4}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1860,11 +1860,16 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
         selected = variants[0]
         prepared = [v.prepared for v in variants]
         workspace = max(v.workspace_bytes for v in variants)
-        if knobs.split_kv_policy in (1, 2, 3):
+        if knobs.split_kv_policy in (1, 2, 3, 4):
             from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
             from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-            members = ((128, 128 // facts.h_q), (256, 64 // facts.h_q)) if knobs.split_kv_policy == 3 else ((128 if knobs.split_kv_policy == 1 else 256, 8),)
+            if knobs.split_kv_policy in (3, 4):
+                members = ((128, 128 // facts.h_q), (256, 64 // facts.h_q))
+                if knobs.split_kv_policy == 4:
+                    members += ((512, 32 // facts.h_q),)
+            else:
+                members = ((128 if knobs.split_kv_policy == 1 else 256, 8),)
             for capacity, splits in members:
                 km = _load_sm100_kernel_module(
                     (192, 128),

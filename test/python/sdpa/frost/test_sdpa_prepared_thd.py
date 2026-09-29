@@ -340,8 +340,9 @@ def test_thd_runtime_split_record_rebind_and_capture(dtype, stats, split_policy,
 @requires_dsl
 @pytest.mark.parametrize("dtype,stats", [(torch.bfloat16, "HN"), (torch.float16, "NH"), (torch.bfloat16, None)])
 @pytest.mark.parametrize("heads", [4, 8, 16])
-def test_thd_balanced_split_record_rebind_and_capture(dtype, stats, heads, monkeypatch):
-    _runtime_policy_record_rebind_and_capture(dtype, stats, 2, heads, monkeypatch, split_policy=3)
+@pytest.mark.parametrize("split_policy", [3, 4])
+def test_thd_balanced_split_record_rebind_and_capture(dtype, stats, heads, split_policy, monkeypatch):
+    _runtime_policy_record_rebind_and_capture(dtype, stats, 2, heads, monkeypatch, split_policy=split_policy)
 
 
 def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypatch, split_policy=None):
@@ -369,7 +370,8 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
     record = g.get_engine_and_knobs_at_index(g._plan_index)
     assert record[1][cudnn.knob_type.CGA_POLICY] == 2 and cudnn.knob_type.TILE_CGA_M not in record[1]
     initial_split_policy = record[1].get(cudnn.knob_type.SPLIT_KV_POLICY)
-    initial_modules = [(1, False), (2, True)] + ([(1, False)] * (2 if initial_split_policy == 3 else 1) if initial_split_policy else [])
+    split_members = {None: 0, 1: 1, 2: 1, 3: 2, 4: 3}
+    initial_modules = [(1, False), (2, True)] + [(1, False)] * split_members[initial_split_policy]
     assert loaded[-len(initial_modules) :] == initial_modules
     # Exercise the requested persisted record independently of which valid
     # policy the heuristic currently recommends first.
@@ -380,17 +382,21 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
         record[1].pop(cudnn.knob_type.SPLIT_KV, None)
         record[1][cudnn.knob_type.SPLIT_KV_POLICY] = split_policy
     rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h, kcap=kcap)
-    expected_modules = [(1, False), (2, policy == 2)] + ([(1, False)] * (2 if split_policy == 3 else 1) if split_policy else [])
+    expected_modules = [(1, False), (2, policy == 2)] + [(1, False)] * split_members[split_policy]
     assert loaded[-len(expected_modules) :] == expected_modules
     assert rebuilt.get_engine_and_knobs_at_index(rebuilt._plan_index) == record
     family = _plan(rebuilt)._prepared
     assert isinstance(family, prep_mod.PreparedThdChoices)
-    assert len(family.variants) == (4 if split_policy == 3 else 3 if split_policy else 2)
-    if split_policy == 3:
-        short, long = (v.spec for v in family.variants[2:])
+    assert len(family.variants) == 2 + split_members[split_policy]
+    if split_policy in (3, 4):
+        short, long = (v.spec for v in family.variants[2:4])
         assert (short.split_workspace.capacity, short.split_workspace.splits) == (128, 128 // h)
         assert (long.split_workspace.capacity, long.split_workspace.splits) == (256, 64 // h)
         assert short.scratch_bytes == long.scratch_bytes
+        if split_policy == 4:
+            wide = family.variants[4].spec
+            assert (wide.split_workspace.capacity, wide.split_workspace.splits) == (512, 32 // h)
+            assert wide.scratch_bytes == short.scratch_bytes
     elif split_policy:
         assert family.variants[2].spec.split_workspace.capacity == (128 if split_policy == 1 else 256)
     assert _plan(rebuilt).get_workspace_size() >= max(v.spec.scratch_bytes for v in family.variants)
@@ -428,7 +434,21 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
 
     try:
         cases = [([127], 65), ([max(2048, 32768 // h)], 65), ([513, 127], 65), ([65, 0, 192], 65)]
-        if split_policy == 3:
+        if split_policy == 4:
+            cases = [
+                ([64], 32768),
+                ([64], 8192),
+                ([129], 8192),
+                ([257], 8192),
+                ([32] * 4, 8192),
+                ([64, 0, 64, 0], 8192),
+                ([128] * 4, 8192),
+                ([256, 256], 8192),
+                ([513], 8192),
+                ([128], 8191),
+                *cases,
+            ]
+        elif split_policy == 3:
             cases = [([64], 32768), ([128], 32768), ([129], 32768), ([256], 32768), *cases, ([257], 32768)]
         elif split_policy:
             capacity = 128 if split_policy == 1 else 256
@@ -491,6 +511,11 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
             held.append((buf, lengths, ws, graph, pack, uids, shapes, strides))
             for old, old_lengths, old_ws, capture, *_ in held:
                 old["q"].mul_(-0.5)
+                if split_policy == 4 and 0 in old_lengths:
+                    # Reuse captured storage and max-Q bounds while moving live
+                    # rows between sequences, including previously empty ones.
+                    old_lengths[:] = old_lengths[::-1]
+                    old["cq"].copy_(torch.tensor([0, *accumulate(old_lengths)], device=DEV, dtype=torch.int32))
                 old["o"].fill_(float("nan"))
                 if stats is not None:
                     old["s"].fill_(float("nan"))
@@ -498,7 +523,7 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
                 torch.cuda.synchronize()
                 verify(old, old_lengths)
                 assert torch.all(old_ws[workspace_bytes:] == 0xA5)
-        assert seen == ({0, 1, 2, 3} if split_policy == 3 else {0, 1, 2} if split_policy else {0, 1})
+        assert seen == set(range(2 + split_members[split_policy]))
         # Both modules were warmed serially above. Exercise two different
         # members of the same plan concurrently with independent workspaces.
         streams = [torch.cuda.Stream() for _ in range(2)]

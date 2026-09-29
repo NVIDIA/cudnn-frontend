@@ -1307,12 +1307,13 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # itself; a missing width alone must not silently opt into new behavior.
         adaptive = replace(base, cga=None, cga_policy=2)
         unique.insert(0, adaptive)
-        if 3 in caps.split_kv_policies and facts.h_q == facts.h_kv and facts.h_q in (4, 8, 16):
+        split_policy = 4 if 4 in caps.split_kv_policies else 3
+        if split_policy in caps.split_kv_policies and facts.h_q == facts.h_kv and facts.h_q in (4, 8, 16):
             # Override declarations are cache envelopes, not the next request's
             # live geometry. The recorded policy chooses bounded split members
             # from the current bindings and keeps the same unsplit members for
             # larger queries / batches. Retain the smaller-workspace alternative.
-            unique.insert(0, replace(adaptive, split_kv=None, split_kv_policy=3))
+            unique.insert(0, replace(adaptive, split_kv=None, split_kv_policy=split_policy))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
