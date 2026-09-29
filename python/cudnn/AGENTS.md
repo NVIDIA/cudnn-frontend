@@ -308,6 +308,8 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
+  (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
