@@ -2928,7 +2928,9 @@ def _tmastg_warp_group(
                 # Streamed store: the GMEM slice is built ONCE per tile, BEFORE the chunk loop (a Python ternary:
                 # only the chosen arm is evaluated at trace time).  THD: this batch's pre-built descriptor (base at the
                 # sequence's packed row, seq extent = S_q_b → box past S_q_b OOB-clipped); q_row_coord sequence-local;
-                # batch coord → 0.
+                # batch coord → 0.  Building the slice is pointer arithmetic only (tma_slice_runtime_desc constructs a
+                # record and touches no memory), so it is safe on a DEAD unit too -- the acquire + the stores are what
+                # the dead-unit guard inside the chunk loop skips.
                 q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
                 o_slice = (
                     tma_slice_runtime_desc(
@@ -2949,8 +2951,17 @@ def _tmastg_warp_group(
             for chunk in cutlass.range_constexpr(N_O_CHUNKS):
                 bars.mb_tma_o_full[chunk].wait(o_full_phase)
                 if cutlass.const_expr(O_STORE_STREAM):
-                    for j in cutlass.range_constexpr(_O_SUBTILES_PER_CHUNK):
-                        tma_store_subtile(sO[0], o_slice, chunk * _O_SUBTILES_PER_CHUNK + j, acquire=(chunk == 0 and j == 0))
+                    if cutlass.const_expr(CFG.THD_VARLEN):
+                        # THD DEAD unit (batch_idx == n_batch, the over-launched persistent grid's sentinel): no O rows
+                        # exist and descriptor slot n_batch is never built, so skip only the store (its acquire included)
+                        # -- the chunk waits and the commit / drain / mb_tma_o_empty protocol below still run, exactly
+                        # as the whole-tile form's guard around its whole-tile store.
+                        if batch_idx < n_batch:
+                            for j in cutlass.range_constexpr(_O_SUBTILES_PER_CHUNK):
+                                tma_store_subtile(sO[0], o_slice, chunk * _O_SUBTILES_PER_CHUNK + j, acquire=(chunk == 0 and j == 0))
+                    else:
+                        for j in cutlass.range_constexpr(_O_SUBTILES_PER_CHUNK):
+                            tma_store_subtile(sO[0], o_slice, chunk * _O_SUBTILES_PER_CHUNK + j, acquire=(chunk == 0 and j == 0))
             if cutlass.const_expr(not O_STORE_STREAM):
                 # Whole-tile form (VERBATIM, incl. statement order): after every chunk is ready, ONE whole-tile store.
                 q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
@@ -2958,9 +2969,13 @@ def _tmastg_warp_group(
                     # THD: store through this batch's pre-built descriptor (base at
                     # the sequence's packed row, seq extent = S_q_b → box past S_q_b
                     # OOB-clipped).  q_row_coord sequence-local; batch coord → 0.
-                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-                    o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_coord, cutlass.Int32(0))
-                    tma_store_tile(sO[0], o_slice)
+                    # DEAD unit (batch_idx == n_batch, the over-launched persistent grid's
+                    # sentinel): no O rows exist and descriptor slot n_batch is never
+                    # built, so skip only the store -- the barrier protocol still runs.
+                    if batch_idx < n_batch:
+                        o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                        o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_coord, cutlass.Int32(0))
+                        tma_store_tile(sO[0], o_slice)
                 else:
                     tma_store_tile(
                         sO[0],
