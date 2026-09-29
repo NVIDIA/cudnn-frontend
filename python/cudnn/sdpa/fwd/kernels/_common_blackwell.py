@@ -362,11 +362,31 @@ def store_fp32_partial_tile(
         scaled = vals * inv_sum
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
-            for j in cutlass.range_constexpr(chunk):
-                if cutlass.const_expr(blk * chunk + j < d_v):
-                    row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
-                        arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
-                    )
+            if cutlass.const_expr(d_v % 4 == 0 and chunk % 4 == 0 and o_partial_f32.stride[3] == 1):
+                row_ptr = op.data_ptr((o_batch, q_row_global, row_head_idx, 0))
+                if (row_ptr.toint(cutlass.Int64) & cutlass.Int64(15)) == 0:
+                    for group in cutlass.range_constexpr(chunk // 4):
+                        if cutlass.const_expr(blk * chunk + group * 4 < d_v):
+                            values = cutlass.Vector.from_elements(
+                                tuple(
+                                    cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[group * 4 + j].ir_value()))
+                                    for j in range(4)
+                                ),
+                                cutlass.Float32,
+                            )
+                            (row_ptr + cutlass.Int32(blk * chunk + group * 4)).store(values, alignment=16)
+                else:
+                    for j in cutlass.range_constexpr(chunk):
+                        if cutlass.const_expr(blk * chunk + j < d_v):
+                            row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                                arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                            )
+            else:
+                for j in cutlass.range_constexpr(chunk):
+                    if cutlass.const_expr(blk * chunk + j < d_v):
+                        row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                            arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                        )
 
 
 class SplitHelpers(NamedTuple):
