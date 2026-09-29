@@ -151,7 +151,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (256, 256)): (False, 29, 11),
     ("fp8", (256, 256)): (False, 29, 11),
     ("mxfp8", (256, 256)): (False, 29, 11),
-    ("f16", (512, 512)): (True, 22, 14),
+    ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
     ("fp8", (512, 512)): (True, 22, 14),
     ("mxfp8", (512, 512)): (False, 22, 14),
 }
@@ -228,6 +228,59 @@ def test_sm107_every_mask_site_calls_apply_mask_chunk(flavor, kind, load_kw):
     assert n_sites > 0, f"{mod.__name__}: no masked call site found"
     for spelling in (r"\bapply_mask_chunk_form\b", r"\bapply_mask_chunk_bits\b", r"\bMASK_FORM", r"(?<!\w)form="):
         assert not re.search(spelling, code), f"{mod.__name__}: {spelling!r} -- the per-kernel mask-form selector was collapsed into apply_mask_chunk"
+
+
+# ------------------------------------------------------------------ the O store / epilogue levers of the d512 kernels: module constants
+# The sm107 d512 kernels (the cga4x1 role-split, one TMA-STG warp per CTA) carry two measured perf levers, each spelled ONCE as a
+# module constant next to CFG and folded at every site with ``cutlass.const_expr`` -- the SPIN_RING_WAITS discipline:
+#   O_STORE_STREAM  -- the sg1 TMA-STG warp issues chunk c's TMA-O subtile (``tile_dsl.tma.tma_store_subtile``) right behind its
+#                      ``mb_tma_o_full[c]`` wait instead of queueing the whole tile after the last chunk.  The store's cost is
+#                      the SM's in-order TMA ENGINE occupancy ahead of the next work item's V loads, not HBM bytes: +16.3 / +16.5 /
+#                      +5.9 / +0.5 % of time at S_KV = 512 / 1024 / 2048 / 8192 on the d512 mxfp8 kernel (212-SM Rubin, B=1 H_Q=64
+#                      H_KV=1 S_Q=16K bf16-O dense, A/B/A x3, controls <= 0.03 %), O / LSE / Amax_O bitwise identical.
+#   O_EPI_PIPELINE  -- the sg1 epilogue issues the tcgen05.ld batch of chunk c+1 before chunk c's ALU / STS / fence / arrive (the
+#                      fence + arrive pin a tcgen05.ld; the classic order exposes one TMEM latency per chunk) and skips the
+#                      per-element dead-row select behind a warp-uniform vote; +1.7 pt @1024, -1.1 pt @8192 on top of the stream.
+# Both arms of both levers trace, and both constants False is cubin-md5-identical to develop (f16 / fp8 / mxfp8, sm_107a).  The
+# per-block body is ONE shared helper (``_common_blackwell.o_epilogue_convert_store``) and the subtile store ONE library op -- the
+# kernels carry no in-file copy of either (twice hand-rolled belongs in the library).  The SASS twin of this check is
+# test_sm107_d512_o_store_path_sass_pins.
+_O_STORE_LEVERS = ("O_STORE_STREAM", "O_EPI_PIPELINE")
+_D512 = (512, 512)
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
+    """Every sm107 d512 kernel holds both levers as bool module constants (the module's own values, not a source grep), defines
+    each exactly once, folds each at its sites with ``const_expr`` (no literal, both arms present), streams the O store through
+    ``tile_dsl.tma.tma_store_subtile`` and converts through ``_common_blackwell.o_epilogue_convert_store`` -- with no in-file
+    copy of either (the experiment's ``_tma_store_subtile`` / ``_o_epi_convert_store``) and no bare bulk-tensor store op."""
+    import re
+
+    mod = _load(_D512, rubin=True, **load_kw)
+    for name in _O_STORE_LEVERS:
+        val = getattr(mod, name)
+        assert isinstance(val, bool) and val is True, f"{mod.__name__}: {name}={val!r}, the shipped value is True"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    for name in _O_STORE_LEVERS:
+        assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one {name} definition"
+        assert f"const_expr({name})" in code, f"{mod.__name__}: {name} is not folded at a site"
+    assert "const_expr(not O_STORE_STREAM)" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
+    assert re.search(r"\btma_store_tile\(", code) and re.search(r"\btma_store_subtile\(", code), f"{mod.__name__}: both store forms must trace"
+    assert "    tma_store_subtile," in code, f"{mod.__name__}: tma_store_subtile must come from cudnn.frost.tile_dsl.tma"
+    assert (
+        "o_epilogue_convert_store(" in code and "o_epilogue_convert_store" in code.split("def _compute_warp_group")[0]
+    ), f"{mod.__name__}: the per-block convert is the shared _common_blackwell helper"
+    for spelling in (
+        "def _tma_store_subtile",
+        "def _o_epi_convert_store",
+        "nvvm.cp_async_bulk_tensor_global_shared_cta(",
+        "_O_STORE_STREAM",
+        "_O_EPI_LD_GROUP",
+        "abs_max_tree",
+    ):
+        assert spelling not in code, f"{mod.__name__}: {spelling!r} -- an in-file copy / experiment knob is back"
 
 
 @pytest.mark.parametrize("flavor", _FLAVORS)
@@ -2813,6 +2866,129 @@ def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o,
     ), f"the {quant} d={d} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
 
 
+# ============================================================================ Rubin SASS pins: the d512 O store path
+# The two d512 levers above are invisible to every numerics test (O / LSE / Amax_O bit-identical either way); their SASS is the
+# tripwire.  O_STORE_STREAM: each `UTMASTG` sits right behind ITS chunk's `PHASECHK` wait, so the longest run of UTMASTG with no
+# PHASECHK between them is _O_SUBTILES_PER_CHUNK (1 at the 128 B O swizzle); the whole-tile form reads a run of TMA_O_ITERS_HOST
+# (8 at a half-precision O, 4 at fp8 O -- the develop counts).  O_EPI_PIPELINE: the dead-row fast path is the kernel's only
+# `VOTE.ANY` (develop: 0; the correction loop's vote is VOTE.ALL).  Both: ONE bulk group per tile (1 UTMACMDFLUSH + 1 DEPBAR), no
+# GPU-scope drain, no spill, and REG within the measured ceiling -- the fp8-O batch sizing is what the REG pin holds: a 2-block
+# tcgen05.ld batch at an FP8 O is 256 live registers and read REG 255 / STACK 512 / 192 STL / 332 LDL before the batch was sized by
+# registers (frost-tile-dsl.md; both O dtypes of the mxfp8 kernel are pinned for that reason).  Measured 2026-09-28 on the branch
+# (sm_107a, cutlass-dsl 4.8.0 + CUDA 13.5 ptxas, dense B=1 H=128 S=8192 LSE on, production cga2): REG f16 205 / fp8 156 / mxfp8 224 /
+# mxfp8-fp8out 158 (develop 203 / 158 / 222 / -), STL = LDL = 0 on every row; a REG slack of 16 tolerates ptxas drift and still
+# catches the 255 of a wrong batch.
+_SM107_O_STORE_PROBE = textwrap.dedent("""
+    import glob, os, re, subprocess, sys
+    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    fp8 = quant != "f16"
+    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    # E4M3 in on the quantized rows, BF16 in on the f16 row; the row picks the O dtype.
+    params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma)
+    mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=(quant == "fp8"), rubin=True)
+    print("EXPECT_UTMASTG", mod.TMA_O_ITERS_HOST)
+    print("EXPECT_UTMASTG_MAX_RUN", mod._O_SUBTILES_PER_CHUNK if mod.O_STORE_STREAM else mod.TMA_O_ITERS_HOST)
+    print("EXPECT_VOTE_ANY", 1 if mod.O_EPI_PIPELINE else 0)
+    entry = getattr(mod, "compile_prepared", None) or mod.compile
+    entry(d_qk=d, d_v=d, has_lse=True)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    for key in ("UTMASTG", "UTMACMDFLUSH", "DEPBAR", "STL", "LDL", "CGAERRBAR"):
+        print("SASS", key, cnt(key))
+    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
+    print("SASS VOTE_ANY", cnt("VOTE.ANY"))
+    run = best = 0
+    for ln in sass:
+        if "UTMASTG" in ln:
+            run += 1; best = max(best, run)
+        elif "PHASECHK" in ln:
+            run = 0
+    print("SASS UTMASTG_MAX_RUN", best)
+    # REG of the main kernel = the largest REG of any function in the cubin (the amax reset / unscale helpers are tiny), read by the
+    # cuobjdump that ships beside the nvdisasm that decoded the cubin; -1 when there is none (the REG bound is then not checked).
+    cuobj = os.path.join(os.path.dirname(nvd), "cuobjdump")
+    reg = -1
+    if os.path.isfile(cuobj):
+        ru = subprocess.run([cuobj, "--dump-resource-usage", cubins[-1]], capture_output=True, text=True).stdout
+        regs = [int(m) for m in re.findall(r"REG:(\\d+)", ru)]
+        reg = max(regs) if regs else -1
+    print("SASS REG", reg)
+    print("SASS LINES", len(sass))
+    """)
+
+_REG_SLACK = 16
+_SM107_O_STORE_SASS_ROWS = [
+    # (quant, TemplateParams.dtype_o, REG measured on the branch)
+    pytest.param("f16", _BF16_OUT, 205, id="f16-d512"),
+    pytest.param("fp8", _E4M3, 156, id="fp8-d512"),
+    pytest.param("mxfp8", _BF16_OUT, 224, id="mxfp8-d512"),
+    pytest.param("mxfp8", _E4M3, 158, id="mxfp8-d512-fp8out"),
+]
+
+
+@pytest.mark.parametrize("quant, dtype_o, reg_measured", _SM107_O_STORE_SASS_ROWS)
+def test_sm107_d512_o_store_path_sass_pins(tmp_path, quant, dtype_o, reg_measured):
+    """The streamed O store (one UTMASTG per chunk wait, TMA_O_ITERS_HOST stores, one bulk group per tile), the pipelined epilogue
+    (one VOTE.ANY), no GPU-scope drain, no spill, REG within the measured ceiling -- on every sm107 d512 kernel, both O dtypes of the
+    mxfp8 one.  Expectations come from the module itself (its constants and TMA geometry), so a flipped lever re-pins its own row."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_ostore_{quant}_o{dtype_o}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_O_STORE_PROBE, str(dump), quant, "512", str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d=512 dtype_o={dtype_o} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("EXPECT_") and len(ln.split()) == 2}
+    print(f"\nsm107 {quant} d=512 dtype_o={dtype_o} sm_107a SASS: {stats}; module says {expect}")
+    assert stats["UTMASTG"] == expect["EXPECT_UTMASTG"], f"{stats['UTMASTG']} UTMASTG, the module's TMA-O geometry says {expect['EXPECT_UTMASTG']}"
+    assert stats["UTMASTG_MAX_RUN"] == expect["EXPECT_UTMASTG_MAX_RUN"], (
+        f"longest UTMASTG run without a PHASECHK between = {stats['UTMASTG_MAX_RUN']}, O_STORE_STREAM says {expect['EXPECT_UTMASTG_MAX_RUN']}: "
+        "a store is no longer issued behind its own chunk wait (or the whole-tile arm is being traced)"
+    )
+    assert (
+        stats["UTMACMDFLUSH"] == 1 and stats["DEPBAR"] == 1
+    ), f"{stats['UTMACMDFLUSH']} commit / {stats['DEPBAR']} wait_group: the store must stay ONE bulk group per tile"
+    assert (
+        stats["VOTE_ANY"] == expect["EXPECT_VOTE_ANY"]
+    ), f"{stats['VOTE_ANY']} VOTE.ANY, O_EPI_PIPELINE says {expect['EXPECT_VOTE_ANY']}: the dead-row fast path (which pins the pipelined loads) is gone"
+    assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
+    assert (
+        stats["STL"] == 0 and stats["LDL"] == 0
+    ), f"the {quant} d=512 dtype_o={dtype_o} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL): a tcgen05.ld batch wider than 64 fp32 per lane?"
+    if stats["REG"] >= 0:
+        assert (
+            stats["REG"] <= reg_measured + _REG_SLACK
+        ), f"REG {stats['REG']} > {reg_measured} + {_REG_SLACK}: the pipelined epilogue holds more than two 64-register load batches"
+
+
 # ============================================================================ Rubin SASS pins: the ring-wait retry form
 # The hint-less ``wait(spin=True)`` is visible only in the SASS: on sm_107a the DSL's time_limit form costs 2 divergent
 # SYNCS.PHASECHK + 1 NANOSLEEP per wait instantiation, the spin form 2 uniform USYNCS.PHASECHK and no sleep.  One opted-in kernel
@@ -2918,3 +3094,201 @@ class TestStagedHalf:
     test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
     test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
     test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+
+
+# ============================================================================
+# Runtime regression for the mixed-warp correction hand-off (PR #1288, Codex P2)
+#
+# The O-store stream re-orders the d512 epilogue: BMM2-ready arrives early
+# and the correction warps rescale (alpha != 1) or pass through (alpha == 1)
+# PER ROW GROUP.  The source / SASS pins above protect the lowering; this is
+# the numerical evidence that an early arrival stays correct when some warps
+# rescale and others do not.  Geometry from the review's independent probe:
+#   * Q[..., 0] repeats 32-row groups of 0 / +1 / -1 (one softmax warp's rows
+#     each; 96 does not divide 128, so every warp position sees every group
+#     over the tiles); every other Q component is 0.
+#   * K[..., 0] = 12 * floor(key / 128): a staircase, so the +1 rows' row-max
+#     grows at EVERY KV tile (a rescale per tile), the 0 rows never rescale,
+#     the -1 rows never rescale after the first tile.
+#   * per-batch lengths Q [1024, 641, 0] / KV [512, 385, 128]: a full, a
+#     mid-tile-trimmed and a QUERYLESS batch; bottom-right anchors the
+#     diagonal at (seq_len_q[b], seq_len_kv[b]), so the first 512 / 256 rows
+#     of batches 0 / 1 are KEYLESS under the masked arm.
+#   * scale 0.5; dense (padding only) and bottom-right causal + left window 129.
+# Reference: fp64, composing the SAME padding / diagonal / window as the
+# kernel (sdpa-invariants § 8); dead rows (row >= seq_len_q[b]) and keyless
+# rows are O = 0 / LSE = -inf (§ 1, § 4).  Replay: compile once, then three
+# re-executions with a CHANGED V and NaN / +inf-poisoned outputs -- each
+# retained O / LSE equals the recomputed reference, LSE is bitwise independent
+# of V, and two executions on identical inputs are bitwise equal.
+# The scale = 1 masked variant NaNs on develop 4c0dc9a8 exactly as on this
+# head (the review's finding): the live rows whose window excludes KV tile 0
+# publish LSE = log(1e-30) and O = NaN -- classified as a pre-existing develop
+# defect (documented in the PR #1288 follow-ups); kept as a
+# STRICT xfail so the suite documents it and flips the day it is fixed.
+# ============================================================================
+
+_HANDOFF_GEOMETRY = dict(b=3, h_q=8, h_kv=4, s_q=1024, s_kv=512, d=512)
+_HANDOFF_Q_LENS = (1024, 641, 0)
+_HANDOFF_KV_LENS = (512, 385, 128)
+_HANDOFF_ROW_GROUP = 32  # rows per 0 / +1 / -1 group = one softmax warp's rows of a 128-row CTA tile
+_HANDOFF_STAIR_STEP, _HANDOFF_STAIR_KEYS = 12.0, 128  # K[..., 0] = 12 * floor(key / 128)
+_HANDOFF_WINDOW_LEFT = 129
+_HANDOFF_REPLAYS = 3
+
+
+def _handoff_problem(dtype, *, seed=0):
+    """BSHD-physical / BHSD-logical Q, K, V of the review's correction-storm
+    geometry, plus the per-batch (seq_q_lens, seq_kv_lens) int32 vectors."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    dev = "cuda"
+    torch.manual_seed(seed)
+    rows = torch.arange(g["s_q"], device=dev)
+    sign = torch.tensor([0.0, 1.0, -1.0], device=dev)[(rows // _HANDOFF_ROW_GROUP) % 3]
+    q = torch.zeros(g["b"], g["s_q"], g["h_q"], g["d"], device=dev, dtype=dtype)
+    q[..., 0] = sign.view(1, g["s_q"], 1).to(dtype)
+    keys = torch.arange(g["s_kv"], device=dev)
+    stair = _HANDOFF_STAIR_STEP * torch.div(keys, _HANDOFF_STAIR_KEYS, rounding_mode="floor").float()
+    k = torch.zeros(g["b"], g["s_kv"], g["h_kv"], g["d"], device=dev, dtype=dtype)
+    k[..., 0] = stair.view(1, g["s_kv"], 1).to(dtype)
+    v = _handoff_fresh_v(dtype, seed=seed)
+    q_lens = torch.tensor(_HANDOFF_Q_LENS, dtype=torch.int32, device=dev)
+    kv_lens = torch.tensor(_HANDOFF_KV_LENS, dtype=torch.int32, device=dev)
+    return q.transpose(1, 2), k.transpose(1, 2), v, q_lens, kv_lens
+
+
+def _handoff_fresh_v(dtype, *, seed):
+    """A new random V (BSHD-physical) -- the operand the replays change."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    gen = torch.Generator(device="cuda").manual_seed(1000 + seed)
+    return (torch.randn(g["b"], g["s_kv"], g["h_kv"], g["d"], device="cuda", generator=gen) * 0.5).to(dtype).transpose(1, 2)
+
+
+def _handoff_reference(q, k, v, *, scale, causal_br, window_left, q_lens, kv_lens):
+    """fp64 softmax(QK^T) V and the natural-log LSE under the SAME conditions
+    the kernel runs: per-batch padding on both sides, the bottom-right
+    diagonal anchored at (seq_len_q[b], seq_len_kv[b]) and the left window
+    riding it (``window_left`` keys below the diagonal are kept, as in
+    ``_ref_sdpa_full``'s ``swa_window``).  Dead (row >= seq_len_q[b]) and
+    keyless rows come out as O = 0 / LSE = -inf."""
+    import torch
+
+    b, h_q, s_q, _ = q.shape
+    h_kv, s_kv = k.shape[1], k.shape[2]
+    rep = h_q // h_kv
+    kd, vd = k.double().repeat_interleave(rep, 1), v.double().repeat_interleave(rep, 1)
+    scores = q.double() @ kd.transpose(-1, -2) * scale
+    i = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+    ql, kl = q_lens.to(torch.int64).view(b, 1, 1, 1), kv_lens.to(torch.int64).view(b, 1, 1, 1)
+    masked = (i >= ql) | (j >= kl)
+    if causal_br:
+        diag = i + (kl - ql)
+        masked = masked | (j > diag) | (j < diag - window_left)
+    scores = scores.masked_fill(masked, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)  # a row with no live key is -inf
+    o = torch.softmax(scores, dim=-1).nan_to_num(0.0) @ vd  # ... and O = 0 there
+    return o.float(), lse.float()
+
+
+def _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens):
+    """Poison the outputs (an unwritten O cell stays NaN, an unwritten LSE +inf,
+    both distinct from the legitimate 0 / -inf of a dead row), launch, sync,
+    and hand back COPIES -- the retained outputs of this replay."""
+    import torch
+
+    o.fill_(float("nan"))
+    lse.fill_(float("inf"))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+    torch.cuda.synchronize()
+    return o.clone(), lse.clone()
+
+
+def _handoff_check(o, lse, ref_o, ref_lse, q_lens, *, tag):
+    """The retained O / LSE of one replay against the fp64 reference: every
+    cell written, dead rows exactly 0 / -inf, the rest at the suite's
+    tolerances (the same atol / rtol every dense f16 case in this tree uses)."""
+    import torch
+
+    b, h_q, s_q, _ = o.shape
+    rows = torch.arange(s_q, device=o.device).view(1, 1, s_q, 1)
+    dead = rows >= q_lens.to(torch.int64).view(b, 1, 1, 1)
+    bad = ~torch.isfinite(o.float())
+    assert not bad.any(), f"{tag}: {int(bad.sum())} non-finite / unwritten O cells, first at (b, h, row, col) = {tuple(bad.nonzero()[0].tolist())}"
+    bad = torch.isnan(lse) | torch.isposinf(lse)
+    assert not bad.any(), f"{tag}: {int(bad.sum())} NaN / unwritten LSE cells, first at (b, h, row) = {tuple(bad.nonzero()[0].tolist())}"
+    assert (o[dead.expand_as(o)] == 0).all(), f"{tag}: rows at / past seq_len_q[b] must be EXACTLY 0 (a select, not residue * 0)"
+    assert torch.isneginf(lse[dead.squeeze(-1).expand_as(lse)]).all(), f"{tag}: rows at / past seq_len_q[b] publish LSE = -inf"
+    torch.testing.assert_close(o.float(), ref_o, **_GATE_O_TOL, msg=lambda m: f"{tag}: O vs the fp64 reference -- {m}")
+    torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL, msg=lambda m: f"{tag}: LSE vs the fp64 reference -- {m}")
+
+
+_HANDOFF_MASKS = {"dense": dict(causal_br=False, window_left=None), "causal_br_swa129": dict(causal_br=True, window_left=_HANDOFF_WINDOW_LEFT)}
+_HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 kernel NaNs the LIVE rows whose 130-key window excludes the first KV "
+    "tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
+    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups",
+)
+_HANDOFF_CASES = [
+    pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 0.5, id="bf16-causal_br_swa129-scale0.5"),
+    pytest.param("fp16", "dense", 0.5, id="fp16-dense-scale0.5"),
+    pytest.param("fp16", "causal_br_swa129", 0.5, id="fp16-causal_br_swa129-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+    pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+]
+
+
+@pytest.mark.parametrize("dtype, mask, scale", _HANDOFF_CASES)
+def test_sm107_d512_correction_handoff_under_mixed_rescale(dtype, mask, scale):
+    """Rubin e2e for the pipelined O store's correction hand-off (see the
+    section comment): the +1 / 0 / -1 row groups make some correction warps
+    rescale at every KV tile while their neighbours pass through, a queryless
+    batch and (masked arm) keyless rows exercise the dead-row selects, and the
+    outputs are retained across three replays with a changed V.  The reference
+    composes the same padding, diagonal and window as the graph."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 d512 f16 / bf16 kernel runs on cc10.7 only")
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    arm = _HANDOFF_MASKS[mask]
+    q, k, v, q_lens, kv_lens = _handoff_problem(dt)
+    g = _HANDOFF_GEOMETRY
+    o = torch.empty(g["b"], g["s_q"], g["h_q"], g["d"], device="cuda", dtype=dt).transpose(1, 2)
+    lse = torch.empty(g["b"], g["h_q"], g["s_q"], device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=arm["causal_br"],
+        causal_bottom_right=arm["causal_br"],
+        window_size_left=arm["window_left"],
+        scale_softmax=scale,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+    )
+    assert api.check_support()
+    api.compile()  # the one capture; everything below is a replay
+    ref_kw = dict(scale=scale, causal_br=arm["causal_br"], window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens)
+
+    o0, lse0 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(q, k, v, **ref_kw)
+    _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag="launch 0")
+    for replay in range(1, _HANDOFF_REPLAYS + 1):
+        v.copy_(_handoff_fresh_v(dt, seed=replay))  # a changed V, same storage (what a captured graph sees)
+        o_k, lse_k = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+        ref_o, _ = _handoff_reference(q, k, v, **ref_kw)
+        _handoff_check(o_k, lse_k, ref_o, ref_lse, q_lens, tag=f"replay {replay}")
+        assert torch.equal(lse_k, lse0), f"replay {replay}: LSE must be bitwise independent of V"
+    o_again, lse_again = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    assert torch.equal(o_again, o_k) and torch.equal(lse_again, lse_k), "two replays on identical inputs must be bitwise equal (a race otherwise)"
