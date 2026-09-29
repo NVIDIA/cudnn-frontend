@@ -87,6 +87,28 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
 
 
 @pytest.mark.L0
+def test_recommend_packs_gqa_under_a_band_on_sm100():
+    """SM100 rows pack a GQA group under a diagonal band at prefill S_q (llama
+    3.1 layer: 64/8 heads, S=2048 causal), unpacked as the runner-up; a dense
+    graph of the same shape keeps the decode rule (unpacked first); MHA never
+    packs (heuristics._sm100_banded_gqa_packs)."""
+    llama = dict(b=2, h_q=64, h_kv=8, s_q=2048, s_kv=2048)
+    rows = (
+        (20500, dict(dtype=cudnn.data_type.HALF)),
+        (20501, dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True)),
+    )
+    for eid, dt in rows:
+        plans = [p for p in recommend("A", _facts(causal=True, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert plans and plans[0].knobs.pack_gqa is True and False in {p.knobs.pack_gqa for p in plans}, (eid, [p.knobs for p in plans])
+        window = [p for p in recommend("A", _facts(causal=True, window_left=127, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert window and window[0].knobs.pack_gqa is True, (eid, window[0].knobs)
+        dense = [p for p in recommend("A", _facts(causal=False, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert dense and dense[0].knobs.pack_gqa is False, (eid, dense[0].knobs)
+        mha = [p for p in recommend("A", _facts(causal=True, **dt, **{**llama, "h_kv": 64}), _OFFERED) if p.engine_id == eid]
+        assert mha and all(p.knobs.pack_gqa is False for p in mha), (eid, [p.knobs for p in mha])
+
+
+@pytest.mark.L0
 def test_recommend_packs_partial_gqa_group_on_decode_shapes():
     # 96 query heads over 8 KV heads (G=12) at S_q=1: 12 does not divide the
     # 128-row tile, but 4 does -- the d128 f16 flavor packs 4 heads per token
