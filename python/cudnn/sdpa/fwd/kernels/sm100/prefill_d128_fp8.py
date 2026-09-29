@@ -133,6 +133,8 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.pointwise import (
     exp2_mixed,
+    fmax_f32,
+    opaque_f32_zero,
     # cc10.0: the MASK_NONE fast path uses manual tcgen05_ld + row_max_reduction.
     # cc10.3+ (FUSED_LDTM_STAT) fuses load + row-max into tmem_load_max_reduction_x64.
     row_reduction_pair,
@@ -2346,7 +2348,8 @@ def _correction_warp_group(
             # by scale_o in api to give the pre-quant output amax (cuDNN FP8 ref, in-kernel).
             if cutlass.const_expr(amax_o_tensor is not None):
                 _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-                _amax_o_local = cutlass.Float32(0.0)
+                # Opaque, not a constant: it feeds fmax_f32's inline_ptx (frost-tile-dsl s7).
+                _amax_o_local = opaque_f32_zero()
 
             sO_sub_base = sO[qs].base
 
@@ -2401,7 +2404,7 @@ def _correction_warp_group(
                     for _i in cutlass.range_constexpr(O_CHUNK):
                         _e = o_elems[_i]
                         if cutlass.const_expr(amax_o_tensor is not None):
-                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
 
                     # Plain range (not range_constexpr) — extraction at Python trace time.
                     o_packed_v = fp32_to_fp8_pack(
@@ -2478,12 +2481,12 @@ def _correction_warp_group(
                     else:
                         o_elems = _load_o_chunk_scaled(2 * g) + _load_o_chunk_scaled(2 * g + 1)
 
-                    g_amax = cutlass.Float32(0.0)
+                    g_amax = opaque_f32_zero()  # feeds fmax_f32 inline_ptx: must not fold to a literal
                     for _i in cutlass.range_constexpr(_GROUP):
                         _e = o_elems[_i]
-                        g_amax = cute.math.max(g_amax, cute.math.max(_e, -_e))
+                        g_amax = fmax_f32(g_amax, cute.math.abs(_e))
                     if cutlass.const_expr(amax_o_tensor is not None):
-                        _amax_o_local = cute.math.max(_amax_o_local, g_amax)
+                        _amax_o_local = fmax_f32(_amax_o_local, g_amax)
 
                     if cutlass.const_expr(CFG.DTYPE_O == 4):
                         # E2M1 max-normal is 6: the E4M3 scale maps the block amax onto it.
@@ -2555,7 +2558,7 @@ def _correction_warp_group(
                     for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                         _e = o_scaled_h[_i]
                         if cutlass.const_expr(amax_o_tensor is not None):
-                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                            _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))
                     o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
 
                     col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
