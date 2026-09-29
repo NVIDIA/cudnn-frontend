@@ -290,3 +290,41 @@ def test_shared_metadata_serves_both_forward_providers(provider, return_lse, mon
         check(captured)
     finally:
         graph.reset()
+
+
+def test_varlen_metadata_missing_execution_entry_falls_back(monkeypatch):
+    _require_prepared()
+    from cudnn.frost import compiled_cache
+    from cudnn.sdpa import varlen_metadata
+
+    varlen_metadata._plan.cache_clear()
+    calls = []
+    original = varlen_metadata._torch_metadata
+
+    def fallback(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(compiled_cache, "positional_entry", lambda artifact: None)
+    monkeypatch.setattr(varlen_metadata, "_torch_metadata", fallback)
+    q = torch.tensor([0, 3, 7], dtype=torch.int32, device="cuda")
+    kv = torch.tensor([0, 5, 9], dtype=torch.int64, device="cuda")
+    q_strides, kv_strides = (2**32 + 16, 32), (80,)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        actual = varlen_metadata.prepare_varlen_metadata(q, kv, q_strides, kv_strides)
+        _check(actual, _expected([0, 3, 7], [0, 5, 9], q_strides, kv_strides))
+        with torch.cuda.graph(graph):
+            captured = varlen_metadata.prepare_varlen_metadata(q, kv, q_strides, kv_strides)
+        q.add_(2)
+        kv.add_(4)
+        for output in captured:
+            output.fill_(-19)
+        graph.replay()
+        _check(captured, _expected([2, 5, 9], [4, 9, 13], q_strides, kv_strides))
+        assert len(calls) == 2
+        assert varlen_metadata._plan.cache_info().misses == 1
+        assert varlen_metadata._plan.cache_info().hits == 1
+    finally:
+        graph.reset()
+        varlen_metadata._plan.cache_clear()

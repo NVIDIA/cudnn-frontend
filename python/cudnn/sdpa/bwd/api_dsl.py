@@ -1641,8 +1641,10 @@ def sdpa_bwd_wrapper_sm80(
         h_kv, s_kv = k_tensor.shape[1], k_tensor.shape[2]
         dk = torch.empty((b, s_kv, h_kv, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
         dv = torch.empty((b, s_kv, h_kv, d_v), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
-        dbias = torch.zeros_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
-        dsink = torch.zeros(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
+        # The prepared chain clears its accumulators and copies every auxiliary
+        # element, including fully masked rows, into these output buffers.
+        dbias = torch.empty_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
+        dsink = torch.empty(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
 
     cache_key = (
         q_tensor.shape,

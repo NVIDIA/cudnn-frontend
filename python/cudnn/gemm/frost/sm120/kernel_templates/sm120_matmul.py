@@ -731,8 +731,8 @@ def _kernel(
                                 acc[_o + 3],
                             )
 
-                # Stage fully consumed by this warp (ldmatrix is synchronous).
                 nvvm.bar_warp_sync(0xFFFFFFFF)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 if elect_one:
                     nvvm.mbarrier_arrive(ab_empty_mbar_ptr.subview(stage))
                 ab_iter += 1

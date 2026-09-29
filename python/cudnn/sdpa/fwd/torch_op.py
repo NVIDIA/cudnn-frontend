@@ -179,11 +179,6 @@ def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torc
     return t
 
 
-def _int32_col(t: torch.Tensor) -> torch.Tensor:
-    """View a 1-D int tensor as the (N, 1, 1, 1) INT32 column cuDNN expects."""
-    return t.to(torch.int32).reshape(-1, 1, 1, 1)
-
-
 def _round64(n: int) -> int:
     return ((n + 63) // 64) * 64
 
@@ -467,8 +462,12 @@ def _sdpa_fwd_impl(
     variant = {int(_UIDs.Q): q, int(_UIDs.K): k, int(_UIDs.V): v, int(_UIDs.O): o}
     if return_lse:
         variant[int(_UIDs.STATS)] = stats
-    if has_sinks:
-        variant[int(_UIDs.SINKS)] = sinks.to(torch.float32).reshape(1, H_q, 1, 1)
+    if has_sinks or has_seq_lens:
+        from cudnn.sdpa.forward_metadata import prepare_forward_metadata
+
+        len_q_col, len_kv_col, sinks_col = prepare_forward_metadata(seq_len_q, seq_len_kv, sinks, B, H_q)
+        if has_sinks:
+            variant[int(_UIDs.SINKS)] = sinks_col
     if is_thd:
         # Each ragged offset is an int64 ELEMENT offset using its own tensor's
         # token stride. The shared producer widens prefixes before multiplying.
@@ -478,8 +477,8 @@ def _sdpa_fwd_impl(
         metadata = prepare_varlen_metadata(cu_seqlens_q, cu_seqlens_kv, q_strides, (k.stride(0), v.stride(0)))
         variant.update((int(role), value) for role, value in zip(roles, metadata))
     elif has_seq_lens:
-        variant[int(_UIDs.SEQ_LEN_Q)] = _int32_col(seq_len_q)
-        variant[int(_UIDs.SEQ_LEN_KV)] = _int32_col(seq_len_kv)
+        variant[int(_UIDs.SEQ_LEN_Q)] = len_q_col
+        variant[int(_UIDs.SEQ_LEN_KV)] = len_kv_col
 
     g.execute(variant, workspace, handle=handle)
     return o, stats
@@ -1099,15 +1098,9 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
     dispatch, where reading a cu value to host raises
     GuardOnDataDependentSymNode.
     """
-    B = cu_seqlens_q.numel() - 1
-    T, H = lse_th.shape
-    cu = cu_seqlens_q.long()
-    token = torch.arange(T, device=lse_th.device)
-    seq_of_token = torch.searchsorted(cu[1:], token, right=True)  # t in [cu[i], cu[i+1]) -> i
-    pos_in_seq = token - cu[seq_of_token]
-    padded = torch.zeros(B, H, max_seqlen_q, 1, dtype=torch.float32, device=lse_th.device)
-    padded[seq_of_token, :, pos_in_seq, 0] = lse_th
-    return padded
+    from ..packed_lse import prepare_padded_lse
+
+    return prepare_padded_lse(lse_th, cu_seqlens_q, max_seqlen_q)
 
 
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable

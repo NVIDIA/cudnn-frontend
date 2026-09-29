@@ -17,11 +17,12 @@ def _plan(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index):
     from cudnn.frost.compiled_cache import positional_entry
     from .fwd.kernels.varlen_metadata import compile_metadata
 
-    artifact = compile_metadata(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index)
+    major, minor = torch.cuda.get_device_capability(device_index)
+    artifact = compile_metadata(q_dtype, kv_dtype, n_q_offsets, n_kv_offsets, device_index, f"sm_{major}{minor}")
     entry = positional_entry(artifact)
-    if entry is None:
-        raise NotImplementedError("SDPA metadata preparation requires a positional tvm-ffi entry")
-    return artifact, entry
+    # An explicit foreign target can have no execution entry in the installed
+    # DSL. This optional producer must then retain the Torch implementation.
+    return None if entry is None else (artifact, entry)
 
 
 def _torch_metadata(cu_q, cu_kv, q_strides, kv_strides):
@@ -62,6 +63,8 @@ def prepare_varlen_metadata(cu_q, cu_kv, q_strides, kv_strides):
             stream = torch.cuda.current_stream(device).cuda_stream
         ensure_current_context(stream, device.index)
         plan = _plan(str(cu_q.dtype), str(cu_kv.dtype), len(q_strides), len(kv_strides), device.index)
+        if plan is None:
+            return _torch_metadata(cu_q, cu_kv, q_strides, kv_strides)
         n = cu_q.numel() - 1
         # Each column starts at a 16-byte boundary, including odd batch counts.
         offset_pitch, length_pitch = (n + 2) // 2 * 2, (n + 3) // 4 * 4
