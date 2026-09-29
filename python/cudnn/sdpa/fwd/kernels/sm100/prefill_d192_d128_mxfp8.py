@@ -72,6 +72,14 @@ Cfg = type(CFG)
 # row_max_reduction_64 (default 0). api_dsl sets this from the device capability at
 # compile time; a distinct value yields a distinct kernel specialization (cache key).
 FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
+# exp2 MUFU / FMA split -- the ex2_emulation_2 mix in _exp2_chunk0_mask_aware /
+# _exp2_chunk0_e4_6pairs / _exp2_mixed_late / _exp2_emulated_scalar.  Claimed per
+# kernel and per arch by api_dsl._exp2_fma_split_for: on for cc 10.0, where a few
+# emulated exponentials relieve a saturated MUFU.EX2; off elsewhere (cc 10.3's
+# doubled MUFU.EX2 rate turns the emulated ones into a net loss), when every
+# element takes the plain MUFU exp2.  Folded at trace time; a distinct value is a
+# distinct specialization.
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
 # THD / varlen follows the device-built-metadata + persistent-grid design used
 # by the sibling FP8-family kernels. Q/K/V/O are packed with dynamic token
 # extents; MXFP8 scale factors are packed per-sequence and tile-padded.
@@ -246,7 +254,7 @@ def _max_abs_reduction(vec):
 def _exp2_chunk0_mask_aware(vec, apply_mask):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if CFG.DTYPE_QKV == 1 and apply_mask:
+        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:
@@ -263,7 +271,7 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
 def _exp2_chunk0_e4_6pairs(vec):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if i < 30 and i % 10 < 4:
+        if _E2E_ENABLED and i < 30 and i % 10 < 4:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -275,7 +283,7 @@ def _exp2_chunk0_e4_6pairs(vec):
 def _exp2_mixed_late(vec):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if i >= 48:
+        if _E2E_ENABLED and i >= 48:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -285,6 +293,8 @@ def _exp2_mixed_late(vec):
 
 
 def _exp2_emulated_scalar(x):
+    if not _E2E_ENABLED:
+        return cute.math.exp2(x, fastmath=True)
     value, _ = ex2_emulation_2(x, x, poly_degree=2)
     return value
 
