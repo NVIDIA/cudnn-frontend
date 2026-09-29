@@ -130,6 +130,24 @@ CUDA Graph Support:
 """
 
 
+def _target_needs_shuffle_amax():
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    return (int(arch.major), int(arch.minor)) == (11, 0)
+
+
+@cute.jit
+def _warp_amax_shuffle(value):
+    # SM110 cannot assemble redux.f32. Keep the original path on other targets.
+    if cutlass.const_expr(_target_needs_shuffle_amax()):
+        for shift in cutlass.range_constexpr(5):
+            value = cute.arch.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift), nan=True)
+    else:
+        value = cute.arch.warp_redux_sync(value=value, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
+    return value
+
+
 class BlockScaledContiguousGroupedGemmKernel:
     """This class implements batched matrix multiplication (D = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -981,12 +999,7 @@ class BlockScaledContiguousGroupedGemmKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = cute.arch.warp_redux_sync(
-            value=amax_fp32,
-            kind="fmax",
-            mask_and_clamp=0xFFFFFFFF,
-            nan=True,
-        )
+        warp_amax = _warp_amax_shuffle(amax_fp32)
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx] = cutlass.Float32(warp_amax)
@@ -1145,18 +1158,7 @@ class BlockScaledContiguousGroupedGemmKernel:
 
         tmp_f32 = cutlass.Float32(0.0)
         for vi in cutlass.range_constexpr(acc_frg.shape[0]):
-            max_value_original = (
-                cutlass.Float32(
-                    cute.arch.warp_redux_sync(
-                        value=acc_frg[vi, 0],
-                        kind="fmax",
-                        mask_and_clamp=0xFFFFFFFF,
-                        nan=True,
-                    )
-                )
-                * rcp_limit
-                * norm_const
-            )
+            max_value_original = cutlass.Float32(_warp_amax_shuffle(acc_frg[vi, 0])) * rcp_limit * norm_const
             max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
             max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
             max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)

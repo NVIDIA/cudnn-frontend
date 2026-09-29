@@ -1088,9 +1088,14 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfb_tensor.dtype,
     )
 
+    # AMAX is an output of this invocation, not cached plan state. The kernel
+    # atomically accumulates into it, so each call needs the reduction identity.
+    if d_dtype in (cutlass.BFloat16, cutlass.Float16):
+        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
-        grouped_gemm_swiglu, amax_tensor = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
+        grouped_gemm_swiglu, _ = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
         # The cuDNN graph API binds data pointers at execute time, not plan-build time.
         # During CUDA graph capture, padded_offsets is allocated in the graph pool
         # (stable address across replays), so passing it directly is graph-safe.
@@ -1113,10 +1118,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
     else:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: No previously cached GroupedGemmSwigluSm100 object found, creating new GroupedGemmSwigluSm100 object")
-        # Allocate amax_tensor once here; cache-hit calls reuse this buffer so
-        # the FillFunctor (torch.full) only fires during warmup, not every step.
-        if d_dtype in (cutlass.BFloat16, cutlass.Float16):
-            amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
         grouped_gemm_swiglu = GroupedGemmSwigluSm100(
             sample_a=a_tensor,
             sample_b=b_tensor,
