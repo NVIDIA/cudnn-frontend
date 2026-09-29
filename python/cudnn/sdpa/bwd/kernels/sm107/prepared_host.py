@@ -130,10 +130,15 @@ _pad_lse.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 @cute.kernel
 def _fill_i32(dst: cute.Tensor, value: cutlass.Constexpr[int]):
-    """``dst[:] = value`` over a small int32 vector (the per-batch kv lengths the padded mask arm reads)."""
+    """``dst[:] = value`` over an int32 vector of ANY length (the per-batch kv lengths the padded mask arm reads): one block,
+    every thread striding by ``_THREADS``.  A bare ``tid < size`` guard covers 256 entries only -- a ragged-S_kv graph with
+    B > 256 then reads an UNWRITTEN ``seq_kv_lens[b]`` for every batch past the block (workspace residue; a 0 there is a dead
+    batch whose dQ / dK / dV come back as exact zeros -- Codex review on #1212, B = 257 / S_kv = 129)."""
     tid, _, _ = cute.arch.thread_idx()
-    if tid < cute.size(dst):
-        dst.iterator[tid] = cutlass.Int32(value)
+    i = tid
+    while i < cute.size(dst):
+        dst.iterator[i] = cutlass.Int32(value)
+        i += _THREADS
 
 
 _fill_i32.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -274,7 +279,9 @@ def _stage2_inputs(
         v_k = _scratch(workspace, regions[R_V_PAD], dtype)
         _pad_copy(k, k_k, itemsize, stream)
         _pad_copy(v, v_k, itemsize, stream)
-    # Read by the padded mask arm only (the uniform real kv length); carved and written regardless (fixed kernel ABI).
+    # Read by the padded mask arm only (the uniform real kv length, one entry per batch); carved and written regardless (fixed
+    # kernel ABI).  ONE block: the fill strides over all B entries itself, so the launch needs no B-derived grid (B is at most a
+    # few hundred here; a second block would cost more than the loop it saves).
     seq_kv = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)
     _fill_i32(seq_kv, skv).launch(grid=(1, 1, 1), block=(_THREADS, 1, 1), stream=stream)
     # Zero ONCE, ahead of every chunk, and ONLY when the adapter says so (`api_dsl_sm107._stage3_needs_zero_fill`): with the

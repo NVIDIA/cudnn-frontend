@@ -759,6 +759,34 @@ def test_dead_padded_entry_is_exactly_zero_when_padded_is_claimed():
 
 
 @requires_rubin
+@pytest.mark.parametrize("b", [257, 300])
+def test_ragged_kv_batches_past_the_fill_block_read_their_own_kv_length(b):
+    """B > 256 on a ragged S_kv: the padded mask arm reads ``seq_kv_lens[b]`` for EVERY batch, and the per-batch kv-length
+    fill used to cover one 256-thread block, so batches 256.. read workspace residue.  ``ws_poison=0`` makes the unwritten
+    entry read 0 deterministically -- a dead batch whose dQ / dK / dV came back as EXACT zeros (fp64 reference max
+    0.78 / 0.93 / 1.13 at B = 257, S_kv = 129; Codex review on #1212).  B = 256, and a tile-multiple S_kv (dense arm, no read)
+    at any B, passed all along, so this shape is the pin -- on a poisoned workspace the fill is the only writer of."""
+    _run(b=b, hq=1, hkv=1, sq=128, skv=129, ws_poison=0, poison=float("nan")).check()
+
+
+@requires_rubin
+def test_padded_kv_lengths_past_the_fill_block_when_padded_is_claimed():
+    """The second reader of per-batch kv lengths, the graph-level padding mask (``seq_len_kv``), at B > 256 with zero-length
+    entries among the batches past the fill block.  Gated on the ``padded`` claim exactly like the dead-entry test above (the
+    row declines padding masks today, asserted host-side); it activates with the claim, so the B > 256 coverage of that arm
+    does not depend on someone remembering it then."""
+    if not _spec().capabilities.padded:
+        pytest.skip("padded is deferred (plan Q4); the decline is asserted host-side")
+    b, sq, skv = 300, 128, 256
+    kv_lens = [(skv, skv // 2, 0)[i % 3] for i in range(b)]
+    run = _run(b=b, hq=1, hkv=1, sq=sq, skv=skv, seq_lens=([sq] * b, kv_lens), ws_poison=0, poison=float("nan")).check()
+    dead_entries = [i for i in range(b) if kv_lens[i] == 0]
+    for name, got in zip(("dQ", "dK", "dV"), run.outs[0]):
+        dead = got[dead_entries].float()
+        assert torch.isfinite(dead).all() and (dead == 0).all(), f"{name}: every seq_kv_len == 0 entry must be EXACTLY zero"
+
+
+@requires_rubin
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
 def test_two_launches_are_bitwise_and_race_free(dt):
     """Two probes in one: launch 1 vs 2 is the two-launch race trick (a first-launch / cold-cache race the warm second
