@@ -597,7 +597,24 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         elem = 1 if (facts.is_fp8 or facts.is_mxfp8) else 2
         one_head_bytes = int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) * elem
         primary = SCHED_LPT_L2 if one_head_bytes <= _SM100_L2_BUDGET_BYTES else SCHED_LPT
-        if caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
+        if (
+            caps.sm_lo == 100
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(caps, facts) == (192, 128)
+            and int(facts.h_q) == int(facts.h_kv)
+            and facts.window_left is None
+        ):
+            # SM100 d192x128 f16/bf16 without GQA (DeepSeek-V3 / Kimi layers):
+            # every KV head is read by one Q head, so LPT_L2 has nothing to
+            # group, and at these head counts the causal triangle spans dozens
+            # of waves, so LPT has little to balance -- the natural walk keeps
+            # a head's K/V hot in L2.  MEASURED (cuDNN 9.30 yardstick, profiler
+            # kernel sums, 2026-09-28) NATURAL / LPT_L2 / LPT of cuDNN: B300
+            # 128 heads S=2K 1.06 / 1.09 / 1.09x, S=8K 1.08 / 1.12 / 1.25x;
+            # B200 S=2K 1.03 / 1.05 / 1.06x, S=8K 1.02 / 1.02 / 1.12x, 64 heads
+            # S=4K 1.02 / 1.03 / 1.05x.  GQA d192 graphs keep the L2 rule.
+            primary = SCHED_NATURAL
+        elif caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
             # The SM100 d128 / d64 f16 and per-tensor FP8 kernels: below a few
             # MiB per head the K/V of a head stays L2-resident under ANY walk, so
             # LPT_L2's head grouping only costs balance.  MEASURED on B200
