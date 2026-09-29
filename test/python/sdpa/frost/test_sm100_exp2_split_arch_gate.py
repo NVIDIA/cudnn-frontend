@@ -39,7 +39,9 @@ _ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("f16", 
 # Measured on B200 and deliberately OFF: d128 bf16 (dense +3.9 % but causal -1.9 / -2.4 %), d192x128 mxfp8
 # (-3.3..-4.0 % dense; it already carries its own exp2 emulation).  An ADDITIONAL _E2E_* block on d192x128 fp8
 # measured dense +1 %, causal -1.6 % -- that block is not what its ON entry gates.
-_MEASURED_OFF = {("f16", (128, 128)), ("mxfp8", (192, 128))}
+# The native d64 quantized legs (gpt-oss, B=2 H=128 d=64 SWA=128, B200 2026-09-28): the split loses there too --
+# fp8 -7 % (1.19x -> 1.28x of cuDNN), mxfp8 -10 % (0.96x -> 1.06x).
+_MEASURED_OFF = {("f16", (128, 128)), ("mxfp8", (192, 128)), ("fp8", (64, 64)), ("mxfp8", (64, 64))}
 
 
 def test_quant_kind_is_the_kernel_file_spelling():
