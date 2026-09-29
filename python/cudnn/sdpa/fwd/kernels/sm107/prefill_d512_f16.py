@@ -131,12 +131,12 @@ O_STORE_STREAM: bool = True
 # tcgen05.ld batch of chunk c+1 right after the wait that completes chunk c, BEFORE chunk c's ALU / STS / fence / arrive, so
 # the next wait finds it landed.  A batch is sized by REGISTERS, 64 fp32 per lane (2 batches live = 128): one 128-B chunk
 # (2 blocks of 32) at a half-precision O, HALF a chunk (1 block of 64) at an FP8 O -- a 2-block batch there is 256 live
-# registers and spills (MEASURED sm_107a, E4M3 O: REG 255, STACK 512, 192 STL / 332 LDL); live fp32 load registers = 2 x 64).  The dead-row fast path is one warp-uniform ``vote.any(_row_empty)`` per tile: when no lane of
+# registers and spills (MEASURED sm_107a, E4M3 O: REG 255, STACK 512, 192 STL / 332 LDL); live fp32 load registers = 2 x 64.  The dead-row fast path is one warp-uniform ``vote.any(_row_empty)`` per tile: when no lane of
 # the warp holds a dead row (every lane on a dense tile) the per-element ``select(_row_empty, 0, x)`` are ``x`` and are
 # skipped; the slow arm keeps the selects verbatim (never ``* 0``, sdpa-invariants.md s2).  The branch encloses ALU + STS
 # only -- never a tcgen05.ld (.sync.aligned) -- and it is what PINS the early issue: without it ptxas sinks the load batch
 # back to its consumers, so the fast path and the pipelining are ONE lever, not two.  Numerics are bit-identical by
-# construction (same multiply, same select same pack, same store offsets, same chunk arrive
+# construction (same multiply, same select, same pack, same store offsets, same chunk arrive
 # order); no barrier count or order changes.  MEASURED on the MXFP8 sibling on top of O_STORE_STREAM (212-SM Rubin): +1.7 pt
 # of time @ S_KV=1024, one LSB @512, -1.1 pt @8192 (+0.50 % vs +1.63 % stream alone); this kernel's A/B is owed with the
 # one above.  False = the classic per-block body (ld -> wait -> convert -> store -> chunk arrive), verbatim.
@@ -313,6 +313,24 @@ if (CFG.TILE_O * CFG.BPE_O) % 128 != 0 or _O_SUBTILES_PER_CHUNK * N_O_CHUNKS != 
         f"{__name__}: streamed O store needs whole 128 B chunks that tile the TMA-O subtiles; "
         f"got TILE_O={CFG.TILE_O} BPE_O={CFG.BPE_O} O_SWZ_BYTES={CFG.O_SWZ_BYTES} (N_O_CHUNKS={N_O_CHUNKS}, TMA_O_ITERS_HOST={TMA_O_ITERS_HOST})"
     )
+
+# sg1 O epilogue readout (O_EPI_PIPELINE): the TMEM O accumulator is read out in blocks of O_EPI_BLOCK_SIZE output columns (64 B
+# of output per row per block: 32 at a half-precision O, 64 at an FP8 O), and the pipelined form batches those blocks by
+# REGISTERS -- O_EPI_LD_BATCH_FP32 fp32 per lane per tcgen05.ld, 2 batches live under the 1-ahead pipeline (128): 2 blocks (one
+# 128-B chunk) at a half-precision O, 1 (half a chunk) at an FP8 O.  The pipelined loop walks N_O_EPI_GROUPS WHOLE batches, so
+# the block count must tile into batches: a block past the last whole batch would never be read out, and the chunk arrive it
+# completes would never fire (the TMA-STG warp hangs on mb_tma_o_full).  Pinned at import, like the chunk geometry above.
+O_EPI_BLOCK_SIZE = 64 // CFG.BPE_O  # 32 fp16, 64 fp8
+O_EPI_LD_BATCH_FP32 = 64  # fp32 registers per lane per tcgen05.ld batch (2 batches live under the 1-ahead pipeline = 128)
+N_O_EPI_BLOCKS = CFG.TILE_O // O_EPI_BLOCK_SIZE  # 16 blocks of 32 fp32 columns at a half-precision O, 8 of 64 at FP8 O
+O_EPI_BLOCKS_PER_BATCH = max(1, O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE)  # 2 (one 128-B chunk) at a half-precision O, 1 at FP8 O
+if CFG.TILE_O % O_EPI_BLOCK_SIZE != 0 or N_O_EPI_BLOCKS % O_EPI_BLOCKS_PER_BATCH != 0:
+    raise ValueError(
+        f"{__name__}: the pipelined O epilogue needs TILE_O to tile into whole tcgen05.ld batches; "
+        f"got TILE_O={CFG.TILE_O} BPE_O={CFG.BPE_O} (O_EPI_BLOCK_SIZE={O_EPI_BLOCK_SIZE}, N_O_EPI_BLOCKS={N_O_EPI_BLOCKS}, "
+        f"O_EPI_BLOCKS_PER_BATCH={O_EPI_BLOCKS_PER_BATCH})"
+    )
+N_O_EPI_GROUPS = N_O_EPI_BLOCKS // O_EPI_BLOCKS_PER_BATCH  # whole batches per tile: 8 at either O dtype at d=512
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
@@ -1296,7 +1314,7 @@ def _compute_warp_group(
     _O_EPI_SWIZZLE = cutlass.Swizzle(3, 4, 3)
 
     # Epilogue tile params (O SMEM stride).  TILE_O=512, BPE_O=2 → 8 chunks.
-    O_EPI_BLOCK_SIZE = 64 // CFG.BPE_O  # 32 fp16, 64 fp8
+    # O_EPI_BLOCK_SIZE (32 fp16 / 64 fp8) is a module constant, pinned with the readout-batch geometry next to N_O_CHUNKS.
     O_TMA_ITERS = (CFG.TILE_O * CFG.BPE_O) // CFG.O_SWZ_BYTES  # 8 chunks
     O_D_BLOCK = CFG.TILE_O // O_TMA_ITERS  # 64 elements / chunk
     O_TMA_GRANU_ELEMS = CFG.TILE_M * O_D_BLOCK  # 8192 elements / TMA chunk
@@ -1725,15 +1743,13 @@ def _compute_warp_group(
             # ``o_fp32 * beta`` here, then o_epilogue_convert_store (select the dead-row zero ->
             # pack -> swizzled store) -- in two ISSUE orders.  Blocks in OUTPUT order; the TMEM block index is bit-permuted
             # (b_sub {0..3} -> {0,2,1,3}, see the layout above).
-            N_O_EPI_BLOCKS = CFG.TILE_O // O_EPI_BLOCK_SIZE  # 16 blocks of 32 fp32 columns at a half-precision O, 8 of 64 at FP8 O
-            O_EPI_LD_BATCH_FP32 = 64  # fp32 registers per lane per tcgen05.ld batch (2 batches live under the 1-ahead pipeline = 128)
-            O_EPI_BLOCKS_PER_BATCH = max(1, O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE)  # 2 (one 128-B chunk) at a half-precision O, 1 at FP8 O
+            # N_O_EPI_BLOCKS / O_EPI_BLOCKS_PER_BATCH / N_O_EPI_GROUPS are module constants (next to N_O_CHUNKS), where the block
+            # count is pinned to tile into whole tcgen05.ld batches.
             if cutlass.const_expr(O_EPI_PIPELINE):
                 # Software-pipelined readout.  Iteration _g issues the tcgen05.ld batch of chunk _g and processes chunk
                 # _p = _g - 1; the wait that completes chunk _p is placed BEFORE chunk _g's loads are issued, so it never
                 # waits on the batch in flight.  A chunk is one batch (half-precision O) or two (FP8 O): the chunk arrive
                 # fires after the block that completes it, as in the classic form.
-                N_O_EPI_GROUPS = N_O_EPI_BLOCKS // O_EPI_BLOCKS_PER_BATCH
                 # Warp-uniform: does ANY lane of this warp hold a dead row?  When False, `select(_row_empty, 0, x)` is `x`
                 # for every lane of the warp, so the fast arm below is bit-identical to the select arm.
                 _o_epi_any_empty = vote_sync(0xFFFFFFFF, _row_empty, VoteSync.ANY)
