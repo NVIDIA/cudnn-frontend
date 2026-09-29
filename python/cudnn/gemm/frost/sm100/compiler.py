@@ -2829,13 +2829,18 @@ def _swap_mn_view(t: object) -> object:
 
 
 def _offset_vector(t):
-    """``first_token_offset`` as the rank-1 vector the launch indexes. cuDNN
-    declares it ``(E, 1, 1)`` and the variant pack hands the declaration over;
-    the trailing singleton axes carry nothing."""
+    """View ``[G+1,1,1]`` offsets as a vector."""
     shape = tuple(t.shape)
     if len(shape) == 3 and shape[1:] == (1, 1):
         return t.reshape([shape[0]])
     return t
+
+
+def _moe_num_groups(offsets, num_experts: int) -> int:
+    count = int(offsets.shape[0]) - 1
+    if num_experts < 1 or count < 1 or count % num_experts:
+        raise ValueError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
+    return count
 
 
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
@@ -3576,28 +3581,13 @@ def _check_input_alignment(chain: FusionChain) -> None:
 _EPI_SMEM_STAGES = 2
 
 
-_SF_ATOM_ROWS = 128  # F8_128x4: the SF blob is padded to whole 128-row blocks
-
-
-def _moe_required_offset_multiple(chain, cfg) -> int:
-    """Divisor of every group boundary, including S, for the GLOBAL-descriptor path."""
-    req = cfg.cga_tile_mn[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0]
-    if chain.block_scale is not None:
-        req = math.lcm(req, _SF_ATOM_ROWS)
-    return req
-
-
 def _moe_aligned_offsets(chain, cfg) -> bool:
-    """Can this (graph, geometry) address A and SFA globally, skipping the
-    per-routed-group TMA-descriptor rewrite? `alignment_value` promises only
-    the explicit first_token_offset values; S (matmul.M), the implicit last
-    endpoint, must independently satisfy the same tile/SF alignment. The
-    default promise of 1 never qualifies, so un-annotated graphs keep the rewrite."""
     if not chain.has_moe or chain.moe is None:
         return False
-    required = _moe_required_offset_multiple(chain, cfg)
-    extent = chain.matmul.N if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.M
-    return chain.moe.offset_multiple % required == 0 and extent % required == 0
+    required = cfg.cga_tile_mn[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0]
+    if chain.block_scale is not None:
+        required = math.lcm(required, 128)
+    return chain.moe.offset_multiple % required == 0
 
 
 # TMEM accumulator stages: 2 = MMA of tile N+1 overlaps the epilogue of tile N.
@@ -3769,10 +3759,6 @@ def _output_store_mode(
         if chain.moe.offset_multiple * carrier % 16 or chain.matmul.N * carrier % 16:
             return "stg"
     if out.major == "m":
-        # MoE clips D per routed group. Explicit offsets and the implicit last
-        # endpoint S must both satisfy the contiguous 16-byte granule; padding
-        # the column stride does not align S, and alignment_value only covers
-        # values stored in first_token_offset.
         if chain.has_moe and not isinstance(chain.moe, MoeSwapAbSpec) and (chain.moe.offset_multiple * carrier % 16 or chain.matmul.M * carrier % 16):
             return "stg"
         # A block taller than the drain emits ZERO stores.
@@ -4661,8 +4647,8 @@ class CompiledMoeGemm:
       * ``token``  — (1, T, K) row-major (A); T == S for NONE.
       * ``weight`` — (E, N, K) row-major (B, per-expert; bit-identical to cuDNN's
         ``[E, H, N]`` column-major-in-H×N layout).
-      * ``first_token_offset`` — (E,) int32: group g spans token rows
-        ``[fto[g], fto[g+1])`` (last group → S).
+      * ``first_token_offset`` — (G+1,) explicit boundaries:
+        group g spans ``[fto[g], fto[g+1])``.
       * ``output`` — (1, S, N) row-major."""
 
     chain: FusionChain
@@ -4740,11 +4726,9 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, self.chain, (S, N, K))}; " f"got {tuple(t.shape)}"
                 )
-        _initialize_reduction_outputs(self.chain, outputs, stream)
-        # num_experts = weight batch (E); num_groups = first_token_offset len
-        # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
-        num_groups = int(first_token_offset.shape[0])
+        num_groups = _moe_num_groups(first_token_offset, num_experts)
+        _initialize_reduction_outputs(self.chain, outputs, stream)
         # Permute to the kernel's (S,K,1)/(N,K,E)/(S,N,1) layout.
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
@@ -4877,9 +4861,9 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"multi-GEMM MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
-        _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0].shape[0])
-        num_groups = int(first_token_offset.shape[0])
+        num_groups = _moe_num_groups(first_token_offset, num_experts)
+        _initialize_reduction_outputs(chain, outs, stream)
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]
@@ -4903,7 +4887,7 @@ class CompiledMoeGemm:
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(
-                    f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
+                    f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the number of groups); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
@@ -4938,15 +4922,13 @@ def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight
     m, n, k = map(int, mnk)
     e = int(weights[0].shape[0])
     offsets = _offset_vector(offsets)
-    g = int(offsets.shape[0])
+    g = _moe_num_groups(offsets, e)
     if chain.quants and (m, n) != (chain.matmul.M, chain.matmul.N):
         runtime_chain = replace(chain, matmul=replace(chain.matmul, M=m, N=n))
         try:
             _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
         except NotImplementedError as exc:
             raise ValueError(str(exc)) from exc
-    if _moe_aligned_offsets(chain, cfg) and n % _moe_required_offset_multiple(chain, cfg):
-        raise ValueError("MoE weight-by-token runtime S violates the compiled global-descriptor alignment")
     if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.moe.offset_multiple, chain.matmul.N):
         raise ValueError("MoE weight-by-token runtime S violates the compiled STG chunk alignment")
     for quant in chain.quants:
@@ -5104,8 +5086,8 @@ class CompiledMoeBlockScaleGemm:
       * ``sfa``    — token SF, F8_128x4-reordered + padded to 128 rows PER GROUP,
         then concatenated (Σ ceil(group_m/128) blocks).
       * ``sfb``    — weight SF, F8_128x4-reordered, per-expert.
-      * ``first_token_offset`` — (num_groups,) int32/int64; group g spans token
-        rows ``[fto[g], fto[g+1])`` (last → S). Group sizes arbitrary (NOT
+      * ``first_token_offset`` — (num_groups+1,) int32/int64; group g spans token
+        rows ``[fto[g], fto[g+1])``. Group sizes arbitrary (NOT
         128-aligned); the scheduler tracks each group's start SF-block.
       * ``output`` — (1, S, N) row-major.
 
@@ -5200,20 +5182,18 @@ class CompiledMoeBlockScaleGemm:
                     f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
                     f"got {tuple(t.shape)}"
                 )
+        num_experts = int(weight.shape[0])
+        num_groups = _moe_num_groups(first_token_offset, num_experts)
         scale_blob_reason = _grouped_row_quant_scale_blob_reject(
             self.chain,
             outputs,
             S,
             N,
-            int(first_token_offset.shape[0]),
+            num_groups,
         )
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
-        # num_experts = weight batch (E); num_groups = first_token_offset len
-        # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
-        num_experts = int(weight.shape[0])
-        num_groups = int(first_token_offset.shape[0])
         # Permute to inner-plane layouts (batch last). The host rebuilds SF
         # descriptors from .iterator, so the SF permute just preserves the base ptr.
         a_perm = token.permute(1, 2, 0)
@@ -5294,7 +5274,7 @@ class CompiledMoeBlockScaleGemm:
                         raise ValueError(reason)
                 token_sf = []  # Linear inputs do not use segmented F8_128x4 capacity.
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
-            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
+            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), _moe_num_groups(fto, int(weights[0].shape[0])))
             _r_sf = _sf_blob_reject(
                 [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]
                 + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
@@ -5386,18 +5366,18 @@ class CompiledMoeBlockScaleGemm:
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
                     f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
+        num_experts = int(b_slots[0][0].shape[0])
+        num_groups = _moe_num_groups(first_token_offset, num_experts)
         scale_blob_reason = _grouped_row_quant_scale_blob_reject(
             chain,
             outs,
             S,
             N,
-            int(first_token_offset.shape[0]),
+            num_groups,
         )
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(chain, outs, stream)
-        num_experts = int(b_slots[0][0].shape[0])
-        num_groups = int(first_token_offset.shape[0])
         a0, b0 = a_slots[0][0], b_slots[0][0]
         a_stride_perms = [t.permute(1, 2, 0) for (t, _sf) in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for (t, _sf) in b_slots]
@@ -5428,7 +5408,7 @@ class CompiledMoeBlockScaleGemm:
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(
-                    f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
+                    f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the number of groups); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)

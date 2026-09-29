@@ -834,7 +834,7 @@ def _emit_reduction_atomic(
     `row < M` / `col_j + vsize <= N` from the drain; the TMA arm has neither, so
     it re-applies them here. Each subchunk divides the column boundary alignment,
     so its local fold never mixes real columns with OOB ones. N-grouped MoE
-    uses both the offset-value promise and S, the implicit final endpoint."""
+    uses both the offset-value promise and the token capacity S."""
     body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, chain, vsize)
     if row_pred is None:
         return body
