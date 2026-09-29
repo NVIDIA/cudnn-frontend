@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Native launch-cache and output-layout regressions for the JAX integration."""
+"""Native KDA execution, launch-cache, and output-layout regressions."""
 
 import importlib
+import math
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ import cutlass.cute as cute
 import cudnn
 from cudnn.frost.workspace import Workspace
 from cudnn.linear_attention.frost.kda_engine import build_kda, build_kda_summary
+from cudnn.linear_attention.ops import kimi_delta_attention
 
 from linear_attention.test_la import CUDNN_DTYPE, LEAF_NAMES, make_case, thd_tensors
 
@@ -126,6 +128,55 @@ def test_kda_gate_decay_split_is_opt_in(backward):
     enabled, *_ = make_plan(64, (1, 1, 1), backward=backward, invariant=False, enable_gate_decay_split=True)
     assert not default.chain and not default.split
     assert not enabled.chain and enabled.split
+
+
+def test_kda_default_retains_history_across_gate_decay_cut():
+    """The default schedule retains history that gate-only warmup would drop.
+
+    With two equal live key channels, choosing alpha so that
+    ``alpha * (1 - ||k||^2) == -1`` preserves the state component parallel to
+    k even though every individual channel has ``alpha**16 < exp(-10)``.  An
+    impulse immediately before the historical warmup window must therefore
+    remain visible after the cut.
+    """
+    total, heads, dim = 3840, 96, 64
+    cut, impulse = 1280, 1263  # historical warmup starts at 1264
+    live = 1.2265625  # exactly representable in bfloat16
+    alpha = 1.0 / (2.0 * live * live - 1.0)
+    log_alpha = float(torch.tensor(math.log(alpha), dtype=torch.float32))
+
+    q = torch.zeros(total, heads, dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros_like(q)
+    q[..., :2] = live
+    k[..., :2] = live
+    v = torch.zeros_like(q)
+    v[impulse, :, 0] = 1.0
+    g = torch.full((total, heads, dim), log_alpha, dtype=torch.float32, device="cuda")
+    beta = torch.ones(total, heads, dtype=torch.float32, device="cuda")
+    cu = torch.tensor([0, total], dtype=torch.int32, device="cuda")
+
+    actual, _ = kimi_delta_attention(q, k, v, g, beta, cu, plan_name="kda_frost")
+
+    # Independent recurrence over the only two live key channels.  Use the
+    # rounded float32 gate value consumed by the kernel, not ideal alpha.
+    rounded_alpha = math.exp(log_alpha)
+    state = [0.0, 0.0]
+    expected = []
+    scale = 1.0 / math.sqrt(dim)
+    for token in range(total):
+        state[0] *= rounded_alpha
+        state[1] *= rounded_alpha
+        residual = (1.0 if token == impulse else 0.0) - live * (state[0] + state[1])
+        state[0] += live * residual
+        state[1] += live * residual
+        if cut <= token < cut + 16:
+            expected.append(scale * live * (state[0] + state[1]))
+
+    expected = torch.tensor(expected, dtype=torch.float64, device="cuda")[:, None]
+    observed = actual[cut : cut + 16, :, 0].double()
+    relative_l2 = ((observed - expected).square().mean() / expected.square().mean()).sqrt().item()
+    assert relative_l2 < 0.03, f"history after gate-decay cut was lost: relative L2 {relative_l2:.5f}"
+    assert alpha**16 < math.exp(-10), "counterexample must cross the splitter's decay threshold"
 
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
