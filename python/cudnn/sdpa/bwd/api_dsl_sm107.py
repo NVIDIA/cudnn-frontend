@@ -307,8 +307,11 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # dS workspace dtype: the io dtype on the half chain; e4m3 (shipped) or bf16 (the twin) on the fp8 chain (`_ds_torch_dtype`).
         self._ds_dtype = self._ds_torch_dtype()
         self._bpe_ds = self._ds_dtype.itemsize
-        # attn_scale is OPTIONAL on the graph (see the SM100 adapter for the story).
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        # attn_scale is OPTIONAL on the graph: None = absent -> 1/sqrt(d) (the SM100 adapter's story).  An EXPLICIT 0.0 is a
+        # valid declared scale -- uniform P, dQ = dK = 0 exactly, dV = sum(dO) / S_kv -- that the analyzer preserves
+        # (`scale = float(attn_scale)`), so it is preserved here too; `or == 0.0` ran such a graph at 1/sqrt(d) and returned
+        # nonzero dQ / dK (Codex review on #1212).  Pinned by test_explicit_zero_attn_scale_* (both rows, host + Rubin).
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape: the q loop walks 128-row q tiles, a cga2 pair owns a
         # 256-row kv block.  The padded operands are staged (zero-filled), see the module doc.

@@ -464,14 +464,15 @@ def _padded_keep(sq, skv, seq_q_lens, seq_kv_lens, dev="cuda"):
     return (qi < lq) & (ki < lk)
 
 
-def _reference64(q, k, v, do, keep=None, group=1):
+def _reference64(q, k, v, do, keep=None, group=1, scale=None):
     """fp64 attention backward on the STORAGE-rounded operands.  ``keep`` is a bool mask broadcastable to
     [B, 1, S_q, S_kv].  GQA groups q heads CONTIGUOUSLY (kv head h serves q heads h*g .. h*g+g-1), the convention the
-    analyzer, the adapters and ``sdpa.fp8_ref.gqa_kv_head`` share."""
+    analyzer, the adapters and ``sdpa.fp8_ref.gqa_kv_head`` share.  ``scale`` None = 1/sqrt(d); an explicit value is the
+    graph's attn_scale (0.0 included: uniform P over the kept keys, dQ = dK = 0, dV = sum(dO) / n_kept)."""
     q64, k64, v64, do64 = (x.double() for x in (q, k, v, do))
     kx = k64.repeat_interleave(group, dim=1) if group > 1 else k64
     vx = v64.repeat_interleave(group, dim=1) if group > 1 else v64
-    scale = 1.0 / math.sqrt(q.shape[3])
+    scale = 1.0 / math.sqrt(q.shape[3]) if scale is None else float(scale)
     s = (q64 @ kx.transpose(-1, -2)) * scale
     if keep is not None:
         s = s.masked_fill(~keep, float("-inf"))
@@ -531,6 +532,7 @@ def _run(
     runs=1,
     seq_lens=None,
     ws_poison=None,
+    attn_scale=None,
     **sdpa_kwargs,
 ):
     """Build, PIN the engine, execute ``runs`` times and hand back every run's (dQ, dK, dV) plus the fp64 oracle.
@@ -539,7 +541,8 @@ def _run(
     (a zero-initialized output hides a skipped store).  ``ws_poison`` (a BYTE, e.g. ``0xFF`` = NaN in every dtype the chain
     stores) pre-fills the WORKSPACE before every run: a stage that reads a scratch region before writing it -- a stage-3
     GEMM reaching a dS tile the main kernel skipped -- then surfaces as NaN in an output instead of riding a stale zero.
-    ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask."""
+    ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask.  ``attn_scale`` (None = 1/sqrt(d) on the graph and the
+    oracle alike) declares an EXPLICIT scale on both -- 0.0 included, a valid scale the adapters must preserve."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -551,7 +554,7 @@ def _run(
     k, v = draw(b, skv, hkv), draw(b, skv, hkv)
     if seq_lens is not None:
         keep = _padded_keep(sq, skv, *seq_lens) if keep is None else (keep & _padded_keep(sq, skv, *seq_lens))
-    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=attn_scale)
     o = _bshd_empty(b, sq, hq, _D, dt)
     o.copy_(o64.to(dt))
     lse = lse64.float()
@@ -559,7 +562,8 @@ def _run(
         lse = lse.masked_fill(all_masked, 0.0)
     if seq_lens is not None:
         sdpa_kwargs["padded"] = True
-    g, t, (dq_t, dk_t, dv_t) = _build_graph(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dt=dt, scale=None if omit_scale else "default", **sdpa_kwargs)
+    graph_scale = None if omit_scale else ("default" if attn_scale is None else attn_scale)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dt=dt, scale=graph_scale, **sdpa_kwargs)
     select_engine(g, _ENGINE)
     g.check_support()
     g.build_plans()
@@ -649,6 +653,17 @@ def test_non_tile_multiple_causal(sq, skv):
 def test_default_attn_scale():
     """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d), which the oracle assumes either way."""
     _run(omit_scale=True).check()
+
+
+@requires_rubin
+def test_explicit_zero_attn_scale_is_preserved():
+    """An EXPLICIT attn_scale = 0.0 is a valid declared scale, not an omission: P is uniform over the keys, so dQ = dK = 0
+    EXACTLY (the kernel's ``dS = attn_scale * P * (dP - delta)`` carries the 0.0) and dV = sum(dO) / S_kv.  The adapter used to
+    fold ``== 0.0`` into the None default and run the graph at 1/sqrt(d): max|dQ| 1.14, max|dK| 0.97, dV off by 0.69 at this
+    shape (Codex review on #1212).  Stats is the exact LSE of the zero scores, log(S_kv), as the oracle computes it."""
+    run = _run(b=1, hq=1, sq=128, skv=256, attn_scale=0.0, poison=float("nan")).check()
+    for name, got in zip(("dQ", "dK"), run.outs[0][:2]):
+        assert (got.float() == 0).all(), f"{name}: attn_scale = 0.0 must give an EXACT zero, got max |{name}| = {got.float().abs().max().item():.4f}"
 
 
 @requires_rubin
@@ -832,7 +847,9 @@ def _adapter_desc(shape, dtype, name):
     )
 
 
-def _adapter(cls, b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, grad_dt=None, **kw):
+def _adapter(cls, b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, grad_dt=None, d=_D, **kw):
+    """Construct ``cls`` host-side over BSHD-physical descs (no kernel, no compile).  ``scale_softmax`` defaults to 1/sqrt(d)
+    unless ``kw`` carries one (None included -- the graph-omitted case); ``d`` widens the shape for the SM100 d512 adapter."""
     from cudnn.api_base import TensorDesc
 
     hkv = hq if hkv is None else hkv
@@ -841,18 +858,40 @@ def _adapter(cls, b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, grad_
         dtype=torch.float32, shape=(b, hq, sq, 1), stride=(hq * sq, sq, 1, 1), stride_order=(3, 2, 1, 0), device=torch.device("cuda", 0), name="stats"
     )
     return cls(
-        sample_q=_adapter_desc((b, hq, sq, _D), dt, "q"),
-        sample_k=_adapter_desc((b, hkv, skv, _D), dt, "k"),
-        sample_v=_adapter_desc((b, hkv, skv, _D), dt, "v"),
-        sample_o=_adapter_desc((b, hq, sq, _D), dt, "o"),
-        sample_do=_adapter_desc((b, hq, sq, _D), dt, "dO"),
+        sample_q=_adapter_desc((b, hq, sq, d), dt, "q"),
+        sample_k=_adapter_desc((b, hkv, skv, d), dt, "k"),
+        sample_v=_adapter_desc((b, hkv, skv, d), dt, "v"),
+        sample_o=_adapter_desc((b, hq, sq, d), dt, "o"),
+        sample_do=_adapter_desc((b, hq, sq, d), dt, "dO"),
         sample_stats=stats,
-        sample_dq=_adapter_desc((b, hq, sq, _D), grad_dt, "dQ"),
-        sample_dk=_adapter_desc((b, hkv, skv, _D), grad_dt, "dK"),
-        sample_dv=_adapter_desc((b, hkv, skv, _D), grad_dt, "dV"),
-        scale_softmax=1.0 / math.sqrt(_D),
+        sample_dq=_adapter_desc((b, hq, sq, d), grad_dt, "dQ"),
+        sample_dk=_adapter_desc((b, hkv, skv, d), grad_dt, "dK"),
+        sample_dv=_adapter_desc((b, hkv, skv, d), grad_dt, "dV"),
+        scale_softmax=kw.pop("scale_softmax", 1.0 / math.sqrt(d)),
         **kw,
     )
+
+
+@pytest.mark.parametrize("row", ["sm107", "sm107_fp8", "sm100_d512"])
+def test_explicit_zero_attn_scale_survives_the_adapters(row):
+    """Host pin (no kernel): ``_initialize_implementation`` defaults ``scale_softmax`` ONLY when it is None (attn_scale omitted
+    on the graph) and keeps an explicit 0.0 -- the analyzer preserves ``attn_scale=0.0`` as 0.0 and it is a valid declared
+    scale (uniform P: dQ = dK = 0, dV = sum(dO) / S_kv).  Both sm107 rows (the fp8 row inherits the initializer) and the SM100
+    d512 adapter, whose clause was the identical ``or == 0.0`` one-liner and has no GPU on this host -- the Rubin numerics live
+    in ``test_explicit_zero_attn_scale_is_preserved`` (this suite and the fp8 one)."""
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+
+    e4m3 = torch.float8_e4m3fn
+    cls, kw = {
+        "sm107": (SdpaBwdDslSm107, dict(dt=torch.bfloat16)),
+        "sm107_fp8": (SdpaBwdDslSm107Fp8, dict(dt=e4m3, grad_dt=e4m3)),
+        "sm100_d512": (SdpaBwdDslSm100, dict(dt=torch.bfloat16, d=512)),
+    }[row]
+    d = kw.get("d", _D)
+    assert _adapter(cls, scale_softmax=0.0, **kw).scale_softmax == 0.0, "an explicit attn_scale = 0.0 must survive the adapter"
+    assert _adapter(cls, scale_softmax=None, **kw).scale_softmax == pytest.approx(1.0 / math.sqrt(d)), "None (omitted) still defaults to 1/sqrt(d)"
+    assert _adapter(cls, scale_softmax=0.125, **kw).scale_softmax == 0.125
 
 
 def test_adapter_chunks_are_divisors_that_fit_the_budget():

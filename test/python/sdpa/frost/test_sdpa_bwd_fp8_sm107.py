@@ -577,6 +577,7 @@ def _run_fp8(
     grad_dtype=_T_E4M3,
     request_amax=_AMAX,
     ws_poison=None,
+    attn_scale=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
@@ -584,7 +585,8 @@ def _run_fp8(
     PIN the engine, execute ``runs`` times and hand back every run's outputs plus what to compare them with.
     ``ws_poison`` (a BYTE, 0xFF = NaN in e4m3 / bf16 / fp32) pre-fills the WORKSPACE before every run, so a stage-3 GEMM
     reading a dS tile the main kernel skipped lands NaN in an output (``check`` asserts finite first).  ``left`` without
-    ``causal`` is a sliding window alone."""
+    ``causal`` is a sliding window alone.  ``attn_scale`` (None = 1/sqrt(d)) declares an EXPLICIT scale on the graph and the
+    oracle alike -- 0.0 included, a valid scale the adapter must preserve."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
 
@@ -604,7 +606,7 @@ def _run_fp8(
     k8, k_ds = quant(k32)
     v8, v_ds = quant(v32)
     do8, do_ds = quant(do32)
-    scale = 1.0 / math.sqrt(_D)
+    scale = 1.0 / math.sqrt(_D) if attn_scale is None else float(attn_scale)
     s_scale = get_fp8_scale_factor(1.0, _T_E4M3)  # P <= 1
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
@@ -858,6 +860,23 @@ def test_two_launches_are_bitwise_and_race_free(ds_knob):
             assert n_diff == 0, f"{name} {which}: {n_diff} elements differ"
         for name in ("dQ", "dK", "dV", "dP"):
             assert run.amax[i][name].item() == run.amax[j][name].item(), f"amax_{name} {which} differs"
+
+
+@requires_rubin
+def test_explicit_zero_attn_scale_is_preserved(ds_knob):
+    """The fp8 row inherits the half row's initializer, so the same ``or == 0.0`` folded an explicit attn_scale = 0.0 into
+    1/sqrt(d) (max|dQ| 0.81, max|dK| 0.94, dV off by 0.62, amax_dP 0.25 at this shape with unit scalars -- Codex review on
+    #1212).  Preserved, P is uniform: dQ = dK = 0 EXACTLY on both dS knobs (e4m3: ``dS_q = e4m3(0 * scale_dP)`` = 0 into the fp8
+    GEMM arm; bf16: a zero workspace), amax_dQ = amax_dK = amax_dP = 0, dV = sum(dO) / S_kv against the oracle at the suite's
+    tolerance (``check``, which also asserts every output finite)."""
+    run = _run_fp8(b=1, hq=1, sq=128, skv=256, attn_scale=0.0).check()
+    for name in ("dQ", "dK"):
+        got = run.outs[0][name].float()
+        assert (
+            got == 0
+        ).all(), f"{name}: attn_scale = 0.0 must give an EXACT zero on the dS knob {run.ds_knob} chain, got max |{name}| = {got.abs().max().item():.4f}"
+    for name in ("dQ", "dK", "dP"):
+        assert run.amax[0][name].item() == 0.0, f"amax_{name} must be exactly 0 under a uniform P (dS == 0)"
 
 
 def _run_on_knob(monkeypatch, knob, **kw):
