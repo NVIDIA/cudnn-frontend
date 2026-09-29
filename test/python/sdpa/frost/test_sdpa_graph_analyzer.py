@@ -2702,14 +2702,26 @@ def test_fp8_bwd_graph_validates_natively_with_a_frost_candidate():
 
 @pytest.mark.parametrize(
     "d, sm_version, admitted",
-    [(256, 107, True), (256, 110, True), (256, 100, False), (256, 103, False), (128, 107, True), (128, 100, True)],
-    ids=["d256-sm107", "d256-sm110", "d256-sm100", "d256-sm103", "d128-sm107", "d128-sm100"],
+    [
+        (256, 107, True),
+        (256, 110, True),
+        (256, 119, True),
+        (256, 120, False),
+        (256, 100, False),
+        (256, 103, False),
+        (128, 107, True),
+        (128, 100, True),
+    ],
+    ids=["d256-sm107", "d256-sm110", "d256-sm119", "d256-sm120", "d256-sm100", "d256-sm103", "d128-sm107", "d128-sm100"],
 )
 def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_version, admitted):
     """The C++ node (``sdpa_fp8_bwd.h`` pre_validate_node) admits per-tensor FP8
-    d_qk == d_v == 256 on SM 10.7 and newer for the frontend engines, spelled
-    like the MXFP8 d256 exemption; below Rubin the classic ``hidden_dim``
-    decline stands and d <= 128 is unchanged everywhere.  Host-side: the
+    d_qk == d_v == 256 on the Rubin line ONLY -- SM 10.7-11.9, the range of the
+    one row that serves it (``sdpa_bwd_sm107_fp8``) -- for the frontend engines,
+    spelled like the MXFP8 d256 exemption; below Rubin AND on SM120 the classic
+    ``hidden_dim`` decline stands (an unbounded ``>= 107`` admitted SM120 and
+    failed late in create_execution_plans -- CodeRabbit on #1212), and d <= 128
+    is unchanged everywhere.  Host-side: the
     pygraph's ``sm_version`` pre-sets the C++ context, so
     populate_sm_version_from_device() never queries a device.  FROST is switched
     OFF so validate() takes the classic eager C++ path -- with a python candidate
