@@ -122,6 +122,7 @@ class CompiledKda:
     summary runs k in place of v, so M is (DK, DK) while H and X are (DV, DK)."""
 
     def __init__(self, node, kernel_module):
+        """Resolve graph attributes and select the forward scheduling family."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.kda_chain_forward_f16 import build_chain_forward, run_chain_forward
@@ -442,6 +443,7 @@ class CompiledKdaBwd:
     every sequence gathered into ``d_initial_state``."""
 
     def __init__(self, node, bwd_module, recompute_module):
+        """Resolve graph attributes and select the backward scheduling family."""
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -928,6 +930,7 @@ class CompiledKdaSummary:
     alone."""
 
     def __init__(self, node, recompute_module):
+        """Resolve graph attributes and select the forward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
@@ -1337,6 +1340,7 @@ class CompiledKdaSummaryBwd:
     state chain whose tail is ``d_initial_state`` and whose running product is ``transition``."""
 
     def __init__(self, node, summary_module):
+        """Resolve graph attributes and select the backward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
