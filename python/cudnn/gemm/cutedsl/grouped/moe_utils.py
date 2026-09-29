@@ -23,8 +23,7 @@ from typing import Literal, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.experimental.primitives as _nvvm
-from cutlass.cute.nvgpu import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute.typing import AddressSpace, Pointer
 from cutlass.cutlass_dsl import dsl_user_op, Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
@@ -114,15 +113,7 @@ def acquire_tma_desc(raw_ptr: Pointer, *, loc=None, ip=None) -> None:
     ``raw_ptr`` (e.g. on CUDA-graph replay or when a workspace is reused). The
     fence covers exactly one 128-byte descriptor.
     """
-    _nvvm.fence_proxy_acquire(
-        _nvvm.MemScope.GPU,
-        gmem_ptr_to_generic(raw_ptr, loc=loc, ip=ip),
-        TensormapDescBytes,
-        from_proxy=_nvvm.Proxy.GENERIC,
-        to_proxy=_nvvm.Proxy.TENSORMAP,
-        loc=loc,
-        ip=ip,
-    )
+    cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(raw_ptr, loc=loc, ip=ip), loc=loc, ip=ip)
 
 
 def _get_tma_field_attr_name(atom_type: ir.Type) -> str:

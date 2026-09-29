@@ -845,6 +845,9 @@ def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
     """Distinct dense outputs share one compiled kernel, with or without a caller workspace."""
     from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
+    # The wrapper memo is consulted before the backend cache, so a prior test's
+    # entry could bypass compile(); give this test an empty one.
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "_wgrad_wrapper_memo", {})
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
     compile_count = {"value": 0}
 
