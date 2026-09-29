@@ -151,7 +151,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (256, 256)): (False, 29, 11),
     ("fp8", (256, 256)): (False, 29, 11),
     ("mxfp8", (256, 256)): (False, 29, 11),
-    ("f16", (512, 512)): (True, 22, 14),
+    ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
     ("fp8", (512, 512)): (True, 22, 14),
     ("mxfp8", (512, 512)): (False, 22, 14),
 }

@@ -11,7 +11,10 @@ packed ``[1,QH,T]`` LSE.  The dense ``[B,S,H,D]`` path is byte-identical.
 Python port (from the pre-upstream DSL) of the C++ Rubin baseline
 ``kernels/c++/sm107/sdpa/prefill/prefill_sdpa_d512_f16.cu`` — same kernel,
 different language.  Pipeline shape, TMEM/SMEM layout, barrier inventory,
-scheduler, warp dispatch, and register split mirror the C++ source 1:1.
+scheduler, warp dispatch, and register split mirror the C++ source 1:1 --
+with one deliberate departure: under ``CORR_READY_BEFORE_DONE`` the sg1
+correction releases O to BMM2(i) BEFORE BMM2(i-1) completes on every iteration
+where no lane of the warp rescales (the C++ :839-848 waits first).
 
 Pipeline shape (cluster (4, 1, 1) = two cga2 sub-groups):
   sg0 (CTAs 0, 1):  TMA-LDG Q + K_ring; BMM1 = Q*K^T → S_acc; streaming
@@ -138,8 +141,38 @@ O_STORE_STREAM: bool = True
 # of time @ S_KV=1024, one LSB @512, -1.1 pt @8192 (+0.50 % vs +1.63 % stream alone); this kernel's A/B is owed with the
 # one above.  False = the classic per-block body (ld -> wait -> convert -> store -> chunk arrive), verbatim.
 O_EPI_PIPELINE: bool = True
-if not (isinstance(O_STORE_STREAM, bool) and isinstance(O_EPI_PIPELINE, bool)):
-    raise TypeError(f"{__name__}: O_STORE_STREAM / O_EPI_PIPELINE are bool module constants; got {O_STORE_STREAM!r} / {O_EPI_PIPELINE!r}")
+# sg1 correction hand-off -- the third lever, same discipline.  True = BALLOT-FIRST release: on a KV iteration where the
+# correction's ``vote.all(alpha == 1)`` says no lane of this warp rescales, the warp arrives BOTH ``mb_bmm2_ready`` half slots
+# BEFORE it waits ``mb_bmm2_done[i-1]``; the wait itself stays unconditional and single-site (one ring wait per iteration
+# either way), it only moves behind the fast-arm arrives.  Why that is legal: on such an iteration the correction writes
+# NOTHING to O, so BMM2(i) has no data reason to wait for BMM2(i-1) -- consecutive ``tcgen05.mma`` from one thread into the
+# same TMEM accumulator are ordered by the tensor pipe (the k-steps inside one ``mma_ss`` rely on exactly this), and its two
+# N-halves target disjoint columns.  The wait exists only to order a RESCALE's ``tcgen05.st`` against BMM2(i-1), and the
+# rescale arm keeps it: a warp that does rescale waits ``bmm2_done[i-1]`` first and arrives each half slot after that half's
+# ``tcgen05_wait(STORE)``, verbatim.  The two arms are exclusive per warp on the warp-uniform ballot bit, so every lane
+# arrives every slot exactly once per iteration: SUM(issuing lanes) = 4 warps x 32 lanes x 2 CTAs = 256 == init, unchanged;
+# ``mb_alpha_xfer_empty`` (128) moves right behind the ballot in both arms (alpha is in a register the vote consumed).  What it
+# removes is the per-iteration round trip commit(i-1) -> mbarrier -> 8-warp wake -> 256-lane cluster arrive -> leader wake
+# before BMM2(i) can issue: MEASURED 0.24 us of sg1 tensor-pipe idle per KV iteration (1.103 vs the 0.862 us MMA floor,
+# NCU_BF16.md s8), 15 % of a 4-tile item.  With bf16's RESCALE_THRESHOLD of 8 (log2 units) the fast arm runs on ~every
+# in-loop iteration of ordinary data, so the standard bitwise gate does NOT exercise the slow arm -- the rescale-storm cells
+# (K tile t scaled by 32**t; per-warp divergent arms) are the gate for it.  This DEPARTS from the C++ mirror
+# (prefill_sdpa_d512_f16.cu:839-848 waits bmm2_done before the ballot).  MEASURED (fractal-ts2-128, 204 SMs, GPU 1, SM clock locked
+# 2376 MHz, A/B/A x3, controls <= 0.05 %, 2026-09-29, vs the branch head, B=1 H_Q=64 H_KV=1 S_Q=16K d=512 bf16 dense): **+2.89 / +1.97 /
+# +0.52 / +0.13 % of time at S_KV = 512 / 1024 / 2048 / 8192** (0.606 -> 0.589, 1.037 -> 1.017, 1.933 -> 1.923, 7.349 -> 7.340 ms),
+# +0.72 % on the S_Q = S_KV = 8192 top_left + window-128 MQA shape (0.278 -> 0.276 ms, 2 LSB of the print).  The gain is a per-ITEM
+# 0.1-0.2 us, not the per-iteration 0.24 us: at 8192 it is neutral, so the steady-state pacer is the softmax -> P-ring -> BMM2 chain,
+# not this hand-off (frost_dev/results/d512_bf16_fixed_cost_2026-09-29/LEVERS_BF16.md "Results").  Bitwise vs the branch head on the
+# 9-case gate + 12 owed / rescale-storm cells (K tile t x 32**t forces the slow arm on every iteration; per-warp divergent arms);
+# 12 fresh-process launches, 0 hangs.  SASS: +2 USYNCS.ARRIVE, REG 205, 0 spills, no new wait instantiation.
+# False = today's order (wait bmm2_done -> ballot -> [rescale half 1] -> alpha_empty -> ready[0] -> [rescale half 2] -> ready[1]),
+# kept verbatim so the base is one flip away (cubin-md5-identical).
+CORR_READY_BEFORE_DONE: bool = True
+if not (isinstance(O_STORE_STREAM, bool) and isinstance(O_EPI_PIPELINE, bool) and isinstance(CORR_READY_BEFORE_DONE, bool)):
+    raise TypeError(
+        f"{__name__}: O_STORE_STREAM / O_EPI_PIPELINE / CORR_READY_BEFORE_DONE are bool module constants; "
+        f"got {O_STORE_STREAM!r} / {O_EPI_PIPELINE!r} / {CORR_READY_BEFORE_DONE!r}"
+    )
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -370,8 +403,13 @@ assert _TMEM_SG1_COLS <= 576, f"sg1 O TMEM overflow: {_TMEM_SG1_COLS} > 576"
 # | mb_tma_v_full[s]         | STAGES_KV        | ONE_LANE                   | sg1 TMA-LDG : arrive_expect_tx (V bytes)        | sg1 MMA (BMM2)                        | cga2 leader-only                                    |
 # | mb_tma_v_empty[s]        | STAGES_KV        | KV_EMPTY_ARRIVERS (=1)     | sg1 MMA : arrive_mma after BMM2 commit          | sg1 TMA-LDG (V_ring back-pressure)    | leader-multicast; pre-arm via PipelineState(0,1)    |
 # | mb_bmm1_done[p]          | XFER_STAGES (=2) | ONE_LANE                   | sg0 MMA : arrive_mma after BMM1 commit          | sg0 softmax                           | local; not bootstrapped                             |
-# | mb_bmm2_done[p]          | XFER_STAGES      | ONE_LANE                   | sg1 MMA : arrive_mma after BMM2 commit          | sg1 corr (epilogue gate)              | local; not bootstrapped                             |
-# | mb_bmm2_ready[p*2+c]     | XFER_STAGES*2(=4)| SM_LANES_TOTAL (=256)      | sg1 corr (all-thread) : arrive_on_peer→leader   | sg1 MMA leader (per-half-N-block)     | cga2 leader-waited                                  |
+# | mb_bmm2_done[p]          | XFER_STAGES      | ONE_LANE                   | sg1 MMA : arrive_mma after BMM2 commit          | sg1 corr (rescale gate; ONE wait per  | local; not bootstrapped.  CORR_READY_BEFORE_DONE:   |
+# |                          |                  |                            |                                                 | iter + the final epilogue wait)       | the in-loop wait sits AFTER the fast-arm ready      |
+# |                          |                  |                            |                                                 |                                       | arrives; count / stage / phase unchanged            |
+# | mb_bmm2_ready[p*2+c]     | XFER_STAGES*2(=4)| SM_LANES_TOTAL (=256)      | sg1 corr (all-thread) : arrive_on_peer→leader   | sg1 MMA leader (per-half-N-block)     | cga2 leader-waited.  Per (iter, slot) every lane    |
+# |                          |                  |                            | FAST arm (vote.all alpha==1): both slots BEFORE |                                       | arrives from exactly ONE of the two warp-uniform    |
+# |                          |                  |                            | the bmm2_done wait; SLOW arm: after each half's |                                       | arms: SUM = 4 warps x 32 x 2 CTAs = 256 == init     |
+# |                          |                  |                            | tcgen05_wait(STORE)  (iter 0: both, unchanged)  |                                       |                                                     |
 # | mb_s_acc_empty[p]        | XFER_STAGES      | SM_LANES_TOTAL (=256)      | sg0 softmax (all-thread) : arrive_on_peer→leader| sg0 MMA leader (S_acc TMEM free)      | cga2 leader-waited; pre-arm via PipelineState(0,1)  |
 # | mb_p_xfer_full[p]        | XFER_STAGES      | leader: CTA_MMA(=2)        | sg0 softmax bulk_copy→peer; sg1 peer→leader DSMEM| sg1 MMA leader (BMM2 P operand)       | P12; leader=2 / non-leader=1                        |
 # |                          |                  | non-leader: ONE_LANE(=1)   |                                                  |                                       |                                                     |
@@ -1189,9 +1227,12 @@ def _compute_warp_group(
         phases via PipelineState(0, 1).
 
     sg1 path (port of C++ lines 750-1024):
-        Correction + epilogue — per kv iter wait alpha (local mbar), apply
-        alpha to O TMEM in two halves (gates BMM2 sub-tile 0 / 1 via
-        mb_bmm2_ready), DSMEM-arrive empty alpha on sg0.  Epilogue: wait
+        Correction + epilogue — per kv iter wait alpha (local mbar), ballot
+        vote.all(alpha == 1); CORR_READY_BEFORE_DONE and no lane rescales:
+        arrive both mb_bmm2_ready slots, THEN wait bmm2_done[i-1]; otherwise
+        wait bmm2_done[i-1] and apply alpha to O TMEM in two halves (gates
+        BMM2 sub-tile 0 / 1 via mb_bmm2_ready after each half's store wait),
+        DSMEM-arrive empty alpha on sg0 right behind the ballot.  Epilogue: wait
         final BMM2, wait stats, normalize O by 1/ell + cast to half, store
         to sO with per-chunk mb_tma_o_full arrive, write LSE to GMEM,
         DSMEM-arrive empty stats on sg0.
@@ -1496,9 +1537,10 @@ def _compute_warp_group(
                     bars.mb_alpha_xfer_full[cur_parity].wait(alpha_full_state.phase, spin=SPIN_RING_WAITS)
                     alpha_full_state = advance(alpha_full_state, CFG.XFER_STAGES)
 
-                    # Wait prior BMM2 done so O is committed.
-                    bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
-                    sg1_bmm2_done_state = advance(sg1_bmm2_done_state, CFG.XFER_STAGES)
+                    if cutlass.const_expr(not CORR_READY_BEFORE_DONE):
+                        # Classic order: wait prior BMM2 done so O is committed, BEFORE the ballot (C++ :839).
+                        bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
+                        sg1_bmm2_done_state = advance(sg1_bmm2_done_state, CFG.XFER_STAGES)
 
                     # Read alpha[tid] from xfer_in[cur_parity].
                     alpha_addr = sAlpha_xfer_raw.subview(cur_parity * cutlass.Int32(CFG.TILE_M) + tid_in_wg)
@@ -1508,6 +1550,29 @@ def _compute_warp_group(
                     # lane's alpha == 1.0.
                     alpha_is_one = alpha_corr == cutlass.Float32(1.0)
                     all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
+
+                    if cutlass.const_expr(CORR_READY_BEFORE_DONE):
+                        # alpha(i) is in a register and the vote above consumed it: the slot goes back to sg0 now
+                        # (ONE site per iteration in this arm, 128 lanes == init).
+                        bars.mb_alpha_xfer_empty[cur_parity].arrive_on_peer(cross_sg_peer)
+                        # FAST arm.  No lane of this warp writes O this iteration, so BMM2(i) may queue behind BMM2(i-1) in
+                        # the tensor pipe: same-thread tcgen05.mma issue order carries the accumulator dependency, exactly as
+                        # the k-steps inside one mma_ss do, and the two N-halves write disjoint columns.  Release both halves
+                        # BEFORE waiting for BMM2(i-1) -- the commit -> 8-warp wake -> 256-lane cluster arrive -> leader wake
+                        # round trip (MEASURED 0.24 us per KV iteration) leaves the sg1 tensor pipe.  Warp-uniform branch on
+                        # the vote; LEADER arrives have no pred= path (P16), so a branch is the required form.  The slow arm
+                        # below arrives the same two slots after its rescales instead: exactly one arrive per lane per slot.
+                        if all_alpha_one:
+                            bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                            bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(
+                                leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
+                            )
+                        # BMM2(i-1) complete -- the ONE in-loop wait site (ring-wait pin), unconditional, now behind the
+                        # fast-arm arrives.  P14: one wait per iteration either way; done(i+1) cannot land on this stage
+                        # before this wait because ready(i+1) is arrived after it in program order.  In the slow arm this is
+                        # the gate that orders the rescale's tcgen05.st behind BMM2(i-1)'s accumulate.
+                        bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
+                        sg1_bmm2_done_state = advance(sg1_bmm2_done_state, CFG.XFER_STAGES)
 
                     # ---- Half-1: cols [0..TILE_O/2) ----
                     if ~all_alpha_one:
@@ -1525,11 +1590,15 @@ def _compute_warp_group(
                                 o_scaled,
                             )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                        if cutlass.const_expr(CORR_READY_BEFORE_DONE):
+                            # SLOW arm, half-1 ready -- after this half's stores drained (the fast arm arrived this slot above).
+                            bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-                    # Notify sg0 alpha slot empty.
-                    bars.mb_alpha_xfer_empty[cur_parity].arrive_on_peer(cross_sg_peer)
-                    # Half-1 ready — sg1 leader BMM2 sub-tile 0 unblocked.
-                    bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                    if cutlass.const_expr(not CORR_READY_BEFORE_DONE):
+                        # Notify sg0 alpha slot empty.
+                        bars.mb_alpha_xfer_empty[cur_parity].arrive_on_peer(cross_sg_peer)
+                        # Half-1 ready — sg1 leader BMM2 sub-tile 0 unblocked.
+                        bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                     # ---- Half-2: cols [TILE_O/2..TILE_O) ----
                     if ~all_alpha_one:
@@ -1548,11 +1617,17 @@ def _compute_warp_group(
                                 o_scaled,
                             )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                        if cutlass.const_expr(CORR_READY_BEFORE_DONE):
+                            # SLOW arm, half-2 ready.
+                            bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(
+                                leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
+                            )
 
-                    # Half-2 ready — sg1 leader BMM2 sub-tile 1 unblocked.
-                    bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(
-                        leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
-                    )
+                    if cutlass.const_expr(not CORR_READY_BEFORE_DONE):
+                        # Half-2 ready — sg1 leader BMM2 sub-tile 1 unblocked.
+                        bars.mb_bmm2_ready[cur_parity * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(
+                            leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
+                        )
 
             # ---- Final BMM2-done wait (always runs — empty path covered) ----
             bars.mb_bmm2_done[sg1_bmm2_done_state.idx].wait(sg1_bmm2_done_state.phase, spin=SPIN_RING_WAITS)
