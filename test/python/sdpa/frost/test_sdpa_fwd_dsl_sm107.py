@@ -3094,3 +3094,201 @@ class TestStagedHalf:
     test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
     test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
     test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+
+
+# ============================================================================
+# Runtime regression for the mixed-warp correction hand-off (PR #1288, Codex P2)
+#
+# The O-store stream re-orders the d512 epilogue: BMM2-ready arrives early
+# and the correction warps rescale (alpha != 1) or pass through (alpha == 1)
+# PER ROW GROUP.  The source / SASS pins above protect the lowering; this is
+# the numerical evidence that an early arrival stays correct when some warps
+# rescale and others do not.  Geometry from the review's independent probe:
+#   * Q[..., 0] repeats 32-row groups of 0 / +1 / -1 (one softmax warp's rows
+#     each; 96 does not divide 128, so every warp position sees every group
+#     over the tiles); every other Q component is 0.
+#   * K[..., 0] = 12 * floor(key / 128): a staircase, so the +1 rows' row-max
+#     grows at EVERY KV tile (a rescale per tile), the 0 rows never rescale,
+#     the -1 rows never rescale after the first tile.
+#   * per-batch lengths Q [1024, 641, 0] / KV [512, 385, 128]: a full, a
+#     mid-tile-trimmed and a QUERYLESS batch; bottom-right anchors the
+#     diagonal at (seq_len_q[b], seq_len_kv[b]), so the first 512 / 256 rows
+#     of batches 0 / 1 are KEYLESS under the masked arm.
+#   * scale 0.5; dense (padding only) and bottom-right causal + left window 129.
+# Reference: fp64, composing the SAME padding / diagonal / window as the
+# kernel (sdpa-invariants § 8); dead rows (row >= seq_len_q[b]) and keyless
+# rows are O = 0 / LSE = -inf (§ 1, § 4).  Replay: compile once, then three
+# re-executions with a CHANGED V and NaN / +inf-poisoned outputs -- each
+# retained O / LSE equals the recomputed reference, LSE is bitwise independent
+# of V, and two executions on identical inputs are bitwise equal.
+# The scale = 1 masked variant NaNs on develop 4c0dc9a8 exactly as on this
+# head (the review's finding): the live rows whose window excludes KV tile 0
+# publish LSE = log(1e-30) and O = NaN -- classified in frost_dev/results/
+# d512_ostream_pr/final_2026-09-29/PREEXISTING_scale1_nan.md; kept as a
+# STRICT xfail so the suite documents it and flips the day it is fixed.
+# ============================================================================
+
+_HANDOFF_GEOMETRY = dict(b=3, h_q=8, h_kv=4, s_q=1024, s_kv=512, d=512)
+_HANDOFF_Q_LENS = (1024, 641, 0)
+_HANDOFF_KV_LENS = (512, 385, 128)
+_HANDOFF_ROW_GROUP = 32  # rows per 0 / +1 / -1 group = one softmax warp's rows of a 128-row CTA tile
+_HANDOFF_STAIR_STEP, _HANDOFF_STAIR_KEYS = 12.0, 128  # K[..., 0] = 12 * floor(key / 128)
+_HANDOFF_WINDOW_LEFT = 129
+_HANDOFF_REPLAYS = 3
+
+
+def _handoff_problem(dtype, *, seed=0):
+    """BSHD-physical / BHSD-logical Q, K, V of the review's correction-storm
+    geometry, plus the per-batch (seq_q_lens, seq_kv_lens) int32 vectors."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    dev = "cuda"
+    torch.manual_seed(seed)
+    rows = torch.arange(g["s_q"], device=dev)
+    sign = torch.tensor([0.0, 1.0, -1.0], device=dev)[(rows // _HANDOFF_ROW_GROUP) % 3]
+    q = torch.zeros(g["b"], g["s_q"], g["h_q"], g["d"], device=dev, dtype=dtype)
+    q[..., 0] = sign.view(1, g["s_q"], 1).to(dtype)
+    keys = torch.arange(g["s_kv"], device=dev)
+    stair = _HANDOFF_STAIR_STEP * torch.div(keys, _HANDOFF_STAIR_KEYS, rounding_mode="floor").float()
+    k = torch.zeros(g["b"], g["s_kv"], g["h_kv"], g["d"], device=dev, dtype=dtype)
+    k[..., 0] = stair.view(1, g["s_kv"], 1).to(dtype)
+    v = _handoff_fresh_v(dtype, seed=seed)
+    q_lens = torch.tensor(_HANDOFF_Q_LENS, dtype=torch.int32, device=dev)
+    kv_lens = torch.tensor(_HANDOFF_KV_LENS, dtype=torch.int32, device=dev)
+    return q.transpose(1, 2), k.transpose(1, 2), v, q_lens, kv_lens
+
+
+def _handoff_fresh_v(dtype, *, seed):
+    """A new random V (BSHD-physical) -- the operand the replays change."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    gen = torch.Generator(device="cuda").manual_seed(1000 + seed)
+    return (torch.randn(g["b"], g["s_kv"], g["h_kv"], g["d"], device="cuda", generator=gen) * 0.5).to(dtype).transpose(1, 2)
+
+
+def _handoff_reference(q, k, v, *, scale, causal_br, window_left, q_lens, kv_lens):
+    """fp64 softmax(QK^T) V and the natural-log LSE under the SAME conditions
+    the kernel runs: per-batch padding on both sides, the bottom-right
+    diagonal anchored at (seq_len_q[b], seq_len_kv[b]) and the left window
+    riding it (``window_left`` keys below the diagonal are kept, as in
+    ``_ref_sdpa_full``'s ``swa_window``).  Dead (row >= seq_len_q[b]) and
+    keyless rows come out as O = 0 / LSE = -inf."""
+    import torch
+
+    b, h_q, s_q, _ = q.shape
+    h_kv, s_kv = k.shape[1], k.shape[2]
+    rep = h_q // h_kv
+    kd, vd = k.double().repeat_interleave(rep, 1), v.double().repeat_interleave(rep, 1)
+    scores = q.double() @ kd.transpose(-1, -2) * scale
+    i = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+    ql, kl = q_lens.to(torch.int64).view(b, 1, 1, 1), kv_lens.to(torch.int64).view(b, 1, 1, 1)
+    masked = (i >= ql) | (j >= kl)
+    if causal_br:
+        diag = i + (kl - ql)
+        masked = masked | (j > diag) | (j < diag - window_left)
+    scores = scores.masked_fill(masked, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)  # a row with no live key is -inf
+    o = torch.softmax(scores, dim=-1).nan_to_num(0.0) @ vd  # ... and O = 0 there
+    return o.float(), lse.float()
+
+
+def _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens):
+    """Poison the outputs (an unwritten O cell stays NaN, an unwritten LSE +inf,
+    both distinct from the legitimate 0 / -inf of a dead row), launch, sync,
+    and hand back COPIES -- the retained outputs of this replay."""
+    import torch
+
+    o.fill_(float("nan"))
+    lse.fill_(float("inf"))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+    torch.cuda.synchronize()
+    return o.clone(), lse.clone()
+
+
+def _handoff_check(o, lse, ref_o, ref_lse, q_lens, *, tag):
+    """The retained O / LSE of one replay against the fp64 reference: every
+    cell written, dead rows exactly 0 / -inf, the rest at the suite's
+    tolerances (the same atol / rtol every dense f16 case in this tree uses)."""
+    import torch
+
+    b, h_q, s_q, _ = o.shape
+    rows = torch.arange(s_q, device=o.device).view(1, 1, s_q, 1)
+    dead = rows >= q_lens.to(torch.int64).view(b, 1, 1, 1)
+    bad = ~torch.isfinite(o.float())
+    assert not bad.any(), f"{tag}: {int(bad.sum())} non-finite / unwritten O cells, first at (b, h, row, col) = {tuple(bad.nonzero()[0].tolist())}"
+    bad = torch.isnan(lse) | torch.isposinf(lse)
+    assert not bad.any(), f"{tag}: {int(bad.sum())} NaN / unwritten LSE cells, first at (b, h, row) = {tuple(bad.nonzero()[0].tolist())}"
+    assert (o[dead.expand_as(o)] == 0).all(), f"{tag}: rows at / past seq_len_q[b] must be EXACTLY 0 (a select, not residue * 0)"
+    assert torch.isneginf(lse[dead.squeeze(-1).expand_as(lse)]).all(), f"{tag}: rows at / past seq_len_q[b] publish LSE = -inf"
+    torch.testing.assert_close(o.float(), ref_o, **_GATE_O_TOL, msg=lambda m: f"{tag}: O vs the fp64 reference -- {m}")
+    torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL, msg=lambda m: f"{tag}: LSE vs the fp64 reference -- {m}")
+
+
+_HANDOFF_MASKS = {"dense": dict(causal_br=False, window_left=None), "causal_br_swa129": dict(causal_br=True, window_left=_HANDOFF_WINDOW_LEFT)}
+_HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 kernel NaNs the LIVE rows whose 130-key window excludes the first KV "
+    "tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
+    "count (3064 rows) on develop and head -- see PR #1288 follow-ups and frost_dev/results/d512_ostream_pr/final_2026-09-29/PREEXISTING_scale1_nan.md",
+)
+_HANDOFF_CASES = [
+    pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 0.5, id="bf16-causal_br_swa129-scale0.5"),
+    pytest.param("fp16", "dense", 0.5, id="fp16-dense-scale0.5"),
+    pytest.param("fp16", "causal_br_swa129", 0.5, id="fp16-causal_br_swa129-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+    pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+]
+
+
+@pytest.mark.parametrize("dtype, mask, scale", _HANDOFF_CASES)
+def test_sm107_d512_correction_handoff_under_mixed_rescale(dtype, mask, scale):
+    """Rubin e2e for the pipelined O store's correction hand-off (see the
+    section comment): the +1 / 0 / -1 row groups make some correction warps
+    rescale at every KV tile while their neighbours pass through, a queryless
+    batch and (masked arm) keyless rows exercise the dead-row selects, and the
+    outputs are retained across three replays with a changed V.  The reference
+    composes the same padding, diagonal and window as the graph."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 d512 f16 / bf16 kernel runs on cc10.7 only")
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    arm = _HANDOFF_MASKS[mask]
+    q, k, v, q_lens, kv_lens = _handoff_problem(dt)
+    g = _HANDOFF_GEOMETRY
+    o = torch.empty(g["b"], g["s_q"], g["h_q"], g["d"], device="cuda", dtype=dt).transpose(1, 2)
+    lse = torch.empty(g["b"], g["h_q"], g["s_q"], device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=arm["causal_br"],
+        causal_bottom_right=arm["causal_br"],
+        window_size_left=arm["window_left"],
+        scale_softmax=scale,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+    )
+    assert api.check_support()
+    api.compile()  # the one capture; everything below is a replay
+    ref_kw = dict(scale=scale, causal_br=arm["causal_br"], window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens)
+
+    o0, lse0 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(q, k, v, **ref_kw)
+    _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag="launch 0")
+    for replay in range(1, _HANDOFF_REPLAYS + 1):
+        v.copy_(_handoff_fresh_v(dt, seed=replay))  # a changed V, same storage (what a captured graph sees)
+        o_k, lse_k = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+        ref_o, _ = _handoff_reference(q, k, v, **ref_kw)
+        _handoff_check(o_k, lse_k, ref_o, ref_lse, q_lens, tag=f"replay {replay}")
+        assert torch.equal(lse_k, lse0), f"replay {replay}: LSE must be bitwise independent of V"
+    o_again, lse_again = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    assert torch.equal(o_again, o_k) and torch.equal(lse_again, lse_k), "two replays on identical inputs must be bitwise equal (a race otherwise)"
