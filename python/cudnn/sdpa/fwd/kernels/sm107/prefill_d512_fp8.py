@@ -131,7 +131,11 @@ SPIN_RING_WAITS: bool = True
 # deleting the store alone is +11.2 % of time @ S_KV=8192, redirecting the SAME store to one L2-resident tile is -0.1 %).
 # MEASURED there with O_EPI_PIPELINE (A/B/A x3, 100 iters, controls <= 0.03 %, 212-SM Rubin at 2376 MHz): +16.32 / +16.52 /
 # +5.89 / +0.50 % of time at S_KV = 512 / 1024 / 2048 / 8192; stream alone +15.98 / +14.78 / +1.63 % @ 512 / 1024 / 8192.
-# THIS kernel's own A/B is owed -- the port is bitwise-gated (O / LSE / Amax_O) but unmeasured here.
+# THIS kernel, MEASURED (fractal-ts2-128, 204-SM Rubin cc 10.7, GPU 1, SM clock locked 2376 MHz, A/B/A x3, slot-checked,
+# controls <= 0.27 %, 2026-09-29, B=1 H_Q=64 H_KV=1 S_Q=16K d=512 fp8 dense; frost_dev/results/d512_bf16_fixed_cost_2026-09-29/
+# FP8_CONSTANTS.md): both levers on vs develop 4c0dc9a8 **+8.02 / +1.19 / -0.47 % of time at S_KV = 512 / 1024 / 8192**
+# (0.377 -> 0.349, 0.511 -> 0.505, 2.988 -> 3.002 ms; c05 +7.76 / - / -0.62); O_STORE_STREAM=False with the pipeline on is
+# -6.30 / +0.00 / +0.02 % vs this head, so the stream carries the whole 512 gain here.  The port is bitwise-gated (O / LSE / Amax_O).
 # False = the whole-tile form (wait all N_O_CHUNKS, then one ``tma_store_tile``), kept verbatim so the base is one flip away.
 # Both forms issue ONE bulk group per tile (one commit + one wait_group.read 0 + one ``mb_tma_o_empty`` arrive); every
 # mbarrier op, its order and its count are identical.  Both arms trace: the constant is the A/B lever, pinned by
@@ -152,8 +156,11 @@ O_STORE_STREAM: bool = True
 # back to its consumers, so the fast path and the pipelining are ONE lever, not two.  Numerics are bit-identical by
 # construction (same multiply, same select, same fmax fold -- order-independent -- same pack, same store offsets, same chunk arrive
 # order); no barrier count or order changes.  MEASURED on the MXFP8 sibling on top of O_STORE_STREAM (212-SM Rubin): +1.7 pt
-# of time @ S_KV=1024, one LSB @512, -1.1 pt @8192 (+0.50 % vs +1.63 % stream alone); this kernel's A/B is owed with the
-# one above.  False = the classic per-block body (ld -> wait -> convert -> store -> chunk arrive), verbatim.
+# of time @ S_KV=1024, one LSB @512, -1.1 pt @8192 (+0.50 % vs +1.63 % stream alone).  THIS kernel, MEASURED (fractal, same
+# session and shape as above, O_EPI_PIPELINE=False with the stream on vs this head): -1.69 / -1.17 / +0.50 % at 512 / 1024 /
+# 8192 -- the pipeline buys 512 / 1024 and costs 0.5 % at 8192, inside the parity allowance, so True stays (FP8_CONSTANTS.md
+# s3: keep the pair with the largest 512 / 1024 gain whose 8192 delta vs develop is within -1 %: (True, True) = -0.47 %).
+# False = the classic per-block body (ld -> wait -> convert -> store -> chunk arrive), verbatim.
 O_EPI_PIPELINE: bool = True
 if not (isinstance(O_STORE_STREAM, bool) and isinstance(O_EPI_PIPELINE, bool)):
     raise TypeError(f"{__name__}: O_STORE_STREAM / O_EPI_PIPELINE are bool module constants; got {O_STORE_STREAM!r} / {O_EPI_PIPELINE!r}")
