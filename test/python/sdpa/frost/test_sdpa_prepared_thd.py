@@ -366,9 +366,15 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
     monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", record_module)
     kcap = 32768 if split_policy else 128
     g, _ = _cga_policy_graph(dtype, stats, h=h, kcap=kcap)
-    assert loaded[-2:] == [(1, False), (2, True)]
     record = g.get_engine_and_knobs_at_index(g._plan_index)
     assert record[1][cudnn.knob_type.CGA_POLICY] == 2 and cudnn.knob_type.TILE_CGA_M not in record[1]
+    initial_split_policy = record[1].get(cudnn.knob_type.SPLIT_KV_POLICY)
+    initial_modules = [(1, False), (2, True)] + ([(1, False)] * (2 if initial_split_policy == 3 else 1) if initial_split_policy else [])
+    assert loaded[-len(initial_modules) :] == initial_modules
+    # Exercise the requested persisted record independently of which valid
+    # policy the heuristic currently recommends first.
+    record[1].pop(cudnn.knob_type.SPLIT_KV_POLICY, None)
+    record[1][cudnn.knob_type.SPLIT_KV] = 1
     record[1][cudnn.knob_type.CGA_POLICY] = policy
     if split_policy:
         record[1].pop(cudnn.knob_type.SPLIT_KV, None)

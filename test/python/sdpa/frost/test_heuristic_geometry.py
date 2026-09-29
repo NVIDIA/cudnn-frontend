@@ -46,7 +46,7 @@ def test_runtime_cga_policy_has_explicit_record_and_bounded_domain(overrides):
     facts = _facts(h_q=16, h_kv=16, s_q=65536, s_kv=65536, d_qk=192, d_v=128, thd=True, shape_overrides=True)
     facts = replace(facts, **overrides)
     knobs = heur._knob_sets(SPEC, facts)
-    policies = [k for k in knobs if k.cga_policy is not None]
+    policies = [k for k in knobs if k.cga_policy is not None and k.split_kv_policy is None]
     if overrides:
         assert not policies
         return
@@ -79,7 +79,7 @@ def test_runtime_cga_policy_records_remain_rebuildable(policy):
 
 @pytest.mark.parametrize("cga_policy", [1, 2])
 @pytest.mark.parametrize("split_policy", [1, 2, 3])
-def test_runtime_split_policy_record_is_explicit_and_not_implicitly_recommended(cga_policy, split_policy):
+def test_runtime_split_policy_record_remains_explicit_and_rebuildable(cga_policy, split_policy):
     facts = _facts(h_q=16, h_kv=16, d_qk=192, d_v=128, thd=True, shape_overrides=True)
     knobs = heur.SdpaFwdKnobs(cga_policy=cga_policy, split_kv_policy=split_policy)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
@@ -87,7 +87,25 @@ def test_runtime_split_policy_record_is_explicit_and_not_implicitly_recommended(
     assert record[cudnn.knob_type.SPLIT_KV_POLICY] == split_policy
     assert cudnn.knob_type.SPLIT_KV not in record
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in record.items()}) == knobs
-    assert all(k.split_kv_policy is None for k in heur._knob_sets(SPEC, facts))
+
+
+@pytest.mark.parametrize("heads", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch,qcap,kv_cap", [(1, 128, 32768), (4096, 65536, 65536)])
+def test_adaptive_split_candidates_preserve_domain_and_concrete_fallback(heads, batch, qcap, kv_cap):
+    facts = _facts(b=batch, h_q=heads, h_kv=heads, s_q=qcap, s_kv=kv_cap, d_qk=192, d_v=128, thd=True, shape_overrides=True)
+    candidates = heur._knob_sets(SPEC, facts)
+    split = [k for k in candidates if k.split_kv_policy is not None]
+    assert len(split) == int(heads in (4, 8, 16))
+    for knobs in split:
+        assert knobs.split_kv is None and knobs.cga is None
+        assert knobs.split_kv_policy == 3 and knobs.cga_policy == 2
+        assert mismatch(SPEC.capabilities, facts, knobs) is None
+        assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
+    assert any(k.cga_policy == 2 and k.split_kv_policy is None for k in candidates)
+    assert any(k.cga in (1, 2) and k.cga_policy is None for k in candidates)
+    assert len(candidates) == len(set(candidates)) <= heur._MAX_SETS_PER_ENGINE
+    fallback = heur._fallback_knobs(SPEC, facts)
+    assert fallback.cga_policy is None and fallback.split_kv_policy is None and fallback.split_kv == 1
 
 
 @pytest.mark.parametrize(
