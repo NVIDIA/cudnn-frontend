@@ -270,11 +270,13 @@ class BlackwellFmhaBackwardDKDV256:
 
     def _setup_pipeline_stages_and_sf_tilers(self):
         """Derive trace-time pipeline depths and scale-factor tile shapes."""
-        # Leakage-safe dK/dV widens QT, dOT, P and dS from FP8 to BF16.
-        # A single load/activation stage keeps the widened operands within the
-        # SM100 227 KiB dynamic-SMEM limit.  The head-dimension-reduction KQ
-        # and VdO contractions remain MXFP8.
-        self.load_mma_all_stage = 1
+        # Double-buffer the streamed MXFP8 Q/dO operands independently from
+        # the wider BF16 QT/dOT sidecars.  The BF16 sequence-reduction inputs
+        # need only one stage; making their lifetime dictate the MXFP8 rings
+        # serializes the next score/dP tile behind the current dK/dV MMAs.
+        self.load_mma_KQ_stage = 2
+        self.load_mma_VDO_stage = 2
+        self.load_mma_aux_stage = 1
         self.mma_compute_KQ_stage = 1
         self.mma_compute_VDO_stage = 1
         self.compute_mma_P_stage = 1
@@ -314,8 +316,8 @@ class BlackwellFmhaBackwardDKDV256:
             128,
         )
         self.SFK_load_stage = self.k_halves
-        self.SFQ_load_stage = self.load_mma_all_stage * self.k_halves
-        self.SFDO_load_stage = self.load_mma_all_stage * self.k_halves
+        self.SFQ_load_stage = self.load_mma_KQ_stage * self.k_halves
+        self.SFDO_load_stage = self.load_mma_VDO_stage * self.k_halves
 
     @cute.jit
     def split_wg(
@@ -517,13 +519,13 @@ class BlackwellFmhaBackwardDKDV256:
             KQ_tiled_mma,
             self.KQ_mma_tiler,
             LOW_PRECISION_TYPE,
-            self.load_mma_all_stage,
+            self.load_mma_KQ_stage,
         )
         QT_smem_layout_staged = sm100_utils.make_smem_layout_b(
             dSQ_tiled_mma,
             self.dSQ_mma_tiler,
             cutlass.BFloat16,
-            self.load_mma_all_stage,
+            self.load_mma_aux_stage,
         )
         K_smem_layout_staged = sm100_utils.make_smem_layout_a(
             KQ_tiled_mma,
@@ -552,13 +554,13 @@ class BlackwellFmhaBackwardDKDV256:
             VDO_tiled_mma,
             self.VDO_mma_tiler,
             LOW_PRECISION_TYPE,
-            self.load_mma_all_stage,
+            self.load_mma_VDO_stage,
         )
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_b(
             PdO_tiled_mma,
             self.PdO_mma_tiler,
             cutlass.BFloat16,
-            self.load_mma_all_stage,
+            self.load_mma_aux_stage,
         )
         V_smem_layout_staged = sm100_utils.make_smem_layout_a(
             VDO_tiled_mma,
@@ -744,15 +746,15 @@ class BlackwellFmhaBackwardDKDV256:
         self.tma_copy_sfV_bytes = cute.size_in_bytes(self.sf_dtype, sfV_smem_layout)
         self.tma_copy_sfdO_bytes = cute.size_in_bytes(self.sf_dtype, sfDO_smem_layout)
 
-        LSE_smem_layout = cute.make_layout((self.cta_tiler[1], self.load_mma_all_stage))
-        sum_OdO_smem_layout = LSE_smem_layout
+        LSE_smem_layout = cute.make_layout((self.cta_tiler[1], self.load_mma_KQ_stage))
+        sum_OdO_smem_layout = cute.make_layout((self.cta_tiler[1], self.load_mma_VDO_stage))
 
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
-            load_mma_KQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_all_stage * 2]
-            load_mma_KQ_aux_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_all_stage * 2]
-            load_mma_VDO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_all_stage * 2]
+            load_mma_KQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_KQ_stage * 2]
+            load_mma_KQ_aux_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_aux_stage * 2]
+            load_mma_VDO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_VDO_stage * 2]
             mma_compute_KQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_compute_KQ_stage * 2]  # 0x460, 0x468
             mma_compute_VDO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_compute_VDO_stage * 2]  # 0x470, 0x478
             compute_mma_dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.compute_mma_dS_stage * 2]
@@ -2176,19 +2178,27 @@ class BlackwellFmhaBackwardDKDV256:
         tTMAsLSE, tTMAgLSE = cute.nvgpu.cpasync.tma_partition(tma_atom_LSE, 0, cute.make_layout(1), sLSE, gLSE)
         tTMAsSum_OdO, tTMAgSum_OdO = cute.nvgpu.cpasync.tma_partition(tma_atom_sum_OdO, 0, cute.make_layout(1), sSum_OdO, gSum_OdO)
 
-        load_mma_KQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_all_stage)
-        load_mma_KQ_aux_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_all_stage)
-        load_mma_VDO_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_all_stage)
+        load_mma_KQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_KQ_stage)
+        load_mma_KQ_aux_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_aux_stage)
+        load_mma_VDO_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_VDO_stage)
         # Persistent mode: advance state to match mbarrier phase accumulated across tiles.
         # After N total stages, state needs N % (2*num_stages) advances from initial.
         if cutlass.const_expr(self.is_persistent):
-            n_advance = cumulative_trip_count % Int32(2 * self.load_mma_all_stage)
-            for _ in cutlass.range_constexpr(2 * self.load_mma_all_stage):
-                if n_advance > Int32(0):
+            n_advance_kq = cumulative_trip_count % Int32(2 * self.load_mma_KQ_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_KQ_stage):
+                if n_advance_kq > Int32(0):
                     load_mma_KQ_producer_state.advance()
+                    n_advance_kq = n_advance_kq - Int32(1)
+            n_advance_aux = cumulative_trip_count % Int32(2 * self.load_mma_aux_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_aux_stage):
+                if n_advance_aux > Int32(0):
                     load_mma_KQ_aux_producer_state.advance()
+                    n_advance_aux = n_advance_aux - Int32(1)
+            n_advance_vdo = cumulative_trip_count % Int32(2 * self.load_mma_VDO_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_VDO_stage):
+                if n_advance_vdo > Int32(0):
                     load_mma_VDO_producer_state.advance()
-                    n_advance = n_advance - Int32(1)
+                    n_advance_vdo = n_advance_vdo - Int32(1)
         # Fix for persistent mode: CTA 1 (non-leader) never calls arrive_and_expect_tx
         # on the full barrier (guarded by is_leader_cta in producer_acquire), but TMA
         # copies still signal it with bytes. Over many persistent tiles, the mbarrier
@@ -2199,15 +2209,17 @@ class BlackwellFmhaBackwardDKDV256:
             is_non_leader = bidx_reinit % cute.size(KQ_tiled_mma.thr_id.shape) != 0
             if is_non_leader:
                 with cute.arch.elect_one():
-                    for stage_idx in cutlass.range_constexpr(self.load_mma_all_stage):
+                    for stage_idx in cutlass.range_constexpr(self.load_mma_KQ_stage):
                         cute.arch.mbarrier_init(
                             load_mma_KQ_pipeline.sync_object_full.get_barrier(stage_idx),
                             1,  # arrive_count = producer_group.size = 1
                         )
+                    for stage_idx in cutlass.range_constexpr(self.load_mma_aux_stage):
                         cute.arch.mbarrier_init(
                             load_mma_KQ_aux_pipeline.sync_object_full.get_barrier(stage_idx),
                             1,  # arrive_count = producer_group.size = 1
                         )
+                    for stage_idx in cutlass.range_constexpr(self.load_mma_VDO_stage):
                         cute.arch.mbarrier_init(
                             load_mma_VDO_pipeline.sync_object_full.get_barrier(stage_idx),
                             1,  # arrive_count = producer_group.size = 1
@@ -2301,15 +2313,6 @@ class BlackwellFmhaBackwardDKDV256:
             mcast_mask=self.b_full_mcast_mask,
         )
 
-        # load dOT (B operand)
-        cute.copy(
-            tma_atom_dOT,
-            tTMAgdOT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
-            tTMAsdOT[None, load_mma_VDO_producer_state.index],
-            tma_bar_ptr=tma_barrier_VDO,
-            mcast_mask=self.b_full_mcast_mask,
-        )
-
         for sfdo_k_half in cutlass.range_constexpr(self.k_halves):
             sfdo_stage = load_mma_VDO_producer_state.index * self.k_halves + sfdo_k_half
             cute.copy(
@@ -2366,6 +2369,15 @@ class BlackwellFmhaBackwardDKDV256:
             tma_atom_QT,
             tTMAgQT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
             tTMAsQT[None, load_mma_KQ_aux_producer_state.index],
+            tma_bar_ptr=tma_barrier_KQ_aux,
+            mcast_mask=self.b_full_mcast_mask,
+        )
+        # dOT has the same leakage-safe BF16 lifetime as QT.  Keep both on
+        # the one-stage sidecar ring so the FP8 dO ring can advance early.
+        cute.copy(
+            tma_atom_dOT,
+            tTMAgdOT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
+            tTMAsdOT[None, load_mma_KQ_aux_producer_state.index],
             tma_bar_ptr=tma_barrier_KQ_aux,
             mcast_mask=self.b_full_mcast_mask,
         )
@@ -2432,15 +2444,6 @@ class BlackwellFmhaBackwardDKDV256:
                 mcast_mask=self.b_full_mcast_mask,
             )
 
-            # load dOT (B operand)
-            cute.copy(
-                tma_atom_dOT,
-                tTMAgdOT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
-                tTMAsdOT[None, load_mma_VDO_producer_state.index],
-                tma_bar_ptr=tma_barrier_VDO_inner,
-                mcast_mask=self.b_full_mcast_mask,
-            )
-
             for sfdo_k_half in cutlass.range_constexpr(self.k_halves):
                 sfdo_stage = load_mma_VDO_producer_state.index * self.k_halves + sfdo_k_half
                 cute.copy(
@@ -2474,6 +2477,13 @@ class BlackwellFmhaBackwardDKDV256:
                 tma_atom_QT,
                 tTMAgQT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
                 tTMAsQT[None, load_mma_KQ_aux_producer_state.index],
+                tma_bar_ptr=tma_barrier_KQ_aux_inner,
+                mcast_mask=self.b_full_mcast_mask,
+            )
+            cute.copy(
+                tma_atom_dOT,
+                tTMAgdOT[(None, 0, iter_index, (blk_coord_h_q, blk_coord_b))],
+                tTMAsdOT[None, load_mma_KQ_aux_producer_state.index],
                 tma_bar_ptr=tma_barrier_KQ_aux_inner,
                 mcast_mask=self.b_full_mcast_mask,
             )
@@ -2554,18 +2564,26 @@ class BlackwellFmhaBackwardDKDV256:
             compute_mma_dS_pipeline,
             mma_compute_dK_pipeline,
         ) = pipeline_args
-        load_mma_KQ_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
-        load_mma_KQ_aux_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
-        load_mma_VDO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
+        load_mma_KQ_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_KQ_stage)
+        load_mma_KQ_aux_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_aux_stage)
+        load_mma_VDO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_VDO_stage)
         # Persistent mode: advance load consumer state to match mbarrier phase
         if cutlass.const_expr(self.is_persistent):
-            n_advance = cumulative_trip_count % Int32(2 * self.load_mma_all_stage)
-            for _ in cutlass.range_constexpr(2 * self.load_mma_all_stage):
-                if n_advance > Int32(0):
+            n_advance_kq = cumulative_trip_count % Int32(2 * self.load_mma_KQ_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_KQ_stage):
+                if n_advance_kq > Int32(0):
                     load_mma_KQ_consumer_state.advance()
+                    n_advance_kq = n_advance_kq - Int32(1)
+            n_advance_aux = cumulative_trip_count % Int32(2 * self.load_mma_aux_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_aux_stage):
+                if n_advance_aux > Int32(0):
                     load_mma_KQ_aux_consumer_state.advance()
+                    n_advance_aux = n_advance_aux - Int32(1)
+            n_advance_vdo = cumulative_trip_count % Int32(2 * self.load_mma_VDO_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_VDO_stage):
+                if n_advance_vdo > Int32(0):
                     load_mma_VDO_consumer_state.advance()
-                    n_advance = n_advance - Int32(1)
+                    n_advance_vdo = n_advance_vdo - Int32(1)
         load_mma_KQ_release_state = load_mma_KQ_consumer_state.clone()
         load_mma_KQ_aux_release_state = load_mma_KQ_aux_consumer_state.clone()
         load_mma_VDO_release_state = load_mma_VDO_consumer_state.clone()
@@ -2895,7 +2913,7 @@ class BlackwellFmhaBackwardDKDV256:
                         PdO_tiled_mma,
                         tDVtDV[None, None, None, 0],
                         tDVrP[None, None, k_block, compute_mma_P_consumer_state.index],
-                        tDVrDOT[None, None, k_block, load_mma_VDO_release_state.index],
+                        tDVrDOT[None, None, k_block, load_mma_KQ_aux_release_state.index],
                         tDVtDV[None, None, None, 0],
                     )
                     PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -2925,19 +2943,17 @@ class BlackwellFmhaBackwardDKDV256:
             if is_leader_cta:
                 peak_VDO_consumer_status = load_mma_VDO_pipeline.consumer_try_wait(load_mma_VDO_consumer_state)
 
-                # now, these dOT and QT buffers could be released
+                # The previous tile's Q/LSE, dO/sum, and BF16 QT/dOT sidecar
+                # are all dead after the dV/dK contractions above.
                 load_mma_KQ_aux_pipeline.consumer_release(load_mma_KQ_aux_release_state)
                 load_mma_VDO_pipeline.consumer_release(load_mma_VDO_release_state)
             load_mma_KQ_aux_release_state.advance()
             load_mma_VDO_release_state.advance()
 
-            # A one-stage load pipeline cannot wait for the next K/Q tile
-            # until every view of the current tile has been consumed and its
-            # empty barriers have been released.  The former two-stage order
-            # started this MMA before dK released KQ stage 0, creating the
-            # cycle: MMA waits next-full -> loader waits current-empty -> MMA
-            # has not reached current release.  Serialize the refill after the
-            # current dV/dK contractions and all three load-pipeline releases.
+            # The loader can fill the next depth-2 MXFP8 stages before it
+            # blocks on the one-stage BF16 sidecar.  Consume those prefetched
+            # Q/dO stages only after releasing every view of the current tile;
+            # this preserves the no-cycle ordering needed by the aux ring.
             s2t_stage_coord = (
                 None,
                 None,
@@ -3050,7 +3066,7 @@ class BlackwellFmhaBackwardDKDV256:
                         PdO_tiled_mma,
                         tDVtDV[None, None, None, 0],
                         tDVrP[None, None, k_block, compute_mma_P_consumer_state.index],
-                        tDVrDOT[None, None, k_block, load_mma_VDO_release_state.index],
+                        tDVrDOT[None, None, k_block, load_mma_KQ_aux_release_state.index],
                         tDVtDV[None, None, None, 0],
                     )
                     PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -3153,11 +3169,11 @@ class BlackwellFmhaBackwardDKDV256:
                     compute_mma_dS_producer_state.advance()
                     n_advance_ds = n_advance_ds - Int32(1)
 
-        load_Q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_all_stage)
+        load_Q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_KQ_stage)
         # Persistent mode: advance load consumer state to match mbarrier phase
         if cutlass.const_expr(self.is_persistent):
-            n_advance = cumulative_trip_count % Int32(2 * self.load_mma_all_stage)
-            for _ in cutlass.range_constexpr(2 * self.load_mma_all_stage):
+            n_advance = cumulative_trip_count % Int32(2 * self.load_mma_KQ_stage)
+            for _ in cutlass.range_constexpr(2 * self.load_mma_KQ_stage):
                 if n_advance > Int32(0):
                     load_Q_consumer_state.advance()
                     n_advance = n_advance - Int32(1)
@@ -3505,10 +3521,10 @@ class BlackwellFmhaBackwardDKDV256:
         mma_compute_dK_pipeline.consumer_release(mma_compute_Q_consumer_state)
         mma_compute_Q_consumer_state.advance()
 
-    def _make_and_init_load_mma_pipeline(self, load_mma_mbar_ptr, cluster_layout_vmnk, tx_count):
+    def _make_and_init_load_mma_pipeline(self, load_mma_mbar_ptr, num_stages, cluster_layout_vmnk, tx_count):
         return cute_common.make_tma_umma_pipeline(
             load_mma_mbar_ptr,
-            self.load_mma_all_stage,
+            num_stages,
             tx_count,
             cluster_layout_vmnk,
             len([self.load_warp_id]),
@@ -3520,17 +3536,17 @@ class BlackwellFmhaBackwardDKDV256:
         tx_count = self.tma_copy_Q_bytes * 2
         tx_count += self.tma_copy_sfQ_bytes * self.k_halves * 4
         tx_count += 2 * self.tma_copy_LSE_bytes
-        return self._make_and_init_load_mma_pipeline(load_mma_KQ_mbar_ptr, cluster_layout_vmnk, tx_count)
+        return self._make_and_init_load_mma_pipeline(load_mma_KQ_mbar_ptr, self.load_mma_KQ_stage, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_KQ_aux_pipeline(self, load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk):
-        tx_count = self.tma_copy_QT_bytes * 2
-        return self._make_and_init_load_mma_pipeline(load_mma_KQ_aux_mbar_ptr, cluster_layout_vmnk, tx_count)
+        tx_count = (self.tma_copy_QT_bytes + self.tma_copy_dOT_bytes) * 2
+        return self._make_and_init_load_mma_pipeline(load_mma_KQ_aux_mbar_ptr, self.load_mma_aux_stage, cluster_layout_vmnk, tx_count)
 
     def make_and_init_load_mma_VDO_pipeline(self, load_mma_VDO_mbar_ptr, cluster_layout_vmnk):
-        tx_count = (self.tma_copy_dO_bytes + self.tma_copy_dOT_bytes) * 2
+        tx_count = self.tma_copy_dO_bytes * 2
         tx_count += self.tma_copy_sfdO_bytes * self.k_halves * 4
         tx_count += 2 * self.tma_copy_sum_OdO_bytes
-        return self._make_and_init_load_mma_pipeline(load_mma_VDO_mbar_ptr, cluster_layout_vmnk, tx_count)
+        return self._make_and_init_load_mma_pipeline(load_mma_VDO_mbar_ptr, self.load_mma_VDO_stage, cluster_layout_vmnk, tx_count)
 
     def _make_and_init_mma_compute_pipeline(self, mbar_ptr, num_stages, cluster_layout_vmnk):
         return cute_common.make_umma_async_pipeline(
