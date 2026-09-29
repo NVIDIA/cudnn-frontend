@@ -45,7 +45,7 @@ from __future__ import annotations
 
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,

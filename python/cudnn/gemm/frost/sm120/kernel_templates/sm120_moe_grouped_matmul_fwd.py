@@ -13,6 +13,8 @@ irregular and only the device can enumerate it. A persistent grid of
 index onto ``(group, tile_m, tile_n)`` with a warp-parallel prefix scan over
 the group sizes and publishes the record through a 2-stage SMEM ring that the
 TMA warp and every compute warp consume once.
+In GATHER mode, ``token_index`` maps each routed row to a source token; the
+source and routed extents are independent.
 
 KEEP IN SYNC WITH ``sm120_matmul.py`` (this tree) and
 ``../../sm100/kernel_templates/sm100_moe_grouped_matmul_fwd.py``
@@ -28,7 +30,7 @@ KEEP IN SYNC WITH ``sm120_matmul.py`` (this tree) and
 
 What is deliberately NOT here (vs. the sm100 MoE kernel)
 -------------------------------------------------------
-* No per-group TMA descriptor replacement. A is addressed by COORDINATE on one
+* No per-group TMA descriptor replacement. In NONE mode A is addressed by COORDINATE on one
   global ``[K, S]`` descriptor: a tile of group ``g`` loads rows
   ``group_begin + tile_m * cta_m ..`` and the ragged tail rows past
   ``group_end`` (the next group's tokens, or hardware zero-fill past ``S``)
@@ -36,6 +38,8 @@ What is deliberately NOT here (vs. the sm100 MoE kernel)
   That removes ``tensormap.replace``, the proxy fences and the per-CTA
   descriptor scratch; the workspace holds only the scheduler counter
   (``moe_desc_slots = 0``, so the compiler's counter offset agrees).
+  GATHER uses a global source descriptor with one-row boxes and shared::cta
+  GATHER4 loads. Group-tail indices are masked before reading token_index.
 * No TMA-store epilogue: sm120 stores STG straight from registers, so the
   output needs no re-dimensioned descriptor either.
 
@@ -59,6 +63,14 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import (
+    moe_scatter_row,
+    tma_scatter4,
+    moe_swizzle_tile as _moe_swizzle_tile,
+    moe_group_at as _moe_group_at,
+    moe_gather_row,
+    tma_gather4,
+)
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
@@ -201,8 +213,8 @@ def _mma_16x8_k32b(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
 
 
 # ---------------------------------------------------------------------------
-# Grouped scheduling helpers (the sm100 MoE kernel's, from its _tile_helpers;
-# inlined here the way the dense sm120 kernel inlines its own L2 raster).
+# Group-local swizzle width depends on this template's injected constants.
+# Tile mapping and group visitation are shared through tile_helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -226,36 +238,6 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     return cutlass.Int32(w)
 
 
-@cute.jit
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (tile_m, tile_n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
-
-
-@cute.jit
-def _moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
-    per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
-    group = visit_idx
-    if per_expert > 1 and per_expert * num_experts == num_groups:
-        group = (visit_idx % per_expert) * num_experts + (visit_idx // per_expert)
-    return group
-
-
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
@@ -266,11 +248,13 @@ def _kernel(
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
+    # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
+    # @@INJECT_MOE_MA_LIST@@
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -526,6 +510,7 @@ def _kernel(
             tile_n = (slot.subview(2)).load()
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
+            group_end = (slot.subview(5)).load()
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -535,9 +520,8 @@ def _kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                # The tile's rows in the flat token matrix: the group's first row
-                # plus its m-tile offset. The ONE global A descriptor clips at S;
-                # rows past group_end are loaded and never stored.
+                # Routed tile origin. GATHER maps these rows to the source
+                # tensor; NONE addresses them directly in the global descriptor.
                 coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
                 coord_n = tile_n * cgrp_tile_mnk[1]
 
@@ -554,16 +538,34 @@ def _kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
-                    # K-major token: one TMA box [K_tile, cta_m] at (k, m, 0); OOB
-                    # rows/cols are hardware zero-filled (K tails contribute 0).
                     for _ai in cutlass.range_constexpr(num_a_operands):
-                        if elect_one:
-                            nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                smem_a_list[_ai].subview(sA_elems * stage),
-                                tma_a_descs[_ai].get_ptr(),
-                                (coord_k, coord_m, cutlass.Int32(0)),
-                                ab_full_mbar_ptr.subview(stage),
-                            )
+                        if cutlass.const_expr(moe_gather):
+                            for _am in cutlass.range(cta_tile_mnk[0] // 4, unroll_full=True):
+                                if elect_one:
+                                    row = coord_m + _am * 4
+                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
+                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                    tma_gather4(
+                                        smem_a_list[_ai].subview(sA_elems * stage + _am * 4 * _CTA_K_ELEMS),
+                                        tma_a_descs[_ai].get_ptr(),
+                                        coord_k,
+                                        r0,
+                                        r1,
+                                        r2,
+                                        r3,
+                                        ab_full_mbar_ptr.subview(stage),
+                                    )
+                        else:
+                            # K-major box; hardware zero-fills K tails.
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    smem_a_list[_ai].subview(sA_elems * stage),
+                                    tma_a_descs[_ai].get_ptr(),
+                                    (coord_k, coord_m, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                )
                     # The expert's weight is B's batch coordinate. K-major B: box
                     # [K_tile, cta_n] at (k, n, e); N-major B walks N in
                     # b_tma_group_elems-wide groups (same row bytes as a K-major row).
@@ -924,21 +926,26 @@ def _host(
 
     # @@INJECT_HOST_REDUCTION_STRIDES@@
 
-    # ONE global A descriptor over the flat token matrix: K-major box
-    # [K_tile, cta_m]; the kernel offsets its row coordinate per routed group.
+    # GATHER uses the original source extent and one-row boxes. NONE walks
+    # whole tiles in the routed token matrix.
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
+        if cutlass.const_expr(moe_gather):
+            a_dims = [k_sym, _a_op.shape[0]]
+            a_strides = [a_stride_m * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], 1]
+        else:
+            a_dims = [k_sym, m, 1]
+            a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], cta_tile_mnk[0], 1]
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
                 dtype=ab_tma_dtype,
-                global_dims=[k_sym, m, 1],
-                global_strides=[
-                    a_stride_m * ab_dtype.width // 128,
-                    a_stride_l * ab_dtype.width // 128,
-                ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                global_dims=a_dims,
+                global_strides=a_strides,
+                box_dims=a_box,
                 swizzle=ab_tma_swizzle,
             )
         )
@@ -990,6 +997,7 @@ def _host(
         first_token_offset,
         a_tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
+        # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
@@ -1013,11 +1021,12 @@ def compile() -> Callable:
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
+    sym_source_m = cute.sym_int64() if moe_gather else sym_m
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_m, sym_k, 1),
+            (sym_source_m, sym_k, 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )

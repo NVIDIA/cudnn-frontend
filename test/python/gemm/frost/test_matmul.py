@@ -3099,7 +3099,7 @@ _VERSION_GATED_KWARGS = {
 
 
 def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
-    """Every template must reach these ops through `_tile_helpers`, which emits
+    """Every template must reach these ops through `tile_helpers`, which emits
     the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
     passing the inert False/None compiles on an internal wheel and fails every
     single JIT on the public one -- which is how the whole gemm suite went red."""
@@ -3117,7 +3117,7 @@ def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
                 and node.func.attr in _VERSION_GATED_KWARGS
             ):
                 offenders.append(f"{path.name}:{node.lineno} nvvm.{node.func.attr}(...)")
-    assert not offenders, "call the _tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
+    assert not offenders, "call the tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
 
 
 def test_the_b_collector_is_off_at_the_64_row_mma():
@@ -3244,7 +3244,7 @@ def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
     import ast
     import inspect
 
-    import cudnn.gemm.frost.sm100.kernel_templates._tile_helpers as helpers
+    import cudnn.gemm.frost.tile_helpers as helpers
 
     for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
         fn = getattr(helpers, fn_name)
