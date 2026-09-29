@@ -1262,9 +1262,14 @@ def _sm107_fp8_spec() -> EngineSpec:
     gradient dtype -- E4M3 scaled by ``scale_dQ / dK / dV`` (the contract) or
     bf16 / fp16 (the pre-quantization value) -- and the four ``amax_dQ / dK / dV
     / dP`` outputs when requested (``amax_dP`` reduces the fp32 ``dS`` right
-    before its cast, as the C++ node does).  dS travels through a bf16
-    workspace and the gradient GEMMs run at bf16 over exactly-upcast Q / K, so
-    ``descale_dP`` / ``scale_dP`` are accepted and never applied.
+    before its cast, as the C++ node does).  dS travels through an E4M3
+    workspace -- the kernel writes ``dS_q = e4m3(dS * scale_dP)`` -- and the
+    gradient GEMMs render the template's fp8 K64 arm, whose epilogue applies
+    ``descale_dP`` (with the payload descale, and ``scale_dQ`` / ``scale_dK`` +
+    the amax where it quantizes in place); the bf16-dS twin
+    (``api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16``: bf16 GEMMs over exactly-upcast
+    Q / K, ``descale_dP`` / ``scale_dP`` bound and never applied) is the A/B and
+    oracle base, not what ships.
 
     E4M3 payloads only (no E5M2 body); otherwise the half row's envelope and
     declines, plus: O must be an FP8 payload of Q's dtype and the gradient triple

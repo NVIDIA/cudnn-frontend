@@ -15,9 +15,12 @@ pipeline rather than a dtype arm of the other:
   3-deep Q / dO rings.
 
 Both compute dV in-kernel and store dS to a GMEM workspace; dK and dQ are the
-``bprop_matmul_blackwell`` GEMMs over that workspace, and the FP8 chain writes
-its dS as **bf16** so the bf16 GEMM renderings consume it unchanged (the fp8
-GEMM arm is a follow-up).  GQA is folded by ``bprop_chain_common.dkv_reduce``.
+``bprop_matmul_blackwell`` GEMMs over that workspace.  The FP8 chain writes its
+dS as **E4M3** (``dS_q = e4m3(dS * scale_dP)``, the ``DTYPE_DS`` default) and
+the GEMMs render the template's fp8 K64 arm, whose epilogue undoes ``scale_dP``;
+``api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`` selects the bf16-dS twin (bf16 GEMM
+renderings over exact upcasts) for A/B.  GQA is folded by
+``bprop_chain_common.dkv_reduce``.
 
 **Why this is a separate module from** :mod:`cudnn.sdpa.bwd.config_sm100`: the
 same reason the forward has one (:mod:`cudnn.sdpa.fwd.config_sm107`).  The
@@ -648,7 +651,8 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
     fp8 body (``sQ | sdO | sdOdv | sExcl[K | V] | sStats | sdS``):
       Q ring 3 x 16 = 48 KiB | dO ring 48 | dO_dv ring 48 | K 32 + V 32 = 64
       (the dV staging ALIASES it post-loop: max(K + V, dV @ BPE_O)) | stats 2 |
-      dS ring 3 x 32 (bf16) = 96  -> 306 KiB.  Every root < 208 KiB.
+      dS ring 3 x 16 (e4m3, the shipped DTYPE_DS) = 48  -> 258 KiB; the bf16-dS
+      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.
 
     f16 body (``sQ | sdO | sCombined[sdOdv_s0 | K | V] | sStats | sdS``):
       Q ring 2 x 32 = 64 | dO ring 64 | dO_dv stage 0 32 + K 64 + V 64 = 160
