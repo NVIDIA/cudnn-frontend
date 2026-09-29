@@ -505,9 +505,10 @@ class BlockScaleSpec:
     while Rubin additionally provides a native-packed K64 form. E5M3 scales
     require SM 10.7+.
 
-    SF tensors are runtime-positional (not ``TensorRef``s), fully described here
-    by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
-    at runtime in the ``F8_128x4`` swizzled layout (128-row × 4-K blocked)."""
+    SF tensors are runtime-positional (not ``TensorRef``s). F8_128x4 inputs are
+    packed byte blobs; MoE GATHER instead requires linear token SF with explicit
+    source-token dimensions and strides. Weight SF retains F8_128x4. GATHER's
+    producer packs the linear rows into the same 128-row × 4-K MMA atoms."""
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
@@ -522,6 +523,10 @@ class BlockScaleSpec:
     # SF reorder layout per side (cuDNN name, e.g. "F8_128x4"; None = NONE).
     sfa_reorder: "str | None" = None
     sfb_reorder: "str | None" = None
+    sfa_dim: tuple[int, ...] | None = None
+    sfa_stride: tuple[int, ...] | None = None
+    sfb_dim: tuple[int, ...] | None = None
+    sfb_stride: tuple[int, ...] | None = None
     # Each dequant op's compute + output dtype (dequant OUTPUT = the MMA's input
     # type for that operand). None for a non-dequantized side. Recorded for the
     # compile-stage check (cuDNN requires dequant math precision = FLOAT).
@@ -1043,6 +1048,10 @@ def swap_ab(chain: FusionChain) -> FusionChain:
             sf_dtype_b=block_scale.sf_dtype_a,
             sfa_reorder=block_scale.sfb_reorder,
             sfb_reorder=block_scale.sfa_reorder,
+            sfa_dim=_mn(block_scale.sfb_dim),
+            sfa_stride=_mn(block_scale.sfb_stride),
+            sfb_dim=_mn(block_scale.sfa_dim),
+            sfb_stride=_mn(block_scale.sfa_stride),
             dequant_compute_a=block_scale.dequant_compute_b,
             dequant_compute_b=block_scale.dequant_compute_a,
             dequant_out_a=block_scale.dequant_out_b,

@@ -989,6 +989,11 @@ def _build_multi_moe_chain(
         data_id, sf_id = deq.inputs
         _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
         sf_meta = meta[sf_id]
+        if moe_ops[0].moe_mode == "gather" and sf_meta.reordering is None and deq.block_size and all(b > 0 for b in deq.block_size):
+            data_dim = meta[data_id].dim
+            expected = (data_dim[0],) + tuple(-(-d // block) for d, block in zip(data_dim[1:], deq.block_size))
+            if sf_meta.dim != expected:
+                raise ValueError(f"MoE GATHER linear scale shape must be {expected}; got {sf_meta.dim}")
         deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
         deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
         return dict(
@@ -1076,6 +1081,14 @@ def _build_multi_moe_chain(
             )
 
         for cap in a_caps.values():
+            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
+                from .kernel_registry import linear_token_sf_reject
+
+                sf = meta[cap["sf_id"]]
+                data = meta[cap["data_id"]]
+                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], sf.dim[-1])
+                if reason is not None:
+                    raise NotImplementedError(reason)
             if _combo_key(cap) != _combo_key(a0):
                 raise ValueError("all token operands of a block-scale multi-MoE must share the same SF combo")
         for cap in b_caps.values():
@@ -1090,6 +1103,10 @@ def _build_multi_moe_chain(
             sf_dtype_b=b0["sf_dtype"],
             sfa_reorder=a0["sf_reorder"],
             sfb_reorder=b0["sf_reorder"],
+            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
+            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
+            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
+            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
             dequant_compute_a=a0["deq_compute"],
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],
@@ -1732,6 +1749,10 @@ def _build_multi_gemm_chain(
             sf_dtype_b=b0["sf_dtype"],
             sfa_reorder=a0["sf_reorder"],
             sfb_reorder=b0["sf_reorder"],
+            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
+            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
+            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
+            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
             dequant_compute_a=a0["deq_compute"],
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],

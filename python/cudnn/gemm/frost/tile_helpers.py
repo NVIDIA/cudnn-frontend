@@ -255,6 +255,61 @@ def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlas
         )
 
 
+@cute.jit
+def moe_gather_scales(
+    dst,
+    scratch,
+    load_bar,
+    ready_bar,
+    desc,
+    token_index,
+    row_begin,
+    group_end,
+    source_rows,
+    scale_k,
+    phase,
+    rows: cutlass.Constexpr,
+    scales: cutlass.Constexpr,
+    cta_group: cutlass.Constexpr = 1,
+):
+    """TMA-load linear source SF, then publish an MMA 128x4 atom per stage.
+
+    A 16-byte SF window serves narrow K tiles too. Each four-row transfer uses
+    a 128-byte-aligned scratch slot (64 payload bytes). Scratch is producer-private
+    and reused only after all lanes have read it. The MMA stage barrier accounts
+    for a release arrival after packing, separately from the TMA scratch bytes.
+    """
+    lane = cute.arch.lane_idx()
+    with cute.arch.elect_one():
+        nvvm.mbarrier_arrive_expect_tx(load_bar, rows * 16)
+    for r in cutlass.range(rows // 4, unroll_full=True):
+        with cute.arch.elect_one():
+            row = row_begin + r * 4
+            r0 = moe_gather_row(token_index, row, group_end, source_rows)
+            r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+            r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+            r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+            tma_gather4(scratch.subview(r * 128), desc, (scale_k // 16) * 16, r0, r1, r2, r3, load_bar)
+    while not nvvm.mbarrier_try_wait_parity(load_bar, phase, time_limit=10_000_000):
+        pass
+    src_words = cutlass.inttoptr(scratch.data_ptr().toint(), 3, cutlass.Uint32)
+    dst_words = cutlass.inttoptr(dst.data_ptr().toint(), 3, cutlass.Uint32)
+    for i in cutlass.range(rows * (scales // 4) // 32, unroll_full=True):
+        word = lane + i * 32
+        row = word // (scales // 4)
+        kw = word % (scales // 4)
+        packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
+        (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
+    cute.arch.fence_view_async_shared()
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+    with cute.arch.elect_one():
+        if cutlass.const_expr(cta_group == 2):
+            leader = cute.arch.block_idx_in_cluster() & ~1
+            nvvm.mbarrier_arrive(nvvm.mapa(ready_bar, leader), scope=nvvm.MemScope.CLUSTER)
+        else:
+            nvvm.mbarrier_arrive(ready_bar)
+
+
 def tcgen05_alloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
     if is_exclusive:
         nvvm.tcgen05_alloc(tmem_ptr, num_cols, is_exclusive=True, group=group)

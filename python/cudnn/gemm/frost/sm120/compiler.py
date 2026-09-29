@@ -1389,6 +1389,8 @@ def _render_block_scale_tile_constants(
     per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
     compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
     staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
+    if chain.has_moe and chain.moe.mode == "gather":
+        staging_bytes += cta_m * 32 * chain.num_a_operands
     ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
     if ab_stages < 1:
         raise NotImplementedError(
@@ -1770,7 +1772,7 @@ def _render_block_scale_template(
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
-    tile_constants += f"\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
+    tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
@@ -1859,17 +1861,25 @@ def _render_block_scale_template(
         + ","
     )
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
-    # SM120 reads grouped data/scales through global descriptors. Only
-    # SCATTER adds raw routing metadata to the device signature.
+    # SM120 reads grouped data/scales through global descriptors. GATHER and
+    # SCATTER add routing metadata to the device signature.
     moe_kernel_ma_params = moe_host_ma_pass = ""
-    if chain.has_moe and chain.moe.mode == "scatter":
+    if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
+        if chain.moe.mode == "gather":
+            moe_kernel_ma_params += "\nsource_rows: cutlass.Int64,"
+            moe_host_ma_pass += "\na_0.shape[0],"
         routed_rows = "sym_n" if isinstance(chain.moe, MoeSwapAbSpec) else "sym_m"
-        host_ab_params = "token_ks: cute.Tensor,\ntoken_index: cute.Tensor,\n" + host_ab_params
+        host_ab_params = "token_index: cute.Tensor,\n" + host_ab_params
         compile_ab_fakes += f"\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
-        compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
-        compile_ab_pass = "fake_token_ks,\nfake_token_index,\n" + compile_ab_pass
-        moe_kernel_ma_params += "\ntoken_index: cute.Tensor,\ntoken_ks: cute.Tensor,"
-        moe_host_ma_pass += "\ntoken_index,\ntoken_ks,"
+        compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
+        moe_kernel_ma_params += "\ntoken_index: cute.Tensor,"
+        moe_host_ma_pass += "\ntoken_index,"
+        if chain.moe.mode == "scatter":
+            host_ab_params = "token_ks: cute.Tensor,\n" + host_ab_params
+            compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
+            compile_ab_pass = "fake_token_ks,\n" + compile_ab_pass
+            moe_kernel_ma_params += "\ntoken_ks: cute.Tensor,"
+            moe_host_ma_pass += "\ntoken_ks,"
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -4455,10 +4465,19 @@ class CompiledMoeBlockScaleGemm:
             raise ValueError(_r)
         if sfa or sfb:
             _S, _N, _K = snk[0], snk[1], snk[2]
+            token_sf = sfa
+            if self.chain.moe.mode == "gather":
+                from ..kernel_registry import linear_token_sf_reject
+
+                for sf in sfa:
+                    reason = linear_token_sf_reject(sf.shape, sf.stride(), a_bufs[0].shape[1], _K // self.chain.block_scale.block_size)
+                    if reason is not None:
+                        raise ValueError(reason)
+                token_sf = []
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
             _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
             _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(sfa or [])]
+                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]
                 + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(b_bufs[j].shape[0])) for j, x in enumerate(sfb or [])]
             )
             if _r_sf is not None:

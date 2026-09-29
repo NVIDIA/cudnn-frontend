@@ -1761,7 +1761,11 @@ def _render_block_scale_tile_constants(
 
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
-    ab_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else 0
+    epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else 0
+    ab_reserved = epi_reserved
+    if chain.has_moe and chain.moe.mode == "gather":
+        token_rows, token_sfs = (cta_n, real_nb) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, real_na)
+        ab_reserved += token_rows * 32 * token_sfs
     if is_sm103:
         # CUTLASS-style sm103 pipeline: an AB stage is ONE 128-B-K chunk (a
         # third of the 384-B K-tile), and SF rides its OWN ring (own warp,
@@ -1819,7 +1823,7 @@ def _render_block_scale_tile_constants(
         # 2-CTA mxfp8 (7 -> 6) -- then refuse anything a single stage still cannot fit.
         def _desc_roots(stages: int) -> dict[str, int]:
             return _block_scale_smem_desc_roots(
-                header_bytes=tmpl.smem_fixed_reserve + (ab_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES else 0),
+                header_bytes=tmpl.smem_fixed_reserve + (epi_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES else 0),
                 rings=[
                     *((f"SFA[{i}]", sfa_smem_bytes * stages) for i in range(real_na)),
                     *((f"SFB[{j}]", sfb_smem_bytes * stages) for j in range(real_nb)),
@@ -2419,7 +2423,7 @@ def _render_block_scale_template(
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_out_vec_bytes(chain, config, use_tma)))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
-    tile_constants += f"\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
+    tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
@@ -2535,14 +2539,19 @@ def _render_block_scale_template(
         moe_msfa_list = "mSFB_list = [" + ", ".join(f"mSFB_{i}" for i in range(nsb)) + "]"
         moe_host_msfa_pass = ",\n".join(f"_sfb_operands[{i}]" for i in range(nsb)) + ("," if nsb else "")
 
-    if chain.has_moe and chain.moe.mode == "scatter":
+    if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
         routed_rows = "sym_n" if isinstance(chain.moe, MoeSwapAbSpec) else "sym_m"
-        host_ab_params = "token_ks: cute.Tensor,\ntoken_index: cute.Tensor,\n" + host_ab_params
+        host_ab_params = "token_index: cute.Tensor,\n" + host_ab_params
         compile_ab_fakes += f"\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
-        compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
-        compile_ab_pass = "fake_token_ks,\nfake_token_index,\n" + compile_ab_pass
-        moe_kernel_ma_params += "\ntoken_index: cute.Tensor,\ntoken_ks: cute.Tensor,"
-        moe_host_ma_pass += "\ntoken_index,\ntoken_ks,"
+        compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
+        moe_kernel_ma_params += "\ntoken_index: cute.Tensor,"
+        moe_host_ma_pass += "\ntoken_index,"
+        if chain.moe.mode == "scatter":
+            host_ab_params = "token_ks: cute.Tensor,\n" + host_ab_params
+            compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
+            compile_ab_pass = "fake_token_ks,\n" + compile_ab_pass
+            moe_kernel_ma_params += "\ntoken_ks: cute.Tensor,"
+            moe_host_ma_pass += "\ntoken_ks,"
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -5275,6 +5284,15 @@ class CompiledMoeBlockScaleGemm:
             if isinstance(self.chain.moe, MoeSwapAbSpec):
                 _S, _N = _N, _S
                 token_sf, weight_sf, weights = sfb, sfa, a_bufs
+            if self.chain.moe.mode == "gather":
+                from ..kernel_registry import linear_token_sf_reject
+
+                source_rows = (b_bufs if isinstance(self.chain.moe, MoeSwapAbSpec) else a_bufs)[0].shape[1]
+                for sf in token_sf:
+                    reason = linear_token_sf_reject(sf.shape, sf.stride(), source_rows, _K // self.chain.block_scale.block_size)
+                    if reason is not None:
+                        raise ValueError(reason)
+                token_sf = []  # Linear inputs do not use segmented F8_128x4 capacity.
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
             _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
             _r_sf = _sf_blob_reject(
