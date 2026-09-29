@@ -785,16 +785,26 @@ only to decline is why `closed_under` existed.
   the unsplit alternative; graph placement still determines whether a FROST plan leads.
   Policies 1 and 2 retain their original H16 selection and workspace contracts.
 - `SPLIT_KV_POLICY=4` retains those two members and adds `32/H_q` splits
-  with 512 reserved packed rows. It admits up to four sequences with total
-  observed KV capacity at least `8192 * batch`. It chooses the smallest
+  with 512 reserved packed rows. It admits up to eight sequences with total
+  observed KV capacity at least `4096 * batch`, or `2048 * batch` when the
+  unsplit tile bound across heads occupies at most a quarter of the SMs.
+  It chooses the smallest
   reserved Q capacity covering both packed Q storage and a host-visible
-  upper bound of one, two or four 128-row tiles across sequences. Thus two
+  upper bound of one or two 128-row tiles across sequences. The third
+  member covers up to four tiles, or a larger bound when those tiles across
+  heads occupy at most half the device's SM count. Thus two
   64-row sequences select the second member, while four 32-row sequences
-  select the third. The first member additionally needs observed KV capacity
+  select the third. H4/H8 plans additionally prepare `16/H_q` splits with
+  1024 reserved packed rows. Eight sequences can select this reduced split
+  member within the same 512-row and tile bounds; it avoids excessive
+  partitioning when those sequences already supply many independent tiles.
+  H16 retains its unsplit choice for eight 16-row sequences on a 148-SM B200.
+  The first member
+  additionally needs observed KV capacity
   of at least `131072 / H_q`; below it the second member avoids excessive
   partitioning. Larger capacities or tile bounds retain the recorded
-  unsplit CGA choice. All three split members reserve the same 16384 partial
-  head-rows, so the extra member does not enlarge caller workspace. This
+  unsplit CGA choice. All split members reserve the same 16384 partial
+  head-rows, so the additional member does not enlarge caller workspace. This
   experimental policy is proposed by normal heuristics. Policies 1–3
   retain their previous selection rules; capture still fixes one launch,
   with no execution-time compilation or device-to-host length read.

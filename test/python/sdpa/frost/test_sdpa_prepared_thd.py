@@ -143,9 +143,9 @@ def _plan(g):
     return g._compiled_plans[g._plan_index]
 
 
-def _cga_policy_graph(dtype, stats, record=None, h=16, *, kcap=128, stats_log2=False):
+def _cga_policy_graph(dtype, stats, record=None, h=16, *, kcap=128, stats_log2=False, bcap=4):
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    b, qcap = 4, 4096
+    b, qcap = bcap, 4096
     g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
     t = {
         name: g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name=name)
@@ -366,11 +366,12 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
 
     monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", record_module)
     kcap = 32768 if split_policy else 128
-    g, _ = _cga_policy_graph(dtype, stats, h=h, kcap=kcap)
+    bcap = 8 if split_policy == 4 else 4
+    g, _ = _cga_policy_graph(dtype, stats, h=h, kcap=kcap, bcap=bcap)
     record = g.get_engine_and_knobs_at_index(g._plan_index)
     assert record[1][cudnn.knob_type.CGA_POLICY] == 2 and cudnn.knob_type.TILE_CGA_M not in record[1]
     initial_split_policy = record[1].get(cudnn.knob_type.SPLIT_KV_POLICY)
-    split_members = {None: 0, 1: 1, 2: 1, 3: 2, 4: 3}
+    split_members = {None: 0, 1: 1, 2: 1, 3: 2, 4: 4 if h in (4, 8) else 3}
     initial_modules = [(1, False), (2, True)] + [(1, False)] * split_members[initial_split_policy]
     assert loaded[-len(initial_modules) :] == initial_modules
     # Exercise the requested persisted record independently of which valid
@@ -381,7 +382,7 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
     if split_policy:
         record[1].pop(cudnn.knob_type.SPLIT_KV, None)
         record[1][cudnn.knob_type.SPLIT_KV_POLICY] = split_policy
-    rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h, kcap=kcap)
+    rebuilt, t = _cga_policy_graph(dtype, stats, record, h=h, kcap=kcap, bcap=bcap)
     expected_modules = [(1, False), (2, policy == 2)] + [(1, False)] * split_members[split_policy]
     assert loaded[-len(expected_modules) :] == expected_modules
     assert rebuilt.get_engine_and_knobs_at_index(rebuilt._plan_index) == record
@@ -397,6 +398,10 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
             wide = family.variants[4].spec
             assert (wide.split_workspace.capacity, wide.split_workspace.splits) == (512, 32 // h)
             assert wide.scratch_bytes == short.scratch_bytes
+            if h in (4, 8):
+                batch = family.variants[5].spec
+                assert (batch.split_workspace.capacity, batch.split_workspace.splits) == (1024, 16 // h)
+                assert batch.scratch_bytes == short.scratch_bytes
     elif split_policy:
         assert family.variants[2].spec.split_workspace.capacity == (128 if split_policy == 1 else 256)
     assert _plan(rebuilt).get_workspace_size() >= max(v.spec.scratch_bytes for v in family.variants)
@@ -446,6 +451,18 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
                 ([256, 256], 8192),
                 ([513], 8192),
                 ([128], 8191),
+                ([128], 2047),
+                ([128], 2048),
+                ([256], 2048),
+                ([512], 2048),
+                ([32] * 4, 2048),
+                ([16] * 8, 2048),
+                ([128], 4095),
+                ([128], 4096),
+                ([32] * 4, 4096),
+                ([16] * 8, 8192),
+                ([128, 0, 0, 0, 128, 0, 0, 0], 4096),
+                ([129, 129, 129, 125], 8192),
                 *cases,
             ]
         elif split_policy == 3:
@@ -533,6 +550,8 @@ def _runtime_policy_record_rebind_and_capture(dtype, stats, policy, h, monkeypat
         torch.cuda.synchronize()
 
         concurrent_cases = [held[0], held[3 if split_policy else 1]]
+        if split_policy == 4 and h in (4, 8):
+            concurrent_cases[1] = next(case for case in held if len(case[1]) == 8 and case[0]["_kv_length"] >= 4096)
 
         def run_concurrent(i):
             old, old_lengths, old_ws, _, old_pack, old_uids, old_shapes, old_strides = concurrent_cases[i]

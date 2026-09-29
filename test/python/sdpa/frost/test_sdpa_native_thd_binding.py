@@ -220,15 +220,18 @@ def test_balanced_split_policy_binds_four_artifacts_and_keeps_old_frames(heads, 
         assert all(tuple(old) == original for old, original in saved)
 
 
-@pytest.mark.parametrize("heads", [4, 8, 16])
+@pytest.mark.parametrize("heads,reduced", [(4, False), (8, False), (16, False), (4, True), (8, True)])
 @pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
-def test_batched_split_policy_bounds_tiles_and_preserves_frames(heads, dtype, layout):
+def test_batched_split_policy_bounds_tiles_and_preserves_frames(heads, reduced, dtype, layout):
     variants, launches = _choice_fixture(dtype, layout, qh=heads, kh=heads)
     variants += [
         _split_member(variants[0], launches, splits // heads, capacity, index) for index, capacity, splits in ((2, 128, 128), (3, 256, 64), (4, 512, 32))
     ]
+    if reduced:
+        variants.append(_split_member(variants[0], launches, 16 // heads, 1024, 5))
     assert {v.scratch_bytes for v in variants[2:]} == {8192 + 16384 * (128 + 1) * 4}
-    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 4, variants[3], variants[4])
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 4, *variants[3:])
+    batch_member = 5 if reduced else 4
     # Recorded policy boundaries, including storage and max-Q bounds that give
     # different tile counts for the same packed total. No heuristic rank golden.
     cases = [(1, q, q, 8192, 3 if member == 2 and heads < 16 else member) for q, member in ((1, 2), (128, 2), (129, 3), (256, 3), (257, 4), (512, 4), (513, 0))]
@@ -239,9 +242,23 @@ def test_batched_split_policy_bounds_tiles_and_preserves_frames(heads, dtype, la
         (2, 256, 512, 8192, 4),
         (4, 32, 128, 8192, 4),
         (4, 128, 512, 8192, 4),
-        (4, 129, 512, 8192, 0),
-        (5, 1, 5, 32768, 0),
-        (1, 128, 128, 8191, 0),
+        (4, 129, 512, 8192, 4 if heads < 16 else 0),
+        (5, 1, 5, 32768, 4 if heads < 16 else 0),
+        (8, 16, 128, 8192, batch_member if heads < 16 else 0),
+        (8, 64, 512, 8192, batch_member if heads < 16 else 0),
+        (8, 128, 256, 4096, batch_member if heads < 16 else 0),
+        (8, 65, 520, 8192, 0),
+        (1, 128, 128, 8191, 3),
+        (1, 128, 128, 2047, 0),
+        (1, 128, 128, 2048, 3),
+        (1, 256, 256, 2048, 3),
+        (1, 512, 512, 2048, 4 if heads < 16 else 0),
+        (4, 32, 128, 2048, 4 if heads < 16 else 0),
+        (8, 16, 128, 2048, batch_member if heads == 4 else 0),
+        (1, 128, 128, 4095, 3),
+        (1, 512, 512, 4095, 4 if heads < 16 else 0),
+        (1, 128, 128, 4096, 3),
+        (4, 32, 128, 4096, 4),
         (1, 32768 // heads, 32768 // heads, 32768, 1),
     ]
     saved = []
@@ -256,6 +273,10 @@ def test_batched_split_policy_bounds_tiles_and_preserves_frames(heads, dtype, la
         assert launches[-1] == (index, tuple(frame))
         saved.append((frame, tuple(frame)))
         assert all(tuple(old) == original for old, original in saved)
+
+    outside_batch = prep._native_pack_from_facts(_choice_facts(variants[0], 9, 1, 9, 32768))
+    with pytest.raises(ValueError, match="batch capacity"):
+        choices.bind(outside_batch, prep._NATIVE_THD_INDICES, 0x4000000, 31)
 
 
 @pytest.mark.parametrize("bad", ["missing", "unrecorded", "capacity", "splits", "contract", "same_member"])
@@ -344,6 +365,50 @@ def test_batched_split_requires_matching_native_support_without_breaking_balance
     old_factory.supports_balanced_split = True
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
     prep.PreparedThdChoices(members[:4], 148, policy=2, split_policy=3)
+    with pytest.raises(NotImplementedError, match="matching native"):
+        prep.PreparedThdChoices(members, 148, policy=2, split_policy=4)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("bad", ["unrecorded", "capacity", "splits", "contract", "heads"])
+def test_reduced_batch_split_rejects_incompatible_member(bad):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    variants += [
+        _split_member(variants[0], launches, splits, capacity, index) for index, capacity, splits in ((2, 128, 16), (3, 256, 8), (4, 512, 4), (5, 1024, 2))
+    ]
+    policy = 4
+    if bad == "unrecorded":
+        policy = 3
+        variants[4] = None
+    elif bad == "capacity":
+        variants[5].split_workspace = variants[5].split_workspace._replace(capacity=512)
+    elif bad == "splits":
+        variants[5].split_workspace = variants[5].split_workspace._replace(splits=4)
+    elif bad == "contract":
+        variants[5].total_q = 512
+    else:
+        for variant in variants:
+            variant.qh = variant.kh = 16
+    with pytest.raises(ValueError, match="split policy|plan choices must share"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], policy, *variants[3:])
+
+
+def test_reduced_batch_split_requires_matching_native_support_without_breaking_existing_members(monkeypatch):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    variants += [
+        _split_member(variants[0], launches, splits, capacity, index) for index, capacity, splits in ((2, 128, 16), (3, 256, 8), (4, 512, 4), (5, 1024, 2))
+    ]
+    members = [SimpleNamespace(spec=s, _roles=("q",), _uids=(1,)) for s in variants]
+    calls = []
+
+    def old_factory(*args):
+        calls.append(args)
+        assert len(args) == 8
+        return object()
+
+    old_factory.supports_batched_split = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
+    prep.PreparedThdChoices(members[:5], 148, policy=2, split_policy=4)
     with pytest.raises(NotImplementedError, match="matching native"):
         prep.PreparedThdChoices(members, 148, policy=2, split_policy=4)
     assert len(calls) == 1

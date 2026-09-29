@@ -1868,6 +1868,10 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
                 members = ((128, 128 // facts.h_q), (256, 64 // facts.h_q))
                 if knobs.split_kv_policy == 4:
                     members += ((512, 32 // facts.h_q),)
+                    if facts.h_q in (4, 8):
+                        # Keep the same partial-workspace budget while giving
+                        # eight short sequences fewer independent KV partitions.
+                        members += ((1024, 16 // facts.h_q),)
             else:
                 members = ((128 if knobs.split_kv_policy == 1 else 256, 8),)
             for capacity, splits in members:

@@ -390,7 +390,7 @@ class SdpaThdBinder {
         return units;
     }
 
-    std::array<int64_t, 2>
+    std::array<int64_t, 3>
     split_capacities(const std::vector<NativeOperandView> &facts,
                      int64_t max_q_capacity,
                      int64_t max_batch        = 1,
@@ -398,16 +398,16 @@ class SdpaThdBinder {
         // The recorded policy bounds the short-Q/long-KV region.
         // Capacities are host observations, never reads of mutable device lengths.
         const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
-        if (b <= 0 || b > max_batch) return {0, 0};
+        if (b <= 0 || b > max_batch) return {};
         int64_t tq = std::min(capacity(required(facts, Q), resolve(facts[Q], Q, b), "q"),
                               capacity(required(facts, O), resolve(facts[O], O, b), "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
-        if (tq <= 0 || tq > max_q_capacity) return {0, 0};
+        if (tq <= 0 || tq > max_q_capacity) return {};
         int64_t tkv = std::min(capacity(required(facts, K), resolve(facts[K], K, b), "k"),
                                capacity(required(facts, V), resolve(facts[V], V, b), "v"));
         if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
-        if (tkv < multiply(b, min_kv_per_batch)) return {0, 0};
-        return {tq, tkv};
+        if (tkv < multiply(b, min_kv_per_batch)) return {};
+        return {tq, tkv, b};
     }
 
    private:
@@ -601,7 +601,8 @@ class SdpaThdPlanChoices {
                        const py::object &split,
                        int64_t split_policy,
                        const py::object &split_large,
-                       const py::object &split_wide)
+                       const py::object &split_wide,
+                       const py::object &split_batch)
         : binders_{SdpaThdBinder(single), SdpaThdBinder(pair)}, sm_count_(sm_count), policy_(policy) {
         if (policy != 1 && policy != 2) invalid("unknown native THD CGA policy");
         if (split_policy < 0 || split_policy > 4) invalid("unknown native THD split policy");
@@ -610,6 +611,9 @@ class SdpaThdPlanChoices {
             invalid("split policy3 or policy4 requires both short and long prepared split members");
         if (split_wide.is_none() != (split_policy != 4))
             invalid("split policy4 requires an additional wide prepared split member");
+        if (!split_batch.is_none() &&
+            (split_policy != 4 || (single.attr("qh").cast<int64_t>() != 4 && single.attr("qh").cast<int64_t>() != 8)))
+            invalid("split policy4 reduced batch member requires H_q in {4, 8}");
         for (const auto &member : {single, pair}) {
             if (py::hasattr(member, "split_workspace") && !member.attr("split_workspace").is_none())
                 invalid("CGA policy requires unsplit plan members");
@@ -625,6 +629,7 @@ class SdpaThdPlanChoices {
         if (!split.is_none()) common_members.push_back(split);
         if (!split_large.is_none()) common_members.push_back(split_large);
         if (!split_wide.is_none()) common_members.push_back(split_wide);
+        if (!split_batch.is_none()) common_members.push_back(split_batch);
         for (const auto &member : common_members) {
             for (const char *name : {"b",
                                      "qh",
@@ -657,6 +662,7 @@ class SdpaThdPlanChoices {
                     invalid("split policy3 or policy4 requires H_q=H_kv in {4, 8, 16}");
                 std::vector<py::object> split_members{split, split_large};
                 if (split_policy == 4) split_members.push_back(split_wide);
+                if (!split_batch.is_none()) split_members.push_back(split_batch);
                 for (size_t i = 0; i < split_members.size(); ++i) {
                     const auto &member = split_members[i];
                     if (!py::hasattr(member, "split_workspace") || member.attr("split_workspace").is_none())
@@ -712,8 +718,8 @@ class SdpaThdPlanChoices {
 
     int
     select(const std::vector<NativeOperandView> &facts) const {
-        if (binders_.size() == 5) {
-            const auto capacities = binders_[0].split_capacities(facts, split_q_capacity_, 4, 8192);
+        if (binders_.size() >= 5) {
+            const auto capacities = binders_[0].split_capacities(facts, split_q_capacity_, 8, 2048);
             const auto q_capacity = capacities[0];
             if (q_capacity > 0) {
                 const auto units = binders_[0].choice_units(facts);
@@ -721,11 +727,25 @@ class SdpaThdPlanChoices {
                 // 64-row sequences occupy two tiles. The host-visible max-Q
                 // and storage bounds also cover empty or changed device prefixes.
                 const auto heads = binders_[0].query_heads();
-                // Very short KV work does not repay the widest split, especially
-                // at H4/H8. Keep its partitions bounded by observed head-token work.
-                if (q_capacity <= 128 && units[0] <= heads && capacities[1] >= 131072 / heads) return 2;
-                if (q_capacity <= 256 && units[0] <= 2 * heads) return 3;
-                if (units[0] <= 4 * heads) return 4;
+                // Shorter KV only repays splitting when the unsplit tiles occupy
+                // at most a quarter of the SMs. Retain the longer-KV rule otherwise.
+                const auto min_kv = units[0] <= sm_count_ / 4 ? 2048 : 4096;
+                if (capacities[1] >= multiply(capacities[2], min_kv)) {
+                    // Very short KV work does not repay the widest split, especially
+                    // at H4/H8. Keep its partitions bounded by observed head-token work.
+                    if (q_capacity <= 128 && units[0] <= heads && capacities[1] >= 131072 / heads) return 2;
+                    if (q_capacity <= 256 && units[0] <= 2 * heads) return 3;
+                    // Small head counts can leave most SMs idle even with more
+                    // than four sequence tiles. The existing wide member covers
+                    // their packed storage without increasing partial workspace.
+                    if (units[0] <= std::max(4 * heads, sm_count_ / 2)) {
+                        // Eight short sequences already supply many independent
+                        // tiles. Halve their partitions while retaining the wider
+                        // split for smaller batches and longer individual queries.
+                        if (binders_.size() == 6 && capacities[2] == 8) return 5;
+                        return 4;
+                    }
+                }
             }
         } else if (binders_.size() >= 3) {
             const auto q_capacity = binders_[0].split_capacities(facts, split_q_capacity_)[0];
@@ -774,6 +794,7 @@ init_sdpa_thd_binding(py::module_ &m) {
                       const py::object &,
                       int64_t,
                       const py::object &,
+                      const py::object &,
                       const py::object &>(),
              py::arg("single"),
              py::arg("pair"),
@@ -782,9 +803,11 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("split")        = py::none(),
              py::arg("split_policy") = 0,
              py::arg("split_large")  = py::none(),
-             py::arg("split_wide")   = py::none())
+             py::arg("split_wide")   = py::none(),
+             py::arg("split_batch")  = py::none())
         .def_property_readonly_static("supports_balanced_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_batched_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_reduced_batched_split", [](py::object) { return true; })
         .def("select_index", &SdpaThdPlanChoices::select_index, py::arg("pack"), py::arg("indices"))
         .def("bind",
              &SdpaThdPlanChoices::bind,

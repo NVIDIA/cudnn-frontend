@@ -1037,9 +1037,10 @@ class PreparedThdChoices:
 
         self.variants = variants
         single, pair = variants[:2]
-        if len(variants) != (5 if split_policy == 4 else 4 if split_policy == 3 else 3 if split_policy is not None else 2):
+        expected_members = (5, 6) if split_policy == 4 else (4,) if split_policy == 3 else (3,) if split_policy is not None else (2,)
+        if len(variants) not in expected_members:
             if split_policy == 4:
-                raise ValueError("THD split policy4 needs two width members and three split members")
+                raise ValueError("THD split policy4 needs two width members and three or four split members")
             if split_policy == 3:
                 raise ValueError("THD split policy3 needs two width members and two split members")
             raise ValueError("THD plan choices need two width members and one member for an explicit split policy")
@@ -1053,6 +1054,8 @@ class PreparedThdChoices:
             raise NotImplementedError("THD plan choices require the matching native cuDNN Frontend extension")
         if split_policy == 4 and not getattr(factory, "supports_batched_split", False):
             raise NotImplementedError("THD split policy4 requires the matching native cuDNN Frontend extension")
+        if len(variants) == 6 and not getattr(factory, "supports_reduced_batched_split", False):
+            raise NotImplementedError("THD reduced batch split member requires the matching native cuDNN Frontend extension")
         if split_policy == 3 and not getattr(factory, "supports_balanced_split", False):
             raise NotImplementedError("THD split policy3 requires the matching native cuDNN Frontend extension")
         extra = tuple(member.spec for member in variants[3:]) if split_policy in (3, 4) else ()
