@@ -678,6 +678,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
             amax_o_tensor=amax_o_tensor,
+            amax_unscale=_scl_o,
             o_partial_f32=o_partial_f32,
             qh_per_kh=qh_per_kh,
             sf_o_tensor=sf_o_tensor,
@@ -2100,6 +2101,7 @@ def _correction_warp_group(
     sfo_row_off_b=0,
     sfo_col_off_h=0,
     sfo_cols=0,
+    amax_unscale=None,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -2567,6 +2569,12 @@ def _correction_warp_group(
             # sm100/split_combine computes it over the recombined O instead;
             # this write has to stay out of the way, since atomicMax only grows.
             if cutlass.const_expr(SPLIT_KV == 1 and amax_o_tensor is not None):
+                if cutlass.const_expr(amax_unscale is not None):
+                    # Publish the UNSCALED amax: the per-CTA max is over o * scale_o, so
+                    # divide once per CTA (fp32 division is monotonic -> bit-identical
+                    # to dividing the global max afterwards) and retire the trailing
+                    # _unscale_amax_kernel launch (_fp8_host amax_prescaled).
+                    _amax_o_local = _amax_o_local / amax_unscale
                 if _row_valid:
                     nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
@@ -2891,4 +2899,5 @@ def compile_prepared(
         paged_hnd,
         sfo_geometry=sfo_geometry,
         optional_amax=True,
+        amax_prescaled=True,
     )
