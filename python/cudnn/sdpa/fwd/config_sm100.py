@@ -242,8 +242,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor not in ("d128", "d192", "d256", "d512"):
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
+    if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
@@ -1823,8 +1823,8 @@ def _validate_cfg_d64(cfg: CfgD64) -> None:
     """Consistency checks on the native d64 geometry."""
     checks = (
         (cfg.TILE_K == 64 and cfg.TILE_O == 64, "d64: d_qk = d_v = 64"),
-        (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d64: FP16/BF16 inputs only (no FP8/MXFP8 kernel at this flavor)"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d64: DTYPE_O must equal DTYPE_QKV for half input"),
+        (cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16), "d64: DTYPE_QKV must be E4M3/E5M2/BF16/FP16"),
+        (cfg.DTYPE_QKV <= 1 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d64: DTYPE_O must equal DTYPE_QKV for half input"),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d64: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d64: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d64: per-role regs must be multiples of 8"),
@@ -1838,7 +1838,10 @@ def _validate_cfg_d64(cfg: CfgD64) -> None:
         (cfg.CORRECTION_WARPS == 4, "d64: CORRECTION_WARPS must be 4"),
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d64: 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d64: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64: TILE_K_HW must be 16 (f16, 1-chunk on SM10x)"),
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if cfg.DTYPE_QKV <= 1 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if cfg.DTYPE_QKV <= 1 else 16)),
+            "d64: TILE_K_HW must be 32 for FP8/MXFP8 inputs and 16 for f16/bf16",
+        ),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d64: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d64: V/O swizzle out of range"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64: N_BMM2_CHUNKS * BMM2_CHUNK_SIZE must equal TILE_N (KV axis), not TILE_O"),
@@ -1850,20 +1853,22 @@ def _validate_cfg_d64(cfg: CfgD64) -> None:
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
     _validate_params("d64", params)
-    if params.dtype_qkv <= 1:
-        raise ValueError("d64: FP8/MXFP8 inputs have no kernel at this flavor")
     if params.decode_tile:
         raise ValueError("d64: decode_tile selects the decode tile (make_cfg_d64_decode), not the prefill one")
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs: the FP8 / MXFP8 d128 kernel files at d_flavor=64
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    if fp8 and params.decode_tile:
+        raise ValueError("d64: the decode tile is f16/bf16 only")
+    # Same K-path rule as d128: FP8/MXFP8 pin the Blackwell K=32 QMMA path.
+    tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
+    b_v = 2 if params.pv_bf16 else b
     cfg = CfgD64(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
-        # f16/bf16 only here, so V matches Q/K: d128's `2 if pv_bf16 else b`
-        # collapses to b, _validate_params already declining pv_bf16 at d64.
-        BPE_V=b,
+        BPE_V=b_v,
         PV_BF16=int(params.pv_bf16),
         EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
@@ -1877,11 +1882,11 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         QO_ALIAS=1 if params.cta_mma == 1 else 0,
         Q_SWZ_BYTES=q_swz_bytes(64, b),
         K_SWZ_BYTES=q_swz_bytes(64, b),
-        V_SWZ_BYTES=v_swz_bytes(64, params.cta_mma, b),
-        O_SWZ_BYTES=o_swz_bytes(64, b_o),
+        V_SWZ_BYTES=v_swz_bytes(64, params.cta_mma, b_v),
+        O_SWZ_BYTES=o_swz_bytes(64, b_o, o_pack_div(dtype_o)),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else tile_k_hw_fp8,
         # Deeper KV pipeline than d128's 2. The halved d64 slabs pay for it
         # (cga1: 32 KiB Q u O + 64 K + 64 V = 160 KiB against the 227 KiB cap;
         # cga2: 128 KiB), and ncu says this is where the room is worth spending:
@@ -2053,7 +2058,6 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
-        RAGGED_Q=int(params.ragged_q),
     )
     _validate_cfg_d64_decode(cfg)
     return cfg, _tma_iters(cfg)
