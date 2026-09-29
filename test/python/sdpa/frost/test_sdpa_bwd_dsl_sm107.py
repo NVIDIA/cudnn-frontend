@@ -442,11 +442,14 @@ def test_reject_quantized_graphs(monkeypatch):
 # =========================================================================== ACCEPT -- fp64 oracle (Rubin)
 
 
-def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0):
+def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0, causal=True):
+    """[S_q, S_kv] keep for the band the graph applies: ``causal`` = the diagonal ``kv <= q + diag (+ right)``, ``left`` =
+    the graph's ``diagonal_band_left_bound`` (keeps ``kv >= q + diag - (left - 1)``: ``left`` keys per row, what the analyzer
+    hands the rows as ``window_left = left - 1``); ``causal=False`` with ``left`` = a sliding window alone."""
     qi = torch.arange(sq, device=dev).view(-1, 1)
     ki = torch.arange(skv, device=dev).view(1, -1)
     diag = (skv - sq) if bottom_right else 0
-    keep = ki <= qi + diag + right
+    keep = (ki <= qi + diag + right) if causal else torch.ones(sq, skv, dtype=torch.bool, device=dev)
     if left is not None:
         keep &= ki >= qi + diag - (left - 1)
     return keep
@@ -514,11 +517,29 @@ class _Run:
         return self
 
 
-def _run(b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, keep=None, omit_scale=False, seed=0, poison=None, runs=1, seq_lens=None, **sdpa_kwargs):
+def _run(
+    b=2,
+    hq=2,
+    hkv=None,
+    sq=512,
+    skv=512,
+    dt=torch.bfloat16,
+    keep=None,
+    omit_scale=False,
+    seed=0,
+    poison=None,
+    runs=1,
+    seq_lens=None,
+    ws_poison=None,
+    **sdpa_kwargs,
+):
     """Build, PIN the engine, execute ``runs`` times and hand back every run's (dQ, dK, dV) plus the fp64 oracle.
     Inputs are unit normal (the pre-port driver's data), drawn on a CPU generator so the dataset does not depend on the
     GPU's SM count (torch's CUDA Philox lays draws out by grid size).  ``poison`` pre-fills the outputs before every run
-    (a zero-initialized output hides a skipped store).  ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask."""
+    (a zero-initialized output hides a skipped store).  ``ws_poison`` (a BYTE, e.g. ``0xFF`` = NaN in every dtype the chain
+    stores) pre-fills the WORKSPACE before every run: a stage that reads a scratch region before writing it -- a stage-3
+    GEMM reaching a dS tile the main kernel skipped -- then surfaces as NaN in an output instead of riding a stale zero.
+    ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -553,6 +574,8 @@ def _run(b=2, hq=2, hkv=None, sq=512, skv=512, dt=torch.bfloat16, keep=None, omi
         if poison is not None:
             for x in (dq, dk, dv):
                 x.fill_(poison)
+        if ws_poison is not None:
+            ws.fill_(ws_poison)
         g.execute(pack, ws)
         torch.cuda.synchronize()
         outs.append(tuple(x.clone() for x in (dq, dk, dv)))
@@ -670,6 +693,54 @@ def test_causal_tail_kv_block_writes_zeros_not_residue():
         tail = got[:, :, sq:, :].float()
         assert torch.isfinite(tail).all(), f"{name}: NaN poison survived on the unattended kv rows"
         assert (tail == 0).all(), f"{name}: unattended kv rows must be EXACTLY zero, got max|.|={tail.abs().max().item():.3e}"
+
+
+# One case per arm of the band the rows serve, on the shapes where the trim's clamps and roundings bite.  ``left`` is the
+# graph's band bound (``W = left - 1`` reaches the kernels); ``causal=None`` = a window without a causal diagonal.
+_MASK_POISON_CASES = {
+    "causal": dict(sq=512, skv=512, causal=True),
+    "causal-tl-rect-q": dict(sq=768, skv=512, causal=True),  # q rows past S_kv attend everything; every kv block writes them
+    "causal-tl-tail-kv": dict(sq=256, skv=768, causal=True),  # kv blocks past S_q: the forced fully-masked last q tile is what dK's clamp reads
+    "bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True),  # shift 512: a block multiple
+    "bottom-right-ragged-sq": dict(b=1, sq=500, skv=1024, causal=True, bottom_right=True),  # shift 524: the LO floor and the dQ pair straddle
+    "bottom-right-ragged-kv": dict(sq=512, skv=1000, causal=True, bottom_right=True),  # shift 488 + the padded-kv arm
+    "swa640": dict(sq=1024, skv=1024, causal=True, left=640),  # W = 639: the dK upper / dQ lower bounds at a 64-multiple + 63
+    "swa200": dict(sq=1024, skv=1024, causal=True, left=200),  # W = 199: neither a k-tile nor a q-tile multiple
+    "swa200-bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True, left=200),
+    "swa200-bottom-right-ragged-sq": dict(b=1, sq=500, skv=1024, causal=True, bottom_right=True, left=200),
+    "swa200-no-causal": dict(sq=1024, skv=1024, causal=None, left=200),  # the diagonal dropped (causal_diag=False)
+    "swa200-tl-rect-kv": dict(sq=512, skv=1024, causal=True, left=200),  # top-left window with S_kv > S_q: blocks past S_q run the forced tile
+    "swa200-gqa": dict(hq=4, hkv=2, sq=1024, skv=1024, causal=True, left=200),  # the dQ GEMM runs once per group member
+}
+# A window with S_q > S_kv is refused by the frontend ("Sliding window attention is only supported with max_s_q <= max_s_kv",
+# fractal 2026-09-29), so the one geometry `_stage3_needs_zero_fill` still fills for -- a top-left window with
+# S_q > roundup(S_kv + W, 256) -- cannot reach the adapter through a graph; it stays as the backstop the host tile walk asserts.
+
+
+def _mask_case_kw(case):
+    """``(run kwargs, keep)`` for one ``_MASK_POISON_CASES`` entry (shared with the fp8 suite's twin through its own builder)."""
+    case = dict(case)
+    causal, bottom_right, left = case.pop("causal"), case.pop("bottom_right", False), case.pop("left", None)
+    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else (dict(use_causal_mask=True) if causal else {})
+    if left is not None:
+        kw["diagonal_band_left_bound"] = left
+    keep = _causal_keep(case["sq"], case["skv"], bottom_right=bottom_right, left=left, causal=bool(causal))
+    return case, kw, keep
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_masked_stage3_reads_only_what_stage2_wrote(case):
+    """The stage-3 GEMMs' two-sided K-trim reads ONLY dS tiles the main kernel wrote, under every mask arm the row serves --
+    so the per-execute workspace zero-fill is gone (``api_dsl_sm107._stage3_needs_zero_fill``; kept for the untrimmed twin
+    and the ``swa128-tl-rect-q-past`` geometry, which this test runs WITH the fill).  The whole workspace is poisoned with
+    0xFF (NaN in bf16 / fp16 / fp32) before the execute: a GEMM reaching a tile the kernel skipped -- the LO floor one q
+    tile below a bottom-right band, a dQ M tile spanning a q pair only half written, the window's zero tiles -- lands NaN
+    in dQ / dK (``_check`` asserts finite first), and the fp64 oracle then holds the values.  The kernel side of the
+    contract is the pair rounding in ``_q_loop_bounds`` (``config_sm107.q_write_tiles``).  Every case here runs
+    WITHOUT the fill (`_stage3_needs_zero_fill` is False on all of them; the tile walk pins that)."""
+    shape, kw, keep = _mask_case_kw(_MASK_POISON_CASES[case])
+    _run(keep=keep, poison=float("nan"), ws_poison=0xFF, **shape, **kw).check()
 
 
 @requires_rubin
@@ -801,6 +872,341 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
     assert (dq.dtype_qkv, dq.epi_mode, dq.dtype_out, dq.causal_mode) == (DTYPE_E4M3, EPI_QUANT, DTYPE_E4M3, CAUSAL_K_HI)
     dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_BF16)
     assert (dk.epi_mode, dk.dtype_out, dq.epi_mode, dq.dtype_out) == (EPI_QUANT, DTYPE_BF16, EPI_QUANT, DTYPE_BF16)
+    # The band's second edge: the graph's window rides on BOTH records (dK's upper q bound, dQ's lower kv bound) with the
+    # diagonal kept; a window alone drops the diagonal (causal_diag=False, shift 0) but keeps the modes (they name the axis);
+    # no window = the defaults (0 / True) on every record that existed before the fields did; the untrimmed twin is NONE.
+    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, cgrp_tile_mn=(256, 256), window=639)
+    assert (dk.causal_mode, dk.causal_window, dk.causal_diag, dk.causal_shift) == (CAUSAL_K_LO, 639, True, 512)
+    assert (dq.causal_mode, dq.causal_window, dq.causal_diag, dq.causal_shift) == (CAUSAL_K_HI, 639, True, 512)
+    dk, dq = _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), window=199)
+    assert (dk.causal_mode, dk.causal_window, dk.causal_diag) == (CAUSAL_K_LO, 199, False), "a window without a causal diagonal still trims"
+    assert (dq.causal_mode, dq.causal_window, dq.causal_diag) == (CAUSAL_K_HI, 199, False)
+    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256))
+    assert (dk.causal_window, dk.causal_diag, dq.causal_window, dq.causal_diag) == (0, True, 0, True), "no window: the pre-existing rendering"
+    dk, dq = _stage3_params(DTYPE_BF16, causal=True, shift=512, gran=256, trim=False, cgrp_tile_mn=(256, 256), window=639)
+    assert (dk.causal_mode, dk.causal_window, dk.causal_shift, dq.causal_mode, dq.causal_window) == (
+        CAUSAL_K_NONE,
+        0,
+        0,
+        CAUSAL_K_NONE,
+        0,
+    ), "untrimmed: no band at all"
+
+
+def test_stage3_band_params_are_validated():
+    """The two band fields are refused where they would silently render the wrong thing: a window on CAUSAL_K_NONE (the
+    full range -- every window-masked zero tile read), a dropped diagonal with no window (a trimmed mode with no bound),
+    a shift without the diagonal it offsets, a negative window, and the THD leg (absolute-row bounds)."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
+
+    ok = dict(causal_gran=256, cgrp_tile_mn=(256, 256))
+    for good in (
+        dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=639),
+        dict(**ok, causal_mode=CAUSAL_K_HI, causal_window=199, causal_diag=False),
+        dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=1, causal_shift=512),
+        dict(**ok, causal_mode=CAUSAL_K_LO),
+        dict(),
+    ):
+        validate_matmul_params(MatmulTemplateParams(**good))
+    for bad, needle in (
+        (dict(**ok, causal_mode=CAUSAL_K_NONE, causal_window=5), "needs causal_mode"),
+        (dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=-1), "must be >= 0"),
+        (dict(**ok, causal_mode=CAUSAL_K_NONE, causal_diag=False), "only means something on a trimmed"),
+        (dict(**ok, causal_mode=CAUSAL_K_LO, causal_diag=False), "neither edge"),
+        (dict(**ok, causal_mode=CAUSAL_K_HI, causal_diag=False, causal_window=5, causal_shift=3), "must be 0"),
+        (dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True), "THD"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(needle)):
+            validate_matmul_params(MatmulTemplateParams(**bad))
+
+
+def _k_range_twin(mode, m0, nkt, *, gran, shift, window, diag, tk, cgrp_m):
+    """Pure-Python twin of ``bprop_matmul_blackwell._causal_k_range`` -- the same statements over Python ints (every
+    dividend is clamped at 0 before its ``//``, as there, so floor and trunc division agree)."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_LO, CAUSAL_K_NONE
+
+    assert shift >= 0, "the sm107 rows never see a negative shift (the frontend refuses bottom-right with S_q > S_kv)"
+    if mode == CAUSAL_K_NONE:
+        return 0, nkt
+    if mode == CAUSAL_K_LO:
+        k_lo = 0
+        if diag:
+            k_lo = min(((max(m0 - shift, 0) // gran) * gran) // tk, nkt - 1)
+        k_hi = nkt
+        if window > 0:
+            k_hi = max(min((max(m0 + cgrp_m - shift + window, 0) + tk - 1) // tk, nkt), k_lo + 1)
+        return k_lo, k_hi
+    k_hi = nkt
+    if diag:
+        hi = max(((m0 + cgrp_m - 1 + shift) // gran + 1) * gran, gran)
+        k_hi = max(min((hi + tk - 1) // tk, nkt), 1)
+    k_lo = 0
+    if window > 0:
+        k_lo = min(max(m0 + shift - window, 0) // tk, k_hi - 1)
+    return k_lo, k_hi
+
+
+def _q_range_twin(k0, *, sq_pad, sq_real, skv_real, window, causal, bottom_right, tile_q=128, kv_blk=256, pair=2):
+    """Pure-Python twin of the bodies' ``_q_loop_bounds``: ``tile_dsl.mask.compute_q_loop_bounds`` (causal from below, the
+    window from above, the bottom-right anchor on both), the outward rounding to the ``pair`` (``config_sm107.q_write_tiles``)
+    and the never-empty clamps -- ``[q_lo, q_hi)`` in q tiles for the kv block at ``k0``.  The f16 body's real-length
+    diagonal; the fp8 body's is the padded one, equal wherever it serves bottom-right (S_q % 128 == 0)."""
+    n_q = sq_pad // tile_q
+    diag = (skv_real - sq_real) if bottom_right else 0
+    lo = max((k0 - diag) // tile_q, 0) if causal else 0
+    hi = n_q
+    if window is not None:
+        hi = min(-(-max(k0 + kv_blk + window - diag, 0) // tile_q), n_q)
+    if causal or window is not None:
+        lo = (lo // pair) * pair
+        hi = min(-(-hi // pair) * pair, n_q)
+    q_lo = min(lo, n_q - 1)
+    return q_lo, max(hi, q_lo + 1)
+
+
+# (S_q, S_kv, left, causal, bottom_right): the served band arms on the shapes where the roundings and clamps bite (the
+# poisoned-workspace cases, the bitwise-pin cases, one-block and ragged shapes, the past-the-window geometry).
+_BAND_GEOMETRIES = [
+    (512, 512, None, True, False),
+    (768, 512, None, True, False),
+    (256, 768, None, True, False),
+    (500, 500, None, True, False),
+    (1000, 1000, None, True, False),
+    (129, 256, None, True, False),
+    (512, 1024, None, True, True),
+    (500, 1024, None, True, True),
+    (512, 1000, None, True, True),
+    (300, 1000, None, True, True),
+    (129, 256, None, True, True),
+    (1024, 1024, 640, True, False),
+    (1024, 1024, 200, True, False),
+    (1024, 1024, 2, True, False),  # W = 1, the narrowest window the rows serve (window_left = left - 1 must be > 0: left = 1 is declined)
+    (1024, 1024, 1024, True, False),
+    (1000, 1000, 200, True, False),
+    (512, 1024, 200, True, True),
+    (500, 1024, 200, True, True),
+    (512, 1000, 200, True, True),
+    (1024, 1024, 200, False, False),
+    (1000, 1280, 200, False, False),
+    (384, 768, 200, True, True),
+    # A window with S_q > S_kv: the frontend refuses these graphs, but the model still has to agree with the adapter's fill rule
+    # on them -- (512, 256, W=127) writes every q pair, (1024, 256, W=127) and (2048, 512, W=299) leave pairs no block writes.
+    (512, 256, 128, True, False),
+    (1024, 256, 128, True, False),
+    (1024, 256, 128, False, False),
+    (2048, 512, 300, True, False),
+]
+
+
+@pytest.mark.parametrize("tk", (64, 128), ids=("bf16-k64", "fp8-k128"))
+def test_stage3_two_sided_band_arithmetic(tk):
+    """The K-trim's contract, checked against the mask definition on ~26 geometries x both k tiles with no GPU: for EVERY
+    cluster M tile of both GEMMs, (a) the K range COVERS every cell the band keeps (a trim that rounds inward drops
+    gradient), (b) every dS tile the range reads was WRITTEN by the kernel's q range (twin of ``_q_loop_bounds``, pair
+    rounding included) -- the property the poisoned-workspace tests measure on the device -- and (c) the adapter's
+    ``_stage3_needs_zero_fill`` says True exactly where (b) fails (the untrimmed twin aside).  The two twins mirror the
+    device code statement by statement; a change to either side that is not mirrored here fails (b) or (c)."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_KV_PAD, _SM107_Q_PAD, _stage3_needs_zero_fill, _stage3_params
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    gran, cgrp_m, tile_q = _SM107_KV_PAD, 256, _SM107_Q_PAD
+    for sq, skv, left, causal, bottom_right in _BAND_GEOMETRIES:
+        window = None if left is None else left - 1  # the analyzer hands the rows window_left = left - 1
+        sq_pad, skv_pad = -(-sq // tile_q) * tile_q, -(-skv // gran) * gran
+        shift = (skv - sq) if bottom_right else 0
+        dk, dq = _stage3_params(DTYPE_BF16, causal, shift, gran, trim=True, cgrp_tile_mn=(cgrp_m, cgrp_m), window=window)
+        assert (dk.causal_mode, dq.causal_mode) == (CAUSAL_K_LO, CAUSAL_K_HI)
+        common = dict(gran=gran, shift=dk.causal_shift, window=dk.causal_window, diag=dk.causal_diag, tk=tk, cgrp_m=cgrp_m)
+        # the band the kernel masks (kept cells) and the tiles it writes (per kv block x q tile)
+        qi = torch.arange(sq).view(-1, 1)
+        ki = torch.arange(skv).view(1, -1)
+        kept = (ki <= qi + shift) if causal else torch.ones(sq, skv, dtype=torch.bool)
+        if window is not None:
+            kept &= ki >= qi + shift - window
+        written = torch.zeros(skv_pad // gran, sq_pad // tile_q, dtype=torch.bool)
+        for blk in range(skv_pad // gran):
+            lo, hi = _q_range_twin(blk * gran, sq_pad=sq_pad, sq_real=sq, skv_real=skv, window=window, causal=causal, bottom_right=bottom_right)
+            written[blk, lo:hi] = True
+        written_cells = written.repeat_interleave(tile_q, dim=1)[:, :sq].repeat_interleave(gran, dim=0)[:skv]  # [kv, q]
+        all_written = True
+        tag = f"S_q={sq} S_kv={skv} left={left} causal={causal} bottom_right={bottom_right} tk={tk}"
+        # dK: M = kv (one 256-row block per cluster tile), K = q
+        nkt = -(-sq // tk)
+        for m0 in range(0, skv, cgrp_m):
+            k_lo, k_hi = _k_range_twin(CAUSAL_K_LO, m0, nkt, **common)
+            assert 0 <= k_lo < k_hi <= nkt, (tag, m0, k_lo, k_hi)
+            rows = slice(m0, min(m0 + cgrp_m, skv))
+            kept_q = kept[:, rows].any(dim=1)  # q rows with a kept cell in this kv tile
+            outside = torch.ones(sq, dtype=torch.bool)
+            outside[k_lo * tk : min(k_hi * tk, sq)] = False
+            assert not (
+                kept_q & outside
+            ).any(), f"dK {tag}: M tile {m0} K range [{k_lo}, {k_hi}) drops kept q rows {torch.nonzero(kept_q & outside).flatten().tolist()[:6]}"
+            all_written &= bool(written_cells[rows, k_lo * tk : min(k_hi * tk, sq)].all())
+        # dQ: M = q (a 256-row pair per cluster tile), K = kv
+        nkt = -(-skv // tk)
+        for m0 in range(0, sq, cgrp_m):
+            k_lo, k_hi = _k_range_twin(CAUSAL_K_HI, m0, nkt, **common)
+            assert 0 <= k_lo < k_hi <= nkt, (tag, m0, k_lo, k_hi)
+            rows = slice(m0, min(m0 + cgrp_m, sq))
+            kept_kv = kept[rows, :].any(dim=0)
+            outside = torch.ones(skv, dtype=torch.bool)
+            outside[k_lo * tk : min(k_hi * tk, skv)] = False
+            assert not (
+                kept_kv & outside
+            ).any(), f"dQ {tag}: M tile {m0} K range [{k_lo}, {k_hi}) drops kept kv rows {torch.nonzero(kept_kv & outside).flatten().tolist()[:6]}"
+            all_written &= bool(written_cells[k_lo * tk : min(k_hi * tk, skv), rows].all())
+        needs = _stage3_needs_zero_fill(causal, window, bottom_right, sq_pad, skv_pad, gran, trim=True, cgrp_tile_m=cgrp_m)
+        assert needs == (
+            not all_written
+        ), f"{tag}: the adapter's zero-fill decision ({needs}) disagrees with the tile walk (every read tile written: {all_written})"
+        assert _stage3_needs_zero_fill(
+            causal, window, bottom_right, sq_pad, skv_pad, gran, trim=False
+        ), f"{tag}: the untrimmed twin reads every tile and needs the fill"
+    assert not _stage3_needs_zero_fill(False, None, False, 512, 512, gran), "dense never needs the fill"
+    # The wide-tile twin (`STAGE3_D256_TILE = False`: a 512-row cluster M tile over 256-row kv blocks) is not tight on any mask.
+    assert _stage3_needs_zero_fill(True, None, False, 512, 512, gran, cgrp_tile_m=512) and _stage3_needs_zero_fill(
+        True, 639, False, 8192, 8192, gran, cgrp_tile_m=512
+    )
+    assert not _stage3_needs_zero_fill(False, None, False, 512, 512, gran, cgrp_tile_m=512), "dense stays fill-free on the wide tile too"
+    # W = 0 would be "no window" to the template (causal_window=0) while the kernel's SWA arm keeps one key per row: the rows
+    # decline window_left <= 0 (check_support / config_sm107) and the record builder refuses it too, so the two cannot disagree.
+    with pytest.raises(ValueError, match="window"):
+        _stage3_params(DTYPE_BF16, True, 0, gran, trim=True, cgrp_tile_mn=(cgrp_m, cgrp_m), window=0)
+    # the one served-mask family that would need the fill is a top-left window with S_q > roundup(S_kv + W, 256) -- a graph the
+    # frontend refuses (max_s_q <= max_s_kv under a window), kept as the backstop
+    assert _stage3_needs_zero_fill(True, 127, False, 1024, 256, gran) and not _stage3_needs_zero_fill(True, 127, False, 512, 256, gran)
+
+
+def test_kernels_round_the_masked_q_range_to_the_stage3_pair():
+    """Both bodies write their masked q range in the pair the stage-3 trim is keyed on: ``_Q_WRITE_TILES`` is
+    ``config_sm107.q_write_tiles(CFG)`` = ``kv_pad_rows / TILE_N`` (2), ``kv_pad_rows`` is what the adapter hands the GEMMs
+    as ``causal_gran`` (``_SM107_KV_PAD``), and ``_q_loop_bounds`` rounds with it (the source pin) -- the three facts
+    ``test_stage3_two_sided_band_arithmetic`` assumes.  The dense arm folds the rounding out on both bodies."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_KV_PAD, _SM107_Q_PAD
+    from cudnn.sdpa.bwd.config_sm107 import kv_pad_rows, q_pad_rows, q_write_tiles
+
+    for family in _FAMILIES:
+        mod = _load_kernel(family, window_right=0, window_left=199, **({"dtype_o": DTYPE_BF16} if family == "fp8" else {}))
+        assert mod._Q_WRITE_TILES == q_write_tiles(mod.CFG) == kv_pad_rows(mod.CFG) // mod.CFG.TILE_N == 2, family
+        assert kv_pad_rows(mod.CFG) == _SM107_KV_PAD and q_pad_rows(mod.CFG) == _SM107_Q_PAD, "the adapter's trim granularity IS the kernel's kv block"
+        assert mod.CFG.SWA_WINDOW == 199
+        body = _code_only(_kernel_source(family))
+        fn = body[body.index("def _q_loop_bounds(") : body.index("def _mask_p_chunk(")]
+        assert "_Q_WRITE_TILES" in fn and "(lo // pair) * pair" in fn.replace("b.lo", "lo") and "+ pair - cutlass.Int32(1)) // pair) * pair" in fn, family
+        assert "q_hi = cute.math.max(hi, q_lo + cutlass.Int32(1))" in fn, f"{family}: the never-empty clamp must stay AFTER the rounding"
+
+
+def _renderings_dir():
+    """``frost_dev/results/bwd_d256_sm107/parity/renderings`` of this checkout or of the main checkout (a worktree's
+    frost_dev is untracked) -- the local-only PTX md5 record of the stage-3 renderings."""
+    root = Path(__file__).resolve().parents[4]
+    roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
+    for r in roots:
+        d = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings"
+        if (d / "md5_develop_sm100a.txt").is_file():
+            return d
+    return None
+
+
+# The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them (no cgrp_tile_mn, no band
+# field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names = the recorded list's.
+_SM100_STAGE3_RECORDS = {
+    "lo_dense": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
+    "hi_dense": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
+    "lo_causal": dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=False),
+    "hi_causal": dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=False),
+    "lo_causal_br512": dict(a_is_m_major=True, causal_mode=1, causal_shift=512, dtype_qkv=2, thd_varlen=False),
+    "hi_causal_br512": dict(a_is_m_major=False, causal_mode=2, causal_shift=512, dtype_qkv=2, thd_varlen=False),
+    "lo_thd": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=True),
+    "hi_thd": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=True),
+    "lo_dense_fp16": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
+    "hi_dense_fp16": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
+}
+_SM100_PTX_PROBE = textwrap.dedent(r"""
+    import glob, hashlib, json, os, sys
+    dump, params_json = sys.argv[1], sys.argv[2]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "ptx"
+    os.environ["CUTE_DSL_ARCH"] = "sm_100a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams
+    kw = json.loads(params_json)
+    params = MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32, **kw)
+    mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="ptx_probe_sm100_stage3")
+    print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag)
+    io = cutlass.Float16 if int(params.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
+    # The recorded list's probe shapes (gemm_probe.py): the THD renderings fold the probe's strides into their setup kernel, so
+    # a different D or S changes THEIR md5 (the eight dense / causal ones do not depend on it).
+    S_Q, S_KV, H, B, D = 1024, 1024, 8, 1, 256
+    a_m_major = bool(params.a_is_m_major)
+
+    @cute.jit
+    def probe(entry: cutlass.Constexpr, a_ptr: cute.Pointer, b_ptr: cute.Pointer, c_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer, stream):
+        if cutlass.const_expr(a_m_major):
+            a = cute.make_tensor(a_ptr, cute.make_layout((S_KV, S_Q, H, B), stride=(1, S_KV, S_KV * S_Q, H * S_KV * S_Q)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_Q, H, B), stride=(1, H * D, D, S_Q * H * D)))
+            c = cute.make_tensor(c_ptr, cute.make_layout((S_KV, D, H, B), stride=(H * D, 1, D, S_KV * H * D)))
+        else:
+            a = cute.make_tensor(a_ptr, cute.make_layout((S_Q, S_KV, H, B), stride=(S_KV, 1, S_KV * S_Q, H * S_KV * S_Q)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_KV, H, B), stride=(1, H * D, D, S_KV * H * D)))
+            c = cute.make_tensor(c_ptr, cute.make_layout((S_Q, D, H, B), stride=(H * D, 1, D, S_Q * H * D)))
+        meta = cute.make_tensor(meta_ptr, cute.make_layout((1,), stride=(1,)))
+        desc = cute.make_tensor(desc_ptr, cute.make_layout((1,), stride=(1,)))
+        problem = tuple(cutlass.Int64(x) for x in (a.shape[0], b.shape[0], a.shape[1], H, B, *a.stride, *b.stride, *c.stride, b.shape[1], a.shape[0], c.shape[0]))
+        entry(problem, a, b, c, meta, desc, stream)
+
+    def ptr(t, align=16):
+        return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+    cute.compile(probe, mod._host, ptr(io), ptr(io), ptr(io), ptr(cutlass.Int32, 4), ptr(cutlass.Int64, 8),
+                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_100a")
+    ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
+    if not ptxs:
+        print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
+    print("PTX_MD5", hashlib.md5(open(ptxs[-1], "rb").read()).hexdigest())
+""")
+
+
+@pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
+def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
+    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to develop's: every field this branch appended to
+    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``) defaults to what the
+    SM100 adapter never spells, so its records render byte-for-byte what they always did.  The develop list is the
+    LOCAL-ONLY record ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` (re-rendered from
+    develop with the same DSL; skipped where absent, like the reference-dump pins); the rendering is a host trace-compile
+    for sm_100a of the exact record.  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    import json
+
+    d = _renderings_dir()
+    if d is None:
+        pytest.skip("no local develop PTX md5 list (frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt)")
+    want = {}
+    for ln in (d / "md5_develop_sm100a.txt").read_text().splitlines():
+        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    if not arch_known_to_the_dsl("sm_100a"):
+        pytest.skip("this cutlass-dsl has no sm_100a")
+    dump = tmp_path / f"sm100a_stage3_{record}"
+    dump.mkdir()
+    script = dump / "ptx_probe.py"
+    script.write_text(_SM100_PTX_PROBE)
+    proc = subprocess.run([sys.executable, str(script), str(dump), json.dumps(_SM100_STAGE3_RECORDS[record])], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_100a trace-compile of the SM100 stage-3 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CONST")))
+    assert out["CONST"] == "causal_window 0 causal_diag True", f"the SM100 record rendered a band: {out['CONST']}"
+    got = out["PTX_MD5"].strip()
+    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
+    assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"
 
 
 def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
@@ -1172,17 +1578,35 @@ def test_fp8_adapter_backstop_and_workspace(monkeypatch):
 @requires_rubin
 # S_q > S_kv is TOP-LEFT only: the frontend validator rejects a bottom-right causal graph with max_s_q > max_s_kv
 # ("virtually slice the Q tensor") before any engine runs, so that combination is not a shape this row can be asked for.
-@pytest.mark.parametrize("sq,skv,bottom_right", [(512, 512, False), (512, 1024, True), (768, 512, False)], ids=["square", "br-rect-kv", "tl-rect-q"])
-def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq, skv, bottom_right):
-    """The dK / dQ GEMMs' causal K-trim (plan s5: LO on dK, HI on dQ, over the kv-major workspace) is an OPTIMIZATION,
-    made exact by the zero-filled workspace: rendering both GEMMs untrimmed (``STAGE3_CAUSAL_TRIM = False``, every
-    k tile read) must give the SAME BITS for dQ / dK / dV.  A trim mode paired with the wrong operand major, or a
-    shift off by the bottom-right diagonal, drops real tiles here and shows up as a non-zero diff."""
+@pytest.mark.parametrize(
+    "sq,skv,bottom_right,left",
+    [
+        (512, 512, False, None),
+        (512, 1024, True, None),
+        (768, 512, False, None),
+        (1024, 1024, False, 640),  # W = 639: the window's bounds land 63 rows into a k tile
+        (1024, 1024, False, 200),  # W = 199: a window that is neither a k-tile nor a q-tile multiple
+        (500, 1024, True, None),  # bottom-right with a ragged S_q: shift 524, the LO floor one q tile below the band
+        (500, 1024, True, 200),  # ... plus a window: both edges off every tile grid
+        (1024, 1024, None, 200),  # a window WITHOUT a causal diagonal (causal_diag=False)
+    ],
+    ids=["square", "br-rect-kv", "tl-rect-q", "swa640", "swa200", "br-ragged-sq", "br-ragged-sq-swa200", "swa200-no-causal"],
+)
+def test_stage3_causal_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, sq, skv, bottom_right, left):
+    """The dK / dQ GEMMs' two-sided K-trim (plan s5: LO on dK, HI on dQ, over the kv-major workspace; the window bounds
+    the other side of each) is numerically INERT: rendering both GEMMs untrimmed (``STAGE3_CAUSAL_TRIM = False``, every
+    k tile read over a zero-filled workspace) must give the SAME BITS for dQ / dK / dV.  A trim mode paired with the
+    wrong operand major, a shift off by the bottom-right diagonal, or a window bound rounded INWARD drops real tiles
+    here and shows up as a non-zero diff.  The trimmed run gets a POISONED workspace: it must not read a tile the kernel
+    skipped (the poisoned-workspace test proves that per mask; here it makes the bitwise compare two proofs in one)."""
     import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
 
-    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else dict(use_causal_mask=True)
-    keep = _causal_keep(sq, skv, bottom_right=bottom_right)
-    trimmed = _run(b=2, hq=4, hkv=2, sq=sq, skv=skv, keep=keep, poison=float("nan"), **kw).check()
+    causal = bottom_right is not None
+    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else (dict(use_causal_mask=True) if causal else {})
+    if left is not None:
+        kw["diagonal_band_left_bound"] = left
+    keep = _causal_keep(sq, skv, bottom_right=bool(bottom_right), left=left, causal=causal)
+    trimmed = _run(b=2, hq=4, hkv=2, sq=sq, skv=skv, keep=keep, poison=float("nan"), ws_poison=0xFF, **kw).check()
     monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
     untrimmed = _run(b=2, hq=4, hkv=2, sq=sq, skv=skv, keep=keep, poison=float("nan"), **kw).check()
     for name, x, y in zip(("dQ", "dK", "dV"), trimmed.outs[0], untrimmed.outs[0]):

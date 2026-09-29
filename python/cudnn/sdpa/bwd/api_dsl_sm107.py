@@ -25,9 +25,16 @@ the SM100 chain's ``[S_q, S_kv]`` workspace: dK reads dS as ``A[kv, q]`` K-major
 (``a_is_m_major=False``) and dQ reads dS^T as ``A[q, kv]`` M-major (``a_is_m_major=True``).
 The causal K-trim MODES do not flip with the layout (they follow which axis is the
 output row): dK trims the low q tiles (``CAUSAL_K_LO``), dQ the high kv blocks
-(``CAUSAL_K_HI``), rounded to the kernel's 256-row kv block.  Under any mask the trim
-is an optimization only: the adapter zero-fills the workspace once, so a tile the
-stage-2 kernel skips reads as zero (``_zero_ws``).
+(``CAUSAL_K_HI``), rounded to the kernel's 256-row kv block; a sliding window adds the
+band's second edge to both (``MatmulTemplateParams.causal_window``: dK ends after the
+window, dQ starts at it), so each GEMM visits only the band's k tiles.  The trim is a
+CORRECTNESS-neutral subset of what stage 2 wrote: the bodies round every kv block's q
+range outward to the GEMMs' 256-row pair (``config_sm107.q_write_tiles``) and every
+GEMM bound rounds outward inside it (``bprop_matmul_blackwell._causal_k_range``), so no
+mask needs the workspace zero-filled -- ``_stage3_needs_zero_fill`` keeps the per-execute
+fill only for the untrimmed twin and for the one geometry a q pair is written by no kv
+block (a top-left window with ``S_q > roundup(S_kv + W, 256)``); the poisoned-workspace
+tests are the proof (``test_masked_stage3_reads_only_what_stage2_wrote``).
 
 Both renderings take the d = 256 cluster tile (``MatmulTemplateParams.cgrp_tile_mn =
 (256, 256)``, ``_stage3_cgrp_tile_mn``): cluster 2x1, one 256-row x 256-col tile per
@@ -115,7 +122,7 @@ _SM107_D = 256
 # the padded operands (module doc).  ``_SM107_Q_PAD`` is also the fp8 row's bottom-right alignment
 # claim (``engines.Capabilities.bottom_right_s_q_multiple``; pinned equal by the fp8 suite).
 _SM107_Q_PAD = 128
-_SM107_KV_PAD = 256
+_SM107_KV_PAD = 256  # also the stage-3 K-trim granularity (`causal_gran`) and the kernels' q write pair (`config_sm107.q_write_tiles`)
 _SM107_KERNEL_FILES = {_cfg.FAMILY_F16: "sm107/bprop_d256_f16.py", _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py"}
 _SM107_TEMPLATE_TAGS = {_cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16", _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8"}
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
@@ -187,39 +194,90 @@ def _stage3_params(
     cgrp_tile_mn: tuple,
     epi_modes: tuple = (EPI_NONE, EPI_NONE),
     dtype_out: int = -1,
+    window: Optional[int] = None,
 ):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
-    dK = dS . Q  : A = dS[kv, q]   -- M = kv, K = q, q contiguous -> K-major; K starts at kv's block (LO)
-    dQ = dS^T . K: A = dS^T[q, kv] -- M = q,  K = kv, q contiguous -> M-major; K ends after q's block (HI)
+    dK = dS . Q  : A = dS[kv, q]   -- M = kv, K = q, q contiguous -> K-major; K starts at kv's block (LO), ends after the window
+    dQ = dS^T . K: A = dS^T[q, kv] -- M = q,  K = kv, q contiguous -> M-major; K starts at the window, ends after q's block (HI)
 
     ``shift`` is how far the written band extends past the plain ``kv <= q`` diagonal
-    (bottom-right: ``S_kv - S_q``); ``gran`` the kernel's kv write block (256).  ``trim``
-    defaults to the module constant, read at CALL time so the bitwise pin can flip it.
-    ``cgrp_tile_mn`` is the cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a
-    caller cannot fall into the padded rendering by omission.  ``dtype_code`` is the dS
-    WORKSPACE dtype (the GEMMs' A operand): E4M3 selects the template's fp8 K64 arm, whose
-    epilogue each rendering names in ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16
-    true-unit partials, ``EPI_QUANT`` -> the quantized gradient in ``dtype_out`` + amax);
-    the half row's bf16 / fp16 records keep ``EPI_NONE`` and the inherited output dtype.
+    (bottom-right: ``S_kv - S_q``); ``gran`` the kernel's kv write block (256) = the q pair
+    it rounds its q range to (``config_sm107.q_write_tiles``).  ``window`` is the graph's
+    ``window_left`` (the kernel keeps ``kv >= q + shift - W``), None = no window; a window
+    alone (no causal) renders the band with the diagonal dropped (``causal_diag=False``).
+    ``trim`` defaults to the module constant, read at CALL time so the bitwise pin can flip
+    it; off, both records are ``CAUSAL_K_NONE`` and read every tile.  ``cgrp_tile_mn`` is the
+    cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a caller cannot fall into the
+    padded rendering by omission.  ``dtype_code`` is the dS WORKSPACE dtype (the GEMMs' A
+    operand): E4M3 selects the template's fp8 K64 arm, whose epilogue each rendering names in
+    ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16 true-unit partials, ``EPI_QUANT`` -> the
+    quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
+    ``EPI_NONE`` and the inherited output dtype.
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
-    lo = CAUSAL_K_LO if (causal and trim) else CAUSAL_K_NONE
-    hi = CAUSAL_K_HI if (causal and trim) else CAUSAL_K_NONE
+    if window is not None and int(window) <= 0:
+        # The template spells "no window" as causal_window == 0, while the kernels' SWA arm at W = 0 keeps exactly one key per
+        # row -- the two would disagree on what was written.  Unreachable through the rows (check_support / config_sm107
+        # decline window_left <= 0); refused here so it stays that way.
+        raise ValueError(f"sm107 stage 3: a sliding window needs window_left > 0 (the rows decline window_left <= 0); got {window}")
+    band = trim and (causal or window is not None)
+    lo = CAUSAL_K_LO if band else CAUSAL_K_NONE
+    hi = CAUSAL_K_HI if band else CAUSAL_K_NONE
     common = dict(
         b_is_n_major=True,
         causal_gran=gran,
-        causal_shift=shift,
+        causal_shift=shift if band else 0,
         vec_bytes_epi=vec_bytes_epi_for(_SM107_D, 2),
         dtype_qkv=dtype_code,
         cgrp_tile_mn=tuple(cgrp_tile_mn),
+        causal_window=int(window) if (band and window is not None) else 0,
+        causal_diag=bool(causal) if band else True,
     )
     dk_mode, dq_mode = epi_modes
     return (
         MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=dtype_out if dk_mode == EPI_QUANT else -1, **common),
         MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, **common),
     )
+
+
+def _stage3_needs_zero_fill(
+    causal: bool, window: Optional[int], bottom_right: bool, s_q_pad: int, s_kv_pad: int, gran: int, trim: Optional[bool] = None, cgrp_tile_m: int = 256
+) -> bool:
+    """Whether the dS workspace must be zero-filled before the main kernel writes it (once per execute, the WHOLE chunk).
+
+    The stage-3 GEMMs read only tiles the main kernel wrote: the kernel rounds every kv block's q range OUTWARD to the
+    GEMMs' ``gran``-row pair (``config_sm107.q_write_tiles``) and every K-trim bound rounds outward inside that band
+    (``bprop_matmul_blackwell._causal_k_range``), so a masked cell the GEMM reads is a zero the kernel STORED, not one the
+    fill left.  Proven per mask by the poisoned-workspace tests (``test_masked_stage3_reads_only_what_stage2_wrote``,
+    both suites: top-left / bottom-right causal, aligned and ragged, a window at 640 and at a non-multiple of the tile,
+    window + bottom-right, window without causal).  Three cases still need the fill:
+
+    * the untrimmed twin (``trim=False``): both GEMMs render ``CAUSAL_K_NONE`` and read every tile, skipped ones included
+      (the bitwise pin's base);
+    * a cluster M tile WIDER than the kernel's write block (``cgrp_tile_m > gran``: the (512, 512) / (512, 256) rows the
+      ``STAGE3_D256_TILE = False`` twin renders on this line, the SM100 chain's tile) -- a 512-row M tile straddles two
+      256-row kv blocks whose bands differ, so no per-tile K range stays inside what both wrote (the template's
+      tight-trim invariant, ``_causal_k_range``);
+    * a TOP-LEFT window with ``S_q > roundup(S_kv + W, gran)``: the last kv block (base ``S_kv_pad - gran``) writes q up
+      to ``roundup(S_kv_pad + W, gran)`` and the q pairs past it are written by NO block, while the dQ GEMM's never-empty
+      clamp still reads one k tile of them.  Bottom-right anchors the window on the diagonal (``S_kv - S_q``), so its
+      last block reaches the last q row and the case cannot arise there.
+
+    Dense (no mask) never needs it: every tile is written.  The fill is a whole-chunk ``cudaMemset``-class kernel outside
+    the harness's kernel-time filter -- 0.44 ms per 8K backward when it ran under every mask (MASK_FLOPS.md).
+    """
+    if trim is None:
+        trim = STAGE3_CAUSAL_TRIM
+    if not (causal or window is not None):
+        return False
+    if not trim or cgrp_tile_m > gran:
+        return True
+    if window is not None and not bottom_right:
+        last_written_q = -(-(s_kv_pad + int(window)) // gran) * gran
+        return s_q_pad > last_written_q
+    return False
 
 
 def _bshd_physical_ok(desc: TensorDesc) -> bool:
@@ -262,11 +320,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._b_chunk, self._qh_chunk = _sm107_chunks(
             self.batch_size, self.h_q, self._gqa_group, self._sq_pad, self._skv_pad, self._bpe_ds, batch_chunking=self._BATCH_CHUNKING
         )
-        # Under ANY mask the stage-2 kernel skips the q tiles a kv block does not attend
-        # (causal: below the block; SWA: above it), and the stage-3 GEMMs read those
-        # tiles (the dQ / dK trim is an optimization, not a bound -- and SWA has none).
-        # Zero-filled once per execute, the skipped tiles contribute exactly 0.
-        self._zero_ws = bool(self.is_causal or self.window_size_left is not None)
+        # Whether the dS workspace is zero-filled per execute: decided in `compile()`, where the stage-3 cluster tile is
+        # known (`_stage3_needs_zero_fill`: the two-sided K-trim reads only what the kernel wrote, so only the untrimmed
+        # twin, the wide-tile twin and one top-left-window geometry need it; the poisoned-workspace tests pin the rest).
+        self._zero_ws = None
         self._compiled = None
         self._prepared = None
 
@@ -396,7 +453,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _stage3_records(self, mod, tile_mn):
         """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
-        return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn)
+        return _stage3_params(
+            _DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn, window=self.window_size_left
+        )
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
         return _prepared.compile_plan(self, mod, mm_dk, mm_dq)
@@ -416,6 +475,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
         tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
+        self._zero_ws = _stage3_needs_zero_fill(
+            bool(self.is_causal), self.window_size_left, bool(self.causal_bottom_right), self._sq_pad, self._skv_pad, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0]
+        )
         p_dk, p_dq = self._stage3_records(mod, tile_mn)
         mm_dk = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dk, tag=_SM107_MM_TAGS["dk"])
         mm_dq = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dq, tag=_SM107_MM_TAGS["dq"])
@@ -530,11 +592,19 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         otherwise.  bf16 dS: the bf16 renderings, no epilogue (stage 4 folds + quantizes all three)."""
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
         gran = _cfg.kv_pad_rows(mod.CFG)
+        window = self.window_size_left
         if not self._ds_fp8:
-            return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn)
+            return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn, window=window)
         dk_mode = EPI_QUANT if self._gqa_group == 1 else EPI_DESCALE
         return _stage3_params(
-            DTYPE_E4M3, bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn, epi_modes=(dk_mode, EPI_QUANT), dtype_out=_DTYPE_CODE[self.grad_dtype]
+            DTYPE_E4M3,
+            bool(self.is_causal),
+            shift,
+            gran,
+            cgrp_tile_mn=tile_mn,
+            epi_modes=(dk_mode, EPI_QUANT),
+            dtype_out=_DTYPE_CODE[self.grad_dtype],
+            window=window,
         )
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
@@ -628,4 +698,4 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE"]
+__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE", "_stage3_needs_zero_fill"]

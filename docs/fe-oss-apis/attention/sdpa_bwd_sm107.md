@@ -80,7 +80,7 @@ scratch buffer carved from the caller's workspace (`graph.get_workspace_size()`
 is a build-time function of the shape).  Both rows are **prepared launches**
 (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`): the plan compiles
 ONE pointer-host artifact that runs the whole chain from device pointers, and
-every stage below -- the padding copies, the `seq_kv` fill and the dS zero-fill
+every stage below -- the padding copies, the `seq_kv` fill and the (rare) dS zero-fill
 included, plus the fp8 row's fold + quantize passes -- is a kernel of that
 artifact.  No torch op runs on the execute path; the graph binds its variant pack
 straight into the artifact, follows the handle's stream and captures into a CUDA
@@ -138,12 +138,19 @@ a different, three-stage shape.
 ### Masks
 
 The main kernel bounds WHICH q tiles a KV block attends (causal: from the
-diagonal; sliding window: up to the window) and zeroes P on masked cells, so dV,
-dS, dK and dQ inherit the mask. The stage-3 GEMMs render a causal K-trim (dK
-starts at the block's first attended q tile, dQ ends after the last attended kv
-block); under any mask the adapter zero-fills the workspace once so the tiles
-the kernel never visits read as zero — the trim is an optimization, and a
-bitwise pin against the untrimmed rendering keeps it that way.
+diagonal; sliding window: up to the window), rounds that range outward to a
+256-row q pair, and zeroes P on masked cells, so dV, dS, dK and dQ inherit the
+mask. The stage-3 GEMMs render a TWO-SIDED K-trim over the same band (dK starts
+at the block's first attended q pair and ends after the window; dQ starts at the
+window and ends after the last attended kv block), so each GEMM multiplies only
+the band's tiles — under a sliding window that is `~(W + 256) / S` of the dense
+K range instead of all of it. The pair rounding is what makes the trim
+self-contained: every tile a GEMM reads was written by the kernel (masked cells
+as stored zeros), so the workspace needs no zero-fill under any mask; the one
+exception the adapter still fills for is a top-left window with
+`S_q > roundup(S_kv + W, 256)` (q rows past every block's window, written by no
+block). Poisoned-workspace tests pin this per mask, and a bitwise pin against the
+untrimmed rendering keeps the trim numerically inert.
 
 ### Sequence lengths
 

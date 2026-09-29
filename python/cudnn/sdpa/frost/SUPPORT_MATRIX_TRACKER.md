@@ -689,8 +689,14 @@ per 256-row kv block walks the q tiles; dV accumulates in TMEM and is stored per
 head, dS goes to a kv-major `[B, H_chunk, S_kv, S_q]` GMEM workspace) → dK = dS·Q
 and dQ = dSᵀ·K as the shared `bprop_matmul_blackwell` GEMMs over that workspace
 (operand majors flipped relative to the SM100 chain's `[S_q, S_kv]` workspace; the
-causal K-trim modes are not, and under any mask the workspace is zero-filled so a
-skipped tile reads as zero; rendered at the d = 256 cluster tile
+causal K-trim modes are not; the trim is TWO-SIDED — a sliding window bounds the
+K range on its second side (`MatmulTemplateParams.causal_window`, appended,
+default = no window: the SM100 renderings stay PTX-identical) — and the kernels
+round every kv block's q range outward to the GEMMs' 256-row pair, so a GEMM reads
+only tiles the kernel wrote and no mask needs the workspace zero-filled (kept only
+for the untrimmed twin and a top-left window with `S_q > roundup(S_kv + W, 256)`;
+poisoned-workspace tests `test_masked_stage3_reads_only_what_stage2_wrote` in
+both suites); rendered at the d = 256 cluster tile
 `MatmulTemplateParams.cgrp_tile_mn = (256, 256)` — cluster 2x1, 256 × 256 per pair,
 no N padding at d = 256, accumulator double-buffered — selected by the sm107 adapter
 only, the SM100 d512 renderings byte-identical: `test_stage3_tile_rows_render_their_upstream_constants`,

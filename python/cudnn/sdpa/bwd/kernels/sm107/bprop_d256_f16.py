@@ -202,7 +202,16 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 
 # Config comes from the FROST template loader, never an env var: the loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain import usable.
-from cudnn.sdpa.bwd.config_sm107 import FAMILY_F16, TemplateParams, buffer_elems, desc_version, make_cfg_d256_bwd, tmem_layout, validate_head_chunk
+from cudnn.sdpa.bwd.config_sm107 import (
+    FAMILY_F16,
+    TemplateParams,
+    buffer_elems,
+    desc_version,
+    make_cfg_d256_bwd,
+    q_write_tiles,
+    tmem_layout,
+    validate_head_chunk,
+)
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG = make_cfg_d256_bwd(PARAMS, FAMILY_F16)
@@ -305,6 +314,9 @@ STATS_DOT_OFF = _B.STATS_DOT_OFF
 _SMX_CHUNK = _B._SMX_CHUNK  # 64 q cols per softmax wg (lane = kv row -> 64 q elems per lane)
 _LDTM_NUM = _B._LDTM_NUM  # tcgen05.ld.32x32b.x64 per q half
 _KV_BLOCK_ROWS = _B._KV_BLOCK_ROWS  # 256 kv rows per cga2 pair
+# The q tiles a kv block's masked q range is rounded OUTWARD to (2 = the kv block = the stage-3 GEMMs' cluster M tile and
+# their K-trim granularity `causal_gran`): stage 2 writes dS in 256-row q PAIRS so the GEMMs never read an unwritten tile.
+_Q_WRITE_TILES = q_write_tiles(CFG)
 # log2(e): P = exp(scale * S - lse) = exp2(scale * log2e * S - lse * log2e); the lse
 # factor is applied by the scheduler warp at prefetch time (the host passes natural-log lse).
 _LOG2E = 1.4426950408889634
@@ -343,10 +355,12 @@ def _causal_diag(seqlen_q_real, eff_seqlen_kv):
 
 
 def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv):
-    """[q_lo, q_hi) -- the q-tile range that attends this kv block, FORCED non-empty.
+    """[q_lo, q_hi) -- the q-tile range that attends this kv block, rounded OUTWARD to a q pair, FORCED non-empty.
 
     ``compute_q_loop_bounds`` (tile_dsl.mask) trims causal from below and SWA from above
-    with the bottom-right anchor; MASK_NONE -> [0, n_q_tiles).  An empty range (a kv
+    with the bottom-right anchor; MASK_NONE -> [0, n_q_tiles).  Under a mask the range is
+    then rounded outward to ``_Q_WRITE_TILES`` (the 256-row pair the stage-3 GEMMs trim
+    at), so every dS tile a GEMM's K range can reach was written here.  An empty range (a kv
     block past the last query under top-left causal with S_kv > S_q, a window that
     ends before this block) would leave the UNCONDITIONAL MMA prologue waiting on a
     mb_q_full the TMA warp never armed, and a runtime ``if`` cannot skip it (loop-carried
@@ -369,8 +383,18 @@ def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv):
         bottom_right=bool(CFG.CAUSAL_BOTTOM_RIGHT),
         window_right=0,
     )
-    q_lo = cute.math.min(b.lo, n_q_tiles - cutlass.Int32(1))
-    q_hi = cute.math.max(b.hi, q_lo + cutlass.Int32(1))
+    lo, hi = b.lo, b.hi
+    if cutlass.const_expr(CFG.MASK_FLAGS != MASK_NONE):
+        # Round the band OUTWARD to `_Q_WRITE_TILES` (a 256-row q pair = the stage-3 GEMMs' cluster M tile and K-trim
+        # granularity): the extra tile is fully masked (P = 0 -> dS = 0, dV += 0), and a dQ M tile that spans the pair then
+        # reads only kv blocks that wrote BOTH its q tiles -- what lets the adapter drop the workspace zero-fill
+        # (`config_sm107.q_write_tiles`; `bprop_matmul_blackwell._causal_k_range`).  Plain top-left causal pays nothing
+        # (the diagonal's tile is even); the dense arm folds this out.
+        pair = cutlass.Int32(_Q_WRITE_TILES)
+        lo = (lo // pair) * pair
+        hi = cute.math.min(((hi + pair - cutlass.Int32(1)) // pair) * pair, n_q_tiles)
+    q_lo = cute.math.min(lo, n_q_tiles - cutlass.Int32(1))
+    q_hi = cute.math.max(hi, q_lo + cutlass.Int32(1))
     return q_lo, q_hi
 
 

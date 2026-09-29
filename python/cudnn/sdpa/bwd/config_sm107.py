@@ -1169,6 +1169,11 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"per-batch kv lengths masks against the padded total and every sequence attends the whole pad",
             ),
             (cfg.SCHEDULER_POLICY in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2), f"{flavor}: SCHEDULER_POLICY must be 0/1/2"),
+            (
+                (cfg.TILE_M * cfg.CTA_MMA) % cfg.TILE_N == 0 and (cfg.TILE_M * cfg.CTA_MMA) // cfg.TILE_N >= 1,
+                f"{flavor}: the kv block (TILE_M * CTA_MMA = {cfg.TILE_M * cfg.CTA_MMA}) must be whole q tiles (TILE_N = {cfg.TILE_N}): the bodies round a "
+                f"kv block's q range OUTWARD to that many tiles so the stage-3 GEMMs' K-trim (causal_gran = the kv block) never reads an unwritten tile",
+            ),
         ]
     )
     # --- SMEM: the per-CTA cap, and the scaffold budget -----------------------------------------
@@ -1333,6 +1338,19 @@ def q_pad_rows(cfg: CfgBwdD256) -> int:
 def kv_pad_rows(cfg: CfgBwdD256) -> int:
     """S_kv must be padded to the cga2 pair's kv block (TILE_M * CTA_MMA)."""
     return cfg.TILE_M * cfg.CTA_MMA
+
+
+def q_write_tiles(cfg: CfgBwdD256) -> int:
+    """The q tiles a kv block's q range is rounded OUTWARD to before the body walks it: ``kv_pad_rows / TILE_N`` (2).
+
+    The bodies' ``_q_loop_bounds`` round the mask band's ``[q_lo, q_hi)`` to this many tiles so that stage 2 writes its
+    dS in ``kv_pad_rows``-row q PAIRS -- the granularity the stage-3 GEMMs trim at (``MatmulTemplateParams.causal_gran``,
+    which the adapter sets to ``kv_pad_rows``; ``bprop_matmul_blackwell._causal_k_range``).  A dQ cluster M tile spans a
+    whole pair, so a kv block that wrote one tile of the pair wrote the other: the GEMM never reads a tile only its
+    neighbour's band covered, and the workspace needs no zero-fill.  The cost is at most one fully-masked (P = 0 -> dS = 0,
+    dV += 0) q tile per side per kv block; under plain top-left causal none (the diagonal's tile is already even).
+    """
+    return kv_pad_rows(cfg) // cfg.TILE_N
 
 
 def ds_workspace_bytes(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_q_pad: int, s_kv_pad: int) -> int:

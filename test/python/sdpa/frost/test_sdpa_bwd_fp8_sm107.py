@@ -563,12 +563,28 @@ class _Fp8Run:
 
 
 def _run_fp8(
-    b=1, hq=2, hkv=None, sq=512, skv=512, causal=False, bottom_right=False, left=None, seed=0, runs=1, poison=None, grad_dtype=_T_E4M3, request_amax=_AMAX
+    b=1,
+    hq=2,
+    hkv=None,
+    sq=512,
+    skv=512,
+    causal=False,
+    bottom_right=False,
+    left=None,
+    seed=0,
+    runs=1,
+    poison=None,
+    grad_dtype=_T_E4M3,
+    request_amax=_AMAX,
+    ws_poison=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
     scalars (delayed scaling: scale_dP / dQ / dK / dV from the oracle's amaxes, the recipe the backend suite feeds),
-    PIN the engine, execute ``runs`` times and hand back every run's outputs plus what to compare them with."""
+    PIN the engine, execute ``runs`` times and hand back every run's outputs plus what to compare them with.
+    ``ws_poison`` (a BYTE, 0xFF = NaN in e4m3 / bf16 / fp32) pre-fills the WORKSPACE before every run, so a stage-3 GEMM
+    reading a dS tile the main kernel skipped lands NaN in an output (``check`` asserts finite first).  ``left`` without
+    ``causal`` is a sliding window alone."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
 
@@ -676,6 +692,8 @@ def _run_fp8(
             x.fill_(float("nan") if poison is None else poison)
         for x in amax_t.values():
             x.fill_(float("nan"))
+        if ws_poison is not None:
+            ws.fill_(ws_poison)
         g.execute(pack, ws)
         torch.cuda.synchronize()
         outs.append({n: x.clone() for n, x in outs_t.items()})
@@ -770,6 +788,62 @@ def test_causal_tail_kv_block_writes_zeros_not_residue(ds_knob):
     for name in ("dK", "dV"):
         tail = run.outs[0][name][:, sq:].float()
         assert torch.isfinite(tail).all() and (tail == 0).all(), f"{name}: unattended kv rows must be EXACTLY zero"
+
+
+# The band arms the fp8 row serves, on the shapes where the K-trim's roundings and clamps bite (the bf16 suite's
+# ``_MASK_POISON_CASES`` minus the ragged-S_q bottom-right shapes this row declines).  ``left`` = the graph's band bound.
+_MASK_POISON_CASES = {
+    "causal": dict(sq=512, skv=512, causal=True),
+    "causal-tl-rect-q": dict(sq=768, skv=512, causal=True),
+    "causal-tl-tail-kv": dict(sq=256, skv=768, causal=True),
+    "bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True),
+    "bottom-right-ragged-kv": dict(sq=512, skv=1000, causal=True, bottom_right=True),
+    "swa640": dict(sq=1024, skv=1024, causal=True, left=640),
+    "swa200": dict(sq=1024, skv=1024, causal=True, left=200),
+    "swa200-bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True, left=200),
+    "swa200-no-causal": dict(sq=1024, skv=1024, causal=False, left=200),
+    "swa200-tl-rect-kv": dict(sq=512, skv=1024, causal=True, left=200),  # top-left window with S_kv > S_q: blocks past S_q run the forced tile
+    # The fp8 graph ADMITS a window with S_q > S_kv (the half graph refuses it: "max_s_q <= max_s_kv"), so the fill's one remaining
+    # geometry is reachable here: (512, 256, W=127) writes every q pair (no fill), (1024, 256, W=127) leaves q pairs no block writes
+    # and `_stage3_needs_zero_fill` turns the fill on -- both ran green on fractal GPU 3, 2026-09-29.
+    "swa128-tl-rect-q-within": dict(sq=512, skv=256, causal=True, left=128),
+    "swa128-tl-rect-q-past": dict(sq=1024, skv=256, causal=True, left=128),
+    "swa200-gqa": dict(hq=8, hkv=2, sq=1024, skv=1024, causal=True, left=200),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_masked_stage3_reads_only_what_stage2_wrote(ds_knob, case):
+    """The two-sided K-trim of the stage-3 GEMMs (the e4m3 K64 arm on the shipped knob, the bf16 renderings on the twin)
+    reads ONLY dS tiles the main kernel wrote: the WHOLE workspace is poisoned with 0xFF (NaN in e4m3, bf16 and fp32)
+    before the execute, so a GEMM reaching a skipped tile lands NaN in dQ / dK -- and the per-execute zero-fill is gone
+    under every served mask but one (``api_dsl_sm107._stage3_needs_zero_fill``: only ``swa128-tl-rect-q-past`` runs with
+    it).  The bf16 suite's twin carries the ragged-S_q bottom-right shapes this row declines."""
+    _run_fp8(poison=float("nan"), ws_poison=0xFF, **_MASK_POISON_CASES[case]).check()
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "case",
+    [dict(sq=512, skv=512, causal=True), dict(sq=1024, skv=1024, causal=True, left=200), dict(sq=512, skv=1024, causal=True, bottom_right=True, left=200)],
+    ids=["causal", "swa200", "swa200-bottom-right"],
+)
+def test_stage3_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, ds_knob, case):
+    """The fp8 twin of the bf16 suite's pin: the two-sided K-trim is numerically INERT on the e4m3 K64 arm too --
+    rendering both GEMMs untrimmed (``STAGE3_CAUSAL_TRIM = False``: every k tile read over a zero-filled workspace) gives
+    the SAME BITS for dQ / dK / dV and the same amax values.  The trimmed run gets the poisoned workspace."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    trimmed = _run_fp8(b=1, hq=4, hkv=2, poison=float("nan"), ws_poison=0xFF, **case).check()
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
+    untrimmed = _run_fp8(b=1, hq=4, hkv=2, poison=float("nan"), **case).check()
+    for name in ("dQ", "dK", "dV"):
+        x, y = trimmed.outs[0][name], untrimmed.outs[0][name]
+        n_diff = (x.view(torch.int8) != y.view(torch.int8)).sum().item()
+        assert n_diff == 0, f"{name}: trimmed vs untrimmed stage 3 differ in {n_diff} elements"
+    for name in ("dQ", "dK", "dV", "dP"):
+        assert trimmed.amax[0][name].item() == untrimmed.amax[0][name].item(), f"amax_{name}: trimmed vs untrimmed differ"
 
 
 @requires_rubin

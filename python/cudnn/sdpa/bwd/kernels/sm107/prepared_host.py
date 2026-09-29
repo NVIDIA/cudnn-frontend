@@ -277,8 +277,11 @@ def _stage2_inputs(
     # Read by the padded mask arm only (the uniform real kv length); carved and written regardless (fixed kernel ABI).
     seq_kv = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)
     _fill_i32(seq_kv, skv).launch(grid=(1, 1, 1), block=(_THREADS, 1, 1), stream=stream)
-    # Zero ONCE, ahead of every chunk: under a mask the main kernel skips the q tiles a kv block does not attend and the
-    # stage-3 GEMMs read them (the trim is an optimization, SWA has none); the skipped set is the same for every chunk.
+    # Zero ONCE, ahead of every chunk, and ONLY when the adapter says so (`api_dsl_sm107._stage3_needs_zero_fill`): with the
+    # two-sided K-trim the stage-3 GEMMs read only the tiles the main kernel wrote (it rounds every kv block's q range
+    # outward to the GEMMs' 256-row pair), so no mask needs it -- except the untrimmed twin (every tile read) and a top-left
+    # window with S_q > roundup(S_kv + W, 256), where the q pairs past the last kv block's window are written by nobody.
+    # The skipped set is the same for every chunk.
     ds_full = _scratch(workspace, regions[R_DS], ds_dtype)
     if cutlass.const_expr(zero_ws):
         n16 = bc * hc * skvp * sqp * bpe_ds // 16

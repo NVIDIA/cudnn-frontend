@@ -206,6 +206,31 @@ class MatmulTemplateParams:
     # Output (D) dtype code.  -1 = inherit: dtype_qkv on the bf16 / fp16 rows,
     # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT.
     dtype_out: int = -1
+    # The band's SECOND edge (append-only, defaulted: every rendering that existed
+    # before these two fields -- the SM100 d512 chain's ten, the sm107 dense and
+    # plain-causal ones -- renders exactly what it did; the proof is a PTX md5 per
+    # rendering, frost_dev/results/bwd_d256_sm107/parity/renderings/RENDERINGS.md).
+    #   ``causal_window``  the sliding window W in elements, as the stage-2 kernel
+    #                      applies it (it keeps kv >= q + shift - W, i.e. W + 1
+    #                      keys per row -- ``compute_q_loop_bounds`` / the bodies'
+    #                      ``_mask_p_chunk``); 0 = no window.  With a window each
+    #                      mode gains its second bound: CAUSAL_K_LO (M = kv, K = q)
+    #                      an UPPER q bound (q <= kv - shift + W), CAUSAL_K_HI
+    #                      (M = q, K = kv) a LOWER kv bound (kv >= q + shift - W),
+    #                      both rounded OUTWARD to the k tile.  Without it the
+    #                      window's zero tiles -- (S - W) / S of every K range -- are
+    #                      read and multiplied (measured 80 % of the sm107 d256
+    #                      SWA-640 backward, fractal 2026-09-24, PERF.md).
+    #   ``causal_diag``    whether the causal edge kv <= q + shift is part of the
+    #                      band.  False = a window WITHOUT a causal diagonal (SWA
+    #                      only): ``causal_mode`` then just names the output axis,
+    #                      the diagonal's bound is dropped and ``causal_shift`` is 0.
+    # A window needs a mode (LO / HI names the axis) and a band needs an edge
+    # (``causal_diag`` or a window); ``validate_matmul_params`` refuses the rest.
+    # See ``bprop_matmul_blackwell._causal_k_range`` for the tile arithmetic and
+    # the invariant the stage-2 kernel owes it.
+    causal_window: int = 0
+    causal_diag: bool = True
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -266,6 +291,29 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")
     if params.vec_bytes_epi not in (16, 32):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
+    window = int(getattr(params, "causal_window", 0))
+    diag = bool(getattr(params, "causal_diag", True))
+    if window < 0:
+        raise ValueError(f"SDPA bwd stage 3: causal_window must be >= 0 (0 = no window; W = window_left as the stage-2 kernel applies it); got {window}.")
+    if window > 0 and params.causal_mode == CAUSAL_K_NONE:
+        raise ValueError(
+            f"SDPA bwd stage 3: a window (causal_window={window}) needs causal_mode CAUSAL_K_LO or CAUSAL_K_HI to name the output axis -- "
+            f"CAUSAL_K_NONE renders the full K range and would silently read every window-masked zero tile."
+        )
+    if not diag and params.causal_mode == CAUSAL_K_NONE:
+        raise ValueError(
+            "SDPA bwd stage 3: causal_diag=False only means something on a trimmed rendering (causal_mode LO / HI); render CAUSAL_K_NONE for dense."
+        )
+    if not diag and window == 0:
+        raise ValueError(
+            "SDPA bwd stage 3: a band with neither edge (causal_diag=False, causal_window=0) is dense -- render CAUSAL_K_NONE; a trimmed mode with no bound "
+            "would still take the never-empty clamp path."
+        )
+    if not diag and params.causal_shift != 0:
+        raise ValueError(
+            f"SDPA bwd stage 3: causal_shift ({params.causal_shift}) is the causal diagonal's offset; without the diagonal (causal_diag=False) it must be 0 "
+            f"(bottom-right alignment requires a causal band on every row)."
+        )
     if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
         # The causal K-trim assumes the workspace is one dense rectangle per
         # (batch, head), which is exactly what THD's blocked layout is not: the

@@ -279,6 +279,10 @@ b_is_n_major = bool(PARAMS.b_is_n_major)
 causal_mode = int(PARAMS.causal_mode)
 causal_gran = int(PARAMS.causal_gran)
 causal_shift = int(PARAMS.causal_shift)
+# The band's second edge (`MatmulTemplateParams.causal_window` / `.causal_diag`, appended 2026-09-29; read through getattr like
+# `epi_mode` so a record built before the fields existed renders the one-sided band it always did).
+causal_window = int(getattr(PARAMS, "causal_window", 0))
+causal_diag = bool(getattr(PARAMS, "causal_diag", True))
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
 ab_stages = _ROW.ab_stages
@@ -534,45 +538,72 @@ def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
 
 @cute.jit
 def _causal_k_range(coord_m_cgrp, num_k_tiles):
-    """The K-tile range this M tile may read, under stage 2's causal skip.
+    """``[k_begin, k_end)`` -- the K tiles this cluster M tile reads under the mask band stage 2 wrote.
 
-    Stage 2 leaves the tiles above the diagonal UNWRITTEN, so what is outside
-    this range is whatever the caller left in the workspace.
+    THE INVARIANT (both kernels, both directions): the GEMM reads exactly the tiles
+    stage 2 writes for the band, plus at most one OUTWARD-rounded k tile per side,
+    and only tiles the caller zeroed or the kernel wrote.  Stage 2 writes a kv
+    block's q range rounded OUTWARD to ``causal_gran`` rows (the sm107 bodies'
+    ``_q_loop_bounds``: two 128-row q tiles = the 256-row kv block = this GEMM's
+    cluster M tile); every bound here rounds OUTWARD too (down for a low bound,
+    up for a high one), first to ``causal_gran`` where the bound is the diagonal's,
+    then to the k tile ``tk``.  So the range covers every structurally non-zero
+    cell and stays inside the written region -- an unwritten tile is never read,
+    and no zero-fill is needed (the poisoned-workspace tests
+    ``test_masked_stage3_reads_only_what_stage2_wrote`` in the two sm107 suites
+    are the runtime proof; ``test_stage3_two_sided_band_arithmetic`` the host one).
 
-    Whether that makes the range a CORRECTNESS bound or only an optimization
-    depends on the tight-trim invariant::
+    The band, with ``shift`` = how far the diagonal sits past ``kv == q`` (the
+    bottom-right ``S_kv - S_q``; 0 top-left) and ``W = causal_window``::
 
-        cgrp_tile_mnk[0] <= causal_gran
+        causal edge (causal_diag)   kv <= q + shift          <=>  q >= kv - shift
+        window edge (W > 0)         kv >= q + shift - W      <=>  q <= kv - shift + W
 
-    i.e. one cluster M tile fits inside one stage-2 write block.  It depends on
-    the tile row (``_TILE_ROWS``): it HOLDS on the (256, 256) row (256 <= 256,
-    the sm107 d256 chain) and does NOT hold on the (512, 512) and (512, 256)
-    rows (512 > 256): a 512-row M tile straddles two 256-row stage-2 blocks, and
-    since the bounds below are per-tile, no range can cover the tile's live rows
-    without also covering its neighbour's skipped ones.
+    and the two renderings, each keyed on the CLUSTER's M base ``m0`` (identical on
+    both CTAs of a pair) over the M tile ``[m0, m0 + M)``:
 
-    So on a 512-row M tile this is an OPTIMIZATION ONLY, and the caller's
-    zero-fill is what makes it correct -- both adapters set `_zero_ws` whenever
-    a causal-family mask is active, which is exactly the condition under which
-    any of this runs.  Do not weaken that zero-fill to "only when shift != 0" on
-    the theory that the trim protects the aligned case; at 512 rows it does not.
-    On the tight (256, 256) row the zero-fill is still what covers the ONE
-    128-row q tile the dK (LO) bound over-reads under a bottom-right shift
-    (``causal_gran`` is stage 2's 256-row kv block, not its 128-row Q tile) and
-    the never-empty clamp below; dropping it there is a follow-up that passes
-    a per-mode granularity, gated on poisoned-workspace tests.
+        CAUSAL_K_LO  (dV / dK: M = kv, K = q)
+            k_lo = floor((m0 - shift) / gran) * gran / tk         causal edge  (= stage 2's rounded first q tile)
+            k_hi = ceil((m0 + M - shift + W) / tk)                window edge  (the tile's last kv row's last kept q)
+        CAUSAL_K_HI  (dQ: M = q, K = kv)
+            k_lo = floor((m0 + shift - W) / tk)                   window edge  (the tile's first q row's first kept kv)
+            k_hi = ceil((floor((m0 + M - 1 + shift) / gran) + 1) * gran / tk)   causal edge (= stage 2's last kv block)
 
-    The SM100 d512 chain keeps the (512, 512) row despite the looser trim
-    because it measures faster BOTH ways at B=1 H=128 S=8192 d=512 bf16: +3.5%
-    no_mask, +7.8% causal (the wider tile more than pays for the extra k-tiles
-    it reads).
+    An absent edge leaves its bound at 0 / ``nkt``.  Where a bound is the
+    diagonal's it is rounded to ``causal_gran`` -- the granularity stage 2 writes
+    at -- because the M tile of the OTHER GEMM spans that many rows and the two
+    tiles of a pair must have been written together; where it is the window's it
+    is rounded to ``tk`` only, which is finer than what stage 2 wrote (``tk`` divides
+    the q tile), hence still inside it.  The two edges are independent, so a
+    window without a diagonal (``causal_diag=False``, SWA-only) is the same code
+    with one bound dropped.
 
-    Keyed on the CLUSTER's M tile base (``tile_m * cgrp_tile_m``), which is
-    identical on both CTAs of a pair, and rounded to ``causal_gran`` -- stage
-    2's own write granularity.  Rounding OUTWARD (down for the low bound, up for
-    the high one) is what keeps the range covering every structurally non-zero
-    tile; under the tight-trim invariant that outward rounding also keeps it a
-    subset of what stage 2 wrote.
+    Tight-trim invariant: ``cgrp_tile_mnk[0] <= causal_gran`` -- one cluster M
+    tile fits inside one stage-2 write block.  It HOLDS on the (256, 256) row
+    (256 <= 256, the sm107 d256 chain) and does NOT hold on the (512, 512) and
+    (512, 256) rows (512 > 256): a 512-row M tile straddles two 256-row stage-2
+    blocks, and since the bounds are per tile no range can cover the tile's live
+    rows without also covering its neighbour's skipped ones.  On those rows this
+    is an OPTIMIZATION ONLY and the caller's zero-fill is what makes it correct --
+    the SM100 adapter sets ``_zero_ws`` whenever a causal-family mask is active,
+    which is exactly the condition under which any of this runs.  Do not weaken
+    that zero-fill on the theory that the trim protects the aligned case; at 512
+    rows it does not.  (The SM100 d512 chain keeps the (512, 512) row despite the
+    looser trim because it measures faster BOTH ways at B=1 H=128 S=8192 d=512
+    bf16: +3.5 % no_mask, +7.8 % causal.)
+
+    NEVER return an empty range.  The mainloop would run zero iterations, but the
+    EPILOGUE still stores the accumulator -- and ``scale_d`` starts False, so with
+    no MMA the accumulator is uninitialised TMEM and the output row is garbage.
+    The clamps below keep one k tile, chosen inside the written region: LO clamps
+    ``k_lo`` to ``nkt - 1`` (the last q tile, which stage 2's forced fully-masked
+    tile wrote with zeros for a kv block past the last query) and ``k_hi`` to
+    ``k_lo + 1``; HI clamps ``k_hi`` to ``>= 1`` (kv block 0 wrote every q pair
+    under a causal band) and ``k_lo`` to ``k_hi - 1``.  One structurally-masked
+    tile contributes exactly 0, which is the answer those rows want.  The ONE
+    geometry where a q pair is written by NO kv block -- a top-left window with
+    ``S_q > roundup(S_kv + W, gran)`` -- is the one case the sm107 adapter still
+    zero-fills for (``_stage3_needs_zero_fill``).
 
     Never reached under THD: the adapter renders the packed stage 3 with
     ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
@@ -581,7 +612,7 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     ``SdpaBwdDslSm100.compile``.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
-    # two bounds and the min() below share one numeric type.
+    # bounds and the min() / max() below share one numeric type.
     nkt = cutlass.Int32(num_k_tiles)
     if cutlass.const_expr(causal_mode == CAUSAL_K_NONE):
         return cutlass.Int32(0), nkt
@@ -589,26 +620,41 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     tk = cutlass.Int32(cta_tile_mnk[2])
     m0 = cutlass.Int32(coord_m_cgrp)
     shift = cutlass.Int32(causal_shift)
-    # NEVER return an empty range. The mainloop would run zero iterations, but
-    # the EPILOGUE still stores the accumulator -- and `scale_d` starts False, so
-    # with no MMA the accumulator is uninitialised TMEM and the output row is
-    # garbage. One k-tile of a ZEROED workspace contributes exactly 0, which is
-    # the answer those rows want anyway (they are structurally masked out).
-    # This is why the caller must zero S/dS whenever the trim is active.
+    # Every new operand is clamped at 0 BEFORE its `//`: the bounds are non-negative rows, and a negative dividend's
+    # division direction is not something this arithmetic should depend on.
     if cutlass.const_expr(causal_mode == CAUSAL_K_LO):
-        # dV / dK: output row is kv, so K (= q) starts at the stage-2 block
-        # holding kv -- pulled EARLIER by the shift, because S[q, kv] is
-        # non-zero for q >= kv - shift.  Clamped at 0.
-        lo = m0 - shift
+        # dV / dK: output row is kv, so K (= q) starts at the stage-2 block holding kv -- pulled EARLIER by the shift,
+        # because S[q, kv] is non-zero for q >= kv - shift.  Clamped at 0, then to the last q tile (never empty).
+        k_lo = cutlass.Int32(0)
+        if cutlass.const_expr(causal_diag):
+            lo = m0 - shift
+            lo = cute.math.max(lo, cutlass.Int32(0))
+            k_lo = ((lo // blk) * blk) // tk
+            k_lo = cute.math.min(k_lo, nkt - cutlass.Int32(1))
+        k_hi = nkt
+        if cutlass.const_expr(causal_window > 0):
+            # ... and ENDS after the last q the tile's last kv row keeps: q <= kv - shift + W for kv < m0 + M, so
+            # q < m0 + M - shift + W; rounded UP to the k tile, clamped to nkt and to at least one tile past k_lo.
+            hi = m0 + cutlass.Int32(cgrp_tile_mnk[0]) - shift + cutlass.Int32(causal_window)
+            hi = cute.math.max(hi, cutlass.Int32(0))
+            k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+            k_hi = cute.math.max(k_hi, k_lo + cutlass.Int32(1))
+        return k_lo, k_hi
+    # dQ: output row is q, so K (= kv) ends after q's stage-2 block, pushed LATER by the shift (kv <= q + shift) ...
+    k_hi = nkt
+    if cutlass.const_expr(causal_diag):
+        hi = ((m0 + cutlass.Int32(cgrp_tile_mnk[0] - 1) + shift) // blk + cutlass.Int32(1)) * blk
+        hi = cute.math.max(hi, blk)
+        k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+        k_hi = cute.math.max(k_hi, cutlass.Int32(1))
+    k_lo = cutlass.Int32(0)
+    if cutlass.const_expr(causal_window > 0):
+        # ... and STARTS at the first kv the tile's first q row keeps: kv >= q + shift - W for q >= m0, so kv >= m0 + shift - W;
+        # rounded DOWN to the k tile (clamped at 0) and to at least one tile before k_hi.
+        lo = m0 + shift - cutlass.Int32(causal_window)
         lo = cute.math.max(lo, cutlass.Int32(0))
-        k_lo = ((lo // blk) * blk) // tk
-        return cute.math.min(k_lo, nkt - cutlass.Int32(1)), nkt
-    # dQ: output row is q, so K (= kv) ends after q's stage-2 block, pushed
-    # LATER by the shift (kv <= q + shift).
-    hi = ((m0 + cutlass.Int32(cgrp_tile_mnk[0] - 1) + shift) // blk + cutlass.Int32(1)) * blk
-    hi = cute.math.max(hi, blk)
-    k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
-    return cutlass.Int32(0), cute.math.max(k_hi, cutlass.Int32(1))
+        k_lo = cute.math.min(lo // tk, k_hi - cutlass.Int32(1))
+    return k_lo, k_hi
 
 
 @cute.kernel
