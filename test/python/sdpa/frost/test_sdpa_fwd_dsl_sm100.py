@@ -1524,9 +1524,12 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     # first — the rule is shape-only, so no batch/SM-count staging needed.
     pg = _plans_for(64, 8, 64)
     assert pg[0] is True and False in pg, f"small-s_q GQA should rank packed first with unpacked runner-up; got {pg}"
-    # GQA full prefill: both variants ranked, unpacked first.
+    # GQA full prefill under the causal band: both variants ranked, PACKED first
+    # (heuristics._sm100_banded_gqa_packs -- B200-measured on the llama 3.1
+    # layer: bf16 S=2K 1.23x -> 0.99x of cuDNN, 8K/32K neutral-to-better);
+    # the unpacked plan stays the runner-up for autotune.
     pg = _plans_for(64, 8, 8192)
-    assert pg[0] is False and True in pg, f"full-prefill GQA should rank unpacked first with packed runner-up; got {pg}"
+    assert pg[0] is True and False in pg, f"full-prefill causal GQA should rank packed first with unpacked runner-up; got {pg}"
 
 
 # THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of

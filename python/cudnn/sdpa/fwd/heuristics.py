@@ -828,6 +828,23 @@ def _pack_gqa_wins(facts, tile_q: int) -> bool:
     return facts.s_q < tile_q
 
 
+def _sm100_banded_gqa_packs(caps: Capabilities, facts) -> bool:
+    """The SM100 prefill rows pack a GQA group under a diagonal band (causal,
+    bottom-right causal, sliding window) at ANY S_q, not only on decode shapes.
+
+    A packed unit holds ``tile_m / G`` tokens of every head in the group, so
+    under a band its K/V walk is bounded by those few tokens' diagonal instead
+    of a whole 128-token tile's, and the group's heads share every K/V tile the
+    unit streams.  MEASURED on B200 (llama 3.1 layer, B=2, H=64/8, d=128,
+    S=2048 top-left causal, profiler kernel sums, cuDNN 9.30 as the yardstick):
+    bf16 unpacked 0.155 ms (1.23x cuDNN) -> packed 0.125 ms (0.99x); e4m3
+    unpacked 0.150 ms (1.39x) -> packed 0.127 ms (1.18x); S=8192 e4m3 causal
+    1.17x -> 1.09x.  Dense (no band) graphs are unmoved (e4m3 0.184 vs 0.183
+    ms), so the plain decode rule keeps them.  Rubin (cc 10.7) and SM120 keep
+    their own rows' rules."""
+    return caps.sm_lo == 100 and caps.sm_hi < 107 and not facts.thd and (facts.causal or facts.window_left is not None) and facts.h_q != facts.h_kv
+
+
 def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
@@ -959,7 +976,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
     else:
         wins = _pack_gqa_wins(facts, tile_q)
-    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
+    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
 
