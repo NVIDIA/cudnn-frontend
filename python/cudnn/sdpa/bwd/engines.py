@@ -241,6 +241,9 @@ class Capabilities:
     # threads the real length keeps 1.  Appended last: Capabilities is
     # positional-append-only.
     bottom_right_s_q_multiple: int = 1
+    # THD ports may be head-interleaved (head stride >= D, a multiple of 8
+    # elements); rows without it require head stride == D.
+    thd_head_stride: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -364,14 +367,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if not facts.bshd_layout:
             return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical under THD (the packed path has no staging copy)"
         # PACKED rows, not necessarily compact: the kernels address a row as
-        # ``token * token_stride + head * D + col`` with each port's own
-        # plan-time token stride, so a port declared as a view into a wider
-        # per-token record (a K or V slice of an interleaved [T, 2, H, D]
-        # buffer, token stride 2*H*D) is served at that stride. Required: head
-        # stride D (no head stride is read), element stride 1, and a token
-        # stride that covers the row (>= H*D) and keeps every row 16-byte
-        # aligned (a multiple of 8 fp16/bf16 elements -- the cp.async loads
-        # move 16-byte chunks). The batch stride is not consulted (a ragged
+        # ``token * token_stride + head * head_stride + col`` with each port's
+        # own plan-time strides, so a view into a wider per-token record (a K
+        # or V slice of an interleaved [T, 2, H, D] buffer, token stride
+        # 2*H*D) or a head-interleaved record (head stride D + gap) is served
+        # at those strides. Required: element stride 1, head stride >= D and
+        # token stride >= H * head_stride, each a multiple of 8 fp16/bf16
+        # elements so every head base stays 16-byte aligned (the cp.async
+        # loads move 16-byte chunks). The batch stride is not consulted (a ragged
         # port's sequences start at its ragged offsets). The TOKEN stride is
         # always checked: the packed view walks every token of every sequence
         # with it, so it is load-bearing even when the envelope S_max is 1.
@@ -381,13 +384,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         for name, dim, stride in facts.port_layouts:
             _, h, _, d = (int(x) for x in dim)
             ts = int(stride[2])
-            head_ok = int(dim[1]) == 1 or int(stride[1]) == d
-            token_ok = ts >= h * d and ts % 8 == 0
+            hs = int(stride[1]) if h > 1 else d
+            head_ok = h == 1 or (hs == d if not capabilities.thd_head_stride else (hs >= d and hs % 8 == 0))
+            token_ok = ts >= h * hs and ts % 8 == 0
             elem_ok = d == 1 or int(stride[3]) == 1
             if not (head_ok and token_ok and elem_ok):
                 return (
-                    f"{name} must be packed BSHD rows under THD (head stride D, element stride 1, "
-                    f"token stride >= H*D and a multiple of 8 elements); got stride {tuple(stride)}"
+                    f"{name} must be packed BSHD rows under THD (element stride 1, "
+                    f"{'head stride >= D and ' if capabilities.thd_head_stride else 'head stride D, '}"
+                    f"token stride >= H * head stride, each a multiple of 8 elements); got stride {tuple(stride)}"
                 )
         # A packed graph has no [B, H, S_q, S_kv] bias: the per-sequence score
         # rectangles are different sizes, and the kernels' bias read is the
@@ -818,7 +823,8 @@ def _sm80_spec() -> EngineSpec:
     opt-in SMEM, which the sm86/sm89 parts do not have.
 
     THD / ragged: served on the packed ``[1, T, H, D]`` path (BSHD ports each
-    at its own token stride -- a K/V slice of an interleaved record included --
+    at its own token and head stride -- a K/V slice of an interleaved record
+    and a head-interleaved record included --
     per-batch ``seq_len_q/kv`` turned into device ``cu_seqlens`` by a setup
     launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
@@ -855,6 +861,7 @@ def _sm80_spec() -> EngineSpec:
             # build time; B * S_max would be the fallback and is far larger
             # than any packed buffer.
             thd_declared_totals=True,
+            thd_head_stride=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the
