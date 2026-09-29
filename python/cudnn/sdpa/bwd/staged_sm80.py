@@ -30,6 +30,7 @@ def layout_for(api):
     plan = SimpleNamespace(**vars(api))
     plan.head_dim_qk, plan.head_dim_v = api.flavor_d_qk, api.flavor_d_v
     plan._thd_token_strides = dict(api._thd_token_strides)
+    plan._thd_head_strides = dict(api._thd_head_strides)
     copies, offset = [], 0
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
@@ -55,6 +56,7 @@ def layout_for(api):
             setattr(plan, role + "_desc", cooked)
             if api.thd:
                 plan._thd_token_strides[role] = heads * dim
+                plan._thd_head_strides[role] = dim
             copies.append((role, offset, shape))
             offset += ws_align(math.prod(shape) * 2)
     # Auxiliary accumulators stay in the chain workspace. Prepared casts
@@ -110,7 +112,7 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
         if api.thd:
             tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
             shape = (1, shape[1], tokens, shape[3])
-            strides = (tokens * api._thd_token_strides[role], shape[3], api._thd_token_strides[role], 1)
+            strides = (tokens * api._thd_token_strides[role], api._thd_head_strides[role], api._thd_token_strides[role], 1)
         if tensor.dtype != api.dtype or f.shape != shape or any(n > 1 and actual != expected for n, actual, expected in zip(shape, f.strides, strides)):
             raise ValueError(f"sdpa_bwd_sm80: {role} must match the declared shape, dtype and strides")
     stats = original["stats"]

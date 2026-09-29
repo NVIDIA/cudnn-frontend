@@ -75,7 +75,7 @@ def build_spec(api, d64_module, *, staged=False):
                         tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
                         token_stride = api._thd_token_strides[role]
                         shape = (1, shape[1], tokens, shape[3])
-                        strides = (tokens * token_stride, shape[3], token_stride, 1)
+                        strides = (tokens * token_stride, api._thd_head_strides[role], token_stride, 1)
                     elif role == "stats":
                         if api._thd_lse_token_major:
                             shape, strides = (api._t_q_cap, api.h_q), (api.h_q, 1)
