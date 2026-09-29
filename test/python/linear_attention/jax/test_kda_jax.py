@@ -451,7 +451,12 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
         args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
     if safe_gate and schedule == "warmup":
         args = (*args[:5], None, *args[6:])
-    options = dict(checkpoint_every_n_tokens=checkpoint, batch_invariant=schedule == "uncut", safe_gate=safe_gate)
+    options = dict(
+        checkpoint_every_n_tokens=checkpoint,
+        batch_invariant=schedule == "uncut",
+        safe_gate=safe_gate,
+        enable_gate_decay_split=schedule == "warmup",
+    )
     if domain == "linear":
         options["gate_domain"] = domain
 

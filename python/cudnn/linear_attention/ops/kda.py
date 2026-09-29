@@ -95,6 +95,7 @@ def make_fprop_cache_key(
     plan_name,
     overwrite_initial_state,
     state_pool_rows=None,
+    enable_gate_decay_split=False,
 ):
     return (
         "fprop",
@@ -130,6 +131,7 @@ def make_fprop_cache_key(
         plan_name,
         bool(overwrite_initial_state),
         state_pool_rows,
+        bool(enable_gate_decay_split),
     )
 
 
@@ -166,6 +168,7 @@ def make_bprop_cache_key(
     dt_bias_dtype,
     device,
     plan_name,
+    enable_gate_decay_split=False,
 ):
     return (
         "bprop",
@@ -201,6 +204,7 @@ def make_bprop_cache_key(
         dt_bias_dtype,
         device,
         plan_name,
+        bool(enable_gate_decay_split),
     )
 
 
@@ -237,6 +241,7 @@ def build_fprop_graph(
     overwrite_initial_state=False,
     state_indices_dtype=None,
     state_pool_rows=None,
+    enable_gate_decay_split=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -282,6 +287,7 @@ def build_fprop_graph(
         gate_domain=None if gate_domain == "log" else gate_domain,
         overwrite_initial_state=overwrite_initial_state or None,
         checkpoint_every_n_tokens=checkpoint,
+        enable_gate_decay_split=enable_gate_decay_split or None,
         name="kda",
     )
     return graph, dict(
@@ -329,6 +335,7 @@ def run_kda_fwd(
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal KDA forward over a cached single-node KDA pygraph in THD layout.
 
@@ -434,6 +441,7 @@ def run_kda_fwd(
         plan_name,
         final_state_out is not None,
         state_pool_rows,
+        enable_gate_decay_split,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -464,6 +472,7 @@ def run_kda_fwd(
             overwrite_initial_state=final_state_out is not None,
             state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
             state_pool_rows=state_pool_rows,
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -526,6 +535,7 @@ def kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional KDA forward: :func:`run_kda_fwd` with fresh outputs; the autograd formula registers below."""
     return run_kda_fwd(
@@ -549,6 +559,7 @@ def kda_fwd(
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         plan_name=plan_name,
+        enable_gate_decay_split=enable_gate_decay_split,
     )
 
 
@@ -575,6 +586,7 @@ def kda_fwd_overwrite_state(
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """KDA forward whose final state overwrites ``initial_state``, the rows ``state_indices`` names when that int32 ``[N]``
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
@@ -603,6 +615,7 @@ def kda_fwd_overwrite_state(
         output_final_state=bool(output_final_state),
         final_state_out=initial_state if output_final_state else None,
         state_indices=state_indices,
+        enable_gate_decay_split=enable_gate_decay_split,
     )
     return o, state_checkpoints
 
@@ -629,6 +642,7 @@ def kda_fwd_fake(
     dt_bias=None,
     checkpoint_every_n_tokens=0,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split=False,
 ):
     total, H, K = q.shape
     HK = k.shape[1]
@@ -681,6 +695,7 @@ def kda_fwd_overwrite_state_fake(
     plan_name=None,
     state_indices=None,
     output_final_state=True,
+    enable_gate_decay_split=False,
 ):
     o, _, state_checkpoints = kda_fwd_fake(
         q=q,
@@ -703,6 +718,7 @@ def kda_fwd_overwrite_state_fake(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
+        enable_gate_decay_split=enable_gate_decay_split,
     )
     return o, state_checkpoints
 
@@ -738,6 +754,7 @@ def build_bprop_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     checkpoint_every_n_tokens=0,
+    enable_gate_decay_split=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -785,6 +802,7 @@ def build_bprop_graph(
         safe_gate=safe_gate or None,
         gate_lower_bound=gate_lower_bound,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        enable_gate_decay_split=enable_gate_decay_split or None,
         name="kda_bwd",
     )
     return graph, dict(
@@ -840,6 +858,7 @@ def kda_bwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal KDA backward over a cached single-node KDA_BWD pygraph in THD layout.
 
@@ -940,6 +959,7 @@ def kda_bwd(
         dt_bias.dtype if dt_bias is not None else None,
         device,
         plan_name,
+        enable_gate_decay_split,
     )
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
@@ -968,6 +988,7 @@ def kda_bwd(
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1041,6 +1062,7 @@ def kda_bwd_fake(
     a_log=None,
     dt_bias=None,
     plan_name=None,
+    enable_gate_decay_split=False,
 ):
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
@@ -1087,6 +1109,7 @@ def kda_setup_context(ctx, inputs, output):
         dt_bias,
         checkpoint_every_n_tokens,
         plan_name,
+        enable_gate_decay_split,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
     ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 16 == 0 and output[2].numel() > 0
@@ -1105,6 +1128,7 @@ def kda_setup_context(ctx, inputs, output):
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
     ctx.batch_invariant = batch_invariant
     ctx.plan_name = plan_name
+    ctx.enable_gate_decay_split = bool(enable_gate_decay_split)
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
     ctx.allow_neg_eigval = bool(allow_neg_eigval)
     ctx.safe_gate = bool(safe_gate)
@@ -1154,6 +1178,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints):
         a_log=a_log,
         dt_bias=dt_bias,
         plan_name=ctx.plan_name,
+        enable_gate_decay_split=ctx.enable_gate_decay_split,
     )
     return (
         dq,
@@ -1174,6 +1199,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         d_a_log if ctx.has_a_log else None,
         d_dt_bias if ctx.has_dt_bias else None,
+        None,
         None,
         None,
     )
@@ -1214,6 +1240,7 @@ def kimi_delta_attention(
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    enable_gate_decay_split: bool = False,
 ):
     """Kimi Delta Attention (KDA) linear attention.
 
@@ -1303,6 +1330,12 @@ def kimi_delta_attention(
             its paged state pool without a gather and scatter around the
             call.  Implies ``overwrite_initial_state``.  Forward only; cannot
             combine with ``checkpoint_every_n_tokens``.
+        enable_gate_decay_split: opt in to the FROST gate-only decay heuristic
+            that may split a sequence after a finite warmup.  Disabled by
+            default because KDA's ``(I - beta k k^T) Diag(alpha)`` transition
+            mixes channels, so per-channel gate decay alone does not generally
+            bound the recurrent state's decay.  GDN's scalar-gate argument
+            does not carry over to KDA without additional assumptions.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
@@ -1341,6 +1374,7 @@ def kimi_delta_attention(
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
@@ -1365,6 +1399,7 @@ def kimi_delta_attention(
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
             plan_name=plan_name,
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
@@ -1399,6 +1434,7 @@ def build_kda_summary_graph(
     gate_domain,
     a_log_dtype=None,
     dt_bias_dtype=None,
+    enable_gate_decay_split=False,
 ):
     graph = cudnn.pygraph()
     k_t = graph.tensor([total, HK, K], data_type=io_dtype, name="k")
@@ -1432,6 +1468,7 @@ def build_kda_summary_graph(
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        enable_gate_decay_split=enable_gate_decay_split or None,
         name="kda_summary",
     )
     fs_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1475,6 +1512,7 @@ def kda_summary(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Internal KDA summary over a cached single-node KDA_SUMMARY pygraph.  Returns ``(final_state,
     transition)`` float32, ``transition`` zero-size unless ``output_transition``."""
@@ -1551,6 +1589,7 @@ def kda_summary(
         plan_name,
         gate_lower_bound=gate_lower_bound,
         gate_domain=gate_domain,
+        enable_gate_decay_split=enable_gate_decay_split,
     )
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_kda_summary_graph(
@@ -1576,6 +1615,7 @@ def kda_summary(
             str(gate_domain),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1623,6 +1663,7 @@ def kda_summary_fake(
     dt_bias=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split=False,
 ):
     total, HK, K = k.shape
     HV, V = v.shape[1], v.shape[2]
@@ -1673,6 +1714,7 @@ def build_kda_summary_bwd_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     output_transition=False,
+    enable_gate_decay_split=False,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, HQ, K], data_type=io_dtype, name="q")
@@ -1709,6 +1751,7 @@ def build_kda_summary_bwd_graph(
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        enable_gate_decay_split=enable_gate_decay_split or None,
         name="kda_summary_bwd",
     )
     d_initial_state_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1755,6 +1798,7 @@ def kda_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Internal KDA backward summary over a cached single-node KDA_SUMMARY_BWD pygraph.  Returns
     ``d_initial_state`` float32 ``[N, HO, V, K]`` (``G`` with no ``d_final_state``, the full ``dh0`` otherwise) and
@@ -1840,6 +1884,7 @@ def kda_summary_bwd(
         do_dtype=dO.dtype,
         do_shape=tuple(dO.shape),
         q_shape=tuple(q.shape),
+        enable_gate_decay_split=enable_gate_decay_split,
     )
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_kda_summary_bwd_graph(
@@ -1867,6 +1912,7 @@ def kda_summary_bwd(
             output_transition=bool(output_transition),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            enable_gate_decay_split=bool(enable_gate_decay_split),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1917,6 +1963,7 @@ def kda_summary_bwd_fake(
     dt_bias=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split=False,
 ):
     HV, V = dO.shape[1], dO.shape[2]
     K = k.shape[2]
@@ -1977,6 +2024,7 @@ def kimi_delta_attention_summary(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ):
     """Kimi Delta Attention (KDA) per-span summary for context parallelism: the state-only pass over each sequence, returning
     ``(H, M)`` float32 with ``H`` ``[N, HO, V, K]`` the final state under ``initial_state`` (zero when ``None``) and ``M``
@@ -1993,6 +2041,9 @@ def kimi_delta_attention_summary(
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``kda_summary_frost``).
+        enable_gate_decay_split: opt in to FROST's gate-only decay split;
+            disabled by default because KDA's cross-channel transition is not
+            bounded by the per-channel gate product alone.
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -2014,6 +2065,7 @@ def kimi_delta_attention_summary(
         dt_bias=dt_bias,
         batch_invariant=bool(batch_invariant),
         plan_name=plan_name,
+        enable_gate_decay_split=bool(enable_gate_decay_split),
     )
     return final_state, transition
 
@@ -2039,6 +2091,7 @@ def kimi_delta_attention_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    enable_gate_decay_split: bool = False,
 ):
     """Kimi Delta Attention (KDA) per-span backward summary for context parallelism: the reverse state-gradient recurrence
     over each sequence, returning ``G`` ``[N, HO, V, K]`` float32, the incoming state gradient ``d_initial_state`` under
@@ -2058,6 +2111,9 @@ def kimi_delta_attention_summary_bwd(
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``kda_summary_frost``).
+        enable_gate_decay_split: opt in to FROST's gate-only decay split;
+            disabled by default because KDA's cross-channel transition is not
+            bounded by the per-channel gate product alone.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -2083,5 +2139,6 @@ def kimi_delta_attention_summary_bwd(
         batch_invariant=bool(batch_invariant),
         output_transition=bool(output_transition),
         plan_name=plan_name,
+        enable_gate_decay_split=bool(enable_gate_decay_split),
     )
     return (d_initial_state, transition) if output_transition else d_initial_state
