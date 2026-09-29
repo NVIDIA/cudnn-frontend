@@ -226,7 +226,12 @@ and `test_thd_balanced_split_record_rebind_and_capture` are the detectors.
 ## Persistent THD launch admission
 
 A kernel using `scheduler_warp_loop_persistent` must declare `THD_PERSISTENT`
-so the host launch is sized to resident clusters. Bound the live workload
+so the host launch is ordinarily sized to resident clusters. A measured
+plan-time exception may launch a bounded second wave; keep its admission
+separate from the safety envelope. Under PackGQA, count token tiles of
+`CGA_TILE_M / PACK_G`, not unpacked tiles times all query heads: the latter
+can put a nonaligned sequence into the wrong wave-count regime. Do not infer
+ragged work from the batch's declared maximum alone. Bound the live workload
 with GPU metadata; retain host-known capacity bounds under graph replay.
 Dead initial clusters must exit uniformly before TMEM allocation and barrier
 initialization. A dead-unit O-store guard alone does not prove that an empty

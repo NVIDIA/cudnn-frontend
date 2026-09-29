@@ -2803,13 +2803,40 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if plan is not None:
             return plan
         b = self.batch_size
-        # Persistent THD kernels cap the launch at what the device can hold resident (one
-        # cluster per CGA_SIZE SMs) instead of the plan-time envelope: the kernel pulls units
-        # from a device-bounded counter.
+        # Persistent THD kernels ordinarily launch one resident wave and pull further
+        # units from a device-bounded counter. A bounded packed family benefits from
+        # handing its short second wave directly to the hardware scheduler instead.
         env = units = self._thd_unit_envelope()
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
-            units = min(env, max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas)))
+            resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
+            units = min(env, resident)
+            cfg = self._k_mod.CFG
+            if (
+                self._device_cc == (10, 0)
+                and self.dtype == torch.bfloat16
+                and self.head_dim_qk == self.head_dim_v == 128
+                and self.batch_size == 1
+                and self.paged_page_size == 16
+                and self.is_causal
+                and self.window_left is None
+                and self.window_right == 0
+                and not self.has_sink
+                and self.gate_desc is None
+                and cfg.CTA_MMA == 2
+                and cfg.SPLIT_KV == 1
+                and cfg.SCHEDULER_POLICY == SCHED_LPT
+                and cfg.PACK_G in (4, 8)
+                and self.h_q == self.h_kv * cfg.PACK_G
+            ):
+                # Count packed TOKEN tiles, not the looser safety envelope above:
+                # for H32/GQA4/Q1025 those bounds are 72 and 96, respectively.
+                # With B=1 the declared Q also bounds the single live sequence;
+                # a ragged batch's maximum would overestimate its actual work.
+                tile = int(self._k_mod.CGA_TILE_M)
+                packed_units = ((int(self.q_desc.shape[2]) * cfg.PACK_G + tile - 1) // tile) * (self.h_q // cfg.PACK_G)
+                if resident < packed_units <= 2 * resident:
+                    units = min(env, packed_units)
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)

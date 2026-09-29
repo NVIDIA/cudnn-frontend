@@ -1995,26 +1995,39 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
-    """Policy 3 follows live lengths, including mixed batches and empty sequences."""
+@pytest.mark.parametrize("geometry,stats_layout", [("d256", "NH"), ("d128_packed", "NH"), ("d128_packed", "HN"), ("d128_short", "NH"), ("d128_long", "NH")])
+def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout):
+    """Live scheduling and the packed grid preserve O/Stats under old captures."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("Live-length scheduler is initially admitted only on SM100")
-    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    b, h, hk, d, qcap, kcap = (3, 8, 1, 256, 1025, 2304) if geometry == "d256" else (1, 32, 8, 128, 2049, 2560)
+    if geometry == "d128_short":
+        qcap = 1025
+    elif geometry == "d128_long":
+        qcap = 2305
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
     q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype)
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap, h, device=DEV))
+    if stats_layout == "HN":
+        bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
+    lse_tokens = bufs["lse"].T if stats_layout == "HN" else bufs["lse"]
     bufs.update(
         cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap,
         seq_kv=torch.full((b,), qcap, device=DEV, dtype=torch.int32),
         k_table=table,
         v_table=table.flip(2),
     )
-    bufs["off_q"], bufs["off_lse"] = bufs["cu_q"] * h * d, bufs["cu_q"] * h
-    g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    bufs["off_q"], bufs["off_lse"] = bufs["cu_q"] * h * d, bufs["cu_q"] * lse_tokens.stride(0)
+    g = cudnn.pygraph(
+        io_data_type=dt,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=stats_layout == "HN",
+    )
     t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "o", "lse")}
     t["q"] = g.tensor(dim=[b, h, qcap, d], stride=[qcap * h * d, d, h * d, 1], data_type=dt).set_ragged_offset(t["off_q"])
     t["o"], t["lse"] = g.sdpa(
@@ -2033,7 +2046,17 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         paged_attention_max_seq_len_kv=kcap,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, d]).set_stride([qcap * h * d, d, h * d, 1]).set_ragged_offset(t["off_q"])
-    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride([qcap * h, 1, h, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride(
+        [qcap * h, 1, h, 1] if stats_layout == "NH" else [bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]
+    ).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    kwargs = {}
+    if stats_layout == "HN":
+        # The effective Stats geometry includes the extra per-head capacity.
+        kwargs = dict(
+            override_uids=[t["lse"].get_uid()],
+            override_shapes=[[1, h, lse_tokens.shape[0], 1]],
+            override_strides=[[bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]],
+        )
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -2041,21 +2064,36 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in (0, 1, 3):
-        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})
+    for policy in ((0, 1, 3) if geometry == "d256" else (0, 1)):
+        chosen = {**knobs, cudnn.knob_type.SCHED_POLICY: policy}
+        if geometry != "d256":
+            chosen.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
+        if geometry != "d256":
+            spec = _plan(g)._prepared.spec
+            resident = torch.cuda.get_device_properties(0).multi_processor_count // 2
+            # Independent worklist oracle: every 128-token tile has eight packed heads.
+            work = len({(row // 128, head // 4) for row in range(qcap) for head in range(h)})
+            expanded = dtype == torch.bfloat16 and page == 16 and policy == 1 and resident < work <= 2 * resident
+            assert spec.template[spec.index["n_thd_units"]] == (work if expanded else min(resident, ((qcap + 511) // 512) * h))
         ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
-        g.execute(pack, ws)
+        g.execute(pack, ws, **kwargs)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            g.execute(pack, ws)
+            g.execute(pack, ws, **kwargs)
         captures.append(graph)
         workspaces.append(ws)
     try:
-        for ql, kl in (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025])):
+        lengths = (
+            (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025]))
+            if geometry == "d256"
+            else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]))
+        )
+        for ql, kl in lengths:
             cq = [0, *accumulate(ql)]
-            for name, values in (("cu_q", cq), ("off_q", [x * h * d for x in cq]), ("off_lse", [x * h for x in cq]), ("seq_kv", kl)):
+            for name, values in (("cu_q", cq), ("off_q", [x * h * d for x in cq]), ("off_lse", [x * lse_tokens.stride(0) for x in cq]), ("seq_kv", kl)):
                 bufs[name].copy_(torch.tensor(values, device=DEV, dtype=torch.int32))
             bufs["q"].mul_(-0.5)
             ref_o = torch.zeros(cq[-1], h, d, device=DEV, dtype=torch.float64)
@@ -2075,13 +2113,14 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
             for graph in captures:
                 bufs["o"].fill_(float("nan"))
                 bufs["lse"].fill_(float("nan"))
-                graph.replay()
+                for _ in range(256 if geometry != "d256" and cq[-1] <= 1 else 1):
+                    graph.replay()
                 torch.cuda.synchronize()
-                got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
+                got_o, got_s = bufs["o"][: cq[-1]], lse_tokens[: cq[-1]]
                 torch.testing.assert_close(got_o.float(), ref_o.float(), atol=1.2e-2, rtol=1.2e-2)
                 torch.testing.assert_close(got_s, ref_s.float(), atol=1e-3, rtol=1e-3)
                 assert torch.isnan(bufs["o"][cq[-1] :]).all()
-                assert torch.isnan(bufs["lse"][cq[-1] :]).all()
+                assert torch.isnan(lse_tokens[cq[-1] :]).all()
                 if natural is None:
                     natural = got_o.clone(), got_s.clone()
                 else:
