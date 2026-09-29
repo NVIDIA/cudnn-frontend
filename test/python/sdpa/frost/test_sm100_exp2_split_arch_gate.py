@@ -35,13 +35,13 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 # The kernels that carry the split AND measured a win on B200: three on 2026-09-22 (A/B/A x3, CUPTI medians), plus
 # d192x128 per-tensor FP8 on 2026-09-28, where the field gates the kernel's own pre-existing _exp2_* helper mix
 # (+7.0 % causal / +5.7 % dense at the DSv3 layer, B=2 H=128/128 S=2K; -10 % / -6 % with it left on at cc 10.3).
-_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("f16", (192, 128))}
+_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
 # Measured on B200 and deliberately OFF: d128 bf16 (dense +3.9 % but causal -1.9 / -2.4 %), d192x128 mxfp8
 # (-3.3..-4.0 % dense; it already carries its own exp2 emulation).  An ADDITIONAL _E2E_* block on d192x128 fp8
 # measured dense +1 %, causal -1.6 % -- that block is not what its ON entry gates.
 # The native d64 quantized legs (gpt-oss, B=2 H=128 d=64 SWA=128, B200 2026-09-28): the split loses there too --
 # fp8 -7 % (1.19x -> 1.28x of cuDNN), mxfp8 -10 % (0.96x -> 1.06x).
-_MEASURED_OFF = {("f16", (128, 128)), ("mxfp8", (192, 128)), ("fp8", (64, 64)), ("mxfp8", (64, 64))}
+_MEASURED_OFF = {("f16", (128, 128)), ("fp8", (64, 64)), ("mxfp8", (64, 64))}
 
 
 def test_quant_kind_is_the_kernel_file_spelling():
