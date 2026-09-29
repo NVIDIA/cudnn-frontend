@@ -502,6 +502,12 @@ def _bshd_empty(b, s, h, d, dt, fill=None):
 
 def _check(name, got, ref, dt):
     assert torch.isfinite(got.float()).all(), f"{name}: non-finite output"
+    if not ref.bool().any():
+        # An identically-zero reference (attn_scale = 0.0: dS = 0 exactly, so dQ = dK = 0): the cosine of two zero vectors is
+        # undefined and torch reads it as 0.0, which the gate below would call a mismatch at max|diff| = 0.  The only honest
+        # verdict there is the EXACT zero the kernel owes (a GEMM over an all-zero dS), so that is the gate.
+        assert (got.float() == 0).all(), f"{name}: the reference is identically zero, got max|{name}| = {got.float().abs().max().item():.3e}"
+        return
     cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.float().flatten(), dim=0).item()
     diff = (got.double() - ref.double()).abs()
     assert cos > _TOL_COS, f"{name}: cos={cos:.6f} (max|diff|={diff.max().item():.3e} at |ref|max={ref.abs().max().item():.3e})"
