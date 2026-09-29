@@ -240,3 +240,17 @@ correct invocations; validate the dead initial-unit path explicitly.
 `test_sm107_f16_thd_declares_its_persistent_scheduler` catches missing host
 wiring; the THD overlaunch, multi-unit, zero-length and capture tests exercise
 the device contract.
+
+
+## Setup/main programmatic dependencies
+
+PDL may overlap an independent kernel prologue with metadata setup, but every
+consumer must wait before reading live metadata or patched tensor maps. Keep
+the producer's proxy-release and the consumer's tensor-map acquire; PDL does
+not replace those fences. A following setup must still wait for the preceding
+attention to finish before reusing its workspace. Derive admission from graph
+facts at plan time, not device lengths or per-execute Python dispatch. A small
+single-request gain does not establish a batched gain; retain long-prefix
+controls. `test_live_lpt_paged_capture_changes_full_and_prefix_lengths` checks
+O/Stats after length changes and repeated empty replay, and checks actual
+programmatic graph edges when Torch and CUDA Python expose them.

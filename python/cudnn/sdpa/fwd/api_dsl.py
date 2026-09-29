@@ -2245,6 +2245,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(self.h_q * 4))
         return 0
 
+    def _sm100_packed_paged_b1_lpt(self) -> bool:
+        """Measured plan family for the packed grid and setup/main overlap."""
+        cfg = self._k_mod.CFG
+        return bool(
+            self.thd
+            and self.paged
+            and self._device_cc == (10, 0)
+            and self.dtype == torch.bfloat16
+            and self.head_dim_qk == self.head_dim_v == 128
+            and self.batch_size == 1
+            and self.paged_page_size == 16
+            and self.is_causal
+            and self.window_left is None
+            and self.window_right == 0
+            and not self.has_sink
+            and self.gate_desc is None
+            and cfg.CTA_MMA == 2
+            and cfg.SPLIT_KV == 1
+            and cfg.SCHEDULER_POLICY == SCHED_LPT
+            and cfg.PACK_G in (4, 8)
+            and self.h_q == self.h_kv * cfg.PACK_G
+        )
+
     def _explicit_compile_kwargs(self) -> dict:
         """The compile key of an explicit-ABI template: only what specializes the
         traced code (every extent and stride is a runtime argument)."""
@@ -2264,6 +2287,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
         accepted = inspect.signature(compile_fn).parameters
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "use_pdl" in accepted:
+            # Immutable graph facts only; long multi-request chunks did not
+            # benefit from setup overlap. No per-execute dispatch or new extents
+            # enter the compile key: this adds only the derived Boolean.
+            kw["use_pdl"] = self._sm100_packed_paged_b1_lpt()
         if "static_lse_strides" in accepted and self.lse_desc is not None and not self.thd and self.split_kv == 1:
             # Plan metadata only. The compiled host retains a generic branch
             # for other legal runtime Stats strides. SM100 D512 half outputs
@@ -2812,23 +2840,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
             units = min(env, resident)
             cfg = self._k_mod.CFG
-            if (
-                self._device_cc == (10, 0)
-                and self.dtype == torch.bfloat16
-                and self.head_dim_qk == self.head_dim_v == 128
-                and self.batch_size == 1
-                and self.paged_page_size == 16
-                and self.is_causal
-                and self.window_left is None
-                and self.window_right == 0
-                and not self.has_sink
-                and self.gate_desc is None
-                and cfg.CTA_MMA == 2
-                and cfg.SPLIT_KV == 1
-                and cfg.SCHEDULER_POLICY == SCHED_LPT
-                and cfg.PACK_G in (4, 8)
-                and self.h_q == self.h_kv * cfg.PACK_G
-            ):
+            if self._sm100_packed_paged_b1_lpt():
                 # Count packed TOKEN tiles, not the looser safety envelope above:
                 # for H32/GQA4/Q1025 those bounds are 72 and 96, respectively.
                 # With B=1 the declared Q also bounds the single live sequence;

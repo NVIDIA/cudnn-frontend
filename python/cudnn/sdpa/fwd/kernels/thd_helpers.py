@@ -255,6 +255,7 @@ def build_thd_meta_o_descs_kernel(
     # so no packed-total clamp exists (the descriptors are pool-shaped).
     clamp_kv: cutlass.Constexpr[bool] = True,
     splits: cutlass.Constexpr[int] = 1,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -268,6 +269,10 @@ def build_thd_meta_o_descs_kernel(
     are normalized by subtracting their first entry. This preserves sliced
     prefixes without host validation or device-to-host reads.
     """
+    # Only the dependent kernel's independent prologue may overlap setup.
+    # Its griddepcontrol.wait orders every metadata/descriptor read after us.
+    if cutlass.const_expr(use_pdl):
+        nvvm.griddepcontrol("launch_dependents")
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
     meta = cutlass.make_array_view(meta_t)

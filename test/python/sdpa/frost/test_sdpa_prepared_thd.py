@@ -1998,6 +1998,8 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @pytest.mark.parametrize("geometry,stats_layout", [("d256", "NH"), ("d128_packed", "NH"), ("d128_packed", "HN"), ("d128_short", "NH"), ("d128_long", "NH")])
 def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
+    import inspect
+
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
@@ -2064,6 +2066,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
+    keep_graph = "keep_graph" in inspect.signature(torch.cuda.CUDAGraph).parameters
     for policy in ((0, 1, 3) if geometry == "d256" else (0, 1)):
         chosen = {**knobs, cudnn.knob_type.SCHED_POLICY: policy}
         if geometry != "d256":
@@ -2077,12 +2080,28 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
             work = len({(row // 128, head // 4) for row in range(qcap) for head in range(h)})
             expanded = dtype == torch.bfloat16 and page == 16 and policy == 1 and resident < work <= 2 * resident
             assert spec.template[spec.index["n_thd_units"]] == (work if expanded else min(resident, ((qcap + 511) // 512) * h))
+        expected_pdl = geometry != "d256" and dtype == torch.bfloat16 and page == 16 and policy == 1
+        api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
+        assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
         ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
         g.execute(pack, ws, **kwargs)
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(**({"keep_graph": True} if keep_graph else {}))
         with torch.cuda.graph(graph):
             g.execute(pack, ws, **kwargs)
+        if keep_graph:
+            from cuda.bindings import runtime as cudart
+
+            edges = cudart.cudaGraphGetEdges(graph.raw_cuda_graph(), 0)
+            assert int(edges[0]) == 0
+            # Older CUDA Python exposes only the legacy query without edge data.
+            # Numerical replay still runs there; modern lanes verify the actual
+            # setup/main dependency, so an unwired launch flag cannot pass.
+            if len(edges) == 5:
+                edges = cudart.cudaGraphGetEdges(graph.raw_cuda_graph(), edges[-1])
+                assert int(edges[0]) == 0
+                count = sum(int(edge.type) == int(cudart.cudaGraphDependencyType.cudaGraphDependencyTypeProgrammatic) for edge in edges[3])
+                assert count == int(expected_pdl)
         captures.append(graph)
         workspaces.append(ws)
     try:

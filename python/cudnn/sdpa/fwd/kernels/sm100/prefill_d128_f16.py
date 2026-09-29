@@ -387,6 +387,7 @@ def _kernel(
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -526,6 +527,11 @@ def _kernel(
     # cga2 routing strips bit-24 so bytes land on leader's mbar.
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
+
+    # Shared-memory and cluster initialization does not consume setup output.
+    # All roles must wait before reading live lengths or patched descriptors.
+    if cutlass.const_expr(use_pdl):
+        nvvm.griddepcontrol("wait")
 
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -2440,6 +2446,7 @@ def _host(
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
 
@@ -2592,6 +2599,7 @@ def _host(
             cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
+            use_pdl=use_pdl,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2623,11 +2631,13 @@ def _host(
         block_table_tensor,
         block_table_v_tensor,
         paged_hnd,
+        use_pdl=use_pdl,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, 1),
         stream=stream,
+        use_pdl=use_pdl,
     )
 
 
@@ -2642,6 +2652,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -2651,13 +2662,15 @@ def compile(  # noqa: A001
     tile box stays the compile-time TILE geometry — box columns past d_qk / d_v
     zero-fill on load, O columns past d_v clip on store), whether the LSE store
     exists, the Stats layout kind, and for paged pools whether the in-page
-    layout is HND (row stride below head stride).
+    layout is HND (row stride below head stride), plus the plan-time setup-overlap policy.
 
     Constraint: every non-innermost TMA global stride must be a 16-byte
     multiple; the compact BSHD H-stride is d * BPE, so d must be a multiple of
     8 at 2 bytes/elem — checked here for the envelope, checked by the adapter
     for declared strides."""
     _cache_key = _template_key(globals(), locals(), "compile")
+    if use_pdl and not CFG.THD_VARLEN:
+        raise ValueError("PDL requires the THD setup producer")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
@@ -2710,6 +2723,7 @@ def compile(  # noqa: A001
         d_v,
         lse_kind,
         paged_hnd,
+        use_pdl=use_pdl,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
