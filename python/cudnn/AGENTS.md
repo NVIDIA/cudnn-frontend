@@ -58,6 +58,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **Native geometry caches retain no storage observations.** A geometry hit must
+  still check the current dtype, device, address alignment and observed byte span.
+  Mark an uninitialized cache entry explicitly: an empty shape is an input to
+  reject, not an initialized entry. Derive binder ABI tests from the actual host
+  signature, including optional slots, then exercise the real graph launch.
+  `test_sdpa_native_dense_binding.py` covers these boundaries and changed-input replay.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

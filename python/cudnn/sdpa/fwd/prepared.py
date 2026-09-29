@@ -1025,6 +1025,7 @@ class DenseLaunchSpec:
         "order",
         "index",
         "template",
+        "native",
         "quant",
         "b",
         "qh",
@@ -1204,6 +1205,25 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
+    # Bounded SM100 decode prototype. Provider selection and the public execute
+    # contract are unchanged. An admitted plan validates every call natively;
+    # runtime validation errors never select a different executor.
+    s.native = None
+    if (
+        getattr(api, "_device_cc", None) == (10, 0)
+        and getattr(api, "kernel_template", None) == "decode_d128_f16"
+        and s.d_qk == s.d_v == 128
+        and s.s_q_max == 1
+        and s.split == 1
+        and not s.ragged
+        and not s.has_sink
+        and s.gate_expect is None
+        and s.quant is None
+        and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
+    ):
+        from cudnn import _pybind_module
+
+        s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
 
@@ -1640,6 +1660,7 @@ class PreparedDenseLaunch:
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
+        self._native_indices = None
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
@@ -1648,6 +1669,12 @@ class PreparedDenseLaunch:
                 indices = self._indices = [pack.index_of(u) for u in self._uids]
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        if getattr(self.spec, "native", None) is not None:
+            if self._native_indices is None:
+                roles = dict(zip(self._roles, indices))
+                self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_DENSE_ROLES)
+            self.spec.native.execute(pack.native, self._native_indices, stream)
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
@@ -1661,3 +1688,6 @@ class PreparedDenseLaunch:
             self.spec.combine.fn(*combine_args)
         else:
             self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
+
+
+_NATIVE_DENSE_ROLES = ("q", "k", "v", "o", "lse", "sinks", "seq_kv_lens", "seq_q_lens", "block_table", "block_table_v", "gate")

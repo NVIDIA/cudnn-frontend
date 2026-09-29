@@ -32,6 +32,9 @@ read_native_operand_views(pybind11::handle pack, const std::vector<int64_t> &ind
 void
 init_sdpa_thd_binding(pybind11::module_ &);
 
+void
+init_sdpa_dense_binding(pybind11::module_ &);
+
 // Call-local packs retain immutable geometry independently of the graph's
 // bounded cache. No runtime tensor addresses or Python owners live here.
 struct BindingOverrides {

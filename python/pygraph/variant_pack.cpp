@@ -1535,6 +1535,7 @@ its parts.
             return py::make_tuple(ok, offender);
         });
     init_sdpa_thd_binding(m);
+    init_sdpa_dense_binding(m);
 }
 
 }  // namespace python_bindings
