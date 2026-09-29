@@ -737,10 +737,15 @@ scalar descales / scales as 1-element fp32 device tensors (read in-kernel, never
 host-folded), fp32 Stats, dQ/dK/dV in the graph's gradient dtype (E4M3 scaled by
 `scale_dQ/dK/dV`, or bf16 / fp16), and the four `amax_dQ/dK/dV/dP` outputs when
 requested (`amax_dP` reduces the fp32 dS before its cast, as the C++ node does).
-dS rides a **bf16** workspace and the gradient GEMMs run at bf16 over exactly-upcast
-Q / K; a fold + quantize pass (`bprop_chain_common.fold_quant`) applies the pending
-`descale_q` / `descale_k`, the amax folds, the scales and the cast — so `descale_dP`
-/ `scale_dP` are accepted and never applied. E5M2 payloads are declined (no body).
+dS rides an **E4M3** workspace (`dS_q = e4m3(dS · scale_dP)`) and the gradient GEMMs
+run the template's fp8 K64 arm over it and the E4M3 Q / K payloads, undoing both
+scalings in their epilogue (`· descale_dP · descale_k` for dQ, `· descale_q` for dK),
+folding `amax_dQ` / `amax_dK` over the true-unit value, applying `scale_dQ` / `scale_dK`
+and casting in place (dQ always, dK at MHA); dV always, and dK under GQA, take the
+fold + quantize pass (`bprop_chain_common.fold_quant`: fixed-order partial sum, amax,
+scale, cast). The bf16-dS twin (`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`: bf16 GEMMs
+over exact E4M3 → bf16 upcasts of Q / K, three fold passes, `descale_dP` / `scale_dP`
+bound and unused) is the A/B and oracle base. E5M2 payloads are declined (no body).
 **Declined on both rows, each asserted by a test:** dense padding masks
 (`seq_len_q/kv`), sink / dSink, bias / dBias, right-band widening, THD,
 `dense_flex`, decode shapes, and `use_deterministic_algorithm` (the chain has no
