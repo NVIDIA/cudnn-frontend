@@ -34,6 +34,7 @@ def blackwell():
 
 
 def make_plan(total, heads, *, backward, invariant, enable_gate_decay_split=False):
+    """Build and bind a native KDA forward or backward execution plan."""
     hq, hk, hv = heads
     case = make_case("kda", torch.bfloat16, T=total, H=hq, HK=hk, HV=hv, K=64, V=64)
     values = dict(zip(LEAF_NAMES["kda"], thd_tensors(case)))
@@ -63,6 +64,7 @@ def make_plan(total, heads, *, backward, invariant, enable_gate_decay_split=Fals
 
 
 def make_summary_plan(total, heads, *, backward, enable_gate_decay_split=False):
+    """Build a native KDA forward- or backward-summary plan."""
     hq, hk, hv = heads
     case = make_case("kda", torch.bfloat16, T=total, H=hq, HK=hk, HV=hv, K=64, V=64)
     leaves = dict(zip(LEAF_NAMES["kda"], thd_tensors(case)))
@@ -91,6 +93,7 @@ def execute(plan, values, outputs, workspace):
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("schedule", ["uncut", "warmup", "chain"])
 def test_frost_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
+    """One compiled native host is reused across dynamic token/head counts."""
     family = "chain" if schedule == "chain" else "warmup"
     direction = "backward" if backward else "forward"
     module = importlib.import_module(f"cudnn.linear_attention.frost.kernel.kda_{family}_{direction}_f16")
@@ -124,6 +127,7 @@ def test_frost_native_cache_reuses_kda_across_shapes(monkeypatch, backward, sche
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 def test_kda_gate_decay_split_is_opt_in(backward):
+    """Forward and backward select gate-decay splitting only when requested."""
     default, *_ = make_plan(64, (1, 1, 1), backward=backward, invariant=False)
     enabled, *_ = make_plan(64, (1, 1, 1), backward=backward, invariant=False, enable_gate_decay_split=True)
     assert not default.chain and not default.split
@@ -181,6 +185,7 @@ def test_kda_default_retains_history_across_gate_decay_cut():
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 def test_kda_summary_gate_decay_split_is_opt_in(backward):
+    """Both KDA summary directions keep gate-decay splitting opt-in."""
     default = make_summary_plan(64, (1, 1, 1), backward=backward)
     enabled = make_summary_plan(64, (1, 1, 1), backward=backward, enable_gate_decay_split=True)
     assert not default.chain and not default.split
