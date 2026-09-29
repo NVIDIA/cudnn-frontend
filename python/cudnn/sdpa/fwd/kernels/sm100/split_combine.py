@@ -177,11 +177,16 @@ def _combine_kernel(
         inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
 
         # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
-        # The partial slab is compact [S*B, S_q, H, d_v] with d_v % 4 == 0, so
-        # lane l owns four contiguous columns of every split (one 16-byte load
-        # for fp32 partials); the split loop is branch-free and unrolled so the
-        # loads of several splits are in flight together.
+        # The partial slab is compact [S*B, S_q, H, d_v]; lane l owns four
+        # contiguous columns of every split (one 16-byte load for fp32 partials
+        # when all four are inside the row); the split loop is branch-free and
+        # unrolled so the loads of several splits are in flight together.
         o_base = o_partial.iterator.toint()
+        # The 16-byte loads need d_v % 4 == 0 (row starts stay 16-byte aligned)
+        # and a 16-byte aligned slab base: the pointer entries only promise the
+        # element alignment and take a runtime d_v, so decide at runtime (one
+        # warp-uniform test); otherwise every lane takes the element path.
+        vec_ok = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
         amax_local = cutlass.Float32(0.0)
         q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
@@ -199,21 +204,41 @@ def _combine_kernel(
                     live = lse_s > neg_inf
                     e = cute.math.exp(lse_s - m_safe, fastmath=True)
                     w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                    e0 = zero
+                    e1 = zero
+                    e2 = zero
+                    e3 = zero
+                    # Element loads through the view, each bounded by the row, serve
+                    # the half partials (flavors whose split epilogue keeps the staged
+                    # TMA-store O path, e.g. d512) and any d_v / base that cannot take
+                    # aligned 16-byte loads (legal through the runtime-shape pointer
+                    # entries); aligned fp32 partials take one 16-byte load per split.
                     if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
-                        # fp32 partials (the SM100 direct-store split epilogues):
-                        # one 16-byte load per split.
-                        idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
-                        v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
-                        e0, e1, e2, e3 = cutlass.Float32(v[0]), cutlass.Float32(v[1]), cutlass.Float32(v[2]), cutlass.Float32(v[3])
+                        if vec_ok:
+                            idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
+                            v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
+                            e0 = cutlass.Float32(v[0])
+                            e1 = cutlass.Float32(v[1])
+                            e2 = cutlass.Float32(v[2])
+                            e3 = cutlass.Float32(v[3])
+                        else:
+                            o_row = op[batch + s * n_batch, q_row, head, :]
+                            e0 = cutlass.Float32(o_row[d0])
+                            if d0 + cutlass.Int32(1) < d_v:
+                                e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                            if d0 + cutlass.Int32(2) < d_v:
+                                e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                            if d0 + cutlass.Int32(3) < d_v:
+                                e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
                     else:
-                        # half partials (flavors whose split epilogue keeps the
-                        # staged TMA-store O path, e.g. d512): element loads
-                        # through the view, still one contiguous 8-byte run per lane.
                         o_row = op[batch + s * n_batch, q_row, head, :]
                         e0 = cutlass.Float32(o_row[d0])
-                        e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
-                        e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
-                        e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
+                        if d0 + cutlass.Int32(1) < d_v:
+                            e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                        if d0 + cutlass.Int32(2) < d_v:
+                            e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                        if d0 + cutlass.Int32(3) < d_v:
+                            e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
                     # a dead slot may hold anything, including non-finite values
                     v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
                     v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
@@ -235,7 +260,7 @@ def _combine_kernel(
                     # Index all modes: ArrayView's row slice is a pointer and drops
                     # the final mode's stride, so a subsequent [d0] would assume
                     # contiguous D.
-                    if row_live:
+                    if row_live & (d0 + cutlass.Int32(i) < d_v):
                         oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
 
         # amax: reduce across the warp, then ONE atomic per warp.  The value is
@@ -288,8 +313,9 @@ def _launch_combine(
     token capacities."""
     B, H, SQ, D = problem_size
     # Lane l reads columns 4l..4l+3 of the compact fp32 partial rows as one
-    # 16-byte load; every flavor's d_v (64 / 128 / 192 / 256 / 512) is a
-    # multiple of 4.  (D is a staged value here, so this cannot be asserted.)
+    # 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other
+    # d_v / base (legal through this runtime-shape entry) takes bounded element
+    # loads and stores instead.
     _combine_kernel(
         o_partial,
         lse_partial,

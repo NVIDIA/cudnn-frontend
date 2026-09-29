@@ -104,6 +104,25 @@ def test_pointer_combine_strided_outputs_and_dead_splits(dtype, stats, layout):
     _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, stats == "log2")
 
 
+@pytest.mark.parametrize("layout", ["compact", "strided"])
+@pytest.mark.parametrize("d", [5, 66, 130], ids=lambda d: f"d{d}")
+def test_pointer_combine_head_dim_not_multiple_of_four(d, layout):
+    """The pointer entry takes a runtime d_v: a lane whose four columns run past
+    the row must neither read nor write the next row (the strided layout's
+    untouched storage would show an overwrite)."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h, sq, splits = 2, 3, 5, 3
+    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    ostride, lstride = _strides(b, h, sq, d, layout)
+    o, ostorage, oused = _output((b, sq, h, d), ostride, torch.bfloat16)
+    lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32)
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True))
+    assert fn is not None
+    fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, ostride, lstride, torch.cuda.current_stream().cuda_stream)
+    _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
+
+
 def test_pointer_combine_reuses_artifact_for_new_shapes():
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
