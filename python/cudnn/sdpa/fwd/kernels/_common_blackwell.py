@@ -637,6 +637,7 @@ def make_sdpa_helpers(
     # f16).  A Cfg without PACK_G packs the whole group.
     _pack_g = int(getattr(CFG, "PACK_G", 0)) or int(getattr(CFG, "QH_PER_KH", 1))
     _packed_heads_per_kv = max(1, int(getattr(CFG, "QH_PER_KH", 1)) // _pack_g) if CFG.PACK_GQA else 1
+    thd_token_tile_m = cga_tile_m // (_pack_g if CFG.PACK_GQA else 1)
 
     @cute.jit
     def _lpt_linear(block_id):
@@ -862,7 +863,7 @@ def make_sdpa_helpers(
         for i in cutlass.range(0, n_batch, 1, unroll=1):
             b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
-            cb = (s_i + cutlass.Int32(cga_tile_m - 1)) // cutlass.Int32(cga_tile_m)
+            cb = (s_i + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
             units_b = cb * n_qh
             # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
             # in_rng is false and the quotient is discarded — but arith.select

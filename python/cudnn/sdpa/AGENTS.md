@@ -41,6 +41,11 @@ head-major, never dense-padded.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+- Under THD PackGQA, both worklist setup and decoding count **token** tiles
+  (`CGA_TILE_M / PACK_G`), while every Stats store uses the unpacked query
+  head of its row. Updating only the store or only the worklist leaves the
+  other half wrong. `test_dsl_sm100_thd_pack_gqa_stats_capture` checks both;
+  its tail sentinels and partial groups expose missed or aliased rows.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**

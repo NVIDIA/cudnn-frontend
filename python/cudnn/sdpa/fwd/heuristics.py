@@ -930,16 +930,16 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
-    the batch is dense, the graph carries no fused epilogue gate (its per-head
+    the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
     declines the same pair), there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
-    A THD graph packs only on the decode tile's ragged-Q leg (the row base is
-    token-unit there, so the packed group composes with the ragged offset)."""
+    THD prefill packs only on a flavor advertising token-unit worklists and
+    packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
     return (
         True in caps.pack_gqas
-        and not (facts.thd and not _thd_decode_leg(caps, facts))
+        and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
         and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
@@ -964,6 +964,13 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
+    if facts.thd and not _thd_decode_leg(caps, facts):
+        # On the admitted d128 half prefill tile, packing shortens the token
+        # span along the causal diagonal and shares KV across query heads.
+        # Keep the default bounded to the measured GQA4/GQA8 family; other
+        # supported groups remain explicit tuning candidates. This also
+        # covers a long declared envelope replayed with short live lengths.
+        return (True, False) if facts.causal and facts.h_q // facts.h_kv in (4, 8) else (False, True)
     if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
