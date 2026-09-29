@@ -54,7 +54,9 @@ def test_torch_ordered_bindings_rebind_and_replay(provider, layout, monkeypatch)
     backward = not thd or provider == "backend"
     cu = torch.tensor([0, 64, 160], dtype=torch.int32, device="cuda")
     kwargs = dict(cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=96, max_seqlen_kv=96) if thd else {}
-    d = 128 if thd else 512  # SM100 half backward serves the >256 head-dim envelope.
+    # Pin each provider within its current backward domain on SM100: the
+    # half FROST row serves D > 256, while this backend serves D128.
+    d = 512 if provider == "frost" and not thd else 128
     shape = (160, 4, d) if thd else (2, 96, 4, d)
 
     def make_inputs():
