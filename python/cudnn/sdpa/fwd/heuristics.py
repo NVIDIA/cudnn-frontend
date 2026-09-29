@@ -474,10 +474,8 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
-    The PRIMARY reproduces what each adapter's internal derivation historically
-    chose for the graph path, so promoting the decision into the ranked list
-    changes nothing for a caller that builds the first plan; the remaining
-    domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
+    The PRIMARY follows the measured preference for the graph's shape; the
+    remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
     standalone wrapper users who bypass ranking.
     """
@@ -493,10 +491,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # machine-sized grid. Only flavors with a THD policy decoder can tune
         # its ordering; the dense rectangular LPT decoder cannot serve it.
         # D128/D192/D256 half THD implements policy ordering within the live list.
-        # Expose alternatives for tuning and prefer the live-length policy only
-        # inside the measured single-sequence full-prefill envelope.
+        # Expose alternatives for tuning and prefer live-length policies only
+        # for the measured prefill families below.
         if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (192, 128), (256, 256)):
             primary = SCHED_NATURAL
+            if SCHED_LPT in domain and _prefer_thd_pack_gqa(caps, facts) and facts.window_left is None and not (facts.right_band_widening or facts.has_sink):
+                # Packing does not remove the causal load imbalance: order the
+                # live token tiles by their GPU-resident lengths. The decoder
+                # still uses current lengths when a cached full-prefill plan
+                # replays a prefix chunk, including tiny Q and low TP heads.
+                primary = SCHED_LPT
             # Measured B200 full-prefill envelopes. Runtime lengths may still
             # become prefix chunks after capture; policy 3 reads them on GPU.
             # Keep mixed batches and 32K envelopes on the existing default.
@@ -959,6 +963,20 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
 
 
+def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
+    """The measured native-half THD causal family, separate from decode."""
+    return (
+        _sm100_f16(caps, facts)
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.thd
+        and not _thd_decode_leg(caps, facts)
+        and facts.causal
+        and not facts.has_epilogue_gate
+        and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
+        and facts.h_q // facts.h_kv in (4, 8)
+    )
+
+
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
@@ -970,7 +988,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         # Keep the default bounded to the measured GQA4/GQA8 family; other
         # supported groups remain explicit tuning candidates. This also
         # covers a long declared envelope replayed with short live lengths.
-        return (True, False) if facts.causal and facts.h_q // facts.h_kv in (4, 8) else (False, True)
+        return (True, False) if _prefer_thd_pack_gqa(caps, facts) else (False, True)
     if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)

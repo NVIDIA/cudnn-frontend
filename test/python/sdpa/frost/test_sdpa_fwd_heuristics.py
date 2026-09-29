@@ -805,7 +805,9 @@ def test_decode_tile_model_counts_the_whole_packed_group():
 def test_thd_half_candidates_offer_live_worklist_policies(d, paged):
     facts = _facts(d_qk=d, d_v=128 if d == 192 else d, s_q=2048, h_q=16, h_kv=2, thd=True, padded=True, has_paged_kv=paged, page_size=128)
     plans = recommend("A", facts, {_F16: 20500})
-    assert plans and plans[0].knobs.sched_policy == 0, "the default THD execution order is unchanged"
+    assert plans
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
     assert {p.knobs.sched_policy for p in plans} == {0, SCHED_LPT, SCHED_LPT_L2}
 
 
