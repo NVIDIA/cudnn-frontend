@@ -48,11 +48,10 @@ The support matrix is based on the latest cuDNN backend.
 
 ### FROST GATHER support
 
-The opt-in `frost_gemm` engine supports non-block-scaled GATHER in both SM100
-orientations, token-by-weight and weight-by-token (`SWAP_AB=1`), and in the
-SM120 token-by-weight path. Enable it with
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning. Block-scaled GATHER
-and the remaining GATHER-specific support-surface checks are pending.
+The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER in
+both SM100 orientations, token-by-weight and weight-by-token (`SWAP_AB=1`),
+and in the SM120 token-by-weight path. Enable it with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning.
 
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
@@ -60,6 +59,15 @@ and INT32 or INT64 `first_token_offset` `[G,1,1]`. The result is `[1,R,N]`.
 Offsets are nondecreasing starts beginning at zero, with implicit endpoint R;
 group `g` uses expert `g % E`, and empty groups are supported. Each index is a
 source row in `[0,T)`, so repeated source tokens are allowed.
+
+For block-scaled GATHER, token scale factors (SFA) use `reorder=NONE` and
+logical shape `[1,T,K/block]`, with contiguous K scales. Each scale occupies
+one byte; the row stride must be at least `round_up(K/block,16)` bytes and
+a multiple of 16 bytes, and the base pointer must be 16-byte aligned. SFA
+uses source-token order and is gathered with the same `token_index` as the
+token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
+factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
+roles and layout requirements also apply with `SWAP_AB=1`.
 
 ```python
 fc1 = graph.moe_grouped_matmul(
@@ -120,7 +128,7 @@ Pointwise epilogues and multiple materialized outputs share this store logic;
 token-indexed auxiliary tensors and `gen_index` use the scattered output
 coordinates. Input block scales retain their existing segmented SFA/per-expert
 SFB contract. Output block quantization, reductions, and packed sub-byte
-outputs are currently declined for SCATTER. Block-scaled GATHER remains pending.
+outputs are currently declined for SCATTER.
 
 SCATTER preserves each top-k contribution separately. Multiplication by routing
 weights and reduction across top-k require a subsequent operation to produce

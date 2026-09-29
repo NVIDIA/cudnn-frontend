@@ -884,6 +884,28 @@ def test_gather_block_scale_rejects_sf_layout(bad, match, swap_ab):
         C.probe_chain(analyze(g), replace(by_name(_CFG_1CTA), swap_ab=swap_ab))
 
 
+@pytest.mark.parametrize(
+    "block_size,sf_k,match",
+    [
+        ([1, 16], 31, "linear scale shape"),
+        ([1, 16], 33, "linear scale shape"),
+        ([], 32, "token SF must have shape"),
+        ([1, 0], 32, "K block size must be positive"),
+        ([1, -16], 32, "K block size must be positive"),
+    ],
+)
+def test_gather_block_scale_analyzer_rejects_bad_scale_metadata(block_size, sf_k, match):
+    """Direct analysis must validate SF width even without frontend validation."""
+    from cudnn.graph_types import NodeType
+
+    g = _build_graph(2, 137, 128, 512, 5, gather_rows=259)
+    dequant = next(node for node in g.nodes if node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE)
+    dequant.params["block_size"] = block_size
+    dequant.inputs["descale"].set_dim([1, 137, sf_k]).set_stride([137 * 64, 64, 1])
+    with pytest.raises((ValueError, NotImplementedError), match=match):
+        analyze(g)
+
+
 @pytest.mark.parametrize("case", ["dequant_output", "block_size", "pointwise_shape"])
 def test_gather_block_scale_native_validation(case):
     from cudnn.graph_types import NodeType

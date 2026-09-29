@@ -1086,7 +1086,11 @@ def _build_multi_moe_chain(
 
                 sf = meta[cap["sf_id"]]
                 data = meta[cap["data_id"]]
-                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], sf.dim[-1])
+                kblock = int(cap["block_size_2d"][-1]) if cap["block_size_2d"] else 1
+                if kblock <= 0:
+                    raise ValueError("MoE GATHER token scale K block size must be positive")
+                scale_k = -(-int(data.dim[-1]) // kblock)
+                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], scale_k)
                 if reason is not None:
                     raise NotImplementedError(reason)
             if _combo_key(cap) != _combo_key(a0):

@@ -686,6 +686,14 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
     def pipeline(file):
         tree = ast.parse(template_path(file).read_text())
         kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+        # The gathered token SF is A normally and B after swapAB. Normalize
+        # only that role in SF barrier arrival counts; keep MMA roles literal.
+        token_sf_count = "num_sfb_operands" if file.endswith("_swap_ab.py") else "num_sfa_operands"
+        for call in ast.walk(kernel):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) == "nvvm.mbarrier_init" and ast.unparse(call.args[0]) == "sf_full_mbar_ptr.subview(i)":
+                for name in ast.walk(call.args[1]):
+                    if isinstance(name, ast.Name) and name.id == token_sf_count:
+                        name.id = "num_token_sf_operands"
         warp_regions = [
             ast.dump(node, include_attributes=False)
             for node in kernel.body

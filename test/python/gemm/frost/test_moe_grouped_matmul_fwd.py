@@ -599,8 +599,11 @@ def test_scatter_coordinates_and_public_replay(swap_ab):
 
 @requires_matmul_gpu
 def test_scatter_coordinates_and_public_replay_sm120():
+    from cudnn.gemm.frost.arch_family import active_family
     from cudnn.gemm.frost.sm120 import compiler as C
 
+    if active_family() != "sm120":
+        pytest.skip("set CUDNN_FRONTEND_GEMM_ARCH_FAMILY=sm120 before import to replay the public SM120 plan on SM10.x")
     _run_scatter_coordinates(C, by_name(_SM120_CFG))
 
 
