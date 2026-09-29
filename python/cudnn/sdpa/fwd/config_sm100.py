@@ -1867,8 +1867,11 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
         # f16/bf16 only here, so V matches Q/K: d128's `2 if pv_bf16 else b`
         # collapses to b, _validate_params already declining pv_bf16 at d64.
         BPE_V=b,
+        PV_BF16=int(params.pv_bf16),
         EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
+        O_BLOCK_SCALE=O_BLOCK_SCALE_BY_DTYPE[dtype_o],
+        O_PACK_DIV=o_pack_div(dtype_o),
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
         # Mirror d128's rule rather than exploiting d64's smaller slabs: the
@@ -2053,6 +2056,7 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
+        RAGGED_Q=int(params.ragged_q),
     )
     _validate_cfg_d64_decode(cfg)
     return cfg, _tma_iters(cfg)
