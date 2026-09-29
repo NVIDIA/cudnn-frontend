@@ -1082,10 +1082,22 @@ else:
                     attn_scale=attn_scale,
                     use_causal_mask=(args.attn_mask == "top_left"),
                     use_causal_mask_bottom_right=(args.attn_mask == "bottom_right"),
+                    # The sliding-window band, as the fp8 forward and the half backward pass it.  `left_bound` ONLY: the
+                    # binding folds `right_bound = 0` out of the causal flags and raises when both are given.  Without
+                    # it a `--sliding_window_size` run built a PLAIN-causal fp8 backward while the FLOP model counted
+                    # window pairs (the sm107 d256 fp8 SWA640 cell read 148 TFLOPS on 11.14 ms that way, 2026-09-24).
+                    left_bound=left_bound,
                     dropout=dropout_tuple if is_dropout else None,
                     use_deterministic_algorithm=args.deterministic_bwd,
                 )
             elif args.data_type == "mxfp8":
+                if left_bound is not None:
+                    # No band on this call (the FROST MXFP8 backward row serves causal only): the graph below is PLAIN
+                    # causal, and `bwd_sliding_window` below rates it on causal pairs -- never window pairs for a graph
+                    # that carries no window.
+                    print(
+                        f"[WARN] mxfp8 backward: --sliding_window_size {left_bound} is not applied to the backward graph (plain causal); its TFLOPS count causal pairs"
+                    )
                 # MXFP8 backward requires transposed tensor views and scale factors
                 # Q, K, V in FP8_E4M3
                 q_bwd = graph_bwd.tensor_like(query)
@@ -2072,6 +2084,10 @@ else:
     bwd_median_time = (
         np.median(np.array(backward_times[5:])) if len(backward_times) > 5 else (np.median(np.array(backward_times)) if len(backward_times) > 0 else 0.0)
     )
+    # The backward FLOP count follows the GRAPH that ran: the mxfp8 backward carries no band (its build above warns), so a
+    # `--sliding_window_size` run of it is a plain-causal graph rated on causal pairs; the fp8 and half backward graphs
+    # pass `left_bound`, so the window counts there.
+    bwd_sliding_window = None if args.data_type == "mxfp8" else args.sliding_window_size
     bwd_tflops = 0.0
     if run_bwd and bwd_median_time > 0:
         bwd_tflops = tflops_per_sec(
@@ -2084,7 +2100,7 @@ else:
             args.attn_mask,
             bwd_median_time,
             "bwd",
-            args.sliding_window_size,
+            bwd_sliding_window,
         )
 
     # Compute MMA SOL% using the per-arch FLOPs/clk/SM table and the actual

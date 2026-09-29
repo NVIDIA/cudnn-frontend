@@ -57,6 +57,18 @@ elif arch == "sm120":
     g, vp, ws = case.graph, case.pack, case.workspace
     outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
     check = lambda: _check_prepared_bwd(case)
+elif arch == "sm107" and route == "fp8":
+    from test_sdpa_bwd_fp8_sm107 import _prepared_fp8_case, _check_prepared_fp8
+    case = _prepared_fp8_case()
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = list(case.outs_t.values()) + list(case.amax_t.values())
+    check = lambda: _check_prepared_fp8(case)
+elif arch == "sm107":
+    from test_sdpa_bwd_dsl_sm107 import _prepared_case, _check_prepared
+    case = _prepared_case(dt=dtype, causal=(route != "dense"))
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
+    check = lambda: _check_prepared(case)
 elif route == "dense":
     from test_sdpa_bwd_dsl_sm100 import _prepared_case, _check_prepared
     case = _prepared_case(dtype=dtype, chunks=True)

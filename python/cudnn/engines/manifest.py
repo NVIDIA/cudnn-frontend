@@ -140,6 +140,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
     "SDPA_BWD": "frost_sdpa_bwd",
+    "SDPA_FP8_BWD": "frost_sdpa_bwd",
     "SDPA_MXFP8_BWD": "frost_sdpa_bwd",
     "GDN": "gdn",
     "GDN_BWD": "gdn",
@@ -260,6 +261,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
             "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
+            "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
+            "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick

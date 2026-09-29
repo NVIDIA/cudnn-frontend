@@ -1880,8 +1880,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # when the caller omits it. Default it here, as the SM120 and SM80
         # adapters do -- without this the row admits the graph, check_support
         # passes, and execute dies on `None * log2(e)`. Found by review on the
-        # d512 bring-up PR; regression test `test_default_attn_scale`.
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        # d512 bring-up PR; regression test `test_default_attn_scale`.  ONLY
+        # None defaults: an explicit attn_scale = 0.0 is a valid declared scale
+        # the analyzer preserves (uniform P -> dQ = dK = 0, dV = sum(dO) / S_kv);
+        # `or == 0.0` here ran it at 1/sqrt(d) (Codex on #1212, same clause in
+        # the sm107 adapter; host pin test_sdpa_bwd_dsl_sm107.py::
+        # test_explicit_zero_attn_scale_survives_the_adapters).
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape. The kernel's grid and workspace are tiled,
         # so a sequence length that is not a multiple runs on the next multiple

@@ -93,12 +93,23 @@ def mma_m16n8k32_f32(
 
 
 @cute.jit
-def desc_opaque(value):
-    """Identity mov.b64 so LLVM cannot reassociate a descriptor base into per-k-step 64-bit literals."""
+def desc_opaque(value, anchor=None):
+    """Identity mov.b64 so LLVM cannot reassociate a descriptor base into per-k-step 64-bit literals.
+
+    ``anchor`` (optional): a loop-VARIANT ``Int32`` (the kv-block or q-tile counter) passed as an extra, unreferenced
+    asm operand.  Without it, a base whose SMEM address is static and whose ring index folds to a constant (a 1-stage
+    ring: ``idx % 1 == 0``) is KERNEL-invariant, so LLVM's LICM hoists this mov AND every ``base + k_step`` add to the
+    persistent loop's preheader; the sm107 d256 backward's 40-register MMA warp then held 32 descriptor pairs (K front
+    8 + V 8 + K back-half UTCCP 16 = 64 URs, over the 63-UR file) live across the WHOLE kernel and spilled 38 STL /
+    45 LDL (2026-09-23, sm_107a).  A loop-variant operand pins the mov -- and the adds that depend on it -- inside the
+    loop body next to the MMA / UTCCP that consumes them, so their live range is one iteration.  The default path
+    (no anchor) emits exactly the asm it always did.
+    """
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
     return inline_ptx(
         "mov.b64 $0, $1;",
         write_only_types=[type(value)],
-        read_only_args=[value],
+        read_only_args=args,
     )
 
 
