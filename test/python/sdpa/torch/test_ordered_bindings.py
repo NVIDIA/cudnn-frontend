@@ -54,7 +54,8 @@ def test_torch_ordered_bindings_rebind_and_replay(provider, layout, monkeypatch)
     backward = not thd or provider == "backend"
     cu = torch.tensor([0, 64, 160], dtype=torch.int32, device="cuda")
     kwargs = dict(cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=96, max_seqlen_kv=96) if thd else {}
-    shape = (160, 4, 128) if thd else (2, 96, 4, 128)
+    d = 128 if thd else 512  # SM100 half backward serves the >256 head-dim envelope.
+    shape = (160, 4, d) if thd else (2, 96, 4, d)
 
     def make_inputs():
         values = [torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.2 for _ in range(4)]
@@ -62,10 +63,10 @@ def test_torch_ordered_bindings_rebind_and_replay(provider, layout, monkeypatch)
 
     def run(values):
         q, k, v, grad = values
-        output, stats = torch.ops.cudnn.sdpa_fwd(q, k, v, 128**-0.5, is_causal=True, **kwargs)
+        output, stats = torch.ops.cudnn.sdpa_fwd(q, k, v, d**-0.5, is_causal=True, **kwargs)
         if backward:
             lse = torch_op.thd_lse_to_padded(stats[:, :, 0], cu, 96) if thd else stats
-            grads = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, output, lse, 128**-0.5, is_causal=True, **kwargs)
+            grads = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, output, lse, d**-0.5, is_causal=True, **kwargs)
         else:
             grads = ()
         return output, stats, grads
@@ -77,7 +78,7 @@ def test_torch_ordered_bindings_rebind_and_replay(provider, layout, monkeypatch)
             lse = lse.unsqueeze(-1)
         else:
             qr, kr, vr = (value.detach().float().requires_grad_(True) for value in (q, k, v))
-            output, lse = ref_attention(qr, kr, vr, 128**-0.5, is_causal=True, return_lse=True)
+            output, lse = ref_attention(qr, kr, vr, d**-0.5, is_causal=True, return_lse=True)
             output.backward(grad.float())
             grads = (qr.grad, kr.grad, vr.grad)
         for name, actual, expected in [("O", result[0], output), ("Stats", result[1], lse)]:
