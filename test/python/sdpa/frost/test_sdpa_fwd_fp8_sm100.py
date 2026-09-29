@@ -571,6 +571,32 @@ def test_fp8_masks(in_key, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_fp8_d64_masks(in_key, mask):
+    """The native d64 leg of the d128 FP8 kernel (TemplateParams.d_flavor=64,
+    gpt-oss class): every mask family at d_qk = d_v = 64, cga1."""
+    scale = 1.0 / math.sqrt(64)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=64, d_v=64)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d64_gptoss_shape(in_key, out_key):
+    """gpt-oss geometry on the native d64 leg: MHA, causal + 128-wide sliding
+    window, S not a tile multiple, half and FP8 O."""
+    scale = 1.0 / math.sqrt(64)
+    out, o_ref, a_o, a_o_ref = _run(
+        1, 16, 16, 1000, 1000, in_key, _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True, left_bound=128), d_qk=64, d_v=64
+    )
+    _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)

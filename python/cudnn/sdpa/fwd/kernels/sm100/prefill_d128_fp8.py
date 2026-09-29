@@ -85,12 +85,17 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d64, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-CFG, _TMA = make_cfg_d128(PARAMS)
+# One pipeline, two head-dim geometries: d128 and the native d64 (gpt-oss class),
+# selected by TemplateParams.d_flavor exactly as in prefill_d128_f16.py.
+_MAKE_CFG = {64: make_cfg_d64, 128: make_cfg_d128}
+if PARAMS.d_flavor not in _MAKE_CFG:
+    raise ValueError(f"prefill_d128_fp8: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
+CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_fp8_sm100: softmax_f16 is served by the SM107 sibling only (softmax_precision knob domain)")
 Cfg = type(CFG)

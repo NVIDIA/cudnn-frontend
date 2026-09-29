@@ -170,6 +170,9 @@ def _with_fp4(dtypes):
 # Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "sm100/prefill_d128_mxfp8.py",
+    # Native d64: the same file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor),
+    # instead of zero-filling a 128-wide tile for gpt-oss-class head dims.
+    (64, 64): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
     (512, 512): "sm100/prefill_d512_mxfp8.py",
@@ -198,6 +201,9 @@ _SM107_MXFP8_KERNEL_FILES = {
 }
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "sm100/prefill_d128_fp8.py",
+    # Native d64: the same file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor),
+    # instead of zero-filling a 128-wide tile for gpt-oss-class head dims.
+    (64, 64): "sm100/prefill_d128_fp8.py",
     (192, 128): "sm100/prefill_d192_d128_fp8.py",
     (256, 256): "sm100/prefill_d256_fp8.py",
     (512, 512): "sm100/prefill_d512_fp8.py",
@@ -473,7 +479,9 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     # Q/O alias, and a 2-CTA cluster only widens the Q rows a cluster must cover
     # under a narrow band). cga2 still builds, so both are offered.
     if flavor == (64, 64):
-        return (1, 2)
+        # The quantized d64 legs run cga1 only: at cga2 the halved V slab would
+        # need a 32-byte swizzle the FP8 kernels' P.V descriptors do not model.
+        return (1,) if fp8 else (1, 2)
     if fp8 and flavor == (256, 256):
         return (1,)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
