@@ -496,6 +496,54 @@ class Sm120KernelTemplate(KernelTemplate):
     output only. Fronts both sm120 templates (dense and block-scale): a packed
     fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
+    # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
+    # The MoE template keeps one register accumulator per GEMM resident for the
+    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each). How many
+    # registers that takes is NOT a support question: past what the compute
+    # warp's grant holds, ptxas spills to local memory and the plan still
+    # computes the same function, only slower -- a perf trade-off left to the
+    # autotuner and the auto pick (tile_config.select_config's shared 256-wide
+    # N budget keeps the auto pick spill-free), never a reason to reject a plan.
+    # The one hard gate is SMEM: a stage of every distinct operand tile plus the
+    # epilogue staging has to fit.
+    COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in both sm120 templates
+
+    def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
+        """``(ab_stages, per_stage_bytes, staging_bytes)`` of a multi-GEMM chain on
+        this template: one SMEM tile per DISTINCT operand per stage (+16 B slack,
+        as the template counts), with the transposed-STG epilogue staging taken
+        off the budget in BYTES before the ring is sized -- the block-scale
+        template's accounting, not the whole-stage deduction the single-GEMM
+        path keeps (a multi-operand stage is so large that giving one up can
+        leave none). The renderer emits the result verbatim and tells the
+        template not to deduct."""
+        from .dtypes import DTYPE_BYTES
+        from .tile_config import _SM120_STG_STAGE_ELEMS, smem_ab_stages
+
+        _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+        per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
+        staging = 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
+        return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
+
+    def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        """Why a multi-GEMM chain CANNOT run on this template with ``config`` --
+        SMEM only: one stage of every distinct operand tile plus the epilogue
+        staging has to fit. ``None`` when it fits or the chain is a single GEMM.
+        Register pressure is deliberately not a reason here: spilling is a perf
+        trade-off, never grounds to disable a plan. Asked by the funnel
+        (``_extra_reject``) and by the sm120 renderer
+        (``_render_tile_constants``), so both agree."""
+        if not chain.is_multi_gemm:
+            return None
+        stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
+        if stages < 1:
+            return (
+                f"one AB stage of {per_stage} B ({chain.num_a_operands} A + {chain.num_b_operands} B tiles) plus the "
+                f"{staging}-B epilogue staging does not fit the SMEM budget of the sm120 multi-GEMM kernel; "
+                f"pick a smaller CTA tile or K"
+            )
+        return None
+
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
@@ -522,6 +570,10 @@ class Sm120KernelTemplate(KernelTemplate):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":
             return f"{self.file} does not support fp4 output"
+        if not self.block_scale:  # the block-scale template declines multi-GEMM by flag; its SMEM ring is sized elsewhere
+            _mg = self.multi_gemm_reject(chain, config)
+            if _mg is not None:
+                return f"{self.file}: {_mg}"
         from . import compiler as C
 
         try:
@@ -618,7 +670,10 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # coordinate on one global descriptor (no tensormap scratch to reserve).
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
-        supports_multi_gemm=False,
+        # Multi-GEMM (SwiGLU-style dual MoE) runs on the same kernel: one register
+        # accumulator per GEMM; SMEM feasibility is `Sm120KernelTemplate.multi_gemm_reject`
+        # (register pressure is a perf trade-off, never a gate).
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(

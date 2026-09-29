@@ -465,3 +465,89 @@ def test_partial_tiles_empty_padding_and_bias_batch(d, bias_batch):
     _check(_case(d, sq=33, skv=65, hk=2, features=True, padding=([0, 27], [59, 0]), bias_batch=bias_batch))
     if bias_batch == 2:
         _check(_case(d, sq=33, skv=65, hk=2, features=True, bias_batch=bias_batch))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "d,dv,bias_batch,staged", [(48, 32, 1, True), (96, 80, 2, True), (64, 64, 1, False), (128, 128, 2, False), (192, 128, 1, False), (256, 256, 2, False)]
+)
+def test_wrapper_aux_outputs_need_no_torch_clear(dtype, d, dv, bias_batch, staged, monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl
+
+    case = _case(d, dv, dtype=dtype, sq=33, skv=65, features=True, padding=([27, 0], [59, 31]), bias_batch=bias_batch)
+    monkeypatch.setattr(api_dsl, "_sm80_bwd_cache", {})
+
+    def run():
+        return api_dsl.sdpa_bwd_wrapper_sm80(
+            *(case.bufs[name] for name in ("q", "k", "v", "o", "do", "stats")),
+            is_causal=case.causal,
+            scale_softmax=case.scale,
+            seq_len_q=case.bufs["seq_q"],
+            seq_kv_lens=case.bufs["seq_kv"],
+            bias_tensor=case.bufs["bias"],
+            sinks=case.bufs["sink"],
+        )
+
+    def check(result):
+        _check(case, {name: result[name + "_tensor"].reshape(ref.shape) for name, ref in case.expected.items()})
+
+    def refresh_reference():
+        o, stats, dq, dk, dv_ref, aux = _reference(case.bufs, case.scale, case.causal, case.padding)
+        case.bufs["o"].copy_(o)
+        case.bufs["stats"].copy_(stats)
+        case.expected = dict(dq=dq, dk=dk, dv=dv_ref, dbias=aux.dbias, dsink=aux.dsink)
+
+    check(run())
+    plan = next(iter(api_dsl._sm80_bwd_cache.values()))
+    assert (plan._staged_prepared is not None) == staged
+    assert (plan._prepared is not None) != staged
+    case.bufs = {name: torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device).copy_(t) for name, t in case.bufs.items()}
+    case.bufs["q"].mul_(0.75)
+    case.bufs["do"].mul_(1.25)
+    case.bufs["bias"].mul_(0.5)
+    case.bufs["sink"].add_(0.25)
+    refresh_reference()
+    empty, empty_like = torch.empty, torch.empty_like
+    zeros, zeros_like = torch.zeros, torch.zeros_like
+    poisoned = set()
+
+    def poison_sink(*args, **kwargs):
+        result = empty(*args, **kwargs)
+        if result.dtype == torch.float32 and result.shape == (case.bufs["q"].shape[1],):
+            result.fill_(float("nan"))
+            poisoned.add("sink")
+        return result
+
+    def poison_bias(tensor, **kwargs):
+        result = empty_like(tensor, **kwargs)
+        if tensor is case.bufs["bias"]:
+            result.fill_(float("nan"))
+            poisoned.add("bias")
+        return result
+
+    monkeypatch.setattr(torch, "empty", poison_sink)
+    monkeypatch.setattr(torch, "empty_like", poison_bias)
+    for name in ("zeros", "zeros_like"):
+        monkeypatch.setattr(torch, name, lambda *a, **k: pytest.fail("wrapper redundantly cleared auxiliary outputs"))
+    check(run())
+    assert poisoned == {"bias", "sink"}
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run()
+        # Previously active rows become entirely masked. The prepared chain
+        # must overwrite every auxiliary output, including the partial tiles.
+        case.padding = ([0, 27], [59, 0])
+        for name, values in zip(("seq_q", "seq_kv"), case.padding):
+            case.bufs[name].copy_(torch.tensor(values, dtype=torch.int32, device="cuda").reshape_as(case.bufs[name]))
+        # The reference may legitimately allocate zeros; only the wrapper's
+        # allocating call is forbidden from rebuilding those clears.
+        with monkeypatch.context() as guard:
+            guard.setattr(torch, "zeros", zeros)
+            guard.setattr(torch, "zeros_like", zeros_like)
+            refresh_reference()
+        graph.replay()
+        check(captured)
+    finally:
+        graph.reset()

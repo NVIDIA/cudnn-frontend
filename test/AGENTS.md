@@ -74,6 +74,14 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Decode Stats must be tested independently of training.** The random SDPA harness uses `generate_stats=cfg.is_train`, so its `s_q == 1` inference sweep checks O without checking LSE. For ragged GQA decode, request Stats explicitly, initialize every head to NaN, and compare every head against the reference. Include padded-Stats, MHA, and `s_q > 1` controls; pin a backend plan when testing native codegen so FROST cannot mask it. `test_mhas_v2.py::test_sdpa_ragged_decode_stats` is the detector (NVBug 6783545); run with `--runxfail` when checking an affected older backend.
 - **Plan-specific xfails must check the selected plan.** A heuristic can start ranking a working engine first without fixing another engine's compiler bug. An architecture-only xfail then turns correct outputs into strict-XPASS failures. Inspect `get_engine_and_knobs_at_index()` for the selected plan and keep `strict=True` plus the expected exception type for the affected engine. `test_sdpa_ragged_decode_stats` distinguishes the affected native 10X/107 engines (10/18) from working engine 8.
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
+- **Bound dense attention references independently of kernel memory.** A full
+  `[B, H, S_q, S_kv]` FP32 score tensor and GQA `repeat_interleave` can exhaust a
+  small GPU when xdist workers share it, even after the tested kernel succeeds.
+  Compute independent heads separately, mapping each query head to its KV head,
+  while preserving the full workload, masks, precision and tolerances. Validate
+  the refactor against the dense oracle on small MHA/GQA/MQA cases and run the
+  original large kernel test under the same allocator cap before and after the
+  fix. `test_sdpa_fwd_split_kv_sm120.py` covers this pattern.
 - **Every randomized SDPA input uses the per-test generator.** A seeded Q/K/V tuple is not a reproducible case if its block mask comes from the process-global CUDA RNG. Pass `generator=rng_data_gen` to auxiliary draws too; `test_block_mask_uses_the_per_test_data_generator` perturbs global RNG while holding the case seed fixed. Before attributing an order-dependent failure to an earlier engine, compare the actual masks as well as Q/K/V.
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
 - **A compiled-helper test does not cover AOT backward.** `torch.compiler.is_compiling()` can be false while AOT traces a custom op's backward with FakeTensor/FunctionalTensor inputs. Keep raw-pointer helpers behind a registered custom op with a fake implementation even in that context. Run the enclosing op's `torch.library.opcheck`, including dynamic AOT dispatch; `sdpa/torch/test_torch_ops.py::TestOpContract::test_opcheck` detects this for packed Stats preparation.
@@ -408,6 +416,15 @@ SwiGLU pairs alternate 32-column input/gate blocks; the two operands are not
 halves of the N dimension. `test_swiglu_failure_diagnostics.py` checks that mapping,
 bounded failure output, and preservation of the original assertion.
 
+Count TMA store stages in committed groups, not individual output subtiles.
+If one group reads two AB12 slots and one C slot, four AB12 slots and two C
+slots permit only two outstanding groups. Rotate each output ring by its
+own consumed-slot count across persistent tiles. A replay that repeatedly
+overwrites one output can hide an earlier corrupted store; retain distinct
+outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
+covers multiple groups within a tile and persistent tile transitions, including
+one-group tiles that must advance the C ring at every tile boundary.
+
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
 rebind allocations and mutate table values under capture replay. Preserve the
@@ -513,6 +530,22 @@ A `stream_context(None, device)` is deliberately a no-op; it does not select the
 operand device. Packed wrappers must guard that device for both compilation and
 pointer launch and restore the caller. Test a foreign current device on both
 operand GPUs, with default and explicit streams; validate outputs after the call.
+
+Same-dtype `to(dtype)` preserves a sliced input's strides, and `reshape` can
+preserve them too. When a wrapper declares compact lengths or sinks to the
+graph, explicitly normalize both layout and pointer alignment before binding.
+`sdpa/torch/test_aux_metadata.py` pins backend and FROST plans with strided
+native metadata and checks changed-input replay; the old backend silently read
+gap values while FROST rejected the inconsistent declaration. Performance
+comparisons must use a numerically valid baseline, such as dtype-converting
+inputs or an explicit compact-copy control, rather than time the wrong result.
+
+Metadata fusion also needs a single-input timing control. A compact half sink
+alone already requires one Torch cast; general prepared dispatch can improve
+GPU time while increasing CPU enqueue cost. Pin backend and FROST separately
+and measure that case alongside mixed conversions and native views.
+`test_forward_metadata_compact_sink_needs_no_compiler` guards the cheap cast,
+including unaligned source offsets and changed-input replay.
 
 A saved Stats tensor can have `requires_grad=True` inside an ordinary provider
 backward where grad mode is disabled. Route assertions must exercise that caller;

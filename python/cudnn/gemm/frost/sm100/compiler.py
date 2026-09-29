@@ -3297,7 +3297,7 @@ def _check_mma_k_dim(chain: FusionChain, config: TileConfig) -> None:
     fp8_dtypes = ("fp8_e4m3", "fp8_e5m2")
     if _mma_a_dtype(chain) not in fp8_dtypes or _mma_b_dtype(chain) not in fp8_dtypes:
         raise NotImplementedError(f"plain matmul at mma_tile_k_bytes=64 requires FP8 E4M3/E5M2 A and B; config {config.name!r}")
-    from ..kernel_registry import MMA_INST_K64_ARCH_RANGES
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
 
     arch = _current_arch()
     if arch is None or not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
@@ -3971,7 +3971,17 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         return config
     sm = sm_count if sm_count is not None else _sm_count()
     output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
-    if output_tiles >= sm:
+    # On MMA_INST_K64_ARCH_RANGES silicon the one-wave target overshoots for
+    # nvfp4 block-scale: measured split-K curves pay only below 1/8 grid fill,
+    # near 64 total CTAs, with power-of-two S >= 4. fp8 keeps one-wave sizing
+    # (its shallow narrow-tile splits measure as real wins).
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = _current_arch()
+    _k64_part = any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) if arch is not None else sm >= 190
+    _fp4_bs = chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1"
+    eager_fill = not (_k64_part and _fp4_bs)
+    if output_tiles >= (sm if eager_fill else -(-sm // 8)):
         return config
     cta_k_elems = _cta_k_elems(chain, config)
     num_k_tiles = -(-mm.K // cta_k_elems)
@@ -3982,7 +3992,18 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         32,  # reducer chain-unroll limit; S>32 runs one serial dynamic loop
         65535 // mm.batch,  # CUDA grid.z hard limit
     )
+    if not eager_fill:
+        slices = min(slices, max(1, 64 // output_tiles))
+        if slices < 4:
+            # the bounds cannot support four slices; S=2/3 measure as losses
+            return config
+        slices = 1 << (slices.bit_length() - 1)  # snap down to a power of two
     if slices <= 1:
+        return config
+    # For matched FP4 operands, a two-way split does not amortize the
+    # partial-output traffic and reduction launch. Keep the unsplit tile;
+    # larger automatic splits and explicitly supplied knobs remain available.
+    if slices == 2 and chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1":
         return config
     return replace(config, split_k_slices=slices)
 
