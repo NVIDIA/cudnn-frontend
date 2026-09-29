@@ -837,16 +837,12 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    ("caller_owned_workspace", "expected_cache_entries"),
-    [(False, 2), (True, 1)],
-    ids=["compatibility-isolation", "caller-workspace"],
-)
+@pytest.mark.parametrize("caller_owned_workspace", [False, True], ids=["internal-workspace", "caller-workspace"])
 def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
     monkeypatch,
     caller_owned_workspace,
-    expected_cache_entries,
 ):
+    """Distinct dense outputs share one compiled kernel, with or without a caller workspace."""
     from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
@@ -886,8 +882,8 @@ def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
         grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
     assert outputs[0].data_ptr() != outputs[1].data_ptr()
-    assert compile_count["value"] == expected_cache_entries
-    assert cache_entries == expected_cache_entries
+    assert compile_count["value"] == 1
+    assert cache_entries == 1
 
 
 @pytest.mark.L0
