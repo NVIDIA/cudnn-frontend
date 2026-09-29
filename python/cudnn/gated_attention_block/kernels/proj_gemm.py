@@ -75,6 +75,32 @@ tensor.
 must be set BEFORE ``import cudnn`` or the graph silently runs a cuDNN backend
 plan instead. :func:`build_proj_gemm` checks for the plan by name and raises
 rather than letting that happen quietly.
+
+**The BACKWARD's four projection GEMMs -- transposed operands as VIEWS.** The
+``nn.Linear`` orientation (``api_bwd.py``: ``dW = dY^T @ X``, ``dX = dY @ W``) needs
+an M-major A and an N-major B, which the shipped engine already renders (it
+infers each operand's major from the graph's strides). :func:`build_proj_gemm`
+takes them as the appended ``a_major`` / ``b_major`` kwargs -- the dims stay
+``[1, m, k]`` / ``[1, k, n]``, only the strides move -- and the two drivers bind
+views, no repack:
+
+    build                          A bind (view)                      B bind (view)                 C
+    a_major="k", b_major="k"       X [T, K] row-major (the forward)   W [N, K] row-major, read ^T   [T, N]
+    a_major="m", b_major="n"       dY[T, rows]^T  -> run_wgrad_gemm   X [T, cols] row-major         dW [rows, cols]
+    a_major="k", b_major="n"       dY[T, K] row-major -> run_dgrad_gemm   W [K, N] row-major (un-transposed)   dX [T, N]
+
+    B1  dW_o    = dY^T    @ O_gated   ("m", "n"; m=dm, k=T, n=HD)     B2  dO_gated = dY    @ W_o     ("k", "n"; m=T, k=dm, n=HD)
+    B7  dW_qkvg = dQKVG^T @ h         ("m", "n"; m=N,  k=T, n=dm)     B8  dh       = dQKVG @ W_qkvg  ("k", "n"; m=T, k=N,  n=dm)
+
+A view binds ONLY against a plan declared with its majors: the JIT route re-reads
+the runtime strides and refuses a mismatch, but the graph fallback binds pointers
+against the DECLARED strides with no check -- so :func:`run_wgrad_gemm` /
+:func:`run_dgrad_gemm` assert every view's stride-1 axis before binding (a typed
+``ValueError`` naming the operand and both strides). All four backward GEMMs take
+the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
+``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
+by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107``. The
+appended ``split_k`` kwarg (0 / 1 / S >= 2) is documented on :func:`build_proj_gemm`.
 """
 
 from __future__ import annotations
@@ -899,7 +925,8 @@ class ProjGemmPlan:
     #   B "k": dim [1, k, n] stride [k*n, 1, k]  (a row-major [n, k] weight, read transposed -- the forward)
     #     "n": dim [1, k, n] stride [k*n, n, 1]  (a row-major [k, n] -- X of a wgrad, W of a dgrad)
     # `split_k` is the REQUESTED knob (0 = the driver's pick, `build_proj_gemm`); the slices
-    # that run are `plan.jit.config.split_k_slices` on the JIT route.
+    # that run are `plan.jit.config.split_k_slices` on the JIT route, and `tile_config_name`
+    # spells them the catalog's way (`..._cluster2x1_2ctamma_splitK2` for S=2; no suffix at 1).
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
