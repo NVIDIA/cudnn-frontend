@@ -95,6 +95,10 @@ _MAX_SETS_PER_ENGINE = 6
 # LPT_L2's block-cyclic head grouping only pays when ONE head's K+V working set
 # can actually stay L2-resident.
 _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
+# Below this per-head K+V footprint the SM100 d128 / d64 f16 and per-tensor FP8
+# causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
+# S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
+_SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -593,6 +597,15 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         elem = 1 if (facts.is_fp8 or facts.is_mxfp8) else 2
         one_head_bytes = int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) * elem
         primary = SCHED_LPT_L2 if one_head_bytes <= _SM100_L2_BUDGET_BYTES else SCHED_LPT
+        if caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
+            # The SM100 d128 / d64 f16 and per-tensor FP8 kernels: below a few
+            # MiB per head the K/V of a head stays L2-resident under ANY walk, so
+            # LPT_L2's head grouping only costs balance.  MEASURED on B200
+            # (cuDNN 9.30 yardstick, profiler kernel sums, 2026-09-28), LPT vs
+            # LPT_L2: llama 64/8 bf16 S=2K unpacked 1.14x vs 1.23x, S=8K packed
+            # 1.04x vs 1.07x, S=32K packed 1.11x vs 1.07x (16 MiB/head: L2 wins);
+            # e4m3 64/64 S=2K cga1 1.19x vs 1.33x, 64/8 S=2K/8K packed equal.
+            primary = SCHED_LPT
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
