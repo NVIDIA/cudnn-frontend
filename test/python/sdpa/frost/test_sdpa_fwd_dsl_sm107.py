@@ -3123,8 +3123,8 @@ class TestStagedHalf:
 # of V, and two executions on identical inputs are bitwise equal.
 # The scale = 1 masked variant NaNs on develop 4c0dc9a8 exactly as on this
 # head (the review's finding): the live rows whose window excludes KV tile 0
-# publish LSE = log(1e-30) and O = NaN -- classified in frost_dev/results/
-# d512_ostream_pr/final_2026-09-29/PREEXISTING_scale1_nan.md; kept as a
+# publish LSE = log(1e-30) and O = NaN -- classified as a pre-existing develop
+# defect (documented in the PR #1288 follow-ups); kept as a
 # STRICT xfail so the suite documents it and flips the day it is fixed.
 # ============================================================================
 
@@ -3232,7 +3232,7 @@ _HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
     strict=True,
     reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 kernel NaNs the LIVE rows whose 130-key window excludes the first KV "
     "tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
-    "count (3064 rows) on develop and head -- see PR #1288 follow-ups and frost_dev/results/d512_ostream_pr/final_2026-09-29/PREEXISTING_scale1_nan.md",
+    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups",
 )
 _HANDOFF_CASES = [
     pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
