@@ -1921,7 +1921,11 @@ else:
             matched_kernels = [
                 item
                 for item in prof.key_averages()
-                if item.key.startswith("cudnn")
+                # Substring, as in the backward filter below: cuDNN's split-KV
+                # reduction is `void cudnn::fusion::lean_reduction_kernel<...>`, so
+                # the prefix test dropped it from the cuDNN forward time while the
+                # FROST combine (`cudnn_kernel__combine...`) was counted.
+                if "cudnn" in item.key
                 or item.key.startswith("kernel_cutlass")
                 or "pytorch_flash::" in item.key
                 or "flash::" in item.key

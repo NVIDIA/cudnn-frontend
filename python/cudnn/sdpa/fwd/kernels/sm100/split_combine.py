@@ -28,6 +28,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
+from cudnn.frost.tile_dsl.tma import ld_global_v4
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 # This helper is imported normally, outside the parameterized template loader.
@@ -35,9 +36,15 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 # the cache environment manifest also covers all transitive Python sources.
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
-# One block per (q_row, head, batch); 128 lanes stride over d_v, including
-# the wider d256/d512 flavors.
+# One WARP per (q_row, head, batch) and ROWS_PER_BLOCK rows per block: each lane
+# owns four consecutive columns (a 16-byte load per split, so a warp reads a
+# row's 128 columns as one 512-byte coalesced request), and the wider
+# d256/d512 flavors loop the warp over 128-column chunks.  The previous
+# one-block-per-row form (128 lanes, one scalar load each, split loop rolled)
+# was DRAM-latency bound: measured 15.5 us (bf16) / 28.7 us (fp8) for
+# 985 x 9 rows x 4 splits on B300 against ~18 MB of traffic.
 THREADS = 128
+ROWS_PER_BLOCK = THREADS // 32
 
 NEG_INF = float("-inf")
 
@@ -75,6 +82,7 @@ def _combine_kernel(
     n_batch: cutlass.Int32,
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
+    s_q: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],  # write the FINAL LSE in base 2 (stats_use_log2)
     # Ragged final rows (the decode tile's RAGGED_Q leg): (B+1,) int32 / int64 ragged
     # offsets of Q, O and Stats in ELEMENTS and their elements-per-token
@@ -96,122 +104,187 @@ def _combine_kernel(
     ragged_lse_cap: cutlass.Int32 = 0,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
-    q_row = cute.arch.block_idx()[0]
+    lane = tidx % cutlass.Int32(32)
+    q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
     head = cute.arch.block_idx()[1]
     batch = cute.arch.block_idx()[2]
 
-    op = cutlass.make_array_view(o_partial)
-    lp = cutlass.make_array_view(lse_partial)
-    oo = cutlass.make_array_view(o_out)
+    # A warp past S_q (last block only) has no row; there is no block-level
+    # barrier below, so it simply falls through.  Everything inside is
+    # warp-uniform except the per-lane column guard.
+    if q_row < s_q:
+        op = cutlass.make_array_view(o_partial)
+        lp = cutlass.make_array_view(lse_partial)
+        oo = cutlass.make_array_view(o_out)
 
-    # Where the recombined row lands: dense (batch, q_row), or the ragged
-    # placement on the packed outputs (batch coord 0).
-    o_batch = batch
-    o_tok = q_row
-    lse_batch = batch
-    lse_tok = q_row
-    row_live = cutlass.Int32(1) == cutlass.Int32(1)
-    lse_live = row_live
-    if cutlass.const_expr(ragged_q is not None):
-        # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
-        # buffer's element offset can exceed 2^31) and keep the token index in 32.
-        # Bounds are checked in 64 bits BEFORE narrowing: a negative or wrapped
-        # offset must fail the capacity test, not alias a valid token after the cast.
-        rq = cutlass.make_array_view(ragged_q)
-        q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
-        q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
-        in_seq = cutlass.Int64(q_row) < q_len64
-        o_batch = cutlass.Int32(0)
-        o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
-        row_live = in_seq & (o_tok64 >= cutlass.Int64(0)) & (o_tok64 < cutlass.Int64(ragged_o_cap))
-        o_tok = cutlass.Int32(o_tok64)
+        # Where the recombined row lands: dense (batch, q_row), or the ragged
+        # placement on the packed outputs (batch coord 0).
+        o_batch = batch
+        o_tok = q_row
+        lse_batch = batch
+        lse_tok = q_row
+        row_live = cutlass.Int32(1) == cutlass.Int32(1)
         lse_live = row_live
-        if cutlass.const_expr(ragged_lse is not None):
-            lse_batch = cutlass.Int32(0)
-            lse_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div) + cutlass.Int64(q_row)
-            lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
-            lse_tok = cutlass.Int32(lse_tok64)
+        if cutlass.const_expr(ragged_q is not None):
+            # Offsets are int32 or int64 elements; divide in 64 bits (a large packed
+            # buffer's element offset can exceed 2^31) and keep the token index in 32.
+            # Bounds are checked in 64 bits BEFORE narrowing: a negative or wrapped
+            # offset must fail the capacity test, not alias a valid token after the cast.
+            rq = cutlass.make_array_view(ragged_q)
+            q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
+            q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+            in_seq = cutlass.Int64(q_row) < q_len64
+            o_batch = cutlass.Int32(0)
+            o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
+            row_live = in_seq & (o_tok64 >= cutlass.Int64(0)) & (o_tok64 < cutlass.Int64(ragged_o_cap))
+            o_tok = cutlass.Int32(o_tok64)
+            lse_live = row_live
+            if cutlass.const_expr(ragged_lse is not None):
+                lse_batch = cutlass.Int32(0)
+                lse_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_lse)[batch]) // cutlass.Int64(ragged_lse_div) + cutlass.Int64(q_row)
+                lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
+                lse_tok = cutlass.Int32(lse_tok64)
 
-    # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
-    # Every lane redundantly walks the (very short) split axis; the values are
-    # block-uniform and hit L1, which is cheaper than staging them through SMEM.
-    m = cutlass.Float32(NEG_INF)
-    for s in cutlass.range(0, n_splits, 1, unroll=1):
-        lse_row = lp[batch + s * n_batch, head, :]
-        m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
+        # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
+        # Every lane redundantly walks the (very short) split axis; the values
+        # are warp-uniform and hit L1, which is cheaper than staging them.
+        m = cutlass.Float32(NEG_INF)
+        for s in cutlass.range(0, n_splits, 1, unroll=4):
+            lse_row = lp[batch + s * n_batch, head, :]
+            m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
 
-    # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather
-    # than exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
-    all_dead = m == cutlass.Float32(NEG_INF)
-    m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+        # All splits dead (every row fully masked): emit O := 0 / lse := -inf
+        # rather than exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
+        all_dead = m == cutlass.Float32(NEG_INF)
+        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
 
-    # Same reasoning as pass 2: skip dead splits rather than trusting a fastmath
-    # exp(-inf) to be exactly 0.
-    den = cutlass.Float32(0.0)
-    for s in cutlass.range(0, n_splits, 1, unroll=1):
-        lse_row = lp[batch + s * n_batch, head, :]
-        lse_s = cutlass.Float32(lse_row[q_row])
-        if lse_s > cutlass.Float32(NEG_INF):
-            den = den + cute.math.exp(lse_s - m_safe, fastmath=True)
-
-    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
-    inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
-
-    # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
-    #
-    # A dead split (empty KV range) carries lse_s = -inf, so its weight is
-    # exp(-inf) == 0 and it should contribute nothing.  Relying on the ARITHMETIC
-    # to erase it is not safe: 0 * x is NaN for a non-finite x, and under
-    # fastmath the weight itself is only approximately zero.  Skip such splits
-    # outright -- they are the identity element of this reduction by
-    # construction, so branching is exact where multiplying is not.  (Observed:
-    # d512 with 5 KV tiles over 8 splits produced NaN in the recombined O
-    # without this guard, even though every partial slot held a clean
-    # -inf / 0.)
-    neg_inf = cutlass.Float32(NEG_INF)
-    amax_local = cutlass.Float32(0.0)
-    q_scale = cutlass.Float32(1.0)
-    if cutlass.const_expr(scale_o is not None):
-        q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
-    for d0 in cutlass.range(tidx, d_v, THREADS, unroll=1):
-        acc = cutlass.Float32(0.0)
-        for s in cutlass.range(0, n_splits, 1, unroll=1):
+        # A dead split (empty KV range) carries lse_s = -inf and must contribute
+        # nothing.  Its weight is dropped with a SELECT, not by trusting the
+        # arithmetic: 0 * x is NaN for a non-finite x and a fastmath exp(-inf)
+        # is only approximately zero.  (Observed: d512 with 5 KV tiles over 8
+        # splits produced NaN without the guard.)
+        neg_inf = cutlass.Float32(NEG_INF)
+        zero = cutlass.Float32(0.0)
+        den = cutlass.Float32(0.0)
+        for s in cutlass.range(0, n_splits, 1, unroll=4):
             lse_row = lp[batch + s * n_batch, head, :]
             lse_s = cutlass.Float32(lse_row[q_row])
-            if lse_s > neg_inf:
-                w = cute.math.exp(lse_s - m_safe, fastmath=True)
-                o_row = op[batch + s * n_batch, q_row, head, :]
-                acc = acc + w * cutlass.Float32(o_row[d0])
-        o_val = acc * inv_den
-        if cutlass.const_expr(amax_o is not None):
-            # Measured before scale_o, so this is already the pre-quant amax and
-            # needs no post-hoc divide (the single-pass epilogue's does).
-            amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+            live = lse_s > neg_inf
+            e = cute.math.exp(lse_s - m_safe, fastmath=True)
+            den = den + cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+
+        inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+        inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+
+        # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
+        # The partial slab is compact [S*B, S_q, H, d_v]; lane l owns four
+        # contiguous columns of every split (one 16-byte load for fp32 partials
+        # when all four are inside the row); the split loop is branch-free and
+        # unrolled so the loads of several splits are in flight together.
+        o_base = o_partial.iterator.toint()
+        # The 16-byte loads need d_v % 4 == 0 (row starts stay 16-byte aligned)
+        # and a 16-byte aligned slab base: the pointer entries only promise the
+        # element alignment and take a runtime d_v, so decide at runtime (one
+        # warp-uniform test); otherwise every lane takes the element path.
+        vec_ok = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+        amax_local = cutlass.Float32(0.0)
+        q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
-            o_val = o_val * q_scale
-        # Index all modes: ArrayView's row slice is a pointer and drops the
-        # final mode's stride, so a subsequent [d0] would assume contiguous D.
-        if row_live:
-            oo[o_batch, o_tok, head, d0] = o_val.to(o_out.element_type)
+            q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+        for cbase in cutlass.range(0, d_v, 128, unroll=1):
+            d0 = cbase + lane * cutlass.Int32(4)
+            if d0 < d_v:
+                acc0 = cutlass.Float32(0.0)
+                acc1 = cutlass.Float32(0.0)
+                acc2 = cutlass.Float32(0.0)
+                acc3 = cutlass.Float32(0.0)
+                for s in cutlass.range(0, n_splits, 1, unroll=4):
+                    lse_row = lp[batch + s * n_batch, head, :]
+                    lse_s = cutlass.Float32(lse_row[q_row])
+                    live = lse_s > neg_inf
+                    e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                    w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                    e0 = zero
+                    e1 = zero
+                    e2 = zero
+                    e3 = zero
+                    # Element loads through the view, each bounded by the row, serve
+                    # the half partials (flavors whose split epilogue keeps the staged
+                    # TMA-store O path, e.g. d512) and any d_v / base that cannot take
+                    # aligned 16-byte loads (legal through the runtime-shape pointer
+                    # entries); aligned fp32 partials take one 16-byte load per split.
+                    if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
+                        if vec_ok:
+                            idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
+                            v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
+                            e0 = cutlass.Float32(v[0])
+                            e1 = cutlass.Float32(v[1])
+                            e2 = cutlass.Float32(v[2])
+                            e3 = cutlass.Float32(v[3])
+                        else:
+                            o_row = op[batch + s * n_batch, q_row, head, :]
+                            e0 = cutlass.Float32(o_row[d0])
+                            if d0 + cutlass.Int32(1) < d_v:
+                                e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                            if d0 + cutlass.Int32(2) < d_v:
+                                e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                            if d0 + cutlass.Int32(3) < d_v:
+                                e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
+                    else:
+                        o_row = op[batch + s * n_batch, q_row, head, :]
+                        e0 = cutlass.Float32(o_row[d0])
+                        if d0 + cutlass.Int32(1) < d_v:
+                            e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                        if d0 + cutlass.Int32(2) < d_v:
+                            e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                        if d0 + cutlass.Int32(3) < d_v:
+                            e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
+                    # a dead slot may hold anything, including non-finite values
+                    v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
+                    v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
+                    v2 = cutlass.Float32(arith.select(live.ir_value(), e2.ir_value(), zero.ir_value()))
+                    v3 = cutlass.Float32(arith.select(live.ir_value(), e3.ir_value(), zero.ir_value()))
+                    acc0 = acc0 + w * v0
+                    acc1 = acc1 + w * v1
+                    acc2 = acc2 + w * v2
+                    acc3 = acc3 + w * v3
+                outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+                for i in cutlass.range_constexpr(4):
+                    o_val = outs[i]
+                    if cutlass.const_expr(amax_o is not None):
+                        # Measured before scale_o, so this is already the pre-quant
+                        # amax and needs no post-hoc divide.
+                        amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                    if cutlass.const_expr(scale_o is not None):
+                        o_val = o_val * q_scale
+                    # Index all modes: ArrayView's row slice is a pointer and drops
+                    # the final mode's stride, so a subsequent [d0] would assume
+                    # contiguous D.
+                    if row_live & (d0 + cutlass.Int32(i) < d_v):
+                        oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
 
-    # One atomic per lane.  The value is non-negative, so its fp32 bit pattern
-    # orders the same as the float and an integer atomicMax is exact -- the same
-    # trick the kernels' own epilogues use.
-    if cutlass.const_expr(amax_o is not None):
-        _amax_ptr = Pointer(amax_o.iterator.raw_ptr(), dtype=cutlass.Int32)
-        nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_ptr, amax_local.bitcast(cutlass.Int32))
+        # amax: reduce across the warp, then ONE atomic per warp.  The value is
+        # non-negative, so its fp32 bit pattern orders the same as the float and
+        # an integer atomicMax is exact -- the same trick the kernels' own
+        # epilogues use.
+        if cutlass.const_expr(amax_o is not None):
+            for off in cutlass.range_constexpr(5):
+                amax_local = cute.math.max(amax_local, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, amax_local, 16 >> off, 31, kind=nvvm.Shfl.BFLY)))
+            if lane == cutlass.Int32(0):
+                _amax_ptr = Pointer(amax_o.iterator.raw_ptr(), dtype=cutlass.Int32)
+                nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_ptr, amax_local.bitcast(cutlass.Int32))
 
-    # --- the recombined LSE (only when the caller asked for Stats) ---
-    if cutlass.const_expr(lse_out is not None):
-        if (tidx == cutlass.Int32(0)) & lse_live:
-            lo = cutlass.make_array_view(lse_out)
-            lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
-            lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
-            # Base-2 Stats (stats_use_log2): the partials stay natural (the merge
-            # above needs them); only the final value converts. -inf stays -inf.
-            if cutlass.const_expr(stats_log2):
-                lse_val = lse_val * cutlass.Float32(1.4426950408889634)
-            lo[lse_batch, head, lse_tok] = lse_val
+        # --- the recombined LSE (only when the caller asked for Stats) ---
+        if cutlass.const_expr(lse_out is not None):
+            if (lane == cutlass.Int32(0)) & lse_live:
+                lo = cutlass.make_array_view(lse_out)
+                lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
+                lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
+                # Base-2 Stats (stats_use_log2): the partials stay natural (the
+                # merge above needs them); only the final value converts.
+                if cutlass.const_expr(stats_log2):
+                    lse_val = lse_val * cutlass.Float32(1.4426950408889634)
+                lo[lse_batch, head, lse_tok] = lse_val
 
 
 _combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -239,6 +312,10 @@ def _launch_combine(
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
     token capacities."""
     B, H, SQ, D = problem_size
+    # Lane l reads columns 4l..4l+3 of the compact fp32 partial rows as one
+    # 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other
+    # d_v / base (legal through this runtime-shape entry) takes bounded element
+    # loads and stores instead.
     _combine_kernel(
         o_partial,
         lse_partial,
@@ -249,6 +326,7 @@ def _launch_combine(
         cutlass.Int32(B),
         n_splits,
         cutlass.Int32(D),
+        cutlass.Int32(SQ),
         stats_log2,
         ragged_q,
         ragged_o,
@@ -259,7 +337,7 @@ def _launch_combine(
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
     ).launch(
-        grid=(SQ, H, B),
+        grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
         block=[THREADS, 1, 1],
         stream=stream,
     )

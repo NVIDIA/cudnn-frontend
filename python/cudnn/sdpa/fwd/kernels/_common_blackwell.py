@@ -29,7 +29,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
 from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
-from cudnn.frost.tile_dsl.tma import tma_load_tile
+from cudnn.frost.tile_dsl.tma import st_global_v4, tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
 # byte-identical copy).  Importing it from config_sm100 keeps this cross-arch
@@ -345,7 +345,6 @@ def store_fp32_partial_tile(
     can return NaN, and ``NaN * 0.0`` is NaN, not zero.  The staged paths avoid
     this by not loading at all for such rows; here the select does it.
     """
-    op = cutlass.make_array_view(o_partial_f32)
     # The slab carries the graph's ACTUAL d_v, which an ENVELOPE flavor routinely
     # exceeds -- d_v=64 runs on the d128 tile, so tile_o overshoots each row by 64
     # columns.  The staged TMA path clipped that to the tensor extent; a direct
@@ -353,18 +352,30 @@ def store_fp32_partial_tile(
     # end of the slab on the last one.  Read off the tensor rather than passed in,
     # so it cannot drift from the buffer actually bound.
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    assert chunk % 4 == 0 and d_v % 4 == 0, "fp32 partial rows are written 4 columns (16 bytes) at a time"
+    # 16-byte vector stores, four columns per st.global.v4.  Each lane owns one
+    # row (32x32b TMEM layout), so a warp's store touches 32 rows whatever the
+    # width; what the LSU pays for is the instruction count and the sector
+    # fill.  Scalar stores issued 4x the instructions and 4-byte fragments of
+    # 32-byte sectors, and the next TMEM load (which reuses the registers)
+    # stalled behind them -- measured ~35 us per CTA on B300, most of the
+    # split-KV gap at short S_q.  The slab is a contiguous fp32
+    # [rows, S_q, H, d_v] carved at the workspace base and d_v % 4 == 0 for
+    # every flavor, so every 4-column group is 16-byte aligned.
+    row_elem = cute.crd2idx((o_batch, q_row_global, row_head_idx, cutlass.Int32(0)), o_partial_f32.layout)
+    row_addr = o_partial_f32.iterator.toint() + cutlass.Int64(row_elem) * 4
+    zero = cutlass.Float32(0.0)
     for blk in cutlass.range_constexpr(tile_o // chunk):
         addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
         vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         scaled = vals * inv_sum
         if row_valid:
-            row_out = op[o_batch, q_row_global, row_head_idx, :]
-            for j in cutlass.range_constexpr(chunk):
-                if cutlass.const_expr(blk * chunk + j < d_v):
-                    row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
-                        arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
-                    )
+            for v in cutlass.range_constexpr(chunk // 4):
+                col = blk * chunk + 4 * v
+                if cutlass.const_expr(col + 4 <= d_v):
+                    quad = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[4 * v + i].ir_value())) for i in range(4)]
+                    st_global_v4(row_addr + cutlass.Int64(col * 4), quad, cutlass.Float32)
 
 
 class SplitHelpers(NamedTuple):
