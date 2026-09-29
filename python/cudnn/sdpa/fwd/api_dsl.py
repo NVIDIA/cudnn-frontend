@@ -484,6 +484,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         return (1,) if fp8 else (1, 2)
     if fp8 and flavor == (256, 256):
         return (1,)
+    if device_cc != (10, 7) and fp8 and pertensor and flavor == (128, 128):
+        # Per-tensor FP8 d128 builds at both widths: cga1 is one 256-row CTA
+        # (no collective MMA, STAGES_KV=2, Q/O aliased), cga2 the 2-CTA pair.
+        return (1, 2)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
     if device_cc != (10, 7) and not fp8 and flavor == _SM100_DECODE_FLAVOR:

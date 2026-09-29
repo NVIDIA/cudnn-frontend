@@ -790,6 +790,14 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # of a narrow diagonal band) and the decode tile's width. The two are
         # told apart by TemplateParams.decode_tile, not by this knob.
         return sched_policy, 1
+    if selected_shape == (128, 128) and facts.is_fp8 and not facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
+        # Per-tensor FP8 d128 on a dense graph: one 256-row CTA (cga1) for the
+        # unsplit leg, the geometry cuDNN's own fp8 kernel runs.  MEASURED on
+        # B200 (cuDNN 9.30 yardstick, 2026-09-28): llama 64/8 e4m3 causal S=2K
+        # 1.18x -> 1.14x, S=8K 1.09x -> 1.07x, 64/64 S=2K 1.49x -> 1.33x, AR-DiT
+        # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
+        # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -858,6 +866,10 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
+        if facts.is_fp8 and cga == 1:
+            # The quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows); only
+            # the f16 flavor's cga1 is the 128-row decode tile cga_tile_m models.
+            return 256
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
         return cga_tile_m(192, cga)

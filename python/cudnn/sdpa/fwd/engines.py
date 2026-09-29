@@ -1542,10 +1542,14 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             cgas=frozenset({2}),
             # (64, 64): cga1 only -- at cga2 the halved V slab would need a 32-byte
             # swizzle the FP8 P.V descriptors do not model (api_dsl.supported_cgas_for).
+            # (128, 128): the per-tensor FP8 d128 kernel builds at both widths; the
+            # heuristic runs its dense unsplit leg at cga1 (heuristics._auto_sched_cga).
             cgas_by_d_shape=(
-                (((256, 256), frozenset({1})),) if rubin_row else (((64, 64), frozenset({1})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
+                (((256, 256), frozenset({1})),)
+                if rubin_row
+                else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
-            split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((192, 128), frozenset({2})))),
+            split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((128, 128), frozenset({2})), ((192, 128), frozenset({2})))),
             # f16x2-softmax arm: only the SM107 sibling kernel carries the
             # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
             # it). FLOAT is the f32 pipeline every flavor already runs.
