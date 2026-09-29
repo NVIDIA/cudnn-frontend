@@ -140,18 +140,21 @@ class TemplateParams:
     cta_mma: int = 2
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
-    # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
+    # capability at compile time (MXFP8 + the per-tensor FP8 d192x128 kernel; the f16
+    # kernels do not read it, and the SM107 siblings carry the instruction unconditionally).
     fused_ldtm_stat: bool = False
     # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/prefill_d128_mxfp8.py,
-    # prefill_d128_fp8.py and prefill_d192_d128_f16.py): 32 of the 128 exp2 per row on the FMA pipe
-    # instead of MUFU.EX2.  Claimed per KERNEL and per ARCH, because its sign follows the part's
-    # MUFU.EX2 rate: MEASURED 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128
-    # MXFP8, +4.5 % on d128 FP8, +1.9 % on d192x128 bf16 at the chart layers) and 32 on cc 10.7
-    # (Rubin, where the same split is -9..-10 %: an emulated exp2 costs 1.99x the MUFU time it
-    # frees); cc 10.3 (GB300) DOCUMENTS the doubled exp2 rate too.  Auto-set by the adapter from the
-    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the three kernels above) -- widen
+    # prefill_d128_fp8.py and prefill_d192_d128_f16.py; the _exp2_* helper mix of
+    # prefill_d192_d128_fp8.py): a slice of the exp2 per row on the FMA pipe instead of MUFU.EX2.
+    # Claimed per KERNEL and per ARCH, because its sign follows the part's MUFU.EX2 rate: MEASURED
+    # 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128 MXFP8, +4.5 % on d128
+    # FP8, +1.9 % on d192x128 bf16 at the chart layers, +7.0 % causal / +5.7 % dense on d192x128 FP8
+    # at the DSv3 layer) and 32 on cc 10.7 (Rubin, where the same split is -9..-10 %: an emulated
+    # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
+    # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
+    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above) -- widen
     # only after an A/B on the new cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the
-    # develop spelling).  Only those three kernels read it.
+    # develop spelling).  Only those four kernels read it.
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
