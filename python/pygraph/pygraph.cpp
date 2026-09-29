@@ -293,7 +293,10 @@ PyGraph::weight_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            int64_t stage_smem_bytes,
                            int64_t input_alignment,
                            std::vector<int64_t> const& constants,
-                           std::string const& name) {
+                           std::string const& name,
+                           int64_t load_mode,
+                           int64_t storage_bits,
+                           int64_t row_stride_bytes) {
     auto program = cudnn_frontend::graph::Weight_dequantize_program{}
                        .set_source(source)
                        .set_entry(entry)
@@ -302,7 +305,10 @@ PyGraph::weight_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                        .set_cta_smem_bytes(cta_smem_bytes)
                        .set_stage_smem_bytes(stage_smem_bytes)
                        .set_input_alignment(input_alignment)
-                       .set_constants(constants);
+                       .set_constants(constants)
+                       .set_load_mode(load_mode)
+                       .set_storage_bits(storage_bits)
+                       .set_row_stride_bytes(row_stride_bytes);
     return graph->weight_dequantize(
         weights,
         auxiliaries,
@@ -1127,10 +1133,15 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("input_alignment")  = 16,
              py::arg("constants")        = std::vector<int64_t>{},
              py::arg("name")             = "",
+             py::arg("load_mode")        = 0,
+             py::arg("storage_bits")     = 0,
+             py::arg("row_stride_bytes") = 0,
              R"pbdoc(Dequantize custom narrow numerical weights with customer CUDA device source.
 
 Weights are physical byte storage; auxiliaries are ordered runtime scale/metadata tensors.
-The source and entry implement device ABI 1 and become part of the compiled GEMM.
+The source implements ABI 1 (decoder loads) or ABI 2 (managed loads) within the GEMM.
+load_mode: 0=decoder, 1=TMA bulk shared tile, 2=256-bit register fragment.
+Managed loads require ABI 2, storage_bits 2/4/8, padded row_stride_bytes and input_alignment >= 32.
 Set the returned virtual tensor's logical [1,K,N] shape and FP16/BF16 dtype explicitly.
 Scratch declarations are bytes per CTA/per stage; zero is valid. Requires the experimental backend.
 )pbdoc")

@@ -138,3 +138,63 @@ TEST_CASE("Custom weight dequantization reports unavailable headers", "[weight_d
     SUCCEED("Experimental header capability is available");
 #endif
 }
+
+TEST_CASE("Managed weight loads reject unknown serialized load modes", "[weight_dequantize][managed]") {
+    DecodeGraph g(program());
+    REQUIRE(g.graph.validate().is_good());
+    json saved                                = g.graph;
+    saved["nodes"][0]["program"]["load_mode"] = 99;
+    fe::graph::Graph restored;
+    REQUIRE(restored.deserialize(saved).is_good());
+    REQUIRE_FALSE(restored.validate().is_good());
+}
+
+TEST_CASE("Managed weight load metadata survives graph serialization", "[weight_dequantize][managed]") {
+    auto p =
+        program().set_abi_version(2).set_load_mode(1).set_storage_bits(4).set_row_stride_bytes(32).set_input_alignment(
+            32);
+    DecodeGraph original(p);
+    REQUIRE(original.graph.validate().is_good());
+    json saved = original.graph;
+    REQUIRE(saved["nodes"][0]["program"]["load_mode"] == 1);
+    REQUIRE(saved["nodes"][0]["program"]["storage_bits"] == 4);
+    REQUIRE(saved["nodes"][0]["program"]["row_stride_bytes"] == 32);
+    REQUIRE(original.weights->get_alignment() == 32);
+    fe::graph::Graph restored;
+    REQUIRE(restored.deserialize(saved).is_good());
+    REQUIRE(restored.validate().is_good());
+    REQUIRE(restored.key() == original.graph.key());
+    SECTION("different transport") { p.set_load_mode(2); }
+    SECTION("different physical row") { p.set_row_stride_bytes(64); }
+    SECTION("different code width") { p.set_storage_bits(2); }
+    DecodeGraph changed(p);
+    REQUIRE(changed.graph.validate().is_good());
+    REQUIRE(changed.graph.key() != original.graph.key());
+}
+
+TEST_CASE("Managed weight loads validate physical extents and ABI", "[weight_dequantize][managed]") {
+    auto p =
+        program().set_abi_version(2).set_load_mode(1).set_storage_bits(4).set_row_stride_bytes(32).set_input_alignment(
+            32);
+    SECTION("wrong ABI") { p.set_abi_version(1); }
+    SECTION("no transport") { p.set_load_mode(0); }
+    SECTION("unsupported width") { p.set_storage_bits(3); }
+    SECTION("misaligned row") { p.set_row_stride_bytes(48); }
+    SECTION("oversized row") { p.set_row_stride_bytes(int64_t(INT32_MAX) + 1); }
+    SECTION("weak alignment") { p.set_input_alignment(16); }
+    SECTION("short row") { p.set_storage_bits(8); }
+    SECTION("truncated allocation") { p.set_row_stride_bytes(96); }
+    REQUIRE_FALSE(DecodeGraph(p).graph.validate().is_good());
+}
+
+TEST_CASE("Old weight decoder JSON defaults to decoder-owned loads", "[weight_dequantize][managed]") {
+    DecodeGraph g(program());
+    REQUIRE(g.graph.validate().is_good());
+    json saved = g.graph;
+    for (auto field : {"load_mode", "storage_bits", "row_stride_bytes"}) saved["nodes"][0]["program"].erase(field);
+    fe::graph::Graph restored;
+    REQUIRE(restored.deserialize(saved).is_good());
+    REQUIRE(restored.validate().is_good());
+    REQUIRE(json(restored)["nodes"][0]["program"]["load_mode"] == 0);
+    REQUIRE(restored.key() == g.graph.key());
+}

@@ -32,12 +32,15 @@ these fields and corresponding fluent `set_<field>` setters:
 | --- | --- | --- |
 | `source` | `std::string` | Required CUDA C++ source; 1–1048575 bytes, no embedded NUL |
 | `entry` | `std::string` | Required unqualified ASCII identifier, at most 127 bytes |
-| `abi_version` | `int64_t` | 1 |
+| `abi_version` | `int64_t` | 1; use 2 for managed loads |
 | `tile_shape` | `std::vector<int64_t>` | `[32,64]`; the current engine supports only this tile |
 | `cta_smem_bytes` | `int64_t` | 0; fixed scratch bytes per CTA |
 | `stage_smem_bytes` | `int64_t` | 0; scratch bytes per pipeline stage |
 | `input_alignment` | `int64_t` | 16; power of two, at most 256, promised for every physical input |
 | `constants` | `std::vector<int64_t>` | Empty; at most 64 compile-time values, in supplied order |
+| `load_mode` | `int64_t` | 0 (DECODER); ABI 2 supports 1 (TMA_BULK), 2 (VECTOR_256) |
+| `storage_bits` | `int64_t` | 0; ABI 2 requires 2, 4, or 8 |
+| `row_stride_bytes` | `int64_t` | 0; ABI 2 requires padded rows as specified below |
 
 `weights` describes physical INT8/UINT8 byte storage, including for formats whose
 codes are not integers. Supply zero to eight ordered physical auxiliary tensors
@@ -189,7 +192,8 @@ must not retain pointers, launch kernels, synchronize across CTAs, or use FORT's
 not prove its indexing or synchronization correct.
 
 Scratch declarations are independently capped at 1 MiB by descriptor validation.
-The engine then computes stages from the effective shared-memory budget:
+For ABI 1, the engine computes stages from the effective shared-memory budget
+as follows; ABI 2 additionally reserves managed staging/barriers described below:
 
 ```text
 fixed     = align_up(cta_smem_bytes, 256)
@@ -236,3 +240,216 @@ backend for execution and skip when its headers/runtime or hardware are absent.
 cd test/python
 pytest test_weight_dequantize.py
 ```
+
+## Optional engine-managed packed loads (ABI 2)
+
+Physical transport and numerical interpretation are separate contracts. A regular
+row of codes can represent signed integers, a custom floating-point type, or
+indices into a nonlinear codebook, with arbitrary runtime scaling in each case.
+The engine only moves bits; the customer's CUDA C++ still performs dequantization.
+ABI 1 remains the default for irregular layouts, bit planes, non-byte-aligned
+rows, or metadata-dependent addressing.
+
+| `load_mode` | ABI | Input passed to customer entry | Engine operation |
+| --- | --- | --- | --- |
+| `0` / `DECODER` | 1 | Original global storage pointer | Customer owns weight loads |
+| `1` / `TMA_BULK` | 2 | Ready immutable shared tile | `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes` per valid K row |
+| `2` / `VECTOR_256` | 2 | Per-thread, by-value eight-word fragment | Naturally aligned `ld.global.v8.b32` |
+
+The TMA mode uses linear bulk copies, not a multidimensional tensor-map descriptor
+or a swizzled tile. This keeps pointers as ordinary variant-pack bindings and
+requires no host/device descriptor allocation or extra setup kernel. Both managed
+modes retain the existing SM120-only support envelope. VECTOR_256 additionally
+requires NVRTC 12.9 or newer (PTX 8.8); TMA_BULK retains the NVRTC 12.8 minimum.
+These are explicit choices, not an autotuning policy or a guaranteed speedup.
+
+### Physical layout and rejection checks
+
+Set `abi_version=2`, `load_mode=1` or `2`, `storage_bits` to 2, 4, or 8,
+`row_stride_bytes` to the physical row stride, and `input_alignment>=32`.
+All three new fields are INT64 backend attributes:
+`CUDNN_ATTR_WEIGHT_DECODE_LOAD_MODE`, `CUDNN_ATTR_WEIGHT_DECODE_STORAGE_BITS`,
+and `CUDNN_ATTR_WEIGHT_DECODE_ROW_STRIDE_BYTES`. C++ uses the corresponding fluent
+setters on `Weight_dequantize_program`; Python uses matching keyword arguments.
+The C++ program also exposes `DECODER`, `TMA_BULK`, and `VECTOR_256` constants.
+
+Logical weight `(k,n)` starts at bit
+`8*k*row_stride_bytes + n*storage_bits` in the physical byte vector. Codes are
+low-bit-first, contiguous along N, and each K row starts at a byte boundary.
+No bit offset, transpose, interleave, swizzle, pointer indirection, or repacking is
+implicit. For logical `[1,K,N]`, the contract requires:
+
+- Physical storage is a nonvirtual contiguous INT8/UINT8 `[1,1,length]` vector.
+- `row_stride_bytes` is positive, at most INT32_MAX, and a multiple of 32.
+- `row_stride_bytes >= round_up(ceil(N/64) * (64*storage_bits/8), 32)`.
+- `length >= K*row_stride_bytes`, including the final row's padding.
+- `input_alignment` is a power of two in `[32,256]` and promises alignment of
+  **every physical input**, including auxiliary tensors. The frontend propagates
+  this promise into tensor descriptors; the backend verifies actual addresses.
+- ABI 1 requires all three managed-load fields to be zero. ABI 2 requires a
+  supported managed mode. Unknown modes/widths and incompatible ABIs are rejected.
+
+Padding bytes must be allocated and readable, but need not encode numerical zero.
+FORT masks decoded K/N tails to zero. A managed callback must still respect valid
+logical coordinates and its assigned fragment when looking up scales or writing
+output. FORT validates declared extents and pointer alignment; the caller remains
+responsible for providing allocations of those extents and valid auxiliary data.
+The engine declines unsupported layouts instead of silently allocating/repacking.
+
+For example, N=75 with four-bit codes needs 64 physical bytes per K row in this
+contract. ABI 1's tightly packed stream needs only 38 bytes for the first 75 codes
+(and can continue at a half-byte boundary); it is a different physical layout.
+Customers must select a contract matching the storage they actually supply.
+
+### Device ABI and ownership
+
+The backend supplies these types; do not redeclare them in customer source:
+
+```cpp
+struct FortWeightDecodeTileV2 {
+    int abi_version, thread_id, thread_count, auxiliary_count;
+    long long batch, k_begin, n_begin, full_k, full_n;
+    int tile_k, tile_n, valid_k, valid_n, output_stride;
+    int output_bfloat16;
+    const long long* constants;
+    int constant_count;
+    int storage_bits;
+};
+struct FortWeightDecodeSharedTileV2 {
+    const unsigned char* data;
+    int row_stride_bytes;
+};
+struct FortWeightDecodeFragmentV2 {
+    unsigned words[8];
+    int k, n, code_offset, value_count;
+};
+
+// TMA_BULK entry:
+__device__ void decode(const FortWeightDecodeTileV2& tile,
+    FortWeightDecodeSharedTileV2 input, const void* const* auxiliary,
+    void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output);
+// VECTOR_256 entry (a separate signature; an overload is also permitted):
+__device__ void decode(const FortWeightDecodeTileV2& tile,
+    FortWeightDecodeFragmentV2 input, const void* const* auxiliary,
+    void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output);
+```
+
+Common context fields retain their ABI 1 meanings, with `abi_version=2`.
+All 256 CTA threads call the entry uniformly for each nonempty K tile, so uniform
+CTA barriers inside the decoder are permitted. An all-out-of-range K tile skips
+the callback and produces zero B. All pointers, including context/constants,
+auxiliary arrays, shared input, scratch, and output, are borrowed for this call;
+do not retain them. Ordered auxiliary **global base pointers** and compile-time
+constants are unchanged. Neither managed entry receives the original packed
+weight base pointer.
+
+For TMA_BULK, `data` points to a 32x64-code tile, without swizzling. Its local row
+stride is `64*storage_bits/8` bytes, independently of the global row stride.
+Missing K rows are zero-filled; the N tail contains allocated physical padding.
+FORT has completed the bulk transfers and the acquire/proxy synchronization
+before invoking the callback. The input is read-only and remains valid until the
+callback returns. The engine owns barrier initialization, expected transaction
+counts, completion waits, invalidation, and stage reuse. Each barrier is initialized
+once per CTA, alternates phases when its stage is reused, and is invalidated only
+after the final use.
+
+For VECTOR_256, `(input.k,input.n)` gives the first owned logical position **within
+this 32x64 tile**. `value_count` is the number of valid consecutive N values owned
+by this thread. Each owned code begins at bit
+`(input.code_offset+i)*tile.storage_bits` of `words`, for `0<=i<value_count`.
+The words are in increasing byte-address order. An inactive thread receives a
+zero count (and zero words); its coordinates must not be dereferenced. Ownership
+is disjoint: each valid output value belongs to exactly one thread.
+
+Eight-bit fragments own at most 32 values; four-bit fragments own at most 64.
+A two-bit 256-bit load spans 128 codes, so a 64-column tile owns either the first
+or second half (`code_offset=0` or `64`). Adjacent tiles may read the same 32-byte
+payload; this deliberate tradeoff preserves natural alignment without forcing a
+shared-memory round trip. The fixed-size input is passed by value and is available
+for compiler inlining/register scalarization; arbitrary decoder code may still
+cause register pressure or spills. Customer code writes its decoded FP16/BF16
+values to the supplied dense shared-memory output, as in ABI 1.
+
+### Resource budget, synchronization, and performance limits
+
+Let `align256(x)` round a byte count up to 256. Resource planning uses:
+
+```
+fixed = align256(cta_smem_bytes)
+packed = TMA_BULK ? 32*64*storage_bits/8 : 0
+barrier = TMA_BULK ? 256 : 0
+stage = 6144 + packed + barrier + align256(stage_smem_bytes)
+stages = min(8, floor((effective_shared_budget - fixed) / stage))
+```
+
+At least two stages must fit. The 6144 bytes hold dense FP16/BF16 A and B tiles.
+Each TMA stage reserves its packed tile and a separately aligned region containing
+an eight-byte mbarrier, ahead of user stage scratch. User reservations retain
+their exact meaning and cannot overlap engine state. VECTOR_256 reserves neither
+packed shared storage nor a TMA barrier. CTA scratch is initialized once; user
+stage scratch remains unspecified until the callback initializes it.
+
+FORT owns asynchronous A-copy groups, TMA barriers, publication of B, and stage
+reuse. Customer callbacks must finish their work synchronously and must not issue
+asynchronous operations against those groups, modify engine-owned input/barriers,
+or preserve borrowed pointers. The dense B tail is masked **after numerical
+conversion**, because a zero code may represent a nonzero weight.
+
+This prototype waits for managed input before calling the cooperative decoder.
+It does not add independent producer warps or pipeline TMA conversion concurrently
+with MMA. TMA setup/wait overhead and extra shared memory can reduce performance
+or stage count; register fragments reduce load instruction count but concentrate
+decode work in fewer threads and can increase register pressure. The two-bit
+vector path can reread payloads across neighboring tiles. Benchmark a customer's
+actual format and shape before selecting a mode; no universal performance ranking
+is claimed.
+
+Source is still compiled with the GEMM in one NVRTC translation unit. These are
+versioned **source/device-call contracts**, not a promise of a stable binary ABI
+for arbitrary separately compiled objects. Runtime linking/LTO remains future
+work and would need a separately distributed, versioned ABI header and toolchain
+compatibility rules.
+
+### Frontend use and persistence
+
+```cpp
+using Program = cudnn_frontend::graph::Weight_dequantize_program;
+auto program = Program().set_source(managed_source).set_entry("decode")
+    .set_abi_version(2).set_load_mode(Program::TMA_BULK)
+    .set_storage_bits(4).set_row_stride_bytes(row_stride_bytes)
+    .set_input_alignment(32).set_constants({4, 3, 24, 20});
+```
+
+```python
+B = graph.weight_dequantize(
+    W, source=managed_source, entry="decode", auxiliaries=[S, G],
+    abi_version=2, load_mode=1, storage_bits=4,
+    row_stride_bytes=row_stride_bytes, input_alignment=32,
+    constants=[4, 3, 24, 20], out_dims=[1, K, N],
+)
+```
+
+Use mode 2 and the fragment entry for VECTOR_256. The numerical/scaling logic can
+be shared between both entry overloads. The executable samples show both.
+
+The header feature marker is now `CUDNN_WEIGHT_DECODE_ABI_VERSION=2` (maximum
+supported ABI); it does not change the default ABI. New frontend arguments are
+appended, preserving positional calls. All load metadata is owned, serialized,
+and included in graph/plan/cache identity. Old JSON without these fields defaults
+to decoder-owned ABI 1. New headers do not send new attributes for ABI 1, allowing
+older prototype backends to continue supporting their original contract. ABI 2
+lowering requires matching backend capabilities and never fabricates enum values.
+Plan reload, variant-pack rebinding, and CUDA graph capture use the ordinary
+kernel launch path with no extra allocation, host synchronization, or kernel.
+
+### Managed-load test coverage
+
+The executable C++ sample tests 54 combinations: three load modes, three code
+widths, three scaling schemes, and two operand types. Python adds invalid physical
+layouts, ABI mismatches, actual pointer-alignment rejection, plan serialization,
+and CUDA graph capture for each load mode. C++ contract tests check the new
+metadata's graph identity, copied ownership, old-JSON defaults, and unsupported
+header behavior. The backend integration suite additionally tests stage reuse,
+nonlinear codebooks, poisoned padding, and scratch/barrier separation under
+Compute Sanitizer. These establish correctness for the examples, not performance
+for arbitrary customer formats.

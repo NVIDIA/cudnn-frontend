@@ -334,7 +334,10 @@ class PyGraph {
                       int64_t stage_smem_bytes,
                       int64_t input_alignment,
                       std::vector<int64_t> const& constants,
-                      std::string const& name);
+                      std::string const& name,
+                      int64_t load_mode,
+                      int64_t storage_bits,
+                      int64_t row_stride_bytes);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     block_scale_dequantize(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,

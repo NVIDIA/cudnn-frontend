@@ -37,9 +37,66 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
 """
 
 
+MANAGED_SOURCE = r"""
+// Engine-loaded bytes describe storage only. This function supplies the signed
+// numerical interpretation (or a custom nonlinear codebook) and scaling scheme.
+__device__ FortWeightDecodeValue scaled_value(const FortWeightDecodeTileV2& t,
+    const void* const* auxiliary, unsigned code, int row, int col) {
+    const int bits=t.storage_bits, scaling=int(t.constants[1]);
+    const long long k=t.k_begin+row, n=t.n_begin+col;
+    const long long block_k=t.constants[2], block_n=t.constants[3];
+    const long long blocks_n=(t.full_n+block_n-1)/block_n;
+    const int value=int(code)-((code & (1u<<(bits-1))) ? (1<<bits) : 0);
+    float weight=float(value);
+    if (t.constant_count > 4 && t.constants[4]) {
+        // A second numerical interpretation with identical physical transport.
+        const float codebook[4]={-1.25f,-0.125f,0.5f,2.0f};
+        weight=codebook[code & 3];
+    }
+    if (scaling & 2) weight *= static_cast<const float*>(auxiliary[0])[(k/block_k)*blocks_n+n/block_n];
+    if (scaling & 1) weight *= static_cast<const float*>(auxiliary[1])[0];
+    return fort_weight_decode_from_float(weight);
+}
+// TMA supplies a ready, immutable shared tile. Only valid logical values are
+// interpreted; row padding may contain arbitrary codes with nonzero meanings.
+__device__ void decode(const FortWeightDecodeTileV2& t, FortWeightDecodeSharedTileV2 input,
+    const void* const* auxiliary, void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output) {
+    // Optional user scratch is disjoint from engine-managed input and barriers.
+    // Tests with 256-byte reservations poison it before reading the packed tile.
+    if (cta_scratch) static_cast<unsigned char*>(cta_scratch)[t.thread_id]=0x5a;
+    if (stage_scratch) static_cast<unsigned char*>(stage_scratch)[t.thread_id]=0xa5;
+    __syncthreads();
+    for (int i=t.thread_id; i<t.tile_k*t.tile_n; i+=t.thread_count) {
+        const int row=i/t.tile_n, col=i%t.tile_n;
+        if (row>=t.valid_k || col>=t.valid_n) continue;
+        const int bit=col*t.storage_bits;
+        const unsigned code=(input.data[row*input.row_stride_bytes+bit/8] >> (bit%8)) & ((1u<<t.storage_bits)-1);
+        output[row*t.output_stride+col]=scaled_value(t,auxiliary,code,row,col);
+    }
+}
+// VECTOR_256 supplies one by-value register fragment per thread. Inactive
+// threads still call this entry (value_count==0), permitting uniform CTA barriers.
+__device__ void decode(const FortWeightDecodeTileV2& t, FortWeightDecodeFragmentV2 input,
+    const void* const* auxiliary, void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output) {
+    // Optional user scratch is disjoint from engine-managed input and barriers.
+    // Tests with 256-byte reservations poison it before reading the packed tile.
+    if (cta_scratch) static_cast<unsigned char*>(cta_scratch)[t.thread_id]=0x5a;
+    if (stage_scratch) static_cast<unsigned char*>(stage_scratch)[t.thread_id]=0xa5;
+    __syncthreads();
+    for (int i=0; i<input.value_count; ++i) {
+        const int bit=(input.code_offset+i)*t.storage_bits;
+        const unsigned code=(input.words[bit/32] >> (bit%32)) & ((1u<<t.storage_bits)-1);
+        output[input.k*t.output_stride+input.n+i]=scaled_value(t,auxiliary,code,input.k,input.n+i);
+    }
+}
+"""
+
+
 def make_graph(handle, bits=4, scaling=3, dtype=cudnn.data_type.HALF, **program):
     m, k, n, lda, block_k, block_n = 37, 83, 75, 88, 24, 20
-    byte_count = (k * n * bits + 7) // 8
+    mode = program.get("load_mode", 0)
+    row_stride = ((n + 63) // 64 * (64 * bits // 8) + 31) // 32 * 32
+    byte_count = k * row_stride if mode else (k * n * bits + 7) // 8
     scale_count = ((k + block_k - 1) // block_k) * ((n + block_n - 1) // block_n)
     graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=dtype, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
     a = graph.tensor(dim=[1, m, k], stride=[m * lda, lda, 1], name="A", uid=1)
@@ -47,6 +104,8 @@ def make_graph(handle, bits=4, scaling=3, dtype=cudnn.data_type.HALF, **program)
     block = graph.tensor(dim=[1, 1, scale_count], stride=[scale_count, scale_count, 1], data_type=cudnn.data_type.FLOAT, name="block", uid=5)
     global_ = graph.tensor(dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT, name="global", uid=6)
     kwargs = dict(source=SOURCE, entry="decode", constants=[bits, scaling, block_k, block_n])
+    if mode:
+        kwargs.update(source=MANAGED_SOURCE, abi_version=2, storage_bits=bits, row_stride_bytes=row_stride, input_alignment=32)
     kwargs.update(program)
     b = graph.weight_dequantize(weights, auxiliaries=[block, global_], out_dims=[1, k, n], name="dequant", **kwargs)
     b.set_data_type(dtype).set_uid(3)
@@ -80,11 +139,12 @@ def build_prototype(graph):
     assert graph.get_workspace_size() == 0
 
 
+@pytest.mark.parametrize("load_mode", [0, 1, 2], ids=["decoder", "tma_bulk", "vector_256"])
 @pytest.mark.parametrize("bits", [8, 4, 2])
 @pytest.mark.parametrize("scaling", [1, 2, 3], ids=["global", "block", "block_global"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
-    graph, tensors = make_graph(cudnn_handle, bits, scaling, dtype)
+def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype, load_mode):
+    graph, tensors = make_graph(cudnn_handle, bits, scaling, dtype, load_mode=load_mode)
     build_prototype(graph)
     m, k, n, lda, block_k, block_n = 37, 83, 75, 88, 24, 20
     blocks_n = (n + block_n - 1) // block_n
@@ -93,12 +153,16 @@ def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
     i = torch.arange(k * n, dtype=torch.int64)
     original = ((i * 13 + i // 7) % (1 << bits) - (1 << (bits - 1))).reshape(k, n)
     codes = (original.flatten() & ((1 << bits) - 1)).tolist()
-    packed = bytearray((k * n * bits + 7) // 8)
+    row_stride = ((n + 63) // 64 * (64 * bits // 8) + 31) // 32 * 32
+    packed = bytearray(k * row_stride if load_mode else (k * n * bits + 7) // 8)
     for index, code in enumerate(codes):
-        packed[index * bits // 8] |= code << ((index * bits) % 8)
+        bit = (index // n) * row_stride * 8 + (index % n) * bits if load_mode else index * bits
+        packed[bit // 8] |= code << (bit % 8)
     a_cpu = (((torch.arange(m)[:, None] * 3 + torch.arange(k)[None, :] * 7) % 13 - 6) / 16).to(dtype)
     # Use the handle fixture's stream for copies, execution and capture.
-    stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
+    from cudnn._torch_stream import as_torch_stream
+
+    stream = as_torch_stream(cudnn.get_stream(cudnn_handle), torch.cuda.current_device())
     with torch.cuda.stream(stream):
         a_gpu = torch.zeros((1, m, lda), dtype=dtype, device="cuda")[:, :, :k]
         a_gpu.copy_(a_cpu)
@@ -122,7 +186,16 @@ def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
             expected = a_cpu.double() @ expected_b.to(dtype).double()
             torch.testing.assert_close(c_gpu[0].cpu().double(), expected, atol=0.005, rtol=0.005)
 
-        # One representative case checks public plan serialization and capture.
+        # Runtime addresses must satisfy the declared 32-byte promise. A 16-byte
+        # offset would pass the original decoder's default alignment check.
+        if load_mode and bits == 4 and scaling == 3 and dtype == torch.float16:
+            bad_storage = torch.empty(len(packed) + 32, dtype=torch.uint8, device="cuda")[16 : 16 + len(packed)]
+            bad_bindings = dict(bindings)
+            bad_bindings[tensors[1]] = bad_storage
+            with pytest.raises(RuntimeError):
+                graph.execute(bad_bindings, None)
+
+        # One representative case per load mode checks plan serialization/capture.
         if bits == 4 and scaling == 3 and dtype == torch.float16:
             saved = graph.serialize()
             restored = cudnn.pygraph(handle=cudnn_handle)
@@ -139,7 +212,22 @@ def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
 
 
 @pytest.mark.parametrize(
-    "program", [{"entry": "decode;"}, {"abi_version": 2}, {"source": ""}, {"source": "x\0y"}, {"input_alignment": 3}, {"stage_smem_bytes": -1}]
+    "program",
+    [
+        {"entry": "decode;"},
+        {"abi_version": 2},
+        {"source": ""},
+        {"source": "x\0y"},
+        {"input_alignment": 3},
+        {"stage_smem_bytes": -1},
+        {"load_mode": 99},
+        {"load_mode": 1, "storage_bits": 3},
+        {"load_mode": 2, "row_stride_bytes": 48},
+        {"load_mode": 1, "row_stride_bytes": 32},
+        {"load_mode": 2, "row_stride_bytes": 128},
+        {"load_mode": 1, "input_alignment": 16},
+        {"load_mode": 1, "abi_version": 1},
+    ],
 )
 def test_weight_dequantize_invalid_program(cudnn_handle, program):
     graph, _ = make_graph(cudnn_handle, **program)
