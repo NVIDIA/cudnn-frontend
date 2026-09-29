@@ -599,6 +599,12 @@ class Graph : public ICudnn, public INode {
         // Initializes this cudnn graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            plans.is_frontend_engine_candidate(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
+            "record it; capture execute() on a stream instead.");
 
         size_t num_root_nodes;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
@@ -740,6 +746,13 @@ class Graph : public ICudnn, public INode {
                         std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                         void *workspace,
                         cudaGraph_t cudnn_cuda_graph) {
+        // Only a cuDNN execution plan can be recorded into a CUDA graph by this API.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            plans.is_frontend_engine_candidate(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
+            "record it; capture execute() on a stream instead.");
+
         // Check if the cuda graph is empty
         size_t numNodes = 0;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
