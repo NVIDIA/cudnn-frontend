@@ -3018,7 +3018,13 @@ _STRUCTURED_OPS = {
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
         attrs=("mode", "top_k"),
         outputs=("OUT_0",),
-        infer={"OUT_0": lambda n: [1, n.inputs["token"].dim[-2], n.inputs["weight"].dim[-1]]},
+        infer={
+            "OUT_0": lambda n: [
+                1,
+                n.inputs["token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"].dim[-2],
+                n.inputs["weight"].dim[-1],
+            ]
+        },
     ),
     "moe_grouped_matmul_bwd": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL_BWD,

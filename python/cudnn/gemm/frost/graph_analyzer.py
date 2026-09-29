@@ -126,6 +126,9 @@ class _RecordedOp:
     quant_axis: int | None = None
     quant_transpose: bool = False
     moe_mode: str | None = None  # moe_grouped_matmul mode; None otherwise
+    token_index: int | None = None
+    token_ks: int | None = None
+    top_k: int = 1
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     # Optional groupOffset input for grouped reductions / grouped col quant
@@ -171,7 +174,8 @@ class GemmBinding:
     Operand lists are in kernel distinct-slot order; ``outputs`` in
     :pyattr:`FusionChain.outputs` slot order (recorder order); ``aux`` in
     :pyattr:`FusionChain.aux_tensors` order. Block-scale fills ``sfa/sfb_operands``
-    parallel to ``a/b_operands``; MoE fills ``first_token_offset``."""
+    parallel to ``a/b_operands``; MoE fills ``first_token_offset``, GATHER/SCATTER
+    also fill ``token_index``, and SCATTER fills ``token_ks``."""
 
     a_operands: list[Any] = field(default_factory=list)
     b_operands: list[Any] = field(default_factory=list)
@@ -180,6 +184,8 @@ class GemmBinding:
     sfa_operands: list[Any] = field(default_factory=list)
     sfb_operands: list[Any] = field(default_factory=list)
     first_token_offset: Any = None
+    token_index: Any = None
+    token_ks: Any = None
 
     def bound_tensors(self) -> list[Any]:
         ts = [
@@ -192,6 +198,10 @@ class GemmBinding:
         ]
         if self.first_token_offset is not None:
             ts.append(self.first_token_offset)
+        if self.token_index is not None:
+            ts.append(self.token_index)
+        if self.token_ks is not None:
+            ts.append(self.token_ks)
         return [t for t in ts if t is not None]
 
 
@@ -207,6 +217,8 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         sfa_operands=list(binding.sfb_operands),
         sfb_operands=list(binding.sfa_operands),
         first_token_offset=binding.first_token_offset,
+        token_index=binding.token_index,
+        token_ks=binding.token_ks,
     )
 
 
@@ -220,6 +232,8 @@ def _make_multi_binding(
     aux_objs,
     block_scale: bool,
     first_token_offset=None,
+    token_index=None,
+    token_ks=None,
 ) -> GemmBinding:
     """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
     the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
@@ -242,6 +256,8 @@ def _make_multi_binding(
         sfa_operands=_sf(a_caps, a_ids) if block_scale else [],
         sfb_operands=_sf(b_caps, b_ids) if block_scale else [],
         first_token_offset=first_token_offset,
+        token_index=token_index,
+        token_ks=token_ks,
     )
 
 
@@ -368,6 +384,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
             out,
             compute_dtype=compute,
             moe_mode=_MOE_MODE_FROM_CUDNN.get(mode, "none"),
+            token_index=id(node.inputs["token_index"]) if node.inputs.get("token_index") is not None else None,
+            token_ks=id(node.inputs["token_ks"]) if node.inputs.get("token_ks") is not None else None,
+            top_k=node.params.get("top_k", 1),
         )
     if node_type == "REDUCTION":
         inp = node.inputs["input"]
@@ -908,7 +927,7 @@ def _build_multi_moe_chain(
     All GEMMs must share the routed-group layout (same fto), shape / major / dtype,
     and expert count. Operands deduped by tensor id (shared token → one A operand).
     K == 1 additionally supports: no epilogue at all (raw MoE output alone)
-    and the raw output as quant source. POC scope: mode=="none", no mainloop
+    and the raw output as quant source. Forward NONE/GATHER/SCATTER, no mainloop
     fusion; for K > 1 every output must be a fusion op or a block_scale_quantize
     fed by one. Block-scale supported (dequant folds into a shared
     :class:`BlockScaleSpec`)."""
@@ -917,10 +936,27 @@ def _build_multi_moe_chain(
     if any(op.cudnn_name == "matmul" for op in ops):
         raise ValueError("a MoE grouped matmul graph cannot also contain a plain matmul; " "mixed MoE + matmul graphs are out of POC scope")
     for moe in moe_ops:
-        if moe.moe_mode != "none":
-            raise NotImplementedError(
-                f"MoE grouped matmul mode {moe.moe_mode!r} is out of POC scope; " "only mode=NONE is supported (gather / scatter rejected)"
-            )
+        if moe.moe_mode not in ("none", "gather", "scatter"):
+            raise NotImplementedError(f"MoE grouped matmul mode {moe.moe_mode!r} is unsupported")
+        if (moe.moe_mode, moe.token_index, moe.token_ks, moe.top_k) != (moe_ops[0].moe_mode, moe_ops[0].token_index, moe_ops[0].token_ks, moe_ops[0].top_k):
+            raise ValueError("parallel MoE grouped matmuls must share the same mode, token_index, token_ks and top_k")
+    index_meta = None
+    ks_meta = None
+    if moe_ops[0].moe_mode in ("gather", "scatter"):
+        mode = moe_ops[0].moe_mode.upper()
+        index_meta = meta.get(moe_ops[0].token_index)
+        if index_meta is None:
+            raise ValueError(f"MoE {mode} requires token_index")
+        if len(index_meta.dim) != 3 or index_meta.dim[0] != 1 or index_meta.dim[2] != 1 or index_meta.dim[1] < 1:
+            raise ValueError(f"MoE {mode} token_index must have shape [1, routed_rows, 1]")
+        if index_meta.dtype != "int32" or index_meta.stride[1] != 1:
+            raise NotImplementedError(f"MoE {mode} token_index must be INT32 with contiguous routed rows")
+        if mode == "SCATTER":
+            ks_meta = meta.get(moe_ops[0].token_ks)
+            if ks_meta is None or ks_meta.dim != index_meta.dim:
+                raise ValueError("MoE SCATTER token_ks must match token_index shape [1, routed_rows, 1]")
+            if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
+                raise NotImplementedError("MoE SCATTER token_ks must be INT32 with contiguous routed rows")
 
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
@@ -953,6 +989,11 @@ def _build_multi_moe_chain(
         data_id, sf_id = deq.inputs
         _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
         sf_meta = meta[sf_id]
+        if moe_ops[0].moe_mode == "gather" and sf_meta.reordering is None and deq.block_size and all(b > 0 for b in deq.block_size):
+            data_dim = meta[data_id].dim
+            expected = (data_dim[0],) + tuple(-(-d // block) for d, block in zip(data_dim[1:], deq.block_size))
+            if sf_meta.dim != expected:
+                raise ValueError(f"MoE GATHER linear scale shape must be {expected}; got {sf_meta.dim}")
         deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
         deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
         return dict(
@@ -991,6 +1032,8 @@ def _build_multi_moe_chain(
         if len(token_meta.dim) != 3 or len(weight_meta.dim) != 3:
             raise ValueError(f"moe operands must be 3D; got token={token_meta.dim} " f"weight={weight_meta.dim}")
         _bt, M, Ka = token_meta.dim  # token [1, T, H]
+        if index_meta is not None and _bt != 1:
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token must have shape [1, rows, K]")
         E, Kb, N = weight_meta.dim  # weight [E, H, N]
         if Ka != Kb:
             raise ValueError(f"moe K mismatch: token K={Ka} vs weight K={Kb}")
@@ -1010,6 +1053,14 @@ def _build_multi_moe_chain(
         if _moe_geometry(a_ids[ai], b_ids[bi]) != geom0:
             raise ValueError("parallel MoE grouped matmuls must share shape / layout / dtype " "/ expert count; heterogeneous GEMMs are out of POC scope")
     M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
+    if moe_ops[0].moe_mode == "scatter":
+        top_k = moe_ops[0].top_k
+        if not isinstance(top_k, int) or top_k < 1 or top_k > E or M % top_k:
+            raise ValueError("MoE SCATTER requires 1 <= top_k <= num_experts and routed_rows divisible by top_k")
+        if index_meta.dim[1] != M:
+            raise ValueError("MoE SCATTER token_index and token_ks must match token rows")
+    if moe_ops[0].moe_mode == "gather":
+        M = int(index_meta.dim[1])
     matmul_out_dim = (1, M, N)
 
     # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
@@ -1030,6 +1081,18 @@ def _build_multi_moe_chain(
             )
 
         for cap in a_caps.values():
+            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
+                from .kernel_registry import linear_token_sf_reject
+
+                sf = meta[cap["sf_id"]]
+                data = meta[cap["data_id"]]
+                kblock = int(cap["block_size_2d"][-1]) if cap["block_size_2d"] else 1
+                if kblock <= 0:
+                    raise ValueError("MoE GATHER token scale K block size must be positive")
+                scale_k = -(-int(data.dim[-1]) // kblock)
+                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], scale_k)
+                if reason is not None:
+                    raise NotImplementedError(reason)
             if _combo_key(cap) != _combo_key(a0):
                 raise ValueError("all token operands of a block-scale multi-MoE must share the same SF combo")
         for cap in b_caps.values():
@@ -1044,6 +1107,10 @@ def _build_multi_moe_chain(
             sf_dtype_b=b0["sf_dtype"],
             sfa_reorder=a0["sf_reorder"],
             sfb_reorder=b0["sf_reorder"],
+            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
+            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
+            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
+            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
             dequant_compute_a=a0["deq_compute"],
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],
@@ -1401,6 +1468,7 @@ def _build_multi_moe_chain(
             offset_dtype=offset_dtype,
             num_groups=num_groups,
             offset_multiple=offset_multiple,
+            top_k=moe_ops[0].top_k,
         ),
         block_scale=block_scale_spec,
         reductions=reductions,
@@ -1418,6 +1486,8 @@ def _build_multi_moe_chain(
         aux_objs,
         block_scale_spec is not None,
         first_token_offset=meta[fto_id].tensor,
+        token_index=index_meta.tensor if index_meta is not None else None,
+        token_ks=ks_meta.tensor if ks_meta is not None else None,
     )
     return chain, binding
 
@@ -1683,6 +1753,10 @@ def _build_multi_gemm_chain(
             sf_dtype_b=b0["sf_dtype"],
             sfa_reorder=a0["sf_reorder"],
             sfb_reorder=b0["sf_reorder"],
+            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
+            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
+            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
+            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
             dequant_compute_a=a0["deq_compute"],
             dequant_compute_b=b0["deq_compute"],
             dequant_out_a=a0["deq_out"],

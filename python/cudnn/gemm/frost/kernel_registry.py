@@ -269,6 +269,35 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
 }
 
 
+def linear_token_sf_reject(dim, stride, rows, scale_k) -> str | None:
+    """GATHER SF layout support, shared by graph checks and runtime binding."""
+    if dim is None or stride is None or tuple(dim) != (1, rows, scale_k):
+        return f"MoE GATHER token SF must have shape [1, {rows}, {scale_k}]"
+    if len(stride) != 3 or stride[2] != 1 or stride[1] < ((scale_k + 15) // 16) * 16 or stride[1] % 16:
+        return "MoE GATHER token SF needs contiguous K scales and a row stride padded to a multiple of 16 bytes"
+    return None
+
+
+def moe_gather_sf_reject(chain: FusionChain) -> str | None:
+    """Token SF layouts supported by the block-scale GATHER producer."""
+    if not (chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather"):
+        return None
+    bs = chain.block_scale
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    fake = bs.fake_dequant_b if swapped else bs.fake_dequant_a
+    reorder = bs.sfb_reorder if swapped else bs.sfa_reorder
+    if not fake:
+        if reorder is not None:
+            return "MoE block-scale GATHER requires token SF reorder=NONE; F8_128x4 is not supported"
+        dim, stride = (bs.sfb_dim, bs.sfb_stride) if swapped else (bs.sfa_dim, bs.sfa_stride)
+        if dim is None or stride is None or len(dim) != 3 or len(stride) != 3:
+            return "MoE GATHER token SF must have rank-3 shape and strides"
+        if swapped:
+            dim, stride = (dim[0], dim[2], dim[1]), (stride[0], stride[2], stride[1])
+        return linear_token_sf_reject(dim, stride, dim[1], chain.matmul.K // bs.block_size)
+    return None
+
+
 def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline: str) -> str | None:
     """Stage 2: does the ``template_pipeline`` family's pipeline support the
     graph's MMA type, and — for the rare :data:`MMA_GPU_ARCH_SPECIAL_CASES`
@@ -284,6 +313,20 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     if cases is None:
         return f"the {template_pipeline} family has no {graph_type.value} pipeline"
     key = key_fn(chain)
+    if chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather":
+        reason = moe_gather_sf_reject(chain)
+        if reason is not None:
+            return reason
+        # The gather producer lowers the linear token SF to the same MMA atom.
+        # Preserve the instruction/architecture table, including special cases.
+        key = list(key)
+        bs = chain.block_scale
+        key[9 if isinstance(chain.moe, MoeSwapAbSpec) else 3] = "F8_128x4"
+        if bs.fake_dequant_a:
+            key[3] = "F8_128x4"
+        if bs.fake_dequant_b:
+            key[9] = "F8_128x4"
+        key = tuple(key)
     if key not in cases:
         if base_type is GraphType.MATMUL:
             mm = chain.matmul

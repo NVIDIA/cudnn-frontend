@@ -54,6 +54,8 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import moe_scatter_row, moe_gather_row, tma_gather4, moe_gather_scales
+from cudnn.gemm.frost.tile_helpers import moe_swizzle_tile as _moe_swizzle_tile
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
@@ -258,8 +260,8 @@ def _sf_word_offset(r, r_in_block):
 
 
 # ---------------------------------------------------------------------------
-# Grouped scheduling helpers (the sm100 MoE kernels', inlined here the way the
-# dense sm120 kernel inlines its own L2 raster).
+# Group-local swizzle width depends on this template's injected constants.
+# Tile mapping is shared through tile_helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -283,21 +285,6 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     return cutlass.Int32(w)
 
 
-@cute.jit
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (tile_m, tile_n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
-
-
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
@@ -308,6 +295,7 @@ def _kernel(
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
+    # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
@@ -408,10 +396,17 @@ def _kernel(
     # ab empty: one elected arrive per compute warp per stage.
     # sched full: one elected arrive by the scheduler warp per record.
     # sched empty: one elected arrive per consumer warp (compute + TMA) per record.
+    sf_gather_scratch = [
+        cutlass.Array(cutlass.Uint8, cta_tile_mnk[0] * 32, space=cutlass.AddressSpace.smem, alignment=128) for _ in range(num_a_operands if moe_gather else 0)
+    ]
+    sf_gather_mbar = [cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem) for _ in range(num_a_operands if moe_gather else 0)]
     if warp_idx == 0:
+        for _bar in sf_gather_mbar:
+            if elect_one:
+                nvvm.mbarrier_init(_bar, 1)
         for i in range(ab_stages):
             if elect_one:
-                nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+                nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1 + (num_a_operands if moe_gather else 0))
             if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), NUM_COMPUTE_WARPS)
         for i in range(SCHED_STAGES):
@@ -424,7 +419,7 @@ def _kernel(
 
     sA_bytes = sA_elems * (ab_dtype.width // 8)
     sB_bytes = sB_elems * (ab_dtype.width // 8)
-    num_tma_copy_bytes = num_a_operands * (sA_bytes + sfa_smem_bytes) + num_b_operands * (sB_bytes + sfb_smem_bytes)
+    num_tma_copy_bytes = num_a_operands * (sA_bytes + (0 if moe_gather else sfa_smem_bytes)) + num_b_operands * (sB_bytes + sfb_smem_bytes)
 
     # @@INJECT_TAP_PTRS@@
 
@@ -614,6 +609,7 @@ def _kernel(
             tile_n = (slot.subview(2)).load()
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
+            group_end = (slot.subview(5)).load()
             start_sf_block_m = (slot.subview(6)).load()
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
@@ -653,22 +649,56 @@ def _kernel(
                     # NATIVE dtype (fp4 packs via B4X16); OOB rows/cols are hardware
                     # zero-filled (K tails contribute 0).
                     for _ai in cutlass.range_constexpr(num_a_operands):
-                        if elect_one:
-                            nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                smem_a_list[_ai].subview(sA_elems * stage),
-                                tma_a_descs[_ai].get_ptr(),
-                                (coord_k, coord_m, cutlass.Int32(0)),
-                                ab_full_mbar_ptr.subview(stage),
-                            )
-                        # SFA: [256 fp16 (= one 512 B atom), sf_k4 atoms, m blocks, 1]
-                        # -- the whole K-tile of scales for the tile's M blocks.
-                        if elect_one:
-                            nvvm.cp_async_bulk_tensor_shared_cta_global(
+                        if cutlass.const_expr(moe_gather):
+                            for _gr in cutlass.range(cta_tile_mnk[0] // 4, unroll_full=True):
+                                if elect_one:
+                                    row = coord_m + _gr * 4
+                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
+                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                    tma_gather4(
+                                        smem_a_list[_ai].subview(sA_elems * stage + _gr * 4 * _CTA_K_PACKED),
+                                        tma_a_descs[_ai].get_ptr(),
+                                        coord_k,
+                                        r0,
+                                        r1,
+                                        r2,
+                                        r3,
+                                        ab_full_mbar_ptr.subview(stage),
+                                    )
+                            moe_gather_scales(
                                 smem_sfa_list[_ai].subview(_SFA_STAGE_WORDS * stage),
-                                tma_sfa_descs[_ai].get_ptr(),
-                                (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
+                                sf_gather_scratch[_ai],
+                                sf_gather_mbar[_ai],
                                 ab_full_mbar_ptr.subview(stage),
+                                tma_sfa_descs[_ai].get_ptr(),
+                                token_index,
+                                coord_m,
+                                group_end,
+                                source_rows,
+                                coord_k // block_size,
+                                ab_iter % 2,
+                                cta_tile_mnk[0],
+                                cta_tile_mnk[2] // block_size,
                             )
+                        else:
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    smem_a_list[_ai].subview(sA_elems * stage),
+                                    tma_a_descs[_ai].get_ptr(),
+                                    (coord_k, coord_m, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                )
+                            # SFA: [256 fp16 (= one 512 B atom), sf_k4 atoms, m blocks, 1]
+                            # -- the whole K-tile of scales for the tile's M blocks.
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    smem_sfa_list[_ai].subview(_SFA_STAGE_WORDS * stage),
+                                    tma_sfa_descs[_ai].get_ptr(),
+                                    (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                )
                     # The expert's weight is B's batch coordinate. K-major B: box
                     # [K_tile, cta_n] at (k, n, e); N-major B (fp8) walks N in
                     # b_tma_group_elems-wide groups (same row bytes as a K-major row).
@@ -769,7 +799,7 @@ def _kernel(
             # side is GROUP-LOCAL: the segmented blob restarts at a block
             # boundary for every group, so the offset is the tile's, not the
             # global token row's.
-            if cutlass.const_expr(_M_BLOCK_ALIGNED):
+            if cutlass.const_expr(_M_BLOCK_ALIGNED or moe_gather):
                 m_in_block = cutlass.Int32(0)
             else:
                 m_in_block = coord_m_local % 128
@@ -1057,41 +1087,58 @@ def _host(
     tma_sfa_desc_list = []
     for _a_idx, (_a_op, _sfa_op) in enumerate(zip(_a_operands, _sfa_operands)):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
+        if cutlass.const_expr(moe_gather):
+            a_dims, a_strides, a_box = [k_sym, _a_op.shape[0]], [a_stride_m * ab_dtype.width // 128], [cta_tile_mnk[2], 1]
+        else:
+            a_dims, a_strides, a_box = (
+                [k_sym, m, 1],
+                [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128],
+                [cta_tile_mnk[2], cta_tile_mnk[0], 1],
+            )
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
                 dtype=ab_tma_desc_dtype,
-                global_dims=[k_sym, m, 1],
-                global_strides=[
-                    a_stride_m * ab_dtype.width // 128,
-                    a_stride_l * ab_dtype.width // 128,
-                ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                global_dims=a_dims,
+                global_strides=a_strides,
+                box_dims=a_box,
                 swizzle=ab_tma_swizzle,
                 tma_format=ab_tma_format,
             )
         )
-        sfa_fp16_tensor = cute.make_tensor(
-            cute.recast_ptr(_sfa_op.iterator, dtype=cutlass.Float16),
-            cute.make_layout(
-                (256, rest_k, rest_m_sf, 1),
-                stride=(
-                    1,
-                    256,
-                    cute.assume(256 * rest_k, 8),
-                    cute.assume(256 * rest_k * rest_m_sf, 8),
-                ),
-            ),
-        )
-        tma_sfa_desc_list.append(
-            _tma.create_tensor_map_tiled_from_view(
-                sfa_fp16_tensor,
-                dtype=cutlass.Uint16,
-                box_dims=(256, sf_tma_box_k, sfa_tma_box_mn, 1),
-                stride_order=(0, 1, 2, 3),
-                swizzle=_tma.TensorMapSwizzle.none,
+        if cutlass.const_expr(moe_gather):
+            tma_sfa_desc_list.append(
+                _tma.create_tensor_map_tiled(
+                    global_address=_sfa_op.iterator.toint(),
+                    dtype=cutlass.Uint8,
+                    global_dims=[k_sym // block_size, _sfa_op.shape[0]],
+                    global_strides=[_sfa_op.stride[0] // 16],
+                    box_dims=[16, 1],
+                    swizzle=_tma.TensorMapSwizzle.none,
+                )
             )
-        )
+        else:
+            sfa_fp16_tensor = cute.make_tensor(
+                cute.recast_ptr(_sfa_op.iterator, dtype=cutlass.Float16),
+                cute.make_layout(
+                    (256, rest_k, rest_m_sf, 1),
+                    stride=(
+                        1,
+                        256,
+                        cute.assume(256 * rest_k, 8),
+                        cute.assume(256 * rest_k * rest_m_sf, 8),
+                    ),
+                ),
+            )
+            tma_sfa_desc_list.append(
+                _tma.create_tensor_map_tiled_from_view(
+                    sfa_fp16_tensor,
+                    dtype=cutlass.Uint16,
+                    box_dims=(256, sf_tma_box_k, sfa_tma_box_mn, 1),
+                    stride_order=(0, 1, 2, 3),
+                    swizzle=_tma.TensorMapSwizzle.none,
+                )
+            )
     # B and SFB are batched by expert. K-major B: box [K_tile, cta_n]. N-major
     # (fp8): [group_elems, K_tile] boxes, one per N group.
     tma_b_desc_list = []
@@ -1163,6 +1210,7 @@ def _host(
         first_token_offset,
         a_tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
+        # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
@@ -1188,11 +1236,12 @@ def compile() -> Callable:
     sym_kp = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
+    sym_source_m = cute.sym_int64() if moe_gather else sym_m
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             a_fake_dtype,
-            (sym_m, sym_kp, 1),
+            (sym_source_m, sym_kp, 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )
@@ -1205,7 +1254,8 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # SF reaches the kernel as a base pointer only; the host rebuilds the
+    # F8_128x4 SF uses a base pointer; GATHER token SF also uses row shape/stride.
+    # For the blocked inputs, the host rebuilds the
     # F8_128x4 view from problem_size, so no SF mode carries a layout contract.
     def _make_fake_sfa():
         return make_fake_tensor(

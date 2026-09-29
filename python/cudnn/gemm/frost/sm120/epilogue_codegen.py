@@ -155,6 +155,31 @@ def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
     return lines
 
 
+def _scatter_aux_prelude(chain: FusionChain) -> list[str]:
+    """Pointwise nodes consume SCATTER's logical output coordinates."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    row = "row" if swapped else "moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)"
+    col = "moe_scatter_row(token_index, token_ks, col_j + _auxk, group_end, N, moe_top_k)" if swapped else "col_j + _auxk"
+    lines = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode == "per_row":
+            idx = _aux_index_expr(aux, row_var=f"cute.math.min(cutlass.Int32({row}), cutlass.Int32(M) - 1)")
+            lines.append(f"{_aux_prefetch_var(aux.name)} = ({_aux_ptr_var(aux.name)} + {idx}).load()")
+        if aux.bcast_mode not in ("per_col", "per_elem"):
+            continue
+        n = aux.name
+        idx = _aux_index_expr(
+            aux, row_var=f"cute.math.min(cutlass.Int32({row}), cutlass.Int32(M) - 1)", col_var=f"cute.math.min(cutlass.Int32({col}), cutlass.Int32(N) - 1)"
+        )
+        lines += [
+            f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})",
+            "for _auxk in cutlass.range_constexpr(vsize):",
+            f"    _auxt_{n}[_auxk] = ({_aux_ptr_var(n)} + {idx}).load()",
+            f"_auxv_{n} = _auxt_{n}.load().to_vector()",
+        ]
+    return lines
+
+
 def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False) -> str:
     """Expression yielding aux value(s) as a length-`vsize` vector in the op's
     compute dtype, matching ``like_var``'s dtype."""
@@ -641,6 +666,43 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
     if dtype == "fp4_e2m1":
         return max(vsize // 2, 4)
     return _tap_store_elems(chain, dtype, dim, stride, vsize) * DTYPE_BYTES[dtype]
+
+
+def _emit_moe_scatter_store(tap_idx, i, src, spec, chain, vsize, row_pred, col_bound):
+    """Store FC2 fragments into distinct token/top-k slots without atomics."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    lines = [f"_scatter_value = {_store_cast_expr(src, spec.dtype)}"]
+    if not swapped:
+        lines.append("_scatter_row = moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)")
+        pred = "_scatter_row < M"
+        if row_pred:
+            pred = f"({row_pred}) & ({pred})"
+        if spec.major == "n":
+            lines += _emit_tap_store(
+                tap_idx,
+                "_scatter_value",
+                spec.dtype,
+                chain,
+                spec.dim,
+                spec.stride,
+                vsize,
+                f"(_scatter_row * out_stride_m_{i} + col_j)",
+                row_pred=pred,
+                converted=True,
+            )
+            return lines
+    for e in range(vsize):
+        if swapped:
+            lines.append(f"_scatter_col = moe_scatter_row(token_index, token_ks, col_j + {e}, group_end, N, moe_top_k)")
+            pred = "(row < M) & (_scatter_col < N)"
+            offset = f"row * out_stride_m_{i} + _scatter_col * out_stride_n_{i}"
+        else:
+            pred = f"(_scatter_row < M) & (col_j + {e} < N)"
+            offset = f"_scatter_row * out_stride_m_{i} + (col_j + {e}) * out_stride_n_{i}"
+        if row_pred:
+            pred = f"({row_pred}) & ({pred})"
+        lines += [f"if {pred}:", f"    (gC_tap_{tap_idx}_ptr + {offset}).store(_scatter_value[{e}:{e+1}], alignment={DTYPE_BYTES[spec.dtype]})"]
+    return lines
 
 
 def _emit_tap_store(
@@ -1392,6 +1454,7 @@ def generate(
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
     vsize = vec_bytes_epi // output_elem_bytes
+    scatter = chain.has_moe and chain.moe.mode == "scatter"
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
@@ -1399,7 +1462,7 @@ def generate(
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
         if aux.bcast_mode == "scalar":
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
-        elif aux.bcast_mode == "per_row":
+        elif aux.bcast_mode == "per_row" and not scatter:
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
         # per_col / per_elem load inside the inner loop.
 
@@ -1427,7 +1490,7 @@ def generate(
         store_row_pred = f"row < {'group_end' if chain.has_moe else 'M'}"
         if packed_lanes:
             store_row_pred = f"row_active & ({store_row_pred})"
-    _aux_pre = _bounded_aux_prelude(chain) if on_tma_arm else []
+    _aux_pre = _scatter_aux_prelude(chain) if scatter else (_bounded_aux_prelude(chain) if on_tma_arm else [])
     body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
@@ -1453,7 +1516,7 @@ def generate(
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
-            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm)}")
+            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm or scatter)}")
             round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
             body_lines.extend(round_lines)
             result_var[i] = cur
@@ -1462,7 +1525,7 @@ def generate(
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm) for aux in chain.aux_tensors}
+        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm or scatter) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
@@ -1472,6 +1535,18 @@ def generate(
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c")
             body_lines.extend(cast_lines)
         lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes)
+        if scatter and op.op == "gen_index":
+            token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
+            if dict(op.attrs).get("axis") == token_axis:
+                if token_axis == 1:
+                    lines = [f"{cur} = cutlass.full_like({parent_var}, cutlass.Float32(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
+                else:
+                    lines = [
+                        f"_gi{i} = cute.make_rmem_tensor(vsize, cutlass.Float32)",
+                        "for _sk in cutlass.range_constexpr(vsize):",
+                        f"    _gi{i}[_sk] = cutlass.Float32(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
+                        f"{cur} = _gi{i}.load().to_vector()",
+                    ]
         body_lines.extend(lines)
         # Round to the op's out_dtype (no-op for fp32) so every consumer —
         # downstream ops and outputs alike — sees the declared-dtype value.
@@ -1545,6 +1620,9 @@ def generate(
             body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
+        if chain.has_moe and chain.moe.mode == "scatter":
+            body_lines.extend(_emit_moe_scatter_store(tap_idx, si, src, spec, chain, vsize, store_row_pred, "N"))
+            continue
         if spec.major == "m":
             body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred, converted=converted))
             continue

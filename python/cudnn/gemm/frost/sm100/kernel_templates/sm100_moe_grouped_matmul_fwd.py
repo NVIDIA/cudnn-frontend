@@ -25,7 +25,11 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
     dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
 )
-from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.tile_helpers import (
+    moe_scatter_row,
+    tma_scatter4,
+    moe_gather_row,
+    tma_gather4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
@@ -601,11 +605,11 @@ def _kernel(
             for _ai in range(num_a_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets):
+        if cutlass.const_expr(moe_gather or moe_aligned_offsets):
             a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
         else:
             a_desc_load_list = a_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
+        if elect_one and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -644,7 +648,7 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
@@ -690,17 +694,39 @@ def _kernel(
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
-                                        a_desc_load_list[_ai],
-                                        (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_a,
-                                        group=_CTA_GROUP,
-                                    )
+                            if cutlass.const_expr(moe_gather):
+                                for _am in cutlass.range(cta_tile_mnk[0] // a_mcast_slices // 4, unroll_full=True):
+                                    if elect_one:
+                                        row = group_begin + coord_m_group + _a_off + _am * 4
+                                        source_rows = mA_list[_ai].shape[0]
+                                        r0 = moe_gather_row(token_index, row, group_end, source_rows)
+                                        r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+                                        r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+                                        r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                        tma_gather4(
+                                            sA_stage.subview((_a_off + _am * 4) * cta_tile_mnk[2]),
+                                            a_desc_load_list[_ai],
+                                            coord_k,
+                                            r0,
+                                            r1,
+                                            r2,
+                                            r3,
+                                            ab_full_mbar_ptr.subview(stage),
+                                            tma_mcast_mask_a,
+                                            cta_group,
+                                        )
+                            else:
+                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                            a_desc_load_list[_ai],
+                                            (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=_CTA_GROUP,
+                                        )
                     b_issue = (not multicast_b) or (pair_m_idx == 0)
                     if cutlass.const_expr(b_mcast_slices > 1):
                         b_data_issue = True
@@ -1170,7 +1196,7 @@ def _kernel(
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
         previous_group_end = cutlass.Int32(-1)
-        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
+        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
             for _di in cutlass.range_constexpr(n_tma_outputs):
                 if elect_one:
                     _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
@@ -1203,7 +1229,7 @@ def _kernel(
             # Under `moe_aligned_offsets` no tile crosses `group_end` in the
             # first place -- `cgrp_tile_m` divides every group -- so the clip
             # has nothing to clip and the original descriptor serves.
-            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
+            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
                 if group_end != previous_group_end:
                     previous_group_end = group_end
                     # One drain retires the in-flight stores of EVERY descriptor,
@@ -1391,16 +1417,21 @@ def _host(
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
+        if cutlass.const_expr(moe_gather):
+            a_dims = [k_sym, _a_op.shape[0]]
+            a_strides = [a_stride_m * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], 1]
+        else:
+            a_dims = [k_sym, m, 1]
+            a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], a_tma_box_m, 1]
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
                 dtype=ab_tma_dtype,
-                global_dims=[k_sym, m, 1],
-                global_strides=[
-                    a_stride_m * ab_dtype.width // 128,
-                    a_stride_l * ab_dtype.width // 128,
-                ],
-                box_dims=[cta_tile_mnk[2], a_tma_box_m, 1],
+                global_dims=a_dims,
+                global_strides=a_strides,
+                box_dims=a_box,
                 swizzle=ab_tma_swizzle,
             )
         )
@@ -1478,11 +1509,12 @@ def compile() -> Callable:
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
+    sym_source_m = cute.sym_int64() if moe_gather else sym_m
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_m, sym_k, 1),
+            (sym_source_m, sym_k, 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )

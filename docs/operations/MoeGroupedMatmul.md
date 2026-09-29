@@ -42,9 +42,97 @@ The support matrix is based on the latest cuDNN backend.
 
 ### Important Notes
 
-1. `FirstTokenOffset` contains `B * E` values with the total token count implicit from the token tensor dimension.
+1. `FirstTokenOffset` contains `B * E` starts. The final endpoint is implicit: `TokenIndex.shape[1]` in Gather mode, otherwise `Token.shape[1]`.
 2. In **Scatter** mode, both `TokenIndex` and `TokenKs` are required, and `top_k` must be explicitly provided.
 3. In **Gather** mode, `TokenIndex` is required.
+
+### FROST GATHER support
+
+The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER in
+both SM100 orientations, token-by-weight and weight-by-token (`SWAP_AB=1`),
+and in the SM120 token-by-weight path. Enable it with
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning.
+
+Let `T` be the source token count and `R` the routed row count. Supply token
+`[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
+and INT32 or INT64 `first_token_offset` `[G,1,1]`. The result is `[1,R,N]`.
+Offsets are nondecreasing starts beginning at zero, with implicit endpoint R;
+group `g` uses expert `g % E`, and empty groups are supported. Each index is a
+source row in `[0,T)`, so repeated source tokens are allowed.
+
+For block-scaled GATHER, token scale factors (SFA) use `reorder=NONE` and
+logical shape `[1,T,K/block]`, with contiguous K scales. Each scale occupies
+one byte; the row stride must be at least `round_up(K/block,16)` bytes and
+a multiple of 16 bytes, and the base pointer must be 16-byte aligned. SFA
+uses source-token order and is gathered with the same `token_index` as the
+token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
+factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
+roles and layout requirements also apply with `SWAP_AB=1`.
+
+```python
+fc1 = graph.moe_grouped_matmul(
+    token, weight, first_token_offset,
+    token_index=token_index,
+    mode=cudnn.moe_grouped_matmul_mode.GATHER,
+)
+activated = graph.swish(input=fc1)
+activated.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+Routing logits, top-k selection, offsets, and indices are computed by the
+caller. FROST uses TMA `tile::gather4` to load four indexed source rows directly
+into shared memory, then runs grouped matmul and the supported epilogue in the
+same kernel. No globally materialized permutation of the token matrix is
+needed. With `SWAP_AB=1`, tokens are the internal B operand and GATHER4 loads
+the token columns of the transposed matmul; the public tensors and routed
+output order stay the same. SM120 uses the `shared::cta` GATHER4 instruction
+with its existing warp-MMA mainloop and STG epilogue; its workspace remains
+the 128-byte scheduler counter. SM100 supports parallel GEMMs, including the
+gate/up pair for SwiGLU, sharing the same offsets and indices. SM120 retains
+its existing single-GEMM fusion support, including activation epilogues.
+Output rows and row-wise epilogue auxiliaries use routed order.
+The existing dtype, layout, alignment, and fusion support gates still apply.
+
+### FROST SCATTER support
+
+FROST supports SCATTER for ordinary and block-scaled MoE in both SM100
+orientations (`SWAP_AB=0/1`) and the SM120 token-by-weight path. The input and
+its block scales keep their expert-grouped layout. The epilogue writes each
+routed row `r` to the expanded token slot:
+
+```text
+destination = token_index[r] * top_k + token_ks[r]
+output[0, destination, :] = grouped_result[r, :]
+```
+
+For `R = S * top_k`, supply token `[1,R,K]`, output `[1,R,N]`, and contiguous
+INT32 `token_index` and `token_ks`, both `[1,R,1]`. The first index is in
+`[0,S)`; `token_ks` is the position within the token's top-k list, in
+`[0,top_k)`. Destinations must be unique and cover the output slots.
+`1 <= top_k <= E`; offsets retain the GATHER/NONE group convention with
+implicit endpoint R and support empty groups. Routing metadata is supplied
+by the caller and may change between executions, including graph replay.
+
+```python
+fc2 = graph.moe_grouped_matmul(
+    token, weight, first_token_offset,
+    token_index=token_index, token_ks=token_ks, top_k=top_k,
+    mode=cudnn.moe_grouped_matmul_mode.SCATTER,
+)
+fc2.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+SM100 uses TMA `tile::scatter4` for eligible N-major outputs, including
+swapAB, and indexed STG for other supported layouts. SM120 uses indexed STG.
+Pointwise epilogues and multiple materialized outputs share this store logic;
+token-indexed auxiliary tensors and `gen_index` use the scattered output
+coordinates. Input block scales retain their existing segmented SFA/per-expert
+SFB contract. Output block quantization, reductions, and packed sub-byte
+outputs are currently declined for SCATTER.
+
+SCATTER preserves each top-k contribution separately. Multiplication by routing
+weights and reduction across top-k require a subsequent operation to produce
+the final `[1,S,N]` result.
 
 ---
 
@@ -104,7 +192,7 @@ output = graph.moe_grouped_matmul(
 - `weight` (cudnn_tensor): Expert weight data with shape `(E, K, N)`.
 - `first_token_offset` (cudnn_tensor): INT32 tensor of shape `(B*E, 1, 1)`. The $i$-th entry is the index of the first token assigned to expert $i$.
 - `token_index` (Optional[cudnn_tensor]): INT32 tensor of shape `(1, S*topK, 1)`. Maps each routed slot to a source token index. Required for Gather and Scatter modes.
-- `token_ks` (Optional[cudnn_tensor]): INT32 tensor of shape `(1, S*topK, 1)`. The expert index for each routed token. Required for Scatter mode.
+- `token_ks` (Optional[cudnn_tensor]): INT32 tensor of shape `(1, S*topK, 1)`. The top-k slot index in `[0, top_k)` for each routed token. Required for Scatter mode.
 - `mode` (cudnn.moe_grouped_matmul_mode): Routing mode — `NONE`, `GATHER`, or `SCATTER`.
 - `top_k` (int): Top-k routing value. Must be provided for Scatter mode.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation. Defaults to FLOAT.

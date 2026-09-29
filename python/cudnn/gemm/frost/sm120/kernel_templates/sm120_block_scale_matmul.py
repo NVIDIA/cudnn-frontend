@@ -47,6 +47,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import l2_swizzle_tile as _l2_swizzle_tile
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
 from cutlass import apply_swizzle as _apply_smem_swizzle
@@ -258,24 +259,6 @@ def _auto_swizzle_w(m, n, k, nt_n):
     if cutlass.min(m, n) * row_bytes <= budget and m <= n:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
-
-
-def _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
-    """N-direction super-block rasterization of the (m, n) tile coord, for
-    L2 reuse. Applied identically to the launch-grid coords and to every CLC
-    response, so a stolen CTA id lands on the same logical tile the canceled
-    CTA would have computed (fort's ``swizzle()`` plays the same role).
-    ``swizzle_w == 1`` falls out of the math as the identity mapping.
-    """
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
-    return log_m, log_n
 
 
 def _sf_word_offset(r, r_in_block):

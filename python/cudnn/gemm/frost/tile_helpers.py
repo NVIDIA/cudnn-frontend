@@ -1,14 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tile-level helpers shared by the rendered kernel templates.
+"""Tile-level helpers shared by the SM100 and SM120 kernel templates.
 
 A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
 constants) and then exec'd from the kernel cache under a synthetic module
 name, so it cannot use relative imports and this module is never rendered.
 Everything here therefore takes what it needs as ARGUMENTS -- a helper that
 reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
-has to stay in the template, or be re-signed to receive it.
+has to stay in the template, or receive it explicitly.
+
+Scheduling and gather helpers serve both families. The tcgen05 wrappers are
+used only by the SM100 family and retain its instruction-specific contracts.
 """
 
 from __future__ import annotations
@@ -161,6 +164,150 @@ def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
     for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
         dst_i64_ptr.subview(i).store((src_words + i).load())
+
+
+@cute.jit
+def moe_gather_row(token_index, row, group_end, source_rows):
+    # Never read beyond the routed group. An out-of-range source row asks TMA
+    # to zero-fill the padding while still completing the expected byte count.
+    src = cutlass.Int32(source_rows)
+    if row < group_end:
+        src = cutlass.Int32(token_index[row])
+    return src
+
+
+@cute.jit
+def moe_scatter_row(token_index, token_ks, row, group_end, output_rows, top_k: cutlass.Constexpr):
+    """Map a routed row to its token/top-k slot; clip padding with an OOB row."""
+    dst = cutlass.Int32(output_rows)
+    if row < group_end:
+        token = cutlass.Int32(token_index[row])
+        slot = cutlass.Int32(token_ks[row])
+        if token >= 0 and token < output_rows // top_k and slot >= 0 and slot < top_k:
+            dst = token * top_k + slot
+    return dst
+
+
+@cute.jit
+def tma_scatter4(desc, src, col, r0, r1, r2, r3):
+    """Store four indexed rows through a rank-2 map with box_dims[1] == 1."""
+    llvm.inline_asm(
+        None,
+        [
+            desc.toint().ir_value(),
+            src.toint(dtype=cutlass.Int32).ir_value(),
+            cutlass.Int32(col).ir_value(),
+            cutlass.Int32(r0).ir_value(),
+            cutlass.Int32(r1).ir_value(),
+            cutlass.Int32(r2).ir_value(),
+            cutlass.Int32(r3).ir_value(),
+        ],
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group [$0, {$2, $3, $4, $5, $6}], [$1];",
+        "l,r,r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
+    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
+
+    No mask selects shared::cta (SM120); a mask selects SM100 cluster multicast.
+    The experimental DSL TMA wrapper currently validates two coordinates for
+    this five-coordinate instruction, so issue the PTX directly.
+    """
+    bar_addr = mbar.data_ptr().toint(dtype=cutlass.Int32)
+    if cutlass.const_expr(cta_group == 2):
+        bar_addr = bar_addr & cutlass.Int32(0xFEFFFFFF)
+    args = [
+        dst.data_ptr().toint(dtype=cutlass.Int32).ir_value(),
+        desc.toint().ir_value(),
+        cutlass.Int32(k).ir_value(),
+        cutlass.Int32(r0).ir_value(),
+        cutlass.Int32(r1).ir_value(),
+        cutlass.Int32(r2).ir_value(),
+        cutlass.Int32(r3).ir_value(),
+        bar_addr.ir_value(),
+    ]
+    if cutlass.const_expr(mask is None):
+        llvm.inline_asm(
+            None,
+            args,
+            "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4." "mbarrier::complete_tx::bytes [$0], [$1, {$2, $3, $4, $5, $6}], [$7];",
+            "r,l,r,r,r,r,r,r,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    else:
+        llvm.inline_asm(
+            None,
+            args + [cutlass.Int16(mask).ir_value()],
+            "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."
+            "mbarrier::complete_tx::bytes.multicast::cluster."
+            f"cta_group::{cta_group} [$0], [$1, {{$2, $3, $4, $5, $6}}], [$7], $8;",
+            "r,l,r,r,r,r,r,r,h,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
+@cute.jit
+def moe_gather_scales(
+    dst,
+    scratch,
+    load_bar,
+    ready_bar,
+    desc,
+    token_index,
+    row_begin,
+    group_end,
+    source_rows,
+    scale_k,
+    phase,
+    rows: cutlass.Constexpr,
+    scales: cutlass.Constexpr,
+    cta_group: cutlass.Constexpr = 1,
+):
+    """TMA-load linear source SF, then publish an MMA 128x4 atom per stage.
+
+    A 16-byte SF window serves narrow K tiles too. Each four-row transfer uses
+    a 128-byte-aligned scratch slot (64 payload bytes). Scratch is producer-private
+    and reused only after all lanes have read it. The MMA stage barrier accounts
+    for a release arrival after packing, separately from the TMA scratch bytes.
+    """
+    lane = cute.arch.lane_idx()
+    with cute.arch.elect_one():
+        nvvm.mbarrier_arrive_expect_tx(load_bar, rows * 16)
+    for r in cutlass.range(rows // 4, unroll_full=True):
+        with cute.arch.elect_one():
+            row = row_begin + r * 4
+            r0 = moe_gather_row(token_index, row, group_end, source_rows)
+            r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+            r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+            r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+            tma_gather4(scratch.subview(r * 128), desc, (scale_k // 16) * 16, r0, r1, r2, r3, load_bar)
+    while not nvvm.mbarrier_try_wait_parity(load_bar, phase, time_limit=10_000_000):
+        pass
+    src_words = cutlass.inttoptr(scratch.data_ptr().toint(), 3, cutlass.Uint32)
+    dst_words = cutlass.inttoptr(dst.data_ptr().toint(), 3, cutlass.Uint32)
+    for i in cutlass.range(rows * (scales // 4) // 32, unroll_full=True):
+        word = lane + i * 32
+        row = word // (scales // 4)
+        kw = word % (scales // 4)
+        packed = (row // 128) * (128 * (scales // 4)) + kw * 128 + (row % 32) * 4 + (row % 128) // 32
+        (dst_words + packed).store((src_words + (row // 4) * 32 + (row % 4) * 4 + (scale_k % 16) // 4 + kw).load())
+    cute.arch.fence_view_async_shared()
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+    with cute.arch.elect_one():
+        if cutlass.const_expr(cta_group == 2):
+            leader = cute.arch.block_idx_in_cluster() & ~1
+            nvvm.mbarrier_arrive(nvvm.mapa(ready_bar, leader), scope=nvvm.MemScope.CLUSTER)
+        else:
+            nvvm.mbarrier_arrive(ready_bar)
 
 
 def tcgen05_alloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):

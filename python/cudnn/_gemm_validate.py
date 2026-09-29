@@ -33,7 +33,17 @@ from .graph_types import NodeType
 _MOE_FWD_INPUTS = ("token", "weight", "first_token_offset")
 _MOE_BWD_INPUTS = ("doutput", "token", "first_token_offset")
 
-COVERED_NODE_TYPES = frozenset({NodeType.MATMUL, NodeType.MOE_GROUPED_MATMUL, NodeType.MOE_GROUPED_MATMUL_BWD})
+COVERED_NODE_TYPES = frozenset(
+    {
+        NodeType.MATMUL,
+        NodeType.MOE_GROUPED_MATMUL,
+        NodeType.MOE_GROUPED_MATMUL_BWD,
+        NodeType.BLOCK_SCALE_DEQUANTIZE,
+        NodeType.BLOCK_SCALE_QUANTIZE,
+        NodeType.POINTWISE,
+        NodeType.REDUCTION,
+    }
+)
 
 
 def _not_supported(message: str) -> Exception:
@@ -49,10 +59,8 @@ def _dims(t: Any):
 
 
 def validate_graph(graph) -> bool:
-    """Validate every node when all of them are GEMM-family (MATMUL / MoE grouped
-    matmul fwd+bwd); return False without raising when the graph holds a node
-    this module does not cover (a pointwise epilogue, a reshape, ...), so the
-    caller falls back to the classic eager C++ lowering."""
+    """Validate GEMM/MoE graphs and their fusion nodes in Python.
+    Return False for uncovered nodes so they retain classic eager lowering."""
     nodes = list(graph._nodes)
     if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
         return False
@@ -67,8 +75,38 @@ def validate_node(node) -> None:
         _validate_matmul(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
+        mode = getattr(node.params.get("mode"), "name", None)
+        if mode in ("GATHER", "SCATTER"):
+            _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
+        if mode == "SCATTER":
+            _validate_required(node, "MoeGroupedMatmul", ("token_ks",), ())
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
+    elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
+        _validate_required(node, "BlockScaleDequantize", ("input", "descale"), ("OUT_0",))
+        if not node.params.get("block_size"):
+            raise ValueError("Block size not set")
+        if not node.outputs["OUT_0"].get_is_virtual():
+            raise ValueError("Output tensor of dequantize node should be virtual")
+    elif node.node_type == NodeType.BLOCK_SCALE_QUANTIZE:
+        _validate_required(node, "BlockScaleQuantize", ("input",), ("Y", "scale"))
+        if not node.params.get("block_size"):
+            raise ValueError("Block size not set")
+    elif node.node_type == NodeType.REDUCTION:
+        _validate_required(node, "Reduction", ("input",), ("OUT_0",))
+        if not node.params.get("mode"):
+            raise ValueError("Reduction mode not set")
+    elif node.node_type == NodeType.POINTWISE:
+        _validate_required(node, "Pointwise", ("IN_0",), ("OUT_0",))
+        if not node.params.get("mode"):
+            raise ValueError("Pointwise mode not set")
+        # Node.infer_properties checks input broadcasting when inferring an
+        # output. Also check it when callers supplied an explicit output shape.
+        out = _dims(node.outputs["OUT_0"])
+        for tensor in node.inputs.values():
+            dim = _dims(tensor)
+            if dim and out and (len(dim) > len(out) or any(x != 1 and x != y for x, y in zip(reversed(dim), reversed(out)))):
+                raise _not_supported("Pointwise inputs do not broadcast to the output shape")
 
 
 def _validate_matmul(node) -> None:
@@ -99,7 +137,7 @@ def _validate_matmul(node) -> None:
 
 
 def _validate_required(node, label: str, inputs, outputs) -> None:
-    """Classic ATTRIBUTE_NOT_SET parity for the MoE grouped-matmul nodes."""
+    """Classic ATTRIBUTE_NOT_SET parity for required node ports."""
     for port in inputs:
         if node.inputs.get(port) is None:
             raise ValueError(f"{label} input {port} not set.")
