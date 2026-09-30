@@ -291,11 +291,18 @@ compressed column 0.
     described below.
   - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
     described below.
-  - `w`: `(B, S_q, H_q)` BF16. The SM90 FP8 path also accepts FP32 when
-    weights have already been pre-scaled by `q_scale * sm_scale`.
+  - `w`: `(B, S_q, H_q)` BF16 or FP32 with BF16 Q/K, on SM90 and SM100.
+    FP32 head weights retain their precision through score generation, without
+    changing the Q/K dtype; FP32 W requires unit stride in its last dimension.
+    Unsupported strides are rejected instead of copied. The SM90 FP8 path also
+    accepts FP32 when weights have already been pre-scaled by
+    `q_scale * sm_scale`; SM100 MXFP8 requires BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32.
+- **Scope** — FP32 weights are supported by Indexer Forward and Combined
+  Indexer Forward + Top-K. The separate indexer score-recompute and backward
+  APIs still require BF16 weights.
 - **Precision paths**
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
@@ -341,7 +348,8 @@ reproducible across launches. This does not sort the output slots; the default
 `False` path retains the faster scheduling-dependent tie-break.
 
 The combined compressed path is SM100-only. Both BSHD and THD support
-BF16 and MXFP8. `topk_indices_global=True` is the default. Optional caller-owned
+BF16 Q/K with BF16 or FP32 weights, and MXFP8 Q/K with BF16 weights.
+`topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
 `compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
