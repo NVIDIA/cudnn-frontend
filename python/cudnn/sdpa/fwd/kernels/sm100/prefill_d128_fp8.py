@@ -514,7 +514,9 @@ def _kernel(
     sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sP_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * pBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sP_raw = None
+    if cutlass.const_expr(P_IN_SMEM):
+        sP_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * pBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sO_raw = cutlass.Array(OUT_STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     sQ = SmemTile(
@@ -551,14 +553,16 @@ def _kernel(
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
     )
-    sP = SmemTile(
-        base=sP_raw,
-        elems_per_stage=pBufferElems,
-        stages=CFG.TILES_Q,
-        leading_byte_offset=0,
-        stride_byte_offset=STRIDE_BYTE_OFFSET_P,
-        layout=SMEM_LAYOUT_P,
-    )
+    sP = None
+    if cutlass.const_expr(P_IN_SMEM):
+        sP = SmemTile(
+            base=sP_raw,
+            elems_per_stage=pBufferElems,
+            stages=CFG.TILES_Q,
+            leading_byte_offset=0,
+            stride_byte_offset=STRIDE_BYTE_OFFSET_P,
+            layout=SMEM_LAYOUT_P,
+        )
     sO = SmemTile(
         base=sO_raw,
         elems_per_stage=oBufferElems,
@@ -1356,6 +1360,11 @@ _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
 _O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
 # P SMEM tile: TILE_N fp8 per row = 128 B rows in the same K-major 128 B-swizzle layout as Q (TILE_K fp8 rows), so the
 # BMM2 A descriptor is built like Q's (leading 0, stride = 8 rows).
+# P staged in SMEM (with the early next-step QK^T) is a cc10.0 win: there the softmax bounds the step and freeing the
+# S_acc slot early hides the QK^T.  On cc10.3 (FUSED_LDTM_STAT: fused row-max, 2x MUFU) the step is bound by the MMA's
+# SMEM traffic instead, and PV reading P from SMEM on top of V costs more than the overlap returns (measured llama fp8
+# dense S=2K 1.08x -> 1.21x, S=8K 1.07x -> 1.20x), so cc10.3 keeps P in TMEM and the PV-then-QK^T order.
+P_IN_SMEM = not bool(FUSED_LDTM_STAT)
 _P_SWZ_BYTES = CFG.TILE_N * CFG.BPE
 _P_SWZ_B = {128: 3, 64: 2, 32: 1}[_P_SWZ_BYTES]
 SMEM_LAYOUT_P = _SWZ_ENUM[_P_SWZ_BYTES]
@@ -1559,47 +1568,142 @@ def _mma_warp_group(
 
             q_full_phase = q_full_phase ^ 1
 
-            for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
-                old_state = kv_state
-                kv_state = advance(kv_state, CFG.STAGES_KV)
-                is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
+            if cutlass.const_expr(P_IN_SMEM):
+                for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
+                    old_state = kv_state
+                    kv_state = advance(kv_state, CFG.STAGES_KV)
+                    is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
 
-                # EARLY QK^T.  P lives in SMEM, so the S_acc slot holds only S and the stats word at its
-                # head, and the NEXT step's BMM1 may go as soon as the softmax has loaded S into
-                # registers and the correction has consumed the stats -- rather than after this
-                # step's PV.  It then runs on the tensor pipe under the softmax's exp burst and the
-                # softmax no longer waits for S.
-                #   cga1: the CTA's own correction is the only stats consumer, so both sub-tiles'
-                #         BMM1 issue right after mb_stat_empty, ahead of both PVs.
-                #   cga2: the collective BMM1 writes the PEER's S_acc as well, and mb_stat_empty is
-                #         CTA-local; mb_bmm2_ready[qs, chunk 0] is the leader-scope barrier BOTH
-                #         CTAs' softmax and correction arrive on (P chunk 0 stored, stats consumed),
-                #         so each sub-tile's BMM1 issues there, just ahead of its own PV.
-                bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-                desc_K = sK[kv_state.idx].desc()
-                if cutlass.const_expr(CFG.CTA_MMA == 1):
+                    # EARLY QK^T.  P lives in SMEM, so the S_acc slot holds only S and the stats word at its
+                    # head, and the NEXT step's BMM1 may go as soon as the softmax has loaded S into
+                    # registers and the correction has consumed the stats -- rather than after this
+                    # step's PV.  It then runs on the tensor pipe under the softmax's exp burst and the
+                    # softmax no longer waits for S.
+                    #   cga1: the CTA's own correction is the only stats consumer, so both sub-tiles'
+                    #         BMM1 issue right after mb_stat_empty, ahead of both PVs.
+                    #   cga2: the collective BMM1 writes the PEER's S_acc as well, and mb_stat_empty is
+                    #         CTA-local; mb_bmm2_ready[qs, chunk 0] is the leader-scope barrier BOTH
+                    #         CTAs' softmax and correction arrive on (P chunk 0 stored, stats consumed),
+                    #         so each sub-tile's BMM1 issues there, just ahead of its own PV.
+                    bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+                    desc_K = sK[kv_state.idx].desc()
+                    if cutlass.const_expr(CFG.CTA_MMA == 1):
+                        for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                            bars.mb_stat_empty[qs].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
+                            mma_ss(bmm1_desc, desc_Q0 if qs == 0 else desc_Q1, desc_K, tmem_raw.subview(LAYOUT.S0_OFF if qs == 0 else LAYOUT.S1_OFF))
+                            elect_p = nvvm.elect_sync()
+                            bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                        bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                        stat_empty_mma_phase = stat_empty_mma_phase ^ 1
+
+                    # PV for both sub-tiles, P read from SMEM through the Q-shaped descriptor.
+                    bars.mb_v_full[old_state.idx].wait(old_state.phase, spin=SPIN_RING_WAITS)
+                    desc_V = sV[old_state.idx].desc()
                     for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                        bars.mb_stat_empty[qs].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
-                        mma_ss(bmm1_desc, desc_Q0 if qs == 0 else desc_Q1, desc_K, tmem_raw.subview(LAYOUT.S0_OFF if qs == 0 else LAYOUT.S1_OFF))
+                        desc_P = sP[qs].desc()
+                        tmem_O = tmem_raw.subview(LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF)
+                        bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                        if cutlass.const_expr(CFG.CTA_MMA != 1):
+                            mma_ss(bmm1_desc, desc_Q0 if qs == 0 else desc_Q1, desc_K, tmem_raw.subview(LAYOUT.S0_OFF if qs == 0 else LAYOUT.S1_OFF))
+                            elect_p = nvvm.elect_sync()
+                            bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                            if cutlass.const_expr(qs == CFG.TILES_Q - 1):
+                                bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                        mma_ss(bmm2_desc, desc_P, desc_V, tmem_O, accumulate=is_not_first_bmm2, k_start=0, k_count=NUM_KPHASES_PV_PER_CHUNK)
+                        if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                            bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                            mma_ss(
+                                bmm2_desc,
+                                desc_P,
+                                desc_V,
+                                tmem_O,
+                                accumulate=cutlass.Boolean(True),
+                                k_start=NUM_KPHASES_PV_PER_CHUNK,
+                                k_count=NUM_KPHASES_PV_PER_CHUNK,
+                            )
                         elect_p = nvvm.elect_sync()
-                        bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                    stat_empty_mma_phase = stat_empty_mma_phase ^ 1
+                        bars.mb_bmm2_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
-                # PV for both sub-tiles, P read from SMEM through the Q-shaped descriptor.
-                bars.mb_v_full[old_state.idx].wait(old_state.phase, spin=SPIN_RING_WAITS)
-                desc_V = sV[old_state.idx].desc()
+                    bmm2_ready_phase = bmm2_ready_phase ^ 1
+
+            else:
+                for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
+                    old_state = kv_state
+                    kv_state = advance(kv_state, CFG.STAGES_KV)
+
+                    bars.mb_v_full[old_state.idx].wait(old_state.phase, spin=SPIN_RING_WAITS)
+                    desc_V = sV[old_state.idx].desc()
+                    is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
+
+                    bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                    accum_b2 = is_not_first_bmm2
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                        accum_b2 = cutlass.Boolean(True)
+                    # Chunk 1 folds out at N_BMM2_CHUNKS=1 (full NUM_KPHASES_PV in chunk 0).
+                    if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                        bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                        for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                            mma_ts_step(
+                                bmm2_desc,
+                                (tmem_raw.subview(LAYOUT.P0_OFF)),
+                                desc_V,
+                                (tmem_raw.subview(LAYOUT.O0_OFF)),
+                                NUM_KPHASES_PV_PER_CHUNK + local_k,
+                                cutlass.Boolean(True),
+                            )
+                    elect_p = nvvm.elect_sync()
+                    bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                    bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+                    desc_K = sK[kv_state.idx].desc()
+                    mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                    elect_p = nvvm.elect_sync()
+                    bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                    bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                    accum_b2 = is_not_first_bmm2
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                        accum_b2 = cutlass.Boolean(True)
+                    if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                        bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                        for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                            mma_ts_step(
+                                bmm2_desc,
+                                (tmem_raw.subview(LAYOUT.P1_OFF)),
+                                desc_V,
+                                (tmem_raw.subview(LAYOUT.O1_OFF)),
+                                NUM_KPHASES_PV_PER_CHUNK + local_k,
+                                cutlass.Boolean(True),
+                            )
+                    elect_p = nvvm.elect_sync()
+                    bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                    mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                    elect_p = nvvm.elect_sync()
+                    bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                    bmm2_ready_phase = bmm2_ready_phase ^ 1
+
+            # Epilogue BMM2 always runs (n_kv >= 1).
+            elect_p = nvvm.elect_sync()
+            for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+            bars.mb_v_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+            desc_V = sV[kv_state.idx].desc()
+            is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
+
+            if cutlass.const_expr(P_IN_SMEM):
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
                     desc_P = sP[qs].desc()
                     tmem_O = tmem_raw.subview(LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF)
                     bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
-                    if cutlass.const_expr(CFG.CTA_MMA != 1):
-                        mma_ss(bmm1_desc, desc_Q0 if qs == 0 else desc_Q1, desc_K, tmem_raw.subview(LAYOUT.S0_OFF if qs == 0 else LAYOUT.S1_OFF))
-                        elect_p = nvvm.elect_sync()
-                        bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                        if cutlass.const_expr(qs == CFG.TILES_Q - 1):
-                            bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                    mma_ss(bmm2_desc, desc_P, desc_V, tmem_O, accumulate=is_not_first_bmm2, k_start=0, k_count=NUM_KPHASES_PV_PER_CHUNK)
+                    mma_ss(bmm2_desc, desc_P, desc_V, tmem_O, accumulate=is_not_first_bmm2_epi, k_start=0, k_count=NUM_KPHASES_PV_PER_CHUNK)
                     if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                         bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                         mma_ss(
@@ -1613,38 +1717,46 @@ def _mma_warp_group(
                         )
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm2_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-
-                bmm2_ready_phase = bmm2_ready_phase ^ 1
-
-            # Epilogue BMM2 always runs (n_kv >= 1).
-            elect_p = nvvm.elect_sync()
-            for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-
-            bars.mb_v_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-            desc_V = sV[kv_state.idx].desc()
-            is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
-
-            for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                desc_P = sP[qs].desc()
-                tmem_O = tmem_raw.subview(LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF)
-                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
-                mma_ss(bmm2_desc, desc_P, desc_V, tmem_O, accumulate=is_not_first_bmm2_epi, k_start=0, k_count=NUM_KPHASES_PV_PER_CHUNK)
+                bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+            else:
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                accum_b2 = is_not_first_bmm2_epi
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                    accum_b2 = cutlass.Boolean(True)
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
-                    bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
-                    mma_ss(
-                        bmm2_desc,
-                        desc_P,
-                        desc_V,
-                        tmem_O,
-                        accumulate=cutlass.Boolean(True),
-                        k_start=NUM_KPHASES_PV_PER_CHUNK,
-                        k_count=NUM_KPHASES_PV_PER_CHUNK,
-                    )
+                    bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(
+                            bmm2_desc,
+                            (tmem_raw.subview(LAYOUT.P0_OFF)),
+                            desc_V,
+                            (tmem_raw.subview(LAYOUT.O0_OFF)),
+                            NUM_KPHASES_PV_PER_CHUNK + local_k,
+                            cutlass.Boolean(True),
+                        )
                 elect_p = nvvm.elect_sync()
-                bars.mb_bmm2_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-            bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+
+                bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                accum_b2 = is_not_first_bmm2_epi
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                    accum_b2 = cutlass.Boolean(True)
+                if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
+                    bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
+                    for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                        mma_ts_step(
+                            bmm2_desc,
+                            (tmem_raw.subview(LAYOUT.P1_OFF)),
+                            desc_V,
+                            (tmem_raw.subview(LAYOUT.O1_OFF)),
+                            NUM_KPHASES_PV_PER_CHUNK + local_k,
+                            cutlass.Boolean(True),
+                        )
+                elect_p = nvvm.elect_sync()
+                bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
             bmm2_ready_phase = bmm2_ready_phase ^ 1
             kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -1871,12 +1983,22 @@ def _softmax_kv_body(
         cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
     # Hoist chunk-0 sum before cast to overlap with cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
-    # P goes to SMEM.  The previous step's PV may still be reading this tile (its QK^T no longer
-    # orders it, see _mma_warp_group): wait for that BMM2 to complete first -- normally long done.
-    bars.mb_bmm2_done[sub_tile_id].wait(p_free_phase, spin=SPIN_RING_WAITS)
-    _store_p_chunk(sP_sub_base, p_row, 0, chunk_P_0)
-    nvvm.fence_proxy("async.shared", space="cta")
-    bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    if cutlass.const_expr(P_IN_SMEM):
+        # P goes to SMEM.  The previous step's PV may still be reading this tile (its QK^T no longer
+        # orders it, see _mma_warp_group): wait for that BMM2 to complete first -- normally long done.
+        bars.mb_bmm2_done[sub_tile_id].wait(p_free_phase, spin=SPIN_RING_WAITS)
+        _store_p_chunk(sP_sub_base, p_row, 0, chunk_P_0)
+        nvvm.fence_proxy("async.shared", space="cta")
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    else:
+        chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32),
+            chunk_P_0_fp8,
+        )
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
@@ -1887,9 +2009,22 @@ def _softmax_kv_body(
             deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
         # Burst done: admit the other warpgroup's burst.
         cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
-        _store_p_chunk(sP_sub_base, p_row, 1, deferred_P_1)
-        nvvm.fence_proxy("async.shared", space="cta")
-        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+        if cutlass.const_expr(P_IN_SMEM):
+            _store_p_chunk(sP_sub_base, p_row, 1, deferred_P_1)
+            nvvm.fence_proxy("async.shared", space="cta")
+            bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+        else:
+            chunk_P_1_fp8 = deferred_P_1.to(STORAGE_DTYPE)
+            nvvm.tcgen05_st(
+                "32x32b",
+                nvvm.make_tmem_ptr(
+                    p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK),
+                    cutlass.Float32,
+                ),
+                chunk_P_1_fp8,
+            )
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+            bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
@@ -1986,7 +2121,9 @@ def _softmax_warp_group(
     # completion per step per sub-tile, the epilogue's included) so a step's P store waits for the
     # previous step's PV.  Pre-armed at 1: step 0 of every tile passes (the tile's prologue QK^T is
     # already ordered after the previous tile's last PV by mb_stats_read).
-    sP_sub_base = sP[sub_tile_id].base
+    sP_sub_base = None
+    if cutlass.const_expr(P_IN_SMEM):
+        sP_sub_base = sP[sub_tile_id].base
     p_row = tid_in_wg
     p_free_phase = cutlass.Int32(1)
 
