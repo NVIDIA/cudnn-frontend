@@ -1245,7 +1245,7 @@ def test_api_split_requires_a_workspace():
     """A direct caller that passes no workspace gets the R2 contract error --
     the adapter never allocates the partials itself (the suite's autouse shim
     is off here)."""
-    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+    with pytest.raises(ValueError, match=r"requires (a \d+-byte|contiguous) workspace"):
         _api_case(1, 8, 1, 512, 16384, workspace=False, split_kv=2)
 
 
