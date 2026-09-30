@@ -34,9 +34,10 @@ def _paged_split_facts(**overrides):
 
 
 @requires_dsl
-def test_paged_split_record_and_older_native_extension_fallback(monkeypatch):
+@pytest.mark.parametrize("splits", [3, 4, 6, 7, 12])
+def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, splits):
     facts = _paged_split_facts()
-    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     assert any((k.split_kv or 1) > 1 for k in heur._knob_sets(SPEC, facts))

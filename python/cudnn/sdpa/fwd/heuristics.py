@@ -1218,8 +1218,16 @@ def paged_thd_split_count(caps: Capabilities, facts) -> int:
     # tiles per partition to amortize setup/combine on short contexts.
     # These are fixed graph bounds, never global pool capacity or a D2H read.
     units = _ceil_div(facts.s_q, 128) * facts.h_q
-    budget = min(16, max(1, 128 // units), max(1, _ceil_div(facts.s_kv, 128) // 4))
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    budget = min(16, max(1, 128 // units), max(1, kv_tiles // 4))
     splits = 1 << (budget.bit_length() - 1)
+    # A power-of-two partition count can leave a third of the SMs idle.
+    # Fill the first wave only when doing so shortens its longest KV loop;
+    # otherwise extra partials add combine work without reducing that loop.
+    resident_budget = min(16, max(1, (facts.device_sm_count or 0) // units), max(1, kv_tiles // 4))
+    loop_tiles = _ceil_div(kv_tiles, resident_budget)
+    if loop_tiles < _ceil_div(kv_tiles, splits):
+        splits = _ceil_div(kv_tiles, loop_tiles)
     return splits
 
 

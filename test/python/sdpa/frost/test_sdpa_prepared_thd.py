@@ -1996,20 +1996,24 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
 @pytest.mark.parametrize(
-    "geometry,stats_layout,stats_log2",
+    "geometry,stats_layout,stats_log2,splits",
     [
-        ("d256", "NH", False),
-        ("d128_packed", "NH", False),
-        ("d128_packed", "HN", False),
-        ("d128_short", "NH", False),
-        ("d128_long", "NH", False),
-        ("d128_split", "NH", False),
-        ("d128_split", "HN", False),
-        ("d128_split", "NH", True),
-        ("d128_split", "HN", True),
+        ("d256", "NH", False, 1),
+        ("d128_packed", "NH", False, 1),
+        ("d128_packed", "HN", False, 1),
+        ("d128_short", "NH", False, 1),
+        ("d128_long", "NH", False, 1),
+        ("d128_split", "NH", False, 4),
+        ("d128_split", "HN", False, 4),
+        ("d128_split", "NH", True, 4),
+        ("d128_split", "HN", True, 4),
+        ("d128_split", "NH", False, 3),
+        ("d128_split", "HN", False, 3),
+        ("d128_split", "NH", True, 3),
+        ("d128_split", "HN", True, 3),
     ],
 )
-def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout, stats_log2):
+def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout, stats_log2, splits):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
     import inspect
 
@@ -2088,7 +2092,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         if geometry != "d256":
             chosen.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
         if geometry == "d128_split":
-            chosen.update({cudnn.knob_type.PACK_GQA: 0, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: 4})
+            chosen.update({cudnn.knob_type.PACK_GQA: 0, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits})
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         if geometry not in ("d256", "d128_split"):
@@ -2103,7 +2107,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         workspace_bytes = g.get_workspace_size()
         if geometry == "d128_split":
             spec = _plan(g)._prepared.spec
-            assert spec.native is not None and spec.split_workspace.splits == 4
+            assert spec.native is not None and spec.split_workspace.splits == splits
             assert api.paged_thd_split and api._thd_spec.split_workspace == spec.split_workspace
             assert workspace_bytes == spec.scratch_bytes == api.scratch_workspace_bytes()
         assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
