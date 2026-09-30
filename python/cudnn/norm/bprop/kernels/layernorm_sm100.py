@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """LayerNorm backward, sm_100, CUTLASS primitives.
 
 Given ``dy`` and the forward's saved ``x``, ``gamma``, ``mean``, ``rstd`` this
@@ -180,15 +183,41 @@ def _ln_bwd_kernel(
 
 @cute.jit
 def _ln_bwd_host(
-    mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta,
+    mDY,
+    mX,
+    mGamma,
+    mMean,
+    mRstd,
+    mDX,
+    mDGamma,
+    mDBeta,
     R: cutlass.Int32,
-    M: cutlass.Constexpr, V: cutlass.Constexpr, bt: cutlass.Constexpr,
-    elem_bytes: cutlass.Constexpr, stage_mode: cutlass.Constexpr, vec: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    M: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    bt: cutlass.Constexpr,
+    elem_bytes: cutlass.Constexpr,
+    stage_mode: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     _ln_bwd_kernel(
-        mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta,
-        M, V, bt, elem_bytes, stage_mode, vec, has_mean, has_beta,
+        mDY,
+        mX,
+        mGamma,
+        mMean,
+        mRstd,
+        mDX,
+        mDGamma,
+        mDBeta,
+        M,
+        V,
+        bt,
+        elem_bytes,
+        stage_mode,
+        vec,
+        has_mean,
+        has_beta,
     ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
 
 
@@ -206,13 +235,28 @@ def _ln_bwd_host(
 
 @cute.kernel
 def _ln_bwd_pipe_kernel(
-    mDY: cute.Tensor, mX: cute.Tensor, mDXi: cute.Tensor, mGi: cute.Tensor,
-    mMean: cute.Tensor, mRstd: cute.Tensor, mDGp: cute.Tensor, mDBp: cute.Tensor,
-    R: cutlass.Int32, ctas: cutlass.Int32,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, wn: cutlass.Constexpr,
-    ldgs: cutlass.Constexpr, block_threads: cutlass.Constexpr, et: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, cache_xd: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mDY: cute.Tensor,
+    mX: cute.Tensor,
+    mDXi: cute.Tensor,
+    mGi: cute.Tensor,
+    mMean: cute.Tensor,
+    mRstd: cute.Tensor,
+    mDGp: cute.Tensor,
+    mDBp: cute.Tensor,
+    R: cutlass.Int32,
+    ctas: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    tpr: cutlass.Constexpr,
+    wn: cutlass.Constexpr,
+    ldgs: cutlass.Constexpr,
+    block_threads: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    STAGES: cutlass.Constexpr,
+    cache_xd: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -362,9 +406,15 @@ def _ln_bwd_pipe_kernel(
 
 @cute.kernel
 def _ln_bwd_finalize_kernel(
-    mDGp: cute.Tensor, mDBp: cute.Tensor, mDG: cute.Tensor, mDB: cute.Tensor,
-    nparts: cutlass.Int32, C: cutlass.Constexpr, FB: cutlass.Constexpr,
-    CHUNK: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mDGp: cute.Tensor,
+    mDBp: cute.Tensor,
+    mDG: cute.Tensor,
+    mDB: cute.Tensor,
+    nparts: cutlass.Int32,
+    C: cutlass.Constexpr,
+    FB: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     # 2D grid: x = column tile (coalesced, thread-per-column), y = partition chunk.
     # Splitting the reduction over y and atomic-adding into the tiny [C] output keeps
@@ -394,22 +444,63 @@ def _ln_bwd_finalize_kernel(
 
 @cute.jit
 def _ln_bwd_pipe_host(
-    mDY, mX, mDX, mGamma, mMean, mRstd, mDGp, mDBp, mDGamma, mDBeta,
-    R: cutlass.Int32, ctas: cutlass.Int32,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, wn: cutlass.Constexpr,
-    ldgs: cutlass.Constexpr, block_threads: cutlass.Constexpr, et: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, cache_xd: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr,
-    nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
+    mDY,
+    mX,
+    mDX,
+    mGamma,
+    mMean,
+    mRstd,
+    mDGp,
+    mDBp,
+    mDGamma,
+    mDBeta,
+    R: cutlass.Int32,
+    ctas: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    tpr: cutlass.Constexpr,
+    wn: cutlass.Constexpr,
+    ldgs: cutlass.Constexpr,
+    block_threads: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    STAGES: cutlass.Constexpr,
+    cache_xd: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    FB: cutlass.Constexpr,
+    fgrid: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
     _ln_bwd_pipe_kernel(
-        mDY, mX, mDXi, mGi, mMean, mRstd, mDGp, mDBp, R, ctas,
-        C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, cache_xd, has_mean, has_beta,
+        mDY,
+        mX,
+        mDXi,
+        mGi,
+        mMean,
+        mRstd,
+        mDGp,
+        mDBp,
+        R,
+        ctas,
+        C,
+        V,
+        tpr,
+        wn,
+        ldgs,
+        block_threads,
+        et,
+        it_ty,
+        STAGES,
+        cache_xd,
+        has_mean,
+        has_beta,
     ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(
-        grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -423,10 +514,22 @@ def _ln_bwd_pipe_host(
 
 @cute.kernel
 def _ln_bwd_tiled_kernel(
-    mDY: cute.Tensor, mX: cute.Tensor, mDXi: cute.Tensor, mGi: cute.Tensor, mRstd: cute.Tensor,
-    mDGp: cute.Tensor, R: cutlass.Int32, ctas: cutlass.Int32,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, ldgs: cutlass.Constexpr,
-    RPT: cutlass.Constexpr, et: cutlass.Constexpr, it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr,
+    mDY: cute.Tensor,
+    mX: cute.Tensor,
+    mDXi: cute.Tensor,
+    mGi: cute.Tensor,
+    mRstd: cute.Tensor,
+    mDGp: cute.Tensor,
+    R: cutlass.Int32,
+    ctas: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    tpr: cutlass.Constexpr,
+    ldgs: cutlass.Constexpr,
+    RPT: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    STAGES: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -524,20 +627,50 @@ def _ln_bwd_tiled_kernel(
 
 @cute.jit
 def _ln_bwd_tiled_host(
-    mDY, mX, mDX, mGamma, mRstd, mDGp, mDGamma,
-    R: cutlass.Int32, ctas: cutlass.Int32,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, ldgs: cutlass.Constexpr,
-    RPT: cutlass.Constexpr, et: cutlass.Constexpr, it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr,
-    FB: cutlass.Constexpr, fgrid: cutlass.Constexpr, nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr,
+    mDY,
+    mX,
+    mDX,
+    mGamma,
+    mRstd,
+    mDGp,
+    mDGamma,
+    R: cutlass.Int32,
+    ctas: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    tpr: cutlass.Constexpr,
+    ldgs: cutlass.Constexpr,
+    RPT: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    STAGES: cutlass.Constexpr,
+    FB: cutlass.Constexpr,
+    fgrid: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
     _ln_bwd_tiled_kernel(
-        mDY, mX, mDXi, mGi, mRstd, mDGp, R, ctas, C, V, tpr, ldgs, RPT, et, it_ty, STAGES,
+        mDY,
+        mX,
+        mDXi,
+        mGi,
+        mRstd,
+        mDGp,
+        R,
+        ctas,
+        C,
+        V,
+        tpr,
+        ldgs,
+        RPT,
+        et,
+        it_ty,
+        STAGES,
     ).launch(grid=(ctas, 1, 1), block=(64, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(
-        grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+    _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 _PIPE_STAGES = 2
@@ -614,6 +747,7 @@ def _pipe_bwd_cap(R, wn, C, cache_xd):
     global _SM_COUNT
     if _SM_COUNT is None:
         import torch
+
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
     NSM = _SM_COUNT
     if cache_xd:
@@ -677,9 +811,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
         nchunk = ctas
     CHUNK = (ctas + nchunk - 1) // nchunk
 
-    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd),
-            dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta),
-            cutlass.Int32(R), cutlass.Int32(ctas))
+    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, cache_xd, spec.has_mean, has_beta, nchunk, CHUNK)
     fn = _KPIPE.get(key)
@@ -723,8 +855,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
     CHUNK = (ctas + nchunk - 1) // nchunk
     smem_bytes = 2 * STAGES * RPT * C * 2 + C * 2 + (2 * STAGES + 1) * 8 + 64
 
-    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma),
-            cutlass.Int32(R), cutlass.Int32(ctas))
+    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, ldgs, RPT, et, it_ty, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("tiled", params.io_dtype, C, V, tpr, ldgs, RPT, nchunk, CHUNK)
     fn = _KTILED.get(key)
@@ -739,6 +870,7 @@ def _sm_count():
     global _SM_COUNT
     if _SM_COUNT is None:
         import torch
+
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
     return _SM_COUNT
 
@@ -765,8 +897,15 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
 
     args = (
-        dyn(dy2d), dyn(x2d), dyn(gamma), dyn(mean), dyn(rstd),
-        dyn(dx), dyn(dgamma), dyn(dbeta), cutlass.Int32(spec.R),
+        dyn(dy2d),
+        dyn(x2d),
+        dyn(gamma),
+        dyn(mean),
+        dyn(rstd),
+        dyn(dx),
+        dyn(dgamma),
+        dyn(dbeta),
+        cutlass.Int32(spec.R),
     )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
     key = (params.io_dtype,) + ce

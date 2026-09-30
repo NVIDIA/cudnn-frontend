@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """One-backend norm benchmark worker (cuDNN frontend vs cuDNN frost).
 
 Measures fwd + bwd GPU time (CUDA events, l2-flushed, median) for a single
@@ -7,6 +10,7 @@ frost package (backend=frost) without collision.
 
     python _norm_bench_worker.py --backend cudnn --norm_type rms_norm --N 16384 --C 4096 --dtype bfloat16
 """
+
 import argparse
 import sys
 import types
@@ -81,10 +85,8 @@ def run_frost(a):
     dxr = torch.autograd.grad(yr, [xr], grad_outputs=dy.float())[0]
     bwd_maxabs = (dx.float() - dxr).abs().max().item() / max(1.0, dxr.abs().max().item())
 
-    fwd_ms = _median_ms(lambda: norm_fprop(variant, x, g, b, normalized_shape=[a.C], eps=a.epsilon),
-                        a.iters, a.warmup, l2)
-    bwd_ms = _median_ms(lambda: norm_bprop(variant, dy, x, g, mean, rstd, normalized_shape=[a.C], has_beta=a.has_bias),
-                        a.iters, a.warmup, l2)
+    fwd_ms = _median_ms(lambda: norm_fprop(variant, x, g, b, normalized_shape=[a.C], eps=a.epsilon), a.iters, a.warmup, l2)
+    bwd_ms = _median_ms(lambda: norm_bprop(variant, dy, x, g, mean, rstd, normalized_shape=[a.C], has_beta=a.has_bias), a.iters, a.warmup, l2)
     return fwd_ms, bwd_ms, fwd_maxabs, bwd_maxabs
 
 
@@ -104,21 +106,24 @@ def run_cudnn(a):
 
     # ---- forward graph ----
     gf = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    X = gf.tensor_like(x.detach()); S = gf.tensor_like(scale.detach())
+    X = gf.tensor_like(x.detach())
+    S = gf.tensor_like(scale.detach())
     Bt = gf.tensor_like(bias.detach()) if a.has_bias else None
     E = gf.tensor_like(eps)
     if a.norm_type == "rms_norm":
-        Y, INV = gf.rmsnorm(name="RMS", norm_forward_phase=cudnn.norm_forward_phase.TRAINING,
-                            input=X, scale=S, bias=Bt, epsilon=E)
+        Y, INV = gf.rmsnorm(name="RMS", norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=X, scale=S, bias=Bt, epsilon=E)
         MEAN = None
     else:
-        Y, MEAN, INV = gf.layernorm(name="LN", norm_forward_phase=cudnn.norm_forward_phase.TRAINING,
-                                    input=X, scale=S, bias=Bt, epsilon=E)
-    Y.set_output(True).set_data_type(dt); INV.set_output(True).set_data_type(torch.float32)
+        Y, MEAN, INV = gf.layernorm(name="LN", norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=X, scale=S, bias=Bt, epsilon=E)
+    Y.set_output(True).set_data_type(dt)
+    INV.set_output(True).set_data_type(torch.float32)
     if MEAN is not None:
         MEAN.set_output(True).set_data_type(torch.float32)
-    gf.validate(); gf.build_operation_graph()
-    gf.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]); gf.check_support(); gf.build_plans()
+    gf.validate()
+    gf.build_operation_graph()
+    gf.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    gf.check_support()
+    gf.build_plans()
 
     y = torch.empty(N, C, 1, 1, dtype=dt, device=dev)
     invv = torch.empty(N, 1, 1, 1, dtype=torch.float32, device=dev)
@@ -132,7 +137,9 @@ def run_cudnn(a):
     # ---- backward graph ----
     dy = torch.randn(N, C, 1, 1, dtype=dt, device=dev)
     gb = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    DY = gb.tensor_like(dy.detach()); Xb = gb.tensor_like(x.detach()); Sb = gb.tensor_like(scale.detach())
+    DY = gb.tensor_like(dy.detach())
+    Xb = gb.tensor_like(x.detach())
+    Sb = gb.tensor_like(scale.detach())
     INVb = gb.tensor_like(invv)
     if a.norm_type == "rms_norm":
         DX, DS, DB = gb.rmsnorm_backward(name="DRMS", grad=DY, input=Xb, scale=Sb, inv_variance=INVb, has_dbias=a.has_bias)
@@ -142,13 +149,18 @@ def run_cudnn(a):
         DX, DS, DB = gb.layernorm_backward(name="DLN", grad=DY, input=Xb, scale=Sb, mean=MEANb, inv_variance=INVb)
     # cuDNN norm-backward engines want the parameter grads in the IO dtype (the
     # backend declines fp32 DScale with CUDNN_STATUS_NOT_SUPPORTED_DATA_TYPE).
-    DX.set_output(True).set_data_type(dt); DS.set_output(True).set_data_type(dt)
+    DX.set_output(True).set_data_type(dt)
+    DS.set_output(True).set_data_type(dt)
     if DB is not None:
         DB.set_output(True).set_data_type(dt)
-    gb.validate(); gb.build_operation_graph()
-    gb.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]); gb.check_support(); gb.build_plans()
+    gb.validate()
+    gb.build_operation_graph()
+    gb.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    gb.check_support()
+    gb.build_plans()
 
-    dxb = torch.empty_like(x); dsb = torch.empty(1, C, 1, 1, dtype=dt, device=dev)
+    dxb = torch.empty_like(x)
+    dsb = torch.empty(1, C, 1, 1, dtype=dt, device=dev)
     dbb = torch.empty(1, C, 1, 1, dtype=dt, device=dev) if a.has_bias else None
     vpb = {DY: dy.detach(), Xb: x.detach(), Sb: scale.detach(), INVb: invv, DX: dxb, DS: dsb}
     if DB is not None and dbb is not None:
@@ -160,7 +172,8 @@ def run_cudnn(a):
     ws = torch.empty(ws_bytes, device=dev, dtype=torch.uint8)
 
     # run fwd once to populate invv/meanv for a meaningful bwd
-    gf.execute(vpf, ws); torch.cuda.synchronize()
+    gf.execute(vpf, ws)
+    torch.cuda.synchronize()
 
     fwd_ms = _median_ms(lambda: gf.execute(vpf, ws), a.iters, a.warmup, l2)
     bwd_ms = _median_ms(lambda: gb.execute(vpb, ws), a.iters, a.warmup, l2)
@@ -181,8 +194,7 @@ def main():
     a = p.parse_args()
     a.has_bias = bool(a.has_bias)
     fwd_ms, bwd_ms, fwd_maxabs, bwd_maxabs = (run_cudnn if a.backend == "cudnn" else run_frost)(a)
-    print(f"RESULT backend={a.backend} fwd_ms={fwd_ms:.5f} bwd_ms={bwd_ms:.5f} "
-          f"fwd_maxabs={fwd_maxabs:.3e} bwd_maxrel={bwd_maxabs:.3e}")
+    print(f"RESULT backend={a.backend} fwd_ms={fwd_ms:.5f} bwd_ms={bwd_ms:.5f} " f"fwd_maxabs={fwd_maxabs:.3e} bwd_maxrel={bwd_maxabs:.3e}")
 
 
 if __name__ == "__main__":

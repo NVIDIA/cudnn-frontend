@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare cuDNN native norm vs cuDNN frost norm (sm_100) for LN/RMS fprop+bprop.
 
 For each problem shape (from benchmark/norms/configs), spawns two worker
@@ -11,6 +14,7 @@ vs the repo's frost package) in each.
     python benchmark_cudnn_vs_frost.py --dtype float16 --iters 50
     python benchmark_cudnn_vs_frost.py --models llama3-8b,gpt3-175b --csv out.csv
 """
+
 import argparse
 import os
 import re
@@ -52,9 +56,28 @@ def gbps(nbytes, ms):
 
 
 def run_worker(backend, p, dtype, iters, warmup, env):
-    cmd = [sys.executable, _WORKER, "--backend", backend, "--norm_type", p.norm_type,
-           "--N", str(p.N), "--C", str(p.C), "--has_bias", str(int(p.has_bias)),
-           "--dtype", dtype, "--epsilon", str(p.epsilon), "--iters", str(iters), "--warmup", str(warmup)]
+    cmd = [
+        sys.executable,
+        _WORKER,
+        "--backend",
+        backend,
+        "--norm_type",
+        p.norm_type,
+        "--N",
+        str(p.N),
+        "--C",
+        str(p.C),
+        "--has_bias",
+        str(int(p.has_bias)),
+        "--dtype",
+        dtype,
+        "--epsilon",
+        str(p.epsilon),
+        "--iters",
+        str(iters),
+        "--warmup",
+        str(warmup),
+    ]
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     m = re.search(r"fwd_ms=(\S+) bwd_ms=(\S+) fwd_maxabs=(\S+) bwd_maxrel=(\S+)", r.stdout)
     if not m:
@@ -67,6 +90,7 @@ def run_worker(backend, p, dtype, iters, warmup, env):
 def load_presets(models):
     sys.path.insert(0, _REPO)
     from benchmark.norms.configs.all_models import CONFIG
+
     presets = CONFIG.norms
     if models:
         want = set(models.split(","))
@@ -91,9 +115,11 @@ def main():
     env_frost = dict(os.environ)
 
     print(f"\ncuDNN (custom build) vs frost  |  dtype={args.dtype}  iters={args.iters}\n")
-    hdr = (f"{'model':<22} {'type':<10} {'N':>7} {'C':>6} | "
-           f"{'cuDNN fwd':>18} {'frost fwd':>18} {'spd':>5} | "
-           f"{'cuDNN bwd':>18} {'frost bwd':>18} {'spd':>5}")
+    hdr = (
+        f"{'model':<22} {'type':<10} {'N':>7} {'C':>6} | "
+        f"{'cuDNN fwd':>18} {'frost fwd':>18} {'spd':>5} | "
+        f"{'cuDNN bwd':>18} {'frost bwd':>18} {'spd':>5}"
+    )
     print(hdr)
     print("-" * len(hdr))
     rows = []
@@ -110,9 +136,11 @@ def main():
 
         fwd_spd = c["fwd_ms"] / f["fwd_ms"] if f["fwd_ms"] else 0
         bwd_spd = c["bwd_ms"] / f["bwd_ms"] if f["bwd_ms"] else 0
-        print(f"{p.name:<22} {p.norm_type:<10} {p.N:>7} {p.C:>6} | "
-              f"{cell(c['fwd_ms'], fb):>18} {cell(f['fwd_ms'], fb):>18} {fwd_spd:>4.2f}x | "
-              f"{cell(c['bwd_ms'], bb):>18} {cell(f['bwd_ms'], bb):>18} {bwd_spd:>4.2f}x")
+        print(
+            f"{p.name:<22} {p.norm_type:<10} {p.N:>7} {p.C:>6} | "
+            f"{cell(c['fwd_ms'], fb):>18} {cell(f['fwd_ms'], fb):>18} {fwd_spd:>4.2f}x | "
+            f"{cell(c['bwd_ms'], bb):>18} {cell(f['bwd_ms'], bb):>18} {bwd_spd:>4.2f}x"
+        )
         rows.append((p, c, f, fb, bb, fwd_spd, bwd_spd))
 
     if rows:
@@ -126,13 +154,17 @@ def main():
 
     if args.csv and rows:
         with open(args.csv, "w") as fh:
-            fh.write("model,norm_type,N,C,has_bias,dtype,cudnn_fwd_ms,frost_fwd_ms,cudnn_fwd_gbps,frost_fwd_gbps,"
-                     "cudnn_bwd_ms,frost_bwd_ms,cudnn_bwd_gbps,frost_bwd_gbps,fwd_speedup,bwd_speedup\n")
+            fh.write(
+                "model,norm_type,N,C,has_bias,dtype,cudnn_fwd_ms,frost_fwd_ms,cudnn_fwd_gbps,frost_fwd_gbps,"
+                "cudnn_bwd_ms,frost_bwd_ms,cudnn_bwd_gbps,frost_bwd_gbps,fwd_speedup,bwd_speedup\n"
+            )
             for p, c, f, fb, bb, fs, bs in rows:
-                fh.write(f"{p.name},{p.norm_type},{p.N},{p.C},{int(p.has_bias)},{args.dtype},"
-                         f"{c['fwd_ms']:.5f},{f['fwd_ms']:.5f},{gbps(fb,c['fwd_ms']):.1f},{gbps(fb,f['fwd_ms']):.1f},"
-                         f"{c['bwd_ms']:.5f},{f['bwd_ms']:.5f},{gbps(bb,c['bwd_ms']):.1f},{gbps(bb,f['bwd_ms']):.1f},"
-                         f"{fs:.3f},{bs:.3f}\n")
+                fh.write(
+                    f"{p.name},{p.norm_type},{p.N},{p.C},{int(p.has_bias)},{args.dtype},"
+                    f"{c['fwd_ms']:.5f},{f['fwd_ms']:.5f},{gbps(fb,c['fwd_ms']):.1f},{gbps(fb,f['fwd_ms']):.1f},"
+                    f"{c['bwd_ms']:.5f},{f['bwd_ms']:.5f},{gbps(bb,c['bwd_ms']):.1f},{gbps(bb,f['bwd_ms']):.1f},"
+                    f"{fs:.3f},{bs:.3f}\n"
+                )
         print(f"\nwrote {args.csv}")
 
 

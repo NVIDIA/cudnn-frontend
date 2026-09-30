@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """BatchNorm backward, sm_100, CUTLASS primitives.
 
 Per channel ``c`` (one CTA), with ``xhat = (x-mean)*rstd``::
@@ -84,12 +87,33 @@ def _bn_bwd_kernel(
 
 @cute.jit
 def _bn_bwd_host(
-    mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta,
-    C: cutlass.Int32, N: cutlass.Int32, S: cutlass.Int32,
-    bt: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mDY,
+    mX,
+    mGamma,
+    mMean,
+    mRstd,
+    mDX,
+    mDGamma,
+    mDBeta,
+    C: cutlass.Int32,
+    N: cutlass.Int32,
+    S: cutlass.Int32,
+    bt: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     _bn_bwd_kernel(
-        mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta, N, S, bt, has_beta,
+        mDY,
+        mX,
+        mGamma,
+        mMean,
+        mRstd,
+        mDX,
+        mDGamma,
+        mDBeta,
+        N,
+        S,
+        bt,
+        has_beta,
     ).launch(grid=(C, 1, 1), block=(bt, 1, 1))
 
 
@@ -105,9 +129,17 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     dbeta = torch.zeros(spec.C, dtype=torch.float32, device=x3d.device)
 
     args = (
-        dyn(dy3d), dyn(x3d), dyn(gamma), dyn(saved_mean), dyn(saved_rstd),
-        dyn(dx), dyn(dgamma), dyn(dbeta),
-        cutlass.Int32(spec.C), cutlass.Int32(spec.N), cutlass.Int32(spec.S),
+        dyn(dy3d),
+        dyn(x3d),
+        dyn(gamma),
+        dyn(saved_mean),
+        dyn(saved_rstd),
+        dyn(dx),
+        dyn(dgamma),
+        dyn(dbeta),
+        cutlass.Int32(spec.C),
+        cutlass.Int32(spec.N),
+        cutlass.Int32(spec.S),
     )
     ce = (cfg.block_threads, has_beta)
     key = (params.io_dtype,) + ce

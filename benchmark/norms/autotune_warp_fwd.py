@@ -1,8 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Autotune the warp LN/RMS forward per shape: sweep (wn, persist-cap), record
 GB/s, report the fastest config. Data feeds a persist-cap / wn heuristic.
 
     python autotune_warp_fwd.py            # sweep config shapes, write CSV
 """
+
 import os
 import sys
 import types
@@ -10,7 +14,10 @@ import types
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 D = os.path.join(_REPO, "python", "cudnn")
-stub = types.ModuleType("cudnn"); stub.__path__ = [D]; stub.pygraph = type("pygraph", (), {}); sys.modules["cudnn"] = stub
+stub = types.ModuleType("cudnn")
+stub.__path__ = [D]
+stub.pygraph = type("pygraph", (), {})
+sys.modules["cudnn"] = stub
 sys.path.insert(0, _REPO)
 
 import numpy as np
@@ -27,24 +34,40 @@ l2 = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.int8)
 
 
 def dev_ms(fn, it=30, wu=12):
-    for _ in range(wu): fn()
-    torch.cuda.synchronize(); ts = []
+    for _ in range(wu):
+        fn()
+    torch.cuda.synchronize()
+    ts = []
     for _ in range(it):
         l2.zero_()
         with profile(activities=[ProfilerActivity.CUDA]) as p:
-            with record_function("op"): fn()
+            with record_function("op"):
+                fn()
             torch.cuda.synchronize()
-        ka = p.key_averages(); ev = [i for i in ka if i.key == "op"]
+        ka = p.key_averages()
+        ev = [i for i in ka if i.key == "op"]
         ts.append((ev[0].device_time if ev else sum(i.device_time for i in ka if i.device_time > 0)) / 1000)
     return float(np.median(ts))
 
 
 # cuDNN reference GB/s (from the latest sweep; ~10-20% run variance)
-CUDNN = {"llama3-8b": 5779, "llama3-70b": 5075, "llama31-405b": 5246, "llama4-e16": 5520,
-         "gpt3-175b": 3398, "mixtral-8x7b": 5420, "mixtral-8x22b": 5283, "nemotronh-56b": 5466,
-         "deepseek-v3-2048x4096": 3497, "deepseek-v3-131072x128": 3227, "deepseek-v3-8192x128": 992,
-         "qwen3-235b": 5538, "qwen3-30b-4096x2048": 4155, "qwen3-30b-131072x128": 3219,
-         "qwen3-30b-16384x128": 1515}
+CUDNN = {
+    "llama3-8b": 5779,
+    "llama3-70b": 5075,
+    "llama31-405b": 5246,
+    "llama4-e16": 5520,
+    "gpt3-175b": 3398,
+    "mixtral-8x7b": 5420,
+    "mixtral-8x22b": 5283,
+    "nemotronh-56b": 5466,
+    "deepseek-v3-2048x4096": 3497,
+    "deepseek-v3-131072x128": 3227,
+    "deepseek-v3-8192x128": 992,
+    "qwen3-235b": 5538,
+    "qwen3-30b-4096x2048": 4155,
+    "qwen3-30b-131072x128": 3219,
+    "qwen3-30b-16384x128": 1515,
+}
 CAP_MULTS = [2, 3, 4, 6, 8, 0]  # 0 = no cap (one tile/CTA)
 
 

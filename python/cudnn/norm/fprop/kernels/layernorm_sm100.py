@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """LayerNorm forward, sm_100, CUTLASS primitives.
 
 One CTA owns one normalization group (a row of the ``[R, M]`` view). Two-pass:
@@ -143,15 +146,39 @@ def _ln_fwd_kernel(
 
 @cute.jit
 def _ln_fwd_host(
-    mX, mY, mGamma, mBeta, mMean, mRstd,
-    R: cutlass.Int32, eps: cutlass.Float32,
-    M: cutlass.Constexpr, V: cutlass.Constexpr, bt: cutlass.Constexpr,
-    elem_bytes: cutlass.Constexpr, stage_mode: cutlass.Constexpr, vec: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mX,
+    mY,
+    mGamma,
+    mBeta,
+    mMean,
+    mRstd,
+    R: cutlass.Int32,
+    eps: cutlass.Float32,
+    M: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    bt: cutlass.Constexpr,
+    elem_bytes: cutlass.Constexpr,
+    stage_mode: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     _ln_fwd_kernel(
-        mX, mY, mGamma, mBeta, mMean, mRstd, eps,
-        M, V, bt, elem_bytes, stage_mode, vec, has_mean, has_beta,
+        mX,
+        mY,
+        mGamma,
+        mBeta,
+        mMean,
+        mRstd,
+        eps,
+        M,
+        V,
+        bt,
+        elem_bytes,
+        stage_mode,
+        vec,
+        has_mean,
+        has_beta,
     ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
 
 
@@ -171,8 +198,14 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
     rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
 
     args = (
-        dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd),
-        cutlass.Int32(spec.R), cutlass.Float32(eps),
+        dyn(x2d),
+        dyn(y),
+        dyn(gamma),
+        dyn(beta),
+        dyn(mean),
+        dyn(rstd),
+        cutlass.Int32(spec.R),
+        cutlass.Float32(eps),
     )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
     key = (params.io_dtype,) + ce

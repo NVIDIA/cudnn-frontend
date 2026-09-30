@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """sm_100 norm backward kernels (CUTLASS primitives).
 
 One entry module per flavor; the shared cp.async row staging + block reduction

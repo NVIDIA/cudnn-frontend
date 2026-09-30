@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """sm_100 norm forward: torch-tensor API + per-flavor CUTLASS-primitive kernels.
 
     from cudnn.norm.fprop import norm_fprop

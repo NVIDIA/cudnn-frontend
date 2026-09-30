@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Norm variant definitions, layout derivation, and sm_100 kernel config.
 
 This mirrors ``cudnn.sdpa.fwd.config_sm100`` for the norm op family. Three layers:
@@ -122,8 +125,13 @@ def rowwise_spec(
             raise ValueError(f"numel {total} not divisible by normalized size {D}")
         N = total // D
         return RowwiseSpec(
-            variant=variant, R=N, M=D, gamma_len=D,
-            groups_per_sample=1, channels_per_group=0, gamma_inner_span=1,
+            variant=variant,
+            R=N,
+            M=D,
+            gamma_len=D,
+            groups_per_sample=1,
+            channels_per_group=0,
+            gamma_inner_span=1,
             has_mean=(variant == NormVariant.LAYER_NORM),
         )
 
@@ -133,8 +141,13 @@ def rowwise_spec(
         N, C = shape[0], shape[1]
         HW = _prod(shape[2:]) if len(shape) > 2 else 1
         return RowwiseSpec(
-            variant=variant, R=N * C, M=HW, gamma_len=C,
-            groups_per_sample=C, channels_per_group=1, gamma_inner_span=HW,
+            variant=variant,
+            R=N * C,
+            M=HW,
+            gamma_len=C,
+            groups_per_sample=C,
+            channels_per_group=1,
+            gamma_inner_span=HW,
             has_mean=True,
         )
 
@@ -150,8 +163,13 @@ def rowwise_spec(
         Cg = C // G
         HW = _prod(shape[2:]) if len(shape) > 2 else 1
         return RowwiseSpec(
-            variant=variant, R=N * G, M=Cg * HW, gamma_len=C,
-            groups_per_sample=G, channels_per_group=Cg, gamma_inner_span=HW,
+            variant=variant,
+            R=N * G,
+            M=Cg * HW,
+            gamma_len=C,
+            groups_per_sample=G,
+            channels_per_group=Cg,
+            gamma_inner_span=HW,
             has_mean=True,
         )
 

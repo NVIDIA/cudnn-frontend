@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """High-level torch-tensor dispatch for the sm_100 norm forward kernels.
 
 Takes torch tensors in their natural layout, derives the
@@ -99,15 +102,11 @@ def norm_fprop(
             if wcfg is not None:
                 from .kernels import layernorm_warp_sm100
 
-                y2, mean, rstd = layernorm_warp_sm100.forward(
-                    spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params
-                )
+                y2, mean, rstd = layernorm_warp_sm100.forward(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params)
                 return y2.reshape(x.shape), mean, rstd
 
         cfg = make_cfg(params, spec.M)
-        y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(
-            spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params
-        )
+        y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params)
         return y2.reshape(x.shape), mean, rstd
 
     if variant == NormVariant.BATCH_NORM:
@@ -116,8 +115,11 @@ def norm_fprop(
             gamma = torch.ones(spec.C, dtype=x.dtype, device=x.device)
         update_running = bool(training and running_mean is not None and running_var is not None)
         params = TemplateParams(
-            variant=variant, io_dtype=io, has_beta=(beta is not None),
-            training=training, update_running=update_running,
+            variant=variant,
+            io_dtype=io,
+            has_beta=(beta is not None),
+            training=training,
+            update_running=update_running,
         )
         eb = DTYPE_BYTES[io]
 
@@ -126,8 +128,17 @@ def norm_fprop(
             N, C, H, W = (int(v) for v in x.shape)
             x2d = x.permute(0, 2, 3, 1).reshape(N * H * W, C)  # view, no copy
             y2d, sm, sr = batchnorm_nhwc_sm100.forward(
-                spec, x2d, gamma, beta, eps=eps, momentum=momentum, training=training,
-                running_mean=running_mean, running_var=running_var, cfg=None, params=params,
+                spec,
+                x2d,
+                gamma,
+                beta,
+                eps=eps,
+                momentum=momentum,
+                training=training,
+                running_mean=running_mean,
+                running_var=running_var,
+                cfg=None,
+                params=params,
             )
             y = y2d.reshape(N, H, W, C).permute(0, 3, 1, 2)
             return y, sm, sr
@@ -136,17 +147,34 @@ def norm_fprop(
         if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
             x3d = x.reshape(spec.N, spec.C, spec.S)
             y3, sm, sr = batchnorm_nchw_sm100.forward(
-                spec, x3d, gamma, beta, eps=eps, momentum=momentum, training=training,
-                running_mean=running_mean, running_var=running_var, cfg=None, params=params,
+                spec,
+                x3d,
+                gamma,
+                beta,
+                eps=eps,
+                momentum=momentum,
+                training=training,
+                running_mean=running_mean,
+                running_var=running_var,
+                cfg=None,
+                params=params,
             )
             return y3.reshape(x.shape), sm, sr
 
-        cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb),
-                  stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
+        cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb), stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
         y3, sm, sr = batchnorm_sm100.forward(
-            spec, x3d, gamma, beta, eps=eps, momentum=momentum, training=training,
-            running_mean=running_mean, running_var=running_var, cfg=cfg, params=params,
+            spec,
+            x3d,
+            gamma,
+            beta,
+            eps=eps,
+            momentum=momentum,
+            training=training,
+            running_mean=running_mean,
+            running_var=running_var,
+            cfg=cfg,
+            params=params,
         )
         return y3.reshape(x.shape), sm, sr
 

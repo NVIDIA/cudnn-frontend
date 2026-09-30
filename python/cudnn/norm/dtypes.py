@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared dtype tables for the sm_100 norm kernels (single source of truth).
 
 Norm kernels currently support the three high/standard-precision floating types
@@ -44,9 +47,7 @@ def torch_dtype_to_str(dt: Any) -> str:
     try:
         return table[dt]
     except KeyError:
-        raise ValueError(
-            f"norm sm_100 kernels support {SUPPORTED_IO_DTYPES} only; got torch dtype {dt}"
-        ) from None
+        raise ValueError(f"norm sm_100 kernels support {SUPPORTED_IO_DTYPES} only; got torch dtype {dt}") from None
 
 
 def str_to_torch_dtype(s: str) -> Any:

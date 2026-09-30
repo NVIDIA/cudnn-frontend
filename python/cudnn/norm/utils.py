@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Low-level CuTe/DLPack helpers shared by the sm_100 norm kernels.
 
 Mirrors the role of ``cudnn.sdpa.utils``: DLPack -> cute.Tensor conversion and a
