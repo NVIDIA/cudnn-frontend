@@ -134,7 +134,7 @@ def _moe_graph(combo: str, E: int = 2, S: int = 512, N: int = 256, K: int = 512,
     sf_kw = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
     SFA = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, **sf_kw)
     SFB = g.tensor(name="SFB", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, **sf_kw)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[num_groups + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block])
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block, 1])
     out = g.moe_grouped_matmul(tok_d, w_d, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")

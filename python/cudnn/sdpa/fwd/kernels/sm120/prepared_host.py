@@ -47,7 +47,7 @@ def _operands(
     q = _bshd(q_ptr, b, sq, qh, d_qk, q_strides, kernel.thd_varlen)
     k = _bshd(k_ptr, b, skv, kh, d_qk, k_strides, kernel.thd_varlen)
     v = _bshd(v_ptr, b, skv, kh, d_v, v_strides, kernel.thd_varlen)
-    o = _bshd(o_ptr, b * kernel.split_kv, sq, qh, d_v, o_strides, kernel.thd_varlen)
+    o = _bshd(o_ptr, b * kernel.split_kv, sq, qh, d_v // (2 if getattr(kernel, "o_block_scale", 0) == 16 else 1), o_strides, kernel.thd_varlen)
     lse = None
     if cutlass.const_expr(lse_ptr is not None):
         if cutlass.const_expr(kernel.thd_varlen):
@@ -185,7 +185,9 @@ def fp8_host(
     descale_v_ptr: cute.Pointer,
     scale_o_ptr: Optional[cute.Pointer],
     amax_o_ptr: cute.Pointer,
+    sf_o_ptr: Optional[cute.Pointer],
     has_amax: cutlass.Constexpr[bool],
+    sfo_geometry: cutlass.Constexpr,
     kernel: cutlass.Constexpr,
     qh: cutlass.Constexpr[int],
     kh: cutlass.Constexpr[int],
@@ -229,8 +231,17 @@ def fp8_host(
 
     # The attention epilogue uses atomicMax on the nonnegative fp32 bit pattern.
     amax_i32 = cute.make_ptr(cutlass.Int32, amax_o_ptr.toint(), cute.AddressSpace.gmem, assumed_align=4)
-    if cutlass.const_expr(kernel.split_kv == 1):
+    if cutlass.const_expr(kernel.split_kv == 1 and has_amax):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    kwargs = dict(prepared=True)
+    if cutlass.const_expr(sfo_geometry is not None):
+        kwargs.update(
+            sf_o=scalar(sf_o_ptr),
+            sfo_plane_stride=cutlass.Int64(sfo_geometry[0]),
+            sfo_row_off_b=cutlass.Int64(sfo_geometry[1]),
+            sfo_col_off_h=cutlass.Int64(sfo_geometry[2]),
+            sfo_cols=cutlass.Int64(sfo_geometry[3]),
+        )
     kernel(
         q,
         k,
@@ -240,7 +251,7 @@ def fp8_host(
         sinks,
         q_lens,
         kv_lens,
-        scalar(amax_i32),
+        scalar(amax_i32) if cutlass.const_expr(has_amax) else None,
         scale_softmax_log2,
         cutlass.Float32(1.0),
         scalar(descale_q_ptr),
@@ -253,14 +264,28 @@ def fp8_host(
         thd_lens_form,
         n_ctas,
         stream,
-        prepared=True,
+        **kwargs,
     )
     if cutlass.const_expr(has_amax and kernel.split_kv == 1):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
 def compile_host(
-    kernel, dtype, qh, kh, d_qk, d_v, has_lse, persistent_ctas, cache_key, thd_max_sq=0, *, output_dtype=None, has_amax=False, scale_o_in_combine=False
+    kernel,
+    dtype,
+    qh,
+    kh,
+    d_qk,
+    d_v,
+    has_lse,
+    persistent_ctas,
+    cache_key,
+    thd_max_sq=0,
+    *,
+    output_dtype=None,
+    has_amax=False,
+    scale_o_in_combine=False,
+    sfo_geometry=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -296,7 +321,18 @@ def compile_host(
         ptr(cutlass.Int32, 4) if kernel.thd_varlen else None,
         cutlass.Int32(0) if kernel.thd_varlen else None,
         cutlass.Int32(0),
-        *((ptr(cutlass.Float32, 4),) * 3 + (None if scale_o_in_combine else ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4), has_amax) if fp8 else ()),
+        *(
+            (ptr(cutlass.Float32, 4),) * 3
+            + (
+                None if scale_o_in_combine else ptr(cutlass.Float32, 4),
+                ptr(cutlass.Float32, 4),
+                ptr(cutlass.Int8) if sfo_geometry is not None else None,
+                has_amax,
+                sfo_geometry,
+            )
+            if fp8
+            else ()
+        ),
         kernel,
         qh,
         kh,

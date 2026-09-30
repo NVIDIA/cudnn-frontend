@@ -99,9 +99,9 @@ operations for CUDA Graph replay may provide a caller-owned
 captured call site may replay, and do not share it between call sites that may
 overlap. This lets multiple same-signature calls share one compiled kernel
 without sharing mutable runtime TMA descriptors. Callers that omit this
-argument retain the compatibility behavior that isolates cached API instances
-by explicit dense output address; discrete callers retain the compiled
-operation's internal workspace.
+argument use the compiled operation's internal workspace, which is shared by
+every same-signature call; such calls must not run concurrently on different
+streams.
 
 ```python
 workspace = torch.empty(

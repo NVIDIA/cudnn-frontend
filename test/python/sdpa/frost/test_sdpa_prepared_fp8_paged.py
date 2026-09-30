@@ -45,9 +45,10 @@ def _overrides(bufs, tensors, names):
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_prepared_fp8_paged_rebind(d, hnd, split, in_key, dtype, monkeypatch):
-    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
+    import cutlass.cute.runtime as runtime
 
-    monkeypatch.setattr(fp8_host, "make_fake_aux", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("paged FP8 reentered tensor compilation"))
     g, vp, ws, bufs, tensors = _case(d=d, hnd=hnd, split=split, dtype=dtype, in_key=in_key)
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared is not None and prepared.spec.paged
@@ -121,9 +122,10 @@ def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, monkeypatch):
 @pytest.mark.parametrize("d,dv,split", [(64, 64, 1), (64, 64, 4), (112, 96, 1), (112, 96, 4), (384, 320, 1)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_prepared_fp8_dense_head_envelopes(d, dv, split, dtype, monkeypatch):
-    from cudnn.sdpa.fwd.kernels import _fp8_host as fp8_host
+    import cutlass.cute.runtime as runtime
 
-    monkeypatch.setattr(fp8_host, "make_fake_aux", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("envelope reentered tensor compilation"))
     g, vp, ws, bufs, _ = shared._case(d=d, dv=dv, sq=16, skv=256, output_dtype=dtype, split_kv=split, override=True)
     assert g._compiled_plans[g._plan_index]._prepared is not None
     g.execute(vp, ws)
@@ -227,7 +229,14 @@ def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect
 @pytest.mark.parametrize("v_table_layout", ["strided", "batch_inner"])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("hnd", [False, True])
-def test_fp8_paged_distinct_table_strides_keep_tensor_executor(v_table_layout, split, hnd):
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fp8_paged_distinct_table_strides_prepared(v_table_layout, split, hnd, override, dtype, monkeypatch):
+    import cutlass.cute as cute
+    import cutlass.cute.runtime as runtime
+
+    monkeypatch.setattr(runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("distinct tables reentered tensor compilation"))
+    monkeypatch.setattr(runtime, "make_fake_compact_tensor", lambda *a, **k: pytest.fail("distinct tables reentered tensor compilation"))
     g, vp, ws, bufs, tensors = paged._run_graph_fp8(
         2,
         4,
@@ -235,22 +244,89 @@ def test_fp8_paged_distinct_table_strides_keep_tensor_executor(v_table_layout, s
         128,
         16,
         16,
-        [256, 193],
+        [256, 256],
         hnd,
-        out_dt=torch.bfloat16,
+        out_dt=dtype,
         s_q=16,
         explicit_split=split,
         return_case=True,
         v_table_layout=v_table_layout,
+        override=override,
     )
-    assert g._compiled_plans[g._plan_index]._prepared is None
+    prepared = g._compiled_plans[g._plan_index]._prepared
+    assert prepared is not None
+    owner = prepared.spec.owner
     assert bufs["k_table"].stride() != bufs["v_table"].stride()
-    # The helper already checks O, Stats and Amax against a reference on the
-    # nonprepared path; replay also retains both declared table strides.
+    monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("table rebinding must reuse its artifact"))
+    # New allocations preserve the declared geometry; K/V page values differ.
+    for name in ("k_table", "v_table"):
+        old = bufs[name]
+        bufs[name] = torch.empty_strided(old.shape, old.stride(), dtype=old.dtype, device=old.device)
+        bufs[name].copy_(old if name == "k_table" else old.flip(2))
+        vp[tensors[name]] = bufs[name]
+    overrides = {}
+    if override:
+        old = bufs["k_table"]
+        raw = torch.full((2, 1, old.shape[2] * 3 + 1, 1), -1, device="cuda", dtype=torch.int32)
+        bufs["k_table"] = raw[:, :, 1::3, :]
+        bufs["k_table"].copy_(old)
+        vp[tensors["k_table"]] = bufs["k_table"]
+        overrides = _overrides(bufs, tensors, ("k_table", "v_table"))
+    g.execute(vp, torch.empty_like(ws), **overrides)
+    _check(bufs)
     with shared._cuda_graph() as graph:
         with torch.cuda.graph(graph):
-            g.execute(vp, ws)
-        old_o = bufs["o"].clone()
+            g.execute(vp, ws, **overrides)
+        bufs["k_table"].copy_(bufs["k_table"].flip(2))
+        bufs["descale_v"].mul_(0.5)
         bufs["o"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
         graph.replay()
-        torch.testing.assert_close(bufs["o"], old_o, atol=0, rtol=0)
+        _check(bufs)
+    assert prepared.spec.owner is owner
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("role", ["k", "v"])
+@pytest.mark.parametrize("product", [False, True])
+@pytest.mark.parametrize("split", [1, 4])
+def test_prepared_fp8_independent_table_physical_stride_int64(role, product, split):
+    batch, stride, origin = (5, 2**30 + 16, 2**31) if product else (2, 2**32 + 16, 0)
+    pages = 2
+    extent = origin + (batch - 1) * stride + pages
+    if torch.cuda.mem_get_info()[0] < extent * 4 + 2**30:
+        pytest.skip("wide physical page table requires additional GPU memory")
+    g, vp, ws, bufs, tensors = _case(split=split, b=batch, pages=pages)
+    try:
+        storage = torch.empty(extent, device="cuda", dtype=torch.int32)
+    except torch.OutOfMemoryError:
+        pytest.skip("wide physical page-table allocation unavailable")
+    name = role + "_table"
+    old = bufs[name]
+    # Signed Int32 address products stay inside allocated prefix guard storage.
+    # An intentionally narrowed control therefore reads valid wrong page IDs.
+    decoys = []
+    for bi in range(batch):
+        offset = bi * stride
+        wrapped = ((offset + 2**31) % 2**32) - 2**31
+        if wrapped != offset:
+            decoy = storage[origin + wrapped : origin + wrapped + pages]
+            decoy.fill_(0)
+            decoys.append(decoy)
+    table = storage.as_strided(old.shape, (stride, stride, 1, 1), origin)
+    table.copy_(old)
+    bufs[name] = table
+    vp[tensors[name]] = table
+    overrides = _overrides(bufs, tensors, (name,))
+    g.execute(vp, ws, **overrides)
+    _check(bufs)
+    with shared._cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            g.execute(vp, ws, **overrides)
+        table.copy_(table.flip(2))
+        bufs["o"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        graph.replay()
+        _check(bufs)
+    for decoy in decoys:
+        assert torch.count_nonzero(decoy) == 0

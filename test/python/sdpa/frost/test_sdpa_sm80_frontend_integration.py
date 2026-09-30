@@ -275,7 +275,7 @@ def test_bwd_engine_end_to_end_d256():
 @pytest.mark.parametrize("gqa", [1, 4], ids=["mha", "gqa4x"])
 def test_fwd_engine_bhsd_contiguous_layout(gqa):
     """dense_flex delivery: BHSD-contiguous buffers (the test_mhas_v2 norm)
-    and GQA head expansion must both be normalized by the lowering — this was
+    and native GQA must both address the declared layout correctly — this was
     the CI 'stride order' failure of 2026-07-29."""
     h_kv = H // gqa
     g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -360,9 +360,9 @@ def test_engine_execute_does_not_allocate():
     per-execute buffer is carved from the caller's workspace.  Asserted on the
     allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
     clone/contiguous on the execute path would advance.  The geometry is
-    chosen to force real staging on both directions: GQA (fwd K/V head
-    expansion) and a strided stats buffer (fwd LSE staging + bwd gather),
-    so the fwd workspace is non-zero too."""
+    chosen to cover native forward GQA/strided Stats and the backward's
+    remaining staging. Forward must now report zero workspace: its prepared
+    kernel addresses both layouts directly."""
     H_KV = H // 2
     st_kv = _bshd_stride(B, H_KV, S, D)
     # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
@@ -378,7 +378,7 @@ def test_engine_execute_does_not_allocate():
     o.set_output(True).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
     _native_then_pin(g, _FWD)
-    assert g.get_workspace_size() > 0, "GQA expansion + strided-LSE staging must be carved, not allocated"
+    assert g.get_workspace_size() == 0, "prepared forward must address GQA and strided Stats without staging"
     torch.manual_seed(0)
     q_buf = _buf()
     k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)

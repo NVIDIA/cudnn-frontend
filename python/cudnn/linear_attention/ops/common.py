@@ -107,7 +107,9 @@ def make_summary_cache_key(
     do_dtype=None,
     do_shape=None,
     q_shape=None,
+    enable_gate_decay_split=False,
 ):
+    """Return the complete plan-cache identity for a linear-attention summary."""
     return (
         op,
         total,
@@ -146,6 +148,7 @@ def make_summary_cache_key(
         q_shape,
         device,
         plan_name,
+        bool(enable_gate_decay_split),
     )
 
 

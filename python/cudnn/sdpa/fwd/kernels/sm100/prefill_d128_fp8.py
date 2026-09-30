@@ -64,7 +64,7 @@ path clamps its runtime K/V descriptors to a packed KV total a pool does not
 have.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 import os
 import sys
 from functools import lru_cache
@@ -128,11 +128,11 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.pointwise import (
     exp2_mixed,
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.0: the MASK_NONE fast path uses manual tcgen05_ld + row_max_reduction.
+    # cc10.3+ (FUSED_LDTM_STAT) fuses load + row-max into tmem_load_max_reduction_x64.
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
     fp32_to_e2m1_pack,
@@ -211,6 +211,11 @@ _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
 _E2E_CHUNK = CFG.TILE_N // CFG.N_BMM2_CHUNKS
 _E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# LDTM.STAT -- fused ``tcgen05.ld.red.f32.max`` (S_acc load + row-max in one op) --
+# is a cc10.3+ capability; cc10.0 lacks it and keeps the manual tcgen05_ld +
+# software row_max_reduction (default 0).  api_dsl sets it from the device
+# capability at compile time; a distinct value is a distinct specialization.
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off): the MUFU.EX2 the softmax
 # still issues per row per KV step is the alpha exp2 plus the non-emulated columns (97 on, 129 off).
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
@@ -437,7 +442,7 @@ def _kernel(
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
     scale_o_t: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     seq_q_lens_addr: cutlass.Int64,
     o_partial_f32: Optional[cute.Tensor],
     # Paged KV: [B, max_pages] int32 page ids per batch, one table for K and
@@ -452,12 +457,21 @@ def _kernel(
     # Block-scaled O (CFG.O_BLOCK_SCALE > 0): SF_O byte buffer + its 128x4-atom
     # geometry (see _correction_warp_group). None / 0 when the mode is off.
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
-    if cutlass.const_expr(CFG.SPLIT_KV > 1):
+    # The prepared plan fixes this byte geometry; retain Int64 while allowing
+    # constant folding of the SF atom's offset arithmetic.
+    if cutlass.const_expr(prepared_sfo_geometry is not None):
+        sfo_plane_stride = cutlass.Int64(prepared_sfo_geometry[0])
+        sfo_row_off_b = cutlass.Int64(prepared_sfo_geometry[1])
+        sfo_col_off_h = cutlass.Int64(prepared_sfo_geometry[2])
+        sfo_cols = cutlass.Int64(prepared_sfo_geometry[3])
+
+    if cutlass.const_expr(CFG.SPLIT_KV > 1 and amax_o_tensor is not None):
         _initialize_split_amax(amax_o_tensor)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1637,7 +1651,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
-    tmem_ptr_i32,
+    tmem_base,
     bars,
     q_abs,
     eff_seqlen_kv,
@@ -1669,7 +1683,6 @@ def _softmax_kv_body(
     RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
-    tmem_base = tmem_ptr_i32.load()
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
     p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
     stats_addr = tmem_base + cutlass.Int32(stats_off)
@@ -1709,8 +1722,21 @@ def _softmax_kv_body(
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3+: fused HW row-max -- one tcgen05.ld.red.f32.max per 64-col chunk
+        # does the S_acc load AND the row-max in one op, returning 64 data regs
+        # plus the max at index CHUNK, dropping the software max tree.
+        # Unmasked tiles only: the fused .max reduces before a mask could be
+        # applied, so masked tiles keep the software path above.
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(N_CHUNKS)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
-        # SM100: manual row-max (no LDTM.STAT / tmem_load_max_reduction_tile) —
+        # cc10.0: manual row-max (no LDTM.STAT / tmem_load_max_reduction_x64) --
         # the masked path's pattern sans mask.  S_acc is FP32 regardless of dtype.
         raw_chunks = [
             nvvm.tcgen05_ld(
@@ -1729,10 +1755,6 @@ def _softmax_kv_body(
     # size= explicit — Vector.shape[0] is MLIR-typed after vec_concat.
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2
-
-    # sync the warpgroups before the stat-store.
-    if sub_tile_id == 1:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     # Online softmax with RESCALE_THRESHOLD skip.
     old_total_max = total_max
@@ -1766,6 +1788,17 @@ def _softmax_kv_body(
     # the same factor, so normalization cancels it (see P_CAST_LOG2_SCALE).
     reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
+    # Exp-burst mutual exclusion between the two softmax warpgroups (FA4-style
+    # ping-pong).  The two softmax warps on each SM sub-partition share ONE
+    # MUFU pipe: with both bursts in flight each runs at half rate and the
+    # S -> softmax -> P -> PV chain of every sub-tile stretches by a full burst
+    # (measured: the tensor pipe sat at 57 % vs cuDNN's 67 % on B300 fp8, with
+    # the softmax warps' biggest stall being the wait for S).  Named barrier 8
+    # admits WG0's burst, 9 admits WG1's; each WG arrives on the other's after
+    # its last exp2 (below), and WG1 arrives once on 8 before its loop as the
+    # bootstrap.  The S load, row-max and alpha publish above stay outside the
+    # gate so they overlap the other WG's burst.
+    nvvm.barrier_cta_sync(barrier_id=8 + sub_tile_id, thread_count=256)
     chunk_S_0 = reg_S[0:CHUNK].vec
     # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Gated per arch
     # at trace time (_E2E_ENABLED): off, both chunks are the plain MUFU exp2 -- the develop spelling.
@@ -1773,6 +1806,8 @@ def _softmax_kv_body(
         chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
     else:
         chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    if cutlass.const_expr(N_CHUNKS != 2):
+        cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
     # Hoist chunk-0 sum before cast to overlap with cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
@@ -1791,6 +1826,8 @@ def _softmax_kv_body(
             deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
             deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        # Burst done: admit the other warpgroup's burst.
+        cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
         chunk_P_1_fp8 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
@@ -1802,9 +1839,6 @@ def _softmax_kv_body(
         )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-    if sub_tile_id == 0:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
@@ -1841,6 +1875,15 @@ def _softmax_warp_group(
     """
     # Wait on MMA's TMEM-publish bar BEFORE tmem_ptr_i32.load() — else stale base.
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+    if sub_tile_id == 1:
+        # Ping-pong bootstrap: WG0's first exp burst is admitted by WG1 (see
+        # _softmax_kv_body); every later admission comes from the other WG's
+        # burst end, so the two bursts alternate for the whole kernel.
+        cute.arch.barrier_arrive(barrier_id=8, number_of_threads=256)
+    # The base is published once and never changes: load it here, not per KV
+    # iteration (the per-iteration LDS + R2UR sat on the critical path right
+    # before every LDTM of S).
+    tmem_base_sm = tmem_ptr_i32.load()
 
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
@@ -1918,7 +1961,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1938,7 +1981,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1957,7 +2000,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1976,7 +2019,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -2113,14 +2156,13 @@ def _correction_warp_group(
         else:
             bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
+        tmem_base_iter = tmem_ptr_i32.load()  # published once; hoisted out of the KV loop
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
-            tmem_base_iter = tmem_ptr_i32.load()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 stats_off = LAYOUT.STATS_OFF + qs * LAYOUT.STATS_STRIDE
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
 
                 bars.mb_stat_full[qs].wait(stat_full_phase)
-
                 stats_addr = tmem_base_iter + cutlass.Int32(stats_off)
                 stats_vec = nvvm.tcgen05_ld(
                     "32x32b",
@@ -2288,8 +2330,9 @@ def _correction_warp_group(
 
             # amax_o = max over valid rows of |o_scaled| (the fp32 pre-cast output). Divided
             # by scale_o in api to give the pre-quant output amax (cuDNN FP8 ref, in-kernel).
-            _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-            _amax_o_local = cutlass.Float32(0.0)
+            if cutlass.const_expr(amax_o_tensor is not None):
+                _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
+                _amax_o_local = cutlass.Float32(0.0)
 
             sO_sub_base = sO[qs].base
 
@@ -2343,7 +2386,8 @@ def _correction_warp_group(
 
                     for _i in cutlass.range_constexpr(O_CHUNK):
                         _e = o_elems[_i]
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                        if cutlass.const_expr(amax_o_tensor is not None):
+                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
 
                     # Plain range (not range_constexpr) — extraction at Python trace time.
                     o_packed_v = fp32_to_fp8_pack(
@@ -2388,7 +2432,7 @@ def _correction_warp_group(
 
                 _sfo_r = q_row_global + batch_idx * sfo_row_off_b
                 _sfo_c0 = row_head_idx * sfo_col_off_h
-                _sfo_plane = (batch_idx * (n_qh * cutlass.Int32(HEADS_PER_TILE)) + row_head_idx) * sfo_plane_stride
+                _sfo_plane = (cutlass.Int64(batch_idx) * (cutlass.Int64(n_qh) * HEADS_PER_TILE) + row_head_idx) * sfo_plane_stride
                 _sfo_row_part = (
                     _sfo_plane
                     + (_sfo_r >> cutlass.Int32(7)) * (sfo_cols << cutlass.Int32(7))
@@ -2424,7 +2468,8 @@ def _correction_warp_group(
                     for _i in cutlass.range_constexpr(_GROUP):
                         _e = o_elems[_i]
                         g_amax = cute.math.max(g_amax, cute.math.max(_e, -_e))
-                    _amax_o_local = cute.math.max(_amax_o_local, g_amax)
+                    if cutlass.const_expr(amax_o_tensor is not None):
+                        _amax_o_local = cute.math.max(_amax_o_local, g_amax)
 
                     if cutlass.const_expr(CFG.DTYPE_O == 4):
                         # E2M1 max-normal is 6: the E4M3 scale maps the block amax onto it.
@@ -2495,7 +2540,8 @@ def _correction_warp_group(
                     )
                     for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                         _e = o_scaled_h[_i]
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                        if cutlass.const_expr(amax_o_tensor is not None):
+                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
                     o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
 
                     col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
@@ -2512,7 +2558,7 @@ def _correction_warp_group(
             # over partials over-reports the output amax (~2.9x at 8 splits).
             # sm100/split_combine computes it over the recombined O instead;
             # this write has to stay out of the way, since atomicMax only grows.
-            if cutlass.const_expr(SPLIT_KV == 1):
+            if cutlass.const_expr(SPLIT_KV == 1 and amax_o_tensor is not None):
                 if _row_valid:
                     nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
@@ -2576,7 +2622,7 @@ def _host(
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
     scale_o_t: Optional[cute.Tensor],
-    amax_o_tensor: cute.Tensor,
+    amax_o_tensor: Optional[cute.Tensor],
     # Dense padded-Q trim: separate (B,)-int32 lengths. None folds the
     # parameter and all consumers out when the specialization is disabled.
     seq_q_lens_addr: cutlass.Int64 = 0,
@@ -2600,13 +2646,14 @@ def _host(
     block_table_v_tensor: Optional[cute.Tensor] = None,
     # Block-scaled O: SF_O byte buffer + 128x4-atom geometry (None / 0 when off).
     sf_o_tensor: Optional[cute.Tensor] = None,
-    sfo_plane_stride: cutlass.Int32 = 0,
-    sfo_row_off_b: cutlass.Int32 = 0,
-    sfo_col_off_h: cutlass.Int32 = 0,
-    sfo_cols: cutlass.Int32 = 0,
+    sfo_plane_stride: cutlass.Int64 = 0,
+    sfo_row_off_b: cutlass.Int64 = 0,
+    sfo_col_off_h: cutlass.Int64 = 0,
+    sfo_cols: cutlass.Int64 = 0,
     stream: _cuda_driver.CUstream = None,
     prepared: cutlass.Constexpr[bool] = False,
     paged_hnd_prepared: cutlass.Constexpr[bool] = False,
+    prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2776,196 +2823,12 @@ def _host(
         sfo_row_off_b,
         sfo_col_off_h,
         sfo_cols,
+        prepared_sfo_geometry=prepared_sfo_geometry,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, 1),
         stream=stream,
-    )
-
-
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    has_lse: bool = True,
-    lse_head_major: bool = False,
-    lse_head_stride: int = 0,
-    lse_padded_rows: int = 0,
-    lse_padded_order: tuple = (3, 2, 1, 0),
-    dynamic_bhk: bool = False,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-    d_qk: int = CFG.TILE_K,
-    d_v: int = CFG.TILE_O,
-    k_stride: Optional[tuple] = None,
-    v_stride: Optional[tuple] = None,
-    block_table_stride: Optional[tuple[int, int]] = None,
-    block_table_v_stride: Optional[tuple[int, int]] = None,
-) -> Callable:
-    """Compile the remaining dense tensor entry (split, paged, or conversions).
-
-    THD uses compile_prepared for every supported output dtype. Its former
-    fake token/head/Stats layouts are intentionally absent from this entry.
-    Dense dimensions and declared strides remain compile-time metadata;
-    paged pool and table capacities, where supported, remain dynamic.
-    """
-    _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise ValueError("SM100 FP8 THD uses compile_prepared; the tensor entry is dense-only")
-    if dynamic_bhk or lse_head_major or lse_head_stride or lse_padded_rows:
-        raise ValueError("THD layout parameters belong to compile_prepared")
-    if SPLIT_KV > 1 and not has_lse:
-        # Each split's LSE is not optional under KV split — it IS the weight
-        # the combine reduces with.  Without it the partials cannot be recombined.
-        raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
-        raise ValueError(f"fp8 d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
-    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
-        # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
-        # the binding TMA 16-byte global-stride constraint.
-        raise ValueError(f"fp8 d128 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
-    if lse_padded_rows:
-        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
-    _fake_batch = b
-    # Split partials stack the dense batch axis.
-    _o_batch = _fake_batch * SPLIT_KV
-    _lse_batch = b * SPLIT_KV
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    if PAGED_KV:
-        # [num_pages, page_size, H_kv, D] view of the page pool; the declared
-        # strides ARE the in-page layout (HND: row stride D below head stride
-        # P*D; NHD: BSHD-contiguous) and _host reads the layout off them.
-        # Neither depends on num_pages, which therefore compiles dynamic.
-        if k_stride is None or v_stride is None:
-            raise ValueError("PAGED_KV: k_stride / v_stride (the pools' strides in [num_pages, page_size, H_kv, D] order) are required")
-
-        def _fake_pool(shape, stride):
-            if stride[3] != 1:
-                raise ValueError(f"declared pool stride {stride}: the head dim must be innermost-contiguous (stride[3] == 1)")
-            for axis in (1, 2):  # row/head global strides feed TMA: 16-byte rule (BPE=1 -> the stride itself)
-                if (stride[axis] * CFG.BPE) % 16 != 0:
-                    raise ValueError(f"declared pool stride {stride} axis {axis} must be a 16-byte multiple at BPE={CFG.BPE} (TMA global-stride rule)")
-            return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
-
-        n_pages = cute.sym_int(divisibility=1)
-        fake_k = _fake_pool((n_pages, PAGE_SIZE, kh, d_qk), k_stride)
-        fake_v = _fake_pool((n_pages, PAGE_SIZE, kh, d_v), v_stride)
-        # K and V tables share one dynamic page-axis symbol: the kernel reads
-        # its KV maximum from the K table, so both must have the same extent.
-        # Their strides are declared (plan-time) and bound as views: a
-        # batch-innermost table ((1, B) strides) is as legal as a row-major one.
-        _max_pages = cute.sym_int(divisibility=1)
-
-        def _fake_table(stride):
-            if stride is None:
-                return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b, _max_pages), stride_order=(1, 0), assumed_align=4)
-            return cute.runtime.make_fake_tensor(cutlass.Int32, (b, _max_pages), tuple(stride), assumed_align=4)
-
-        fake_block_table = _fake_table(block_table_stride)
-        fake_block_table_v = _fake_table(block_table_v_stride)
-    else:
-        if k_stride is not None or v_stride is not None or block_table_stride is not None or block_table_v_stride is not None:
-            raise ValueError("k_stride / v_stride / block_table_*_stride are PAGED_KV-only (the dense FP8 kernel binds compact K/V)")
-        fake_k = cute.runtime.make_fake_compact_tensor(
-            STORAGE_DTYPE,
-            (_fake_batch, skv, kh, d_qk),
-            stride_order=(3, 2, 1, 0),
-            assumed_align=16,
-        )
-        fake_v = cute.runtime.make_fake_compact_tensor(
-            STORAGE_DTYPE,
-            (_fake_batch, skv, kh, d_v),
-            stride_order=(3, 2, 1, 0),
-            assumed_align=16,
-        )
-        fake_block_table = None
-        fake_block_table_v = None
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        # Under fp32 partials o_tensor IS the fp32 split workspace: the epilogue
-        # writes it directly and the TMA descriptor built from it goes unused.
-        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
-        # E2M1 O is bound as its byte container: d_v / 2 storage elements.
-        (_o_batch, sq, qh, d_v // CFG.O_PACK_DIV),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
-        fake_lse = None
-    else:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
-            if lse_stride is not None and SPLIT_KV == 1
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (_lse_batch, qh, sq),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
-        )
-    # Always part of the ABI; unread when CFG.HAS_SINK == 0 (compile-time fold).
-    from cudnn.sdpa.fwd.kernels._fp8_host import make_fake_aux
-
-    aux = make_fake_aux(b, qh, amax_align=16)
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        aux.sinks,
-        aux.kv_lens,
-        aux.o_desc,
-        (b, qh, kh, sq, skv, 0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        *aux.scales,
-        aux.amax_o,
-        aux.seq_q_lens,
-        None,
-        None,
-        None,
-        # o_partial_f32 slot: the fp32 partial O under a split, else -- only when a
-        # later slot follows it positionally (the paged tables, the block-scaled O
-        # group) -- an explicit None; the THD tensors keep their slots when the mode
-        # is off (a mid-signature slot shifts them by one).
-        *((fake_o,) if _FP32_PARTIALS else ((None,) if (PAGED_KV or CFG.O_BLOCK_SCALE) else ())),
-        # Paged KV: the two block tables.  They PRECEDE the block-scaled O group so a
-        # paged build without it compiles no dynamic scalar slot execute() would have
-        # to bind; a block-scaled dense build None-specializes them (never bound).
-        *((fake_block_table, fake_block_table_v) if PAGED_KV else ((None, None) if CFG.O_BLOCK_SCALE else ())),
-        # Block-scaled O (never combined with a split): the SF_O buffer (dynamic byte
-        # length) + its four geometry scalars.
-        *(
-            (
-                cute.runtime.make_fake_compact_tensor(cutlass.Int8, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=16),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-            )
-            if CFG.O_BLOCK_SCALE
-            else ()
-        ),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
     )
 
 
@@ -2983,14 +2846,19 @@ def compile_prepared(
     paged_hnd: bool = False,
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
+    sfo_geometry: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     cache_key = _template_key(globals(), locals(), "compile_prepared")
     from cudnn.sdpa.fwd.kernels._fp8_host import LSE_KINDS, compile_host
 
-    if getattr(CFG, "O_BLOCK_SCALE", 0):
-        raise NotImplementedError("prepared FP8 serves scalar-scaled outputs")
+    if bool(getattr(CFG, "O_BLOCK_SCALE", 0)) != (sfo_geometry is not None):
+        raise ValueError("prepared block-output geometry must match the specialization")
+    if sfo_geometry is not None and (CFG.THD_VARLEN or CFG.SPLIT_KV > 1 or CFG.PACK_GQA or PARAMS.paged_kv):
+        raise NotImplementedError("prepared block outputs require dense unsplit, unpacked plans")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError("prepared FP8 head dimensions exceed the kernel envelope")
+    if sfo_geometry is not None and d_v != CFG.TILE_O:
+        raise ValueError("prepared block outputs require d_v == CFG.TILE_O")
     if d_qk * CFG.BPE % 16 or d_v * CFG.BPE % 16 or d_v * CFG.BPE_O % 16:
         raise ValueError("prepared FP8 head strides must be 16-byte multiples")
     if lse_kind not in LSE_KINDS:
@@ -2999,4 +2867,20 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
-    return compile_host(_host, CFG, STORAGE_DTYPE, OUT_STORAGE_DTYPE, False, cache_key, d_qk, d_v, has_lse, lse_kind, has_amax, scale_o_in_combine, paged_hnd)
+    return compile_host(
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        OUT_STORAGE_DTYPE,
+        False,
+        cache_key,
+        d_qk,
+        d_v,
+        has_lse,
+        lse_kind,
+        has_amax,
+        scale_o_in_combine,
+        paged_hnd,
+        sfo_geometry=sfo_geometry,
+        optional_amax=True,
+    )

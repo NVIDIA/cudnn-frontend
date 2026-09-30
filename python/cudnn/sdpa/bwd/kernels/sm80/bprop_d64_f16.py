@@ -44,24 +44,9 @@ Validation: f16 rel ~3.8e-4, bf16 ~3.4e-3 (dQ/dK/dV) at S=512; multi-tile
 (S_q=768) also validated.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
-import math
-from functools import lru_cache
-from typing import Optional, Tuple
-
-import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
-
-
-def from_dlpack(t, **kw):
-    """Vendoring shim: the kernels compile with --enable-tvm-ffi, so host-side
-    conversions must produce TVM-FFI tensors regardless of the
-    CUTE_DSL_ENABLE_TVM_FFI environment latch."""
-    kw.setdefault("enable_tvm_ffi", True)
-    return _from_dlpack_raw(t, **kw)
 
 
 from cutlass.base_dsl.typing import Pointer
@@ -149,18 +134,23 @@ def _bprop_kernel(
     LSE_view = cutlass.make_array_view(LSE)
     DOT_view = cutlass.make_array_view(DO_DOT)
 
-    QK_RS = cutlass.Int32(H) * cutlass.Int32(d)  # GMEM row stride for Q/K/dO/V (BSHD)
+    Q_RS = cutlass.Int64(Q.stride[1])
+    K_RS = cutlass.Int64(K.stride[1])
+    V_RS = cutlass.Int64(V.stride[1])
+    DO_RS = cutlass.Int64(dO.stride[1])
     kv_base = kv_tile * cutlass.Int32(N_BLOCK)
 
     # K/V tile base GMEM element pointers for this (batch, head).
-    kv_row0_base = ((batch * cutlass.Int32(SKV) + kv_base) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    k_tile_gmem = K_view.data_ptr() + kv_row0_base
-    v_tile_gmem = V_view.data_ptr() + kv_row0_base
+    k_base = cutlass.Int64(batch) * cutlass.Int64(K.stride[0]) + cutlass.Int64(kv_base) * K_RS + cutlass.Int64(head) * cutlass.Int64(K.stride[2])
+    v_base = cutlass.Int64(batch) * cutlass.Int64(V.stride[0]) + cutlass.Int64(kv_base) * V_RS + cutlass.Int64(head) * cutlass.Int64(V.stride[2])
+    k_tile_gmem = K_view.data_ptr() + k_base
+    v_tile_gmem = V_view.data_ptr() + v_base
 
-    lse_head_base = (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
-    dot_head_base = lse_head_base
+    lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
+    dot_head_base = (cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ)
 
-    bhead_q = (batch * cutlass.Int32(SQ) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    bhead_q = cutlass.Int64(batch) * cutlass.Int64(Q.stride[0]) + cutlass.Int64(head) * cutlass.Int64(Q.stride[2])
+    bhead_do = cutlass.Int64(batch) * cutlass.Int64(dO.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dO.stride[2])
 
     # ---- SMEM tiles -------------------------------------------------------
     QSTAGE = M_BLOCK * d
@@ -179,7 +169,7 @@ def _bprop_kernel(
         k_tile_gmem,
         rows=N_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=K_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -191,7 +181,7 @@ def _bprop_kernel(
         v_tile_gmem,
         rows=N_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=V_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -201,7 +191,6 @@ def _bprop_kernel(
     cp_async_commit()  # group: K / V
 
     SQ_rt = cutlass.Int32(SQ)
-    HD = cutlass.Int32(H) * cutlass.Int32(d)
     # Pipeline fill: Q is 1-deep (tile 0), dO is 2-deep (tiles 0 AND 1).  Each
     # tensor load is its OWN cp.async commit group so the mainloop's
     # ``cp_async_wait(1)`` drains them in order ([K/V],[Q0],[dO0],[dO1]); the
@@ -211,7 +200,7 @@ def _bprop_kernel(
         Q_view.data_ptr() + bhead_q,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=Q_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -223,10 +212,10 @@ def _bprop_kernel(
     cp_async_commit()  # group: Q tile 0 → slot 0
     load_tile_2d(
         sdO,
-        dO_view.data_ptr() + bhead_q,
+        dO_view.data_ptr() + bhead_do,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=DO_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -238,10 +227,10 @@ def _bprop_kernel(
     cp_async_commit()  # group: dO tile 0 → slot 0
     load_tile_2d(
         sdO.subview(cutlass.Int32(QSTAGE)),
-        dO_view.data_ptr() + bhead_q + cutlass.Int32(M_BLOCK) * HD,
+        dO_view.data_ptr() + bhead_do + cutlass.Int64(M_BLOCK) * DO_RS,
         rows=M_BLOCK,
         elems_per_row=d,
-        gmem_row_stride_elems=QK_RS,
+        gmem_row_stride_elems=DO_RS,
         tidx=tidx,
         num_threads=NUM_THREADS,
         elems_per_copy=_COPY_ELEMS,
@@ -319,8 +308,12 @@ def _bprop_kernel(
 
         # ---- softmax: P = exp2(scale·S − lse_q) → p_f (regs; written to sP after dP)
         p_f = cutlass.Array(cutlass.Float32, SDP_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
-        lse_t = Pointer(LSE_view.data_ptr() + lse_head_base + q_base + q_row_t, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
-        lse_b = Pointer(LSE_view.data_ptr() + lse_head_base + q_base + q_row_b, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+        lse_t = Pointer(
+            LSE_view.data_ptr() + lse_head_base + (cutlass.Int64(q_base) + cutlass.Int64(q_row_t)) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32
+        ).load() * cutlass.Float32(_LOG2E)
+        lse_b = Pointer(
+            LSE_view.data_ptr() + lse_head_base + (cutlass.Int64(q_base) + cutlass.Int64(q_row_b)) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32
+        ).load() * cutlass.Float32(_LOG2E)
         for nf in cutlass.range_constexpr(SDP_N_FRAGS):
             off = nf * 4
             p_f[off + 0] = cute.math.exp2(acc_S[off + 0] * softmax_scale_log2 - lse_t, fastmath=True)
@@ -355,10 +348,10 @@ def _bprop_kernel(
                 # prefetch Q tile i+1 → slot stage_nxt (1-deep), overlapped with the dP MMA.
                 load_tile_2d(
                     sQ.subview(stage_nxt * cutlass.Int32(QSTAGE)),
-                    Q_view.data_ptr() + bhead_q + q_next_base * HD,
+                    Q_view.data_ptr() + bhead_q + cutlass.Int64(q_next_base) * Q_RS,
                     rows=M_BLOCK,
                     elems_per_row=d,
-                    gmem_row_stride_elems=QK_RS,
+                    gmem_row_stride_elems=Q_RS,
                     tidx=tidx,
                     num_threads=NUM_THREADS,
                     elems_per_copy=_COPY_ELEMS,
@@ -472,10 +465,10 @@ def _bprop_kernel(
                 # from stage_cur, and dK (below) reads sQ_cur, not sdO.
                 load_tile_2d(
                     sdO.subview(stage_cur * cutlass.Int32(QSTAGE)),
-                    dO_view.data_ptr() + bhead_q + do_next_base * HD,
+                    dO_view.data_ptr() + bhead_do + cutlass.Int64(do_next_base) * DO_RS,
                     rows=M_BLOCK,
                     elems_per_row=d,
-                    gmem_row_stride_elems=QK_RS,
+                    gmem_row_stride_elems=DO_RS,
                     tidx=tidx,
                     num_threads=NUM_THREADS,
                     elems_per_copy=_COPY_ELEMS,
@@ -510,7 +503,7 @@ def _bprop_kernel(
         # staging, no barrier).  kv-tiles add to the same slot for the same (tidx,j)
         # → cross-tile accumulation is exact; the (tidx,j)→(q-row,d-col) permutation
         # is undone by the _unpermute postprocess kernel.
-        dq_perm_base = ((batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ) + q_base) * cutlass.Int32(d) + tidx
+        dq_perm_base = ((cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ) + cutlass.Int64(q_base)) * cutlass.Int64(d) + tidx
         for nf in cutlass.range_constexpr(DQ_N_FRAGS):
             off = nf * 4
             for s in cutlass.range_constexpr(4):
@@ -540,15 +533,19 @@ def _bprop_kernel(
     # =======================================================================
     kv_r_t = warp_idx * cutlass.Int32(16) + g_lane
     kv_r_b = kv_r_t + cutlass.Int32(8)
-    base_t = ((batch * cutlass.Int32(SKV) + kv_base + kv_r_t) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    base_b = ((batch * cutlass.Int32(SKV) + kv_base + kv_r_b) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    dk_head = cutlass.Int64(batch) * cutlass.Int64(dK.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dK.stride[2])
+    dv_head = cutlass.Int64(batch) * cutlass.Int64(dV.stride[0]) + cutlass.Int64(head) * cutlass.Int64(dV.stride[2])
+    dk_base_t = dk_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_t)) * cutlass.Int64(dK.stride[1])
+    dk_base_b = dk_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_b)) * cutlass.Int64(dK.stride[1])
+    dv_base_t = dv_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_t)) * cutlass.Int64(dV.stride[1])
+    dv_base_b = dv_head + (cutlass.Int64(kv_base) + cutlass.Int64(kv_r_b)) * cutlass.Int64(dV.stride[1])
     for nf in cutlass.range_constexpr(DKV_N_FRAGS):
         off = nf * 4
         dcol = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-        Pointer((dV_view.data_ptr() + base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 0], acc_dV[off + 1], dtype=io_dtype), alignment=4)
-        Pointer((dV_view.data_ptr() + base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 2], acc_dV[off + 3], dtype=io_dtype), alignment=4)
-        Pointer((dK_view.data_ptr() + base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 0], acc_dK[off + 1], dtype=io_dtype), alignment=4)
-        Pointer((dK_view.data_ptr() + base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 2], acc_dK[off + 3], dtype=io_dtype), alignment=4)
+        Pointer((dV_view.data_ptr() + dv_base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 0], acc_dV[off + 1], dtype=io_dtype), alignment=4)
+        Pointer((dV_view.data_ptr() + dv_base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dV[off + 2], acc_dV[off + 3], dtype=io_dtype), alignment=4)
+        Pointer((dK_view.data_ptr() + dk_base_t + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 0], acc_dK[off + 1], dtype=io_dtype), alignment=4)
+        Pointer((dK_view.data_ptr() + dk_base_b + dcol), dtype=cutlass.Int32).store(fp32_to_fp16(acc_dK[off + 2], acc_dK[off + 3], dtype=io_dtype), alignment=4)
 
 
 _bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -582,11 +579,21 @@ def _unpermute_dq_kernel(
     acc_view = cutlass.make_array_view(dQ_acc)
     out_view = cutlass.make_array_view(dQ_out)
     # Permuted-flat read base for this (batch, head, q-tile): flat = base + j*256 + tidx.
-    perm_base = ((batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ) + qt * cutlass.Int32(M_BLOCK)) * cutlass.Int32(d) + tidx
+    perm_base = (
+        (cutlass.Int64(batch) * cutlass.Int64(H) + cutlass.Int64(head)) * cutlass.Int64(SQ) + cutlass.Int64(qt) * cutlass.Int64(M_BLOCK)
+    ) * cutlass.Int64(d) + tidx
     q_abs_t = qt * cutlass.Int32(M_BLOCK) + dq_wr * cutlass.Int32(16) + g_lane
     q_abs_b = q_abs_t + cutlass.Int32(8)
-    out_t = ((batch * cutlass.Int32(SQ) + q_abs_t) * cutlass.Int32(H) + head) * cutlass.Int32(d)
-    out_b = ((batch * cutlass.Int32(SQ) + q_abs_b) * cutlass.Int32(H) + head) * cutlass.Int32(d)
+    out_t = (
+        cutlass.Int64(batch) * cutlass.Int64(dQ_out.stride[0])
+        + cutlass.Int64(q_abs_t) * cutlass.Int64(dQ_out.stride[1])
+        + cutlass.Int64(head) * cutlass.Int64(dQ_out.stride[2])
+    )
+    out_b = (
+        cutlass.Int64(batch) * cutlass.Int64(dQ_out.stride[0])
+        + cutlass.Int64(q_abs_b) * cutlass.Int64(dQ_out.stride[1])
+        + cutlass.Int64(head) * cutlass.Int64(dQ_out.stride[2])
+    )
     for nf in cutlass.range_constexpr(DQ_N_FRAGS):
         v0 = Pointer((acc_view.data_ptr() + perm_base + cutlass.Int32((nf * 4 + 0) * NUM_THREADS)), dtype=cutlass.Float32).load()
         v1 = Pointer((acc_view.data_ptr() + perm_base + cutlass.Int32((nf * 4 + 1) * NUM_THREADS)), dtype=cutlass.Float32).load()
@@ -634,169 +641,3 @@ def _bprop_host(
     _bprop_kernel(Q, K, V, dO, dQ_acc, dK, dV, LSE, DO_DOT, d, io_dtype, n_q_tiles, softmax_scale_log2, attn_scale).launch(
         grid=(n_kv_tiles, H, B), block=(NUM_THREADS, 1, 1), stream=stream
     )
-
-
-@lru_cache(maxsize=None)
-def _compile_main(B, H, SQ, SKV, d, io_is_bf16):
-    _cache_key = _template_key(globals(), locals(), "_compile_main")
-    io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
-    mk = cute.runtime.make_fake_compact_tensor
-    fq = mk(io_dtype, (B, SQ, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fk = mk(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fv = mk(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdo = mk(io_dtype, (B, SQ, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    # dQ_acc is the PERMUTED-flat accumulator [B, H, SQ, d] (NOT the row-major
-    # [B,SQ,H,d] output) — the main kernel atomicAdds into it thread-major.
-    fdq = mk(cutlass.Float32, (B, H, SQ, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdk = mk(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdv = mk(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fl = mk(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    fdt = mk(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    return _compile_cached(
-        _bprop_host,
-        fq,
-        fk,
-        fv,
-        fdo,
-        fdq,
-        fdk,
-        fdv,
-        fl,
-        fdt,
-        d,
-        io_dtype,
-        cutlass.Int32(0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cuda.CUstream(0),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_bwd",
-    )
-
-
-@lru_cache(maxsize=None)
-def _compile_unpermute(B, H, SQ, d, io_is_bf16):
-    _cache_key = _template_key(globals(), locals(), "_compile_unpermute")
-    io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
-    mk = cute.runtime.make_fake_compact_tensor
-    fdq_acc = mk(cutlass.Float32, (B, H, SQ, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdq_out = mk(io_dtype, (B, SQ, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    return _compile_cached(
-        _unpermute_host,
-        fdq_acc,
-        fdq_out,
-        d,
-        io_dtype,
-        cutlass.Int32(0),
-        cuda.CUstream(0),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_bwd",
-    )
-
-
-def scratch_bytes(*, B: int, SQ: int, SKV: int, H: int, io_bytes: int = 2, need_do_dot: bool = True) -> int:
-    """Per-execute scratch requirement of ``backward(..., workspace=...)``
-    (issue #514): the exact bytes it will carve. Keep in lockstep with the
-    ``_scratch`` takes there. d_qk == d_v == 64 by this kernel's contract."""
-    from cudnn.sdpa.fwd.api_dsl import ws_align
-
-    d = 64
-    total = ws_align(B * H * SQ * d * 4)  # permuted dQ accumulator (fp32)
-    total += ws_align(B * SKV * H * d * io_bytes)  # dK
-    total += ws_align(B * SKV * H * d * io_bytes)  # dV
-    total += ws_align(B * SQ * H * d * io_bytes)  # dQ
-    if need_do_dot:
-        total += ws_align(B * H * SQ * 4)  # do_dot (fp32)
-    return total
-
-
-def backward(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    dO: torch.Tensor,
-    O: torch.Tensor,
-    lse: torch.Tensor,
-    *,
-    scale: Optional[float] = None,
-    do_dot: Optional[torch.Tensor] = None,
-    workspace: Optional[torch.Tensor] = None,  # caller scratch, sized by
-    # scratch_bytes(); every internal buffer is carved from it instead of
-    # allocated (issue #514). None → allocate (wrapper paths).
-    **_ignored,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """SDPA backward for head-dim 64, fp16/bf16.  BSHD in/out; ``lse`` natural-log
-    [B,H,S_q].  Returns (dQ, dK, dV)."""
-    assert Q.dtype in (torch.float16, torch.bfloat16)
-    assert K.dtype == Q.dtype == V.dtype == dO.dtype == O.dtype
-    io_is_bf16 = Q.dtype == torch.bfloat16
-    B, SQ, H, D = Q.shape
-    _, SKV, Hk, D_v = V.shape
-    assert Hk == H, "MHA only (no GQA)"
-    assert D == D_v == 64, "this kernel is d_qk == d_v == 64 only"
-    assert SQ % M_BLOCK == 0, f"S_q ({SQ}) must be a multiple of {M_BLOCK}"
-    assert SKV % N_BLOCK == 0, f"S_kv ({SKV}) must be a multiple of {N_BLOCK}"
-    if scale is None:
-        scale = 1.0 / math.sqrt(D)
-    scale_log2 = scale * math.log2(math.e)
-
-    dev = Q.device
-    _carver = None
-    if workspace is not None:
-        from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
-
-        _carver = WorkspaceCarver(
-            workspace,
-            scratch_bytes(B=B, SQ=SQ, SKV=SKV, H=H, io_bytes=Q.element_size(), need_do_dot=do_dot is None),
-            "bprop_d64_f16_sm80",
-        )
-
-    def _scratch(numel, dtype, zero):
-        if _carver is None:
-            return (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=dev)
-        t = _carver.take(numel, dtype)
-        if zero:
-            t.zero_()
-        return t
-
-    # PERMUTED-flat dQ scratch [B, H, SQ, D] — the main kernel atomicAdds into it
-    # thread-major; the _unpermute kernel casts it → row-major dQ.
-    dQ_acc = _scratch(B * H * SQ * D, torch.float32, True).view(B, H, SQ, D)
-    dK = _scratch(B * SKV * H * D, Q.dtype, False).view(B, SKV, H, D)
-    dV = _scratch(B * SKV * H * D, Q.dtype, False).view(B, SKV, H, D)
-    dQ = _scratch(B * SQ * H * D, Q.dtype, False).view(B, SQ, H, D)
-    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous()
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    # do_dot (rowsum O∘dO) preprocessing reuses the shared device kernel.
-    if do_dot is None:
-        dot_t = _scratch(B * H * SQ, torch.float32, False).view(B, H, SQ)
-        dd_fn = _base._compile_do_dot(B, H, SQ, D, io_is_bf16)
-        dd_fn(from_dlpack(O), from_dlpack(dO), from_dlpack(dot_t), cutlass.Int32(B * H * SQ), stream)
-    else:
-        dot_t = do_dot.to(dtype=torch.float32, device=dev).contiguous()
-
-    fn = _compile_main(B, H, SQ, SKV, D, io_is_bf16)
-    fn(
-        from_dlpack(Q),
-        from_dlpack(K),
-        from_dlpack(V),
-        from_dlpack(dO),
-        from_dlpack(dQ_acc),
-        from_dlpack(dK),
-        from_dlpack(dV),
-        from_dlpack(lse_t),
-        from_dlpack(dot_t),
-        cutlass.Int32((SQ + M_BLOCK - 1) // M_BLOCK),
-        cutlass.Float32(scale_log2),
-        cutlass.Float32(scale),
-        stream,
-    )
-
-    # Un-permute the dQ scratch → row-major dQ + cast (separate launch).
-    up_fn = _compile_unpermute(B, H, SQ, D, io_is_bf16)
-    up_fn(from_dlpack(dQ_acc), from_dlpack(dQ), cutlass.Int32((SQ + M_BLOCK - 1) // M_BLOCK), stream)
-    return dQ, dK, dV

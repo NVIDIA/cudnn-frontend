@@ -818,3 +818,123 @@ def test_reject_thd_dense_stats():
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     reason = mismatch(spec.capabilities, facts)
     assert reason is not None and "ragged" in reason
+
+
+@pytest.mark.parametrize("stats_layout", ["head_major", "token_major"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prepared_thd_rebind_lengths_and_replay(stats_layout, causal, monkeypatch):
+    from unittest.mock import patch
+    import cutlass.cute as cute
+    from cudnn.sdpa.bwd.api_dsl import WorkspaceCarver
+
+    calls = []
+    original = cudnn.pygraph.execute
+
+    def record(graph, *args, **kwargs):
+        calls.append((graph, args))
+        return original(graph, *args, **kwargs)
+
+    with patch.object(cudnn.pygraph, "execute", record):
+        old, _, _, _ = _run_graph((129, 97, 63), (143, 83, 79), h=4, hkv=2, stats_layout=stats_layout, poison=True, pad_cap=64, use_causal_mask=causal)
+    graph, (pack, old_workspace) = calls[-1]
+    names = [ref.get_name() for ref in pack]
+    assert len(set(names)) == len(names)
+
+    def next_buffers(lens_q, lens_kv):
+        case = _thd_case(lens_q, lens_kv, 4, _D, torch.bfloat16, cap_q=old.cap_q, cap_kv=old.cap_kv, poison=True, causal=causal, hkv=2)
+        _, fresh, outputs = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=2, use_causal_mask=causal)
+        gradients = [
+            torch.full_like(case.q, float("nan")),
+            *(torch.full((1, case.cap_kv, 2, _D), float("nan"), device="cuda", dtype=torch.bfloat16) for _ in range(2)),
+        ]
+        fresh.update(zip(outputs, gradients))
+        by_name = {ref.get_name(): tensor for ref, tensor in fresh.items()}
+        assert set(by_name) == set(names)
+        return case, {ref: by_name[ref.get_name()] for ref in pack}, [ref.get_name() for ref in outputs]
+
+    case, rebound, output_names = next_buffers((63, 0, 121), (37, 81, 0))
+    by_name = {ref.get_name(): tensor for ref, tensor in rebound.items()}
+    gradients = [by_name[name] for name in output_names]
+    workspace = torch.empty_like(old_workspace).fill_(0xBD)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared THD rebuilt tensor operands, allocated, synchronized or compiled")
+
+    def execute_guarded():
+        with monkeypatch.context() as patcher:
+            for name in ("view", "reshape", "as_strided", "permute", "transpose", "copy_", "zero_"):
+                patcher.setattr(torch.Tensor, name, forbidden)
+            for name in ("empty", "empty_like", "zeros", "zeros_like"):
+                patcher.setattr(torch, name, forbidden)
+            patcher.setattr(WorkspaceCarver, "__init__", forbidden)
+            patcher.setattr(cute, "compile", forbidden)
+            graph.execute(rebound, workspace)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        execute_guarded()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    _check(case, *gradients, hkv=2)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            execute_guarded()
+        case, changed, _ = next_buffers((31, 123, 41), (113, 67, 109))
+        for ref, target in rebound.items():
+            target.copy_(changed[ref])
+        workspace.fill_(0xBD)
+        capture.replay()
+        _check(case, *gradients, hkv=2)
+    finally:
+        capture.reset()
+
+
+@pytest.mark.parametrize("token_major", [False, True])
+def test_prepared_thd_standalone_switches_length_and_prefix_form(token_major, monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    original = SdpaBwdDslSm100.execute
+
+    def exercise(api, *args, **kwargs):
+        original(api, *args, **kwargs)
+        artifact = api._prepared.artifact
+        for name in ("seq_q_lens", "seq_kv_lens"):
+            lens = kwargs[name]
+            kwargs[name] = torch.cat((torch.zeros(1, device=lens.device, dtype=torch.int32), lens.cumsum(0, dtype=torch.int32)))
+        for tensor in args[6:9]:
+            tensor.fill_(float("nan"))
+        kwargs["workspace"].fill_(0xBD)
+        capture = torch.cuda.CUDAGraph()
+        try:
+            with monkeypatch.context() as patcher:
+                patcher.setattr(cute, "compile", lambda *a, **k: pytest.fail("length/prefix form must reuse the compiled host"))
+                original(api, *args, **kwargs)
+                with torch.cuda.graph(capture):
+                    original(api, *args, **kwargs)
+            for tensor in args[6:9]:
+                tensor.fill_(float("nan"))
+            kwargs["workspace"].fill_(0xBD)
+            capture.replay()
+            assert api._prepared.artifact is artifact
+        finally:
+            capture.reset()
+
+    monkeypatch.setattr(SdpaBwdDslSm100, "execute", exercise)
+    _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
+
+
+@pytest.mark.parametrize("token_major", [False, True])
+def test_prepared_thd_standalone_accepts_flat_stats(token_major, monkeypatch):
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    original = SdpaBwdDslSm100.execute
+
+    def flat_stats(api, *args, **kwargs):
+        args = list(args)
+        args[5] = args[5].view(-1)
+        return original(api, *args, **kwargs)
+
+    monkeypatch.setattr(SdpaBwdDslSm100, "execute", flat_stats)
+    _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)

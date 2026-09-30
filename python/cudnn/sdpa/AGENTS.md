@@ -23,7 +23,7 @@ head-major, never dense-padded.**
   classification can only check `stride_s == 1 and stride_h >= 1`. In the
   THD path the packed total is a *device* value — Rule 3 bans reading it
   back, so `stride_h >= T` is **caller contract** (stated in
-  `_thd_lse_view`'s docstring), not something the adapter verifies:
+  the prepared THD binding contract), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
   legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
@@ -140,6 +140,13 @@ can otherwise leave half the rows unwritten while corrupting padding. The
 SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
 rebound padded and batch-inner layouts under CUDA Graph replay.
 
+Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
+arguments, device parameters, and every intermediate offset product must all
+stay Int64. Widen operands before multiplication. The physical detector is
+`test_block_scaled_sf_plane_stride_above_int32`: it writes two live SF planes
+separated above 2**32 and checks capture/replay. A wide fake extent alone only
+fixes binding; deliberately narrowing the plane stride must fail numerically.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -177,6 +184,14 @@ offset exceeds `2**32`, including input, Stats and gradient ports. Seed the
 wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
+
+## Output initialization regressions
+
+When removing wrapper-side output clears, verify that the prepared chain
+overwrites every element, including masked rows and partial tiles. Poison
+fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
+replay after previously active rows become fully masked. The detector is
+`test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
 
 ## Heuristic geometry regressions
 

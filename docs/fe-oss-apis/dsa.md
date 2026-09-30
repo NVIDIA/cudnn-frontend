@@ -210,6 +210,11 @@ capabilities, including SM107, do not select the two-CTA paths. No backend or
 tile-size argument is required. SM90 continues to use its Hopper-specific
 implementation.
 
+The SM100 H16/H32/H96 D576 specializations compile the physical row stride of
+`topk_idxs` from `topk_max`, while the query count and per-query `topk_length`
+remain dynamic. H64 and the generic/H128 D512 paths retain their existing
+layout; H128 D576 already uses a static `topk_max` stride.
+
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
 caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
