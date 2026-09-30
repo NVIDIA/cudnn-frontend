@@ -1486,7 +1486,10 @@ def _d128_smem_bytes(cfg) -> int:
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
-    return qo + k + v
+    # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
+    # step's QK^T can overlap the softmax; counted for every quantized row (pessimistic for MXFP8).
+    p = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.DTYPE_QKV <= 1 else 0
+    return qo + k + v + p
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
