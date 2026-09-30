@@ -26,7 +26,9 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     s.decl = {name: (h, 128, h * 128, 128, 1, h * 128) for name, h in (("q", 8), ("k", 2), ("v", 2), ("o", 8))}
-    s.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
+    # The native binder serves half hosts, whose K/V tables share one stride
+    # pair. The global prepared vocabulary also includes quantized-only slots.
+    s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.template[s.index["lse_ext"]] = s.lse_head_stride
@@ -345,28 +347,25 @@ def test_native_paged_singleton_strides_and_empty_q(hnd):
 
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("table_rank", [2, 4])
-@pytest.mark.parametrize("separate_strides", [False, True])
-def test_native_paged_table_stride_contract(hnd, table_rank, separate_strides):
+def test_native_paged_shared_table_stride_contract(hnd, table_rank):
     s, facts, _ = _paged_fixture(hnd=hnd, table_rank=table_rank)
-    if not separate_strides:
-        kept = [(n, value) for n, value in zip(s.order, s.template) if n != "table_v_strides"]
-        s.order, s.template = [n for n, _ in kept], [value for _, value in kept]
-        s.index = {n: i for i, n in enumerate(s.order)}
-    s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
 
-    # V's physical address product is independent of K and remains Int64.
+    # Distinct table pointers are valid, but the half host has one stride pair.
     stride = 2**33
     shape, strides = ((4, 1, 4, 1), (1, 1, stride, 1)) if table_rank == 4 else ((4, 4), (1, stride))
     v = facts["block_table_v"]._replace(ptr=0x90000, shape=shape, strides=strides, span=3 * stride + 4)
     changed = dict(facts, block_table_v=v)
-    if separate_strides:
-        frame = _equal(s, changed)
-        assert frame[s.index["table_strides"]] == (4, 1)
-        assert frame[s.index["table_v_strides"]] == (1, stride)
-        assert frame[s.index["block_table_v_ptr"]] == v.ptr
-        changed["block_table_v"] = v._replace(span=v.span - 1)
-    # Old hosts still require shared strides; modern ones check V's own span.
+    for bind in (_reference, _native):
+        with pytest.raises(ValueError):
+            bind(s, changed)
+    changed["block_table"] = v._replace(ptr=0xA0000)
+    frame = _equal(s, changed)
+    assert frame[s.index["table_strides"]] == (1, stride)
+    assert frame[s.index["block_table_v_ptr"]] == v.ptr
+    assert frame[s.index["block_table_ptr"]] == 0xA0000
+    # Shared geometry still requires checking each table's observed span.
+    changed["block_table_v"] = v._replace(span=v.span - 1)
     for bind in (_reference, _native):
         with pytest.raises(ValueError):
             bind(s, changed)
@@ -375,7 +374,7 @@ def test_native_paged_table_stride_contract(hnd, table_rank, separate_strides):
 def test_native_nonpaged_host_does_not_require_paged_slots():
     """SM120's nonpaged host omits page tables entirely."""
     s, facts, _ = _fixture()
-    slots = {"block_table_ptr", "block_table_v_ptr", "table_strides", "table_v_strides", "n_pages"}
+    slots = {"block_table_ptr", "block_table_v_ptr", "table_strides", "n_pages"}
     kept = [(n, value) for n, value in zip(s.order, s.template) if n not in slots]
     s.order = [n for n, _ in kept]
     s.template = [value for _, value in kept]
