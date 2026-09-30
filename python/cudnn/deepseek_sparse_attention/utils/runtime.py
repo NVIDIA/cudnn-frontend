@@ -3,9 +3,8 @@
 
 """Runtime helpers shared by DSA Python wrappers."""
 
-from contextlib import contextmanager
 from functools import lru_cache
-from typing import Iterator, Optional
+from typing import Optional
 
 import torch
 
@@ -77,19 +76,8 @@ def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstr
     return cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
 
 
-@contextmanager
-def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None) -> Iterator[None]:
+def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None):
     """Run torch work on ``current_stream`` (R1). ``device`` is the operand's
     device; it defaults to the current device, which is only right when the
     operands live there -- pass it whenever a tensor is at hand."""
-    if current_stream is None:
-        yield
-        return
-    # A resolved handle usually names the already-current stream. Avoid
-    # constructing ExternalStream and entering another CUDA stream context.
-    active = torch.cuda.current_stream(device if device is not None else torch.cuda.current_device())
-    if int(current_stream) == active.cuda_stream:
-        yield
-        return
-    with stream_context(current_stream, device):
-        yield
+    return stream_context(current_stream, device)

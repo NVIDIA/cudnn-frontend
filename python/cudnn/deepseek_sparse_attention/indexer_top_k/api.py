@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn._torch_stream import as_torch_stream, contiguous_on_stream
+from cudnn._torch_stream import contiguous_on_stream, device_context, launch_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_capability,
@@ -101,6 +101,8 @@ class IndexerTopK(APIBase):
         self.next_n = int(next_n)
         self.return_val = bool(return_val)
         self.num_copy_bits = int(num_copy_bits)
+        self._buffer_dims = None
+        self._scratch_bytes = None
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -145,13 +147,17 @@ class IndexerTopK(APIBase):
         return True
 
     def _buffer_shape(self) -> Tuple[int, int, int]:
-        n_rows, num_cols = self.input_desc.shape
-        return n_rows, _kernel_module().buffer_numbers(self.input_desc.dtype), num_cols
+        if self._buffer_dims is None:
+            n_rows, num_cols = self.input_desc.shape
+            self._buffer_dims = (n_rows, _kernel_module().buffer_numbers(self.input_desc.dtype), num_cols)
+        return self._buffer_dims
 
     def scratch_workspace_bytes(self) -> int:
         """Bytes of ``workspace`` ``execute()`` carves its int32 radix scratch from (R2)."""
-        n_rows, buffer_numbers, num_cols = self._buffer_shape()
-        return ws_align(n_rows * buffer_numbers * num_cols * torch.int32.itemsize)
+        if self._scratch_bytes is None:
+            n_rows, buffer_numbers, num_cols = self._buffer_shape()
+            self._scratch_bytes = ws_align(n_rows * buffer_numbers * num_cols * torch.int32.itemsize)
+        return self._scratch_bytes
 
     def compile(self) -> None:
         self._logger.debug("Entering compile")
@@ -212,15 +218,15 @@ class IndexerTopK(APIBase):
 
         # The compiled kernel launches on the TVM-FFI environment stream, i.e.
         # torch's current stream: enter the caller's stream so it is honored.
-        with _torch_stream_context(current_stream):
+        with _torch_stream_context(current_stream, device):
             kernel_module.launch_topk_kernel(self._compiled_kernel, input_values, seq_lens, out_indices, out_values, buffer, self.next_n)
 
         # TVM-FFI launches are invisible to the caching allocator: record every
         # tensor the kernel touches on the launch stream (R1).
-        launch_stream = as_torch_stream(current_stream, device) if current_stream is not None else torch.cuda.current_stream(device)
+        consumer = launch_stream(current_stream, device)
         for tensor in (input_values, seq_lens, out_indices, out_values, workspace):
             if tensor is not None:
-                tensor.record_stream(launch_stream)
+                tensor.record_stream(consumer)
         return out_indices, out_values
 
 
@@ -281,11 +287,12 @@ def indexer_top_k_wrapper(
 
     n_rows = int(input_values.shape[0])
     device = input_values.device
-    with torch.cuda.device(device), _torch_stream_context(stream):
+    # One device/stream scope for the allocations and the launch; execute() re-enters it as a no-op.
+    with device_context(device), _torch_stream_context(stream, device):
         indices = torch.empty(n_rows, top_k, dtype=torch.int32, device=device)
         values = torch.empty(n_rows, top_k, dtype=input_values.dtype, device=device) if return_val else None
         workspace = torch.empty(obj.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
-    obj.execute(input_values, seq_lens, indices, values, current_stream=stream, workspace=workspace)
+        obj.execute(input_values, seq_lens, indices, values, current_stream=stream, workspace=workspace)
     return TupleDict(indices=indices, values=values)
 
 
