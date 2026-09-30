@@ -37,6 +37,7 @@ COVERED_DIRS = frozenset(
         ("core", "cutedsl"),
         ("core", "jax"),
         ("engram", "cutedsl"),
+        ("gated_attention_block", "cutedsl"),
         ("gemm", "cutedsl"),
         ("gemm", "jax"),
         ("linear_attention", "jax"),
