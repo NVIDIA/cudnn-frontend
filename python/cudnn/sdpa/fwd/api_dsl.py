@@ -413,10 +413,14 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # kernel's own pre-existing _exp2_* helper mix (chunk-0 / late-tail / alpha), which used to be unconditional.
 # MEASURED 2026-09-28 at the DSv3 layer (B=2 H=128/128 S=2K) vs the all-MUFU spelling: +7.0 % causal / +5.7 %
 # dense on B200, and -10 % causal / -6 % dense with the mix left on at cc 10.3 (B300) -- the reason it is now
-# gated at all.  OFF = MEASURED losses or no measurement: ("f16", (128, 128)) dense +3.9 % but causal -1.9 /
-# -2.4 %; an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %; ("mxfp8",
-# (192, 128)) -3.3..-4.0 % dense (that kernel already carries its own exp2 emulation); every d256 / d512
-# flavor unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
+# gated at all.  ("mxfp8", (192, 128)) is the same kind of entry: it gates that kernel's own pre-existing
+# ex2_emulation_2 mix (chunk-0 mask-aware / 6-pair / late-tail / scalar; unconditional before 2026-09-29), not an
+# _E2E_* block.  B200 keeps the mix, the spelling it was tuned with; MEASURED at the DSv3 layer (B=2 H=128/128)
+# with it left on at cc 10.3 (B300): dense S=2K 1.17x of cuDNN, 1.02x with it off (S=8K 1.14x -> 0.98x; kimi-K3
+# 1.16x -> 1.00x).  OFF = MEASURED losses or no measurement: ("f16", (128, 128)) dense +3.9 % but causal -1.9 /
+# -2.4 %; an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
+# ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
+# every d256 / d512 flavor unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
     {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
