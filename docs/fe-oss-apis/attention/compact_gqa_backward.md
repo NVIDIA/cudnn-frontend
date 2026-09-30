@@ -80,7 +80,6 @@ stock and 74.10% for improved, above the 69.00% target. Both runs use the same
 FE 1.29 image, configuration, and seed; only the GQA flag differs. Real rollouts
 and node allocations differ, and valid tokens increase 1.11%; timings are not
 normalized. Valid-token counts are not exact attention FLOP counts.
-These are development measurements, not a submitted MLPerf result.
 
 The review fixes passed 26 VR200 tests, and the native TE integration passed
 three SM107 numerical cases before the full workload. The current develop merge
