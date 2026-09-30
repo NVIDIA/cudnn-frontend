@@ -1514,10 +1514,12 @@ def run_proj_gemm(
         if need:
             # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
             # `Workspace` validates presence, contiguity, size and 128-B alignment and raises with
-            # the required size -- the same carver the graph engine's execute path uses.
+            # the required size -- the same carver the graph engine's execute path uses.  `device=`
+            # pins it to the launch device: without it a host (CPU) buffer of the right size and
+            # alignment passes every other check and reaches the launch boundary as a bogus pointer.
             from cudnn.frost.workspace import Workspace
 
-            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label))
+            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label, device=out.device.index))
         else:
             plan.jit(vp, stream=stream)
         return

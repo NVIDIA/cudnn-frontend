@@ -395,6 +395,35 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
 
 
 @requires_rubin
+def test_split_k_workspace_must_be_a_cuda_buffer_on_the_launch_device():
+    """A split-K plan carves its fp32 partials out of the CALLER's workspace.  A host (CPU) buffer of the right
+    size and alignment passes the presence / size / alignment checks, so without a device pin it reached the
+    launch boundary as a bogus device pointer.  ``run_proj_gemm`` binds the workspace with the launch device
+    (``out.device``): a CPU buffer -- and a buffer on another CUDA device, where one is visible -- is a typed
+    ``ValueError`` BEFORE any launch (the output is untouched); the CUDA twin still runs (positive control).
+    Shared by both backward drivers and the forward."""
+    m, k, n = _stage_mkn("B7_dw_qkvg", "test", 2048)
+    plan = _plan("wgrad", m, k, n, torch.bfloat16, 2)
+    assert plan.jit is not None and plan.jit.workspace_bytes > 0, "split_k=2 must carry fp32 partials"
+    dy, x, dw = _wgrad_operands(m, k, n, torch.bfloat16)
+    before = dw.clone()
+    ws_cpu = torch.empty(plan.workspace_bytes, dtype=torch.uint8)  # host memory: right size, aligned, wrong place
+    with pytest.raises(ValueError, match="workspace must be a CUDA device buffer"):
+        run_wgrad_gemm(plan, dy, x, dw, ws_cpu)
+    torch.cuda.synchronize()
+    assert torch.equal(dw, before), "the refusal must fire before any launch"
+    if torch.cuda.device_count() > 1:
+        ws_other = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda:1")
+        with pytest.raises(ValueError, match="device"):
+            run_wgrad_gemm(plan, dy, x, dw, ws_other)
+        torch.cuda.synchronize()
+        assert torch.equal(dw, before)
+    run_wgrad_gemm(plan, dy, x, dw, _ws(plan))  # positive control: the CUDA workspace on the launch device
+    torch.cuda.synchronize()
+    assert dw.abs().max().item() > 0
+
+
+@requires_rubin
 def test_workspace_is_honest():
     """The block's engine scratch is ``max(plan.workspace_bytes)`` over every backward plan
     REGARDLESS of route: a split-K plan's fp32 partials are in its number, a too-small or
