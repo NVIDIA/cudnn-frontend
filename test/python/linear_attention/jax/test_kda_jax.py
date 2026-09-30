@@ -450,8 +450,6 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
     args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
     if domain == "linear":
         args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
-    if safe_gate and schedule == "uncut":
-        args = (*args[:5], None, *args[6:])
     options = dict(
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=schedule == "uncut",
