@@ -6,13 +6,13 @@
 
 * ``True`` (default): cuDNN's convention -- dS rounded to E4M3 per 1x32 block along BOTH orientations (``quantize_to_mxfp8``:
   along kv into the dQ product, along q into the dK product), what ``test_sdpa_bwd_mxfp8_sm100.py`` and the backend
-  MXFP8 suite pass against, and the structural twin of the design's P-b policy;
+  MXFP8 suite pass against, and the structural twin of an exact-1x32-both-ways kernel dS policy;
 * ``False``: dS held in fp32 into the dQ / dK products -- the twin of a chain whose dQ / dK consume dS in a wider dtype
-  (the P-c bf16-dS bring-up chain), exactly the ``fp8_ref.compute_ref_backward(quantize_ds=False)`` recipe the sm107
+  (a bf16-dS bring-up chain), exactly the ``fp8_ref.compute_ref_backward(quantize_ds=False)`` recipe the sm107
   per-tensor fp8 suite uses for ITS bf16-dS twin (``test_sdpa_bwd_fp8_sm107.py::ref_bwd``): an e4m3-dS oracle against a
   wider-dS chain misreports the chain by the oracle's own rounding noise (MEASURED there at 0.56 % of dQ);
-* ``(32, 32)``: ONE E8M0 per 32 x 32 (q x kv) tile of dS, the same dequantized tile feeding both products -- the design's
-  P-a policy (a tile scale = max over 32 kv x 32 q, coarser than cuDNN's 1x32).
+* ``(32, 32)``: ONE E8M0 per 32 x 32 (q x kv) tile of dS, the same dequantized tile feeding both products -- a
+  one-scale-per-tile kernel dS policy (a tile scale = max over 32 kv x 32 q, coarser than cuDNN's 1x32).
 
 Every case below is a one-KV-block problem (``s_kv = 128 = fp16_ref.BLOCK``) on the CPU, so an EXPLICIT recomputation of the
 oracle's per-block math with each dS treatment can be held BITWISE against the oracle -- the default against a second
@@ -192,7 +192,7 @@ def test_tile_32x32_is_one_e8m0_per_tile_along_both_orientations(prob):
 
 @pytest.mark.parametrize("bad", [(16, 32), (32,), "1x32", 32, (32, 32, 32), None])
 def test_other_values_are_refused(prob, bad):
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError, match=r"quantize_ds must be True .* False .* or \(32, 32\)|only tile-quantized dS arm"):
         prob.oracle(quantize_ds=bad)
 
 

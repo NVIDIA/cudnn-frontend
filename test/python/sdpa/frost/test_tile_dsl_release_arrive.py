@@ -5,13 +5,13 @@
 generic SMEM stores to the leader.
 
 ``arrive_on_leader`` is ``relaxed=True`` at cluster scope: right when the data it publishes is an async-proxy TMEM write
-already completed by ``tcgen05_wait(STORE)`` (frost-tile-dsl.md s3).  A follower that writes an MMA operand into ITS OWN
+already completed by ``tcgen05_wait(STORE)``.  A follower that writes an MMA operand into ITS OWN
 SMEM with generic stores (``store_swizzled``), fences it into the async proxy and hands it to a leader-issued
 ``cta_group::2`` MMA needs the arrive to RELEASE those stores to the leader's acquiring wait, or the MMA may read the
-slab stale -- a load-dependent first-launch race (design ``bprop_d256_mxfp8_sm107_DESIGN.md`` section 5, R-4).  The
+slab stale -- a load-dependent first-launch race.  The
 form is ``mbarrier.arrive.release.cta.shared::cluster.b64`` on the mapa'd leader mbar (the DSL's own default for a remote
 arrive and the SM100 dkdv chain's ``producer_commit``), NEVER ``.release.cluster``: that puts a ``MEMBAR.ALL.GPU`` +
-``CGAERRBAR`` drain ahead of every arrive (the 47 % -> 92 % SOL story, s3).
+``CGAERRBAR`` drain ahead of every arrive (removing that drain took a cga2 kernel from 47 % to 92 % of SOL).
 
 Tiers, one probe (2 CTAs x 32 lanes; every lane writes a pattern into its CTA's slab, fences, arrives on the leader's
 mbar; the leader waits and reads the FOLLOWER's slab over DSMEM):
@@ -21,8 +21,9 @@ mbar; the leader waits and reads the FOLLOWER's slab over DSMEM):
   control keeps its ``.relaxed.cluster`` form, the cga1 form falls through to a plain local arrive; with a decoding
   nvdisasm the SASS of every form has ``CGAERRBAR == 0`` and ``MEMBAR.ALL.GPU == 0`` (the drain the rule forbids).
 * tier 2 (``requires_rubin``): the probe RUNS -- the leader reads the follower's 32-lane pattern exactly, for the release
-  form, the relaxed control and the cga1 form (a single-launch smoke of the handoff shape; the 12-process x {relaxed,
-  release} x {follower delay} micro-probe of the design's S1 belongs to the P-handoff lane).
+  form, the relaxed control and the cga1 form (a single-launch smoke of the publish-then-read shape; the 12-process x
+  {relaxed, release} x {follower delay} micro-probe under an async-proxy consumer belongs with the first kernel that
+  consumes the release arrive).
 """
 
 import glob
@@ -200,7 +201,7 @@ def test_sm107a_release_arrive_ptx_form_and_no_gpu_drain(tmp_path, form_name):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2: the handoff runs on a Rubin device
+# Tier 2: the publish-then-read runs on a Rubin device
 # ---------------------------------------------------------------------------
 
 

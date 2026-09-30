@@ -10,8 +10,10 @@ and their refusal of a non-divisible split; (2) both forwards import the module 
 or of the ``_PER_PEER`` arithmetic any more (a source pin: a fourth copy would pass every numerics test); (3) the builders
 TRACE -- an sm_107a trace-compile (no device) of a host that builds a rowwise and a columnwise descriptor through the
 module for a dense and a THD geometry.  The byte-identity of the refactor itself is proved outside this module: the
-sm_107a cubin md5 of both forward kernels before / after (device side) and the host IR dump diff, plus the forwards' own
-Rubin accept tests (``test_sdpa_fwd_dsl_sm107.py -k mxfp8``).
+sm_107a cubin, PTX and clean-MLIR md5s of both forward kernels before / after (4 builds, identical; md5 records retained
+internally -- re-check the cubin md5s before and after any edit to the builders), plus the forwards' own Rubin accept
+tests (``test_sdpa_fwd_dsl_sm107.py -k mxfp8``,
+``test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d192_d128``).
 """
 
 import os
@@ -22,11 +24,9 @@ import textwrap
 
 import pytest
 
-from frost_test_utils import _dsl_installed, arch_known_to_the_dsl, requires_dsl
+from frost_test_utils import arch_known_to_the_dsl, requires_dsl
 
 pytestmark = pytest.mark.L0
-
-_REPO_PY = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python"))
 
 
 def _kernel_source(rel):
@@ -60,7 +60,7 @@ def test_peer_split_of_the_forwards_slabs():
 def test_peer_split_refuses_a_split_that_is_not_whole_tma_rows(bad):
     from cudnn.sdpa.kernels._mxfp8_sf import sf_peer_split
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"whole .*TMA rows|does not split evenly"):
         sf_peer_split(*bad)
 
 

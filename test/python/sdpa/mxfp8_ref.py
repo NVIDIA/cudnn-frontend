@@ -137,14 +137,14 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
 
     * ``True``: cuDNN's convention and the SM100 chain's -- dS rounded to ``torch_itype`` per
       1x32 block along BOTH orientations (``quantize_to_mxfp8``: along kv into dQ, along q into
-      dK); the structural twin of the design's P-b (exact 1x32 both ways).
+      dK); the structural twin of an exact-1x32-both-ways kernel dS policy.
     * ``False``: dS stays fp32 into both products -- the reference for a chain whose dQ / dK
-      consume dS in a wider dtype (the bf16-dS P-c bring-up chain), the same recipe as
+      consume dS in a wider dtype (a bf16-dS bring-up chain), the same recipe as
       ``fp8_ref.compute_ref_backward(quantize_ds=False)`` for the sm107 per-tensor fp8 row's
       bf16-dS twin: an e4m3-dS reference misreports such a chain by its own rounding noise
-      (measured there at 0.56 %% of dQ / 0.54 %% of dK outside atol).  dV is untouched.
+      (measured there at 0.56 % of dQ / 0.54 % of dK outside atol).  dV is untouched.
     * ``(32, 32)``: ONE E8M0 per 32 x 32 (q x kv) tile of dS, the same dequantized tile feeding
-      dQ and dK (the design's P-a): the tile's amax -> ``e8m0_ceil(amax * fp32(1/max))`` ->
+      dQ and dK (a one-scale-per-tile kernel dS policy): the tile's amax -> ``e8m0_ceil(amax * fp32(1/max))`` ->
       ``exp2_rcp`` -> clamp -> ``torch_itype`` -> dequant, exactly ``quantize_blocks`` on the
       1024-vector of the tile; sequences that are not multiples of 32 are zero-padded to the
       tile grid (a zero never raises a tile's amax) and sliced back.

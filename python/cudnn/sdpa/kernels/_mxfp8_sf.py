@@ -14,8 +14,8 @@ this module owns is the GMEM geometry of the SF tensors the SDPA graph carries a
   one tile -- :func:`build_rowwise_sf_desc`.
 * **columnwise SF** (V -- quantized along S, the BMM2 contraction axis): the same atom rule applied to the TRANSPOSED
   scale matrix ``[D, S/32]`` lays the grid out ``(D/128) x (b*h*S/128)`` row-major -- the D-plane index is the OUTER one,
-  and the planes of one tile sit a whole plane of ``b*h*tiles`` atoms apart, a stride that GROWS WITH S
-  (``mma-tma-matrix.md`` s7).  At d = 128 there is exactly one plane and the two layouts coincide, which is why the d128
+  and the planes of one tile sit a whole plane of ``b*h*tiles`` atoms apart, a stride that GROWS WITH S.
+  At d = 128 there is exactly one plane and the two layouts coincide, which is why the d128
   and d192x128 kernels read V through the rowwise form and why a d256 kernel was right at S = 128 and wrong from S = 256
   on until it took :func:`build_columnwise_sf_desc`.  THD packs both planes of a (head, sequence-tile) contiguously
   (per-tile strides); dense takes the plane-major strides.
@@ -29,7 +29,10 @@ Every function is plain Python that traces inside the ``@cute.jit`` host (``tmap
 or the ``@cute.kernel`` body, mirroring the closures the sm107 forwards used to carry; ``num_tiles`` / ``num_batches`` may
 be Python ints (dense: derived from ``problem_size``) or traced ``Int32`` (THD: the packed per-sequence-tile totals).
 The op sequence is the forwards' original one, in order, so their sm_107a cubins are byte-identical before and after the
-lift (the S1 gate of the MXFP8 d=256 backward plan; ``test_mxfp8_sf_desc_shared.py``).
+lift (the gate of this refactor; ``test_mxfp8_sf_desc_shared.py``).  MEASURED 2026-09-30: cubin, PTX and clean-MLIR md5s
+of both forwards at dense and causal+SWA640 (4 builds) identical at dd3235c3 and after the lift (md5 records retained
+internally).  Re-check that byte-identity -- dump both forwards' sm_107a cubins before and after and compare md5s, on any
+box whose DSL knows sm_107a -- before and after ANY edit to the builders below.
 """
 
 from typing import NamedTuple
@@ -69,18 +72,16 @@ def sf_peer_split(sf_smem_size: int, cta_mma: int) -> SfPeerSplit:
     return SfPeerSplit(bytes_per_peer, bytes_per_peer // SF_TMA_ROW_BYTES)
 
 
-def build_rowwise_sf_desc(sf_tensor, *, num_tiles, sf_smem_size: int, num_rows_box: int, num_heads, num_batches, base_offset=0):
+def build_rowwise_sf_desc(sf_tensor, *, num_tiles, sf_smem_size: int, num_rows_box: int, num_heads, num_batches):
     """5-D TMA descriptor over a ROWWISE SF tensor (per-tile contiguous atoms): ``[128 B, rows, tiles, heads, batches]``,
     box ``[128, num_rows_box, 1, 1, 1]``.
 
     ``sf_tensor``: the packed uint8 SF tensor; ``num_tiles``: s-tiles per (b, h) (dense ``ceil(S / TILE)``) or the packed
     per-sequence-tile total with ``num_batches = 1`` (THD); ``sf_smem_size``: one tile's bytes (= ``TILE * ceil128(D) / 32``);
     ``num_rows_box``: the box height -- the whole slab for Q (:func:`sf_tma_rows`), a peer's share for K / V at cga2
-    (:func:`sf_peer_split`); ``base_offset``: a byte offset added to the base only when non-zero (a paged-KV page base).
-    Strides are in 16-byte units, as TMA counts them."""
+    (:func:`sf_peer_split`).  Strides are in 16-byte units, as TMA counts them.  (A paged-KV page base is NOT a parameter
+    here: no consumer passes one yet; append it, defaulted, with the consumer and its test -- never ahead of them.)"""
     sf_base = cutlass.Int64(sf_tensor.iterator.toint())
-    if not (isinstance(base_offset, int) and base_offset == 0):
-        sf_base = sf_base + cutlass.Int64(base_offset)
     tile_stride_16 = sf_smem_size // 16
     return tmap.create_tensor_map_tiled(
         global_address=sf_base,

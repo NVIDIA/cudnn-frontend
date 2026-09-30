@@ -4,11 +4,11 @@
 """``tile_dsl.pointwise.warp_abs_max_f32`` -- ``max |x|`` over the 32 lanes of a warp in ONE ``redux.sync.max.abs.f32``
 (sm_100a+, PTX 8.6) -- and its shuffle-tree twin ``warp_abs_max_f32_shfl`` (five ``shfl.sync.bfly`` + ``max.f32``).
 
-The along-kv dS scale of the MXFP8 d=256 backward (design section 9, P-b) needs a per-column amax over 32 LANES; the
+The along-kv dS scale of the MXFP8 d=256 backward (one E8M0 per 32 kv rows of a q column) needs a per-column amax over 32 LANES; the
 redux is the cheap form, the shuffle tree the reference and the fallback.  Both return the same value to every lane.
 
-* tier 1 (any box whose cutlass-dsl knows ``sm_107a`` -- the "assembly check FIRST on this A100 host" of the design's
-  S1): the sm_107a trace-compile of a 1-warp probe is asserted; its PTX carries exactly one ``redux.sync.max.abs.f32``
+* tier 1 (any box whose cutlass-dsl knows ``sm_107a`` -- an assembly check that needs no Rubin device): the sm_107a
+  trace-compile of a 1-warp probe is asserted; its PTX carries exactly one ``redux.sync.max.abs.f32``
   and five ``shfl.sync.bfly``; with a decoding nvdisasm the SASS carries the redux (``CREDUX.MAXABS.F32 UR, R`` on sm_107a --
   the result lands in a UNIFORM register, i.e. the hardware states it is warp-uniform) and five ``SHFL``.
 * tier 2 (``requires_rubin``): on random and edge inputs (0, -0, fp32 denormals alone and mixed with normals, +-inf mixed

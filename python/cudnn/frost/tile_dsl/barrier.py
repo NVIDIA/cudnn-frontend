@@ -151,7 +151,7 @@ def mbar_arrive_on_peer(mb, peer_cta_id, pred=None):
 def arrive_on_leader(mb, leader_cta_id, cta_group: int):
     """RELAXED cluster-scope arrive on the leader's mbar: for data the arrive does NOT have to order -- an async-proxy TMEM
     write (``tcgen05_st``) already completed by ``tcgen05_wait(STORE)``, or a count-only credit.  The relaxed form is what
-    keeps ptxas from draining (``MEMBAR.ALL.GPU`` + ``CGAERRBAR`` before every arrive, frost-tile-dsl.md s3).  For a
+    keeps ptxas from draining (``MEMBAR.ALL.GPU`` + ``CGAERRBAR`` before every arrive).  For a
     lane-written SMEM operand the peer reads, use :func:`arrive_on_leader_release`."""
     if cutlass.const_expr(cta_group == 1):
         nvvm.mbarrier_arrive(mb)
@@ -169,16 +169,21 @@ def arrive_on_leader_release(mb, leader_cta_id, cta_group: int):
     follower's own slab) that a ``fence_proxy("async.shared", space="cta")`` has made visible to the async proxy, before
     the leader's ``mbarrier.try_wait.parity.acquire`` returns and its ``cta_group::2`` MMA reads that slab in place.  The
     relaxed :func:`arrive_on_leader` cannot publish such stores -- the peer-issued MMA may read the slab stale (a
-    load-dependent first-launch race); the SM100 dkdv MXFP8 chain ships exactly this handoff as its P ``producer_commit``
+    load-dependent first-launch race); the SM100 dkdv MXFP8 chain ships exactly this pattern as its P ``producer_commit``
     (``cute.arch.mbarrier_arrive(mb, dst_rank)`` = the DSL's default remote arrive, ``.release`` at CTA scope), and the
     shared scheduler credit uses the same ``.release.cta.shared::cluster`` form at 0 ``CGAERRBAR``.
 
     WHY NOT ``.release.cluster``: a cluster-scope release on a per-iteration path makes ptxas emit ``MEMBAR.ALL.GPU`` +
-    ``CGAERRBAR`` ahead of the arrive -- a kernel-wide drain per arrive site (the 47 % -> 92 % SOL story of
-    frost-tile-dsl.md s3).  The CTA-scope release across CTAs is the DSL's own "historical" default for a remote arrive
-    (formally weaker than cluster scope, empirically what the hardware / compiler honour); it is pinned by the sm107
-    MXFP8 backward's micro-probe and by the kernels' ``CGAERRBAR == 0`` SASS pins.  Lane ledger: same as
-    :func:`arrive_on_leader` (one arrive per calling lane -- nothing here elects)."""
+    ``CGAERRBAR`` ahead of the arrive -- a kernel-wide drain per arrive site (removing that drain took a cga2 kernel
+    from 47 % to 92 % of SOL).  The CTA-scope release across CTAs is the DSL's own "historical" default for a remote arrive
+    -- formally WEAKER than cluster scope.  PINNED today (``test_tile_dsl_release_arrive.py``): the PTX form,
+    ``CGAERRBAR == MEMBAR.ALL.GPU == 0`` in SASS, and a single-launch 2-CTA publish whose leader reads the follower's
+    slab through a generic ``ld.shared::cluster``.  NOT YET PINNED: the async-proxy consumer this helper exists for -- a
+    peer-issued ``cta_group::2`` MMA over a lane-written slab under load.  That micro-probe (12 fresh processes x
+    {relaxed, release.cta} x {follower nanosleep 0 / 2 us}, recording the three exit-code counts and max|diff| per cell)
+    is a MERGE GATE for the first
+    ``Producer.LEADER_RELEASE`` consumer; until it lands, treat the form as the DSL's default, not as verified
+    sufficient.  Lane ledger: same as :func:`arrive_on_leader` (one arrive per calling lane -- nothing here elects)."""
     if cutlass.const_expr(cta_group == 1):
         nvvm.mbarrier_arrive(mb)
     else:
