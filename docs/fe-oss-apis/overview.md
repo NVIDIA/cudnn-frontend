@@ -42,10 +42,12 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)](hstu/hstu_lmsd.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
+- [Aligned HCA Backward](attention/aligned_hca_backward.md)
 - [DSv4.1 Vision RoPE Backward](attention/vision_rope_backward.md)
 - [Engram Saved-State Gate](/fe-oss-apis/engram_saved_gate)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
+- [SDPA Backward, d = 256 (SM107 / Rubin)](attention/sdpa_bwd_sm107.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 - [NVFP4 Block-Scale Conversion](nvfp4_block_scale_conversion.md)
@@ -163,4 +165,4 @@ Methods:
 ## File structure and examples
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
-- Correctness tests/samples are implemented in the `test/python/fe_api` directory.
+- Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).

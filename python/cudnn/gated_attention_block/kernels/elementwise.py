@@ -13,8 +13,9 @@ The second one exists only because stage (1) is still the UNFORKED FROST GEMM,
 which writes a single fused ``[M, N]``. Q and K get de-interleaved for free by
 the norm+RoPE pass (it already reads and writes them), but V is untouched
 between the projection and the SDPA, so it would reach the SDPA as a
-padded-stride view — which ``SdpaFwdDsl._to_bshd`` accepts and then silently
-``.contiguous()``-copies. A hidden copy inside the SDPA adapter is exactly what
+padded-stride view. The historical tensor adapter copied such views; current
+SDPA plans bind TMA-compatible strides directly and declare any conversion
+scratch explicitly. A hidden copy inside the SDPA adapter is exactly what
 AGENTS.md Rule 2 bans, so the block does it as a NAMED, MEASURED stage instead.
 **It disappears the moment stage (1) is forked to write four compact buffers**
 (``api.py`` § 1); until then it is the honest price of not having forked yet,

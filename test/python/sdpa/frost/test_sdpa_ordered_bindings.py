@@ -5,7 +5,7 @@
 import cudnn
 import pytest
 
-import test_execute_overload as ordered_cases
+import core.graph.test_execute_overload as ordered_cases
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
@@ -27,3 +27,10 @@ def test_frost_ordered_matches_mapping_with_fresh_buffers_and_uid_order(frost_at
 
 def test_frost_ordered_overrides_follow_mutable_values(frost_attention_case):
     ordered_cases.test_ordered_overrides_follow_mutable_values(frost_attention_case)
+
+
+@pytest.mark.parametrize("layout", ["dense", "thd"])
+def test_frost_torch_wrapper_ordered_bindings_rebind_and_replay(layout, monkeypatch):
+    from sdpa.torch.test_ordered_bindings import test_torch_ordered_bindings_rebind_and_replay
+
+    test_torch_ordered_bindings_rebind_and_replay("frost", layout, monkeypatch)

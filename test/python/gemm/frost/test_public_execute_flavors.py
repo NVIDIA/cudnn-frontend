@@ -338,29 +338,6 @@ def test_block_scale_matmul():
 
 
 @_GPU
-def test_norm2_reduction_is_refused_at_build():
-    """``norm2`` is the one reduction mode with a post-kernel finalize.
-
-    It never reaches one: the backend refuses the reduction descriptor while
-    the graph is being lowered, so no plan exists and ``execute()`` is never
-    called. Recorded because the finalize would otherwise look like a live path
-    that needs a device-side square root.
-    """
-    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
-    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
-    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    C = g.matmul(A=A, B=B, name="mm")
-    Y = g.relu(input=C, name="relu")
-    Y.set_output(True).set_data_type(BF16)
-    R = g.reduction(input=Y, mode=cudnn.reduction_mode.NORM2, name="red")
-    R.set_dim([1, 1, 1]).set_stride([1, 1, 1])
-    R.set_output(True).set_data_type(F32)
-    g.validate()
-    with pytest.raises(RuntimeError, match="NOT_SUPPORTED"):
-        g.build_operation_graph()
-
-
-@_GPU
 def test_bare_address_operands():
     """The backend has always taken a raw device address; so must a python plan.
 

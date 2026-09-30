@@ -320,7 +320,7 @@ _register_with_torch()
 def served_plan_names() -> list:
     """Which execution plan served each cached graph (debug/reporting)."""
     names = []
-    for graph, _ws in _cudnn_ops._graph_cache.values():
+    for graph, _ws, _uids in _cudnn_ops._graph_cache.values():
         try:
             names.append(graph.get_plan_name_at_index(graph._plan_index))
         except Exception as e:  # noqa: BLE001

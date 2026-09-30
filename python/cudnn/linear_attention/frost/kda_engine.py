@@ -115,13 +115,14 @@ class KdaFrostEngine(BaseEngine):
 
 class CompiledKda:
     """Compiled FROST KDA plan over the resolved node buffers.  ``choose_pieces`` and ``is_dv_split`` fix the scheme at build: ``uncut``
-    (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head, on the prep path up to ``PREP_TILE_FRACTION`` of the SM count in tiles,
+    (one item per sequence and head), ``warmup`` (opt-in decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head, on the prep path up to ``PREP_TILE_FRACTION`` of the SM count in tiles,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused
     summary, an fp32 state chain seeding every piece, the prefill over the pieces storing every piece's final state, the
     last filled piece gathered into ``final_state``).  A rectangular state chains like a square one: the transition
     summary runs k in place of v, so M is (DK, DK) while H and X are (DV, DK)."""
 
     def __init__(self, node, kernel_module):
+        """Resolve graph attributes and select the forward scheduling family."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.kda_chain_forward_f16 import build_chain_forward, run_chain_forward
@@ -152,6 +153,10 @@ class CompiledKda:
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
+        # GDN's scalar gate product bounds its recurrent state.  KDA's
+        # (I - beta k k^T) Diag(alpha) transition mixes channels, so the
+        # per-channel gate product alone is not a general decay bound.
+        self.enable_gate_decay_split = bool(node.params.get("enable_gate_decay_split", False))
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
 
         q, v, g = node.inputs["q"], node.inputs["v"], node.inputs["g"]
@@ -188,7 +193,7 @@ class CompiledKda:
                 unit_chunks=self.unit_chunks,
             )
         )
-        self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
+        self.split = self.enable_gate_decay_split and not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
@@ -438,6 +443,7 @@ class CompiledKdaBwd:
     every sequence gathered into ``d_initial_state``."""
 
     def __init__(self, node, bwd_module, recompute_module):
+        """Resolve graph attributes and select the backward scheduling family."""
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -491,6 +497,7 @@ class CompiledKdaBwd:
         self.num_sm = multiprocessor_count(self.device)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
+        self.enable_gate_decay_split = bool(node.params.get("enable_gate_decay_split", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
@@ -504,7 +511,7 @@ class CompiledKdaBwd:
             expand_num=1,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
+        self.split = self.enable_gate_decay_split and not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
@@ -923,6 +930,7 @@ class CompiledKdaSummary:
     alone."""
 
     def __init__(self, node, recompute_module):
+        """Resolve graph attributes and select the forward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
@@ -963,6 +971,7 @@ class CompiledKdaSummary:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
+        self.enable_gate_decay_split = bool(node.params.get("enable_gate_decay_split", False))
         self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
@@ -980,7 +989,7 @@ class CompiledKdaSummary:
             expand_num=1,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
+        self.split = self.enable_gate_decay_split and not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         from .kernel import kda_summary_f16 as summary_module
@@ -1331,6 +1340,7 @@ class CompiledKdaSummaryBwd:
     state chain whose tail is ``d_initial_state`` and whose running product is ``transition``."""
 
     def __init__(self, node, summary_module):
+        """Resolve graph attributes and select the backward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
@@ -1379,6 +1389,7 @@ class CompiledKdaSummaryBwd:
         self.num_sm = multiprocessor_count(self.device)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
+        self.enable_gate_decay_split = bool(node.params.get("enable_gate_decay_split", False))
         self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
             heads_out=HO,
@@ -1392,7 +1403,7 @@ class CompiledKdaSummaryBwd:
             expand_num=1,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
+        self.split = self.enable_gate_decay_split and not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         layout = WorkspaceLayout()

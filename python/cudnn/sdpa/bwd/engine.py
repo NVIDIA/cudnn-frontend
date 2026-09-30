@@ -15,9 +15,10 @@ The capability table, the probe and the lowering stay in ``engines.py``
 contract around them.
 """
 
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from cudnn.sdpa._plan import _FrostSdpaPlan, _check_workspace
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -25,35 +26,8 @@ if TYPE_CHECKING:
     from .engines import EngineSpec
 
 
-def _check_workspace(workspace, required: int, name: str) -> None:
-    """A FROST executor carves its scratch out of the CALLER's workspace: no
-    hidden per-execute allocation, stable pointers, CUDA-graph friendly."""
-    if workspace is None:
-        raise ValueError(f"{name} needs a {required}-byte workspace; execute() got none — allocate graph.get_workspace_size() bytes and pass it")
-    available = workspace.numel() * workspace.element_size() if hasattr(workspace, "numel") else len(workspace)
-    if available < required:
-        raise ValueError(f"{name} needs a {required}-byte workspace; the buffer provides {available}")
-
-
-class _FrostSdpaBwdPlan(CompiledPlan):
-    """A compiled SDPA-backward executor plus the graph binding it was compiled for."""
-
-    def __init__(self, name: str, compiled: Any):
-        self._name = name
-        self._compiled = compiled
-        # The kernel is bound to specific graph tensors; the variant pack the
-        # graph API hands us covers every IO tensor of the graph, so key the
-        # kernel's own operands out of it by uid (uids are eager and unique).
-        self._tensors = list(compiled.binding.bound_tensors())
-        # A bound tensor's uid is fixed once the graph is frozen, so read them
-        # here rather than re-walking the list on every execute.
-        self._uids = [t.get_uid() for t in self._tensors]
-        self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0) or 0)
-
-    def get_workspace_size(self) -> int:
-        return self._workspace_bytes
-
-    def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
+class _FrostSdpaBwdPlan(_FrostSdpaPlan):
+    def _execute_tensor(self, uid_to_data, ctx):
         # Keyed by IR tensor object: that is the binding's own identity, and the
         # only key resolve_variant_pack() accepts for an auto-assigned uid.
         pack = {}

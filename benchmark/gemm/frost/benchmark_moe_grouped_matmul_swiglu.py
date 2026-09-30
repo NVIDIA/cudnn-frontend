@@ -14,7 +14,6 @@ import argparse
 import sys
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import torch
 
 from types import SimpleNamespace
@@ -102,7 +101,7 @@ def _graph_swiglu(S: int, N: int, K: int, E: int, alignment: int = 1):
     # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,

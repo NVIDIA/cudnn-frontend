@@ -191,3 +191,76 @@ def test_d256_paged_host_rebinds_table_column_stride(batch, splits):
                     expected = scores.softmax(-1) @ values[begin:end]
                     torch.testing.assert_close(o[out_index, 0].float(), expected.float(), atol=2e-3, rtol=2e-3)
                     torch.testing.assert_close(lse[out_index, :, 0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("d", [256, 512])
+def test_mxfp8_v_scale_plane_stride_multiplies_in_int64(d, monkeypatch):
+    """Trace the real descriptor expression; a late Int64 cast cannot repair overflow."""
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    mod = _load("sm100", f"prefill_d{d}_mxfp8", d, d, dtype_qkv=0, dtype_o=2, cta_mma=1)
+    original = mod.tmap.create_tensor_map_tiled
+    observed = []
+
+    def inspect_descriptor(*args, **kwargs):
+        # Q/K SF are rank five; dense V SF has a separate D-plane axis.
+        if len(kwargs.get("global_dims", ())) == 4 and kwargs.get("dtype") is cutlass.Uint8:
+            stride = kwargs["global_strides"][1]
+            widths = []
+
+            def visit(value):
+                owner = value.owner
+                if hasattr(owner, "operands"):
+                    if owner.name == "arith.muli":
+                        widths.append(str(value.type))
+                    for operand in owner.operands:
+                        visit(operand)
+
+            visit(stride.ir_value())
+            observed.append((type(stride), widths))
+            # This is a compiler arithmetic probe, never a device launch.
+            raise RuntimeError("inspected V scale plane stride")
+        return original(*args, **kwargs)
+
+    def uncached(fn, *args, **kwargs):
+        kwargs.pop("cache_key", None)
+        kwargs.pop("symbol", None)
+        kwargs["options"] += " --gpu-arch=sm_100a"
+        return cute.compile(fn, *args, **kwargs)
+
+    monkeypatch.setattr(mod.tmap, "create_tensor_map_tiled", inspect_descriptor)
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", uncached)
+    with pytest.raises(RuntimeError, match="inspected V scale plane stride"):
+        mod.compile_prepared(d_qk=d, d_v=d)
+    assert len(observed) == 1
+    dtype, widths = observed[0]
+    assert dtype is cutlass.Int64
+    assert len(widths) >= 3 and set(widths) == {"i64"}
+
+
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("has_amax", [False, True])
+def test_mxfp8_prepared_amax_flag_reaches_compiler(d, dv, has_amax, monkeypatch):
+    """The host artifact and specialization cache key must describe the same Amax flag."""
+    import inspect
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    template = "prefill_d192_d128_mxfp8" if d == 192 else f"prefill_d{d}_mxfp8"
+    mod = _load("sm100", template, d, dv, dtype_qkv=0, dtype_o=2, cta_mma=1)
+    observed = []
+    sentinel = object()
+
+    def compiler(fn, *args, **kwargs):
+        bound = inspect.signature(fn).bind(*args, stream=kwargs["stream"])
+        observed.append(bound.arguments["has_amax"])
+        return sentinel
+
+    mod.compile_prepared.cache_clear()
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", compiler)
+    try:
+        assert mod.compile_prepared(d_qk=d, d_v=dv, has_amax=has_amax) is sentinel
+        assert observed == [has_amax]
+    finally:
+        mod.compile_prepared.cache_clear()

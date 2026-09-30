@@ -144,7 +144,9 @@ _SM100_MASK_SASS_PROBE = sass_probe_source(
     params = TemplateParams(cta_mma=cta_mma, exp2_fma_split=_exp2_fma_split_for((10, 0), kind=kind, flavor=(d, d)), **params_kw)
     mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=pertensor, rubin=False)
     print("MASK_FLAGS", mod.CFG.MASK_FLAGS)
-    mod.compile(**compile_kw)
+    import inspect
+    entry = mod.compile_prepared if pertensor else mod.compile
+    entry(**{k: v for k, v in compile_kw.items() if k in inspect.signature(entry).parameters})
     """,
     counts=MASK_SASS_OPCODE_COUNTS,
 )

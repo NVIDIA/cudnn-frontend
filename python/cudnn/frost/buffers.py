@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
 import logging
 import re as _re
 import struct
@@ -565,6 +566,24 @@ def cutedsl_too_old(version):
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
     return tuple(parts) < CUTEDSL_MIN_VERSION
+
+
+@lru_cache(maxsize=1)
+def _cutedsl_has_sm107():
+    # Only the SM107 support check imports the DSL. A public version alone
+    # cannot identify target support in the differently numbered internal builds.
+    from cutlass.base_dsl import Arch
+
+    return hasattr(Arch, "sm_107a")
+
+
+def cutedsl_arch_requirement_error(device_cc):
+    """Reject a DSL without the target architecture before kernel compilation."""
+    if device_cc != (10, 7) or _cutedsl_has_sm107():
+        return None
+    _, version = cutedsl_state()
+    found = "unknown version" if version is None else " ".join(version)
+    return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
 
 
 def cutedsl_requirement_error(what):

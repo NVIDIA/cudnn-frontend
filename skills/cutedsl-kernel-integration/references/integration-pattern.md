@@ -198,13 +198,13 @@ The doc page should cover:
 
 ## Tests
 
-Add focused pytest coverage under `test/python/fe_api/`.
+Add focused pytest coverage under `test/python/<operation>/cutedsl/`.
 
 Typical files:
 
-- `test/python/fe_api/<feature>/test_<operation>.py`
-- `test/python/fe_api/<feature>/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
-- A nested family subdirectory when matching existing structure, such as `test/python/fe_api/nsa/`.
+- `test/python/<operation>/cutedsl/test_<operation>.py`
+- `test/python/<operation>/cutedsl/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
+- A nested family subdirectory when matching existing structure, such as `test/python/native_sparse_attention/cutedsl/`.
 
 Coverage should include:
 

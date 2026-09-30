@@ -37,6 +37,12 @@ class _UIDs(IntEnum):
     DBIAS = 203
 
 
+_FPROP_UIDS = tuple(map(int, (_UIDs.X, _UIDs.SCALE, _UIDs.EPSILON, _UIDs.Y, _UIDs.INV_VAR)))
+_FPROP_BIAS_UIDS = _FPROP_UIDS + (int(_UIDs.BIAS),)
+_BPROP_UIDS = tuple(map(int, (_UIDs.DY, _UIDs.X, _UIDs.SCALE, _UIDs.INV_VAR, _UIDs.DX, _UIDs.DSCALE)))
+_BPROP_BIAS_UIDS = _BPROP_UIDS + (int(_UIDs.DBIAS),)
+
+
 def _tensor_key(tensor: torch.Tensor) -> tuple:
     return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
 
@@ -192,16 +198,10 @@ def _rmsnorm_impl_on_device(
     y = torch.empty_like(x)
     inv_var = torch.empty(rows, 1, 1, 1, dtype=torch.float32, device=x.device)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    variant = {
-        int(_UIDs.X): x,
-        int(_UIDs.SCALE): scale,
-        int(_UIDs.EPSILON): epsilon_tensor(eps),
-        int(_UIDs.Y): y,
-        int(_UIDs.INV_VAR): inv_var,
-    }
+    buffers = [x, scale, epsilon_tensor(eps), y, inv_var]
     if bias is not None:
-        variant[int(_UIDs.BIAS)] = bias
-    graph.execute(variant, workspace, handle=handle)
+        buffers.append(bias)
+    graph.execute(buffers, workspace, handle=handle, tensor_uids=_FPROP_BIAS_UIDS if bias is not None else _FPROP_UIDS)
     return y, inv_var
 
 
@@ -255,17 +255,10 @@ def _rmsnorm_bwd_impl_on_device(
     dscale = torch.empty_like(scale)
     dbias = torch.empty_like(scale) if has_dbias else torch.empty(0, dtype=scale.dtype, device=x.device)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
-    variant = {
-        int(_UIDs.DY): dy,
-        int(_UIDs.X): x,
-        int(_UIDs.SCALE): scale,
-        int(_UIDs.INV_VAR): inv_var,
-        int(_UIDs.DX): dx,
-        int(_UIDs.DSCALE): dscale,
-    }
+    buffers = [dy, x, scale, inv_var, dx, dscale]
     if has_dbias:
-        variant[int(_UIDs.DBIAS)] = dbias
-    graph.execute(variant, workspace, handle=handle)
+        buffers.append(dbias)
+    graph.execute(buffers, workspace, handle=handle, tensor_uids=_BPROP_BIAS_UIDS if has_dbias else _BPROP_UIDS)
     return dx, dscale, dbias
 
 
