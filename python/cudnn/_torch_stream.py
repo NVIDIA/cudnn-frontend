@@ -18,14 +18,16 @@ torch is imported lazily: ``python/cudnn`` must import without it.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from contextlib import nullcontext
+from typing import Any, ContextManager, Optional
 
 # cudaStream_t 0, cudaStreamLegacy and cudaStreamPerThread. torch's default
 # stream is the legacy one and every blocking stream orders against it.
 DEFAULT_STREAM_HANDLES = frozenset({0, 1, 2})
 
 _RAW_CURRENT: Any = None  # torch._C._cuda_getCurrentRawStream, resolved once
+_STREAMS: dict = {}  # (handle, device index) -> torch stream; the objects are non-owning handle wrappers
+_DEFAULT_RAW: dict = {}  # device index -> torch's default-stream handle
 
 
 def _device_index(torch, device) -> int:
@@ -62,17 +64,46 @@ def as_torch_stream(stream, device=None):
             raise ValueError(f"stream must be on cuda:{_device_index(torch, device)}, got {stream.device}")
         return stream
     handle = int(stream)
-    default = torch.cuda.default_stream(device)
+    index = _device_index(torch, device)
+    resolved = _STREAMS.get((handle, index))
+    if resolved is not None:
+        return resolved
+    default = torch.cuda.default_stream(index)
     if handle in DEFAULT_STREAM_HANDLES or handle == default.cuda_stream:
-        return default
-    current = torch.cuda.current_stream(device)
-    if handle == current.cuda_stream:
-        return current
-    return torch.cuda.ExternalStream(handle, device=device)
+        resolved = default
+    else:
+        current = torch.cuda.current_stream(index)
+        resolved = current if handle == current.cuda_stream else torch.cuda.ExternalStream(handle, device=index)
+    if len(_STREAMS) >= 256:
+        _STREAMS.clear()
+    _STREAMS[(handle, index)] = resolved
+    return resolved
 
 
-@contextmanager
-def stream_context(stream, device=None, *, verify_current: bool = False) -> Iterator[None]:
+def launch_stream(stream, device=None):
+    """The torch stream a launch on ``stream`` runs on: ``as_torch_stream(stream, device)``,
+    or torch's current stream on ``device`` when ``stream`` is None."""
+    import torch
+
+    index = _device_index(torch, device)
+    if stream is None:
+        stream = _raw_current_stream(torch, index)
+        if stream is None:
+            return torch.cuda.current_stream(index)
+    return as_torch_stream(stream, index)
+
+
+def device_context(device):
+    """``torch.cuda.device(device)``, or a no-op when ``device`` is already current."""
+    import torch
+
+    index = device if isinstance(device, int) else device.index
+    if index is None or index == torch.cuda.current_device():
+        return nullcontext()
+    return torch.cuda.device(index)
+
+
+def stream_context(stream, device=None, *, verify_current: bool = False) -> ContextManager[None]:
     """``torch.cuda.stream(as_torch_stream(stream, device))``; a no-op when ``stream``
     is None or already torch's current stream on ``device``.
 
@@ -80,18 +111,22 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
     common case where the launch stream is the one torch is already on.
     """
     if stream is None:
-        yield
-        return
+        return nullcontext()
     import torch
 
     handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
-    if not verify_current and handle not in DEFAULT_STREAM_HANDLES:
-        raw = _raw_current_stream(torch, device)
-        if raw is not None and handle == raw:
-            yield
-            return
-    with torch.cuda.stream(as_torch_stream(stream, device)):
-        yield
+    if not verify_current:
+        index = _device_index(torch, device)
+        raw = _raw_current_stream(torch, index)
+        if raw is not None:
+            if handle in DEFAULT_STREAM_HANDLES:
+                default_raw = _DEFAULT_RAW.get(index)
+                if default_raw is None:
+                    default_raw = _DEFAULT_RAW.setdefault(index, torch.cuda.default_stream(index).cuda_stream)
+                handle = default_raw
+            if handle == raw:
+                return nullcontext()
+    return torch.cuda.stream(as_torch_stream(stream, device))
 
 
 def record_streams(tensors, stream, device=None) -> None:
