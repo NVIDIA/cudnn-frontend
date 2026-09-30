@@ -131,7 +131,7 @@ def _ref(dy, x, w, cos, sin, rope_dim, qk_norm):
 
 def _compile(inp, *, rope_dim, qk_norm, want_dw, has_seq_lens=False, rows_per_group=None, n_ctas_policy="sm_fill", const_head_counts=True):
     """``rows_per_group=None`` = the SHIPPED per-arm default (1 with the norm, 2 RoPE-only): every
-    numerics test that does not name a value traces exactly the artifact G3a gets."""
+    numerics test that does not name a value traces exactly the artifact the block backward gets."""
     return compile_qk_norm_rope_bwd(
         dtype=inp["dq"].dtype,
         h_q=int(inp["dq"].shape[1]),
@@ -904,7 +904,7 @@ def test_reference_mask_arm_pins_on_the_host():
 @pytest.mark.parametrize("case", ["swa640", "swa640_causal", "bottom_right"])
 def test_reference_window_arm_matches_torch_sdpa(case):
     """The oracle's masked attention vs ``F.scaled_dot_product_attention`` with
-    the SAME explicit bool mask, all fp64, ``atol=1e-12`` -- G3a's ``[swa640]``
+    the SAME explicit bool mask, all fp64, ``atol=1e-12`` -- the block backward's ``[swa640]``
     e2e case is only as good as this branch."""
     dev = torch.device("cuda")
     _mask_pins(dev)
