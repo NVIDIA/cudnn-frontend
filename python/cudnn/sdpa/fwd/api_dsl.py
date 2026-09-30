@@ -2852,7 +2852,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             ws_ptr = scratch.data_ptr()
         if spec.native is not None:
             launched = execute_native_thd_tensors(
-                spec, (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks), ws_ptr, current_stream, scale_softmax_log2
+                spec,
+                (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks, block_table, block_table_v),
+                ws_ptr,
+                current_stream,
+                scale_softmax_log2,
             )
             if not launched:
                 self._logger.debug("execute (THD): no addressable Q token, nothing to do")

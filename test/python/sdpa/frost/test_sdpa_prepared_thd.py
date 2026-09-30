@@ -1301,3 +1301,127 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
         o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d, causal=False)
         torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [128, 256])
+def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
+    """Prepared and standalone launches bind fresh pools/tables without Python admission."""
+    from test_sdpa_fwd_paged_sm100 import _pools
+
+    b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    torch.manual_seed(714)
+    _, _, k, v, table = _pools(b, hk, d, page, pages, hnd, dtype)
+    q = torch.randn(b * ql, h, d, device=DEV, dtype=dtype)
+    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * ql, h, device=DEV))
+    bufs.update(
+        cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * ql,
+        seq_kv=torch.tensor([pages * page - 3, pages * page - 11], device=DEV, dtype=torch.int32),
+        k_table=table,
+        v_table=table.flip(2),
+    )
+    bufs["off_q"], bufs["off_lse"] = bufs["cu_q"] * h * d, bufs["cu_q"] * h
+    g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
+    t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "o", "lse")}
+    t["q"] = g.tensor(dim=[b, h, ql, d], stride=[ql * h * d, d, h * d, 1], data_type=dt).set_ragged_offset(t["off_q"])
+    t["o"], t["lse"] = g.sdpa(
+        q=t["q"],
+        k=t["k"],
+        v=t["v"],
+        generate_stats=True,
+        attn_scale=1 / math.sqrt(d),
+        use_padding_mask=True,
+        cu_seq_len_q=t["cu_q"],
+        seq_len_kv=t["seq_kv"],
+        max_total_seq_len_q=b * ql,
+        paged_attention_k_table=t["k_table"],
+        paged_attention_v_table=t["v_table"],
+        paged_attention_max_seq_len_kv=page * pages,
+    )
+    t["o"].set_output(True).set_dim([b, h, ql, d]).set_stride([ql * h * d, d, h * d, 1]).set_ragged_offset(t["off_q"])
+    t["lse"].set_output(True).set_dim([b, h, ql, 1]).set_stride([ql * h, 1, h, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "[")))
+    g.check_support()
+    g.build_plans()
+    plan = _plan(g)
+    assert plan._prepared.spec.native is not None and plan._prepared.spec.paged
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *a: pytest.fail("paged native binder fell back"))
+    monkeypatch.setattr(prep_mod, "facts_of_roles", lambda *a: pytest.fail("paged graph rebuilt Python facts"))
+
+    def execute(current, workspace, *, override=True):
+        g.execute(
+            {t[n]: x for n, x in current.items()},
+            workspace,
+            override_uids=[t[n].get_uid() for n in ("k", "v", "k_table", "v_table")] if override else None,
+            override_shapes=[list(current[n].shape) for n in ("k", "v", "k_table", "v_table")] if override else None,
+            override_strides=[list(current[n].stride()) for n in ("k", "v", "k_table", "v_table")] if override else None,
+        )
+
+    def check(current):
+        for i, length in enumerate(current["seq_kv"].tolist()):
+            dense = {}
+            for n in ("k", "v"):
+                ids = current[n + "_table"][i, 0, :, 0].long()
+                dense[n] = current[n][ids].transpose(1, 2).reshape(-1, hk, d)[:length].repeat_interleave(h // hk, 1).double()
+            qi = current["q"][i * ql : (i + 1) * ql].double()
+            scores = torch.einsum("qhd,khd->hqk", qi, dense["k"]) / math.sqrt(d)
+            ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), dense["v"])
+            torch.testing.assert_close(current["o"][i * ql : (i + 1) * ql].float(), ref.float(), atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(current["lse"][i * ql : (i + 1) * ql], scores.logsumexp(-1).T.float(), atol=1e-3, rtol=1e-3)
+
+    execute(bufs, ws)
+    check(bufs)
+    # Use fresh addresses and nonunit table columns in the same compiled graph.
+    bufs = {n: x.clone() for n, x in bufs.items()}
+    for n in ("k_table", "v_table"):
+        old = bufs[n]
+        raw = torch.zeros((b, 1, pages * 3, 1), device=DEV, dtype=torch.int32)
+        bufs[n] = raw[:, :, ::3]
+        bufs[n].copy_(old)
+    ws = torch.empty_like(ws)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            execute(bufs, ws)
+            with torch.cuda.graph(graph, stream=stream):
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    execute(bufs, ws)
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+        stream.synchronize()
+        replacement = {n: x.clone() for n, x in bufs.items()}
+        execute(replacement, torch.empty_like(ws))
+        with torch.cuda.stream(stream):
+            bufs["q"].mul_(0.5)
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            graph.replay()
+        stream.synchronize()
+        check(bufs)
+    finally:
+        graph.reset()
+    # The tensor executor uses graph-declared strides and does not accept
+    # overrides. Restore those strides before exercising its native admission.
+    for n in ("k_table", "v_table"):
+        bufs[n] = bufs[n].contiguous()
+    prepared = plan._prepared
+    plan._prepared, plan.takes_variant_pack = None, False
+    try:
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        execute(bufs, ws, override=False)
+        check(bufs)
+    finally:
+        plan._prepared, plan.takes_variant_pack = prepared, True
