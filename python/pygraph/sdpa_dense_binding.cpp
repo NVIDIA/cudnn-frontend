@@ -239,8 +239,8 @@ class SdpaDenseBinder {
             std::equal(cached.shape.begin(), cached.shape.end(), f.shape.begin(), f.shape.end()) &&
             std::equal(cached.strides.begin(), cached.strides.end(), f.stride.begin(), f.stride.end()))
             return cached;
-        std::vector<int64_t> shape(f.shape.begin(), f.shape.end()), strides(f.stride.begin(), f.stride.end());
-        if (strides.empty()) {
+        std::vector<int64_t> shape(f.shape.begin(), f.shape.end()), strides;
+        if (f.stride.empty()) {
             strides.reserve(shape.size());
             int64_t value = 1;
             for (size_t i = shape.size(); i-- > 0;) {
@@ -248,6 +248,8 @@ class SdpaDenseBinder {
                 value = multiply(value, shape[i]);
             }
             std::reverse(strides.begin(), strides.end());
+        } else {
+            strides.assign(f.stride.begin(), f.stride.end());
         }
         if (strides.size() != shape.size()) invalid("operand shape and stride must have the same rank");
         if (cached.valid && cached.shape == shape && cached.strides == strides && cached.batch == b &&
