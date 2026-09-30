@@ -1845,7 +1845,7 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
 
     from cudnn.gemm.frost import kernel_registry as kr
 
-    int8_chain = SimpleNamespace(matmul=SimpleNamespace(a_dtype="int8", b_dtype="int8", accum_dtype="int32"))
+    int8_chain = SimpleNamespace(has_moe=False, matmul=SimpleNamespace(a_dtype="int8", b_dtype="int8", accum_dtype="int32"))
     monkeypatch.setattr(C, "_current_arch", lambda: 103)
     assert "exists only on" in kr.mma_arch_reject(int8_chain, kr.GraphType.MATMUL, "sm100")
     for ok_sm in (100, 110):
@@ -1859,7 +1859,7 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
     monkeypatch.setattr(C, "_current_arch", lambda: 107)
     assert kr.mma_arch_reject(mixed_chain, kr.GraphType.BLOCK_SCALE_MATMUL, "sm100") is None
     # A family-portable combo is arch-free at this gate (stage 0 handles GPUs).
-    bf16_chain = SimpleNamespace(matmul=SimpleNamespace(a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"))
+    bf16_chain = SimpleNamespace(has_moe=False, matmul=SimpleNamespace(a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"))
     monkeypatch.setattr(C, "_current_arch", lambda: 90)
     assert kr.mma_arch_reject(bf16_chain, kr.GraphType.MATMUL, "sm100") is None
 

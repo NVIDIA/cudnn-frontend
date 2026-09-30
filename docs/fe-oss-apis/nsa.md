@@ -627,10 +627,10 @@ All components require `float32` accumulator dtype for numerical stability.
 
 For complete usage examples and tests, see:
 
-- `test/python/fe_api/nsa/test_NSA_selection_attention.py`
-- `test/python/fe_api/nsa/test_NSA_compression_attention.py`
-- `test/python/fe_api/nsa/test_NSA_swa.py`
-- `test/python/fe_api/nsa/test_NSA_topk_reduction.py`
+- `test/python/native_sparse_attention/cutedsl/test_NSA_selection_attention.py`
+- `test/python/native_sparse_attention/cutedsl/test_NSA_compression_attention.py`
+- `test/python/native_sparse_attention/cutedsl/test_NSA_swa.py`
+- `test/python/native_sparse_attention/cutedsl/test_NSA_topk_reduction.py`
 
 ### Example: Full NSA Pipeline
 

@@ -237,6 +237,6 @@ def test_build_bwd_command_uses_test_repro():
     }
 
     command = repro_command.build_command(cfg)
-    assert "test/python/test_mhas_v2.py::test_repro" in command
+    assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in command
     assert "'is_infer': False" in command
     assert "cudnn.diagonal_alignment.TOP_LEFT" in command

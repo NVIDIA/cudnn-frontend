@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int8, Int32
+from cutlass.cute.typing import Int8, Int32, Int64
 
 THREADS = 256
 SF_LAYOUT_SFA = "sfa"
@@ -106,7 +106,7 @@ class Mxfp8SfRepackSm100:
     def kernel(self, src: cute.Tensor, dst: cute.Tensor):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * THREADS + tidx
+        idx = Int64(bidx) * THREADS + tidx
         if idx < self.dst_bytes:
             k0 = idx % 4
             r = idx // 4
@@ -133,7 +133,7 @@ class Mxfp8SfRepackSm100:
                 else:
                     if m1 == 1:
                         if odd == 1:
-                            src_m1 = Int32(3)
+                            src_m1 = Int64(3)
                     else:
                         has_source = Int32(0)
             else:
@@ -156,6 +156,8 @@ class Mxfp8SfRepackSm100:
                 else:
                     value = Int8(_E8M0_ONE)
             dst[idx] = value
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 __all__ = ["Mxfp8SfRepackSm100", "SF_LAYOUT_SFA", "SF_LAYOUT_SFB", "THREADS", "repack_geometry"]

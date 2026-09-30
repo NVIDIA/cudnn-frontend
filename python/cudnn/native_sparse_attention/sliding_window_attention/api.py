@@ -367,6 +367,24 @@ class SlidingWindowAttention(APIBase):
         self._cudnn_swa_graph.build_plans()
         self._workspace_bytes = int(self._cudnn_swa_graph.get_workspace_size())
 
+        tensors = [self.q_cudnn, self.k_cudnn, self.v_cudnn, self.o_cudnn]
+        if self.input_layout == "thd":
+            tensors.extend(
+                (
+                    self.seq_len_q_cudnn,
+                    self.seq_len_kv_cudnn,
+                    self.q_ragged_offset_cudnn,
+                    self.k_ragged_offset_cudnn,
+                    self.v_ragged_offset_cudnn,
+                    self.o_ragged_offset_cudnn,
+                )
+            )
+        if not self.is_infer:
+            tensors.append(self.stats_cudnn)
+            if self.input_layout == "thd":
+                tensors.append(self.stats_ragged_offset_cudnn)
+        self._tensor_uids = tuple(tensor.get_uid() for tensor in tensors)
+
         self._cudnn_compiled = True
         self._logger.debug("SlidingWindowAttention kernel compiled successfully")
 
@@ -482,21 +500,22 @@ class SlidingWindowAttention(APIBase):
         ):
             raise ValueError("SlidingWindowAttention.execute: ragged offset tensors are only defined for the T,H,D layout; pass None for bshd")
 
-        variant_pack = {
-            self.q_cudnn: q_tensor,
-            self.k_cudnn: k_tensor,
-            self.v_cudnn: v_tensor,
-            self.o_cudnn: o_tensor,
-            self.seq_len_q_cudnn: seq_len_q_tensor,
-            self.seq_len_kv_cudnn: seq_len_kv_tensor,
-            self.q_ragged_offset_cudnn: q_ragged_offset_tensor,
-            self.k_ragged_offset_cudnn: k_ragged_offset_tensor,
-            self.v_ragged_offset_cudnn: v_ragged_offset_tensor,
-            self.o_ragged_offset_cudnn: o_ragged_offset_tensor,
-        }
+        buffers = [q_tensor, k_tensor, v_tensor, o_tensor]
+        if self.input_layout == "thd":
+            buffers.extend(
+                (
+                    seq_len_q_tensor,
+                    seq_len_kv_tensor,
+                    q_ragged_offset_tensor,
+                    k_ragged_offset_tensor,
+                    v_ragged_offset_tensor,
+                    o_ragged_offset_tensor,
+                )
+            )
         if not self.is_infer:
-            variant_pack[self.stats_cudnn] = stats_tensor
-            variant_pack[self.stats_ragged_offset_cudnn] = stats_ragged_offset_tensor
+            buffers.append(stats_tensor)
+            if self.input_layout == "thd":
+                buffers.append(stats_ragged_offset_tensor)
 
         required = self.get_workspace_size()
         if required > 0:
@@ -504,7 +523,7 @@ class SlidingWindowAttention(APIBase):
             if not workspace.is_cuda or workspace.device != self.sample_q.device:
                 raise ValueError(f"SlidingWindowAttention: workspace must be on the plan's device {self.sample_q.device}, got {workspace.device}")
         # pygraph.execute lowers workspace=None to a null pointer, legal only when the plan needs 0 bytes.
-        self._cudnn_swa_graph.execute(variant_pack, workspace if required > 0 else None, handle=cudnn_handle)
+        self._cudnn_swa_graph.execute(buffers, workspace if required > 0 else None, handle=cudnn_handle, tensor_uids=self._tensor_uids)
         self._logger.debug("Executed successfully")
 
     def __call__(self, *args, **kwargs) -> None:

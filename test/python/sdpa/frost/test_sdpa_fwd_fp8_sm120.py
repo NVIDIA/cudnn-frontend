@@ -891,7 +891,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     """
     import os
 
-    import cutlass
+    from cudnn.frost.compiled_cache import positional_entry
     import cuda.bindings.driver as cuda_driver
 
     from cudnn.frost.template_loader import load_template
@@ -927,27 +927,38 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     amax_o = torch.zeros(1, dtype=torch.float32, device=dev)
     scale = 1.0 / math.sqrt(D)
     one = torch.ones(1, dtype=torch.float32, device=dev)  # identity device scales
-    fn(
-        q8,  # native fp8 element types across the ABI
-        k8,
-        v8,
-        o,
-        None,  # lse (has_lse=False)
-        None,  # sinks (unsupported; ABI slot)
-        seq_q,
-        seq_kv,
-        amax_o.view(torch.int32),  # bitcast-int32 atomicMax storage
-        cutlass.Float32(scale * math.log2(math.e)),  # softmax_scale_log2 base (descale_q*descale_k fold in-kernel)
-        cutlass.Float32(1.0),  # o_scale_fused base (descale_v*scale_o and the P-cast 2^-4 fold in-kernel)
-        one,  # descale_q_t
-        one,  # descale_k_t
-        one,  # descale_v_t
-        one,  # scale_o_t
-        cutlass.Int32(0),  # thd_max_sq (dense: ignored)
-        None,  # thd_q_lens (dense: folded out of the ABI)
-        None,  # thd_kv_lens
-        None,  # thd_lens_form
-        cutlass.Int32(0),  # thd_n_ctas (dense: no persistent grid)
+    # Keep the direct template (including unreachable head tails), but bind
+    # the shared pointer ABI instead of reviving tensor-fake compilation.
+    raw = positional_entry(fn)
+    assert raw is not None
+    raw(
+        q8.data_ptr(),
+        k8.data_ptr(),
+        v8.data_ptr(),
+        o.data_ptr(),
+        None,
+        0,
+        seq_kv.data_ptr(),
+        0,
+        (B, H, H, S, S, 0),
+        tuple(q8.stride()[:3]),
+        tuple(k8.stride()[:3]),
+        tuple(v8.stride()[:3]),
+        tuple(o.stride()[:3]),
+        (0, 0, 0),
+        0,
+        scale * math.log2(math.e),
+        seq_q.data_ptr(),
+        None,
+        None,
+        None,
+        0,
+        one.data_ptr(),
+        one.data_ptr(),
+        one.data_ptr(),
+        one.data_ptr(),
+        amax_o.data_ptr(),
+        None,
         cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     torch.cuda.synchronize()
@@ -1806,3 +1817,15 @@ def test_fp8_sm120_d512_thd(stats_layout, o_dtype, interleaved, monkeypatch):
         poison_pad=True,
         interleaved=interleaved,
     )
+
+
+import test_sdpa_prepared_block_output as _prepared_block_output_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12, reason="architecture-specific block-output CI entry")
+class TestPreparedBlockOutput:
+    test_rebind_and_replay = staticmethod(_prepared_block_output_checks.test_block_scaled_prepared_rebind_and_replay)
+    test_invalid_storage = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup)
+    test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)
+    test_graph_adapter_parity = staticmethod(_prepared_block_output_checks.test_block_scaled_graph_and_adapter_bind_same_frame)
+    test_scale_presence = staticmethod(_prepared_block_output_checks.test_block_scaled_mxfp8_scale_presence_matches_compilation)

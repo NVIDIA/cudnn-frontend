@@ -74,7 +74,7 @@ come back exactly zero.
 Also RECORDS (not gates) whether out/dKV/dScore happen to be bitwise-equal to eager
 per case, so docs can state honestly which parts remain bitwise. The eager reference
 is the fp32-intermediate mirror of the Megatron-LM eager pooling region, identical to
-the one in test/python/fe_api/csa/test_CSA_compressor.py; it is cross-checked here
+the one in test/python/compressed_sparse_attention/cutedsl/test_CSA_compressor.py; it is cross-checked here
 against the production ratio=4 backward (bitwise dKV/dScore) before being trusted.
 
 Requires a CC 10.0 GPU and the ``cudnn[cutedsl]`` install. Not collected by pytest.
