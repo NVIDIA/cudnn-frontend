@@ -2166,7 +2166,8 @@ class pygraph:
             described = from_graph + schema.finish(native, from_graph)
         if extent is None:
             extent = self._workspace_extent_fallback(workspace)
-        return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described))
+        overridden = tuple(self._slot_of_uid[uid] for uid in override_uids) if override_uids else ()
+        return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described), overridden)
 
     def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
         """Turn the caller's variant pack into :class:`VariantPack`, once.
@@ -2249,7 +2250,7 @@ class pygraph:
                 workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
         """The storage-slot geometry each slot of ``order`` was declared with,
@@ -3017,7 +3018,13 @@ _STRUCTURED_OPS = {
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
         attrs=("mode", "top_k"),
         outputs=("OUT_0",),
-        infer={"OUT_0": lambda n: [1, n.inputs["token"].dim[-2], n.inputs["weight"].dim[-1]]},
+        infer={
+            "OUT_0": lambda n: [
+                1,
+                n.inputs["token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"].dim[-2],
+                n.inputs["weight"].dim[-1],
+            ]
+        },
     ),
     "moe_grouped_matmul_bwd": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL_BWD,
@@ -3202,6 +3209,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "enable_gate_decay_split",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3225,6 +3233,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "enable_gate_decay_split",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3248,7 +3257,17 @@ _STRUCTURED_OPS = {
     "kda_summary": dict(
         node_type=NodeType.KDA_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+            "enable_gate_decay_split",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3267,6 +3286,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "enable_gate_decay_split",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},

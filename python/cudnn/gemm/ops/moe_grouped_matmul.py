@@ -10,7 +10,9 @@ expert-parallel grouped matrix multiplication used in Mixture-of-Experts layers.
 **Layout convention**:
 - Token tensor: ``(1, total_tokens, hidden_size)`` row-major
 - Weight tensor: ``(num_experts, hidden_size, output_size)`` with column-major inner dims
-- first_token_offset: ``(batch_size * num_experts, 1, 1)`` INT32
+- first_token_offset: ``(G+1, 1, 1)`` INT32 boundaries, where
+  ``G = batch_size * num_experts``. Implicit ``(G, 1, 1)`` starts are deprecated
+  and remain supported by native engines for E>1. FROST requires G+1.
 
 Graph caching ensures cuDNN graphs are built once per unique configuration
 and reused across calls.
@@ -158,7 +160,6 @@ def _build_graph(
     weight_shape = list(weight.shape)
     weight_stride = list(weight.stride())
 
-    # first_token_offset: (batch_size * num_experts, 1, 1) — use actual strides
     fto_shape = list(first_token_offset.shape)
     fto_stride = list(first_token_offset.stride())
 
@@ -275,7 +276,7 @@ def _moe_grouped_matmul_op(
     Args:
         token: Token tensor (1, M, K)
         weight: Weight tensor (num_experts, K, N) -- row-major, transposed internally
-        first_token_offset: First token offset (batch_size * num_experts, 1, 1) INT32
+        first_token_offset: G+1 explicit INT32 boundaries; implicit G starts are deprecated.
         token_index: Optional token index (1, num_tokens, 1) INT32, for GATHER/SCATTER modes
         token_ks: Optional token ks (1, num_tokens, 1) INT32, for SCATTER mode
         mode: "none", "gather", or "scatter"
@@ -290,6 +291,12 @@ def _moe_grouped_matmul_op(
         raise ValueError("SCATTER mode requires both token_index and token_ks")
     if mode == "gather" and token_index is None:
         raise ValueError("GATHER mode requires token_index")
+
+    from cudnn._gemm_validate import moe_offset_mode
+
+    if first_token_offset.ndim != 3 or tuple(first_token_offset.shape[1:]) != (1, 1):
+        raise ValueError("first_token_offset must have shape [G,1,1] or [G+1,1,1]")
+    moe_offset_mode(first_token_offset.shape[0], weight.shape[0])
 
     handle = _get_handle(token.device)
 
@@ -389,8 +396,12 @@ def moe_grouped_matmul(
         token: Token tensor ``(1, M, K)`` where ``M = batch_size * token_num * top_k``
             and ``K = hidden_size``.
         weight: Weight tensor ``(num_experts, K, N)``
-        first_token_offset: Expert routing offsets ``(batch_size * num_experts, 1, 1)``
-            INT32 tensor indicating the starting token index for each expert.
+        first_token_offset: INT32 boundaries ``(G+1, 1, 1)`` with an explicit final
+            endpoint <= the routed token capacity. Implicit ``(G, 1, 1)`` starts
+            are deprecated; native engines accept them for E>1 with endpoint
+            equal to routed capacity. Append that endpoint to migrate to G+1.
+            G must be a positive multiple of E; E=1 is explicit-only.
+            Output slots outside the routed groups are unspecified.
         token_index: Optional token index ``(1, num_tokens, 1)`` INT32 tensor.
             Required for ``"gather"`` and ``"scatter"`` modes.
         token_ks: Optional token ks ``(1, num_tokens, 1)`` INT32 tensor.

@@ -8,7 +8,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 - A function and its implementation module can share a name. Python installs an imported
   submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
-  `test_ops_callable_exports_survive_import_order` in `test/python/test_import_boundaries.py`.
+  `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
@@ -137,16 +137,14 @@ neither names the thing that breaks it most directly: a device-to-host read.
   range(B): int(cu[i])` loop). Extract the correct one and call it from both
   rather than writing the obvious loop again.
 
-Known violations, all pre-existing and each needing a kernel-side change, so
-none is precedent:
-
-- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
-  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
-  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
-  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
-  the graph's envelope `S_max` and turns the per-batch lengths into
-  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
-  violation on the wrapper surface (a caller contract, documented there).
+The SM80 packed backward wrapper now shares the prepared graph chain. When
+`max_s_kv` is absent, the packed capacity bounds the grid; B+1 prefixes stay
+on device. `test_wrapper_without_length_hints_does_not_sync` detects the old
+CPU copy after warmup (verified RED on the preceding wrapper). Capacity,
+Stats head pitch, launch bounds and deterministic-counter size are distinct:
+a caller may reserve more storage than `B * max_sequence_length`. Preserve
+that capacity while honoring the caller's valid launch bounds; cover poisoned
+slack and changed device prefixes under replay.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -181,9 +179,18 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
-- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
-  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
-  plus the plan-time sequence count; the regression tests are
+- **Prove artifact reuse across plans.** A stable key does not guarantee that
+  `compile_cached` exported an artifact: its wrapper serializer declines
+  dataclass compile arguments, including `Constexpr` ones. Read an immutable
+  template module's `PARAMS` inside the host instead of passing the same
+  dataclass again. Build a second plan with `cute.compile` forbidden, assert
+  a real cache hit, and check the reloaded artifact's outputs and graph replay;
+  `test_replan_reloads_prepared_artifact` is the SM80 detector.
+- **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
+  The prepared backward host takes Int64 capacities and launch bounds at
+  runtime, including the compact Stats head pitch and deterministic-counter
+  size; the retained tensor compiles use `cute.sym_int` and key on
+  `b = 1, sq = skv = 0` plus the plan-time sequence count. The regression tests are
   `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
   `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
   pattern, not a shape-keyed one.
@@ -290,6 +297,10 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- A version floor does not guarantee target-architecture support. For example,
+  public 4.7.0 lacks `sm_107a`; check the actual target capability before
+  admitting SM107 plans. Test graph and standalone declines with the real
+  unsupported wheel as well as a controlled missing-target probe.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
@@ -405,7 +416,7 @@ copy_into_on_stream(user_out, staged_out, stream, device)   # copy-back into a c
 ```
 Record whenever `stream` is given, even when it is torch's current stream (the caller may have
 entered a side-stream context; the allocator orders reuse against the ALLOCATION stream);
-`stream=None` is the caller's own context and records nothing. Detector: `test/python/fe_api/test_torch_stream_staging.py` -- a long kernel on
+`stream=None` is the caller's own context and records nothing. Detector: `test/python/core/torch/test_torch_stream_staging.py` -- a long kernel on
 the side stream, the wrapper call, release the original, a same-size allocation filled with
 poison, synchronize, compare (the bare-`.contiguous()` control reads the poison). Launch every
 kernel of the window once before it: under CUDA lazy module loading a kernel's first launch waits
@@ -507,7 +518,7 @@ carve: a torch buffer is `record_stream`ed on the launch stream; an eager-JAX
 buffer (no `record_stream`) is held until an event recorded on its launch stream
 has completed, every pending one and never only the latest
 (`gemm/cutedsl/grouped/**`, `discrete_grouped/**`; detectors
-`fe_api/test_grouped_gemm_rule8.py`, `fe_api/grouped_gemm/test_grouped_gemm_rule8_fusions.py`).
+`gemm/cutedsl/test_grouped_gemm_rule8.py`, `gemm/cutedsl/test_grouped_gemm_rule8_fusions.py`).
 An APIBase whose kernel needs per-execute metadata built on device (HSTU
 block-sparse CSR from `func`) plus a wide-dtype accumulator (fp32 dQ) declares
 both in `scratch_workspace_bytes()` from plan-time geometry
@@ -583,9 +594,9 @@ base + E*stride_bytes, stride_bytes, dtype=torch.int64)` under
 the wrapper calls it when the caller passed none. Never derive it per execute
 inside `execute()` (the API cannot memoize it and it hides an R1
 `record_stream`), never a host list through `torch.tensor(..., device=)`; or the
-kernel takes `(base, stride)` as scalars. The fe_api sync detector (R9) flags
+kernel takes `(base, stride)` as scalars. The R9 sync detector flags
 the host list on the first call, so the failure is loud, not a silent
-serialisation (`fe_api/test_grouped_gemm_rule8.py::test_wgrad_discrete_requires_wgrad_ptrs`).
+serialisation (`gemm/cutedsl/test_grouped_gemm_rule8.py::test_wgrad_discrete_requires_wgrad_ptrs`).
 A device-side scheduler counter / ticket / semaphore the kernel self-resets is
 still caller scratch: carve it (R2) and `memset_zero_async` it on the launch
 stream EVERY execute, not once — the buffer is shared scratch another engine may
@@ -728,17 +739,17 @@ executes (no allocation) — `test_sdpa_prepared_thd.py::test_execute_allocates_
 capture-safety claim, `test_cuda_capture_lifetime.py` (GC inside a global-mode
 window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
-(`test_torch_stream.py`). Every `fe_api` test already runs each `APIBase`
-`execute()` under `set_sync_debug_mode("error")` (`test/python/fe_api/conftest.py`);
+(`test_torch_stream.py`). Every test in the frontend-only API directories already runs each `APIBase`
+`execute()` under `set_sync_debug_mode("error")` (`test/python/rule8_detector.py`, armed for its `COVERED_DIRS`);
 an R6 engine's tests carry `@pytest.mark.allow_host_sync` and say why. Rule 8
 holds build to the execute standard, so a family's own tests also wrap
 `__init__` + `check_support()` + `compile()` in `set_sync_debug_mode("error")`
 (`test_NSA_topk_reduction.py`, `test_NSA_swa.py`, `test_NSA_compression_attention.py`).
-The `compile_allocates_nothing` fixture in the fe_api conftest is the R11 detector.
+The `compile_allocates_nothing` fixture (`test/python/rule8_detector.py`, registered by the root conftest) is the R11 detector.
 Feed the sync detector tensors the plan has never
 seen (a fresh `.clone()` of the offsets / pointer table per execute): an
 id-keyed validation memo hid a per-tensor D2H from every warm test
-(`fe_api/test_grouped_gemm_rule8.py::test_execute_never_synchronizes`).
+(`gemm/cutedsl/test_grouped_gemm_rule8.py::test_execute_never_synchronizes`).
 Run the allocation detector over the CONVERTED-dtype graphs too (bf16 gate /
 int64 cu / bf16 state), not just the native one — a staging allocation only
 shows up there
@@ -768,7 +779,7 @@ execute (atomically accumulated outputs such as dGLU `dprob` get a tolerance);
 feed the allocation/sync detector fresh tables per execute; check the workspace
 contract with None / undersized / a 64-byte-offset slice; a metadata-only
 `TensorDesc` for the sample offsets proves the build reads no values
-(`fe_api/test_grouped_gemm_rule8.py`, `fe_api/grouped_gemm/test_grouped_gemm_rule8_fusions.py`).
+(`gemm/cutedsl/test_grouped_gemm_rule8.py`, `gemm/cutedsl/test_grouped_gemm_rule8_fusions.py`).
 A wrapper cache-smoke test that stubs `check_support` / `compile` / `execute`
 must stub `scratch_workspace_bytes` too, since the wrapper now sizes from it.
 
@@ -823,6 +834,15 @@ assumed_align=16)` reproduces it exactly
 (`block_sparse_builder._fake_dynamic_tensor`); a divisibility the launch-time
 view guarantees goes on the fake too (`sym_int64(divisibility=8)` for the HSTU
 fp32 accumulator).
+
+For a host-overhead migration, measure warm enqueue and captured GPU replay
+separately, and check changed-input outputs after timing. A tiny async memset
+can introduce cross-engine waits between graph kernels even when their kernel
+durations improve. If replay regresses, inspect profiler timestamps between
+nodes as well as individual kernel durations; the prepared FP8 scalar amax
+reset uses an SM kernel to avoid that wait. Keep the empty-input reduction
+identity correct when no attention host is launched
+(`test_prepared_fp8_empty_thd_resets_amax_without_attention`).
 
 
 **Rule 9 — backend and FROST share one FE Python graph contract; no special
@@ -928,7 +948,7 @@ Every OSS kernel API extends `APIBase` and implements:
 2. `APIBase` subclass + wrapper in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/fe_api/<family>/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
 6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
@@ -941,3 +961,14 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Formatting: black, line length 160.
 
 CUDA-owning objects, GC-timed release and stream capture: Rule 8.
+
+
+## DSA training composition
+
+Metadata for backward and targets has two different ordering contracts. Training
+may compact valid active indices only if forward and backward share that exact
+metadata. Score targets must preserve original slots, mask invalid/inactive
+entries, and normalize over retained slots after summing heads. Never reuse
+compacted training indices as the caller-visible target order. Detector:
+`deepseek_sparse_attention/cutedsl/test_DSA_training.py::test_native_training_and_original_score_slots`
+checks holes, duplicates, bounded lengths, all-masked rows and target alignment.

@@ -22,7 +22,7 @@ re-layout.  Two formats, one kernel (``const_expr`` arms):
 Both multiply the block amax by the fp32 rounding of ``1/6`` (``0x3E2AAAAB``, e2m1's max is 6) --
 ONE fp32 multiply, never ``amax / 6`` (one ulp apart on a third of all inputs, i.e. across
 e4m3 / e8m0 rounding corners).  **Oracle** (bit-exact is the bar):
-``test/python/fe_api/gated_attention_block/gated_block_reference.py::fp4_quantize_rowwise_2d`` +
+``test/python/gated_attention_block/cutedsl/gated_block_reference.py::fp4_quantize_rowwise_2d`` +
 ``mx_swizzle_sf_rowwise_padded(e, block)``; the codes are compared as uint8 (torch 2.13 cannot cast
 to or from ``float4_e2m1fn_x2``) and the blob byte for byte.
 

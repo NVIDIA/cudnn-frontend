@@ -84,8 +84,17 @@ dtype_is(const NativeOperandView &f, int code, int bits) {
 
 // Fixed role order shared by graph and standalone observation. -1 in an index
 // table means an absent optional role; unfilled required roles fail below.
-enum Role : size_t { Q, K, V, O, QLens, KVLens, LSE, Sinks, NumRoles };
-constexpr std::array<const char *, NumRoles> names = {"q", "k", "v", "o", "q_lens", "kv_lens", "lse_tensor", "sinks"};
+enum Role : size_t { Q, K, V, O, QLens, KVLens, LSE, Sinks, KTable, VTable, NumRoles };
+constexpr std::array<const char *, NumRoles> names = {"q",
+                                                      "k",
+                                                      "v",
+                                                      "o",
+                                                      "q_lens",
+                                                      "kv_lens",
+                                                      "lse_tensor",
+                                                      "sinks",
+                                                      "paged_attention_k_table",
+                                                      "paged_attention_v_table"};
 
 struct Geometry {
     int64_t token, head, element, row;
@@ -112,26 +121,23 @@ enum HostSlot : size_t {
     ODescPtr,
     Stream,
     ScaleSoftmaxLog2,
+    KTablePtr,
+    VTablePtr,
+    TableStrides,
+    NumPages,
     NumHostSlots
 };
-constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
-                                                                    "k_ptr",
-                                                                    "v_ptr",
-                                                                    "o_ptr",
-                                                                    "q_strides",
-                                                                    "k_strides",
-                                                                    "v_strides",
-                                                                    "o_strides",
-                                                                    "thd_q_lens_ptr",
-                                                                    "thd_kv_lens_ptr",
-                                                                    "lse_ptr",
-                                                                    "lse_ext",
-                                                                    "problem_size",
-                                                                    "sinks_ptr",
-                                                                    "meta_ptr",
-                                                                    "o_desc_ptr",
-                                                                    "stream",
-                                                                    "scale_softmax_log2"};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
+                                                                    "v_ptr",           "o_ptr",
+                                                                    "q_strides",       "k_strides",
+                                                                    "v_strides",       "o_strides",
+                                                                    "thd_q_lens_ptr",  "thd_kv_lens_ptr",
+                                                                    "lse_ptr",         "lse_ext",
+                                                                    "problem_size",    "sinks_ptr",
+                                                                    "meta_ptr",        "o_desc_ptr",
+                                                                    "stream",          "scale_softmax_log2",
+                                                                    "block_table_ptr", "block_table_v_ptr",
+                                                                    "table_strides",   "n_pages"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -139,10 +145,13 @@ class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
-        if (spec.attr("paged").cast<bool>() || spec.attr("has_sink").cast<bool>() ||
-            spec.attr("lse_padded").cast<bool>()) {
-            invalid("native THD binding requires nonpaged f16 without sinks or padded Stats");
+        if (spec.attr("has_sink").cast<bool>() || spec.attr("lse_padded").cast<bool>()) {
+            invalid("native THD binding requires f16 without sinks or padded Stats");
         }
+        paged_     = spec.attr("paged").cast<bool>();
+        paged_hnd_ = paged_ && spec.attr("paged_hnd").cast<bool>();
+        page_size_ = paged_ ? integer(spec, "page_size") : 0;
+        if (paged_ && page_size_ <= 0) invalid("page_size must be positive for a paged plan");
         b_               = integer(spec, "b");
         qh_              = integer(spec, "qh");
         kh_              = integer(spec, "kh");
@@ -172,6 +181,8 @@ class SdpaThdBinder {
         auto order = spec.attr("order").cast<std::vector<std::string>>();
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
+            // Nonpaged hosts (including SM120) need not expose paged ABI slots.
+            if (!paged_ && slot >= KTablePtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
@@ -184,7 +195,7 @@ class SdpaThdBinder {
          int64_t workspace,
          py::object stream,
          py::object scale) const {
-        if (indices.size() != NumRoles) invalid("native THD binding requires eight role indices");
+        if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
         const auto facts = read_native_operand_views(pack, indices);
         std::array<Geometry, 4> geometry;
         for (size_t i = Q; i <= O; ++i) {
@@ -205,7 +216,9 @@ class SdpaThdBinder {
         const int64_t nk = add(b, (lens_form_ & 2) ? 1 : 0);
         if (numel(kv_lens) != nk)
             invalid("seq_kv_lens must describe the same " + std::to_string(b) + " sequences as seq_q_lens");
-        for (size_t i = Q; i <= O; ++i) geometry[i] = resolve(facts[i], i, b);
+        for (size_t i = Q; i <= O; ++i) {
+            if (!paged_ || i == Q || i == O) geometry[i] = resolve(facts[i], i, b);
+        }
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
 
@@ -234,8 +247,11 @@ class SdpaThdBinder {
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
-        int64_t tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
-        if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
+        int64_t tkv = 0;
+        if (!paged_) {
+            tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
+            if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
+        }
         if (facts[Sinks].filled)
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         if (workspace % 16 != 0) invalid("the workspace must be 16-byte aligned");
@@ -246,12 +262,14 @@ class SdpaThdBinder {
         for (size_t i = 0; i < template_.size(); ++i) frame[i] = template_[i];
         for (size_t i = Q; i <= O; ++i) {
             put(frame, pointer_slots[i], py::int_(facts[i].pointer));
-            put(frame, stride_slots[i], py::make_tuple(geometry[i].token, geometry[i].token, geometry[i].head));
+            if (!paged_ || i == Q || i == O)
+                put(frame, stride_slots[i], py::make_tuple(geometry[i].token, geometry[i].token, geometry[i].head));
         }
         put(frame, QLensPtr, py::int_(q_lens.pointer));
         put(frame, KVLensPtr, py::int_(kv_lens.pointer));
         if (has_lse_) put(frame, LSEPtr, py::int_(lse.pointer));
-        if (tkv == 0) {
+        if (paged_) tkv = bind_paged(frame, facts, b);
+        if (!paged_ && tkv == 0) {
             // Descriptor-only K/V dummy rows alias Q/O. Zero device KV lengths
             // make setup/kernel skip all reads, exactly as in the existing ABI.
             tkv = 1;
@@ -383,6 +401,70 @@ class SdpaThdBinder {
             invalid("token-major lse_tensor must be packed (T, H): head stride 1, token stride H_q");
         }
     }
+    struct TableGeometry {
+        int64_t batch, pages, batch_stride, page_stride;
+    };
+
+    TableGeometry
+    table_geometry(const NativeOperandView &f, size_t role, int64_t b) const {
+        const auto name = names[role];
+        on_device(f, name);
+        if (!dtype_is(f, kDLInt, 32)) invalid(std::string(name) + " must be int32");
+        if (!f.pointer || f.pointer % 4) invalid(std::string(name) + " must have a non-null, 4-byte-aligned address");
+        const bool rank4 = f.shape.size() == 4;
+        if ((!rank4 && f.shape.size() != 2) || (rank4 && (f.shape[1] != 1 || f.shape[3] != 1)))
+            invalid(std::string(name) + " must be (B, max_pages) or (B, 1, max_pages, 1)");
+        TableGeometry g{f.shape[0], f.shape[rank4 ? 2 : 1], stride(f, 0), stride(f, rank4 ? 2 : 1)};
+        if (g.batch < b || g.pages <= 0 || g.batch_stride < 0 || g.page_stride < 0)
+            invalid(std::string(name) + " needs covering dimensions and nonnegative strides");
+        const auto need = add(add(multiply(b - 1, g.batch_stride), multiply(g.pages - 1, g.page_stride)), 1);
+        if (span(f) >= 0 && span(f) < need) invalid(std::string(name) + " observed storage is too small");
+        return g;
+    }
+
+    std::array<int64_t, 3>
+    pool_geometry(const NativeOperandView &f, size_t role) const {
+        const auto name = std::string(names[role]);
+        const auto d    = declarations_[role][1];
+        if (f.shape.size() != 4 || f.shape[0] <= 0 || f.shape[1] != kh_ || f.shape[2] != page_size_ || f.shape[3] != d)
+            invalid(name + ": a page pool must be (n_pages, H_kv, page_size, D)");
+        if (stride(f, 3) != 1) invalid(name + ": the page pool's head dim must be contiguous");
+        if ((stride(f, 1) > stride(f, 2)) != paged_hnd_)
+            invalid(name + ": page pool layout differs from the compiled HND/NHD specialization");
+        // Same storage-order canonicalization as dense_bind_strides: unused
+        // singleton strides are not observable. Every stepped axis is covering
+        // and TMA-aligned; observed storage remains a separate per-call bound.
+        const int64_t h = paged_hnd_ ? page_size_ : kh_, seq = paged_hnd_ ? kh_ : page_size_;
+        int64_t bs = stride(f, 0), hs = stride(f, paged_hnd_ ? 2 : 1), ss = stride(f, paged_hnd_ ? 1 : 2);
+        if (h == 1) hs = d;
+        if (seq == 1) ss = multiply(h, hs);
+        if (f.shape[0] == 1) bs = multiply(seq, ss);
+        if (hs < d || ss < multiply(h, hs) || bs < multiply(seq, ss) || hs % 8 || ss % 8 || (f.shape[0] > 1 && bs % 8))
+            invalid(name + ": page-pool strides must be covering and 16-byte aligned");
+        const int64_t token = paged_hnd_ ? hs : ss, head = paged_hnd_ ? ss : hs;
+        const auto need =
+            add(add(add(multiply(f.shape[0] - 1, bs), multiply(page_size_ - 1, token)), multiply(kh_ - 1, head)), d);
+        if (span(f) >= 0 && span(f) < need) invalid(name + ": page pool observed storage is too small");
+        return {bs, token, head};
+    }
+
+    int64_t
+    bind_paged(py::tuple &frame, const std::vector<NativeOperandView> &facts, int64_t b) const {
+        const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
+        const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
+        if (kg.pages != vg.pages || kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)
+            invalid("paged K/V tables must share max_pages and strides");
+        const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
+        if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
+        put(frame, KStrides, py::make_tuple(ks[0], ks[1], ks[2]));
+        put(frame, VStrides, py::make_tuple(vs[0], vs[1], vs[2]));
+        put(frame, KTablePtr, py::int_(kt.pointer));
+        put(frame, VTablePtr, py::int_(vt.pointer));
+        put(frame, TableStrides, py::make_tuple(kg.batch_stride, kg.page_stride));
+        put(frame, NumPages, py::int_(facts[K].shape[0]));
+        return multiply(kg.pages, page_size_);
+    }
+
     void
     put(py::tuple &frame, HostSlot slot, py::object value) const {
         frame[index_[slot]] = std::move(value);
@@ -394,7 +476,8 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
-    bool has_lse_, lse_head_major_;
+    int64_t page_size_;
+    bool has_lse_, lse_head_major_, paged_, paged_hnd_;
 };
 
 }  // namespace

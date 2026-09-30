@@ -40,7 +40,10 @@ import math
 import os
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, offers_engine, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
@@ -473,18 +476,8 @@ def _run_kernel(
     else:
         o_out = torch.zeros(B, s_q, H, d, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, s_q, device=dev, dtype=torch.float32)
-        cfn = comb.compile(
-            b=B,
-            h=H,
-            sq=s_q,
-            d_v=d,
-            splits=splits,
-            dtype_o="f16" if dtype == torch.float16 else "bf16",
-            has_lse=True,
-            dtype_partial="f32",
-            stats_log2=stats_log2,
-        )
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, s_q, d), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial="f32", stats_log2=stats_log2))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, s_q, d), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):

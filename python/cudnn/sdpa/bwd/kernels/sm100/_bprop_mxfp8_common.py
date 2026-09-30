@@ -382,6 +382,9 @@ def sum_OdO(
                 scaled_lse[idx_q, head_coord] = lse_scale * lse_bhq
 
 
+sum_OdO.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # =================== @cute.jit methods ===========================
 
 
