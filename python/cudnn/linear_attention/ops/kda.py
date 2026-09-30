@@ -1185,7 +1185,6 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints):
         d_dt_bias if ctx.has_dt_bias else None,
         None,
         None,
-        None,
     )
 
 
