@@ -10,12 +10,14 @@ DRIVER's claims (``kernels/proj_gemm.py``):
 * the appended ``a_major`` / ``b_major`` kwargs declare the graph strides the FROST GEMM
   engine renders as its M-major-A / N-major-B template arms, and the tile the block
   FORCES for every ``n % 256 == 0`` (``_forced_tile_config``) renders and computes
-  correctly on cc 10.7 under those majors -- the riskiest assumption of the backward
-  track (IMPL spec R3), settled by :func:`test_forced_tile_renders_mn_major_on_cc107`;
+  correctly on cc 10.7 under those majors -- the riskiest assumption behind the block's
+  backward, settled by :func:`test_forced_tile_renders_mn_major_on_cc107`;
 * ``run_wgrad_gemm`` / ``run_dgrad_gemm`` bind transposed VIEWS (zero-copy) against a plan
-  DECLARED with the matching majors, and refuse a view whose stride-1 axis is not the
-  declared one BEFORE any launch -- the graph fallback would read the declared strides
-  with no check (a silent reinterpretation, spec R12);
+  DECLARED with the matching majors, and refuse a view whose strides are not EXACTLY the
+  declared ones (a wrong major, or a column slice of a wider slab) BEFORE any launch, on
+  both routes -- the graph fallback would read the declared strides with no check (a
+  silent reinterpretation) and the JIT re-labels B into kernel order only on
+  an exact match;
 * ``split_k`` semantics: ``0`` the driver's pick, ``1`` a pinned JIT at one slice that
   refuses the graph fallback, ``S >= 2`` the fixed-order two-kernel split whose fp32
   partials ride ``plan.workspace_bytes``.
@@ -25,7 +27,6 @@ tests run anywhere.
 """
 
 import functools
-import os
 import sys
 
 import pytest
@@ -49,8 +50,6 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     run_wgrad_gemm,
 )
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 _SM107 = (10, 7)
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
 
@@ -70,23 +69,27 @@ requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets 
 # (i) the output rounding -- half an ulp = 2^-9 relative for bf16 (8 significand bits),
 # 2^-12 for f16 -- and (ii) the fp32 accumulation order over K terms, whose error is
 # ABSOLUTE and about sqrt(K) * 2^-24 * |typical partial sum| (K = 8192: ~1e-5 of the
-# tensor's scale, three orders below the bound).  So rtol = 2^-7 (= 2 bf16 ulps, 4x the
-# half-ulp; the SAME bound for f16 is 16x its half-ulp -- deliberately one bound per
-# suite, not per dtype) and atol = 2^-7 * max|ref| (tensor-scaled, test/AGENTS.md: a
-# fixed absolute bound turns wrong when the magnitudes grow).  Never widened; a
-# violation is reported with its magnitude.
-_RTOL = 2.0**-7
+# tensor's scale, three orders below either bound).  So rtol = 4x the half-ulp of the
+# OUTPUT dtype -- 2^-7 for bf16, 2^-10 for f16, derived the same way;
+# one bound per dtype, never one for both (a shared 2^-7 would let an f16 cell 16x its
+# half-ulp through, so the f16 arms would assert less than they appear to) -- and
+# atol = rtol * max|ref| (tensor-scaled, test/AGENTS.md: a fixed absolute bound turns
+# wrong when the magnitudes grow).  Measured worst cells on Rubin (cc 10.7, 204 SMs), 2026-09-29: bf16
+# 0.16-0.23 of its bound, f16 0.02-0.03 of the 2^-7 bound = 0.16-0.24 of 2^-10 -- the
+# same 4-6x margin at both dtypes.  Never widened; a violation is reported with its magnitude.
+_RTOL_BY_DTYPE = {torch.bfloat16: 2.0**-7, torch.float16: 2.0**-10}
 
 
 def _assert_close_vs_fp64(out: torch.Tensor, ref64: torch.Tensor, what: str) -> None:
+    rtol = _RTOL_BY_DTYPE[out.dtype]
     ref_max = ref64.abs().max().item()
-    atol = _RTOL * ref_max
+    atol = rtol * ref_max
     diff = (out.double() - ref64).abs()
-    scale = atol + _RTOL * ref64.abs()
+    scale = atol + rtol * ref64.abs()
     worst = (diff / scale).max().item()
-    msg = f"{what}: max|diff| = {diff.max().item():.4g} (max|ref| = {ref_max:.4g}); worst cell at {worst:.3f} of the bound (rtol = atol/max|ref| = {_RTOL})"
+    msg = f"{what}: max|diff| = {diff.max().item():.4g} (max|ref| = {ref_max:.4g}); worst cell at {worst:.3f} of the bound (rtol = atol/max|ref| = {rtol}, {out.dtype})"
     print(msg)
-    torch.testing.assert_close(out.double(), ref64, rtol=_RTOL, atol=atol, msg=msg)
+    torch.testing.assert_close(out.double(), ref64, rtol=rtol, atol=atol, msg=msg)
 
 
 def _wgrad_operands(rows: int, t: int, cols: int, dtype: torch.dtype, seed: int = 0):
@@ -126,7 +129,7 @@ def _dims(geom_id: str) -> tuple[int, int, int]:
 
 
 def _stage_mkn(stage: str, geom_id: str, t: int) -> tuple[int, int, int]:
-    """``(m, k, n)`` of one backward projection plan at the block's geometry (spec section 1.2 table)."""
+    """``(m, k, n)`` of one backward projection plan at the block's geometry."""
     dm, hd, n_qkvg = _dims(geom_id)
     return {
         "B1_dw_o": (dm, t, hd),  # dW_o [dm, HD] = dY[T, dm]^T @ O_gated[T, HD]
@@ -161,14 +164,14 @@ def _park_the_default_stream(seconds: float = 0.5) -> None:
 
 
 # ---------------------------------------------------------------------------
-# R3 -- THE probe: the forced tile renders and computes M-major A / N-major B on cc 10.7
+# THE probe: the forced tile renders and computes M-major A / N-major B on cc 10.7
 # ---------------------------------------------------------------------------
 
 
 @requires_rubin
 def test_forced_tile_renders_mn_major_on_cc107():
-    """The riskiest assumption of the backward track (spec R3): the bf16 M-major-A /
-    N-major-B renderings of the tile the block FORCES (``..._cluster2x1_2ctamma``, D10)
+    """The riskiest assumption behind the block's backward: the bf16 M-major-A /
+    N-major-B renderings of the tile the block FORCES (``..._cluster2x1_2ctamma``)
     have never run on cc 10.7 -- the FROST GEMM suite covers the layouts on the sm100
     pipeline, and the block's own forward only ever rendered K-major operands.
 
@@ -179,7 +182,7 @@ def test_forced_tile_renders_mn_major_on_cc107():
     zero (the >256 KiB tcgen05 descriptor landmine's signature, ``test_proj_gemm.py::
     test_output_is_not_silently_zero``), and the numbers match the fp64 oracle."""
     m, k, n = 4096, 8192, 8192
-    plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="r3_probe_dw_o", a_major="m", b_major="n")
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="mn_major_probe_dw_o", a_major="m", b_major="n")
     assert plan.tile_config_name == _FORCED_TILE, f"not the forced tile: {plan.tile_config_name!r} (route {plan.route!r})"
     assert plan.jit is not None, f"no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
     assert (plan.a_major, plan.b_major) == ("m", "n")
@@ -299,7 +302,7 @@ def test_bind_is_zero_copy(monkeypatch):
 def test_plan_is_frost_and_named(stage):
     """Every backward plan at the test geometry: ``frost_gemm`` is pinned in the graph's ranked
     list (the name, exact or with its knob bracket), the plan IS the forced JIT at the named tile
-    (D10 -- a fallback to the heuristic is a FAILURE here, not a skip: it changes route, config and
+    (a fallback to the heuristic is a FAILURE here, not a skip: it changes route, config and
     possibly split-K), one slice, and the majors are stamped for the perf table."""
     m, k, n = _stage_mkn(stage, "test", 2048)
     kind = "wgrad" if stage in _WGRAD else "dgrad"
@@ -314,13 +317,15 @@ def test_plan_is_frost_and_named(stage):
 
 
 @requires_rubin
-@pytest.mark.parametrize("split_k", [0, 2], ids=["auto", "split_k=2"])
-def test_two_runs_bitwise(split_k):
-    """Determinism by construction (D6): two executes of the same plan agree bit for bit -- the
+@pytest.mark.parametrize("split_k,t", [(0, 2048), (2, 2048), (2, 4104)], ids=["auto", "split_k=2", "split_k=2-T4104"])
+def test_two_runs_bitwise(split_k, t):
+    """Determinism by construction: two executes of the same plan agree bit for bit -- the
     split-K reducer is a fixed-order tree, no atomics anywhere.  The ``split_k=2`` plan is a JIT
     CONFIG replace (``plan.jit.config.split_k_slices == 2``), not a graph-route knob replay, and its
-    fp32 partials show in ``plan.workspace_bytes``; its result meets the same fp64 bound."""
-    m, k, n = _stage_mkn("B1_dw_o", "test", 2048)
+    fp32 partials show in ``plan.workspace_bytes``; its result meets the same fp64 bound.  The
+    block's wgrads have K = T, so ``T = 4104`` splits an UNEVEN K (65 CTA-K tiles of 64 over two
+    slices, the last tile ragged) -- the slice bookkeeping the even case never exercises."""
+    m, k, n = _stage_mkn("B1_dw_o", "test", t)
     plan = _plan("wgrad", m, k, n, torch.bfloat16, split_k)
     # The catalog spells a split config by suffix (`TileConfig.name`, `by_name` round-trips it), so the
     # stamped name says which slice count runs -- what the perf table wants to see.
@@ -335,15 +340,15 @@ def test_two_runs_bitwise(split_k):
     run_wgrad_gemm(plan, dy, x, dw2, ws)
     torch.cuda.synchronize()
     assert torch.equal(dw1, dw2), f"two executes differ: max|diff| = {(dw1.float() - dw2.float()).abs().max().item()}"
-    _assert_close_vs_fp64(dw1, dy.double().T @ x.double(), f"B1 wgrad split_k={split_k}")
+    _assert_close_vs_fp64(dw1, dy.double().T @ x.double(), f"B1 wgrad split_k={split_k}, T={t}")
 
 
 @requires_rubin
 def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     """``split_k=1`` is a PIN, not a no-op: the plan is the forced JIT at one slice; and when the
     forced compile is refused, the graph-heuristic fallback ``split_k=0`` takes silently is REFUSED
-    (typed ``SplitKPinRefused`` carrying the compiler's decline) -- what the G3b recompute plans
-    need for their bit-identical claim (spec R4 / R12).  The compiler is stubbed to decline so the
+    (typed ``SplitKPinRefused`` carrying the compiler's decline) -- what the follow-up recompute
+    plans need for their bit-identical claim.  The compiler is stubbed to decline so the
     fallback arm is exercised without a shape the tile cannot take."""
     import cudnn.gemm.frost.compiler as compiler
 
@@ -351,16 +356,31 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     plan = _plan("wgrad", m, k, n, torch.bfloat16, 1)
     assert plan.jit is not None and plan.jit.config.split_k_slices == 1 and plan.tile_config_name == _FORCED_TILE and plan.route == "graph+jit"
     assert plan.split_k == 1 and plan.jit.workspace_bytes == 0
+    # The recompute plans' premise, pinned: the pinned one-slice plan and the driver's pick run the SAME config,
+    # so their outputs are bitwise equal -- a tripwire against a future catalog `split_k_slices`
+    # change (or an auto-split) on the forced tile.
+    dy, x, dw_pinned = _wgrad_operands(m, k, n, torch.bfloat16)
+    dw_auto = torch.zeros_like(dw_pinned)
+    plan0 = _plan("wgrad", m, k, n, torch.bfloat16, 0)
+    run_wgrad_gemm(plan, dy, x, dw_pinned, _ws(plan))
+    run_wgrad_gemm(plan0, dy, x, dw_auto, _ws(plan0))
+    torch.cuda.synchronize()
+    assert dw_pinned.abs().max().item() > 0 and torch.equal(
+        dw_pinned, dw_auto
+    ), "split_k=1 (pinned) and split_k=0 (the driver's pick) differ on the forced tile"
 
     orig = compiler.jit_from_cudnn_graph
 
     def decline(graph, *args, **kwargs):
-        # Decline ONLY the forced tile's compile: the backend's own frost_gemm plan (the heuristic's
-        # cluster2x4 pick, built inside `_backend_pin`) goes through the same entry point and must
-        # still build, or the graph fallback under test could never be reached.
-        config = kwargs.get("config", args[0] if args else None)
-        if config is not None and "cluster2x1_2ctamma" in config.name:
-            raise NotImplementedError(f"probe: {config.name} declined")
+        # Decline ONLY the compile `build_proj_gemm` issues ITSELF (its caller frame): the backend's own
+        # frost_gemm plan -- the heuristic's pick, built inside `_backend_pin` -> `g.build_plans()` -> the
+        # engine -> `graph_analyzer` -- goes through the same entry point with the same kwargs and must
+        # still build, or the graph fallback under test could never be reached.  Keyed on the caller, not
+        # on the config NAME: a heuristic that one day picks the forced tile's family would otherwise
+        # turn this test into an unrelated `_backend_pin` error.
+        if sys._getframe(1).f_code.co_name == "build_proj_gemm":
+            config = kwargs.get("config", args[0] if args else None)
+            raise NotImplementedError(f"probe: {getattr(config, 'name', config)} declined")
         return orig(graph, *args, **kwargs)
 
     monkeypatch.setattr(compiler, "jit_from_cudnn_graph", decline)
@@ -377,24 +397,42 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
 @requires_rubin
 def test_workspace_is_honest():
     """The block's engine scratch is ``max(plan.workspace_bytes)`` over every backward plan
-    REGARDLESS of route (spec R8): a split-K plan's fp32 partials are in its number, a too-small or
+    REGARDLESS of route: a split-K plan's fp32 partials are in its number, a too-small or
     missing workspace is a typed refusal BEFORE the launch (an overflow would not fail it), and the
-    max covers each plan."""
+    max covers each plan.
+
+    The plan under test must make ``workspace_bytes = max(graph, jit)`` LOAD-BEARING: at the test
+    geometry the backend's own frost_gemm plan auto-splits 3-way (``SPLIT_K_SLC=3`` in its name,
+    ``graph.get_workspace_size()`` = 12 MiB, measured on Rubin cc 10.7, 2026-09-29), which already exceeds
+    a JIT ``split_k=2``'s 8 MiB -- a ``workspace_bytes`` that forgot the JIT term would still pass
+    there.  ``split_k=8`` needs 32 MiB, and the precondition below asserts the ordering, so the
+    test tells you to move the shape if the heuristic ever splits deeper instead of going quiet."""
     m, k, n = _stage_mkn("B1_dw_o", "test", 2048)
-    plan2 = _plan("wgrad", m, k, n, torch.bfloat16, 2)
-    assert plan2.workspace_bytes >= plan2.jit.workspace_bytes >= 2 * m * n * 4
+    plan8 = _plan("wgrad", m, k, n, torch.bfloat16, 8)
+    assert plan8.jit is not None and plan8.jit.config.split_k_slices == 8 and plan8.tile_config_name == _FORCED_TILE + "_splitK8"
+    graph_ws, jit_ws = int(plan8.graph.get_workspace_size()), int(plan8.jit.workspace_bytes)
+    assert jit_ws >= 8 * m * n * 4
+    assert (
+        graph_ws < jit_ws
+    ), f"precondition: the graph's number ({graph_ws}) must be BELOW the JIT's ({jit_ws}) for max() to be load-bearing -- raise split_k or move the shape"
+    assert plan8.workspace_bytes >= jit_ws, f"plan.workspace_bytes = {plan8.workspace_bytes} forgot the JIT's split-K partials ({jit_ws}; graph {graph_ws})"
     dy, x, dw = _wgrad_operands(m, k, n, torch.bfloat16)
     with pytest.raises(ValueError, match="workspace"):
-        run_wgrad_gemm(plan2, dy, x, dw, torch.empty(16, dtype=torch.uint8, device="cuda"))
+        run_wgrad_gemm(plan8, dy, x, dw, torch.empty(16, dtype=torch.uint8, device="cuda"))
     with pytest.raises(ValueError, match="workspace"):
-        run_wgrad_gemm(plan2, dy, x, dw, None)
-    plans = [_plan("wgrad" if st in _WGRAD else "dgrad", *_stage_mkn(st, "test", 2048), torch.bfloat16) for st in _WGRAD + _DGRAD] + [plan2]
+        run_wgrad_gemm(plan8, dy, x, dw, torch.empty(graph_ws, dtype=torch.uint8, device="cuda"))  # the graph-only size is NOT enough
+    with pytest.raises(ValueError, match="workspace"):
+        run_wgrad_gemm(plan8, dy, x, dw, None)
+    plans = [_plan("wgrad" if st in _WGRAD else "dgrad", *_stage_mkn(st, "test", 2048), torch.bfloat16) for st in _WGRAD + _DGRAD] + [plan8]
     scratch = max(p.workspace_bytes for p in plans)
-    assert scratch >= plan2.jit.workspace_bytes and all(scratch >= p.workspace_bytes for p in plans)
+    assert scratch >= jit_ws and all(scratch >= p.workspace_bytes for p in plans)
     ws = torch.empty(scratch, dtype=torch.uint8, device="cuda")
-    run_wgrad_gemm(plan2, dy, x, dw, ws)  # the shared scratch serves the split-K plan
+    run_wgrad_gemm(plan8, dy, x, dw, ws)  # the shared scratch serves the split-K plan
+    dw2 = torch.zeros_like(dw)
+    run_wgrad_gemm(plan8, dy, x, dw2, ws)
     torch.cuda.synchronize()
-    _assert_close_vs_fp64(dw, dy.double().T @ x.double(), "B1 wgrad split_k=2 on the shared scratch")
+    assert torch.equal(dw, dw2), "two executes of the split_k=8 plan differ"
+    _assert_close_vs_fp64(dw, dy.double().T @ x.double(), "B1 wgrad split_k=8 on the shared scratch")
 
 
 @requires_rubin
@@ -447,6 +485,70 @@ def test_build_refuses_an_unknown_major_or_split_k_before_any_graph():
         build_proj_gemm(m=256, k=256, n=256, dtype=torch.bfloat16, label="bad", split_k=True)
 
 
+def test_split_k_needs_pin_frost():
+    """A pinned split is a JIT plan by definition; ``pin_frost=False`` deselects the FROST engine, so
+    there is nothing to pin -- a typed ``ValueError`` naming both kwargs, not a silently dropped knob
+    (before this, the plan came back ``route='graph'``, ``jit=None`` with ``plan.split_k`` still
+    stamped with the request)."""
+    for split_k in (1, 2):
+        with pytest.raises(ValueError, match=rf"split_k={split_k}.*pin_frost=False"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, label="x", a_major="m", b_major="n", split_k=split_k, pin_frost=False)
+
+
+_FP8 = getattr(torch, "float8_e4m3fn", None)
+
+
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_fp8_mn_major_is_a_typed_decline():
+    """The drivers serve bf16 / f16.  An fp8 (e4m3) operand with an M-major A or an N-major B is
+    a typed ``NotImplementedError`` BEFORE any graph exists -- that rendering is unmeasured on
+    cc 10.7 and the quantized backward lands its own fp8 GEMM drivers -- rather than an admitted
+    but never-run path.  The forward's K-major fp8 plans are untouched (``test_proj_gemm.py``)."""
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m'"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dw", a_major="m", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*b_major='n'"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dx", a_major="k", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*w_dtype"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
+
+
+def test_workspace_bytes_is_the_max_of_graph_and_jit():
+    """``ProjGemmPlan.workspace_bytes`` on fakes, so the ``max(graph, jit)`` rule is pinned
+    independently of what the backend heuristic happens to report: the JIT's split-K
+    partials count whenever a JIT exists (``run_proj_gemm`` launches it), the graph's number when
+    it is the larger, the JIT's alone on the JIT-only route, and never 0."""
+
+    class _Graph:
+        def __init__(self, ws):
+            self.ws = ws
+
+        def get_workspace_size(self):
+            return self.ws
+
+    class _Jit:
+        def __init__(self, ws):
+            self.workspace_bytes = ws
+
+    plan = ProjGemmPlan(graph=_Graph(12 << 20), a=None, b=None, c=None, m=512, k=2048, n=2048, label="ws", dtype=torch.bfloat16)
+    plan.route = "graph+jit"
+    plan.jit = _Jit(32 << 20)
+    assert plan.workspace_bytes == 32 << 20  # the JIT's split-K partials win
+    plan.jit = _Jit(8 << 20)
+    assert plan.workspace_bytes == 12 << 20  # the graph's number wins (the test-geometry case above)
+    plan.jit = _Jit(0)
+    assert plan.workspace_bytes == 12 << 20
+    plan.jit = None
+    plan.route = "graph"
+    assert plan.workspace_bytes == 12 << 20
+    plan.graph = _Graph(0)
+    assert plan.workspace_bytes == 1  # never 0: an empty buffer would fail Workspace's presence check
+    plan.route = "jit-only"
+    plan.jit = _Jit(8 << 20)
+    assert plan.workspace_bytes == 8 << 20  # no backend plan to ask
+    plan.jit = None
+    assert plan.workspace_bytes == 1
+
+
 def test_tma_rule_is_typed():
     """B1 at ``dm = 4100``: A is M-major, so TMA reads M contiguously and needs ``M % 8 == 0``
     at bf16 (16-byte contiguous-extent rule).  A typed ``ValueError`` naming the operand
@@ -463,7 +565,7 @@ def test_wrong_major_view_is_a_typed_refusal():
     the operand and BOTH strides, raised by the DRIVER before any launch.  Why the driver
     checks: the JIT route re-reads runtime strides and refuses a mismatch, but the graph
     fallback binds pointers against the DECLARED strides with no check -- a wrong view there
-    is a silent reinterpretation (spec R12).  Hand-built plans, so this runs on any device
+    is a silent reinterpretation.  Hand-built plans, so this runs on any device
     (nothing is launched; the check precedes every route)."""
     t, dm, hd = 256, 512, 1024
     dy = torch.zeros(t, dm, device="cuda", dtype=torch.bfloat16)
@@ -487,3 +589,23 @@ def test_wrong_major_view_is_a_typed_refusal():
     fwd = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=dm, n=hd, label="fwd", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=r"b_major='k'"):
         run_dgrad_gemm(fwd, dy, torch.zeros(dm, hd, device="cuda", dtype=torch.bfloat16), torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)
+    # (5) the right major, a PADDED view: x as a column slice of a wider slab has the declared stride-1
+    #     axis but a row stride != n -- refused naming both strides, on the graph route (jit=None) ...
+    x_wide = torch.zeros(t, hd + 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"B.*strides \(\d+, 1088, 1\) but the plan declared \(\d+, 1024, 1\).*exactly the declared layout"):
+        run_wgrad_gemm(mn, dy, x_wide[:, :hd], dw, ws)
+    # (6) ... and on the JIT route alike (the JIT re-labels B into kernel order only on an exact match,
+    #     so its own refusal would be the generic 'input layout' one; the driver's typed message comes first).
+    mn_jit = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=dm, k=t, n=hd, label="mn_jit", dtype=torch.bfloat16, a_major="m", b_major="n")
+    mn_jit.jit = object()
+    with pytest.raises(ValueError, match=r"B.*strides \(\d+, 1088, 1\) but the plan declared"):
+        run_wgrad_gemm(mn_jit, dy, x_wide[:, :hd], dw, ws)
+    # (7) a padded A: dy_like as a column slice of a wider slab -> the transposed view's K stride != m.
+    dy_wide = torch.zeros(t, dm + 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"A.*strides \(\d+, 1, 576\) but the plan declared \(\d+, 1, 512\)"):
+        run_wgrad_gemm(mn_jit, dy_wide[:, :dm], x, dw, ws)
+    # (8) a dgrad's un-transposed weight as a column slice: same refusal for B.
+    dg = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=dm, n=hd, label="dg", dtype=torch.bfloat16, a_major="k", b_major="n")
+    w_wide = torch.zeros(dm, hd + 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"B \(w\).*strides \(\d+, 1088, 1\) but the plan declared"):
+        run_dgrad_gemm(dg, dy, w_wide[:, :hd], torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)

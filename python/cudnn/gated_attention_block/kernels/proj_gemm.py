@@ -92,11 +92,16 @@ views, no repack:
     B1  dW_o    = dY^T    @ O_gated   ("m", "n"; m=dm, k=T, n=HD)     B2  dO_gated = dY    @ W_o     ("k", "n"; m=T, k=dm, n=HD)
     B7  dW_qkvg = dQKVG^T @ h         ("m", "n"; m=N,  k=T, n=dm)     B8  dh       = dQKVG @ W_qkvg  ("k", "n"; m=T, k=N,  n=dm)
 
-A view binds ONLY against a plan declared with its majors: the JIT route re-reads
-the runtime strides and refuses a mismatch, but the graph fallback binds pointers
-against the DECLARED strides with no check -- so :func:`run_wgrad_gemm` /
-:func:`run_dgrad_gemm` assert every view's stride-1 axis before binding (a typed
-``ValueError`` naming the operand and both strides). All four backward GEMMs take
+A view binds ONLY against a plan declared with its majors, and ONLY with exactly
+the declared strides (size-1 axes aside): the graph fallback binds pointers
+against the DECLARED strides with no check (a padded view is a silent
+reinterpretation), and the JIT route re-labels B from graph order into kernel
+order only when the runtime ``(shape, stride)`` EQUALS the declaration
+(``sm100/compiler.py`` ``_lower``: a padded N-major B trips its generic
+``gave_up["input layout"]``, a padded M-major A would be accepted) -- so
+:func:`run_wgrad_gemm` / :func:`run_dgrad_gemm` assert the whole declared layout
+of every view before binding, on both routes (a typed ``ValueError`` naming the
+operand and both strides). All four backward GEMMs take
 the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
 ``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
 by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107``. The
@@ -941,7 +946,7 @@ class ProjGemmPlan:
         # one: `run_proj_gemm` launches `plan.jit` whenever it exists, and the graph's number is
         # the backend plan's, which knows nothing of a `split_k=` the driver pinned on the JIT
         # config.  The max of both keeps `gemm_scratch = max(plan.workspace_bytes)` honest under
-        # either route (spec R8: a forgotten reducer workspace does not fail the launch).
+        # either route (a forgotten reducer workspace does not fail the launch).
         jit_ws = int(getattr(self.jit, "workspace_bytes", 0) or 0) if self.jit is not None else 0
         if self.route == "jit-only":
             # No backend plan exists to ask; the JIT artifact knows its own (split-K only).
@@ -1082,10 +1087,14 @@ def build_proj_gemm(
     build the views and refuse a mismatch.  The TMA 16-byte contiguous-extent rule
     now falls on the MN extent (``M % (16/BPE)`` for an M-major A, ``N % (16/BPE)``
     for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists.
-    Served on the dense path only (bf16 / f16 / fp8): the block-scale rows lay their
-    scale-factor blobs over K-major operand rows and are refused with a non-K major.
+    Served on the dense bf16 / f16 path only: the block-scale rows lay their
+    scale-factor blobs over K-major operand rows and are refused with a non-K major
+    (``ValueError``), and an fp8 (e4m3) operand with a non-K major is a typed
+    ``NotImplementedError`` until the quantized backward (its own fp8 GEMM drivers)
+    measures that rendering on cc 10.7 -- the forward's fp8 plans keep the K-major
+    defaults and are untouched.
 
-    **``split_k`` -- three values (spec D10).** ``0`` (default) is the driver's pick:
+    **``split_k`` -- three values.** ``0`` (default) is the driver's pick:
     the FORCED tile's catalog ``split_k_slices=1`` on the JIT route -- the heuristic's
     ``_auto_split_k`` (``compiler.py``) is reached ONLY if the forced compile fell back
     to the graph route.  ``1`` PINS ``replace(cfg, split_k_slices=1)`` on the JIT config
@@ -1097,7 +1106,10 @@ def build_proj_gemm(
     and fp32 partials of ``S*M*N*4`` bytes, reported through ``plan.workspace_bytes``
     and handed to the JIT by :func:`run_proj_gemm` (``compiler._check_splitk_supported``
     gates S).  A pinned split without a forced name takes the engine's auto pick as
-    the base geometry (``_auto_tile_config``), so it is always a JIT plan.
+    the base geometry (``_auto_tile_config``), so it is always a JIT plan -- which is
+    why ``split_k >= 1`` needs ``pin_frost=True``: with the FROST engine deselected there
+    is no JIT to pin, and the combination is a ``ValueError`` (a knob is honoured or
+    refused, never silently dropped).
     """
     import cudnn
 
@@ -1111,10 +1123,21 @@ def build_proj_gemm(
         raise ValueError(
             f"{label}: split_k must be an int >= 0 (0 = the driver's pick, 1 = pin one slice on the JIT, S >= 2 = split-K with S slices), got {split_k!r}"
         )
+    if split_k >= 1 and not pin_frost:
+        raise ValueError(
+            f"{label}: split_k={split_k} pins a FROST JIT config and cannot be combined with pin_frost=False (the deselected-FROST graph route "
+            "has no JIT to pin, so the knob would be silently dropped)"
+        )
     if (a_major != "k" or b_major != "k") and (block_scale or _is_fp4(dtype) or _is_fp4(w_dtype)):
         raise ValueError(
             f"{label}: M-major A / N-major B are served on the dense path only (got a_major={a_major!r}, b_major={b_major!r} with "
             f"block_scale={block_scale}, dtype={dtype}, w_dtype={w_dtype}); the block-scale rows' F8_128x4 scale-factor blobs are laid out over K-major operand rows"
+        )
+    if (a_major != "k" or b_major != "k") and (_is_fp8(dtype) or _is_fp8(w_dtype)):
+        raise NotImplementedError(
+            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} is not served by this driver yet (dtype={dtype}, "
+            f"w_dtype={w_dtype}): the MN-major fp8 rendering is unmeasured on cc 10.7 and the quantized backward lands its own fp8 GEMM drivers; "
+            "use bf16 / f16 operands here, or the K-major defaults"
         )
     if split_k and block_scale:
         raise ValueError(
@@ -1348,7 +1371,16 @@ def build_proj_gemm(
                     "and the graph-heuristic fallback is refused too (it would change the tile config, the route and the slice count)"
                 ) from exc
             compiled = None
-            _LOG.debug("%s: forced tile %s rejected (%s); falling back to the heuristic", label, name, type(exc).__name__)
+            # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
+            # route and possibly the slice count (`_auto_split_k`), under a different plan name -- a perf table
+            # or a bit-identical claim built on it must see the switch without -v.
+            _LOG.warning(
+                "%s: forced tile %s rejected (%s: %s); falling back to the graph heuristic (tile config, route and slice count change)",
+                label,
+                name,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
         if compiled is not None:
             plan.jit, plan.jit_binding = compiled, compiled.binding
             plan.tile_config_name = getattr(compiled.config, "name", name)
@@ -1623,13 +1655,17 @@ def _check_view_against_declaration(plan: ProjGemmPlan, operand: str, what: str,
     """The rank-3 VIEW about to be bound as ``operand`` has the declared dims and its stride-1 axis
     IS the declared major -- else a typed ``ValueError`` naming the operand and both strides.
 
-    Why the DRIVER checks (spec R12): on the JIT route the lowered call re-reads the runtime
-    strides and refuses a mismatch (``sm100/compiler.py`` ``gave_up["input layout"]``), but the
-    graph fallback binds pointers against the DECLARED strides with no check -- a wrong view there
-    is a silent reinterpretation of the bytes.  On that route the WHOLE stride tuple must match
-    the declaration (the backend reads nothing else); the JIT route accepts any leading dimension
-    (it passes the runtime strides to the kernel), so only the contiguous axis is pinned there.
-    A size-1 axis' stride is arbitrary in torch and is never compared."""
+    Why the DRIVER checks, and why the WHOLE stride tuple on BOTH routes: the graph
+    fallback binds pointers against the DECLARED strides with no check -- a wrong or padded view
+    there is a silent reinterpretation of the bytes.  The JIT route is not uniform either: its
+    lowered call (``sm100/compiler.py`` ``_lower``, the ``renorm`` loop) re-labels B from graph
+    order ``[1, K, N]`` into kernel order ONLY when the runtime ``(shape, stride)`` EQUALS the
+    declared layout (``graph_order`` is None on the ``__call__`` path), so a padded N-major B is
+    refused by its generic ``gave_up["input layout"]`` message, while A -- already in kernel
+    order -- takes any leading dimension.  One rule the block can rely on, exactly the declared
+    layout, and one typed message naming the operand and both strides.  A size-1 axis' stride is
+    arbitrary in torch and is never compared (the drivers build the views from rank-2 inputs, so
+    the batch stride follows from the checked axes)."""
     dims, declared, contig = _declared_layout(plan, operand)
     shape, stride = tuple(int(x) for x in view.shape), tuple(int(x) for x in view.stride())
     if shape != dims:
@@ -1640,10 +1676,11 @@ def _check_view_against_declaration(plan: ProjGemmPlan, operand: str, what: str,
             f"{plan.a_major if operand == 'A' else plan.b_major}-major with strides {declared}: the view's stride-1 axis is not the declared "
             f"contiguous axis {contig}. Build the plan with the matching a_major / b_major, or hand the driver the un-transposed storage"
         )
-    if plan.jit is None and any(s != d for s, d, e in zip(stride, declared, shape) if e != 1):
+    if any(s != d for s, d, e in zip(stride, declared, shape) if e != 1):
         raise ValueError(
-            f"{plan.label}: {operand} ({what}) view has strides {stride} but the plan declared {declared}; this plan launches through the graph "
-            "route, which binds the DECLARED strides with no runtime check -- a padded / strided view would be read as the declared layout"
+            f"{plan.label}: {operand} ({what}) view has strides {stride} but the plan declared {declared}; the drivers bind exactly the declared "
+            "layout on every route -- the graph route would read a padded / strided view as the declared layout, and the JIT re-labels B into "
+            "kernel order only on an exact match. Hand the driver a contiguous [rows, cols] storage (or its plain transpose), not a slice of a wider slab"
         )
 
 
@@ -1682,9 +1719,11 @@ def run_wgrad_gemm(
     ``[T*rows, 1, rows]`` VIEW), ``B = x.unsqueeze(0)`` (== ``[1, T, cols]`` stride
     ``[T*cols, cols, 1]``) and ``C = dw.unsqueeze(0)`` -- all views, no copy, no allocation;
     :func:`run_proj_gemm`'s ``_rank3`` passes rank-3 through.  BEFORE binding it asserts
-    ``plan.a_major == "m"`` and ``plan.b_major == "n"`` and that every view's stride-1 axis
-    IS the plan's declared major (a typed ``ValueError`` naming the operand and both strides
-    -- the graph fallback would read the declared strides with no check, spec R12).
+    ``plan.a_major == "m"`` and ``plan.b_major == "n"`` and that every view carries EXACTLY
+    the plan's declared strides, size-1 axes aside (a typed ``ValueError`` naming the operand
+    and both strides -- the graph fallback would read the declared strides with no check, and
+    the JIT re-labels B into kernel order only on an exact match; a column slice of a
+    wider slab is refused, not reinterpreted).
     ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream)."""
     if (plan.a_major, plan.b_major) != ("m", "n"):
         raise ValueError(
