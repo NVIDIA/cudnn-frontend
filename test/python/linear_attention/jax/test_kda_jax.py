@@ -444,6 +444,7 @@ def test_bad_metadata():
     ids=["int64", "linear", "coarse_safe", "combined", "linear_fp32"],
 )
 def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, built_plans):
+    """JIT forward, gradients, residual backward, and plan selection agree."""
     bounds = dict(uncut=(0, 81, 81, 177), warmup=(0, 49, 49, 97), chain=(0, 129, 129, 3073))[schedule]
     dtype = jnp.float16 if domain == "linear" and offset_dtype == jnp.int64 else jnp.bfloat16
     args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
@@ -451,7 +452,12 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
         args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
     if safe_gate and schedule == "warmup":
         args = (*args[:5], None, *args[6:])
-    options = dict(checkpoint_every_n_tokens=checkpoint, batch_invariant=schedule == "uncut", safe_gate=safe_gate)
+    options = dict(
+        checkpoint_every_n_tokens=checkpoint,
+        batch_invariant=schedule == "uncut",
+        safe_gate=safe_gate,
+        enable_gate_decay_split=schedule == "warmup",
+    )
     if domain == "linear":
         options["gate_domain"] = domain
 

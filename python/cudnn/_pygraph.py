@@ -3209,6 +3209,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "enable_gate_decay_split",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3232,6 +3233,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "enable_gate_decay_split",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3255,7 +3257,17 @@ _STRUCTURED_OPS = {
     "kda_summary": dict(
         node_type=NodeType.KDA_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "gate_lower_bound",
+            "batch_invariant",
+            "enable_gate_decay_split",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3274,6 +3286,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "enable_gate_decay_split",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
