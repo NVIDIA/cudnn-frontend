@@ -131,8 +131,10 @@ def sparse_attention_forward_jax_sm100(
         raise ValueError("topk_length must be (Tq,) int32")
     if attn_sink.shape != (64,) or attn_sink.dtype != jnp.float32:
         raise ValueError("attn_sink must be (64,) float32")
-    if indexer_topk not in (512, 1024, 2048) or indexer_topk > topk_indices.shape[1]:
-        raise ValueError("indexer_topk must be a supported prefix no wider than K")
+    # indexer_topk=0 disables the indexer-prefix LSE (e.g. HCA, whose index list is
+    # a fixed local window plus causal compressed blocks); lse_indexer is then zeros.
+    if indexer_topk not in (0, 512, 1024, 2048) or indexer_topk > topk_indices.shape[1]:
+        raise ValueError("indexer_topk must be 0 or a supported prefix no wider than K")
 
     kernel_key = (512, int(indexer_topk))
     kernel = _sparse_fwd_kernels.get(kernel_key)
@@ -149,6 +151,7 @@ def sparse_attention_forward_jax_sm100(
             jax.ShapeDtypeStruct((tq, 64), jnp.float32),
             jax.ShapeDtypeStruct((tq, 64), jnp.float32),
         ),
+        initialized_outputs={3: zeros_init} if indexer_topk == 0 else None,
         kernel=kernel,
         softmax_scale=scale,
     )(q, kv, topk_indices, topk_length, attn_sink)
