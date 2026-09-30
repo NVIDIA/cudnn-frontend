@@ -27,24 +27,19 @@ from cudnn.api_base import APIBase
 TEST_ROOT = Path(__file__).resolve().parent
 
 # (operation, backend) directories whose tests the detector arms for; a renamed or new frontend-only
-# API directory must be added here (test_rule8_detector.py fails when a listed one disappears).
+# API directory must be added here (test_rule8_detector.py fails when a listed one disappears). An
+# operation joins once its APIs are migrated, in the same change.
 COVERED_DIRS = frozenset(
     {
         ("block_sparse_attention", "cutedsl"),
         ("block_sparse_attention", "jax"),
         ("causal_conv1d", "cutedsl"),
-        ("compressed_sparse_attention", "cutedsl"),
         ("core", "cutedsl"),
         ("core", "jax"),
-        ("deepseek_sparse_attention", "cutedsl"),
         ("engram", "cutedsl"),
-        ("flex_attention", "cutedsl"),
-        ("gated_attention_block", "cutedsl"),
         ("gemm", "cutedsl"),
         ("gemm", "jax"),
-        ("hstu", "cutedsl"),
         ("linear_attention", "jax"),
-        ("native_sparse_attention", "cutedsl"),
         ("norm", "cutedsl"),
         ("quantize", "cutedsl"),
         ("rope", "cutedsl"),
