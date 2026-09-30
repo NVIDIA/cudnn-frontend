@@ -438,7 +438,7 @@ TEST_CASE("Precompiled plans need no retention by the CUDA graph", "[cudagraph][
         for (size_t i = 0; i < d_host.size(); i++) {
             REQUIRE(__half2float(d_host[i]) == expected);
         }
-        CUDA_CHECK(cudaMemset(d_gpu.devPtr, 0xFF, sizeof(half) * d_gpu.size));
+        CUDA_CHECK(cudaMemsetAsync(d_gpu.devPtr, 0xFF, sizeof(half) * d_gpu.size, stream));
     }
 
     CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));

@@ -156,7 +156,9 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     cudaError_t
     retain_on_capturing_stream(cudaStream_t stream) const {
         if (!needs_cuda_graph_retention()) {
-            return cudaSuccess;
+            // Nothing to retain, but still the moment to release what destroyed graphs of other
+            // plans left queued.
+            return detail::CudaGraphRetainedResource::drain_deferred_releases_on_stream(stream);
         }
         return cuda_graph_retention.retain_on_capturing_stream(stream,
                                                                [this] { return make_graph_retention_payload(); });
@@ -165,7 +167,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     //! Whether a CUDA graph recorded from this plan has to keep the plan alive: true for engines that
     //! compile their kernels at runtime (CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION), whose code is
     //! released with the plan. Precompiled kernels are part of the cuDNN library, so recording those
-    //! costs no retention (and no capture-status query per execute). Defaults to true until the
+    //! costs no retention (and no capture-status query per execute, unless released
+    //! references are waiting to be freed). Defaults to true until the
     //! engine's behavior notes are known.
     bool
     needs_cuda_graph_retention() const {
