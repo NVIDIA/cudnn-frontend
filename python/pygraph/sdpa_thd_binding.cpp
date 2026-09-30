@@ -125,6 +125,7 @@ enum HostSlot : size_t {
     VTablePtr,
     TableStrides,
     NumPages,
+    TableVStrides,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
@@ -137,7 +138,8 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",    
                                                                     "meta_ptr",        "o_desc_ptr",
                                                                     "stream",          "scale_softmax_log2",
                                                                     "block_table_ptr", "block_table_v_ptr",
-                                                                    "table_strides",   "n_pages"};
+                                                                    "table_strides",   "n_pages",
+                                                                    "table_v_strides"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -184,6 +186,12 @@ class SdpaThdBinder {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+            // Some hosts retain one shared table-stride pair. Resolve this
+            // ABI distinction once without weakening their binding contract.
+            if (slot == TableVStrides) {
+                separate_table_strides_ = found != order.end();
+                if (!separate_table_strides_) continue;
+            }
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -452,7 +460,8 @@ class SdpaThdBinder {
     bind_paged(py::tuple &frame, const std::vector<NativeOperandView> &facts, int64_t b) const {
         const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
         const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
-        if (kg.pages != vg.pages || kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)
+        if (kg.pages != vg.pages ||
+            (!separate_table_strides_ && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)))
             invalid("paged K/V tables must share max_pages and strides");
         const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
         if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
@@ -461,6 +470,7 @@ class SdpaThdBinder {
         put(frame, KTablePtr, py::int_(kt.pointer));
         put(frame, VTablePtr, py::int_(vt.pointer));
         put(frame, TableStrides, py::make_tuple(kg.batch_stride, kg.page_stride));
+        if (separate_table_strides_) put(frame, TableVStrides, py::make_tuple(vg.batch_stride, vg.page_stride));
         put(frame, NumPages, py::int_(facts[K].shape[0]));
         return multiply(kg.pages, page_size_);
     }
@@ -478,6 +488,7 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t page_size_;
     bool has_lse_, lse_head_major_, paged_, paged_hnd_;
+    bool separate_table_strides_ = false;
 };
 
 }  // namespace
