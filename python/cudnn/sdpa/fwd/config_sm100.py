@@ -140,18 +140,21 @@ class TemplateParams:
     cta_mma: int = 2
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
-    # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
+    # capability at compile time (MXFP8 + the per-tensor FP8 d192x128 kernel; the f16
+    # kernels do not read it, and the SM107 siblings carry the instruction unconditionally).
     fused_ldtm_stat: bool = False
     # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/prefill_d128_mxfp8.py,
-    # prefill_d128_fp8.py and prefill_d192_d128_f16.py): 32 of the 128 exp2 per row on the FMA pipe
-    # instead of MUFU.EX2.  Claimed per KERNEL and per ARCH, because its sign follows the part's
-    # MUFU.EX2 rate: MEASURED 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128
-    # MXFP8, +4.5 % on d128 FP8, +1.9 % on d192x128 bf16 at the chart layers) and 32 on cc 10.7
-    # (Rubin, where the same split is -9..-10 %: an emulated exp2 costs 1.99x the MUFU time it
-    # frees); cc 10.3 (GB300) DOCUMENTS the doubled exp2 rate too.  Auto-set by the adapter from the
-    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the three kernels above) -- widen
+    # prefill_d128_fp8.py and prefill_d192_d128_f16.py; the _exp2_* helper mix of
+    # prefill_d192_d128_fp8.py): a slice of the exp2 per row on the FMA pipe instead of MUFU.EX2.
+    # Claimed per KERNEL and per ARCH, because its sign follows the part's MUFU.EX2 rate: MEASURED
+    # 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128 MXFP8, +4.5 % on d128
+    # FP8, +1.9 % on d192x128 bf16 at the chart layers, +7.0 % causal / +5.7 % dense on d192x128 FP8
+    # at the DSv3 layer) and 32 on cc 10.7 (Rubin, where the same split is -9..-10 %: an emulated
+    # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
+    # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
+    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above) -- widen
     # only after an A/B on the new cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the
-    # develop spelling).  Only those three kernels read it.
+    # develop spelling).  Only those four kernels read it.
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
@@ -318,7 +321,7 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
         # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
-        # (block-scale SF atoms bundle 128 rows of one head; not pageable), so
+        # (wired on every native flavor), so
         # the dtype family is NOT gated here: every kernel file WITHOUT the
         # PAGED_KV specialization raises at module scope on paged_kv=True
         # (next to its softmax_f16 guard), which is the backstop that cannot
@@ -414,11 +417,10 @@ def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int
     None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
     layout the kernels cannot bind zero-copy"; a caller that must tell the two
     apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback).  The rules are the kernels' own (``_fake_bshd`` in every
-    f16 / per-tensor-FP8 prefill kernel), restated here so the decision is made
-    BEFORE a compile rather than as a raise inside one -- and so the engine rows
+    copy fallback). The rules describe the kernels' TMA layout requirements,
+    checked before compilation so the engine rows
     (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter (``api_dsl.SdpaFwdDsl._bshd_zero_copy_stride``)
+    and the standalone adapter's admission and prepared binder
     judge a layout with ONE function (rule 8b lockstep):
 
       * the head dim is innermost-contiguous (stride 1);
@@ -1868,11 +1870,11 @@ def canonicalize_d192_lowering(
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time
         # `window_right` at the kernel's mask sites, so it must sit INSIDE the
-        # bits mask form's Int32 domain: `apply_mask_chunk_bits` raises at trace
+        # bit-word mask op's Int32 domain: `apply_mask_chunk` raises at trace
         # time from MASK_BOUND_LIMIT (1 << 30) on, and a trace-time raise is a
         # typed decline at engine.build_plan -- the former `1 << 30` dropped the
         # FROST fp8 row out of every dense per-tensor d192 graph once the kernels
-        # masked in that form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
+        # masked in the bit-word form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
         # sequence that fits in SM100 memory while leaving signed-int32 headroom
         # for q + R, and keeps the module key independent of S_kv.  Imported here,
         # not at module level: tile_dsl.mask imports cutlass, which stays off the

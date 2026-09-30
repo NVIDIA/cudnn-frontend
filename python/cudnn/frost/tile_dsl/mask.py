@@ -14,117 +14,59 @@ from .constants import MASK_CAUSAL, MASK_NONE, MASK_PADDED, MASK_SWA  # noqa: F4
 _NEG_INF_BITS = -3.4028235e38
 
 
-def apply_mask_chunk(
-    reg_S,
-    q_abs,
-    kv_col_base,
-    seq_kv_len,
-    window_left: int,
-    mask_flags: int,
-    N: int = 64,
-    bottom_right: int = 0,
-    causal_diag=None,
-    mask_value: float = _NEG_INF_BITS,
-    window_right: int = 0,
-):
-    # mask_value: what a masked score becomes.  Default is the legacy finite
-    # sentinel; the f16 prefill kernels pass float("-inf") so a fully-masked
-    # row's max stays -inf under any scale and the canonical
-    # `max == -inf -> substitute 0` guard (row_max_for_exp2) applies.
-    if cutlass.const_expr(mask_flags == MASK_NONE):
-        return reg_S
-
-    neg_inf = cutlass.Float32(mask_value)
-    # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
-    # lower limit is q + (S_kv - S_q) - W — the same causal_diag offset the
-    # upper (causal) limit uses below. Top-left keeps the plain q - W.
-    q_minus_w = None
-    if mask_flags & MASK_SWA:
-        swa_base = (q_abs + causal_diag) if bottom_right else q_abs
-        q_minus_w = swa_base - cutlass.Int32(window_left)
-    # window_right is the compile-time diagonal-band right bound (cuDNN
-    # diagonal_band_right_bound): kv columns up to q + window_right (plus the
-    # bottom-right diagonal offset) stay unmasked. 0 = plain causal.
-    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and bottom_right):
-        q_caus_lim = q_abs + causal_diag
-    else:
-        q_caus_lim = q_abs
-    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and window_right != 0):
-        q_caus_lim = q_caus_lim + cutlass.Int32(window_right)
-
-    elems = []
-    for i in range(N):
-        kv_abs = kv_col_base + cutlass.Int32(i)
-        masked = None
-        if cutlass.const_expr(mask_flags & MASK_PADDED):
-            term = kv_abs >= seq_kv_len
-            masked = term if masked is None else (masked | term)
-        if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-            term = kv_abs > q_caus_lim
-            masked = term if masked is None else (masked | term)
-        if cutlass.const_expr(mask_flags & MASK_SWA):
-            term = kv_abs < q_minus_w
-            masked = term if masked is None else (masked | term)
-        val = cutlass.Float32(
-            arith.select(
-                masked.ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        elems.append(val)
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
-
-
 # ---------------------------------------------------------------------------
-# Per-cell mask, "bits" form: one keep-word per 32 columns, register-to-predicate
+# Per-cell mask: one keep-word per 32 columns, register-to-predicate select
 # ---------------------------------------------------------------------------
 #
-# `apply_mask_chunk` above compares EVERY cell against every active bound and
-# ORs the terms: per cell one IADD (kv_col_base + i, never folded into the
-# compare), one ISETP per term and one FSEL per term (the i1 OR lowers to nested
-# selects), so a causal+SWA tile costs 5 instructions per cell and a padded
-# causal+SWA one 7 -- 51-72 % of a masked softmax tile's instructions, serialized
-# in front of the exp burst (sm_107a listings, 2026-09-22: a masked KV tile ran
-# 805-1602 instructions per lane against 358-451 for a dense one).  The information
-# content of any of these masks is one or two band EDGES per row, so the form
-# below spends its instructions there instead:
+# `apply_mask_chunk` below masks a register chunk of S in the BIT-WORD form.  The
+# information content of a padded / causal / sliding-window mask is one or two
+# band EDGES per row, so that is where the instructions go:
 #
 #   1. per 32-column word, build the KEEP mask from the band edges with two
 #      saturating shifts (`shr.u32` for the upper edge, `shl.b32` for the lower;
 #      PTX clamps a shift amount >= 32 to a zero result, which is exactly the
 #      "edge is outside this word" case) -- ~7 integer ops per word, per lane;
-#   2. per cell, test one bit of the word and feed the SAME `arith.select`
-#      `apply_mask_chunk` uses.  ptxas turns 32 consecutive bit tests into
-#      `R2P` (register -> 7 predicates) + one `FSEL` per cell, so the per-cell
-#      cost is 1.4-1.6 instructions regardless of how many mask terms are on
-#      (sm_107a / sm_100a micro-kernel listings, 2026-09-22, against 3.0-7.6 for
-#      the per-cell form; the same idiom the block-sparse-attention SM90 backward
-#      uses, `predicate_bitmask_below`).
+#   2. per cell, test one bit of the word and feed it to an `arith.select`.
+#      ptxas turns 32 consecutive bit tests into `R2P` (register -> 7 predicates)
+#      + one `FSEL` per cell, so the per-cell cost is 1.4-1.6 instructions
+#      regardless of how many mask terms are on (sm_107a / sm_100a micro-kernel
+#      listings, 2026-09-22; the same idiom the block-sparse-attention SM90
+#      backward uses, `predicate_bitmask_below`).
 #
-# Semantics contract (shared with `apply_mask_chunk`, bitwise):
+# The form it replaced (shipped until PR #1192 / #1197 behind a per-kernel
+# `MASK_FORM` constant, collapsed since) compared EVERY cell against every active
+# bound and ORed the terms: per cell one IADD (kv_col_base + i, never folded into
+# the compare), one ISETP per term and one FSEL per term (the i1 OR lowers to
+# nested selects), so a causal+SWA tile cost 5 instructions per cell and a padded
+# causal+SWA one 7 -- 51-72 % of a masked softmax tile's instructions, serialized
+# in front of the exp burst (sm_107a listings, 2026-09-22: a masked KV tile ran
+# 805-1602 instructions per lane against 358-451 for a dense one; one build had
+# spilled its 128 live i1 values into GPR bits).  Both forms mask the same set
+# with the same sentinel through the same `arith.select`, so O / LSE were bitwise
+# identical across the switch; `test_tile_dsl_mask_bits.py` keeps a host emulation
+# of the per-cell formula as the reference this op is pinned against, and the
+# sm_107a / sm_100a SASS pins hold the lowering (R2P > 0, ISETP within the
+# measured ceiling).
+#
+# Semantics contract:
 #   - a masked cell becomes `mask_value` (default: the finite fp32-min sentinel;
 #     pass float("-inf") for the true -inf form); an unmasked cell is passed
 #     through untouched (NaN payloads included);
 #   - bounds are PER LANE (one lane = one q row): `lo`/`hi` are Int32 values
 #     derived from that lane's q row, `kv_col_base` is the chunk's first
 #     absolute kv column; a fully-masked row yields `mask_value` in every cell,
-#     so the caller's `row_max_for_exp2` guard applies exactly as today;
+#     so the caller's `row_max_for_exp2` guard applies exactly as before;
 #   - a `tcgen05.ld 32x32b` chunk is contiguous along columns per lane (register
 #     k = column k), so NO column remap is needed here -- unlike the WGMMA
 #     accumulator layout the BSA kernel remaps with `sm90_col_to_predicate_idx`.
-
-MASK_FORM_CELLS = "cells"  # apply_mask_chunk: per-cell compare + select
-MASK_FORM_BITS = "bits"  # apply_mask_chunk_bits: keep-word + register-to-predicate select
-MASK_FORMS = (MASK_FORM_CELLS, MASK_FORM_BITS)
 
 MASK_WORD_COLS = 32  # columns per keep-word = bits per register
 
 # The band arithmetic (`lo - kv_col_base`, `hi - kv_col_base`, the per-word shift count) is Int32.
 # With every absolute row / column index below 2**28 (a TMA coordinate keeps S far under that) a
 # window bound below this limit cannot wrap it; a bound at or past it can, and a wrapped `lo` makes
-# the bits form mask EVERYTHING where `apply_mask_chunk` masks nothing.  Enforced at trace time on
-# the Python-int bounds (no instruction); pinned by `test_bits_form_domain_guard`.
+# the op mask EVERYTHING where the per-cell formula masks nothing.  Enforced at trace time on the
+# Python-int bounds (no instruction); pinned by `test_bits_form_domain_guard`.
 MASK_BOUND_LIMIT = 1 << 30
 
 
@@ -167,9 +109,9 @@ def band_mask_words(lo, hi, kv_col_base, n_cols: int):
     for a side no mask term defines -- that side folds out at trace time (one shift per word
     for a one-sided mask, two for a band), never an INT_MIN/INT_MAX sentinel, so ``lo - base``
     cannot wrap as long as the caller keeps every bound within ``MASK_BOUND_LIMIT`` of the chunk
-    (:func:`apply_mask_chunk_bits` refuses a wider window).  Returns a tuple of
+    (:func:`apply_mask_chunk` refuses a wider window).  Returns a tuple of
     ``ceil(n_cols / 32)`` ``Uint32`` words.  Trace-time helper (plain Python over traced
-    values), like :func:`apply_mask_chunk`."""
+    values)."""
     if lo is None and hi is None:
         raise ValueError("band_mask_words: at least one of lo / hi must be given (a mask with no edge is no mask)")
     n_words = (n_cols + MASK_WORD_COLS - 1) // MASK_WORD_COLS
@@ -193,9 +135,10 @@ def apply_mask_words(reg_S, words, mask_value: float = _NEG_INF_BITS, n_cols: in
     ``words`` is the tuple :func:`band_mask_words` returns (bit ``i`` of word ``s`` = column
     ``32 s + i`` is KEPT).  The inner loop is a Python ``range`` over a compile-time bit
     index, which is what lets ptxas see 32 consecutive single-bit tests of one register and
-    emit ``R2P`` + one ``FSEL`` per cell.  Same ``arith.select`` as :func:`apply_mask_chunk`
-    (only the predicate derivation differs), so the two forms are bitwise identical for the
-    same mask set, for either sentinel, NaN payloads included."""
+    emit ``R2P`` + one ``FSEL`` per cell.  One ``arith.select`` per cell, so a kept cell passes
+    through bit-exactly (NaN payloads included) and a masked one is exactly ``mask_value``,
+    for either sentinel -- the same select the per-cell compare form used, only the predicate
+    derivation differs."""
     if n_cols is None:
         n_cols = MASK_WORD_COLS * len(words)
     if len(words) * MASK_WORD_COLS < n_cols:
@@ -212,7 +155,7 @@ def apply_mask_words(reg_S, words, mask_value: float = _NEG_INF_BITS, n_cols: in
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
 
 
-def apply_mask_chunk_bits(
+def apply_mask_chunk(
     reg_S,
     q_abs,
     kv_col_base,
@@ -225,27 +168,36 @@ def apply_mask_chunk_bits(
     mask_value: float = _NEG_INF_BITS,
     window_right: int = 0,
 ):
-    """:func:`apply_mask_chunk` with the same signature and the same masked set, in the
-    "bits" form.  The three terms map onto one band ``[lo, hi)`` per lane:
+    """Mask the ``N``-wide fp32 register chunk ``reg_S`` (one lane = one q row ``q_abs``, columns
+    ``kv_col_base .. kv_col_base + N``) for the compile-time ``mask_flags`` set, in the bit-word form.
 
-    - CAUSAL masks ``kv > q_caus_lim``  ->  ``hi = q_caus_lim + 1`` with the same
-      ``q_caus_lim = q_abs (+ causal_diag under bottom_right) (+ window_right)``;
+    The three terms map onto one band ``[lo, hi)`` per lane:
+
+    - CAUSAL masks ``kv > q_caus_lim``  ->  ``hi = q_caus_lim + 1`` with
+      ``q_caus_lim = q_abs (+ causal_diag under bottom_right) (+ window_right)``.  ``window_right``
+      is the compile-time diagonal-band right bound (cuDNN diagonal_band_right_bound): kv columns
+      up to ``q + window_right`` (plus the bottom-right diagonal offset) stay unmasked; 0 = plain causal;
     - PADDED masks ``kv >= seq_kv_len``  ->  ``hi = min(hi, seq_kv_len)``;
-    - SWA masks ``kv < q_minus_w``  ->  ``lo = q_minus_w`` (the same bottom-right anchor).
+    - SWA masks ``kv < q_minus_w``  ->  ``lo = q_minus_w = swa_base - window_left`` with the same
+      bottom-right anchor (``swa_base = q_abs + causal_diag`` under bottom_right, else ``q_abs``) --
+      the whole band shifts with the diagonal.
 
-    A side no term defines is ``None`` and folds out.  Fully-masked rows, the sentinel and
-    the caller's tile-level trimming are exactly as for :func:`apply_mask_chunk`.
+    A side no term defines is ``None`` and folds out.  ``mask_value`` is what a masked score becomes:
+    the default is the legacy finite sentinel; the f16 prefill kernels pass ``float("-inf")`` so a
+    fully-masked row's max stays -inf under any scale and the canonical ``max == -inf -> substitute 0``
+    guard (``row_max_for_exp2``) applies.  ``MASK_NONE`` returns ``reg_S`` itself.
 
-    Domain: a compile-time ``window_left`` / ``window_right`` at or past ``MASK_BOUND_LIMIT``
-    raises at trace time (see the constant); the per-cell form has no such limit because it
-    never subtracts the chunk base."""
+    Domain: a compile-time ``window_left`` / ``window_right`` at or past ``MASK_BOUND_LIMIT`` raises
+    at trace time (see the constant): the band arithmetic is Int32 and a wrapped ``lo`` would mask the
+    whole chunk.  Callers that invent a "no sequence reaches this" band (the dense per-tensor fp8 d192
+    lowering) must stay below it -- `config_sm100.canonicalize_d192_lowering` uses ``MASK_BOUND_LIMIT - 1``."""
     if cutlass.const_expr(mask_flags == MASK_NONE):
         return reg_S
 
     if (mask_flags & MASK_SWA) and isinstance(window_left, int) and window_left >= MASK_BOUND_LIMIT:
-        raise ValueError(f"apply_mask_chunk_bits: window_left must be < {MASK_BOUND_LIMIT} (got {window_left}); the Int32 band arithmetic would wrap")
+        raise ValueError(f"apply_mask_chunk: window_left must be < {MASK_BOUND_LIMIT} (got {window_left}); the Int32 band arithmetic would wrap")
     if (mask_flags & MASK_CAUSAL) and isinstance(window_right, int) and window_right >= MASK_BOUND_LIMIT:
-        raise ValueError(f"apply_mask_chunk_bits: window_right must be < {MASK_BOUND_LIMIT} (got {window_right}); the Int32 band arithmetic would wrap")
+        raise ValueError(f"apply_mask_chunk: window_right must be < {MASK_BOUND_LIMIT} (got {window_right}); the Int32 band arithmetic would wrap")
 
     lo = None
     hi = None
@@ -262,35 +214,6 @@ def apply_mask_chunk_bits(
 
     words = band_mask_words(lo, hi, kv_col_base, N)
     return apply_mask_words(reg_S, words, mask_value=mask_value, n_cols=N)
-
-
-def apply_mask_chunk_form(
-    reg_S,
-    q_abs,
-    kv_col_base,
-    seq_kv_len,
-    window_left: int,
-    mask_flags: int,
-    N: int = 64,
-    bottom_right: int = 0,
-    causal_diag=None,
-    mask_value: float = _NEG_INF_BITS,
-    window_right: int = 0,
-    *,
-    form: str,
-):
-    """:func:`apply_mask_chunk` (``form=MASK_FORM_CELLS``) or :func:`apply_mask_chunk_bits`
-    (``form=MASK_FORM_BITS``) behind one signature.  A kernel picks the form with ONE
-    module-level constant (``MASK_FORM``) that every masked call site passes -- the
-    ``DESC_VERSION`` discipline -- so an A/B of the two lowerings is a constant flip and a
-    test can count call sites against the constant.  ``form`` is keyword-only and has no
-    default: a call site that forgets it fails at trace time instead of silently picking one."""
-    kw = dict(N=N, bottom_right=bottom_right, causal_diag=causal_diag, mask_value=mask_value, window_right=window_right)
-    if form == MASK_FORM_BITS:
-        return apply_mask_chunk_bits(reg_S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, **kw)
-    if form == MASK_FORM_CELLS:
-        return apply_mask_chunk(reg_S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, **kw)
-    raise ValueError(f"apply_mask_chunk_form: form must be one of {MASK_FORMS}, got {form!r}")
 
 
 # ---------------------------------------------------------------------------

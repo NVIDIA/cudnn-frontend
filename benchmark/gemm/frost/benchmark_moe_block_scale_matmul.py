@@ -94,7 +94,7 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str, alignment: int = 1
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,

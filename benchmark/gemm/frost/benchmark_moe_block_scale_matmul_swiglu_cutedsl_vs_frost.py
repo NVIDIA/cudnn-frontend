@@ -213,7 +213,7 @@ def _frost_graph(S, N, K, E, combo, output_mode="bf16", alignment=1):
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,
@@ -377,16 +377,7 @@ def main() -> int:
     p.add_argument("--dynamic-sched", choices=("off", "on", "both"), default="both")
     p.add_argument("--vector-f32", choices=("off", "on", "both"), default="both", help="cuteDSL packed f32x2 epilogue math")
     p.add_argument("--frost-store", choices=("tma", "stg", "both"), default="both", help="FROST epilogue store mode to sweep (default: both)")
-    p.add_argument(
-        "--fto-alignment",
-        type=int,
-        default=1,
-        help="first_token_offset `alignment_value`: promise every routed-group start is a "
-        "multiple of it. Lets FROST address A / SFA / D through the ORIGINAL TMA descriptors "
-        "instead of rewriting them per group, for every config whose cluster tile M (and, "
-        "block-scale, 128) divides it. 1 (default) = no promise. The bench checks its own "
-        "offsets against it; the kernel does not.",
-    )
+    bu.add_fto_alignment_arg(p)
     bu.add_sweep_args(p, nsys=False)
     args = p.parse_args()
 
@@ -421,7 +412,7 @@ def main() -> int:
     print(f"\n=== MoE grouped SwiGLU ({args.combo}, {args.output_mode})  " f"E={E} x M={M} (S={S})  N_out={N} (gemm N={n_gemm})  K={K} ===")
     print(f"  {torch.cuda.get_device_name(0)}  sm_{major}{minor}   ~{flops / 1e9:.1f} GFLOP")
     print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]")
-    if args.fto_alignment > 1:
+    if str(args.fto_alignment).strip() != "1":
         print(f"  [fto alignment_value: {args.fto_alignment} — FROST may take the global-descriptor path]")
 
     elem = 0.5 if _COMBOS[args.combo][1] is torch.float4_e2m1fn_x2 else 1.0

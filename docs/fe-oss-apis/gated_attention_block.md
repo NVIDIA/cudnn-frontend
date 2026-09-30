@@ -233,6 +233,6 @@ Dense (no mask):
 - How the block is composed (workspace, streams, fusion knobs, typed declines) and how to build the next one:
   [Composing multi-kernel blocks in Python](../utilities/composing_kernel_blocks.md).
 - The MLA sibling of the fused projection epilogue: [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md).
-- Tests: `test/python/fe_api/gated_attention_block/` (layout contract, reference oracle, end to end, FP8, MXFP8,
+- Tests: `test/python/gated_attention_block/cutedsl/` (layout contract, reference oracle, end to end, FP8, MXFP8,
   fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`), per-stage kernels,
   stream ordering).
