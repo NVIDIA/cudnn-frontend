@@ -3988,10 +3988,29 @@ class GatedAttentionBlockFwd(APIBase):
         for dtype / byte count / contiguity / 16-B alignment, typed), REFUSED
         otherwise.  ``w_o_sf`` (appended): REQUIRED under ``MxQuantSpec.o_fp4``
         (same checks at the format's block and scale dtype), REFUSED otherwise.
+
+        ``saved``: REQUIRED under ``save_for_backward=True`` (the whole record is
+        validated by :meth:`_check_saved_set` before any launch), REFUSED on a
+        block declared without it -- an inference forward writes none of the
+        record's tensors, so a silently ignored ``saved=`` would hand the
+        backward an uninitialised save set.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
+        # `saved=` is the training forward's write-through record.  On an inference
+        # block no stage targets saved.o / lse / rstd_* / proj_slab / gate, so
+        # accepting it would leave the caller holding an uninitialised record that
+        # the backward then consumes -- refused up front, like every other argument
+        # this declaration cannot consume (h_sf / w_qkvg_sf outside MXFP8, w_o_sf
+        # outside fp4 O).  The training-side validation stays in _check_saved_set.
+        if saved is not None and not self.save_for_backward:
+            raise ValueError(
+                "saved= is the SavedForBackward record a TRAINING forward writes through, but this block was declared "
+                "save_for_backward=False (inference): no stage would write saved.o / lse / rstd_q / rstd_k / proj_slab / gate, so the "
+                "record would stay uninitialised. Declare GatedAttentionBlockFwd(..., save_for_backward=True) for a training forward, "
+                "or drop saved="
+            )
         if self.mxfp8:
             if h_sf is None or w_qkvg_sf is None:
                 raise ValueError("MXFP8 execute needs both scale-factor blobs: h_sf (over B*S rows) and w_qkvg_sf (over n_qkvg rows); no silent unit scale")
@@ -4051,7 +4070,8 @@ class GatedAttentionBlockFwd(APIBase):
         # FIRST -- before any launch -- and bind what the stages write THROUGH: the
         # caller's slab (proj_slab mode), the PRE-gate O, the LSE, rstd, and the
         # gate-copy destinations.  `_check_saved_set` is the contract (typed,
-        # device-free, callable on a declared block).
+        # device-free, callable on a declared block).  An inference block reached
+        # this line with saved=None: a record there was refused at the top.
         sv = self._check_saved_set(h, seq_lens, lse, saved) if self.save_for_backward else None
         rstd_q, rstd_k = (sv.rstd_q, sv.rstd_k) if sv is not None else (None, None)
         if sv is not None:

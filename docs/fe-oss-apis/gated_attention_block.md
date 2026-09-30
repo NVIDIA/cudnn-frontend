@@ -168,6 +168,10 @@ saved = SavedForBackward(
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens=seq_lens, saved=saved)
 ```
 
+A runnable version of this recipe, self-checked against torch on the record alone (the slab is `h @ W_qkvg^T`, `rstd_*` are the
+RMSNorm statistics of the pre-norm bands, `out` is `(o * sigmoid(gate)) @ W_o^T`):
+[`samples/frost/gated_attention_block/00_training_forward.py`](../../samples/frost/gated_attention_block/00_training_forward.py).
+
 Two **save modes**, chosen at declaration because the workspace carve differs (`execute` checks that the record agrees):
 
 | mode | declaration | what is saved | forward cost |
@@ -184,8 +188,10 @@ activation dtype; `saved.rstd_q` / `rstd_k` are `[B, S, H]` fp32 compact (presen
 buffer a kernel writes (`proj_slab`, `o`, `lse`, `rstd_*`, the gate-copy targets) is **16-byte aligned** -- they are TMA-store
 targets, and a slice at an odd element offset is refused here rather than failing untyped after stage (1) launched; in the
 proj_slab mode `saved.gate` / `q_pre` / `k_pre`, when given, alias `saved.proj_slab` exactly as `saved_slab_views` spells
-them (each may be `None` there: the backward derives it from the slab). A padded forward (`seq_lens`) is served: a dead
-entry (`seq_lens[b] == 0`) leaves `saved.o[b] == 0`, `saved.lse[b] == -inf` and `out[b] == 0` exactly.
+them (each may be `None` there: the backward derives it from the slab). The refusal runs the other way too: `saved=` on a
+block declared **without** `save_for_backward` is a `ValueError` naming the knob -- an inference forward writes none of the
+record's tensors, so a silently ignored record would reach the backward uninitialised. A padded forward (`seq_lens`) is
+served: a dead entry (`seq_lens[b] == 0`) leaves `saved.o[b] == 0`, `saved.lse[b] == -inf` and `out[b] == 0` exactly.
 
 `execute()` allocates nothing, reads nothing back to the host and converts nothing: every intermediate is a
 strided view of the caller's workspace, sized honestly by `get_workspace_size()`, so the call is CUDA-graph

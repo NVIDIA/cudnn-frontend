@@ -582,6 +582,50 @@ def test_saved_seq_lens_identity_is_typed():
         assert (out == 1.5e30).all() and (bad.proj_slab == 1.5e30).all() and (bad.o == 1.5e30).all()
 
 
+@requires_cuda
+def test_inference_block_refuses_a_saved_record():
+    """``saved=`` on a block declared WITHOUT ``save_for_backward`` is a ``ValueError`` naming the argument and the
+    declaration knob, before any launch: an inference forward writes none of the record's tensors (no stage targets
+    ``saved.o`` / ``lse`` / ``rstd_*`` / ``proj_slab`` / ``gate``), so accepting it would hand the caller an uninitialised
+    save set that the backward then consumes -- the same rule as every other ignored argument (``h_sf`` outside MXFP8,
+    ``w_o_sf`` outside fp4 O, ``gate`` without ``fuse_gate``).  ``saved=None`` stays the inference default, and the
+    training block keeps REQUIRING its record.  Declared block on any CUDA device (``_ws`` set by hand: the argument
+    contracts run before the workspace is read); through ``execute()`` on a COMPILED block on Rubin, sentinel-checked."""
+    b, s = 1, 256
+    geom = GatedAttentionBlockGeometry(**_COMMON)
+    inp = make_inputs(RefGeometry(**_COMMON), batch=b, seq_len=s, dtype=torch.bfloat16)
+    out = torch.empty(b, s, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    infer = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom)
+    assert not infer.save_for_backward
+    record = _alloc_saved(infer.geom, inp, b, s, save_mode="proj_slab", sentinel=1.5e30)
+    infer._ws = infer._layout()  # bypass compile: the argument contracts run before the workspace is read (any CUDA device)
+    ws16 = torch.empty(16, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="save_for_backward") as ei:
+        _execute(infer, inp, out, ws16, saved=record)
+    assert "saved=" in str(ei.value)
+    torch.cuda.synchronize()
+    assert (record.proj_slab == 1.5e30).all() and (record.o == 1.5e30).all() and (record.lse == 1.5e30).all()  # nothing wrote the record
+    # The other direction is unchanged: a training block without its record is the existing typed decline.
+    train, inp_t, _ = _declare(_COMMON, b, s)
+    with pytest.raises(ValueError, match="requires a SavedForBackward"):
+        train._check_saved_set(inp_t["h"], None, None, None)
+    if _cc() == _SM107:
+        # Through execute() on a COMPILED inference block: refused before any launch -- out and the record untouched --
+        # and the inference default (saved=None) still runs.
+        infer._ws = None
+        infer.check_support()
+        infer.compile()
+        ws = torch.empty(infer.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        out.fill_(1.5e30)
+        with pytest.raises(ValueError, match="save_for_backward"):
+            _execute(infer, inp, out, ws, saved=record)
+        torch.cuda.synchronize()
+        assert (out == 1.5e30).all() and (record.proj_slab == 1.5e30).all() and (record.o == 1.5e30).all()
+        _execute(infer, inp, out, ws, saved=None)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all() and not (out == 1.5e30).any()
+
+
 # ---------------------------------------------------------------------------
 # The accept half -- Rubin only
 # ---------------------------------------------------------------------------
