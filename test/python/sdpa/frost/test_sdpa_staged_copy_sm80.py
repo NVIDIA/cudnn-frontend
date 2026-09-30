@@ -240,6 +240,7 @@ def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch
     _check(case)
 
 
+@pytest.mark.no_workspace_shim
 @pytest.mark.parametrize("bad", ["missing", "short", "unaligned", "noncontiguous", "alias_q", "alias_stats"])
 def test_workspace_rejected_before_copy(bad, monkeypatch):
     from cudnn.sdpa.fwd import prepared_staged_sm80
