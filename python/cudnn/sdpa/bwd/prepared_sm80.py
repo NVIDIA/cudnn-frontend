@@ -20,8 +20,8 @@ def native_layouts(api):
         if not dense_layout_ok(desc.shape, desc.stride) or any(n > 1 and st % 8 for n, st in zip(desc.shape[:-1], desc.stride[:-1])):
             return False
     # Older direct adapters declared only has_bias or omitted auxiliary gradient
-    # descriptors. Their optional runtime-output contract remains on the tensor
-    # path until it can be represented by a complete immutable declaration.
+    # descriptors. Their optional runtime-output contract uses the staged
+    # prepared recipe, which validates and binds auxiliary outputs per call.
     if api._has_bias:
         if api.bias_desc is None or api.dbias_desc is None:
             return False
@@ -38,6 +38,7 @@ def native_layouts(api):
 def build_spec(api, d64_module, *, staged=False):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
     from .kernels.sm80.prepared_host import compile_host, launch_bounds
+    from cudnn.sdpa.fwd.kernels.sm80.packed_init import FROST_SOURCE_DIGEST as init_digest
 
     for role in ROLES:
         if role in ("seq_q", "seq_kv"):
@@ -74,7 +75,7 @@ def build_spec(api, d64_module, *, staged=False):
                         tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
                         token_stride = api._thd_token_strides[role]
                         shape = (1, shape[1], tokens, shape[3])
-                        strides = (tokens * token_stride, shape[3], token_stride, 1)
+                        strides = (tokens * token_stride, api._thd_head_strides[role], token_stride, 1)
                     elif role == "stats":
                         if api._thd_lse_token_major:
                             shape, strides = (api._t_q_cap, api.h_q), (api.h_q, 1)
@@ -129,6 +130,7 @@ def build_spec(api, d64_module, *, staged=False):
             swa_window=api.swa_window_runtime,
             right_bound=api.right_bound_runtime,
             thd=(api.batch_size, api._thd_lse_token_major) if api.thd else None,
+            packed_init=init_digest if getattr(api, "_initialize_packed_outputs", False) else None,
         ),
         "prepared_pointer",
     )

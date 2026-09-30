@@ -13,11 +13,18 @@ d_qk=192/d_v=128 while preserving the FP8-on-Blackwell K-path:
   1. **cga1/cga2, STAGES_KV=2/4** (config; FP8 BPE=1).
   2. **512-col TMEM** with per-sub-tile stats on the S_acc heads (col 0/128;
      FP8 P is 4:1-packed at the S_acc tails 96/224, so the heads are free).
-  3. **Manual row-max** (no LDTM.STAT).
+  3. **Row-max**: fused LDTM.STAT (``tcgen05.ld.red.f32.max``) on cc10.3+ for
+     unmasked tiles; manual ``tcgen05_ld`` + software reduction on cc10.0 and
+     on every masked tile.
   4. **FP8 MMA uses the Blackwell K=32 QMMA path** — idesc ``k_dim=0`` +
      ``TILE_K_HW=32`` (config).  ``NUM_KPHASES_PV`` derives from
      ``CFG.TILE_K_HW_BMM2`` (→ 4 k-steps at TILE_K_HW=32).  Confirmed by the
      cuDNN f8 reference (UTCMMA_TILE_K=32, BMM_XMMAS_K=4, kind::f8f6f4).
+  5. **exp2 split MUFU / FMA** (``_E2E_ENABLED``, **cc 10.0 only**): a slice of
+     each P burst takes the FMA-pipe ``ex2_emulation_2`` instead of MUFU.EX2.
+     ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out
+     everywhere the split loses — cc 10.3's doubled MUFU.EX2 rate makes every
+     emulated exponential a net cost there.
 
 THD / varlen (``CFG.THD_VARLEN=1``) follows the device-built-metadata and
 persistent-grid design used by the d128 FP8 and d192 f16 siblings: packed
@@ -26,7 +33,7 @@ metadata and runtime TMA descriptors, and a device-bounded work counter. Dense
 specializations fold the THD path out.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from functools import lru_cache
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -85,11 +92,12 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.3+ fuses the MASK_NONE S load + row-max into one LDTM.STAT
+    # (tmem_load_max_reduction_x64); cc10.0 and every masked iter keep the
+    # manual tcgen05_ld + software row_max_reduction (see _softmax_kv_body).
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
 )
@@ -113,6 +121,18 @@ _REUSE_BMM2_ELECT = (not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_NONE) or (CFG
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
 MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
+# exp2 MUFU / FMA split — the ex2_emulation_2 mix in _exp2_chunk0_mask_aware /
+# _exp2_mixed_late / _exp2_emulated_scalar. Claimed per kernel and per arch by
+# api_dsl._exp2_fma_split_for: on for cc 10.0, where a few emulated exponentials
+# relieve a saturated MUFU.EX2; off elsewhere (cc 10.3's doubled MUFU.EX2 rate
+# turns the emulated ones into a net loss), when every element takes the plain
+# MUFU exp2. Folded at trace time; a distinct value is a distinct specialization.
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
+# cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software
+# row_max_reduction (default 0). api_dsl sets this from the device capability at
+# compile time; a distinct value yields a distinct kernel specialization (cache key).
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 
 
 @cute.jit
@@ -156,10 +176,11 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
     E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
     exceed the output tolerance there. The repeated unmasked path retains its
     tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    With the split off (_E2E_ENABLED, cc != 10.0) every element takes native EXP2.
     """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if CFG.DTYPE_QKV == 1 and apply_mask:
+        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:
@@ -178,7 +199,7 @@ def _exp2_mixed_late(vec):
     tail_start = 36 if _FAST_E4_DENSE_MHA else 56
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if i >= tail_start:
+        if _E2E_ENABLED and i >= tail_start:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -188,6 +209,8 @@ def _exp2_mixed_late(vec):
 
 
 def _exp2_emulated_scalar(x):
+    if not _E2E_ENABLED:
+        return cute.math.exp2(x, fastmath=True)
     value, _ = ex2_emulation_2(x, x, poly_degree=2)
     return value
 
@@ -1857,7 +1880,9 @@ def _softmax_kv_body(
     """Per-kv-iter softmax body with rotated S/P ownership.
 
     Compile-time apply_mask picks the load+max strategy:
-    - False: tcgen05.ld.red.f32.max fast path (fused HW row-max).
+    - False, FUSED_LDTM_STAT (cc10.3+): tcgen05.ld.red.f32.max fast path
+      (fused HW row-max, 64-wide chunks).
+    - False, cc10.0: manual 32-wide tcgen05_ld + sw row_max_reduction.
     - True: chunked load + apply_mask_chunk + sw row_max_reduction.
     HW max can't observe NEG_INFINITY written after the load, so masked
     iters fall back; 3-segment kv-loop keeps the fast path on interior iters.
@@ -1928,6 +1953,20 @@ def _softmax_kv_body(
             ]
         chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
         reg_S_vec = vec_concat(chunks_S)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3+: fused HW row-max — one tcgen05.ld.red.f32.max per 64-col chunk
+        # does the S_acc load AND the row-max in one op, returning 64 data regs
+        # plus the max at index CHUNK.  Halves the LDTM count (64-wide vs the
+        # 32-wide loads below) and drops the software max tree entirely.
+        # Unmasked tiles only: the fused .max reduces before a mask could be
+        # applied, so masked tiles keep the software path above.
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(CFG.TILE_N // CHUNK)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
@@ -2950,123 +2989,6 @@ def _host(
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, 1),
         stream=stream,
-    )
-
-
-@lru_cache(maxsize=None)
-def compile(  # noqa: A001
-    b: int = 1,
-    qh: int = 1,
-    kh: int = 1,
-    sq: int = 256,
-    skv: int = 128,
-    has_lse: bool = True,
-    lse_head_major: bool = False,
-    lse_head_stride: int = 0,
-    lse_padded_rows: int = 0,
-    lse_padded_order: tuple = (3, 2, 1, 0),
-    dynamic_bhk: bool = False,
-    lse_stride: Optional[tuple[int, int, int]] = None,
-    d_qk: int = CFG.TILE_K,
-    d_v: int = CFG.TILE_O,
-) -> Callable:
-    """Compile the remaining dense tensor entry (split, paged, or conversions).
-
-    THD uses compile_prepared for every supported output dtype. Its former
-    fake token/head/Stats layouts are intentionally absent from this entry.
-    Dense dimensions and declared strides remain compile-time metadata;
-    paged pool and table capacities, where supported, remain dynamic.
-    """
-    _cache_key = _template_key(globals(), locals(), "compile")
-    if CFG.THD_VARLEN:
-        raise ValueError("SM100 FP8 THD uses compile_prepared; the tensor entry is dense-only")
-    if dynamic_bhk or lse_head_major or lse_head_stride or lse_padded_rows:
-        raise ValueError("THD layout parameters belong to compile_prepared")
-    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
-        raise ValueError(f"fp8 d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
-    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
-        # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
-        # the binding TMA 16-byte global-stride constraint.
-        raise ValueError(f"fp8 d192 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
-    if SPLIT_KV > 1 and not has_lse:
-        raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
-    if lse_stride is not None and SPLIT_KV > 1:
-        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
-    if lse_padded_rows:
-        raise ValueError("lse_padded_rows is THD-only (a dense LSE is the compact (B, H, S_q) form)")
-    _fake_batch = b
-    _o_batch = _fake_batch * SPLIT_KV
-    _lse_batch = b * SPLIT_KV
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, sq, qh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (_fake_batch, skv, kh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
-        (_o_batch, sq, qh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    if not has_lse:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
-        fake_lse = None
-    elif lse_stride is not None:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only")
-        fake_lse = cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
-    else:
-        if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-    # Always part of the ABI; unread when CFG.HAS_SINK == 0 (compile-time fold).
-    from cudnn.sdpa.fwd.kernels._fp8_host import make_fake_aux
-
-    aux = make_fake_aux(b, qh, amax_align=16)
-    return _compile_cached(
-        _host,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        aux.sinks,
-        aux.kv_lens,
-        aux.o_desc,
-        (b, qh, kh, sq, skv, 0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        *aux.scales,
-        aux.amax_o,
-        aux.seq_q_lens,
-        None,
-        None,
-        None,
-        *((fake_o,) if _FP32_PARTIALS else ()),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
     )
 
 

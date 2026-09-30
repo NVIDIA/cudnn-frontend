@@ -58,7 +58,8 @@ The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
 The existing D256 quantized epilogue gate also uses prepared launches, with
 runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
-output's maximum. Conversion routes retain tensor execution.
+output's maximum. Existing conversion routes use prepared gather/scatter copies
+around a compact prepared attention plan.
 Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
@@ -72,7 +73,8 @@ shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
 operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
-layouts and bias retain their tensor executor and decline overrides;
+layouts and bias continue to decline runtime shape/stride overrides. Existing
+conversion layouts use staged copies around a prepared compact plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -134,7 +136,7 @@ MMA as d=512.
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (E4M3 only, d=256) |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (fp16/bf16 gradients) |
 | Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107) | ❌ | ❌ | ❌ | ❌ |
-| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
+| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
@@ -158,7 +160,7 @@ MMA as d=512.
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |
-| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (d128 envelope) | ✅ᵖ f16 + fp8 | ✅ᵖ f16 only (native (192, 128)) | ✅ᵖ ᵈ f16 only | ❌ | ❌ |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (d128 envelope) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | mxfp8 only | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ᵈᵗ **d128 decode tile (`sm100/decode_d128_f16.py`, f16/bf16).** The (128, 128) flavor of
@@ -227,13 +229,14 @@ the prefill THD leg keeps it), ragged K/V (non-paged THD decode), d192×d128 / d
 d512 ragged decode (their decode graphs keep the prefill THD leg), fp8.
 
 ᵖ **Paged KV (issue #920): f16/bf16 on the d128 / d192×d128 / d256 flavors, per-tensor
-FP8 on the d128 flavor** (`Capabilities.paged_d_shapes`: the f16/bf16 row `{(128, 128),
-(192, 128), (256, 256)}`, the SM100 per-tensor FP8 row `{(128, 128)}`). The head-dim
+FP8 on the d128 flavor, MXFP8 on every native flavor** (`Capabilities.paged_d_shapes`: the
+f16/bf16 row `{(128, 128), (192, 128), (256, 256)}`, the SM100 per-tensor FP8 row
+`{(128, 128)}`, the MXFP8 row all four native shapes). The head-dim
 gate is the flavor the lowering SELECTS — the smallest covering envelope — not the raw
 dims: d=64 rides the d128 envelope, d=192/192 and mixed dims such as (256, 128) or
 (64, 192) ride the d256 one, (192, 128) is **native** on d192×d128 and shapes below it
 such as (136, 72) ride its envelope; a d512-envelope selection ((512, 512), (512, 128),
-...) is declined until that kernel wires the specialization. On the FP8 row only the
+...) is declined on f16/bf16 until that kernel wires the specialization. On the FP8 row only the
 d128 selection is wired (`d_qk, d_v <= 128`; d=64 rides the d128 FP8 envelope — exact in
 FP8); a d192×d128 or d256 FP8 selection is declined. The K and V pools may
 differ in row width (d192×d128: a 192-wide K pool and a 128-wide V pool behind
@@ -275,14 +278,13 @@ upper bound top-left or bottom-right (MTP `S_q <= 8`, each batch's diagonal anch
 at its own KV length, rows left without a key write O := 0 / LSE := -inf) and a left
 sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests, pinned
 on the FROST plan, and the `test_mhas_v2.py` fp8 paged decode fuzz, which draws the same
-masks over the default walk and asserts the row served every draw). Not yet: MXFP8 pools (the F8_128x4
-block-scale atoms bundle 128 rows of one head and cannot be assembled from sub-tile
-pages), packed (ragged-offset) block tables, the d512 flavor, the SM107 (Rubin)
-siblings, sink + KV split (a sink graph runs unsplit — see ˢ), sink and block-scaled O
-(`sf_o`) over FP8 pools.
+masks over the default walk and asserts the row served every draw). Not yet: packed (ragged-offset) block tables, the f16/bf16 and FP8 d512 flavors, the SM107 (Rubin)
+siblings, sink + KV split (a sink graph runs unsplit — see ˢ), sink over FP8 pools, block-scaled O
+(`sf_o`) over FP8 and MXFP8 pools.
 Served by the `PAGED_KV` specialization of
 `sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/prefill_d256_f16.py`
-and `sm100/prefill_d128_fp8.py` (block-table indirection on the K/V TMA loads; boxes past
+and `sm100/prefill_d128_fp8.py`, and of the four `sm100/prefill_d*_mxfp8.py` kernels
+(**MXFP8 pools**, below) (block-table indirection on the K/V TMA loads; boxes past
 a sequence's live pages are TMA-OOB zero-filled; under paged KV the d192×d128 kernel
 takes the plain scheduler decode — its predecoded THD+SWA segment path folds off);
 every other kernel file refuses `paged_kv=True` at module scope. For decode / MTP shapes
@@ -324,6 +326,17 @@ the quantized twin of ᵈᵗ, and the prefill tile's own short-`S_q` tuning — 
 backend-relative ordering rule, which encodes a performance snapshot that goes stale
 (gaps table); a caller that needs the backend plan for such a shape today deselects the
 FROST row by engine name (`graph.deselect_engines([...])`).
+
+**MXFP8 pools** (`sdpa_mxfp8` with the same paged arguments; the `PAGED_KV` specialization of all four
+`sm100/prefill_d*_mxfp8.py` kernels, `paged_d_shapes` = every native MXFP8 shape on that row): the block-scale
+descale tensors are page pools too and page with K/V through the same block tables —
+`descale_k` is `[num_pages, H_kv, page_size, D/32]` (scaled along D) and
+`descale_v` is `[num_pages, H_kv, page_size/32, D]` (scaled along the page's rows), both F8_128x4-reordered,
+so `page_size % 128 == 0` (a page holds whole 128-row SF atoms and TMA loads one SF tile per KV tile).
+Q keeps the dense `[B, H_q, S_q_padded, D/32]` F8_128x4 descale. E4M3/E5M2 in, O in FP16 / BF16 / E4M3 / E5M2, Stats,
+GQA (no PackGQA), KV split, sink; exact native head dims (d128 / d192×d128 / d256 / d512), dense Q only
+(no THD queries), no block-scaled O (`sf_o`) over pools, SM100/SM103 only. The cuDNN backend declines these graphs (no paged load for block-scale
+pools), so a FROST engine is the only server.
 
 ˢ **Attention sink at `S_q == 1` (decode), incl. paged KV and sliding window.**
 Served natively by this row: the sink is a per-Q-row epilogue fold (`max(m, sink)`
@@ -503,7 +516,12 @@ stride and positive outer strides aligned to eight half-precision elements.
 Q/K/V/O/dO and gradient pointers must also be 16-byte aligned; misaligned
 bindings are rejected before launch. Dense layouts outside the native stride
 requirements retain workspace staging (one copy in, and one back out for a
-gradient).
+gradient). That existing staging path uses prepared bitwise gather/scatter
+entries around the same pointer chain. It retains no tensor-ABI compiler,
+per-call tensor staging views or DLPack wrapping; current pointers, Int64
+strides, workspace storage origins and stream bind on each call. Potentially
+overlapping gradient outputs preserve ordered copy-back. Native dense and
+packed layout admission is unchanged.
 ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
 shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
 mask it, and hands stage 3 a real-extent slice so the padding never reaches a
@@ -597,8 +615,10 @@ standalone support checks decline it with the installed version before compile.
 SM100/SM120 keep their existing 4.7.0 floor.
 
 Engines: `sdpa_fwd_prefill_sm107` (f16/bf16), `sdpa_fwd_prefill_sm107_fp8`
-(per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale). **No
-backward** on the Rubin line — those graphs fall through to the backend.
+(per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale) forward;
+`sdpa_bwd_sm107` (f16/bf16) and `sdpa_bwd_sm107_fp8` (per-tensor FP8 E4M3,
+`sdpa_fp8_backward`) backward — **d = 256 exactly**, see ᵇ. Every other backward
+graph on the Rubin line (any other head dim, MXFP8) falls through to the backend.
 
 The f16/bf16 row is a separate engine from `sdpa_fwd_prefill_sm100` (which stops
 at cc 10.6) because the lowerings diverge: the Rubin kernels build **version-1
@@ -627,39 +647,111 @@ from the layout **and** the version-1 SF path validated on Rubin — not free:
 putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
 red (2026-09-08).
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP<br>no engine |
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | **Data types** | | |  | | | |
-| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
+| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | E4M3 ✅ᵇ · E5M2 ❌ |
 | MXFP8 | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ❌ |
-| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ (fp8 row: dQ/dK/dV e4m3, bf16 or fp16) |
 | Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ✅ | ❌ | ❌ | ❌ | — |
-| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | — |
+| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256) |
 | **Layout** | | |  | | | |
-| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ |
 | **Masks / features** | | |  | | | |
-| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | f16 ✅ · fp8 ✅ **`S_q % 128 == 0` only**ᵇ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | ❌ |
-| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | ❌ |
-| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | — |
+| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |
+| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ❌ |
+| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv; padded to 128 / 256 — except bottom-right on the fp8 row, which needs `S_q % 128 == 0`ᵇ) |
 | FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |
 
+ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
+FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels
+`sm107/bprop_d256_{f16,fp8}.py`, config `bwd/config_sm107.py`).** Exact
+`d_qk = d_v = 256` (the bodies hardcode the 256-wide tiles; no envelope). A
+TWO-kernel chain per row: `delta = rowsum(dO·O)` → the main kernel (one cga2 pair
+per 256-row kv block walks the q tiles; dV accumulates in TMEM and is stored per Q
+head, dS goes to a kv-major `[B, H_chunk, S_kv, S_q]` GMEM workspace) → dK = dS·Q
+and dQ = dSᵀ·K as the shared `bprop_matmul_blackwell` GEMMs over that workspace
+(operand majors flipped relative to the SM100 chain's `[S_q, S_kv]` workspace; the
+causal K-trim modes are not; the trim is TWO-SIDED — a sliding window bounds the
+K range on its second side (`MatmulTemplateParams.causal_window`, appended,
+default = no window: the SM100 renderings stay PTX-identical) — and the kernels
+round every kv block's q range outward to the GEMMs' 256-row pair, so a GEMM reads
+only tiles the kernel wrote and no mask needs the workspace zero-filled (kept only
+for the untrimmed twin and a top-left window with `S_q > roundup(S_kv + W, 256)`;
+poisoned-workspace tests `test_masked_stage3_reads_only_what_stage2_wrote` in
+both suites); rendered at the d = 256 cluster tile
+`MatmulTemplateParams.cgrp_tile_mn = (256, 256)` — cluster 2x1, 256 × 256 per pair,
+no N padding at d = 256, accumulator double-buffered — selected by the sm107 adapter
+only, the SM100 d512 renderings byte-identical: `test_stage3_tile_rows_render_their_upstream_constants`,
+`test_stage3_d256_rendering_is_bitwise_the_padded_one`, `test_stage3_d256_rendering_sass_pins`;
+the fp8 row writes `dS_q = e4m3(dS · scale_dP)` and renders the template's fp8 K64 arm
+(`MatmulTemplateParams.dtype_qkv = DTYPE_E4M3`, 256x256x64 `F8F6F4`, idesc `k_dim=1`)
+whose epilogue applies `descale_dP · descale_{q|k}` and quantizes dQ / MHA dK with
+`scale_{dQ|dK}` + `amax` in place — no Q / K upcasts, half the dS bytes; the bf16-dS twin
+`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16` is the A/B and oracle base, every fp8 accept case
+runs on both: `test_sdpa_bwd_fp8_sm107.py::ds_knob`)
+→ the GQA fold of the per-Q-head partials
+(`dkv_reduce`, fixed order). Served: dense, top-left and bottom-right causal,
+sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
+128-row q tile / 256-row kv block is padded through zero-filled staging copies,
+`+inf` LSE rows, and the kernels' padded-mask arm at the uniform real S_kv), BSHD-
+physical io, contiguous fp32 Stats. **One shape-conditioned decline, fp8 row only:
+bottom-right causal needs `S_q % 128 == 0`.** The bottom-right diagonal is
+`S_kv − S_q` in REAL rows; the f16 body takes the real lengths (`sq_real` /
+`skv_real` on its `compile()`, `SQ_REAL` in its problem_size, adapter passes
+`s_q_max`) while the fp8 body's ABI has no `seqlen_q_real` and derives the diagonal
+and the q-tile trim from the PADDED compile extent (its kv term IS the runtime real
+length), so a ragged S_q would shift both by `pad − S_q` rows — finite, wrong dQ/dK/dV
+near the diagonal, no crash. `mismatch()` declines it at eligibility
+(`Capabilities.bottom_right_s_q_multiple = 128`; the half row keeps 1) and the
+adapter backstops (`SdpaBwdDslSm107Fp8._check_support_family`); a ragged S_kv under
+bottom-right is served on both rows. Tests:
+`test_sdpa_bwd_fp8_sm107.py::test_reject_bottom_right_with_ragged_s_q` (host, +
+the half row admitting the same graph), `::test_fp8_adapter_backstop_refuses_bottom_right_with_ragged_s_q`,
+`::test_causal_bottom_right_{rectangular,ragged_kv}` (Rubin accept),
+`::test_unserved_bottom_right_ragged_s_q_graph_declines_as_not_supported` (Rubin,
+typed error end to end); `test_sdpa_bwd_dsl_sm107.py::test_causal_bottom_right_ragged_s_q`
+pins the f16 claim. Follow-up: thread `seqlen_q_real` through the fp8 body like the
+f16 one, then set the field back to 1 (the reject test inverts by itself). The dS
+workspace is head-chunked (and, on the
+f16 row, batch-chunked) to a 4 GiB budget; one compiled artifact serves every
+chunk. **FP8 row** = cuDNN's `sdpa_fp8_backward`: E4M3 Q/K/V/O/dO with the twelve
+scalar descales / scales as 1-element fp32 device tensors (read in-kernel, never
+host-folded), fp32 Stats, dQ/dK/dV in the graph's gradient dtype (E4M3 scaled by
+`scale_dQ/dK/dV`, or bf16 / fp16), and the four `amax_dQ/dK/dV/dP` outputs when
+requested (`amax_dP` reduces the fp32 dS before its cast, as the C++ node does).
+dS rides an **E4M3** workspace (`dS_q = e4m3(dS · scale_dP)`) and the gradient GEMMs
+run the template's fp8 K64 arm over it and the E4M3 Q / K payloads, undoing both
+scalings in their epilogue (`· descale_dP · descale_k` for dQ, `· descale_q` for dK),
+folding `amax_dQ` / `amax_dK` over the true-unit value, applying `scale_dQ` / `scale_dK`
+and casting in place (dQ always, dK at MHA); dV always, and dK under GQA, take the
+fold + quantize pass (`bprop_chain_common.fold_quant`: fixed-order partial sum, amax,
+scale, cast). The bf16-dS twin (`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`: bf16 GEMMs
+over exact E4M3 → bf16 upcasts of Q / K, three fold passes, `descale_dP` / `scale_dP`
+bound and unused) is the A/B and oracle base. E5M2 payloads are declined (no body).
+**Declined on both rows, each asserted by a test:** dense padding masks
+(`seq_len_q/kv`), sink / dSink, bias / dBias, right-band widening, THD,
+`dense_flex`, decode shapes, and `use_deterministic_algorithm` (the chain has no
+atomics; the claim waits on the bring-up sweep). The bf16 d256 graph has a native
+backend competitor (engine 17): pin the engine when validating or measuring. Both
+rows are `opt_in`. Tests: `test_sdpa_bwd_dsl_sm107.py`, `test_sdpa_bwd_fp8_sm107.py`.
 ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
 multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
@@ -996,9 +1088,16 @@ Q/K/V/O base addresses and reject misaligned runtime bindings. They address
 declared B/H/S permutations, padded strides, GQA/MQA and strided Stats directly,
 with no layout staging or GQA expansion. Sink logits are converted to log2
 units inside the attention kernel. Address strides and products retain Int64
-width. The served capability envelope is unchanged: other head dimensions and
-layouts retain their existing tensor-entry staging, as do the standalone
-RoPE callers. Those remaining callers still require the tensor compiler.
+width. Other admitted head dimensions and layouts use prepared bitwise
+gather/pad and scatter kernels in caller workspace around the same native GQA
+host. Q/K padding preserves the original attention scale; sink conversion remains
+inside attention. Native operands bind directly without redundant copies. The
+standalone dense wrapper keys plans by input strides and supplies current scratch.
+The capability envelope is unchanged; standalone RoPE uses prepared angle-table
+preprocessing and data copies. Its shared forward/backward table host fuses
+full-precision FP32 sin/cos and interleaving, retaining the existing CPU/dtype/layout
+normalization and launch-stream allocation. All forward entries share prepared host lowering;
+the former tensor compilers and their fake-operand construction are removed.
 
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
@@ -1039,9 +1138,14 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper pads to the native flavor width and uses this prepared packed chain.
-Off-flavor graph/direct-adapter widths, unaligned strides, RoPE and older direct adapters
-without complete optional-output declarations retain their existing staging and
-optional-gradient copy-backs, followed by the same prepared pointer chain.
+Off-flavor graph/direct-adapter widths, unaligned strides and older direct adapters
+without complete optional-output declarations use prepared gather/pad, gradient
+scatter and auxiliary cast recipes around the same pointer chain. These replace
+the existing tensor copies within the same caller-workspace budget. Packed copy
+capacities and stepped strides stay Int64 runtime arguments; disjoint dense gradients
+share one scatter launch, while overlapping storage ranges retain ordered copy-back.
+Standalone RoPE uses the same prepared data-copy recipes and the shared prepared
+angle-table host on the launch stream, preserving the existing FP32 trigonometry.
 Packed output casts and folds truncate flavor padding on device and leave capacity
 tails untouched. The obsolete generic and d64 tensor compilers and fake builders
 are removed. Standalone adapters require caller workspace, as native prepared
@@ -1051,25 +1155,45 @@ The standalone SM80 packed forward wrapper also uses a cached pointer host.
 Packed capacities, Q/K/V token and head strides, and launch bounds bind as
 runtime Int64 arguments; Sink logits remain in natural units. The wrapper
 preserves its output allocation, capacity-tail zeroing and off-flavor padding.
-THD tensor-fake construction has no remaining caller and is removed; dense
-off-flavor/RoPE tensor entries remain live. Native-flavor THD forward graphs
-reuse this pointer host, with optional head-major or token-major Stats and
-device-side length normalization in caller workspace. Plan construction and
-execution allocate no device memory. Graph admission requires compact packed
-Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+All SM80 forward tensor-fake construction is removed. Dense conversion copies,
+including standalone RoPE, share prepared gather/scatter plans with native GQA
+and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
+its obsolete tensor-staging executor and dedicated host compiler are removed.
+Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+or token-major Stats and device-side length normalization in caller workspace.
+Plan construction and execution allocate no device memory. Graph admission requires
+compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+The graph path does not run the standalone wrapper's output-capacity initialization.
+
+Standalone packed forward/backward wrappers share prepared bitwise data copies
+for their existing head-width padding, backward compaction and output trimming.
+One fused copy handles the selected operands; native operands bind directly.
+The bounded wrapper allocation-recipe memo contains only host metadata, while
+compiled copy artifacts specialize on head/width geometry and bind Int64 token
+capacities, strides and addresses per call. The former Torch padding helpers
+are removed. Packed forward initializes O and Stats together inside its prepared
+host; packed backward combines its existing dQ/GQA-gradient capacity zeroing with
+workspace initialization. MHA dK/dV and direct graph-output tails retain their
+previous write contract. Initialization capacities and offset products stay Int64.
+Both packed wrappers bind the operand device around compilation and execution,
+including the default-stream path, and restore the caller's current device.
+CPU prefix/scalar conversion retains its existing convenience-wrapper contract;
+graph eligibility is unchanged.
 
 The SM80 backward additionally has a dedicated plain-dense **d=64 fast path**
 (~2× on A100) that supports **no** features — it is selected only for a
 feature-free d=64 graph.
 
 ᵏ **THD / ragged backward** (`sdpa_bwd_sm80`). Q/K/V/O/dO and the gradients are
-PACKED `[1, T, H, D]` **BSHD rows, each at its own token stride**: head stride
-`D`, element stride 1, token stride `>= H*D` and a multiple of 8 elements
-(16-byte rows for the `cp.async` loads). A compact port is the common case; a
-K/V view into an interleaved `[T, 2, H, D]` record (token stride `2*H*D`, the
-fused-KV slicing layout) is served at that stride, the gap columns never read or
-written. Stepped strides are plan-time specialization; packed token capacities
-remain dynamic in the compiled host.
+PACKED `[1, T, H, D]` **BSHD rows, each at its own token and head stride**:
+element stride 1, head stride `>= D`, token stride `>= H * head_stride`, each a
+multiple of 8 elements (every head base 16-byte aligned for the `cp.async`
+loads). A compact port is the common case; a K/V view into an interleaved
+`[T, 2, H, D]` record (token stride `2*H*D`, the fused-KV slicing layout) or a
+head-interleaved record (head stride `D + gap`, what the ragged sweeps fuzz) is
+served at those strides, the gap cells never read or written. Stepped strides
+are plan-time specialization; packed token capacities remain dynamic in the
+compiled host.
 Lengths arrive as the graph's per-batch `seq_len_q/kv` (`use_padding_mask=True`)
 and become `cu_seqlens` on device in a one-warp setup launch. Like every FROST
 THD row, the packed addressing is `prefix(lengths) × token stride`: the bound
@@ -1099,7 +1223,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 
 | Missing | Where |
 |---|---|
-| Backward pass entirely | SM107 |
+| Backward outside d = 256 (f16/bf16 and per-tensor FP8 E4M3): every other head dim, MXFP8; and on the d256 rows the dense padding mask, sink / dSink, bias / dBias, deterministic, THD, `dense_flex`, right-band widening, decode | SM107 — the two d256 rows are the whole Rubin backward (see the SM107 table, ᵇ) |
 | Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
@@ -1108,9 +1232,9 @@ envelope and fused bias/sinks remain unavailable to THD.
 | f16/bf16 forward split-KV, PackGQA | SM107 (Rubin) — the row serves dense f16/bf16 at d128/d192×d128/d256/d512, THD on all of them as of 2026-09-09, and the dense padded-Q trim as of #1037; these two are the machinery its kernels still lack (optional stats IS served — `lse_optional=True`) |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
-| Per-tensor FP8 backward | every arch |
+| Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
-| THD / ragged backward | SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
+| THD / ragged backward | SM120, SM107, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
 | THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost (decode shapes ride the d128 decode tile, ᵈᵗ) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
@@ -1118,7 +1242,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
-| Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 and per-tensor FP8 d128 (see ᵖ); the d512 flavor, mxfp8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries, the attention sink and a block-scaled O (`sf_o`) over FP8 pools |
+| Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
@@ -1150,6 +1274,20 @@ prepares its existing dense scalar-output and D256 gate paths as described above
 Standalone prepared calls require the declared
 caller workspace, like graph execution; no plan owns device scratch.
 
+### Prepared SM107 d256 backward launch contract
+
+The two Rubin d=256 backward rows (`sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8`) use one
+prepared pointer launch per plan (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`):
+dense BSHD-physical operands and contiguous Stats at the plan's fixed geometry (no
+runtime shape overrides; a mismatching override or a changed layout is refused
+before any stage launches), padding copies / fills / the fp8 fold passes (and, on
+the bf16-dS twin, the Q / K upcasts) as kernels of the artifact, the caller-owned
+workspace carved in a fixed order that
+reproduces `get_workspace_size()` exactly.  The fp8 row binds its twelve scalar
+descales / scales as 1-element fp32 device operands and ONLY the amax outputs the
+graph requested (an unrequested amax is compiled out of the artifact).  Standalone
+prepared calls require the declared caller workspace, like graph execution.
+
 ### Prepared block-scaled output launch contract
 
 Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
@@ -1157,7 +1295,8 @@ SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
 MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
 current O, SF_O, optional Amax and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
-SF_O offsets and retained tensor-entry fake extents preserve Int64 addressing.
+SF_O offsets and prepared copy strides preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
-their existing admission boundaries. Remaining conversion layouts retain their
-tensor entries. Standalone prepared calls require caller-owned workspace.
+their existing admission boundaries. Remaining conversion layouts use prepared
+gather/scatter copies around a compact prepared plan. Standalone prepared calls
+require caller-owned workspace.

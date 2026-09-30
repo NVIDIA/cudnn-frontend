@@ -19,11 +19,12 @@ Two integration surfaces are provided:
   `graph.select_plan(i)`) with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm120/`: the fused five-GEMM
-main kernel and its per-shape `compile()` in `bprop_f16.py`, the rest
-of the launch chain (`dot` preprocess, the det_2kernel dQ GEMM, the dQ /
-dBias convert kernels, the GQA `reduce`, `dsink`) in
-`bprop_chain_f16.py`, and the shared warp-level primitives in
-`_common.py`.
+main kernel and its per-shape `compile()` in `bprop_f16.py`, the SM120-only
+rest of the launch chain (the det_2kernel dQ GEMM, the dQ / dBias convert
+kernels) in `bprop_chain_f16.py`, and the shared warp-level primitives in
+`_common.py`. The arch-neutral chain kernels (`dot` preprocess, the GQA
+`reduce`, `dsink`) sit one level up in `kernels/bprop_chain_common.py`,
+shared with the SM100 chain.
 
 ## Requirements
 

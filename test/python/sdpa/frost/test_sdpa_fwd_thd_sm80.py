@@ -269,14 +269,29 @@ def test_graph_thd_all_q_empty():
 
 
 def test_graph_thd_execute_does_not_allocate_or_sync(monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
 
-    monkeypatch.setattr(api_dsl, "_sm80_call", lambda *a, **kw: pytest.fail("THD graph reached legacy tensor launch"))
+    compile_thd_host = prepared_host.compile_thd_host
+    launches = []
+
+    def compile_spy(*args, **kwargs):
+        assert kwargs["initialize_outputs"] is False
+        artifact, launch = compile_thd_host(*args, **kwargs)
+
+        def launch_spy(*launch_args):
+            assert launch_args[-2] == (1, 1, 1)
+            launches.append(True)
+            return launch(*launch_args)
+
+        return artifact, launch_spy
+
+    monkeypatch.setattr(prepared_host, "compile_thd_host", compile_spy)
     graph, vp, nodes, _ = _make_graph((144, 96), (160, 128))
     workspace = _plan(graph)
     graph.execute(vp, workspace)
     torch.cuda.synchronize()
     ref = vp[nodes[3]].clone()
+    assert len(launches) == 1, "THD graph did not use the prepared pointer host"
 
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     for _ in range(3):
@@ -284,6 +299,7 @@ def test_graph_thd_execute_does_not_allocate_or_sync(monkeypatch):
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()["allocation.all.allocated"]
     assert after == before, f"THD graph execute allocated {after - before} CUDA blocks"
+    assert len(launches) == 4
     torch.testing.assert_close(vp[nodes[3]], ref, rtol=0, atol=0)
 
     prior_mode = torch.cuda.get_sync_debug_mode()

@@ -1473,7 +1473,10 @@ def _cast_thd_kernel(
             src = cutlass.make_array_view(dQ_acc).data_ptr() + (cutlass.Int64(row) * cutlass.Int64(H) + cutlass.Int64(h)) * cutlass.Int64(fd) + c
             # The caller's dQ at ITS token stride (compact folds to H*d_out).
             dst = (
-                cutlass.make_array_view(dQ_out).data_ptr() + cutlass.Int64(row) * cutlass.Int64(dQ_out.stride[1]) + cutlass.Int64(h) * cutlass.Int64(d_out) + c
+                cutlass.make_array_view(dQ_out).data_ptr()
+                + cutlass.Int64(row) * cutlass.Int64(dQ_out.stride[1])
+                + cutlass.Int64(h) * cutlass.Int64(dQ_out.stride[2])
+                + c
             )
             v = Pointer(src, dtype=cutlass.Float32).load(count=2)
             Pointer(dst, dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
@@ -1565,7 +1568,7 @@ def _dkv_reduce_thd_kernel(
             for g in cutlass.range_constexpr(ratio):
                 acc = acc + Pointer(src + in_base + cutlass.Int32(g * d_in), dtype=io_dtype).load().to(cutlass.Float32)
             # The caller's dK/dV at ITS token stride (compact folds to Hk*d_out).
-            out_off = cutlass.Int64(row) * cutlass.Int64(OUT.stride[1]) + cutlass.Int64(hk) * cutlass.Int64(d_out) + di
+            out_off = cutlass.Int64(row) * cutlass.Int64(OUT.stride[1]) + cutlass.Int64(hk) * cutlass.Int64(OUT.stride[2]) + di
             Pointer(cutlass.make_array_view(OUT).data_ptr() + out_off, dtype=io_dtype).store(acc.to(io_dtype))
 
 

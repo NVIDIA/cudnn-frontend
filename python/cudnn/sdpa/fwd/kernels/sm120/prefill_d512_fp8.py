@@ -25,7 +25,7 @@ multiples (THD views of kv-interleaved records included); the adapter
 normalizes only non-BSHD dense layouts.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from cudnn.sdpa.fwd.kernels.sm120.prepared_host import compile_host as _compile_prepared_host, fp8_host as _host_prepared
 from functools import lru_cache, partial
 from types import SimpleNamespace
@@ -2157,19 +2157,16 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple[int, int, int, int]] = None,
     o_stride: Optional[tuple[int, int, int, int]] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
-    prepared: bool = False,
+    prepared: bool = True,
     persistent_ctas: int = 0,
     has_amax: bool = True,
     scale_o_in_combine: bool = False,
 ) -> Callable:
-    """Compile the prepared dense/THD entry or a remaining dense tensor entry.
-
-    Packed capacities and Int64 strides bind at execution. Head geometry and
-    Stats packing specialize the pointer host; THD no longer creates tensor fakes.
-    Block-scaled output and conversion layouts retain the tensor entry.
-    """
+    """Compile the dense/packed pointer host; geometry binds at execution."""
 
     _cache_key = _template_key(globals(), locals(), "compile")
+    if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
+        raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
     if pick_flavor(d_qk, d_v, fp8=True) != D512_FLAVOR:
         raise ValueError(f"SM120 SDPA d512 kernel: head dimensions must both be in (256, 512]; got ({d_qk}, {d_v})")
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -2196,113 +2193,18 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
-    if prepared:
-        return _compile_prepared_host(
-            kernel,
-            IN_DTYPE,
-            qh,
-            kh,
-            d_qk,
-            d_v,
-            has_lse,
-            persistent_ctas,
-            _cache_key,
-            thd_max_sq=sq if PARAMS.thd_varlen else 0,
-            output_dtype=OUT_DTYPE,
-            has_amax=has_amax,
-            scale_o_in_combine=scale_o_in_combine,
-        )
-    if PARAMS.thd_varlen:
-        raise ValueError("SM120 FP8 THD uses prepared=True; the tensor entry is dense-only")
-
-    if PARAMS.split_kv > 1 and not has_lse:
-        raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    if has_lse and lse_stride is not None and PARAMS.split_kv > 1:
-        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
-    fake_batch = b
-
-    # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on the
-    # batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.
-    o_fake_batch = fake_batch * PARAMS.split_kv
-    lse_fake_batch = fake_batch * PARAMS.split_kv
-
-    def _fake_bshd(dtype, shape, stride):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
-
-    fake_q = _fake_bshd(IN_DTYPE, (fake_batch, sq, qh, d_qk), q_stride)
-    fake_k = _fake_bshd(IN_DTYPE, (fake_batch, skv, kh, d_qk), k_stride)
-    fake_v = _fake_bshd(IN_DTYPE, (fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd(OUT_DTYPE, (o_fake_batch, sq, qh, d_v), o_stride)
-    fake_lse_shape = (lse_fake_batch, qh, sq)
-    if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
-        fake_lse = None
-    else:
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, fake_lse_shape, lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                fake_lse_shape,
-                stride_order=(2, 1, 0),
-                assumed_align=4,
-            )
-        )
-    fake_sinks = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (qh,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if PARAMS.has_sink
-        else None
-    )
-    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), stride_order=(0,), assumed_align=4)
-
-    def _fake_scale():
-        return cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4)
-
-    return _compile_cached(
+    return _compile_prepared_host(
         kernel,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_sinks,
-        fake_seq_q_lens,
-        fake_seq_kv_lens,
-        fake_amax_o,
-        cutlass.Float32(1.0),
-        cutlass.Float32(1.0),
-        _fake_scale(),
-        _fake_scale(),
-        _fake_scale(),
-        _fake_scale(),
-        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
-        None,
-        None,
-        None,
-        cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
+        IN_DTYPE,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        has_lse,
+        persistent_ctas,
+        _cache_key,
+        thd_max_sq=sq if PARAMS.thd_varlen else 0,
+        output_dtype=OUT_DTYPE,
+        has_amax=has_amax,
+        scale_o_in_combine=scale_o_in_combine,
     )

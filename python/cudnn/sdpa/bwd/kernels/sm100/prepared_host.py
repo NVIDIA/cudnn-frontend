@@ -11,7 +11,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
-from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host, dkv_reduce_host
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
 
@@ -205,6 +205,11 @@ def host(
 
 
 def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key):
+    # Source codegen domain; the complete engine remains qualified only on
+    # SM100/SM103. Other targets are used for isolated lowering checks.
+    if sm not in (100, 103, 107, 110):
+        raise ValueError(f"SM100 SDPA bwd has codegen targets for SM100, SM103, SM107, SM110; got SM{sm}")
+
     def ptr(t, align=16):
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 

@@ -185,6 +185,14 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+## Output initialization regressions
+
+When removing wrapper-side output clears, verify that the prepared chain
+overwrites every element, including masked rows and partial tiles. Poison
+fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
+replay after previously active rows become fully masked. The detector is
+`test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's

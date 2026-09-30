@@ -63,20 +63,15 @@ def test_declines_every_arch_but_rubin():
 
 
 def test_the_bshd_handover_is_zero_copy():
-    """Stage (1) writes BSHD-compact; the SDPA takes BHSD. The block hands over
-    ``.transpose(1, 2)``, and the adapter's ``_to_bshd`` must recognise that as
-    already-canonical and return the SAME storage.
+    """The block's BHSD handover binds its original compact BSHD storage."""
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
 
-    If this ever fails, every Q handover became a gather copy -- 16 GiB at 1M
-    tokens, silent, and the reason § 1 rejects the fused-slab layout."""
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl
-
-    q_bshd = torch.empty(2, 128, 8, 256)  # [B, S, H, D] compact
-    handover = q_bshd.transpose(1, 2)  # what execute() passes
-    back = SdpaFwdDsl._to_bshd(handover)
-    assert back.data_ptr() == q_bshd.data_ptr()
-    assert back.shape == q_bshd.shape
-    assert back.is_contiguous()
+    q_bshd = torch.empty(2, 128, 8, 256, dtype=torch.bfloat16)
+    handover = q_bshd.transpose(1, 2)
+    facts = facts_of_tensor(handover)
+    assert facts.ptr == q_bshd.data_ptr()
+    assert dense_bind_strides(facts.shape, facts.strides, handover.element_size()) == q_bshd.stride()[:3]
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,8 @@ irregular and only the device can enumerate it. A persistent grid of
 index onto ``(group, tile_m, tile_n)`` with a warp-parallel prefix scan over
 the group sizes and publishes the record through a 2-stage SMEM ring that the
 TMA warp and every compute warp consume once.
+In GATHER mode, ``token_index`` maps each routed row to a source token; the
+source and routed extents are independent.
 
 KEEP IN SYNC WITH ``sm120_matmul.py`` (this tree) and
 ``../../sm100/kernel_templates/sm100_moe_grouped_matmul_fwd.py``
@@ -28,7 +30,7 @@ KEEP IN SYNC WITH ``sm120_matmul.py`` (this tree) and
 
 What is deliberately NOT here (vs. the sm100 MoE kernel)
 -------------------------------------------------------
-* No per-group TMA descriptor replacement. A is addressed by COORDINATE on one
+* No per-group TMA descriptor replacement. In NONE mode A is addressed by COORDINATE on one
   global ``[K, S]`` descriptor: a tile of group ``g`` loads rows
   ``group_begin + tile_m * cta_m ..`` and the ragged tail rows past
   ``group_end`` (the next group's tokens, or hardware zero-fill past ``S``)
@@ -36,8 +38,23 @@ What is deliberately NOT here (vs. the sm100 MoE kernel)
   That removes ``tensormap.replace``, the proxy fences and the per-CTA
   descriptor scratch; the workspace holds only the scheduler counter
   (``moe_desc_slots = 0``, so the compiler's counter offset agrees).
+  GATHER uses a global source descriptor with one-row boxes and shared::cta
+  GATHER4 loads. Group-tail indices are masked before reading token_index.
 * No TMA-store epilogue: sm120 stores STG straight from registers, so the
   output needs no re-dimensioned descriptor either.
+
+Multi-GEMM (e.g. SwiGLU: ``silu(A @ B0) * (A @ B1)``)
+-------------------------------------------------------
+One SMEM tile per DISTINCT operand per stage, one register accumulator per
+GEMM (``gemm_a_idx`` / ``gemm_b_idx`` pick each GEMM's operands, as in the
+sm100 template). Every GEMM's accumulators stay resident for the whole tile
+(``num_gemms * _ACC_REGS`` fp32 per lane); past the compute warp's register
+grant ptxas spills them to local memory -- a perf trade-off, never a reject.
+The one hard gate is SMEM: the renderer sizes the ring with the epilogue
+staging pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` /
+``.multi_gemm_ab_stages`` in kernel_registry). The STG epilogue stages the GEMMs' fragments
+through the same warp-private buffer one after another and hands the fused
+epilogue one fp32 vector per GEMM (``vec_f32``, ``vec_f32_1``, ...).
 """
 
 from __future__ import annotations
@@ -46,6 +63,14 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.tile_helpers import (
+    moe_scatter_row,
+    tma_scatter4,
+    moe_swizzle_tile as _moe_swizzle_tile,
+    moe_group_at as _moe_group_at,
+    moe_gather_row,
+    tma_gather4,
+)
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
@@ -139,8 +164,15 @@ _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-_AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
-ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
+# One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several B tiles).
+_AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
+# Single-GEMM: the staging is funded by giving up whole AB stages (legacy
+# accounting; the catalog sweep and every existing kernel count the same way).
+# Multi-GEMM: the renderer took the staging off the budget in BYTES before
+# sizing the ring (Sm120KernelTemplate.multi_gemm_ab_stages) -- a whole
+# multi-operand stage may be all that fits -- so nothing is deducted here.
+if not stg_epi_prefunded:
+    ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +213,8 @@ def _mma_16x8_k32b(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
 
 
 # ---------------------------------------------------------------------------
-# Grouped scheduling helpers (the sm100 MoE kernel's, from its _tile_helpers;
-# inlined here the way the dense sm120 kernel inlines its own L2 raster).
+# Group-local swizzle width depends on this template's injected constants.
+# Tile mapping and group visitation are shared through tile_helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -206,36 +238,6 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     return cutlass.Int32(w)
 
 
-@cute.jit
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (tile_m, tile_n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
-
-
-@cute.jit
-def _moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
-    per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
-    group = visit_idx
-    if per_expert > 1 and per_expert * num_experts == num_groups:
-        group = (visit_idx % per_expert) * num_experts + (visit_idx // per_expert)
-    return group
-
-
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
@@ -246,11 +248,13 @@ def _kernel(
     first_token_offset: cute.Tensor,
     a_tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
+    # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
+    # @@INJECT_MOE_MA_LIST@@
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -506,6 +510,7 @@ def _kernel(
             tile_n = (slot.subview(2)).load()
             is_valid = (slot.subview(3)).load()
             group_begin = (slot.subview(4)).load()
+            group_end = (slot.subview(5)).load()
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
@@ -515,9 +520,8 @@ def _kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                # The tile's rows in the flat token matrix: the group's first row
-                # plus its m-tile offset. The ONE global A descriptor clips at S;
-                # rows past group_end are loaded and never stored.
+                # Routed tile origin. GATHER maps these rows to the source
+                # tensor; NONE addresses them directly in the global descriptor.
                 coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
                 coord_n = tile_n * cgrp_tile_mnk[1]
 
@@ -534,16 +538,34 @@ def _kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
-                    # K-major token: one TMA box [K_tile, cta_m] at (k, m, 0); OOB
-                    # rows/cols are hardware zero-filled (K tails contribute 0).
                     for _ai in cutlass.range_constexpr(num_a_operands):
-                        if elect_one:
-                            nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                smem_a_list[_ai].subview(sA_elems * stage),
-                                tma_a_descs[_ai].get_ptr(),
-                                (coord_k, coord_m, cutlass.Int32(0)),
-                                ab_full_mbar_ptr.subview(stage),
-                            )
+                        if cutlass.const_expr(moe_gather):
+                            for _am in cutlass.range(cta_tile_mnk[0] // 4, unroll_full=True):
+                                if elect_one:
+                                    row = coord_m + _am * 4
+                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
+                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
+                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
+                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                                    tma_gather4(
+                                        smem_a_list[_ai].subview(sA_elems * stage + _am * 4 * _CTA_K_ELEMS),
+                                        tma_a_descs[_ai].get_ptr(),
+                                        coord_k,
+                                        r0,
+                                        r1,
+                                        r2,
+                                        r3,
+                                        ab_full_mbar_ptr.subview(stage),
+                                    )
+                        else:
+                            # K-major box; hardware zero-fills K tails.
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    smem_a_list[_ai].subview(sA_elems * stage),
+                                    tma_a_descs[_ai].get_ptr(),
+                                    (coord_k, coord_m, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
+                                )
                     # The expert's weight is B's batch coordinate. K-major B: box
                     # [K_tile, cta_n] at (k, n, e); N-major B walks N in
                     # b_tma_group_elems-wide groups (same row bytes as a K-major row).
@@ -597,7 +619,9 @@ def _kernel(
         bt_ldm_k = (lane % 8) + 8 * ((lane // 8) % 2)
         bt_ldm_n8 = lane // 16
 
-        acc = cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16)
+        # One register accumulator per GEMM of the chain (multi-GEMM: past the
+        # warp's register grant ptxas spills -- a perf trade-off, never a gate).
+        acc_list = [cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16) for _g in range(num_gemms)]
 
         ab_full_phase_bit = cutlass.Int32(0)
         ab_iter = cutlass.Int32(0)
@@ -627,8 +651,10 @@ def _kernel(
             coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
             coord_n = tile_n * cgrp_tile_mnk[1]
 
-            for _z in cutlass.range_constexpr(_ACC_REGS):
-                acc[_z] = mma_c_dtype(0)
+            for _g in cutlass.range_constexpr(num_gemms):
+                _acc_g = acc_list[_g]
+                for _z in cutlass.range_constexpr(_ACC_REGS):
+                    _acc_g[_z] = mma_c_dtype(0)
 
             for k_tile_idx in range(num_k_tiles):
                 stage = ab_iter % ab_stages
@@ -638,111 +664,123 @@ def _kernel(
                 while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr.subview(stage), ab_full_phase_bit, time_limit=10_000_000):
                     pass
 
-                sA_ptr = smem_a_list[0].subview(sA_elems * stage).data_ptr()
-                sB_ptr = smem_b_list[0].subview(sB_elems * stage).data_ptr()
+                sA_ptrs = [smem_a_list[_ai].subview(sA_elems * stage).data_ptr() for _ai in range(num_a_operands)]
+                sB_ptrs = [smem_b_list[_bj].subview(sB_elems * stage).data_ptr() for _bj in range(num_b_operands)]
 
                 for k_blk in cutlass.range_constexpr(_NUM_K_BLOCKS):
                     kb_base = k_blk * _K_BLK_ELEMS
-                    a_frags = []
-                    for mf in cutlass.range_constexpr(_M_FRAGS):
-                        a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
-                        a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
-                        a_frags.append(
-                            nvvm.ldmatrix(
-                                _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.ROW,
+                    a_frags_list = []
+                    for _ai in cutlass.range_constexpr(num_a_operands):
+                        sA_ptr = sA_ptrs[_ai]
+                        a_frags = []
+                        for mf in cutlass.range_constexpr(_M_FRAGS):
+                            a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
+                            a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
+                            a_frags.append(
+                                nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                    4,
+                                    nvvm.MMALayout.ROW,
+                                )
                             )
-                        )
-                    b_frags = []
-                    if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
-                        # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
-                        # transposed columns span n-frags (2p, 2p+1), so the result
-                        # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses:
-                        # k = kb_base + lane, no lane map. (_N_FRAGS is even here.)
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_n = warp_col * _WARP_TILE_N + npair * 16
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS) + (kb_base + lane) * b_tma_group_elems + b_n % b_tma_group_elems
-                            )
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.COL,
-                                shape=nvvm.LoadShape.M16N16,
-                                src_format=nvvm.LoadSrcFormat.B8,
-                            )
-                            b_frags.append((bv[0], bv[2]))
-                            b_frags.append((bv[1], bv[3]))
-                    elif cutlass.const_expr(b_is_n_major):
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                + b_n % b_tma_group_elems
-                            )
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.COL,
-                            )
-                            b_frags.append((bv[0], bv[1]))
-                            b_frags.append((bv[2], bv[3]))
-                        if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                            b_n = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8
-                            b_off = (
-                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                + b_n % b_tma_group_elems
-                            )
-                            bt = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                2,
-                                nvvm.MMALayout.COL,
-                            )
-                            b_frags.append((bt[0], bt[1]))
-                    else:
-                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                            b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
-                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
-                            bv = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                4,
-                                nvvm.MMALayout.ROW,
-                            )
-                            b_frags.append((bv[0], bv[1]))
-                            b_frags.append((bv[2], bv[3]))
-                        if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                            b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
-                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
-                            bt = nvvm.ldmatrix(
-                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                2,
-                                nvvm.MMALayout.ROW,
-                            )
-                            b_frags.append((bt[0], bt[1]))
+                        a_frags_list.append(a_frags)
+                    for _bj in cutlass.range_constexpr(num_b_operands):
+                        sB_ptr = sB_ptrs[_bj]
+                        b_frags = []
+                        if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
+                            # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
+                            # transposed columns span n-frags (2p, 2p+1), so the result
+                            # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses:
+                            # k = kb_base + lane, no lane map. (_N_FRAGS is even here.)
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_n = warp_col * _WARP_TILE_N + npair * 16
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + lane) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    4,
+                                    nvvm.MMALayout.COL,
+                                    shape=nvvm.LoadShape.M16N16,
+                                    src_format=nvvm.LoadSrcFormat.B8,
+                                )
+                                b_frags.append((bv[0], bv[2]))
+                                b_frags.append((bv[1], bv[3]))
+                        elif cutlass.const_expr(b_is_n_major):
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    4,
+                                    nvvm.MMALayout.COL,
+                                )
+                                b_frags.append((bv[0], bv[1]))
+                                b_frags.append((bv[2], bv[3]))
+                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
+                                b_n = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8
+                                b_off = (
+                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
+                                    + b_n % b_tma_group_elems
+                                )
+                                bt = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    2,
+                                    nvvm.MMALayout.COL,
+                                )
+                                b_frags.append((bt[0], bt[1]))
+                        else:
+                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                                b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
+                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
+                                bv = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    4,
+                                    nvvm.MMALayout.ROW,
+                                )
+                                b_frags.append((bv[0], bv[1]))
+                                b_frags.append((bv[2], bv[3]))
+                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
+                                b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
+                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
+                                bt = nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                    2,
+                                    nvvm.MMALayout.ROW,
+                                )
+                                b_frags.append((bt[0], bt[1]))
 
-                    for mf in cutlass.range_constexpr(_M_FRAGS):
-                        av = a_frags[mf]
-                        for nf in cutlass.range_constexpr(_N_FRAGS):
-                            b0, b1 = b_frags[nf]
-                            _o = (mf * _N_FRAGS + nf) * 4
-                            acc[_o:4] = _mma_16x8_k32b(
-                                av[0],
-                                av[1],
-                                av[2],
-                                av[3],
-                                b0,
-                                b1,
-                                acc[_o + 0],
-                                acc[_o + 1],
-                                acc[_o + 2],
-                                acc[_o + 3],
-                            )
-
-                # Stage fully consumed by this warp (ldmatrix is synchronous).
+                        # Every GEMM fed by this B operand (trace-time selection).
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            if cutlass.const_expr(gemm_b_idx[_g] == _bj):
+                                _acc_g = acc_list[_g]
+                                a_frags = a_frags_list[gemm_a_idx[_g]]
+                                for mf in cutlass.range_constexpr(_M_FRAGS):
+                                    av = a_frags[mf]
+                                    for nf in cutlass.range_constexpr(_N_FRAGS):
+                                        b0, b1 = b_frags[nf]
+                                        _o = (mf * _N_FRAGS + nf) * 4
+                                        _acc_g[_o:4] = _mma_16x8_k32b(
+                                            av[0],
+                                            av[1],
+                                            av[2],
+                                            av[3],
+                                            b0,
+                                            b1,
+                                            _acc_g[_o + 0],
+                                            _acc_g[_o + 1],
+                                            _acc_g[_o + 2],
+                                            _acc_g[_o + 3],
+                                        )
                 nvvm.bar_warp_sync(0xFFFFFFFF)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 if elect_one:
                     nvvm.mbarrier_arrive(ab_empty_mbar_ptr.subview(stage))
                 ab_iter += 1
@@ -756,14 +794,21 @@ def _kernel(
                 for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
                     _nf0 = grp * _STG_EPI_GROUP_FRAGS
                     _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
-                    # -- STS_128: reg-index-order dump, one batch per fragment --
-                    for b in cutlass.range_constexpr(_grp_frags):
-                        _o = (mf * _N_FRAGS + _nf0 + b) * 4
-                        _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
-                        (_stg_stage.data_ptr() + _s_off).store(acc[_o:4], alignment=16)
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
-                    # -- LDS: 16 contiguous elems = both row-halves of one frag --
-                    _seg = (_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16)
+                    # -- STS_128: reg-index-order dump, one batch per fragment; then
+                    # LDS: 16 contiguous elems = both row-halves of one frag. One GEMM
+                    # at a time through the same warp-private buffer (multi-GEMM keeps
+                    # every GEMM's segment in registers, not extra SMEM).
+                    _seg_list = []
+                    for _g in cutlass.range_constexpr(num_gemms):
+                        _acc_g = acc_list[_g]
+                        for b in cutlass.range_constexpr(_grp_frags):
+                            _o = (mf * _N_FRAGS + _nf0 + b) * 4
+                            _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
+                            (_stg_stage.data_ptr() + _s_off).store(_acc_g[_o:4], alignment=16)
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        _seg_list.append((_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16))
+                        if cutlass.const_expr(_g + 1 < num_gemms):
+                            nvvm.bar_warp_sync(0xFFFFFFFF)  # every lane has its segment before the buffer is reused
                     # Short tail group: trailing lanes own no fragment there
                     # (True at trace time for full groups — no guard emitted).
                     _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
@@ -775,22 +820,32 @@ def _kernel(
                             # hold the next group's tokens (or zero-fill) and are
                             # not this expert's output.
                             if row < group_end:
-                                _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
-                                for sj in cutlass.range_constexpr(4):
-                                    _row[2 * sj] = _seg[4 * sj + 2 * half]
-                                    _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
+                                _row_list = []
+                                for _g in cutlass.range_constexpr(num_gemms):
+                                    _seg = _seg_list[_g]
+                                    _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
+                                    for sj in cutlass.range_constexpr(4):
+                                        _row[2 * sj] = _seg[4 * sj + 2 * half]
+                                        _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
+                                    _row_list.append(_row)
                                 for sv in cutlass.range_constexpr(8 // _STG_V):
                                     col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
                                     col_j = col
                                     if col_j + vsize <= N:
+                                        # One epilogue input vector per GEMM: GEMM 0 is the
+                                        # template's `vec_f32`, GEMMs > 0 are bound as
+                                        # `vec_f32_<g>` by the injected STG bindings below.
                                         # NB: Array slices are [start:COUNT], not
                                         # [start:stop] (matches acc[_o:2] above).
-                                        _vec = _row[sv * _STG_V : _STG_V]
-                                        if cutlass.const_expr(acc_widen_to_fp32):
-                                            _pf = _vec.to(cutlass.Float32)
-                                            vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
-                                        else:
-                                            vec_f32 = _vec
+                                        c_rmem_vecs = []
+                                        for _g in cutlass.range_constexpr(num_gemms):
+                                            _vec = _row_list[_g][sv * _STG_V : _STG_V]
+                                            if cutlass.const_expr(acc_widen_to_fp32):
+                                                _pf = _vec.to(cutlass.Float32)
+                                                c_rmem_vecs.append(_pf + cutlass.full_like(_pf, 0.0))
+                                            else:
+                                                c_rmem_vecs.append(_vec)
+                                        vec_f32 = c_rmem_vecs[0]
                                         linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
@@ -871,21 +926,26 @@ def _host(
 
     # @@INJECT_HOST_REDUCTION_STRIDES@@
 
-    # ONE global A descriptor over the flat token matrix: K-major box
-    # [K_tile, cta_m]; the kernel offsets its row coordinate per routed group.
+    # GATHER uses the original source extent and one-row boxes. NONE walks
+    # whole tiles in the routed token matrix.
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
+        if cutlass.const_expr(moe_gather):
+            a_dims = [k_sym, _a_op.shape[0]]
+            a_strides = [a_stride_m * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], 1]
+        else:
+            a_dims = [k_sym, m, 1]
+            a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
+            a_box = [cta_tile_mnk[2], cta_tile_mnk[0], 1]
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
                 dtype=ab_tma_dtype,
-                global_dims=[k_sym, m, 1],
-                global_strides=[
-                    a_stride_m * ab_dtype.width // 128,
-                    a_stride_l * ab_dtype.width // 128,
-                ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                global_dims=a_dims,
+                global_strides=a_strides,
+                box_dims=a_box,
                 swizzle=ab_tma_swizzle,
             )
         )
@@ -937,6 +997,7 @@ def _host(
         first_token_offset,
         a_tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
+        # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
@@ -960,11 +1021,12 @@ def compile() -> Callable:
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
+    sym_source_m = cute.sym_int64() if moe_gather else sym_m
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_m, sym_k, 1),
+            (sym_source_m, sym_k, 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )

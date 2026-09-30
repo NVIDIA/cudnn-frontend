@@ -72,3 +72,30 @@ def test_count_causal_nonmasked_elems_matches_reference():
             attn_mask=attn_mask,
             sliding_window_size=sliding_window_size,
         )
+
+
+def _backward_graph_call_kwargs(src: str):
+    """``{method: {keyword, ...}}`` for every ``<graph>.sdpa*backward(...)`` call the harness builds."""
+    import ast
+
+    out = {}
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("sdpa") and node.func.attr.endswith("backward"):
+            out.setdefault(node.func.attr, set()).update(k.arg for k in node.keywords if k.arg)
+    return out
+
+
+def test_backward_graphs_carry_the_sliding_window_the_flop_model_counts():
+    """A ``--sliding_window_size`` run must be rated on the graph that RAN.  The half and fp8 backward calls carry the band
+    (the fp8 one as ``left_bound`` alone: the binding folds ``right_bound = 0`` out of the causal flags and raises when both
+    are given), and the backward FLOP count goes through ``bwd_sliding_window`` -- None for the mxfp8 backward, whose call
+    carries no band.  Until 2026-09-28 the fp8 backward built a PLAIN-causal graph under a window while the FLOP model counted
+    window pairs: the sm107 d256 fp8 SWA640 cell read 148 TFLOPS on 11.14 ms, its main kernel 3.1x the windowed one's time."""
+    src = (_REPO_ROOT / "benchmark" / "attention_training" / "benchmark_single_sdpa.py").read_text()
+    kw = _backward_graph_call_kwargs(src)
+    assert "diagonal_band_left_bound" in kw["sdpa_backward"], "the half backward call dropped the band"
+    assert "left_bound" in kw["sdpa_fp8_backward"], "the fp8 backward call dropped the band (a window run measures a plain-causal graph)"
+    assert "right_bound" not in kw["sdpa_fp8_backward"], "sdpa_fp8_backward raises when use_causal_mask and right_bound are both set"
+    assert "left_bound" not in kw["sdpa_mxfp8_backward"], "the mxfp8 backward carries the band now: drop the mxfp8 arm of bwd_sliding_window"
+    assert 'bwd_sliding_window = None if args.data_type == "mxfp8" else args.sliding_window_size' in src
+    assert src.count("bwd_sliding_window,") == 1, "the backward tflops_per_sec call must take bwd_sliding_window, not args.sliding_window_size"

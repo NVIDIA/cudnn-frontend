@@ -10,6 +10,7 @@ import logging
 import math
 import os
 from abc import abstractmethod
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Optional
 
@@ -807,19 +808,26 @@ def _sm80_bwd_pick_flavor(d_qk: int, d_v: int) -> str:
     raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {_SM80_BWD_FLAVOR_DIMS}.")
 
 
-def _sm80_bwd_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
-    """Zero-pad the trailing dim of an fp16/bf16 tensor up to ``new_last``."""
-    old_last = t.shape[-1]
-    if old_last == new_last:
-        return t
-    if old_last > new_last:
-        raise ValueError(f"_sm80_bwd_pad_last_dim: tensor's last dim {old_last} exceeds target {new_last}")
-    pad = torch.zeros((*t.shape[:-1], new_last - old_last), dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=-1).contiguous()
-
-
 @lru_cache(maxsize=128)
-def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtype, device, is_causal, window_size, bottom_right, has_sink, deterministic):
+def _sm80_thd_plan(
+    n_seq,
+    h_q,
+    h_kv,
+    d_qk,
+    d_v,
+    t_q,
+    t_kv,
+    max_sq,
+    max_skv,
+    dtype,
+    device,
+    is_causal,
+    window_size,
+    bottom_right,
+    has_sink,
+    deterministic,
+    stats_token_major=False,
+):
     """Cache immutable wrapper plans without retaining tensors or runtime pointers.
 
     Capacities and bounds size each plan's workspace; the prepared compiler
@@ -853,12 +861,14 @@ def _sm80_thd_plan(n_seq, h_q, h_kv, d_qk, d_v, t_q, t_kv, max_sq, max_skv, dtyp
         thd=True,
         max_total_seq_len_q=t_q,
         max_total_seq_len_kv=t_kv,
+        thd_stats_token_major=stats_token_major,
     )
     assert api.check_support(), "Unsupported configuration"
     # Wrapper buffers may have capacity beyond B * max_sequence_length.
     # Preserve their physical capacity/Stats pitch while separately bounding
     # the launch grid and deterministic counters from the caller's hints.
     api._thd_launch_bounds = (max_sq, max_skv)
+    api._initialize_packed_outputs = True
     api.compile()
     return api
 
@@ -878,10 +888,6 @@ def _sm80_thd_backward(
     # Resolve from the user's width before envelope padding (e.g. D=96).
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    if d_qk < fdqk:
-        q, k = _sm80_bwd_pad_last_dim(q, fdqk), _sm80_bwd_pad_last_dim(k, fdqk)
-    if d_v < fdv:
-        v, o, do = (_sm80_bwd_pad_last_dim(t, fdv) for t in (v, o, do))
     n_seq = cu_q.numel() - 1
     assert n_seq > 0 and cu_k is not None and cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
     t_q, t_kv, dev = q.shape[1], k.shape[1], q.device
@@ -889,21 +895,37 @@ def _sm80_thd_backward(
         if hint is not None:
             assert int(hint) > 0, f"{label} must be > 0; got {hint}"
 
+    if d_qk < fdqk or d_v < fdv or any(not t.is_contiguous() for t in (q, k, v, o, do)):
+        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+
+        q, k, v, o, do = copy_packed_half((q, k, v, o, do), (fdqk, fdqk, fdv, fdv, fdv), (True, False, False, True, True), compact=True)
+
     # A zero-capacity wrapper operand gets one never-live row. Device prefixes
     # still contain the actual totals; no adapter-side degenerate computation.
     def packed(t):
-        return t.contiguous() if t.shape[1] else torch.empty((1, 1, *t.shape[2:]), dtype=t.dtype, device=dev)
+        return t if t.shape[1] else torch.empty((1, 1, *t.shape[2:]), dtype=t.dtype, device=dev)
 
     q, k, v, o, do = map(packed, (q, k, v, o, do))
     tq_cap, tkv_cap = max(t_q, 1), max(t_kv, 1)
-    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous() if t_q else torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
+    stats_token_major = False
+    if t_q:
+        lse_t = lse if lse.dtype == torch.float32 and lse.device == dev else lse.to(dtype=torch.float32, device=dev)
+        if tuple(lse_t.shape) == (1, h_q, t_q) and lse_t.stride(1) == 1 and lse_t.stride(2) == h_q:
+            # Reuse the graph chain's existing compact token-major Stats ABI.
+            # This is a view of the caller's storage, not a layout conversion.
+            lse_t = lse_t[0].transpose(0, 1)
+            stats_token_major = True
+        else:
+            lse_t = lse_t.contiguous()
+    else:
+        lse_t = torch.empty((1, h_q, 1), dtype=torch.float32, device=dev)
     cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
     cu_k_t = cu_k.to(dtype=torch.int32, device=dev).contiguous()
     sinks_t = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous() if sinks is not None else None
     # The cast/fold only writes live rows. Keep the established zeroed dQ and
     # GQA output tails; MHA dK/dV remain direct kernel outputs.
-    dq = torch.zeros_like(q)
-    dk, dv = (torch.zeros_like(k), torch.zeros_like(v)) if h_q != h_kv else (torch.empty_like(k), torch.empty_like(v))
+    # The wrapper specialization folds this into workspace initialization.
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     dsink = torch.empty(h_q, dtype=torch.float32, device=dev) if sinks is not None else None
     wl, wr = window_size
     wl = None if wl is None or wl < 0 else int(wl)
@@ -925,6 +947,7 @@ def _sm80_thd_backward(
         bool(causal_bottom_right) and (bool(is_causal) or wl is not None),
         sinks is not None,
         bool(deterministic),
+        stats_token_major,
     )
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     api.execute(
@@ -944,11 +967,9 @@ def _sm80_thd_backward(
         sink_tensor=sinks_t,
         dsink_tensor=dsink,
     )
-    dQ_k, dK_k, dV_k = dq[:, :t_q, :, :d_qk], dk[:, :t_kv, :, :d_qk], dv[:, :t_kv, :, :d_v]
-    if d_qk < fdqk:
-        dQ_k, dK_k = dQ_k.contiguous(), dK_k.contiguous()
-    if d_v < fdv:
-        dV_k = dV_k.contiguous()
+    dQ_k, dK_k, dV_k = dq[:, :t_q], dk[:, :t_kv], dv[:, :t_kv]
+    if d_qk < fdqk or d_v < fdv:
+        dQ_k, dK_k, dV_k = copy_packed_half((dQ_k, dK_k, dV_k), (d_qk, d_qk, d_v), (True, False, False))
     out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
     if dsink is not None:
         out["dsink_tensor"] = dsink
@@ -1065,6 +1086,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._thd_lse_token_major: bool = False
         self._thd_lse_head_stride: int = 0
         self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
+        self._thd_head_strides: dict = {}  # port role -> the caller's head stride (plan-time; D when compact)
 
     @staticmethod
     def _thd_total(capacity: int, declared: Optional[int]) -> int:
@@ -1086,13 +1108,14 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     @staticmethod
     def _packed_bshd(desc: TensorDesc) -> bool:
         """True when a logical-BHSD desc sits on PACKED BSHD rows the kernels can
-        bind directly: head stride D, element stride 1, and a token stride that
-        covers the row (``>= H*D``) and keeps every row 16-byte aligned (a
-        multiple of 8 fp16/bf16 elements -- the cp.async loads move 16-byte
-        chunks).  The token stride need not be compact: the kernels address a
-        row as ``token * token_stride + head * D`` with the port's own plan-time
-        stride, so a view into a wider per-token record (a K/V slice of an
-        interleaved ``[T, 2, H, D]`` buffer) is served at that stride.  The
+        bind directly: element stride 1, head stride ``>= D`` and token stride
+        ``>= H * head_stride``, each a multiple of 8 fp16/bf16 elements so every
+        head base stays 16-byte aligned (the cp.async loads move 16-byte
+        chunks).  Neither need be compact: the kernels address a row as
+        ``token * token_stride + head * head_stride`` with the port's own
+        plan-time strides, so a view into a wider per-token record (a K/V slice
+        of an interleaved ``[T, 2, H, D]`` buffer) or a head-interleaved record
+        is served at those strides.  The
         batch stride is not consulted -- a ragged port's sequences start at the
         ragged offsets, and the packed view rebuilds that axis from the token
         extent.  The token stride is always checked (the packed view walks every
@@ -1100,7 +1123,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         strides wildcard on a size-1 extent (the analyzer's convention)."""
         _, h, _, d = (int(x) for x in desc.shape)
         st = tuple(int(x) for x in desc.stride)
-        return (int(desc.shape[1]) == 1 or st[1] == d) and st[2] >= h * d and st[2] % 8 == 0 and (d == 1 or st[3] == 1)
+        hs = st[1] if h > 1 else d
+        head_ok = h == 1 or (hs >= d and hs % 8 == 0)
+        return head_ok and st[2] >= h * hs and st[2] % 8 == 0 and (d == 1 or st[3] == 1)
 
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided Stats/LSE buffer and return the
@@ -1212,9 +1237,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             # No staging leg: the kernels bind the caller's packed rows directly,
             # each port at its own plan-time token stride (the compiled fake
             # carries it).  Anything the row arithmetic cannot express -- a
-            # head stride other than D, a token stride below the row or off
-            # 16-byte alignment -- is a decline here, not a silent mis-bind.
+            # head or token stride below its extent or off 16-byte alignment --
+            # is a decline here, not a silent mis-bind.
             self._thd_token_strides = {}
+            self._thd_head_strides = {}
             for role, desc in (
                 ("q", self.q_desc),
                 ("k", self.k_desc),
@@ -1227,10 +1253,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             ):
                 self._value_error_if(
                     not self._packed_bshd(desc),
-                    f"SM80 bwd THD: {desc.name} must be packed BSHD rows (head stride D, element stride 1, "
-                    f"token stride >= H*D and a multiple of 8 elements); got {tuple(desc.stride)} (the packed path has no staging copy)",
+                    f"SM80 bwd THD: {desc.name} must be packed BSHD rows (element stride 1, head stride >= D and "
+                    f"token stride >= H * head stride, each a multiple of 8 elements); got {tuple(desc.stride)} (the packed path has no staging copy)",
                 )
                 self._thd_token_strides[role] = int(desc.stride[2])
+                self._thd_head_strides[role] = int(desc.stride[1]) if int(desc.shape[1]) > 1 else int(desc.shape[3])
             self._t_q_cap = self._thd_total(int(b) * int(s_qo), self.max_total_seq_len_q)
             self._t_kv_cap = self._thd_total(int(b) * int(s_kv), self.max_total_seq_len_kv)
             self._value_error_if(self._t_q_cap <= 0 or self._t_kv_cap <= 0, "SM80 bwd THD: the packed token capacities must be > 0")
@@ -1581,7 +1608,12 @@ def sdpa_bwd_wrapper_sm80(
         ):
             if present:
                 raise NotImplementedError(f"SM80 SDPA THD (cum_seqlen_*) backward does not support {label}; the dense path serves it")
-        with _torch_stream_context(current_stream, q_tensor.device):
+        # A missing/current stream handle does not switch CUDA devices.
+        # Compile and launch on the operand device, then restore the caller.
+        device_context = (
+            nullcontext() if q_tensor.device.type != "cuda" or torch.cuda.current_device() == q_tensor.device.index else torch.cuda.device(q_tensor.device)
+        )
+        with device_context, _torch_stream_context(current_stream, q_tensor.device):
             return _sm80_thd_backward(
                 q_tensor,
                 k_tensor,
@@ -1615,8 +1647,10 @@ def sdpa_bwd_wrapper_sm80(
         h_kv, s_kv = k_tensor.shape[1], k_tensor.shape[2]
         dk = torch.empty((b, s_kv, h_kv, d_qk), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
         dv = torch.empty((b, s_kv, h_kv, d_v), dtype=q_tensor.dtype, device=q_tensor.device).transpose(1, 2)
-        dbias = torch.zeros_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
-        dsink = torch.zeros(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
+        # The prepared chain clears its accumulators and copies every auxiliary
+        # element, including fully masked rows, into these output buffers.
+        dbias = torch.empty_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
+        dsink = torch.empty(h_q, dtype=torch.float32, device=q_tensor.device) if sinks is not None else None
 
     cache_key = (
         q_tensor.shape,
@@ -1729,11 +1763,6 @@ _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 _THD_STAGE2_DESC_SLOTS = 4
 _SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
-# do_dot's inner loop is `n_chunks = D_V // chunk_elems` with no tail, so D_V is
-# always passed ROUNDED UP to this and the kernel's padded-head-dim guard covers
-# the remainder. 64 keeps 8 threads/row, which is a 2x throughput cliff over 32.
-_SM100_DOT_CHUNK_ELEMS = 64
-_SM100_DOT_Q_TILE = 128
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
@@ -1857,8 +1886,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # when the caller omits it. Default it here, as the SM120 and SM80
         # adapters do -- without this the row admits the graph, check_support
         # passes, and execute dies on `None * log2(e)`. Found by review on the
-        # d512 bring-up PR; regression test `test_default_attn_scale`.
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        # d512 bring-up PR; regression test `test_default_attn_scale`.  ONLY
+        # None defaults: an explicit attn_scale = 0.0 is a valid declared scale
+        # the analyzer preserves (uniform P -> dQ = dK = 0, dV = sum(dO) / S_kv);
+        # `or == 0.0` here ran it at 1/sqrt(d) (Codex on #1212, same clause in
+        # the sm107 adapter; host pin test_sdpa_bwd_dsl_sm107.py::
+        # test_explicit_zero_attn_scale_survives_the_adapters).
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape. The kernel's grid and workspace are tiled,
         # so a sequence length that is not a multiple runs on the next multiple
@@ -1868,8 +1902,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._skv_pad = -(-self.s_k_max // 128) * 128
         self._is_padded = self._sq_pad != self.s_q_max or self._skv_pad != self.s_k_max
         self._compiled = None
-        self._dot_fn = None
-        self._reduce_fn = None
+        self._staged_prepared = None
         self._zero_ws = False
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
         # Head-major Stats only: the caller's head stride, which the compiled
@@ -1928,6 +1961,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         assert vanishes under -O and an import-time crash is undebuggable from
         the frontend.
         """
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        error = cutedsl_requirement_error("SdpaBwdDslSm100")
+        if error:
+            raise NotImplementedError(error)
         self._value_error_if(self.head_dim_qk != self.head_dim_v, f"SM100 bwd: d_qk must equal d_v; got {self.head_dim_qk} / {self.head_dim_v}")
         self._value_error_if(not (256 < self.head_dim_qk <= 512), f"SM100 bwd: d must be in (256, 512]; got {self.head_dim_qk}")
         self._value_error_if(
@@ -2020,8 +2058,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
         operand-major and the other causal K-trim direction). Native layouts
-        compile the complete chain here; the retained conversion path still
-        compiles its tensor wrappers at first execute."""
+        and the existing dense conversion path both compile the complete
+        pointer chain here."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
@@ -2033,7 +2071,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             TemplateParams,
             vec_bytes_epi_for,
         )
-        from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
         stage2_mod = load_template(
@@ -2129,18 +2166,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._prepared = compile_plan(self, stage2_mod, mm_lo, mm_hi)
             self._compiled = self._prepared
             return self._compiled
-        stage2 = stage2_mod.compile(
-            b=self.batch_size,
-            qh=self.h_q,
-            sq=self._sq_pad,
-            skv=self._skv_pad,
-            qh_chunk=self._qh_chunk,
-            d=self.head_dim_qk,
-            qh_kv=self.h_kv,
-            sq_real=self.s_q_max,
-            skv_real=self.s_k_max,
-        )
-        self._compiled = (dot_do_o_host, stage2_mod, stage2, mm_lo, mm_hi)
+        from .prepared_sm100 import compile_staged
+
+        self._staged_prepared = compile_staged(self, stage2_mod, mm_lo, mm_hi)
+        self._compiled = self._staged_prepared
         return self._compiled
 
     # --- execution -----------------------------------------------------------
@@ -2185,224 +2214,12 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 current_stream,
                 scale_softmax,
             )
-        import cutlass
-        from cutlass.cute.runtime import from_dlpack, make_fake_stream
+        from .prepared_sm100 import execute_staged
 
-        dot_host, stage2_mod, stage2, mm_lo, mm_hi = self.compile()
-        b, h, sq, skv, d = self.batch_size, self.h_q, self.s_q_max, self.s_k_max, self.head_dim_qk
-        scale = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
-        scale_log2 = scale * math.log2(math.e)
-
-        # Logical BHSD over BSHD storage -> the [B, S, H, D] view the kernels
-        # declare. A permutation, never a copy.
-        as_bshd = lambda t: t.permute(0, 2, 1, 3)
-
-        stream = self._get_default_stream(current_stream)
-        with _torch_stream_context(current_stream, q_tensor.device):
-            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100")
-            # ROW_ROUND: dot_do_o_kernel strides delta by ceil(S_q/128)*128.
-            sq_dot = -(-sq // 128) * 128
-            delta = carver.take(b * h * sq_dot, torch.float32).reshape(b, h, sq_dot)
-            chunk = self._qh_chunk
-            # Allocated at the PADDED extent, because that is what stage 2's
-            # tiled grid writes; stage 3 consumes a REAL-extent slice, so the
-            # padded tail never reaches a GEMM's M/N/K at all.
-            sqp, skvp = self._sq_pad, self._skv_pad
-            s_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
-            ds_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
-            s_ws, ds_ws = s_ws_full[:, :, :sq, :skv], ds_ws_full[:, :, :sq, :skv]
-
-            # Layout normalisation. A conforming tensor is used in place (the
-            # permute is a view); a non-conforming one gets a BSHD staging buffer
-            # from the workspace -- copied IN for reads, and copied back OUT
-            # after the chain for the gradients.
-            def _stage(t, name, is_out):
-                if name not in (self._stage_out if is_out else self._stage_in):
-                    return as_bshd(t), None
-                bt, ht, st, dd = t.shape[0], t.shape[1], t.shape[2], t.shape[3]
-                # `buf` is the BSHD-physical [B, S, H, D] buffer the kernels
-                # want; `view` is its logical-BHSD alias, used only to copy
-                # against the caller's tensor. Returning `view` here instead of
-                # `buf` hands the kernel [B, H, S, D] and it rejects the shape.
-                buf = carver.take(int(bt) * int(st) * int(ht) * int(dd), self.dtype).view(int(bt), int(st), int(ht), int(dd))
-                view = buf.permute(0, 2, 1, 3)
-                if not is_out:
-                    view.copy_(t)
-                return buf, (view, t)
-
-            q, _ = _stage(q_tensor, "q", False)
-            k, _ = _stage(k_tensor, "k", False)
-            v, _ = _stage(v_tensor, "v", False)
-            o, _ = _stage(o_tensor, "o", False)
-            do, _ = _stage(do_tensor, "dO", False)
-            dq, dq_back = _stage(dq_tensor, "dQ", True)
-            dk, dk_back = _stage(dk_tensor, "dK", True)
-            dv, dv_back = _stage(dv_tensor, "dV", True)
-
-            # Under GQA the stage-3 dK/dV GEMMs write ONE PARTIAL PER Q HEAD and
-            # a separate reduce folds the group afterwards. Writing straight to
-            # dk/dv would have the group's Q heads overwrite each other instead
-            # of summing. MHA (group == 1) skips both the buffers and the reduce.
-            # Zero the S/dS workspace when the stage-3 K-trim can straddle the
-            # boundary of what stage 2 wrote.
-            #
-            # With shift == 0 it cannot: the trim starts at (m0 // 256) * 256 ==
-            # m0, and every q-cluster from there wrote the whole 256-wide M tile,
-            # so the skipped tiles are never read (the poisoned-workspace test
-            # proves it at 43.8% skipped). A non-zero shift -- band widening or
-            # bottom-right -- pulls the start BELOW m0, and then an M tile can
-            # straddle the written boundary and read residue. That showed up as a
-            # 1-in-6 catastrophic dK/dV (cos 0.0006), not a numerics drift,
-            # because it depends on whatever was in the buffer.
-            if self._zero_ws:
-                # NOT for padding: stage 2 writes its own zeros there. Its kv
-                # bound is div_up(REAL S_kv, TILE_N), so the tail tile IS visited
-                # and apply_mask_chunk zeroes the columns past the real length;
-                # the padded q rows are visited too (the grid is sized on the
-                # rounded S_q) and row_scale zeroes them. Only a MASK-SKIPPED
-                # tile is genuinely never written.
-                s_ws_full.zero_()
-                ds_ws_full.zero_()
-
-            gqa = self._gqa_group > 1
-            if gqa:
-                dk_part = carver.take(b * skv * h * d, self.dtype).view(b, skv, h, d)
-                dv_part = carver.take(b * skv * h * d, self.dtype).view(b, skv, h, d)
-                # Already [B, S_kv, H_q, D] -- the same BSHD orientation `_stage`
-                # hands back, so the `hs` head slice below hits the same axis.
-                dk_tgt, dv_tgt = dk_part, dv_part
-            else:
-                dk_tgt, dv_tgt = dk, dv
-
-            _t = lambda x: from_dlpack(x, assumed_align=16, enable_tvm_ffi=True)
-            # STAGE 1, hoisted out of the chunk loop: one streaming pass over O
-            # and dO instead of n_chunks passes. Nothing in the loop feeds it.
-            #
-            # The compiled artifact is CACHED on the adapter. Building it here on
-            # every call cost ~250 ms of WALL time per execute while device time
-            # stayed at 0.1 ms -- invisible to a device-time benchmark, ruinous
-            # for anything that measures the real call.
-            if self._dot_fn is None:
-                d_padded = -(-d // _SM100_DOT_CHUNK_ELEMS) * _SM100_DOT_CHUNK_ELEMS
-                self._dot_fn = cutlass.cute.compile(
-                    dot_host,
-                    _t(o),
-                    _t(do),
-                    _t(delta),
-                    None,
-                    None,
-                    _SM100_DOT_Q_TILE,
-                    d_padded,
-                    d_padded,
-                    _SM100_DOT_CHUNK_ELEMS,
-                    False,
-                    False,
-                    make_fake_stream(use_tvm_ffi_env_stream=False),
-                    options="--enable-tvm-ffi",
-                )
-            self._dot_fn(_t(o), _t(do), _t(delta), None, None, stream)
-
-            lse = stats_tensor.reshape(b, h, sq)
-            # Stage 2 / stage 3's THD ABI slots: dead on this dense path (every
-            # read is under const_expr(_THD)), but the compiled ABI is a (B,) int32
-            # and a 1-element int64 tensor, so borrow them from the workspace.
-            seq_kv = carver.take(b, torch.int32)
-            desc_words = carver.take(1, torch.int64)
-            for c in range(h // chunk):
-                hb = c * chunk
-                hs = slice(hb, hb + chunk)
-                # STAGE 2: head_base offsets every full-tensor read; the S/dS
-                # workspace stays chunk-local at origin.
-                # Stage 2 gets the FULL padded workspace and the REAL seq
-                # lengths; it computes the tail tile and masks it.
-                stage2(
-                    q,
-                    k,
-                    v,
-                    do,
-                    s_ws_full,
-                    ds_ws_full,
-                    lse,
-                    delta,
-                    seq_kv,
-                    desc_words,
-                    # The trailing 0 is N_THD_UNITS: the persistent grid's
-                    # cluster count, which only the THD path uses.
-                    (b, h, sqp, skvp, chunk, self.h_kv, sq, skv, 0),
-                    float(scale),
-                    float(scale_log2),
-                    float(scale),
-                    hb,
-                    0,
-                    stream,
-                )
-                # STAGE 3: consume the chunk workspace, write the full output's
-                # head slice. Every operand is a permuted view.
-                mm_lo.matmul_bh(
-                    s_ws.permute(3, 2, 1, 0),
-                    do[:, :, hs, :].permute(3, 1, 2, 0),
-                    dv_tgt[:, :, hs, :].permute(1, 3, 2, 0),
-                    n_head=chunk,
-                    n_batch=b,
-                    stream=stream,
-                    meta=seq_kv,
-                    desc_words=desc_words,
-                )
-                mm_lo.matmul_bh(
-                    ds_ws.permute(3, 2, 1, 0),
-                    q[:, :, hs, :].permute(3, 1, 2, 0),
-                    dk_tgt[:, :, hs, :].permute(1, 3, 2, 0),
-                    n_head=chunk,
-                    n_batch=b,
-                    stream=stream,
-                    meta=seq_kv,
-                    desc_words=desc_words,
-                )
-                # dQ = dS.K. Under GQA the K head is shared by `group` Q heads,
-                # so the GEMM runs once per group MEMBER: taking every `group`-th
-                # Q head lines A and the output up with the KV heads exactly, and
-                # every operand stays a strided view (no expand, no copy).
-                kv_lo, kv_n = hb // self._gqa_group, chunk // self._gqa_group
-                kvs = slice(kv_lo, kv_lo + kv_n)
-                for gi in range(self._gqa_group):
-                    a_g = ds_ws[:, gi :: self._gqa_group] if gqa else ds_ws
-                    o_g = dq[:, :, hs, :][:, :, gi :: self._gqa_group, :] if gqa else dq[:, :, hs, :]
-                    mm_hi.matmul_bh(
-                        a_g.permute(2, 3, 1, 0),
-                        k[:, :, kvs, :].permute(3, 1, 2, 0),
-                        o_g.permute(1, 3, 2, 0),
-                        n_head=kv_n,
-                        n_batch=b,
-                        stream=stream,
-                        meta=seq_kv,
-                        desc_words=desc_words,
-                    )
-
-            if gqa:
-                # Fold the Q-head partials onto the KV heads. Reused verbatim
-                # from the SM120 chain: arch-neutral, one thread per 16 B output
-                # vector, fixed-order fp32 accumulation (so it is deterministic).
-                from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dkv_reduce_host
-
-                io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
-                if self._reduce_fn is None:
-                    self._reduce_fn = cutlass.cute.compile(
-                        dkv_reduce_host,
-                        _t(dk_part),
-                        _t(dv_part),
-                        _t(dk),
-                        _t(dv),
-                        d,
-                        d,
-                        self._gqa_group,
-                        io_dt,
-                        False,
-                        make_fake_stream(use_tvm_ffi_env_stream=False),
-                        options="--enable-tvm-ffi",
-                    )
-                self._reduce_fn(_t(dk_part), _t(dv_part), _t(dk), _t(dv), stream)
-
-            for back in (dq_back, dk_back, dv_back):
-                if back is not None:
-                    staged, dest = back
-                    dest.copy_(staged)
+        return execute_staged(
+            self,
+            (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens),
+            workspace,
+            current_stream,
+            scale_softmax,
+        )

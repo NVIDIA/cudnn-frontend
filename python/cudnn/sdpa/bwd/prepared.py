@@ -70,7 +70,7 @@ def _same_geometry(actual, expected):
     return tuple((n, st) for n, st in zip(*actual) if n != 1) == tuple((n, st) for n, st in zip(*expected) if n != 1)
 
 
-def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
+def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
     if not workspace_ptr or workspace_ptr % 16:
         raise ValueError(f"{spec.name} needs an aligned caller workspace")
@@ -131,6 +131,11 @@ def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None
                     form |= 1 << bit
         frame.append(form)
     frame.append(stream_int)
+    return frame
+
+
+def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
+    frame = bind(spec, facts, workspace_ptr, stream_int, scale=scale, geometry=geometry, raw_storage=raw_storage)
     spec.fn(*frame)
 
 
