@@ -505,9 +505,10 @@ class BlockScaleSpec:
     while Rubin additionally provides a native-packed K64 form. E5M3 scales
     require SM 10.7+.
 
-    SF tensors are runtime-positional (not ``TensorRef``s), fully described here
-    by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
-    at runtime in the ``F8_128x4`` swizzled layout (128-row × 4-K blocked)."""
+    SF tensors are runtime-positional (not ``TensorRef``s). F8_128x4 inputs are
+    packed byte blobs; MoE GATHER instead requires linear token SF with explicit
+    source-token dimensions and strides. Weight SF retains F8_128x4. GATHER's
+    producer packs the linear rows into the same 128-row × 4-K MMA atoms."""
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
@@ -522,6 +523,10 @@ class BlockScaleSpec:
     # SF reorder layout per side (cuDNN name, e.g. "F8_128x4"; None = NONE).
     sfa_reorder: "str | None" = None
     sfb_reorder: "str | None" = None
+    sfa_dim: tuple[int, ...] | None = None
+    sfa_stride: tuple[int, ...] | None = None
+    sfb_dim: tuple[int, ...] | None = None
+    sfb_stride: tuple[int, ...] | None = None
     # Each dequant op's compute + output dtype (dequant OUTPUT = the MMA's input
     # type for that operand). None for a non-dequantized side. Recorded for the
     # compile-stage check (cuDNN requires dequant math precision = FLOAT).
@@ -623,23 +628,29 @@ class MoeSpec:
     MatmulSpec dims: M=total tokens, K=hidden, N=weight; a_batch=1,
     b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
     (grouped persistent scheduler + per-group A TMA descriptor replacement).
-    POC scope: ``mode == "none"`` only (gather/scatter rejected)."""
+    In ``gather`` mode, M counts routed rows and ``token_index`` maps each
+    routed row to a source token. In ``scatter`` mode, the input stays grouped
+    and output row is ``token_index[row] * top_k + token_ks[row]``.
+    Template capabilities gate execution."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
-    mode: str = "none"  # "none" only in the POC
+    mode: str = "none"
     # first_token_offset dtype (INT32 or INT64; cuDNN accepts both). Baked at JIT
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
     offset_multiple: int = 1
+    top_k: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
             object.__setattr__(self, "num_groups", self.num_experts)
-        if self.mode != "none":
-            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
+        if self.mode not in ("none", "gather", "scatter"):
+            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported")
+        if self.top_k < 1:
+            raise ValueError("MoE top_k must be positive")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:
@@ -1037,6 +1048,10 @@ def swap_ab(chain: FusionChain) -> FusionChain:
             sf_dtype_b=block_scale.sf_dtype_a,
             sfa_reorder=block_scale.sfb_reorder,
             sfb_reorder=block_scale.sfa_reorder,
+            sfa_dim=_mn(block_scale.sfb_dim),
+            sfa_stride=_mn(block_scale.sfb_stride),
+            sfb_dim=_mn(block_scale.sfa_dim),
+            sfb_stride=_mn(block_scale.sfa_stride),
             dequant_compute_a=block_scale.dequant_compute_b,
             dequant_compute_b=block_scale.dequant_compute_a,
             dequant_out_a=block_scale.dequant_out_b,

@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Fused dual MoE grouped matmul + SwiGLU: two grouped matmuls sharing token (A)
-and first_token_offset feed one pointwise epilogue DAG (multi-GEMM, 1/2ctamma)."""
+and first_token_offset feed one pointwise epilogue DAG on SM120."""
 
 from __future__ import annotations
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
 from gemm_test_utils import (
-    requires_sm100,
+    requires_sm120,
     Plan as _plan,
     vp_mg as _vp_mg,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
@@ -24,10 +23,166 @@ from cudnn.gemm.frost.tile_config import by_name
 pytestmark = pytest.mark.L0
 
 
-# (config name, cta_group): 1-CTA cluster1x1 + 2-CTA cluster2x1 (reference design)
+# (config name, cta_group). The sm120 catalog configs for the DUAL MoE grouped matmul
+# chain this module builds whose CTA tile fits the 256-row/column TMA box AND keep both
+# GEMMs' warp-MMA accumulators resident -- 2 x warp_tile_m x warp_tile_n / 32 fp32
+# registers <= 128 per lane, i.e. cta_tile_m * cta_tile_n <= 16384 with 8 compute warps.
+# The larger tiles (128x144 .. 128x256, 256x80 .. 256x256) are ALSO accepted by the
+# registry -- register spill is a perf trade-off, not a support gate; only SMEM rejects --
+# but they spill 2 x 128+ accumulator registers per lane, so this sweep leaves them to
+# _SPILLING_GEOMETRIES below. sm120 has no CTA pair, so cta_group is always 1 (Plan
+# ignores it for ConfigSm120).
 _GEOMETRIES = [
-    ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
-    ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+    # CTA tile 32x64
+    ("CONFIG_sm120_32x64x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x64x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4", 1),
+    # CTA tile 32x128
+    ("CONFIG_sm120_32x128x32_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x128x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x128x64_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x128x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps2x4", 1),
+    # CTA tile 32x192
+    ("CONFIG_sm120_32x192x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x192x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x192x128_16x16x32_cluster1x1_warps2x4", 1),
+    # CTA tile 32x256
+    ("CONFIG_sm120_32x256x32_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x256x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x256x64_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x256x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_32x256x128_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_32x256x128_16x16x32_cluster1x1_warps2x4", 1),
+    # CTA tile 64x32
+    ("CONFIG_sm120_64x32x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x32x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x32x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x64
+    ("CONFIG_sm120_64x64x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x64x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x96
+    ("CONFIG_sm120_64x96x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x96x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x96x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x128
+    ("CONFIG_sm120_64x128x32_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x128x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x128x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x128x64_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x128x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x128x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x160
+    ("CONFIG_sm120_64x160x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x160x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x160x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x192
+    ("CONFIG_sm120_64x192x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x192x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x192x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x192x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x192x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x192x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x224
+    ("CONFIG_sm120_64x224x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x224x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x224x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 64x256
+    ("CONFIG_sm120_64x256x32_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x256x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x256x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x256x64_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x256x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x256x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps4x2", 1),
+    # CTA tile 128x16
+    ("CONFIG_sm120_128x16x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x16x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x16x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x32
+    ("CONFIG_sm120_128x32x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x32x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x32x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x32x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x32x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x32x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x48
+    ("CONFIG_sm120_128x48x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x48x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x64
+    ("CONFIG_sm120_128x64x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x64x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x64x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x64x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x64x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x64x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x80
+    ("CONFIG_sm120_128x80x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x80x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x80x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x96
+    ("CONFIG_sm120_128x96x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x96x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x96x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x96x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x96x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x96x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x112
+    ("CONFIG_sm120_128x112x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x112x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x112x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 128x128
+    ("CONFIG_sm120_128x128x32_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_128x128x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x128x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x128x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps1x8", 1),
+    ("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 256x16
+    ("CONFIG_sm120_256x16x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x16x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x16x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 256x32
+    ("CONFIG_sm120_256x32x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x32x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x32x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x32x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x32x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x32x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 256x48
+    ("CONFIG_sm120_256x48x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x48x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x48x128_16x16x32_cluster1x1_warps8x1", 1),
+    # CTA tile 256x64
+    ("CONFIG_sm120_256x64x32_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_256x64x32_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x64x32_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x64x64_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_256x64x64_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x64x64_16x16x32_cluster1x1_warps8x1", 1),
+    ("CONFIG_sm120_256x64x128_16x16x32_cluster1x1_warps2x4", 1),
+    ("CONFIG_sm120_256x64x128_16x16x32_cluster1x1_warps4x2", 1),
+    ("CONFIG_sm120_256x64x128_16x16x32_cluster1x1_warps8x1", 1),
 ]
 
 
@@ -66,7 +221,7 @@ def _build_graph(
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[num_groups, 1, 1],
+        dim=[num_groups + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )
@@ -109,7 +264,7 @@ def _ref_f32(token, w0, w1, offsets, scale, S, N, num_experts, num_groups):
     starts = offsets.tolist()
     for gi in range(num_groups):
         b = starts[gi]
-        e = starts[gi + 1] if gi + 1 < num_groups else S
+        e = starts[gi + 1]
         if b == e:
             continue
         ex = gi % num_experts
@@ -127,6 +282,7 @@ def _ref(token, w0, w1, offsets, scale, S, N, num_experts, num_groups):
 # --- Analyzer (no GPU needed) ---
 
 
+@requires_sm120
 def test_analyzer_detects_dual_moe_grouped_matmul_fwd() -> None:
     chain = analyze(_build_graph(9, 2000, 248, 520, 36))
     assert chain.has_moe and chain.is_multi_gemm
@@ -139,6 +295,7 @@ def test_analyzer_detects_dual_moe_grouped_matmul_fwd() -> None:
     assert len(chain.outputs) == 1 and chain.outputs[0].source == "op_2"
 
 
+@requires_sm120
 def test_analyzer_detects_dual_moe_grouped_matmul_fwd_reduction() -> None:
     chain = analyze(
         _build_graph(
@@ -160,13 +317,13 @@ def test_analyzer_detects_dual_moe_grouped_matmul_fwd_reduction() -> None:
 # --- End-to-end correctness (GPU) ---
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_dual_moe_grouped_matmul_fwd_swiglu_exact_case(cfg_name, cta_group) -> None:
     """Spec case: S=2000, N=248, K=520, E=9, 36 routed groups (BxE > E)."""
     S, N, K, E = 2000, 248, 520, 9
     offset_values = _FULL_EXPERT_REDUCE_OFFSETS
-    num_groups = len(offset_values)
+    num_groups = len(offset_values) - 1
     cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K, num_groups), config=cfg, cta_group=cta_group)
 
@@ -188,7 +345,7 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_exact_case(cfg_name, cta_group) -> N
     )
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize(
     "group_sizes",
@@ -214,6 +371,7 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_groups(group_sizes, cfg_name, cta_gr
     for gs in group_sizes:
         starts.append(cur)
         cur += gs
+    starts.append(cur)
     offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
 
     compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
@@ -226,7 +384,7 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_groups(group_sizes, cfg_name, cta_gr
     )
 
 
-@requires_sm100
+@requires_sm120
 def test_dual_moe_grouped_matmul_fwd_swiglu_reduction_scalar() -> None:
     E, N, K = 4, 128, 128
     group_sizes = [64, 0, 120, 72]
@@ -258,6 +416,7 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_reduction_scalar() -> None:
     for gs in group_sizes:
         starts.append(cur)
         cur += gs
+    starts.append(cur)
     offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
 
     compiled(_vp_mg(compiled, [(token, w0), (token, w1)], [out, red], scale, fto=offsets))
@@ -289,7 +448,7 @@ def _build_geglu_graph(E, S, N, K, num_groups):
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
     w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
     w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[num_groups + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     bias0 = g.tensor(name="bias0", dim=[num_groups, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
     bias1 = g.tensor(name="bias1", dim=[num_groups, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
     cmax = g.tensor(name="cmax", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
@@ -316,7 +475,7 @@ def _geglu_ref(token, w0, w1, bias0, bias1, offsets, S, N, E, num_groups, cmax=7
     starts = offsets.tolist()
     for gi in range(num_groups):
         b = starts[gi]
-        e = starts[gi + 1] if gi + 1 < num_groups else S
+        e = starts[gi + 1]
         if b == e:
             continue
         ex = gi % E
@@ -327,6 +486,7 @@ def _geglu_ref(token, w0, w1, bias0, bias1, offsets, S, N, E, num_groups, cmax=7
     return out
 
 
+@requires_sm120
 def test_analyzer_detects_dual_moe_geglu() -> None:
     chain = analyze(_build_geglu_graph(9, 2000, 248, 520, 36))
     assert chain.has_moe and chain.is_multi_gemm and chain.num_gemms == 2
@@ -336,12 +496,12 @@ def test_analyzer_detects_dual_moe_geglu() -> None:
     assert [a.grouped_by_moe for a in chain.aux_tensors] == [True, True, False, False, False, False]
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_dual_moe_geglu(cfg_name, cta_group) -> None:
     S, N, K, E = 2000, 248, 520, 9
     offset_values = _FULL_EXPERT_REDUCE_OFFSETS
-    num_groups = len(offset_values)
+    num_groups = len(offset_values) - 1
     compiled = _plan(_build_geglu_graph(E, S, N, K, num_groups), config=by_name(cfg_name), cta_group=cta_group)
 
     torch.manual_seed(0)
@@ -364,15 +524,15 @@ def test_dual_moe_geglu(cfg_name, cta_group) -> None:
     torch.testing.assert_close(out[0].float(), ref.to(torch.bfloat16).float(), atol=8e-2, rtol=8e-2)
 
 
-@requires_sm100
+@requires_sm120
 def test_dual_moe_distinct_tokens_mixed_strides() -> None:
     """Two DISTINCT token (A) operands with DIFFERENT row strides: tokA compact,
     tokB a padded view (stride_m = K + pad). Exercises per-operand a_stride in
     the host descriptor build AND the per-group kernel descriptor patch."""
     S, N, K, E = 512, 128, 256, 4
     pad = 64
-    offset_values = (0, 128, 200, 384)
-    num_groups = len(offset_values)
+    offset_values = (0, 128, 200, 384, S)
+    num_groups = len(offset_values) - 1
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -382,13 +542,13 @@ def test_dual_moe_distinct_tokens_mixed_strides() -> None:
     tokB = g.tensor(name="tokB", dim=[1, S, K], stride=[S * (K + pad), K + pad, 1], data_type=cudnn.data_type.BFLOAT16)
     w0 = g.tensor(name="w0", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
     w1 = g.tensor(name="w1", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[num_groups + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     c0 = g.moe_grouped_matmul(tokA, w0, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
     c1 = g.moe_grouped_matmul(tokB, w1, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe1")
     y = g.mul(a=g.swish(input=c0, name="silu"), b=c1, name="mul")
     y.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = _plan(g, config=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1"), cta_group=2)
+    compiled = _plan(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), cta_group=1)
     assert compiled.chain.num_a_operands == 2
 
     torch.manual_seed(0)
@@ -407,9 +567,82 @@ def test_dual_moe_distinct_tokens_mixed_strides() -> None:
     ref = torch.zeros(S, N, dtype=torch.float32, device="cuda")
     starts = list(offset_values)
     for gi in range(num_groups):
-        b, e = starts[gi], (starts[gi + 1] if gi + 1 < num_groups else S)
+        b, e = starts[gi], starts[gi + 1]
         if b < e:
             ca = tokA_t[0, b:e].float() @ w0_t[gi % E].float().T
             cb = tokB_t[0, b:e].float() @ w1_t[gi % E].float().T
             ref[b:e] = torch.nn.functional.silu(ca) * cb
     torch.testing.assert_close(out[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+
+# --- Register pressure is a perf trade-off, not a support gate ---
+
+# Dual-GEMM configs whose accumulators no longer stay resident (2 x 128 fp32 registers
+# per lane): legal, they build and run with ptxas spills. Kept apart from _GEOMETRIES
+# (the resident sweep) so the spill cost is paid once per geometry.
+_SPILLING_GEOMETRIES = [
+    ("CONFIG_sm120_128x256x64_16x16x32_cluster1x1_warps2x4", 1),  # warp tile 64x64
+    ("CONFIG_sm120_256x128x64_16x16x32_cluster1x1_warps4x2", 1),  # warp tile 64x64
+]
+
+
+def _sm120_moe_template(chain, cfg):
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    return select_template(chain, cfg)
+
+
+@requires_sm120
+@pytest.mark.parametrize("cfg_name,cta_group", _SPILLING_GEOMETRIES)
+def test_dual_moe_spilling_config_is_accepted(cfg_name, cta_group) -> None:
+    """Register spill is not a hard stop for path validation (review on the SM120
+    multi-GEMM register budget): a dual-GEMM config whose accumulators exceed what
+    stays resident passes the funnel and the renderer's SMEM gate."""
+    chain = analyze(_build_graph(9, 2000, 248, 520, 36))
+    cfg = by_name(cfg_name)
+    assert chain.num_gemms * cfg.warp_tile_m * cfg.warp_tile_n // 32 > 128, "not a spilling geometry"
+    tmpl = _sm120_moe_template(chain, cfg)
+    assert tmpl.multi_gemm_reject(chain, cfg) is None
+    assert tmpl.accepts(chain, cfg) is None
+
+
+@requires_sm120
+def test_dual_moe_smem_overflow_is_still_rejected() -> None:
+    """The SMEM gate is a real support limit and stays: one stage of the A tile plus
+    both B tiles plus the epilogue staging must fit."""
+    chain = analyze(_build_graph(9, 2000, 248, 520, 36))
+    cfg = by_name("CONFIG_sm120_256x256x128_16x16x32_cluster1x1_warps2x4")
+    tmpl = _sm120_moe_template(chain, cfg)
+    stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
+    assert stages < 1
+    reason = tmpl.multi_gemm_reject(chain, cfg)
+    assert reason is not None and "SMEM" in reason
+    assert tmpl.accepts(chain, cfg) is not None
+
+
+@requires_sm120
+@pytest.mark.parametrize("cfg_name,cta_group", _SPILLING_GEOMETRIES)
+def test_dual_moe_grouped_matmul_fwd_swiglu_spilling_config_runs(cfg_name, cta_group) -> None:
+    """A spilling dual-GEMM config computes the same function (slower, never wrong)."""
+    S, N, K, E = 2000, 248, 520, 9
+    offset_values = _FULL_EXPERT_REDUCE_OFFSETS
+    num_groups = len(offset_values) - 1
+    cfg = by_name(cfg_name)
+    compiled = _plan(_build_graph(E, S, N, K, num_groups), config=cfg, cta_group=cta_group)
+
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    w0 = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    w1 = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    scale = torch.tensor([[[0.5]]], dtype=torch.float32, device="cuda")
+    out = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
+    offsets = torch.tensor(offset_values, dtype=torch.int32, device="cuda")
+
+    compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out[0],
+        _ref(token, w0, w1, offsets, scale, S, N, E, num_groups),
+        atol=5e-2,
+        rtol=5e-2,
+    )

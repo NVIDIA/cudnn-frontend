@@ -12,7 +12,6 @@ covering nvfp4 / mxfp4 / mxfp8, checked vs a torch dequant + group-loop referenc
 from __future__ import annotations
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
@@ -125,7 +124,7 @@ def _build_graph(
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[num_groups, 1, 1],
+        dim=[num_groups + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=offset_dt,
     )
@@ -198,7 +197,7 @@ def test_one_packed_token_carries_one_dequant() -> None:
     a_dt, sf_dt = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
-    fto = g.tensor(name="fto", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     sfa = [g.tensor(name=f"SFA{i}", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, **rk) for i in range(2)]
     outs = []
     for i in range(2):
@@ -275,12 +274,12 @@ def _mk_sf(combo, shape, dev):
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_group) -> None:
-    """Spec case: S=1024, N=256, K=512, E=2, 4 groups (offsets [0,256,384,512])."""
+    """Spec case: S=1024, N=256, K=512, E=2, 4 groups (offsets [0,256,384,512,1024])."""
     dev = "cuda"
     torch.manual_seed(0)
     E, S, N, K = 2, 1024, 256, 512
-    offsets_list = [0, 256, 384, 512]
-    num_groups = len(offsets_list)
+    offsets_list = [0, 256, 384, 512, S]
+    num_groups = len(offsets_list) - 1
     block_size = _COMBOS[combo][0]
     sf_k = K // block_size
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -301,7 +300,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
     assert (_bs.sf_dtype, _bs.block_size) == (_DTYPE_FROM_CUDNN[_sf_dt], _blk)
 
     # SFA padded to 128 rows PER GROUP, then concatenated; SFB per-expert.
-    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]
     sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
@@ -328,7 +327,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
     ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         if b == e:
             continue
         ex = gi % E
@@ -347,8 +346,8 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_quant_epilogue(combo, cf
     dev = "cuda"
     torch.manual_seed(0)
     E, S, N, K = 2, 1024, 256, 512
-    offsets_list = [0, 256, 384, 512]
-    num_groups = len(offsets_list)
+    offsets_list = [0, 256, 384, 512, S]
+    num_groups = len(offsets_list) - 1
     block_size = _COMBOS[combo][0]
     qblock = 32
     sf_k = K // block_size
@@ -371,7 +370,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_quant_epilogue(combo, cf
     )
     assert compiled.chain.quants
 
-    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]
     sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
@@ -399,7 +398,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_quant_epilogue(combo, cf
     ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         if b == e:
             continue
         ex = gi % E
@@ -419,8 +418,8 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_reduction_scalar() -> No
     torch.manual_seed(0)
     E, S, N, K = 2, 512, 128, 512
     combo = "nvfp4"
-    offsets_list = [0, 100, 300]
-    num_groups = len(offsets_list)
+    offsets_list = [0, 100, 300, S, S]
+    num_groups = len(offsets_list) - 1
     block_size = _COMBOS[combo][0]
     sf_k = K // block_size
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -450,7 +449,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_reduction_scalar() -> No
         cta_group=_GEOMETRIES[1][1],
     )
 
-    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]
     sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
@@ -478,7 +477,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_reduction_scalar() -> No
     ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         if b == e:
             continue
         ex = gi % E

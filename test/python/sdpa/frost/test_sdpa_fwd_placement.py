@@ -130,3 +130,37 @@ def test_short_query_placement_respects_configured_domain(monkeypatch, d, s_q, m
     monkeypatch.setattr(placement, "SHORT_QUERY_MIN_KV_TOKENS", min_kv, raising=False)
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
     assert placement.place(spec, _facts(d_qk=d, d_v=d, s_q=s_q, s_kv=min_kv - 1)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "outside",
+    [
+        None,
+        {"has_paged_kv": False},
+        {"wants_stats": True},
+        {"dtype": cudnn.data_type.HALF},
+        {"d_qk": 192},
+        {"s_q": 63},
+        {"s_kv": 257},
+        {"b": 3},
+        {"device_cc": (10, 3)},
+        {"page_size": 16},
+        {"h_q": 8},
+        {"bottom_right": False},
+        {"window_left": 128},
+    ],
+)
+def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, outside):
+    """Synthetic shard bounds check isolation, not measured workload winners."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_HEADS", frozenset({(6, 2)}), raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_PAGE_SIZES", frozenset({32}), raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MIN_Q", 64, raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MAX_KV", 256, raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MAX_BATCH", 2, raising=False)
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    values = dict(h_q=6, h_kv=2, s_q=128, s_kv=256, d_qk=256, d_v=256, has_paged_kv=True, thd=True, page_size=32)
+    values.update(outside or {})
+    assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)

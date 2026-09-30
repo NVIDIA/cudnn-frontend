@@ -372,6 +372,24 @@ class SlidingWindowAttention(APIBase):
         self._cudnn_swa_graph.check_support()
         self._cudnn_swa_graph.build_plans()
 
+        tensors = [self.q_cudnn, self.k_cudnn, self.v_cudnn, self.o_cudnn]
+        if self.input_layout == "thd":
+            tensors.extend(
+                (
+                    self.seq_len_q_cudnn,
+                    self.seq_len_kv_cudnn,
+                    self.q_ragged_offset_cudnn,
+                    self.k_ragged_offset_cudnn,
+                    self.v_ragged_offset_cudnn,
+                    self.o_ragged_offset_cudnn,
+                )
+            )
+        if not self.is_infer:
+            tensors.append(self.stats_cudnn)
+            if self.input_layout == "thd":
+                tensors.append(self.stats_ragged_offset_cudnn)
+        self._tensor_uids = tuple(tensor.get_uid() for tensor in tensors)
+
         self._cudnn_compiled = True
         self._logger.debug("SlidingWindowAttention kernel compiled successfully")
 
@@ -459,21 +477,22 @@ class SlidingWindowAttention(APIBase):
                         self.sample_stats,
                     )
 
-        variant_pack = {
-            self.q_cudnn: q_tensor,
-            self.k_cudnn: k_tensor,
-            self.v_cudnn: v_tensor,
-            self.o_cudnn: o_tensor,
-            self.seq_len_q_cudnn: seq_len_q_tensor,
-            self.seq_len_kv_cudnn: seq_len_kv_tensor,
-            self.q_ragged_offset_cudnn: q_ragged_offset_tensor,
-            self.k_ragged_offset_cudnn: k_ragged_offset_tensor,
-            self.v_ragged_offset_cudnn: v_ragged_offset_tensor,
-            self.o_ragged_offset_cudnn: o_ragged_offset_tensor,
-        }
+        buffers = [q_tensor, k_tensor, v_tensor, o_tensor]
+        if self.input_layout == "thd":
+            buffers.extend(
+                (
+                    seq_len_q_tensor,
+                    seq_len_kv_tensor,
+                    q_ragged_offset_tensor,
+                    k_ragged_offset_tensor,
+                    v_ragged_offset_tensor,
+                    o_ragged_offset_tensor,
+                )
+            )
         if not self.is_infer:
-            variant_pack[self.stats_cudnn] = stats_tensor
-            variant_pack[self.stats_ragged_offset_cudnn] = stats_ragged_offset_tensor
+            buffers.append(stats_tensor)
+            if self.input_layout == "thd":
+                buffers.append(stats_ragged_offset_tensor)
 
         # Scratch is allocated on the handle's stream (R1): the graph runs there, and the caching
         # allocator only orders a block's reuse against the stream it was allocated on.
@@ -483,7 +502,7 @@ class SlidingWindowAttention(APIBase):
                 device=q_tensor.device,
                 dtype=torch.uint8,
             )
-        self._cudnn_swa_graph.execute(variant_pack, workspace, handle=cudnn_handle)
+        self._cudnn_swa_graph.execute(buffers, workspace, handle=cudnn_handle, tensor_uids=self._tensor_uids)
         self._logger.debug("Executed successfully")
 
     def __call__(self, *args, **kwargs) -> None:

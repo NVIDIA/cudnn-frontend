@@ -16,7 +16,7 @@ import textwrap
 import pytest
 
 import cudnn.gemm.frost
-from cudnn.gemm.frost.arch_family import template_dir, template_files
+from cudnn.gemm.frost.arch_family import template_files
 from cudnn.gemm.frost.kernel_registry import template_path
 
 pytestmark = pytest.mark.L0
@@ -286,7 +286,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
     """A pinned width of one is the identity raster.  Keep the general
     divide/modulo mapping out of every hot path in that specialization."""
 
-    helper_tree = ast.parse((template_dir("sm100") / "_tile_helpers.py").read_text())
+    helper_tree = ast.parse((pathlib.Path(cudnn.gemm.frost.__file__).parent / "tile_helpers.py").read_text())
     helper = next(node for node in helper_tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "l2_swizzle_tile")
     assert helper.args.args[-1].arg == "identity"
     assert len(helper.args.defaults) >= 1 and isinstance(helper.args.defaults[-1], ast.Constant) and helper.args.defaults[-1].value is False
@@ -303,7 +303,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
         tree = ast.parse(src)
         calls = [node for node in ast.walk(tree) if _call_endswith(node, "_l2_swizzle_tile")]
         if path.name in _STANDALONE:
-            continue  # its own in-file raster; no mixed CGA to specialize for
+            continue  # no mixed CGA to specialize for
         if path.name not in _MIXED_CGA:
             if calls:
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
@@ -686,6 +686,14 @@ def test_moe_swap_ab_preserves_mma_and_producer_barriers(stem):
     def pipeline(file):
         tree = ast.parse(template_path(file).read_text())
         kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_kernel")
+        # The gathered token SF is A normally and B after swapAB. Normalize
+        # only that role in SF barrier arrival counts; keep MMA roles literal.
+        token_sf_count = "num_sfb_operands" if file.endswith("_swap_ab.py") else "num_sfa_operands"
+        for call in ast.walk(kernel):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) == "nvvm.mbarrier_init" and ast.unparse(call.args[0]) == "sf_full_mbar_ptr.subview(i)":
+                for name in ast.walk(call.args[1]):
+                    if isinstance(name, ast.Name) and name.id == token_sf_count:
+                        name.id = "num_token_sf_operands"
         warp_regions = [
             ast.dump(node, include_attributes=False)
             for node in kernel.body

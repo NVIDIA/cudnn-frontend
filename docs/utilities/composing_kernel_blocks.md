@@ -122,5 +122,5 @@ lives on that pipeline's spec, so it is unrepresentable on the others instead of
   match=...)`), never skips;
 - a **stream-ordering** test on a side stream with the default stream parked.
 
-Module basenames under `test/python/fe_api/<pkg>/` must be unique across the test tree (pytest's default import
+Module basenames under `test/python/<operation>/<backend>/` must be unique across the test tree (pytest's default import
 mode has no packages there), so name the oracle `<pkg>_reference.py` and the tests `test_<pkg>_*.py`.

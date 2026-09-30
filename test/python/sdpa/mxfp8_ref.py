@@ -18,7 +18,7 @@ def _dequant(x_fp8, sf_ref):
 
 
 def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, torch_itype=torch.float8_e4m3fn, output_type=torch.bfloat16,
-                left_bound=None, right_bound=None, diag_align=None, sink_token=None, rescale_threshold=4.0):
+                left_bound=None, right_bound=None, diag_align=None, sink_token=None, rescale_threshold=4.0, padding=None):
     """
     Compute reference SDPA with MXFP8 dequantization.
     Takes FP8 inputs and converts to FP32 to match cuDNN behavior.
@@ -39,7 +39,7 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
     k_dq = _dequant(k_fp8, sf_k_ref)
     v_dq = _dequant(v_fp8, sf_v_ref)
 
-    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=None, block_mask=None, is_alibi=False, padding=None,
+    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=None, block_mask=None, is_alibi=False, padding=padding,
                       diag_align=diag_align, left_bound=left_bound, right_bound=right_bound, device=device)
 
     m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token.float().reshape(1, h_q, 1, 1) if sink_token is not None else None, device)
