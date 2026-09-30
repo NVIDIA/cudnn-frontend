@@ -2362,7 +2362,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
+        if (
+            (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False))
+            if compiled
+            else (self._can_prepare_fp8() or self._can_prepare_mxfp8())
+        ):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
             # [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
@@ -3712,7 +3716,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if self._prepared_fp8 if compiled else self._can_prepare_fp8():
+        if getattr(self, "_prepared_fp8", False) if compiled else self._can_prepare_fp8():
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].
