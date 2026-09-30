@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""JAX custom-call entry points for the SM100 ratio-4 CSA compressor."""
+"""JAX custom-call entry points for the SM100 CSA (ratio 4) and HCA (ratio 128) compressors."""
 
 from __future__ import annotations
 
@@ -22,6 +22,17 @@ from .compressor_sm100 import (
     _compressor_fwd_kernel,
     _fwd_schedule,
 )
+from .compressor_sm100_r128 import (
+    _bwd_schedule_r128,
+    _compressor_bwd_r128_kernel,
+    _compressor_fwd_r128_kernel,
+    _fwd_schedule_r128,
+    bwd_rows_per_cta_for_sm_count_r128,
+)
+
+# SM count assumed when the JAX device does not report one; only affects the
+# ratio-128 backward rows-per-CTA choice (performance, not correctness).
+_DEFAULT_SM_COUNT = 148
 
 
 @cute.jit
@@ -50,14 +61,9 @@ def _compressor_fwd_adapter(stream, kv, score, ape, cu, cu_comp, out, *, ratio, 
 
 
 @cute.jit
-def _compressor_bwd_adapter(
-    stream, kv, score, ape, cu, cu_comp, grad_out, grad_kv, grad_score, grad_ape, *, ratio, head_dim, coff
-):
+def _compressor_bwd_adapter(stream, kv, score, ape, cu, cu_comp, grad_out, grad_kv, grad_score, grad_ape, *, ratio, head_dim, coff):
     flat = cute.make_layout(_EXT)
-    tensors = [
-        cute.make_tensor(x.iterator, flat)
-        for x in (kv, score, ape, cu, cu_comp, grad_out, grad_kv, grad_score, grad_ape)
-    ]
+    tensors = [cute.make_tensor(x.iterator, flat) for x in (kv, score, ape, cu, cu_comp, grad_out, grad_kv, grad_score, grad_ape)]
     nb_total = cute.size(grad_out.shape[0])
     n_seq = cute.size(cu.shape[0]) - 1
     total_tokens = cute.size(kv.shape[0])
@@ -78,9 +84,98 @@ def _compressor_bwd_adapter(
     )
 
 
+@cute.jit
+def _compressor_fwd_r128_adapter(stream, kv, score, ape, cu, cu_comp, out, *, ratio, head_dim, coff, vec, tchunks, threads_x, twophase, fastexp):
+    flat = cute.make_layout(_EXT)
+    tensors = [cute.make_tensor(x.iterator, flat) for x in (kv, score, ape, cu, cu_comp, out)]
+    nb_total = cute.size(out.shape[0])
+    n_seq = cute.size(cu.shape[0]) - 1
+    ncol = head_dim // vec
+    _compressor_fwd_r128_kernel(
+        *tensors,
+        cutlass.Int32(n_seq),
+        ratio,
+        head_dim,
+        coff,
+        vec,
+        tchunks,
+        threads_x,
+        twophase,
+        fastexp,
+    ).launch(
+        grid=(nb_total, (ncol + threads_x - 1) // threads_x, 1),
+        block=(threads_x, tchunks, 1),
+        stream=stream,
+    )
+
+
+@cute.jit
+def _compressor_bwd_r128_adapter(
+    stream,
+    kv,
+    score,
+    ape,
+    cu,
+    cu_comp,
+    grad_out,
+    grad_kv,
+    grad_score,
+    grad_ape,
+    *,
+    ratio,
+    head_dim,
+    coff,
+    vec,
+    tchunks,
+    threads_x,
+    fastexp,
+    goreuse,
+    rows_per_cta,
+):
+    flat = cute.make_layout(_EXT)
+    tensors = [cute.make_tensor(x.iterator, flat) for x in (kv, score, ape, cu, cu_comp, grad_out, grad_kv, grad_score, grad_ape)]
+    nb_total = cute.size(grad_out.shape[0])
+    n_seq = cute.size(cu.shape[0]) - 1
+    total_tokens = cute.size(kv.shape[0])
+    ncol = head_dim // vec
+    _compressor_bwd_r128_kernel(
+        *tensors,
+        cutlass.Int32(nb_total),
+        cutlass.Int32(n_seq),
+        cutlass.Int32(total_tokens),
+        cutlass.Int32(rows_per_cta),
+        ratio,
+        head_dim,
+        coff,
+        vec,
+        tchunks,
+        threads_x,
+        fastexp,
+        goreuse,
+    ).launch(
+        grid=((nb_total + rows_per_cta - 1) // rows_per_cta, (ncol + threads_x - 1) // threads_x, 1),
+        block=(threads_x, tchunks, 1),
+        stream=stream,
+    )
+
+
+def _sm_count() -> int:
+    try:
+        device = jax.local_devices(backend="gpu")[0]
+    except RuntimeError:
+        return _DEFAULT_SM_COUNT
+    return int(getattr(device, "core_count", None) or _DEFAULT_SM_COUNT)
+
+
 def _validate(kv: Any, score: Any, ape: Any, cu: Any, cu_comp: Any, ratio: int, coff: int) -> int:
-    if ratio != 4 or coff != 2:
-        raise ValueError("The JAX CSA compressor currently supports ratio=4 and coff=2 only")
+    if ratio == 4:
+        if coff != 2:
+            raise ValueError("The JAX CSA compressor supports coff=2 at ratio=4")
+    elif ratio == 128:
+        if coff not in (1, 2):
+            raise ValueError(f"The JAX HCA compressor supports coff in {{1, 2}} at ratio=128, got coff={coff}")
+    else:
+        raise ValueError(f"The JAX compressor supports ratio in {{4, 128}}, got ratio={ratio}")
     if kv.ndim != 2 or score.shape != kv.shape:
         raise ValueError(f"kv and score must have the same 2-D shape, got {kv.shape} and {score.shape}")
     if kv.dtype != jnp.bfloat16 or score.dtype != jnp.bfloat16:
@@ -93,6 +188,8 @@ def _validate(kv: Any, score: Any, ape: Any, cu: Any, cu_comp: Any, ratio: int, 
         raise ValueError(f"ape must have shape {(ratio, width)} and dtype float32")
     if cu.ndim != 1 or cu_comp.shape != cu.shape or cu.dtype != jnp.int32 or cu_comp.dtype != jnp.int32:
         raise ValueError("cu_seqlens and cu_seqlens_comp must be matching 1-D int32 arrays")
+    if ratio == 128 and head_dim not in (128, 512):
+        raise ValueError(f"The JAX HCA compressor is validated for head_dim in {{128, 512}}, got {head_dim}")
     return head_dim
 
 
@@ -107,13 +204,34 @@ def csa_compressor_forward_jax_sm100(
     ratio: int = 4,
     coff: int = 2,
 ) -> Any:
-    """Run ratio-4 overlapping CSA pooling on JAX arrays."""
+    """Run compressor pooling on JAX arrays.
+
+    ``ratio=4`` is the overlapping CSA compressor (``coff=2``); ``ratio=128`` is the
+    HCA compressor (``coff=1`` non-overlapping, or ``coff=2`` overlapping).
+    """
     head_dim = _validate(kv, score, ape, cu_seqlens, cu_seqlens_comp, ratio, coff)
     if total_comp < 0:
         raise ValueError(f"total_comp must be non-negative, got {total_comp}")
+    out_shape = jax.ShapeDtypeStruct((total_comp, head_dim), jnp.bfloat16)
+    if total_comp == 0:
+        return jnp.zeros(out_shape.shape, out_shape.dtype)
+    if ratio == 128:
+        vec, tchunks, threads_x, twophase, fastexp = _fwd_schedule_r128(ratio, head_dim, coff, total_comp)
+        return call(
+            _compressor_fwd_r128_adapter,
+            output_shape_dtype=out_shape,
+            ratio=ratio,
+            head_dim=head_dim,
+            coff=coff,
+            vec=vec,
+            tchunks=tchunks,
+            threads_x=threads_x,
+            twophase=bool(twophase),
+            fastexp=bool(fastexp),
+        )(kv, score, ape, cu_seqlens, cu_seqlens_comp)
     return call(
         _compressor_fwd_adapter,
-        output_shape_dtype=jax.ShapeDtypeStruct((total_comp, head_dim), jnp.bfloat16),
+        output_shape_dtype=out_shape,
         ratio=ratio,
         head_dim=head_dim,
         coff=coff,
@@ -131,7 +249,7 @@ def csa_compressor_backward_jax_sm100(
     ratio: int = 4,
     coff: int = 2,
 ) -> tuple[Any, Any, Any]:
-    """Run the explicit ratio-4 CSA compressor backward custom call."""
+    """Run the explicit compressor backward custom call (ratio 4 or 128)."""
     head_dim = _validate(kv, score, ape, cu_seqlens, cu_seqlens_comp, ratio, coff)
     if grad_out.ndim != 2 or grad_out.shape[1] != head_dim or grad_out.dtype != jnp.bfloat16:
         raise ValueError(f"grad_out must be (total_comp, {head_dim}) bfloat16")
@@ -140,6 +258,27 @@ def csa_compressor_backward_jax_sm100(
         jax.ShapeDtypeStruct(score.shape, jnp.bfloat16),
         jax.ShapeDtypeStruct(ape.shape, jnp.float32),
     )
+    nb_total = grad_out.shape[0]
+    if nb_total == 0:
+        return tuple(jnp.zeros(s.shape, s.dtype) for s in shapes)
+    if ratio == 128:
+        vec, tchunks, threads_x, fastexp, goreuse = _bwd_schedule_r128(ratio, head_dim, coff, nb_total)
+        rows_per_cta = bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, head_dim, coff, _sm_count())
+        return call(
+            _compressor_bwd_r128_adapter,
+            output_shape_dtype=shapes,
+            # grad_kv / grad_score are fully written; grad_ape is accumulated.
+            initialized_outputs={2: zeros_init},
+            ratio=ratio,
+            head_dim=head_dim,
+            coff=coff,
+            vec=vec,
+            tchunks=tchunks,
+            threads_x=threads_x,
+            fastexp=bool(fastexp),
+            goreuse=bool(goreuse),
+            rows_per_cta=rows_per_cta,
+        )(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out)
     return call(
         _compressor_bwd_adapter,
         output_shape_dtype=shapes,

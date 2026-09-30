@@ -88,7 +88,10 @@ from cudnn._cutlass_compat import SmemAllocator
 
 import threading
 
-import torch
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
 
 import cutlass
@@ -1154,10 +1157,15 @@ def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
     ~101 KB smem), 3 for coff=1 T=8, 4 for the coff=1 T=4 (d >= 512) schedule.
     Capped at 16 (beyond one wave per SM the pipeline depth stops paying).
     """
+    return bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, _sm_count(dev))
+
+
+def bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, sm_count):
+    """Framework-neutral form of :func:`_bwd_rows_per_cta` for a known SM count."""
     vec, tchunks, threads_x = _bwd_schedule_r128(ratio, d, coff, nb_total)[:3]
     gy = (d // vec + threads_x - 1) // threads_x
     ctas_per_sm = 2 if coff == 2 else (4 if tchunks <= 4 else 3)
-    slots = ctas_per_sm * _sm_count(dev)
+    slots = ctas_per_sm * sm_count
     return max(1, min(16, -((nb_total * gy) // -slots)))
 
 

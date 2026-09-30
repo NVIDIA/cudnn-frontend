@@ -27,9 +27,18 @@ _sparse_bwd_kernels: dict[tuple, Any] = {}
 @cute.jit
 def _indexer_adapter(stream, q, k, weights, scores, denom, *, kernel, sm_scale, seqlen_q, seqlen_k):
     kernel(
-        q, k, weights, scores, denom,
-        cutlass.Float32(sm_scale), cutlass.Int32(seqlen_q), cutlass.Int32(seqlen_k),
-        None, None, None, stream,
+        q,
+        k,
+        weights,
+        scores,
+        denom,
+        cutlass.Float32(sm_scale),
+        cutlass.Int32(seqlen_q),
+        cutlass.Int32(seqlen_k),
+        None,
+        None,
+        None,
+        stream,
     )
 
 
@@ -54,9 +63,16 @@ def indexer_forward_jax_sm100(q: Any, k: Any, weights: Any, *, ratio: int = 4, s
     kernel = _indexer_kernels.get(key)
     if kernel is None:
         kernel = IndexerScoreUnifiedSm100(
-            head_dim=head_dim, qhead_per_kvhead=heads, m_block_size=128,
-            n_block_size=128, k_block_size=64, kv_stage=4, ratio=ratio,
-            is_varlen=False, compute_lse=False, is_compressed_logits=False,
+            head_dim=head_dim,
+            qhead_per_kvhead=heads,
+            m_block_size=128,
+            n_block_size=128,
+            k_block_size=64,
+            kv_stage=4,
+            ratio=ratio,
+            is_varlen=False,
+            compute_lse=False,
+            is_compressed_logits=False,
         )
         _indexer_kernels[key] = kernel
 
@@ -67,18 +83,28 @@ def indexer_forward_jax_sm100(q: Any, k: Any, weights: Any, *, ratio: int = 4, s
             jax.ShapeDtypeStruct((batch, seqlen_q), jnp.float32),
         ),
         initialized_outputs={0: neg_inf_init, 1: zeros_init},
-        kernel=kernel, sm_scale=float(sm_scale), seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+        kernel=kernel,
+        sm_scale=float(sm_scale),
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
     )(q, k, weights)
     return scores
 
 
 @cute.jit
-def _sparse_fwd_adapter(
-    stream, q, kv, indices, topk_length, attn_sink, out, max_logits, lse, lse_indexer, *, kernel, softmax_scale
-):
+def _sparse_fwd_adapter(stream, q, kv, indices, topk_length, attn_sink, out, max_logits, lse, lse_indexer, *, kernel, softmax_scale):
     kernel(
-        q, kv, indices, out, max_logits, lse, lse_indexer, attn_sink, topk_length,
-        cutlass.Float32(softmax_scale), stream,
+        q,
+        kv,
+        indices,
+        out,
+        max_logits,
+        lse,
+        lse_indexer,
+        attn_sink,
+        topk_length,
+        cutlass.Float32(softmax_scale),
+        stream,
     )
 
 
@@ -105,8 +131,10 @@ def sparse_attention_forward_jax_sm100(
         raise ValueError("topk_length must be (Tq,) int32")
     if attn_sink.shape != (64,) or attn_sink.dtype != jnp.float32:
         raise ValueError("attn_sink must be (64,) float32")
-    if indexer_topk not in (512, 1024, 2048) or indexer_topk > topk_indices.shape[1]:
-        raise ValueError("indexer_topk must be a supported prefix no wider than K")
+    # indexer_topk=0 disables the indexer-prefix LSE (e.g. HCA, whose index list is
+    # a fixed local window plus causal compressed blocks); lse_indexer is then zeros.
+    if indexer_topk not in (0, 512, 1024, 2048) or indexer_topk > topk_indices.shape[1]:
+        raise ValueError("indexer_topk must be 0 or a supported prefix no wider than K")
 
     kernel_key = (512, int(indexer_topk))
     kernel = _sparse_fwd_kernels.get(kernel_key)
@@ -123,7 +151,9 @@ def sparse_attention_forward_jax_sm100(
             jax.ShapeDtypeStruct((tq, 64), jnp.float32),
             jax.ShapeDtypeStruct((tq, 64), jnp.float32),
         ),
-        kernel=kernel, softmax_scale=scale,
+        initialized_outputs={3: zeros_init} if indexer_topk == 0 else None,
+        kernel=kernel,
+        softmax_scale=scale,
     )(q, kv, topk_indices, topk_length, attn_sink)
 
 
@@ -156,9 +186,22 @@ def _sparse_bwd_adapter(
         (cutlass.Int32(64), cutlass.Int32(1)),
     )
     kernel(
-        problem_shape, q, kv, out, dout, lse, attn_sink, indices, topk_length,
-        dq, dkv, dsink, workspace_lse_odo, workspace_dkv,
-        cutlass.Float32(softmax_scale), stream,
+        problem_shape,
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        indices,
+        topk_length,
+        dq,
+        dkv,
+        dsink,
+        workspace_lse_odo,
+        workspace_dkv,
+        cutlass.Float32(softmax_scale),
+        stream,
     )
 
 
@@ -195,16 +238,15 @@ def sparse_attention_backward_jax_sm100(
     kernel = _sparse_bwd_kernels.get(key)
     if kernel is None:
         kernel = FlashAttentionDSABackwardSm100(
-            element_dtype=cutlass.BFloat16, head_dim=512, head_dim_v=512,
-            block_tile=64, max_topk=max_topk,
+            element_dtype=cutlass.BFloat16,
+            head_dim=512,
+            head_dim_v=512,
+            block_tile=64,
+            max_topk=max_topk,
         )
         _sparse_bwd_kernels[key] = kernel
-    workspace_lse_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
-        total_q, 512, 64, 1, cutlass.Float32
-    )
-    workspace_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
-        total_kv, 512, 1, cutlass.Float32
-    )
+    workspace_lse_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(total_q, 512, 64, 1, cutlass.Float32)
+    workspace_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(total_kv, 512, 1, cutlass.Float32)
     scale = 1.0 / math.sqrt(512) if softmax_scale is None else float(softmax_scale)
     results = call(
         _sparse_bwd_adapter,
@@ -216,7 +258,10 @@ def sparse_attention_backward_jax_sm100(
             jax.ShapeDtypeStruct(workspace_dkv_shape, jnp.uint8),
         ),
         initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: zeros_init, 4: zeros_init},
-        kernel=kernel, softmax_scale=scale, total_q=total_q, total_kv=total_kv,
+        kernel=kernel,
+        softmax_scale=scale,
+        total_q=total_q,
+        total_kv=total_kv,
     )(q, kv, out, dout, lse, attn_sink, topk_indices, topk_length)
     return results[:3]
 
