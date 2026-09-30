@@ -1996,10 +1996,20 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
 @pytest.mark.parametrize(
-    "geometry,stats_layout",
-    [("d256", "NH"), ("d128_packed", "NH"), ("d128_packed", "HN"), ("d128_short", "NH"), ("d128_long", "NH"), ("d128_split", "NH"), ("d128_split", "HN")],
+    "geometry,stats_layout,stats_log2",
+    [
+        ("d256", "NH", False),
+        ("d128_packed", "NH", False),
+        ("d128_packed", "HN", False),
+        ("d128_short", "NH", False),
+        ("d128_long", "NH", False),
+        ("d128_split", "NH", False),
+        ("d128_split", "HN", False),
+        ("d128_split", "NH", True),
+        ("d128_split", "HN", True),
+    ],
 )
-def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout):
+def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout, stats_log2):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
     import inspect
 
@@ -2043,6 +2053,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         v=t["v"],
         generate_stats=True,
         attn_scale=1 / math.sqrt(d),
+        stats_use_log2=stats_log2,
         use_causal_mask_bottom_right=True,
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
@@ -2167,7 +2178,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
                 scores = torch.einsum("qhd,khd->hqk", bufs["q"][cq[i] : cq[i + 1]].double(), dense["k"]) / math.sqrt(d)
                 scores.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None] + nk - nq, -float("inf"))
                 ref_o[cq[i] : cq[i + 1]] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), dense["v"])
-                ref_s[cq[i] : cq[i + 1]] = scores.logsumexp(-1).T
+                ref_s[cq[i] : cq[i + 1]] = scores.logsumexp(-1).T * (math.log2(math.e) if stats_log2 else 1)
             natural = None
             for graph in captures:
                 bufs["o"].fill_(float("nan"))

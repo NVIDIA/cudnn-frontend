@@ -2071,7 +2071,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
-            stats_log2=self.stats_log2 and self.split_kv == 1,
+            # Packed split owns the final combine in this template. Its main
+            # kernel keeps partial Stats natural-log; retain the requested
+            # final base for the combine instead of discarding it here.
+            stats_log2=self.stats_log2 and (self.split_kv == 1 or self.paged_thd_split),
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
