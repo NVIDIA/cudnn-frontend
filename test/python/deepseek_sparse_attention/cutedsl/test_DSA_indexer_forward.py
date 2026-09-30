@@ -108,6 +108,8 @@ def test_DSA_indexer_forward_wrapper(
         s_kv_default=512,
         min_compute_capability=90,
     )
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("Indexer forward requires Hopper or Blackwell")
     q, k, w = _allocate_inputs(cfg, weight_dtype)
     q_causal_offsets = torch.full((cfg["b"],), 4, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
