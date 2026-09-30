@@ -375,8 +375,17 @@ def test_constant_scale_byte_out_of_range_is_refused():
     assert _scale_byte_operand(254, fused=True, who="t") == (254, None), "the fused 16-pack handles e = 254 natively (2^-127)"
     with pytest.raises(ValueError, match=r"e8m0_rcp\), valid for e <= 253"):
         _scale_byte_operand(254, fused=True, who="t", const_takes_fmul=True)  # the pair twin's constant takes the FMUL arm even when fused
-    with pytest.raises(TypeError):
+    # a bool is refused as a TYPE error that names the CALLER (`who`), so a caller of the pair twin is not sent to the 16-pack
+    with pytest.raises(TypeError, match=r"^t: .*not a bool"):
         _scale_byte_operand(True, fused=True, who="t")
+    import cutlass
+
+    from cudnn.frost.tile_dsl.pointwise import fp32_to_fp8_pack_scaled, fp32_to_fp8x2_scaled
+
+    with pytest.raises(TypeError, match=r"^fp32_to_fp8_pack_scaled: .*not a bool"):
+        fp32_to_fp8_pack_scaled([None] * 16, True, dtype=cutlass.Float8E4M3FN, fused=False)  # the byte is checked before any value is touched
+    with pytest.raises(TypeError, match=r"^fp32_to_fp8x2_scaled: .*not a bool"):
+        fp32_to_fp8x2_scaled(None, None, True, dtype=cutlass.Float8E4M3FN, fused=False)
 
 
 # ---------------------------------------------------------------------------

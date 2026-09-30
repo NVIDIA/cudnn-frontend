@@ -241,11 +241,11 @@ def _require_scaled_fp8_cvt_target(who: str) -> None:
 _E8M0_RCP_MAX_E = 253  # e8m0_rcp's contract: 2^(127 - e) is an fp32 NORMAL for e <= 253
 
 
-def _constant_scale_byte(sf_byte):
+def _constant_scale_byte(sf_byte, who: str):
     """The Python int behind a compile-time-constant ``sf_byte`` -- a plain ``int`` or a ``cutlass.Int32`` still holding its
     Python value (``cutlass.Int32(119)`` before a traced op touches it) -- or ``None`` for a traced register."""
     if isinstance(sf_byte, bool):
-        raise TypeError("fp32_to_fp8_pack_scaled: the scale byte is an E8M0 exponent, not a bool")
+        raise TypeError(f"{who}: the scale byte is an E8M0 exponent, not a bool")
     if isinstance(sf_byte, int):
         return sf_byte
     v = getattr(sf_byte, "value", None)
@@ -260,7 +260,7 @@ def _scale_byte_operand(sf_byte, *, fused: bool, who: str, const_takes_fmul: boo
     the pair twin -- so the ``e <= 253`` contract of :func:`e8m0_rcp` applies).  A traced value stays ``reg`` and MUST be
     per-lane data (a load, an ``e8m0_from_amax`` byte): a kernel parameter ICEs ptxas and the helper cannot tell it from data
     (header; the caller's contract)."""
-    const = _constant_scale_byte(sf_byte)
+    const = _constant_scale_byte(sf_byte, who)
     if const is None:
         return None, sf_byte
     if not 0 <= const <= 255:
