@@ -320,19 +320,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
     descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
-    memo_dense_output_identity = None
-    if (
-        output_mode == "dense"
-        and wgrad_tensor is not None
-        and descriptor_workspace is None
-        and sfa_tensor is not None
-        and sfb_tensor is not None
-        and hasattr(wgrad_tensor, "data_ptr")
-    ):
-        # A block-scaled API without caller-owned descriptor storage is bound to
-        # one explicit dense output. Keep memo lookup from bypassing that
-        # compatibility isolation without moving backend selection onto memo hits.
-        memo_dense_output_identity = int(wgrad_tensor.data_ptr())
     memo_key = (
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
@@ -344,7 +331,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wrapper_operand_meta(wgrad_tensor),
         wrapper_operand_meta(wgrad_ptrs),
         descriptor_workspace is not None,
-        memo_dense_output_identity,
         wrapper_operand_meta(global_scale_a),
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
@@ -417,17 +403,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
     if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
         raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
-    explicit_dense_output_identity = None
-    if (
-        backend is GroupedGemmBackend.BLOCK_SCALED
-        and framework == "torch"
-        and output_mode == "dense"
-        and wgrad_tensor is not None
-        and descriptor_workspace is None
-    ):
-        # Compatibility path: callers that do not own descriptor workspace keep
-        # the validated one-API-instance-per-output isolation.
-        explicit_dense_output_identity = int(wgrad_tensor.data_ptr())
     wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
         wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
@@ -453,7 +428,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        explicit_dense_output_identity,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:

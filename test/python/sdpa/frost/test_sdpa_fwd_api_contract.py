@@ -62,27 +62,58 @@ def test_d192_hybrid_elides_pv_scale_factor_storage_and_transactions():
 
 
 @pytest.mark.L0
-def test_hybrid_execute_uses_cached_v_scale_factor_dummy():
-    """Hybrid execution must not materialize a sliced SF tensor per launch."""
-    source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
-
-    assert "sf_k_v[..., : km.SF_SMEM_SIZE_V].contiguous()" not in source
-    assert 'f"pv_bf16_sf_v_{b}_{h_kv}_{n_kv_tiles}_{km.SF_SMEM_SIZE_V}"' in source
+def test_hybrid_execute_elides_v_scale_factor_dummy(monkeypatch):
+    """Hybrid execution specializes away the unused V scale-factor operand."""
+    arguments = _prepared_mxfp8_compile_arguments(monkeypatch, pv_bf16=True)
+    assert arguments["sf_q_ptr"] is not None and arguments["sf_k_ptr"] is not None
+    assert arguments["sf_v_ptr"] is None
 
 
 @pytest.mark.L0
-def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy():
+def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     """sdpa_mxfp8's scale_o is optional. A graph that declares none must get the
     kernel's None-specialized identity fold (constructor ``sample_scale_o=None``
     -> ``compile(has_scale_o=False)``), NEVER a cached ``torch.ones`` created on
     the first execute: when that first execute is under CUDA-graph capture the
     dummy is allocated but its fill is only captured, so an eager execute before
     the first replay reads garbage (review on #1180; Rule 8)."""
-    source = inspect.getsource(SdpaFwdDslSm100._execute_mxfp8)
-    assert "self._scale_view(None" not in source
-    assert "self.has_scale_o" in source
-    # Append-only public signature: sample_scale_o is the last constructor parameter.
-    assert list(inspect.signature(SdpaFwdDsl.__init__).parameters)[-1] == "sample_scale_o"
+    arguments = _prepared_mxfp8_compile_arguments(monkeypatch)
+    assert arguments["sf_o_ptr"] is not None
+    assert arguments["scale_o_ptr"] is None
+    # Append-only public signature: sample_scale_o closes the block-scale tail; the
+    # ragged-Q decode leg's plan-time facts (defaulted) follow it.
+    params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
+    assert params[-3:] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64"], params[-4:]
+
+
+def _prepared_mxfp8_compile_arguments(monkeypatch, *, pv_bf16=False):
+    from types import SimpleNamespace
+
+    import cutlass
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    captured = {}
+
+    def capture(fn, *args, **kwargs):
+        parameters = inspect.signature(fn).parameters
+        captured.update(inspect.signature(fn).bind(*args, **{k: v for k, v in kwargs.items() if k in parameters}).arguments)
+
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", capture)
+    _mxfp8_host.compile_host(
+        None,
+        SimpleNamespace(THD_VARLEN=False, SPLIT_KV=1, PV_BF16=pv_bf16, EPILOGUE_GATE=False, O_BLOCK_SCALE=32),
+        cutlass.Float8E4M3FN,
+        cutlass.BFloat16,
+        (512, 512, 512),
+        None,
+        128,
+        128,
+        True,
+        "dense",
+        sfo_geometry=(512, 0, 0, 4),
+        has_scale_o=False,
+    )
+    return captured
 
 
 @pytest.mark.L0
@@ -95,13 +126,18 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
     # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
-    fns = (api_cls.execute, api_cls._execute_fp8) + ((api_cls._execute_mxfp8,) if hasattr(api_cls, "_execute_mxfp8") else ())
+    # Prepared per-tensor routes carry auxiliary buffers in their binding map;
+    # only retained tensor lowerings have individual sf_o keyword arguments.
+    fns = (api_cls.execute,)
     for fn in fns:
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
         assert params["sf_o"].default is None
-    # Append-only public signature: sf_o is the last execute() parameter.
-    assert list(inspect.signature(api_cls.execute).parameters)[-1] == "sf_o"
+    # Append-only public signature: sf_o closes the block-scale tail; the ragged-Q
+    # decode leg's offset operands (defaulted None) follow it.
+    exec_params = list(inspect.signature(api_cls.execute).parameters)
+    tail = exec_params[exec_params.index("sf_o") :]
+    assert tail in (["sf_o"], ["sf_o", "ragged_q", "ragged_o", "ragged_lse"]), tail  # SM100 carries the leg; SM120 does not
 
 
 @pytest.mark.L0

@@ -5,6 +5,10 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 ## Import-time rules (the most common way to break this package)
 
 - `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` that names the missing framework module (torch, jax, cuda-python) alongside the base `pip install nvidia-cudnn-frontend` hint — or, for a CuTe DSL below `CUTEDSL_MIN_VERSION`, points at the DSL upgrade (Rule 7).
+- A function and its implementation module can share a name. Python installs an imported
+  submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
+  sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
+  `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
@@ -131,16 +135,14 @@ neither names the thing that breaks it most directly: a device-to-host read.
   range(B): int(cu[i])` loop). Extract the correct one and call it from both
   rather than writing the obvious loop again.
 
-Known violations, all pre-existing and each needing a kernel-side change, so
-none is precedent:
-
-- `cu_k.to(dtype=..., device="cpu")` in the SM80 packed-THD WRAPPER path
-  (`_sm80_thd_backward` in `sdpa/bwd/api_dsl.py`), taken only when the caller
-  passes no `max_s_kv` hint. Reachable only through the standalone wrapper: the
-  `sdpa_bwd_sm80` engine path bounds its kv-tile grid and relay counter from
-  the graph's envelope `S_max` and turns the per-batch lengths into
-  `cu_seqlens` on device, so `graph.execute()` never reads a length. Still a
-  violation on the wrapper surface (a caller contract, documented there).
+The SM80 packed backward wrapper now shares the prepared graph chain. When
+`max_s_kv` is absent, the packed capacity bounds the grid; B+1 prefixes stay
+on device. `test_wrapper_without_length_hints_does_not_sync` detects the old
+CPU copy after warmup (verified RED on the preceding wrapper). Capacity,
+Stats head pitch, launch bounds and deterministic-counter size are distinct:
+a caller may reserve more storage than `B * max_sequence_length`. Preserve
+that capacity while honoring the caller's valid launch bounds; cover poisoned
+slack and changed device prefixes under replay.
 
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
@@ -175,9 +177,18 @@ not become a compile key.
   execute path's cached call must be a guaranteed hit. Guard it with a
   cache-miss regression test (see
   `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
-- **Issue #604 is closed**: the SM80 THD compiles (forward and backward) take
-  the packed token extents as `cute.sym_int` and key on `b = 1, sq = skv = 0`
-  plus the plan-time sequence count; the regression tests are
+- **Prove artifact reuse across plans.** A stable key does not guarantee that
+  `compile_cached` exported an artifact: its wrapper serializer declines
+  dataclass compile arguments, including `Constexpr` ones. Read an immutable
+  template module's `PARAMS` inside the host instead of passing the same
+  dataclass again. Build a second plan with `cute.compile` forbidden, assert
+  a real cache hit, and check the reloaded artifact's outputs and graph replay;
+  `test_replan_reloads_prepared_artifact` is the SM80 detector.
+- **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
+  The prepared backward host takes Int64 capacities and launch bounds at
+  runtime, including the compact Stats head pitch and deterministic-counter
+  size; the retained tensor compiles use `cute.sym_int` and key on
+  `b = 1, sq = skv = 0` plus the plan-time sequence count. The regression tests are
   `test_sm80_bwd_thd_compile_key_plan_time_only` (wrapper) and
   `test_graph_thd_compile_key_is_plan_time_only` (graph path). Copy that
   pattern, not a shape-keyed one.
@@ -289,6 +300,10 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- A version floor does not guarantee target-architecture support. For example,
+  public 4.7.0 lacks `sm_107a`; check the actual target capability before
+  admitting SM107 plans. Test graph and standalone declines with the real
+  unsupported wheel as well as a controlled missing-target probe.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
@@ -408,7 +423,16 @@ allocates per call on the caller's behalf, it allocates under
 `stream_context(<launch stream>)` (R1): the caching allocator orders a block's
 reuse only against the stream it was allocated on, so scratch allocated on
 torch's ambient stream for a handle re-streamed to a side stream is a
-use-after-free waiting for load.
+use-after-free waiting for load. For eager JAX wrappers, allocation readiness
+(`block_until_ready`) does not extend storage lifetime through a foreign CUDA
+consumer. Pair caller-layer stream-ordered allocation/free around the launch
+(`grouped.backend_utils.wrapper_workspace`), or use an XLA custom call that owns
+scratch. A cached plan's latest reference cannot cover overlapping calls. Test
+multiple pending consumers on independent streams with an intercepted bounded
+byte copy; never run a real kernel on an intentionally recycled scratch pointer.
+For direct API workspace, validate CUDA device type and the operand's ordinal
+before launch (`Workspace(..., device=...)`); byte size/alignment alone also
+accept host memory.
 
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
@@ -466,6 +490,50 @@ window, then replay and a native launch). For R1, monkeypatch
 `torch.cuda.ExternalStream` to raise and drive the path with handle 0
 (`test_torch_stream.py`).
 
+For a host-overhead migration, measure warm enqueue and captured GPU replay
+separately, and check changed-input outputs after timing. A tiny async memset
+can introduce cross-engine waits between graph kernels even when their kernel
+durations improve. If replay regresses, inspect profiler timestamps between
+nodes as well as individual kernel durations; the prepared FP8 scalar amax
+reset uses an SM kernel to avoid that wait. Keep the empty-input reduction
+identity correct when no attention host is launched
+(`test_prepared_fp8_empty_thd_resets_amax_without_attention`).
+
+
+**Rule 9 — backend and FROST share one FE Python graph contract; no special
+treatment at the caller boundary.**
+
+- **Same API and semantics.** For workloads supported by both engines, graph
+  preparation and execution must accept the same arguments and preserve the
+  same meaning of bindings, shape/stride overrides, outputs, workspace, streams,
+  capture/replay, ownership, and invalidation. Users and integrations such as
+  FlashInfer must not branch on the selected engine to invoke a different API.
+  A private method consumed outside FE is still a caller boundary for this rule.
+- **Preparation belongs inside FE.** Prepare plan-derived binding state during
+  build/compile. Geometry first supplied through execute-time overrides can be
+  prepared and reused internally when it becomes known; it does not require an
+  extra caller-visible preparation step. Keep current buffer observations and
+  required checks per call. Any optional lower-level interface needs a demonstrated
+  benefit beyond internal caching and must serve both engines under one contract.
+- **Optimize the shared path.** Reuse provider-independent preparation,
+  UID ordering, metadata validation, binding, and caching work so host-overhead
+  improvements benefit both engines. A backend-only prepared entry plus the old
+  FROST path is not a unified optimization; neither is merely renaming that entry.
+  Engine-specific launch lowering stays internal, without forcing either engine
+  through a slower common implementation. This does not require factoring kernel
+  pipeline templates into a common implementation.
+- **Capabilities may differ; the contract must not.** Express real differences
+  through support checks and plan selection. Decline unsupported requests under
+  the common contract; never silently ignore an argument, weaken validation, or
+  require a caller-side workaround for one engine. Any internal fallback must
+  preserve the same execution and lifetime semantics.
+- **Verify both routes explicitly.** Changes to this shared contract need tests
+  using supported plans from both engines with the same caller code, covering
+  fresh bindings, overrides, replan/invalidation, workspace/stream changes, and
+  capture/replay as applicable. Check outputs and invalid-input behavior, not
+  heuristic ranking or plan-list order. For shared host optimizations, measure
+  both routes and report their scope separately; one engine's result is not proof
+  for the other.
 
 ## Frontend-only kernel package layout
 
@@ -535,7 +603,7 @@ Every OSS kernel API extends `APIBase` and implements:
 2. `APIBase` subclass + wrapper in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/fe_api/<family>/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
 6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
@@ -548,3 +616,14 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 - Formatting: black, line length 160.
 
 CUDA-owning objects, GC-timed release and stream capture: Rule 8.
+
+
+## DSA training composition
+
+Metadata for backward and targets has two different ordering contracts. Training
+may compact valid active indices only if forward and backward share that exact
+metadata. Score targets must preserve original slots, mask invalid/inactive
+entries, and normalize over retained slots after summing heads. Never reuse
+compacted training indices as the caller-visible target order. Detector:
+`deepseek_sparse_attention/cutedsl/test_DSA_training.py::test_native_training_and_original_score_slots`
+checks holes, duplicates, bounded lengths, all-masked rows and target alignment.

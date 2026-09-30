@@ -70,16 +70,19 @@ attention rank; native-only runs do not validate the candidate.
 
 ## Validation status
 
-Latest recorded VR200 full-workload comparison: mean policy-training time over
-all ten steps is 118.77 s → 116.92 s, a 1.55% reduction computed from unrounded
-measurements. Accuracy is 74.90% versus stock's 73.31%; all 152640 backward
-calls use the candidate, with zero fallback. Both runs use FE 1.29 and the same
-image, config, and seed. Real rollouts differ: valid training tokens increase
-6.46% and call-weighted causal pairs decrease 0.22%; timings are not normalized.
+Latest VR200 full-workload A/B: stock job 664477 and improved job 664478, using
+the native TE/NeMo-RL integration. Mean policy-training time over all 11 steps
+is 111.08 s → 109.46 s, a 1.46% reduction.
+Excluding the first step gives 107.55 s → 106.00 s (1.45%).
 
-These are development measurements, not a submitted MLPerf result. The checker
-used for those runs rejected 251 validation samples against its 256 requirement.
-These historical results predate the review fixes and do not validate them.
+Both jobs completed successfully. Step-10 validation accuracy is 72.91% for
+stock and 74.10% for improved, above the 69.00% target. Both runs use the same
+FE 1.29 image, configuration, and seed; only the GQA flag differs. Real rollouts
+and node allocations differ, and valid tokens increase 1.11%; timings are not
+normalized. Valid-token counts are not exact attention FLOP counts.
+These are development measurements, not a submitted MLPerf result.
 
-Gradient replay, workspace reuse/resizing, and VR200 sanitizer checks passed
-before the review fixes; their regression results are reported separately.
+The review fixes passed 26 VR200 tests, and the native TE integration passed
+three SM107 numerical cases before the full workload. The current develop merge
+moves the test to the CI layout and preserves the compact GQA runtime files.
+Earlier sanitizer results predate the review fixes.

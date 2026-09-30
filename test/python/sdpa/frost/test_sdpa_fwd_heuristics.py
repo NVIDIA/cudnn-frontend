@@ -31,6 +31,14 @@ _F16 = "sdpa_fwd_prefill_sm100"
 _OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
 
 
+@pytest.fixture
+def sm107_metadata_target(monkeypatch):
+    """Heuristic unit tests model a supported target independently of the worker's DSL."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 def _facts(**over):
     base = dict(
         b=1,
@@ -446,7 +454,7 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
 
 
 @pytest.mark.L0
-def test_d512_mxfp8_primary_uses_measured_scheduler():
+def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     name = engines.engine_name(mxfp8=True)
     offered = {name: 20510}
     base = dict(
@@ -672,7 +680,7 @@ _RUBIN_OFFERED = {name: _SDPA_FWD_FAMILY.engine_id + _SDPA_FWD_FAMILY.slots[name
 
 
 @pytest.mark.L0
-def test_heuristics_never_propose_split_or_pack_for_a_gated_graph():
+def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata_target):
     """The fused O * sigmoid(G) epilogue lives in the UNSPLIT, UNPACKED kernel:
     a split's combine would write the un-gated O and a packed tile interleaves
     (token, head) rows the gate's TMA box cannot address.  mismatch() declines

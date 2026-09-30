@@ -148,9 +148,9 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described", "overridden")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=(), overridden=()):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
@@ -160,6 +160,9 @@ class VariantPack:
         # axis position needs this: the graph and the caller order a matmul's B
         # differently, and the description does not say which one it is.
         self.graph_described = graph_described
+        # Explicit execute overrides change the requested geometry, while a
+        # producer view can still be raw storage under the graph declaration.
+        self.overridden = overridden
         self._index_of = None  # built on first lookup: the backend never does one
         self._device = None
 

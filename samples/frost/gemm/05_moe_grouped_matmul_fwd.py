@@ -63,6 +63,7 @@ def _dense_case() -> None:
     for gs in group_sizes:
         starts.append(cur)
         cur += gs
+    starts.append(cur)  # Explicit final endpoint; it may be smaller than S.
 
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -72,7 +73,7 @@ def _dense_case() -> None:
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
     # weight [E, K, N] K-major (== (E, N, K) row-major in memory)
     w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(
         tok,
         w,
@@ -91,13 +92,14 @@ def _dense_case() -> None:
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
     offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
 
-    compiled({tok: token, w: weight, fto: offsets, out: output})
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({tok: token, w: weight, fto: offsets, out: output}, workspace=workspace)
     torch.cuda.synchronize()
 
     ref = torch.zeros((S, N), dtype=torch.float32, device="cuda")
     for gi in range(E):
         b = starts[gi]
-        e = starts[gi + 1] if gi + 1 < E else S
+        e = starts[gi + 1]
         if b == e:
             continue
         ref[b:e] = token[0, b:e].float() @ weight[gi].float().T
@@ -118,8 +120,8 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     block_size, data_dt, sf_dt = _BS_COMBOS[combo]
     sf_k = K // block_size
     # 4 routed groups over E=2 experts (BxE > E). Any group sizes work.
-    offsets_list = [0, 256, 384, 512]
-    num_groups = len(offsets_list)
+    offsets_list = [0, 256, 384, 512, S - 128]
+    num_groups = len(offsets_list) - 1
 
     if combo == "nvfp4":
         lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -162,7 +164,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[num_groups, 1, 1],
+        dim=[num_groups + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )
@@ -184,7 +186,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     sfa_parts = []
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
     sfa_live = torch.cat(sfa_parts)
     # Reserve for any partition with this S and group count. Keep the live
@@ -196,7 +198,8 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
 
-    compiled({tok: tok_rt, w: w_rt, SFA: sfa_blk, SFB: sfb_blk, fto: offsets, out: output})
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({tok: tok_rt, w: w_rt, SFA: sfa_blk, SFB: sfb_blk, fto: offsets, out: output}, workspace=workspace)
     torch.cuda.synchronize()
 
     tok_deq = tok_f32 * sfa_log.float().repeat_interleave(block_size, 1)
@@ -204,7 +207,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         if b == e:
             continue
         ref[b:e] = tok_deq[b:e] @ w_deq[gi % E].T
