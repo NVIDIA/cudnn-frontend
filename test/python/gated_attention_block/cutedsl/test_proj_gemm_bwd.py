@@ -413,7 +413,8 @@ def test_split_k_workspace_must_be_a_cuda_buffer_on_the_launch_device():
     torch.cuda.synchronize()
     assert torch.equal(dw, before), "the refusal must fire before any launch"
     if torch.cuda.device_count() > 1:
-        ws_other = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device="cuda:1")
+        other = (dw.device.index + 1) % torch.cuda.device_count()  # an ordinal that is NOT the launch device, whichever that is
+        ws_other = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=f"cuda:{other}")
         with pytest.raises(ValueError, match="device"):
             run_wgrad_gemm(plan, dy, x, dw, ws_other)
         torch.cuda.synchronize()
