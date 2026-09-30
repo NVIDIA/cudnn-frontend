@@ -152,11 +152,11 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import paged_thd_split_count
+    from .heuristics import paged_thd_split_choice
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
-    if not facts.wants_stats and paged_thd_split_count(caps, facts) > 1:
+    if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:

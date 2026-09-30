@@ -1194,8 +1194,8 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
-def paged_thd_split_count(caps: Capabilities, facts) -> int:
-    """Measured fixed-graph split choice; one preserves the existing plan."""
+def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
     if not (
         paged_thd_split_domain(caps, facts)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
@@ -1213,22 +1213,26 @@ def paged_thd_split_count(caps: Capabilities, facts) -> int:
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):
-        return 1
-    # Per-rank query tiles bound parallel work. Keep at least four KV
-    # tiles per partition to amortize setup/combine on short contexts.
-    # These are fixed graph bounds, never global pool capacity or a D2H read.
-    units = _ceil_div(facts.s_q, 128) * facts.h_q
+        return 1, False
+    # Packing changes token rows per tile as well as the number of head
+    # groups. Score both geometries within the first wave only: extra waves
+    # need a separate model of the unsplit kernel and combine cost.
     kv_tiles = _ceil_div(facts.s_kv, 128)
-    budget = min(16, max(1, 128 // units), max(1, kv_tiles // 4))
-    splits = 1 << (budget.bit_length() - 1)
-    # A power-of-two partition count can leave a third of the SMs idle.
-    # Fill the first wave only when doing so shortens its longest KV loop;
-    # otherwise extra partials add combine work without reducing that loop.
-    resident_budget = min(16, max(1, (facts.device_sm_count or 0) // units), max(1, kv_tiles // 4))
-    loop_tiles = _ceil_div(kv_tiles, resident_budget)
-    if loop_tiles < _ceil_div(kv_tiles, splits):
+    choices = []
+    for pack in (False, True):
+        group = facts.h_q // facts.h_kv if pack else 1
+        units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        # Keep four KV tiles per partition to amortize setup/combine.
+        budget = min(16, max(1, (facts.device_sm_count or 128) // units), max(1, kv_tiles // 4))
+        loop_tiles = _ceil_div(kv_tiles, budget)
         splits = _ceil_div(kv_tiles, loop_tiles)
-    return splits
+        if splits > 1:
+            # Equal longest loops prefer fewer partials, then unpacked.
+            choices.append((loop_tiles, splits, pack))
+    if not choices:
+        return 1, False
+    _, splits, pack = min(choices)
+    return splits, pack
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
@@ -1377,9 +1381,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             # from the current bindings and keeps the same unsplit members for
             # larger queries / batches. Retain the smaller-workspace alternative.
             unique.insert(0, replace(adaptive, split_kv=None, split_kv_policy=split_policy))
-    splits = paged_thd_split_count(caps, facts)
+    splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=splits, sched_policy=SCHED_LPT))
+        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

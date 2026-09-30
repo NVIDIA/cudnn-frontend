@@ -50,6 +50,41 @@ def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, spl
 
 
 @requires_dsl
+@pytest.mark.parametrize("packed", [False, True])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
+    """Transport the measured choice without asserting a performance ranking."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _paged_split_facts()
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
+    selected = heur._knob_sets(SPEC, facts)[0]
+    assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
+    assert mismatch(SPEC.capabilities, facts, selected) is None
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+
+
+@requires_dsl
+@pytest.mark.parametrize("overrides", [{"b": 2}, {"h_q": 32, "h_kv": 8}, {"s_q": 1025}, {"s_kv": 20480}, {"shape_overrides": True}, {"window_left": 31}])
+def test_paged_split_choice_keeps_unmeasured_declarations(overrides):
+    assert heur.paged_thd_split_choice(SPEC.capabilities, _paged_split_facts(**overrides)) == (1, False)
+
+
+@requires_dsl
+@pytest.mark.parametrize("q", [128, 129, 257, 513])
+def test_paged_split_choice_counts_packed_token_tiles(monkeypatch, q):
+    calls = []
+    original = heur._ceil_div
+
+    def observe(rows, tile):
+        calls.append((rows, tile))
+        return original(rows, tile)
+
+    monkeypatch.setattr(heur, "_ceil_div", observe)
+    heur.paged_thd_split_choice(SPEC.capabilities, _paged_split_facts(h_q=16, h_kv=4, s_q=q))
+    assert (q, 128) in calls and (q, 32) in calls
+
+
+@requires_dsl
 @pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
 def test_paged_split_override_requires_bounded_workspace(capacity):
     facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity)
