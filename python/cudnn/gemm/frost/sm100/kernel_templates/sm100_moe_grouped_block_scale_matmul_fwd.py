@@ -499,7 +499,7 @@ def _kernel(
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
         lane = cute.arch.lane_idx()
-        gemm_s = cutlass.Int32(M)
+        gemm_s = cutlass.Int32(first_token_arr[num_groups])
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         bcast_stage = cutlass.Int32(0)
@@ -515,7 +515,7 @@ def _kernel(
         group_idx = cutlass.Int32(0)
         is_tile_valid = cutlass.Int32(1)
         cached_next_end = cutlass.Int32(0)
-        if lane + 1 < num_groups:
+        if lane < num_groups:
             cached_next_end = cutlass.Int32(first_token_arr[lane + 1])
         else:
             cached_next_end = gemm_s
@@ -589,7 +589,7 @@ def _kernel(
                         nvvm.Shfl.IDX,
                     )
                     next_end_group = group_idx + 32 + 1
-                    if next_end_group < num_groups:
+                    if next_end_group <= num_groups:
                         cached_next_end = cutlass.Int32(first_token_arr[next_end_group])
                     else:
                         cached_next_end = gemm_s
@@ -673,7 +673,7 @@ def _kernel(
                             nvvm.Shfl.IDX,
                         )
                         group_end_idx = group_idx + lane + 1
-                        if group_end_idx < num_groups:
+                        if group_end_idx <= num_groups:
                             cached_next_end = cutlass.Int32(first_token_arr[group_end_idx])
                         else:
                             cached_next_end = gemm_s
@@ -2174,7 +2174,7 @@ def compile() -> Callable:
 
     fake_first_token_offset = make_fake_compact_tensor(
         offset_cutlass_dtype,
-        (sym_g,),
+        (cute.sym_int64(),),
         stride_order=(0,),
         assumed_align=offset_cutlass_dtype.width // 8,
     )

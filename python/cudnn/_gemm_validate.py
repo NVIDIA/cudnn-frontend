@@ -75,6 +75,7 @@ def validate_node(node) -> None:
         _validate_matmul(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
+        _validate_moe_offsets(node)
         mode = getattr(node.params.get("mode"), "name", None)
         if mode in ("GATHER", "SCATTER"):
             _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
@@ -82,6 +83,7 @@ def validate_node(node) -> None:
             _validate_required(node, "MoeGroupedMatmul", ("token_ks",), ())
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
+        _validate_moe_offsets(node)
     elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
         _validate_required(node, "BlockScaleDequantize", ("input", "descale"), ("OUT_0",))
         if not node.params.get("block_size"):
@@ -144,3 +146,28 @@ def _validate_required(node, label: str, inputs, outputs) -> None:
     for port in outputs:
         if node.outputs.get(port) is None:
             raise ValueError(f"{label} output {port} not set.")
+
+
+def moe_offset_mode(offset_count: int, num_experts: int) -> bool:
+    """Infer G starts vs G+1 boundaries, with G a positive multiple of E.
+
+    E=1 always uses explicit boundaries. For E>1, the length modulo E
+    distinguishes the two modes without adding an operation attribute.
+    """
+    if num_experts > 0 and offset_count > 0:
+        if num_experts == 1:
+            if offset_count >= 2:
+                return True
+        elif offset_count % num_experts == 0:
+            return False
+        if offset_count > 1 and (offset_count - 1) % num_experts == 0:
+            return True
+    raise ValueError("first_token_offset must contain G starts or G+1 boundaries, where G is a positive multiple of the expert count (E=1 requires G+1)")
+
+
+def _validate_moe_offsets(node) -> None:
+    offsets = _dims(node.inputs["first_token_offset"])
+    expert_tensor = node.inputs["weight"] if node.node_type == NodeType.MOE_GROUPED_MATMUL else node.outputs["dweight"]
+    experts = _dims(expert_tensor)
+    if offsets and experts:
+        moe_offset_mode(offsets[0], experts[0])

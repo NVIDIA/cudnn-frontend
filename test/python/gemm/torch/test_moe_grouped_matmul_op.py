@@ -24,7 +24,7 @@ def ref_moe_grouped_matmul(token, weight, first_token_offset, num_experts):
     output = torch.zeros(1, M, N, dtype=token.dtype, device=token.device)
     for b_e in range(num_experts):
         start = first_token_offset[b_e, 0, 0].item()
-        end = first_token_offset[b_e + 1, 0, 0].item() if b_e + 1 < num_experts else M
+        end = first_token_offset[b_e + 1, 0, 0].item() if b_e + 1 < first_token_offset.shape[0] else M
         if start < end:
             output[0, start:end] = (token[0, start:end].float() @ weight[b_e].float()).to(token.dtype)
     return output
@@ -33,7 +33,7 @@ def ref_moe_grouped_matmul(token, weight, first_token_offset, num_experts):
 class TestMoEGroupedMatmul:
 
     @pytest.mark.L0
-    @pytest.mark.skipif(cudnn.backend_version() < 91800, reason="MoE requires cuDNN >= 9.18.0")
+    @pytest.mark.skipif(cudnn.backend_version() < 91800, reason="moe_grouped_matmul requires cuDNN >= 9.18.0")
     @pytest.mark.parametrize(
         "num_experts,tokens,K,N",
         [
@@ -53,13 +53,14 @@ class TestMoEGroupedMatmul:
         token = torch.randn(1, actual_tokens, K, dtype=dtype, device="cuda")
         weight_raw = torch.randn(num_experts, N, K, dtype=dtype, device="cuda")
         weight = weight_raw.transpose(1, 2)  # col-major inner
-        fto_vals = torch.arange(num_experts, dtype=torch.int32, device="cuda") * tpe
+        offset_count = num_experts + int(cudnn.backend_version() >= 92800)
+        fto_vals = torch.arange(offset_count, dtype=torch.int32, device="cuda") * tpe
         fto = fto_vals.reshape(-1, 1, 1)
 
         stream = torch.cuda.current_stream().cuda_stream
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
-        from cudnn.experimental.ops import moe_grouped_matmul
+        from cudnn.gemm import moe_grouped_matmul
 
         result = moe_grouped_matmul(token, weight, fto, mode="none", top_k=1)
 
