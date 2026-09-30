@@ -253,14 +253,15 @@ def ref_indexer_forward(
     w: torch.Tensor,  # (B, S_q, H_q)
     ratio: int,
     q_causal_offsets: Optional[torch.Tensor] = None,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Dense indexer score computation. Returns (B, S_q, S_k) FP32."""
     b, s_q, h_q, d = q.shape
     _, s_k, h_kv, _ = k.shape
     qhead_per_kvhead = h_q // h_kv
-    q_f = q.to(torch.float32)
-    k_f = k.to(torch.float32)
-    w_f = w.to(torch.float32)
+    q_f = q.to(compute_dtype)
+    k_f = k.to(compute_dtype)
+    w_f = w.to(compute_dtype)
 
     # Expand K across the qhead groups so each query head sees its KV head.
     k_exp = k_f.repeat_interleave(qhead_per_kvhead, dim=2)  # (B, S_k, H_q, D)
@@ -273,7 +274,7 @@ def ref_indexer_forward(
 
     valid = _batched_ratio_causal_mask(s_q, s_k, ratio, q.device, b, q_causal_offsets)
     out = out.masked_fill(~valid, float("-inf"))
-    return out
+    return out.float()
 
 
 def check_ref_indexer_forward(
@@ -285,8 +286,9 @@ def check_ref_indexer_forward(
     q_causal_offsets: Optional[torch.Tensor] = None,
     atol: float = 1e-4,
     rtol: float = 1e-4,
+    compute_dtype: torch.dtype = torch.float32,
 ):
-    out_ref = ref_indexer_forward(q, k, w, ratio, q_causal_offsets=q_causal_offsets)
+    out_ref = ref_indexer_forward(q, k, w, ratio, q_causal_offsets=q_causal_offsets, compute_dtype=compute_dtype)
     finite = torch.isfinite(out_ref)
     assert torch.equal(torch.isneginf(out_actual), torch.isneginf(out_ref))
     torch.testing.assert_close(
