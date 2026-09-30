@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """BatchNorm forward for NCHW, sm_100, CUTLASS primitives.
 
 NCHW is the *easy* layout for BatchNorm even though cuDNN treats it as a fallback:
@@ -89,7 +92,7 @@ def nchw_cfg(C: int, N: int, S: int, elem_bytes: int, block_threads: int = _BT):
     if C % wpb != 0 or S < 1:
         return None
     vs = _vec_width(S, elem_bytes)
-    nv = S // vs                                  # lane steps per row
+    nv = S // vs  # lane steps per row
     # UF is capped by register pressure AND by the row actually containing a full
     # strip -- a strip loop that never fires leaves every lane in the scalar tail.
     uf = max(1, min(max(2, 32 // vs), nv // 32))
@@ -128,15 +131,39 @@ def _warp_sum2(a, b):
 
 @cute.kernel
 def _bn_nchw_kernel(
-    mX, mXi, mY, mYi, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-    N: cutlass.Int32, mparts: cutlass.Int32, momentum: cutlass.Float32,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, VS: cutlass.Constexpr,
-    UF: cutlass.Constexpr, WPB: cutlass.Constexpr, CPW: cutlass.Constexpr,
-    CT: cutlass.Constexpr, BT: cutlass.Constexpr, KSR: cutlass.Constexpr,
-    KTR: cutlass.Constexpr, LPT: cutlass.Constexpr, TCOLS: cutlass.Constexpr,
+    mX,
+    mXi,
+    mY,
+    mYi,
+    mG,
+    mB,
+    mP,
+    mRet,
+    mSavedMean,
+    mSavedRstd,
+    mRunMean,
+    mRunVar,
+    N: cutlass.Int32,
+    mparts: cutlass.Int32,
+    momentum: cutlass.Float32,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    UF: cutlass.Constexpr,
+    WPB: cutlass.Constexpr,
+    CPW: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    KSR: cutlass.Constexpr,
+    KTR: cutlass.Constexpr,
+    LPT: cutlass.Constexpr,
+    TCOLS: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
-    et: cutlass.Constexpr, Mf: cutlass.Constexpr, eps: cutlass.Constexpr,
-    has_beta: cutlass.Constexpr, update_running: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    update_running: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     cx, my, _ = cute.arch.block_idx()
@@ -201,18 +228,15 @@ def _bn_nchw_kernel(
                     if cutlass.const_expr(VS == 1):
                         fs = [mX[bs[cw] + kvc].to(cutlass.Float32)]
                     else:
-                        tin = nvvm.load_ext(mXi.iterator + (bs[cw] + kvc * VS),
-                                            dtype=it_ty, count=VS).bitcast(et)
+                        tin = nvvm.load_ext(mXi.iterator + (bs[cw] + kvc * VS), dtype=it_ty, count=VS).bitcast(et)
                         fs = [tin[e].to(cutlass.Float32) for e in range(VS)]
                     if kv < NV:
                         for e in cutlass.range_constexpr(VS):
                             acc[cw] = acc[cw] + fs[e]
                             accsq[cw] = accsq[cw] + fs[e] * fs[e]
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
-                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(
-                        tptr[0], warpg % 4, col, cutlass.Float32)
-                    nvvm.tcgen05_st(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj,
-                                    cutlass.Vector.from_elements(tuple(fs), cutlass.Float32))
+                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warpg % 4, col, cutlass.Float32)
+                    nvvm.tcgen05_st(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, cutlass.Vector.from_elements(tuple(fs), cutlass.Float32))
             n = n + 1
             r = r + 1
         nvvm.tcgen05_wait(nvvm.Tcgen05Wait.STORE)
@@ -223,7 +247,7 @@ def _bn_nchw_kernel(
     # in one basic block. With the channel loop on the outside each channel sat in
     # its own dynamic loop and contributed no memory-level parallelism at all.
     if cutlass.const_expr(KSR > 0):
-        n = nt   # smem tier starts AFTER the TMEM-cached images
+        n = nt  # smem tier starts AFTER the TMEM-cached images
         r = cutlass.Int32(0)
         while n < nc:
             bs = [(cutlass.Int64(n) * C + (c0 + cw * WPB + w)) * S for cw in range(CPW)]
@@ -237,8 +261,7 @@ def _bn_nchw_kernel(
                         if cutlass.const_expr(VS == 1):
                             raws.append(mX[bs[cw] + o])
                         else:
-                            raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS),
-                                                      dtype=it_ty, count=VS))
+                            raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS), dtype=it_ty, count=VS))
                 i = 0
                 for j in cutlass.range_constexpr(UF):
                     for cw in cutlass.range_constexpr(CPW):
@@ -249,8 +272,7 @@ def _bn_nchw_kernel(
                             acc[cw] = acc[cw] + x
                             accsq[cw] = accsq[cw] + x * x
                         else:
-                            nvvm.store_ext(raws[i], sc.iterator + (cbs[cw] + o * VS),
-                                           shared_space=_CTA_SS)
+                            nvvm.store_ext(raws[i], sc.iterator + (cbs[cw] + o * VS), shared_space=_CTA_SS)
                             xv = raws[i].bitcast(et)
                             for e in cutlass.range_constexpr(VS):
                                 x = xv[e].to(cutlass.Float32)
@@ -292,8 +314,7 @@ def _bn_nchw_kernel(
                     if cutlass.const_expr(VS == 1):
                         raws.append(mX[bs[cw] + o].to(cutlass.Float32))
                     else:
-                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS),
-                                                  dtype=it_ty, count=VS).bitcast(et))
+                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS), dtype=it_ty, count=VS).bitcast(et))
             i = 0
             for j in cutlass.range_constexpr(UF):
                 for cw in cutlass.range_constexpr(CPW):
@@ -340,12 +361,10 @@ def _bn_nchw_kernel(
     nvvm.fence_acq_rel(nvvm.MemScope.GPU)
     nvvm.barrier_cta_sync_aligned(0)
     if tid == 0:
-        nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + cx, cutlass.Int32(1),
-                       mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
+        nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + cx, cutlass.Int32(1), mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
         done = False
         while not done:
-            v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + cx, cutlass.Int32(0),
-                               mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
+            v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + cx, cutlass.Int32(0), mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
             if v >= mparts:
                 done = True
     nvvm.barrier_cta_sync_aligned(0)
@@ -399,8 +418,7 @@ def _bn_nchw_kernel(
                 for j in cutlass.range_constexpr(LPT):
                     kv = j * 32 + lane
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
-                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(
-                        tptr[0], warpg % 4, col, cutlass.Float32)
+                    tpj = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warpg % 4, col, cutlass.Float32)
                     tout = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, num=VS)
                     if kv < NV:
                         if cutlass.const_expr(VS == 1):
@@ -409,8 +427,7 @@ def _bn_nchw_kernel(
                             ys = []
                             for e in cutlass.range_constexpr(VS):
                                 ys.append((tout[e] * scale[cw] + shift[cw]).to(et))
-                            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                           mYi.iterator + (bs[cw] + kv * VS))
+                            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             n = n + 1
             r = r + 1
         nvvm.tcgen05_wait(nvvm.Tcgen05Wait.LOAD)
@@ -430,13 +447,11 @@ def _bn_nchw_kernel(
                             y = sc[cbs[cw] + o].to(cutlass.Float32) * scale[cw] + shift[cw]
                             mY[bs[cw] + o] = y.to(et)
                         else:
-                            xv = nvvm.load_ext(sc.iterator + (cbs[cw] + o * VS), dtype=it_ty,
-                                               count=VS, shared_space=_CTA_SS).bitcast(et)
+                            xv = nvvm.load_ext(sc.iterator + (cbs[cw] + o * VS), dtype=it_ty, count=VS, shared_space=_CTA_SS).bitcast(et)
                             ys = []
                             for e in cutlass.range_constexpr(VS):
                                 ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                           mYi.iterator + (bs[cw] + o * VS))
+                            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                 kb = kb + STEP
             kv = kb + lane
             while kv < NV:
@@ -445,13 +460,11 @@ def _bn_nchw_kernel(
                         y = sc[cbs[cw] + kv].to(cutlass.Float32) * scale[cw] + shift[cw]
                         mY[bs[cw] + kv] = y.to(et)
                     else:
-                        xv = nvvm.load_ext(sc.iterator + (cbs[cw] + kv * VS), dtype=it_ty,
-                                           count=VS, shared_space=_CTA_SS).bitcast(et)
+                        xv = nvvm.load_ext(sc.iterator + (cbs[cw] + kv * VS), dtype=it_ty, count=VS, shared_space=_CTA_SS).bitcast(et)
                         ys = []
                         for e in cutlass.range_constexpr(VS):
                             ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                       mYi.iterator + (bs[cw] + kv * VS))
+                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
                 kv = kv + 32
             n = n + 1
             r = r + 1
@@ -468,8 +481,7 @@ def _bn_nchw_kernel(
                     if cutlass.const_expr(VS == 1):
                         raws.append(mX[bs[cw] + o].to(cutlass.Float32))
                     else:
-                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS),
-                                                  dtype=it_ty, count=VS).bitcast(et))
+                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS), dtype=it_ty, count=VS).bitcast(et))
             i = 0
             for j in cutlass.range_constexpr(UF):
                 for cw in cutlass.range_constexpr(CPW):
@@ -480,8 +492,7 @@ def _bn_nchw_kernel(
                         ys = []
                         for e in cutlass.range_constexpr(VS):
                             ys.append((raws[i][e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                       mYi.iterator + (bs[cw] + o * VS))
+                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                     i = i + 1
             kb = kb + STEP
         kv = kb + lane
@@ -495,39 +506,90 @@ def _bn_nchw_kernel(
                     ys = []
                     for e in cutlass.range_constexpr(VS):
                         ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                   mYi.iterator + (bs[cw] + kv * VS))
+                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             kv = kv + 32
         n = n + 1
 
     if cutlass.const_expr(KTR > 0):
         nvvm.barrier_cta_sync_aligned(0)
         if tid < 32:
-            nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32),
-                                 TCOLS, is_exclusive=False)
+            nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32), TCOLS, is_exclusive=False)
 
 
 @cute.jit
 def _bn_nchw_host(
-    mX, mY, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-    N, mparts, momentum,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, VS: cutlass.Constexpr,
-    UF: cutlass.Constexpr, WPB: cutlass.Constexpr, CPW: cutlass.Constexpr,
-    CT: cutlass.Constexpr, BT: cutlass.Constexpr, KSR: cutlass.Constexpr,
-    KTR: cutlass.Constexpr, LPT: cutlass.Constexpr, TCOLS: cutlass.Constexpr,
-    cparts: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Mf: cutlass.Constexpr, eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-    update_running: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
+    mX,
+    mY,
+    mG,
+    mB,
+    mP,
+    mRet,
+    mSavedMean,
+    mSavedRstd,
+    mRunMean,
+    mRunVar,
+    N,
+    mparts,
+    momentum,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    UF: cutlass.Constexpr,
+    WPB: cutlass.Constexpr,
+    CPW: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    KSR: cutlass.Constexpr,
+    KTR: cutlass.Constexpr,
+    LPT: cutlass.Constexpr,
+    TCOLS: cutlass.Constexpr,
+    cparts: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    update_running: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
     _bn_nchw_kernel(
-        mX, mXi, mY, mYi, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-        N, mparts, momentum, C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, it_ty, et, Mf, eps,
-        has_beta, update_running,
-    ).launch(grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes,
-             cooperative=True, min_blocks_per_mp=mbpm)
+        mX,
+        mXi,
+        mY,
+        mYi,
+        mG,
+        mB,
+        mP,
+        mRet,
+        mSavedMean,
+        mSavedRstd,
+        mRunMean,
+        mRunVar,
+        N,
+        mparts,
+        momentum,
+        C,
+        S,
+        VS,
+        UF,
+        WPB,
+        CPW,
+        CT,
+        BT,
+        KSR,
+        KTR,
+        LPT,
+        TCOLS,
+        it_ty,
+        et,
+        Mf,
+        eps,
+        has_beta,
+        update_running,
+    ).launch(grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +599,27 @@ def _bn_nchw_host(
 
 @cute.kernel
 def _bn_nchw_infer_kernel(
-    mX, mXi, mY, mYi, mG, mB, mRunMean, mRunVar, N: cutlass.Int32,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, VS: cutlass.Constexpr,
-    UF: cutlass.Constexpr, WPB: cutlass.Constexpr, CPW: cutlass.Constexpr,
-    CT: cutlass.Constexpr, BT: cutlass.Constexpr, it_ty: cutlass.Constexpr,
-    et: cutlass.Constexpr, eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mX,
+    mXi,
+    mY,
+    mYi,
+    mG,
+    mB,
+    mRunMean,
+    mRunVar,
+    N: cutlass.Int32,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    UF: cutlass.Constexpr,
+    WPB: cutlass.Constexpr,
+    CPW: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     cx, my, _ = cute.arch.block_idx()
@@ -574,8 +652,7 @@ def _bn_nchw_infer_kernel(
                     if cutlass.const_expr(VS == 1):
                         raws.append(mX[bs[cw] + o].to(cutlass.Float32))
                     else:
-                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS),
-                                                  dtype=it_ty, count=VS).bitcast(et))
+                        raws.append(nvvm.load_ext(mXi.iterator + (bs[cw] + o * VS), dtype=it_ty, count=VS).bitcast(et))
             i = 0
             for j in cutlass.range_constexpr(UF):
                 for cw in cutlass.range_constexpr(CPW):
@@ -586,8 +663,7 @@ def _bn_nchw_infer_kernel(
                         ys = []
                         for e in cutlass.range_constexpr(VS):
                             ys.append((raws[i][e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                       mYi.iterator + (bs[cw] + o * VS))
+                        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                     i = i + 1
             kb = kb + STEP
         kv = kb + lane
@@ -601,26 +677,40 @@ def _bn_nchw_infer_kernel(
                     ys = []
                     for e in cutlass.range_constexpr(VS):
                         ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
-                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                   mYi.iterator + (bs[cw] + kv * VS))
+                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             kv = kv + 32
         n = n + nblk
 
 
 @cute.jit
 def _bn_nchw_infer_host(
-    mX, mY, mG, mB, mRunMean, mRunVar, N,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, VS: cutlass.Constexpr,
-    UF: cutlass.Constexpr, WPB: cutlass.Constexpr, CPW: cutlass.Constexpr,
-    CT: cutlass.Constexpr, BT: cutlass.Constexpr, cparts: cutlass.Constexpr,
-    nblk: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mX,
+    mY,
+    mG,
+    mB,
+    mRunMean,
+    mRunVar,
+    N,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    UF: cutlass.Constexpr,
+    WPB: cutlass.Constexpr,
+    CPW: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    cparts: cutlass.Constexpr,
+    nblk: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
-    _bn_nchw_infer_kernel(mX, mXi, mY, mYi, mG, mB, mRunMean, mRunVar, N, C, S, VS,
-                          UF, WPB, CPW, CT, BT, it_ty, et, eps, has_beta).launch(
-        grid=(cparts, nblk, 1), block=(BT, 1, 1))
+    _bn_nchw_infer_kernel(mX, mXi, mY, mYi, mG, mB, mRunMean, mRunVar, N, C, S, VS, UF, WPB, CPW, CT, BT, it_ty, et, eps, has_beta).launch(
+        grid=(cparts, nblk, 1), block=(BT, 1, 1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +772,7 @@ def _ksr(nloc: int, WPB: int, CPW: int, S: int, eb: int, occ: int) -> int:
     return max(0, min(nloc, (_SMEM_CAP // occ) // per_row))
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
-            running_var, cfg, params, knobs=None):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
     """Launch the NCHW BatchNorm forward on ``x3d`` viewed as ``[N, C, S]``.
 
     Returns ``(y3d, saved_mean, saved_rstd)``.
@@ -730,7 +819,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
     count = float(N * S)
 
     NV = S // VS
-    LPT = (NV + 31) // 32          # lane steps per row (constexpr sweep for the TMEM tier)
+    LPT = (NV + 31) // 32  # lane steps per row (constexpr sweep for the TMEM tier)
     okey = (params.io_dtype, C, S, N, has_beta, update_running)
 
     # Try occ=2 first. A coverage-driven choice (prefer whichever occupancy caches
@@ -743,7 +832,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
         nloc = (N + mparts - 1) // mparts
         # TMEM first (it is free of L1 pressure), then shared for whatever is left.
         KTR = min(nloc, _tmem_rows(BT, CPW, LPT, VS, occ)) if knobs is None else 0
-        KSR = (_ksr(nloc - KTR, WPB, CPW, S, eb, occ) if knobs is None else int(knobs))
+        KSR = _ksr(nloc - KTR, WPB, CPW, S, eb, occ) if knobs is None else int(knobs)
         smem_bytes = 2 * (2 * CT) * 4 + WPB * CPW * KSR * S * eb + 128
         mbpm = 2 if occ == 2 else 0
         TCOLS = _tmem_alloc_cols(BT, KTR, CPW, LPT, VS) if KTR > 0 else 0
@@ -754,15 +843,25 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
             # address -> illegal access. Pad shared memory so it is the occupancy
             # limiter and the per-CTA TMEM budget is actually enforceable.
             smem_bytes = max(smem_bytes, _SMEM_PER_SM // (occ + 1) + 1)
-        ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et,
-              count, float(eps), has_beta, update_running, smem_bytes, mbpm)
-        key = (params.io_dtype, C, S, VS, UF, CPW, KSR, KTR, LPT, TCOLS, has_beta,
-               update_running, mbpm)
+        ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et, count, float(eps), has_beta, update_running, smem_bytes, mbpm)
+        key = (params.io_dtype, C, S, VS, UF, CPW, KSR, KTR, LPT, TCOLS, has_beta, update_running, mbpm)
         pbuf = torch.empty(cparts * 2 * mparts * CT, dtype=torch.float32, device=x3d.device)
         ret = torch.zeros(cparts, dtype=torch.int32, device=x3d.device)
-        args = (dyn(xf), dyn(yf), dyn(gamma), dyn(beta), dyn(pbuf), dyn(ret),
-                dyn(saved_mean), dyn(saved_rstd), dyn(rm), dyn(rv),
-                cutlass.Int32(N), cutlass.Int32(mparts), cutlass.Float32(momentum))
+        args = (
+            dyn(xf),
+            dyn(yf),
+            dyn(gamma),
+            dyn(beta),
+            dyn(pbuf),
+            dyn(ret),
+            dyn(saved_mean),
+            dyn(saved_rstd),
+            dyn(rm),
+            dyn(rv),
+            cutlass.Int32(N),
+            cutlass.Int32(mparts),
+            cutlass.Float32(momentum),
+        )
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_bn_nchw_host, *args, *ce)

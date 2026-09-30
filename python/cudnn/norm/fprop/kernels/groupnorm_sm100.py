@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """GroupNorm forward, sm_100, CUTLASS primitives.
 
 One CTA owns one ``(sample, group)`` — a row of the ``[R, M]`` view with
@@ -136,16 +139,43 @@ def _gn_fwd_kernel(
 
 @cute.jit
 def _gn_fwd_host(
-    mX, mY, mGamma, mBeta, mMean, mRstd,
-    R: cutlass.Int32, gps: cutlass.Int32, cpg: cutlass.Int32, span: cutlass.Int32,
+    mX,
+    mY,
+    mGamma,
+    mBeta,
+    mMean,
+    mRstd,
+    R: cutlass.Int32,
+    gps: cutlass.Int32,
+    cpg: cutlass.Int32,
+    span: cutlass.Int32,
     eps: cutlass.Float32,
-    M: cutlass.Constexpr, V: cutlass.Constexpr, bt: cutlass.Constexpr,
-    elem_bytes: cutlass.Constexpr, stage_mode: cutlass.Constexpr, vec: cutlass.Constexpr,
+    M: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    bt: cutlass.Constexpr,
+    elem_bytes: cutlass.Constexpr,
+    stage_mode: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
 ) -> None:
     _gn_fwd_kernel(
-        mX, mY, mGamma, mBeta, mMean, mRstd, gps, cpg, span, eps,
-        M, V, bt, elem_bytes, stage_mode, vec, has_beta,
+        mX,
+        mY,
+        mGamma,
+        mBeta,
+        mMean,
+        mRstd,
+        gps,
+        cpg,
+        span,
+        eps,
+        M,
+        V,
+        bt,
+        elem_bytes,
+        stage_mode,
+        vec,
+        has_beta,
     ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
 
 
@@ -165,9 +195,16 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
     rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device)
 
     args = (
-        dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd),
-        cutlass.Int32(spec.R), cutlass.Int32(spec.groups_per_sample),
-        cutlass.Int32(spec.channels_per_group), cutlass.Int32(spec.gamma_inner_span),
+        dyn(x2d),
+        dyn(y),
+        dyn(gamma),
+        dyn(beta),
+        dyn(mean),
+        dyn(rstd),
+        cutlass.Int32(spec.R),
+        cutlass.Int32(spec.groups_per_sample),
+        cutlass.Int32(spec.channels_per_group),
+        cutlass.Int32(spec.gamma_inner_span),
         cutlass.Float32(eps),
     )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, has_beta)

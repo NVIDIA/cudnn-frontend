@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """InstanceNorm forward, sm_100.
 
 InstanceNorm normalizes each ``(sample, channel)`` over its spatial extent — i.e.

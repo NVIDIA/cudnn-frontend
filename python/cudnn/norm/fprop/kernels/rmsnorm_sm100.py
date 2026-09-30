@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """RMSNorm forward, sm_100.
 
 RMSNorm has the identical row reduction as LayerNorm but no mean subtraction

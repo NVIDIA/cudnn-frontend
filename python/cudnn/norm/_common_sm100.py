@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared device-side building blocks for the sm_100 norm forward kernels.
 
 These are the CUTLASS-primitive equivalents of the old plain-cute-dsl helpers:
@@ -29,15 +32,19 @@ STAGE_BULK = 2
 
 
 @cute.jit
-def stage_row(sX, gX_row, M: cutlass.Constexpr, tid, V: cutlass.Constexpr,
-              block_threads: cutlass.Constexpr, elem_bytes: cutlass.Constexpr) -> None:
+def stage_row(sX, gX_row, M: cutlass.Constexpr, tid, V: cutlass.Constexpr, block_threads: cutlass.Constexpr, elem_bytes: cutlass.Constexpr) -> None:
     """Per-thread cp.async-stage one ``M``-element global row into ``sX``.
 
     Requires ``M % (block_threads * V) == 0``.
     """
     load_tile(
-        sX.iterator, gX_row.iterator, M, tid,
-        num_threads=block_threads, elems_per_copy=V, elem_bytes=elem_bytes,
+        sX.iterator,
+        gX_row.iterator,
+        M,
+        tid,
+        num_threads=block_threads,
+        elems_per_copy=V,
+        elem_bytes=elem_bytes,
     )
     cp_async_commit()
     cp_async_wait(0)

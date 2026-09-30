@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """BatchNorm NHWC forward de-risk (cutlass primitives, sm_100). NHWC x flattens to
 [M, C] (M=N*H*W pixels, C channels contiguous). Reduce over M per channel.
 
@@ -9,29 +12,50 @@ v1 (correctness + baseline): 3 kernels.
   M meanrstd: mean=sum/M, rstd=rsqrt(sumsq/M - mean^2 + eps).
   B norm:   y = (x-mean)*rstd*gamma + beta, per-channel affine, coalesced.
 Traffic 2R+1W -> ~2/3 of copy ceiling target. Single-pass (cache X) is a later step."""
+
 import sys, types
+
 D = str(__import__("pathlib").Path(__file__).resolve().parents[2] / "python" / "cudnn")
-stub = types.ModuleType("cudnn"); stub.__path__ = [D]; stub.pygraph = type("pygraph", (), {}); sys.modules["cudnn"] = stub
+stub = types.ModuleType("cudnn")
+stub.__path__ = [D]
+stub.pygraph = type("pygraph", (), {})
+sys.modules["cudnn"] = stub
 import cutlass, cutlass.cute as cute, cutlass.primitives as nvvm, torch, numpy as np
 from torch.profiler import profile, ProfilerActivity, record_function
 from cutlass.memory import SmemAllocator
 from cutlass.cute.runtime import from_dlpack
+
 _CTA = nvvm.SharedSpace.shared_cta
-def _dyn(t): return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
+
+
+def _dyn(t):
+    return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
+
+
 _C = {}
 
 
 @cute.kernel
-def _bn_stats(mXi, mPart, M: cutlass.Int32, mparts: cutlass.Int32,
-              C: cutlass.Constexpr, V: cutlass.Constexpr, TPP: cutlass.Constexpr,
-              PPL: cutlass.Constexpr, BT: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr):
+def _bn_stats(
+    mXi,
+    mPart,
+    M: cutlass.Int32,
+    mparts: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    TPP: cutlass.Constexpr,
+    PPL: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+):
     tid, _, _ = cute.arch.thread_idx()
     cx, my, _ = cute.arch.block_idx()
     smem = SmemAllocator()
     red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(BT * V * 2), byte_alignment=16)
-    tc = (tid % TPP) * V             # base channel for this thread (within tile)
-    tp = tid // TPP                  # which pixel-in-parallel
-    c0 = cx * (TPP * V) + tc         # global base channel
+    tc = (tid % TPP) * V  # base channel for this thread (within tile)
+    tp = tid // TPP  # which pixel-in-parallel
+    c0 = cx * (TPP * V) + tc  # global base channel
     # M-slice for this (cx,my)
     per = (M + mparts - 1) // mparts
     r0 = my * per
@@ -65,7 +89,7 @@ def _bn_stats(mXi, mPart, M: cutlass.Int32, mparts: cutlass.Int32,
     # reduce over the PPL pixel-groups (threads sharing tc, differing tp) via smem
     if cutlass.const_expr(PPL > 1):
         for e in cutlass.range_constexpr(V):
-            red[(tp * TPP + (tid % TPP)) * V + e] = s[e]           # store sum, laid out [tp][channel]
+            red[(tp * TPP + (tid % TPP)) * V + e] = s[e]  # store sum, laid out [tp][channel]
         cute.arch.sync_threads()
         if tp == 0:
             for e in cutlass.range_constexpr(V):
@@ -92,8 +116,7 @@ def _bn_stats(mXi, mPart, M: cutlass.Int32, mparts: cutlass.Int32,
 
 
 @cute.kernel
-def _bn_finalize(mPart, mSum, mSq, mparts: cutlass.Int32, C: cutlass.Constexpr,
-                 CHUNK: cutlass.Constexpr):
+def _bn_finalize(mPart, mSum, mSq, mparts: cutlass.Int32, C: cutlass.Constexpr, CHUNK: cutlass.Constexpr):
     # 2D grid: bx = C-tile (thread-per-channel), by = partition chunk. Splitting the
     # mparts reduction across the y-grid + atomic-add keeps every SM busy (the 1-block
     # version ran the whole reduction on 1 SM -> 19us for 600KB).
@@ -101,10 +124,12 @@ def _bn_finalize(mPart, mSum, mSq, mparts: cutlass.Int32, C: cutlass.Constexpr,
     bx, by, _ = cute.arch.block_idx()
     c = bx * 256 + tid
     if c < C:
-        p0 = by * CHUNK; p1 = p0 + CHUNK
+        p0 = by * CHUNK
+        p1 = p0 + CHUNK
         if p1 > mparts:
             p1 = mparts
-        ssum = cutlass.Float32(0.0); ssq = cutlass.Float32(0.0)
+        ssum = cutlass.Float32(0.0)
+        ssq = cutlass.Float32(0.0)
         p = p0
         while p < p1:
             base = cutlass.Int64(p) * (2 * C) + c
@@ -128,9 +153,24 @@ def _bn_meanrstd(mSum, mSq, mMean, mRstd, C: cutlass.Constexpr, Mf: cutlass.Cons
 
 
 @cute.kernel
-def _bn_norm(mXi, mYi, mMean, mRstd, mG, mB, M: cutlass.Int32, mnorm: cutlass.Int32,
-             C: cutlass.Constexpr, V: cutlass.Constexpr, TPP: cutlass.Constexpr, PPL: cutlass.Constexpr,
-             BT: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr, has_beta: cutlass.Constexpr):
+def _bn_norm(
+    mXi,
+    mYi,
+    mMean,
+    mRstd,
+    mG,
+    mB,
+    M: cutlass.Int32,
+    mnorm: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    TPP: cutlass.Constexpr,
+    PPL: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+):
     # channel-tile map (same as stats): each thread owns V fixed channels -> stage its
     # affine params (mean,rstd,gamma,beta) ONCE into registers, then stream pixels down
     # the M-slice (coalesced along C). Kills the per-element global affine reads.
@@ -139,7 +179,10 @@ def _bn_norm(mXi, mYi, mMean, mRstd, mG, mB, M: cutlass.Int32, mnorm: cutlass.In
     tc = (tid % TPP) * V
     tp = tid // TPP
     c0 = cx * (TPP * V) + tc
-    m = []; r = []; g = []; bb = []
+    m = []
+    r = []
+    g = []
+    bb = []
     for e in cutlass.range_constexpr(V):
         m.append(mMean[c0 + e])
         r.append(mRstd[c0 + e])
@@ -166,24 +209,51 @@ def _bn_norm(mXi, mYi, mMean, mRstd, mG, mB, M: cutlass.Int32, mnorm: cutlass.In
 
 
 @cute.jit
-def _bn_host(mX, mY, mG, mB, mPart, mSum, mSq, mMean, mRstd, M, mparts, nblk,
-             C: cutlass.Constexpr, V: cutlass.Constexpr, TPP: cutlass.Constexpr, PPL: cutlass.Constexpr,
-             BT: cutlass.Constexpr, cblks: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-             Mf: cutlass.Constexpr, eps: cutlass.Constexpr, cgrid: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-             smem_bytes: cutlass.Constexpr, nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr):
-    mXi = cute.recast_tensor(mX, it_ty); mYi = cute.recast_tensor(mY, it_ty)
-    _bn_stats(mXi, mPart, M, mparts, C, V, TPP, PPL, BT, it_ty, et).launch(
-        grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes)
+def _bn_host(
+    mX,
+    mY,
+    mG,
+    mB,
+    mPart,
+    mSum,
+    mSq,
+    mMean,
+    mRstd,
+    M,
+    mparts,
+    nblk,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    TPP: cutlass.Constexpr,
+    PPL: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    cblks: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    cgrid: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+):
+    mXi = cute.recast_tensor(mX, it_ty)
+    mYi = cute.recast_tensor(mY, it_ty)
+    _bn_stats(mXi, mPart, M, mparts, C, V, TPP, PPL, BT, it_ty, et).launch(grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes)
     _bn_finalize(mPart, mSum, mSq, mparts, C, CHUNK).launch(grid=(cgrid, nchunk, 1), block=(256, 1, 1))
     _bn_meanrstd(mSum, mSq, mMean, mRstd, C, Mf, eps).launch(grid=(cgrid, 1, 1), block=(256, 1, 1))
     # gamma/beta passed as native bf16 (indexed + .to(f32)); X/Y use recast Int16 + bitcast
-    _bn_norm(mXi, mYi, mMean, mRstd, mG, mB, M, nblk, C, V, TPP, PPL, BT, it_ty, et, has_beta).launch(
-        grid=(cblks, nblk, 1), block=(BT, 1, 1))
+    _bn_norm(mXi, mYi, mMean, mRstd, mG, mB, M, nblk, C, V, TPP, PPL, BT, it_ty, et, has_beta).launch(grid=(cblks, nblk, 1), block=(BT, 1, 1))
 
 
 def run_bn(x, g, b, eps=1e-5):
     import cutlass as _c
-    M, C = x.shape; V = 8; BT = 256; NSM = 148
+
+    M, C = x.shape
+    V = 8
+    BT = 256
+    NSM = 148
     # C_PER_CTA knob: channel-tile per CTA, decoupled from C. Cap at 256 so TPP<=32 and
     # PPL>=8 (the old "whole C per CTA" gave PPL=1 for C=2048 -> no pixel parallelism).
     # Smaller CPC also means more channel-tiles -> fewer partials/channel (cheaper finalize).
@@ -205,38 +275,56 @@ def run_bn(x, g, b, eps=1e-5):
     mean = torch.empty(C, dtype=torch.float32, device="cuda")
     rstd = torch.empty(C, dtype=torch.float32, device="cuda")
     cgrid = (C + 255) // 256
-    nchunk = max(1, min(32, 256 // cgrid)); nchunk = min(nchunk, mparts)
+    nchunk = max(1, min(32, 256 // cgrid))
+    nchunk = min(nchunk, mparts)
     CHUNK = (mparts + nchunk - 1) // nchunk
     smem_bytes = BT * V * 2 * 4 + 128
-    ra = (_dyn(x), _dyn(y), _dyn(g), _dyn(b), _dyn(part), _dyn(ssum), _dyn(ssq), _dyn(mean), _dyn(rstd),
-          _c.Int32(M), _c.Int32(mparts), _c.Int32(nblk))
+    ra = (_dyn(x), _dyn(y), _dyn(g), _dyn(b), _dyn(part), _dyn(ssum), _dyn(ssq), _dyn(mean), _dyn(rstd), _c.Int32(M), _c.Int32(mparts), _c.Int32(nblk))
     ce = (C, V, TPP, PPL, BT, cblks, _c.Int16, _c.BFloat16, float(M), float(eps), cgrid, True, smem_bytes, nchunk, CHUNK)
     key = (C, M)
-    fn = _C.get(key); fn = fn or cute.compile(_bn_host, *ra, *ce); _C[key] = fn; fn(*ra)
+    fn = _C.get(key)
+    fn = fn or cute.compile(_bn_host, *ra, *ce)
+    _C[key] = fn
+    fn(*ra)
     return y, mean, rstd
 
 
 def main():
     l2 = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.int8)
+
     def dev(fn, it=40, wu=12):
-        for _ in range(wu): fn()
-        torch.cuda.synchronize(); ts = []
+        for _ in range(wu):
+            fn()
+        torch.cuda.synchronize()
+        ts = []
         for _ in range(it):
             l2.zero_()
             with profile(activities=[ProfilerActivity.CUDA]) as p:
-                with record_function("op"): fn()
+                with record_function("op"):
+                    fn()
                 torch.cuda.synchronize()
-            ka = p.key_averages(); ts.append(sum(i.device_time for i in ka if i.device_time > 0) / 1000)
+            ka = p.key_averages()
+            ts.append(sum(i.device_time for i in ka if i.device_time > 0) / 1000)
         return float(np.median(ts))
+
     N = 128
-    for C, H, W, cud, ceil in [(64,56,56,2877,5480),(256,56,56,3448,6155),(128,28,28,2222,5097),
-                                (256,28,28,2455,5517),(512,14,14,2351,5113),(2048,7,7,2254,5113)]:
+    for C, H, W, cud, ceil in [
+        (64, 56, 56, 2877, 5480),
+        (256, 56, 56, 3448, 6155),
+        (128, 28, 28, 2222, 5097),
+        (256, 28, 28, 2455, 5517),
+        (512, 14, 14, 2351, 5113),
+        (2048, 7, 7, 2254, 5113),
+    ]:
         M = N * H * W
         x = torch.randn(M, C, device="cuda", dtype=torch.bfloat16)
-        g = torch.randn(C, device="cuda", dtype=torch.bfloat16); b = torch.randn(C, device="cuda", dtype=torch.bfloat16)
+        g = torch.randn(C, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(C, device="cuda", dtype=torch.bfloat16)
         # reference
         xf = x.float()
-        mean_r = xf.mean(0); var_r = xf.var(0, unbiased=False); rstd_r = 1.0 / torch.sqrt(var_r + 1e-5)
+        mean_r = xf.mean(0)
+        var_r = xf.var(0, unbiased=False)
+        rstd_r = 1.0 / torch.sqrt(var_r + 1e-5)
         yr = (xf - mean_r) * rstd_r * g.float() + b.float()
         y, mean, rstd = run_bn(x, g, b)
         yerr = (y.float() - yr).abs().max().item()

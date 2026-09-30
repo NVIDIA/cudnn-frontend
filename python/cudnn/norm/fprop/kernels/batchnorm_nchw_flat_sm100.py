@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """BatchNorm forward for NCHW, sm_100 -- FLAT fixed-position map.
 
 The predecessor (``batchnorm_nchw_sm100``) maps a warp to one ``(n, c)`` row. That
@@ -44,9 +47,9 @@ _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
 _BT = 256
-_UN = 4            # images issued per strip in the streamed loop
+_UN = 4  # images issued per strip in the streamed loop
 _SMEM_CAP = 200 * 1024
-_TMEM_COLS = 512   # per SM
+_TMEM_COLS = 512  # per SM
 
 _SM_COUNT = None
 
@@ -73,12 +76,10 @@ def flat_cfg(C: int, N: int, S: int, elem_bytes: int, occ: int = 1, BT: int = _B
     VPT = max(1, -(-PV // (BT * target)))
     pparts = max(1, -(-PV // (BT * VPT)))
     mparts = max(1, min(target // pparts, N))
-    chunk = BT * VS * VPT                 # elements a CTA covers per image
-    CPB = chunk // S + 2                  # channels a CTA's window can touch
-    NPX = S // chunk + 2                  # position-tiles overlapping one channel
-    return dict(P=P, VS=VS, PV=PV, VPT=VPT, pparts=pparts, mparts=mparts,
-                chunk=chunk, CPB=CPB, NPX=NPX, BT=BT,
-                straddle=(S % VS != 0))
+    chunk = BT * VS * VPT  # elements a CTA covers per image
+    CPB = chunk // S + 2  # channels a CTA's window can touch
+    NPX = S // chunk + 2  # position-tiles overlapping one channel
+    return dict(P=P, VS=VS, PV=PV, VPT=VPT, pparts=pparts, mparts=mparts, chunk=chunk, CPB=CPB, NPX=NPX, BT=BT, straddle=(S % VS != 0))
 
 
 def _tmem_cap(BT: int, VS: int, VPT: int, occ: int) -> int:
@@ -91,15 +92,41 @@ def _tmem_cap(BT: int, VS: int, VPT: int, occ: int) -> int:
 
 @cute.kernel
 def _bn_flat(
-    mX, mXi, mY, mYi, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-    N: cutlass.Int32, mparts: cutlass.Int32, momentum: cutlass.Float32,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, P: cutlass.Constexpr,
-    PV: cutlass.Constexpr, VS: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    BT: cutlass.Constexpr, CPB: cutlass.Constexpr, NPX: cutlass.Constexpr,
-    CHUNK: cutlass.Constexpr, KSR: cutlass.Constexpr, KTR: cutlass.Constexpr,
-    UN: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Mf: cutlass.Constexpr, eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-    update_running: cutlass.Constexpr, STRADDLE: cutlass.Constexpr,
+    mX,
+    mXi,
+    mY,
+    mYi,
+    mG,
+    mB,
+    mP,
+    mRet,
+    mSavedMean,
+    mSavedRstd,
+    mRunMean,
+    mRunVar,
+    N: cutlass.Int32,
+    mparts: cutlass.Int32,
+    momentum: cutlass.Float32,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    P: cutlass.Constexpr,
+    PV: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    CPB: cutlass.Constexpr,
+    NPX: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    KSR: cutlass.Constexpr,
+    KTR: cutlass.Constexpr,
+    UN: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    update_running: cutlass.Constexpr,
+    STRADDLE: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     px, my, _ = cute.arch.block_idx()
@@ -109,18 +136,16 @@ def _bn_flat(
     stat = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * CPB), byte_alignment=16)
     slc = smem.allocate_tensor(cutlass.Int32, cute.make_layout(BT * VPT), byte_alignment=16)
     sv = smem.allocate_tensor(cutlass.Float32, cute.make_layout(4 * BT * VPT), byte_alignment=16)
-    sc = (smem.allocate_tensor(it_ty, cute.make_layout(BT * VPT * KSR * VS), byte_alignment=16)
-          if cutlass.const_expr(KSR > 0) else None)
+    sc = smem.allocate_tensor(it_ty, cute.make_layout(BT * VPT * KSR * VS), byte_alignment=16) if cutlass.const_expr(KSR > 0) else None
     tptr = None
     if cutlass.const_expr(KTR > 0):
         tptr = smem.allocate_tensor(cutlass.Int32, cute.make_layout(4), byte_alignment=16)
         if tid < 32:
-            nvvm.tcgen05_alloc(tptr.iterator, max(1, BT // 128) * KTR * VPT * VS,
-                               is_exclusive=False)
+            nvvm.tcgen05_alloc(tptr.iterator, max(1, BT // 128) * KTR * VPT * VS, is_exclusive=False)
             nvvm.tcgen05_relinquish_alloc_permit()
         nvvm.barrier_cta_sync_aligned(0)
 
-    cwbase = (px * CHUNK) // S           # first channel this CTA's window can touch
+    cwbase = (px * CHUNK) // S  # first channel this CTA's window can touch
     per = (N + mparts - 1) // mparts
     n0 = my * per
     n1 = n0 + per
@@ -141,10 +166,10 @@ def _bn_flat(
         ev = pvc * VS
         e0.append(ev)
         lc0.append((ev // S) - cwbase)
-        ksp.append(((ev // S) + 1) * S - ev)   # elements of this vector in channel c0
+        ksp.append(((ev // S) + 1) * S - ev)  # elements of this vector in channel c0
         okq.append(ok)
 
-    acc = [cutlass.Float32(0.0)] * (2 * VPT)   # [lo, hi] per q
+    acc = [cutlass.Float32(0.0)] * (2 * VPT)  # [lo, hi] per q
     asq = [cutlass.Float32(0.0)] * (2 * VPT)
 
     # ---- pass1 ----
@@ -153,9 +178,7 @@ def _bn_flat(
         raws = []
         for u in cutlass.range_constexpr(UN):
             for q in cutlass.range_constexpr(VPT):
-                raws.append(nvvm.load_ext(
-                    mXi.iterator + (cutlass.Int64(nb + u) * P + e0[q]),
-                    dtype=it_ty, count=VS).bitcast(et))
+                raws.append(nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb + u) * P + e0[q]), dtype=it_ty, count=VS).bitcast(et))
         i = 0
         for u in cutlass.range_constexpr(UN):
             for q in cutlass.range_constexpr(VPT):
@@ -175,8 +198,7 @@ def _bn_flat(
         nb = nb + UN
     while nb < n1:
         for q in cutlass.range_constexpr(VPT):
-            xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb) * P + e0[q]),
-                               dtype=it_ty, count=VS).bitcast(et)
+            xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb) * P + e0[q]), dtype=it_ty, count=VS).bitcast(et)
             for e in cutlass.range_constexpr(VS):
                 x = xv[e].to(cutlass.Float32)
                 if cutlass.const_expr(STRADDLE):
@@ -227,12 +249,10 @@ def _bn_flat(
     # ---- grid barrier ----
     nvvm.fence_acq_rel(nvvm.MemScope.GPU)
     if tid == 0:
-        nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator, cutlass.Int32(1),
-                       mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
+        nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator, cutlass.Int32(1), mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
         done = False
         while not done:
-            v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator, cutlass.Int32(0),
-                               mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
+            v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator, cutlass.Int32(0), mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
             if v >= mRet[1]:
                 done = True
     nvvm.barrier_cta_sync_aligned(0)
@@ -263,7 +283,7 @@ def _bn_flat(
             stat[tid] = mn
             stat[CPB + tid] = rs
             if my == 0:
-                if pxl == px:   # the first position-tile covering c owns the publish
+                if pxl == px:  # the first position-tile covering c owns the publish
                     mSavedMean[c] = mn
                     mSavedRstd[c] = rs
                     if cutlass.const_expr(update_running):
@@ -297,9 +317,7 @@ def _bn_flat(
         raws = []
         for u in cutlass.range_constexpr(UN):
             for q in cutlass.range_constexpr(VPT):
-                raws.append(nvvm.load_ext(
-                    mXi.iterator + (cutlass.Int64(nb + u) * P + e0[q]),
-                    dtype=it_ty, count=VS).bitcast(et))
+                raws.append(nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb + u) * P + e0[q]), dtype=it_ty, count=VS).bitcast(et))
         i = 0
         for u in cutlass.range_constexpr(UN):
             for q in cutlass.range_constexpr(VPT):
@@ -314,14 +332,12 @@ def _bn_flat(
                         y = x * sl[q * NH] + sh[q * NH]
                     ys.append(y.to(et))
                 if okq[q]:
-                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                                   mYi.iterator + (cutlass.Int64(nb + u) * P + e0[q]))
+                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (cutlass.Int64(nb + u) * P + e0[q]))
                 i = i + 1
         nb = nb + UN
     while nb < n1:
         for q in cutlass.range_constexpr(VPT):
-            xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb) * P + e0[q]),
-                               dtype=it_ty, count=VS).bitcast(et)
+            xv = nvvm.load_ext(mXi.iterator + (cutlass.Int64(nb) * P + e0[q]), dtype=it_ty, count=VS).bitcast(et)
             ys = []
             for e in cutlass.range_constexpr(VS):
                 x = xv[e].to(cutlass.Float32)
@@ -333,44 +349,99 @@ def _bn_flat(
                     y = x * sl[q * NH] + sh[q * NH]
                 ys.append(y.to(et))
             if okq[q]:
-                nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                               mYi.iterator + (cutlass.Int64(nb) * P + e0[q]))
+                nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (cutlass.Int64(nb) * P + e0[q]))
         nb = nb + 1
 
     if cutlass.const_expr(KTR > 0):
         nvvm.barrier_cta_sync_aligned(0)
         if tid < 32:
-            nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32),
-                                 max(1, BT // 128) * KTR * VPT * VS, is_exclusive=False)
+            nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32), max(1, BT // 128) * KTR * VPT * VS, is_exclusive=False)
 
 
 @cute.jit
 def _bn_flat_host(
-    mX, mY, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-    N, mparts, momentum,
-    C: cutlass.Constexpr, S: cutlass.Constexpr, P: cutlass.Constexpr,
-    PV: cutlass.Constexpr, VS: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    BT: cutlass.Constexpr, CPB: cutlass.Constexpr, NPX: cutlass.Constexpr,
-    CHUNK: cutlass.Constexpr, KSR: cutlass.Constexpr, KTR: cutlass.Constexpr,
-    UN: cutlass.Constexpr, pparts: cutlass.Constexpr, it_ty: cutlass.Constexpr,
-    et: cutlass.Constexpr, Mf: cutlass.Constexpr, eps: cutlass.Constexpr,
-    has_beta: cutlass.Constexpr, update_running: cutlass.Constexpr,
-    STRADDLE: cutlass.Constexpr, smem_bytes: cutlass.Constexpr, mbpm: cutlass.Constexpr,
+    mX,
+    mY,
+    mG,
+    mB,
+    mP,
+    mRet,
+    mSavedMean,
+    mSavedRstd,
+    mRunMean,
+    mRunVar,
+    N,
+    mparts,
+    momentum,
+    C: cutlass.Constexpr,
+    S: cutlass.Constexpr,
+    P: cutlass.Constexpr,
+    PV: cutlass.Constexpr,
+    VS: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    CPB: cutlass.Constexpr,
+    NPX: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    KSR: cutlass.Constexpr,
+    KTR: cutlass.Constexpr,
+    UN: cutlass.Constexpr,
+    pparts: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    update_running: cutlass.Constexpr,
+    STRADDLE: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
+    mbpm: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
-    _bn_flat(mX, mXi, mY, mYi, mG, mB, mP, mRet, mSavedMean, mSavedRstd, mRunMean,
-             mRunVar, N, mparts, momentum, C, S, P, PV, VS, VPT, BT, CPB, NPX, CHUNK,
-             KSR, KTR, UN, it_ty, et, Mf, eps, has_beta, update_running, STRADDLE
-             ).launch(grid=(pparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes,
-                      cooperative=True, min_blocks_per_mp=mbpm)
+    _bn_flat(
+        mX,
+        mXi,
+        mY,
+        mYi,
+        mG,
+        mB,
+        mP,
+        mRet,
+        mSavedMean,
+        mSavedRstd,
+        mRunMean,
+        mRunVar,
+        N,
+        mparts,
+        momentum,
+        C,
+        S,
+        P,
+        PV,
+        VS,
+        VPT,
+        BT,
+        CPB,
+        NPX,
+        CHUNK,
+        KSR,
+        KTR,
+        UN,
+        it_ty,
+        et,
+        Mf,
+        eps,
+        has_beta,
+        update_running,
+        STRADDLE,
+    ).launch(grid=(pparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 _KCACHE = {}
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
-            running_var, cfg, params, knobs=None):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
     import torch
 
     N, C, S = int(spec.N), int(spec.C), int(spec.S)
@@ -397,17 +468,51 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean,
     pparts, mparts, CHUNK = g["pparts"], g["mparts"], g["chunk"]
     KSR = KTR = 0
     smem_bytes = 2 * CPB * 4 + BT * VPT * 4 + 4 * BT * VPT * 4 + 256
-    ce = (C, S, g["P"], g["PV"], VS, VPT, BT, CPB, g["NPX"], CHUNK, KSR, KTR, _UN,
-          pparts, it_ty, et, float(N * S), float(eps), has_beta, update_running,
-          g["straddle"], smem_bytes, 0)
+    ce = (
+        C,
+        S,
+        g["P"],
+        g["PV"],
+        VS,
+        VPT,
+        BT,
+        CPB,
+        g["NPX"],
+        CHUNK,
+        KSR,
+        KTR,
+        _UN,
+        pparts,
+        it_ty,
+        et,
+        float(N * S),
+        float(eps),
+        has_beta,
+        update_running,
+        g["straddle"],
+        smem_bytes,
+        0,
+    )
     key = (params.io_dtype, C, S, VPT, CPB, pparts, has_beta, update_running)
 
     pbuf = torch.empty(pparts * mparts * 2 * CPB, dtype=torch.float32, device=x3d.device)
     ret = torch.zeros(2, dtype=torch.int32, device=x3d.device)
     ret[1] = pparts * mparts
-    args = (dyn(xf), dyn(yf), dyn(gamma), dyn(beta), dyn(pbuf), dyn(ret),
-            dyn(saved_mean), dyn(saved_rstd), dyn(rm), dyn(rv),
-            cutlass.Int32(N), cutlass.Int32(mparts), cutlass.Float32(momentum))
+    args = (
+        dyn(xf),
+        dyn(yf),
+        dyn(gamma),
+        dyn(beta),
+        dyn(pbuf),
+        dyn(ret),
+        dyn(saved_mean),
+        dyn(saved_rstd),
+        dyn(rm),
+        dyn(rv),
+        cutlass.Int32(N),
+        cutlass.Int32(mparts),
+        cutlass.Float32(momentum),
+    )
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_bn_flat_host, *args, *ce)

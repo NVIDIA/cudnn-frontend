@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """BatchNorm forward, sm_100, CUTLASS primitives.
 
 BatchNorm reduces across the batch *per channel*: for channel ``c`` the group is
@@ -91,23 +94,48 @@ def _bn_fwd_kernel(
 
 @cute.jit
 def _bn_fwd_host(
-    mX, mY, mGamma, mBeta, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-    C: cutlass.Int32, N: cutlass.Int32, S: cutlass.Int32,
-    eps: cutlass.Float32, momentum: cutlass.Float32,
-    bt: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-    training: cutlass.Constexpr, update_running: cutlass.Constexpr,
+    mX,
+    mY,
+    mGamma,
+    mBeta,
+    mSavedMean,
+    mSavedRstd,
+    mRunMean,
+    mRunVar,
+    C: cutlass.Int32,
+    N: cutlass.Int32,
+    S: cutlass.Int32,
+    eps: cutlass.Float32,
+    momentum: cutlass.Float32,
+    bt: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    training: cutlass.Constexpr,
+    update_running: cutlass.Constexpr,
 ) -> None:
     _bn_fwd_kernel(
-        mX, mY, mGamma, mBeta, mSavedMean, mSavedRstd, mRunMean, mRunVar,
-        N, S, eps, momentum, bt, has_beta, training, update_running,
+        mX,
+        mY,
+        mGamma,
+        mBeta,
+        mSavedMean,
+        mSavedRstd,
+        mRunMean,
+        mRunVar,
+        N,
+        S,
+        eps,
+        momentum,
+        bt,
+        has_beta,
+        training,
+        update_running,
     ).launch(grid=(C, 1, 1), block=(bt, 1, 1))
 
 
 _KCACHE = {}
 
 
-def forward(spec, x3d, gamma, beta, *, eps, momentum, training,
-            running_mean=None, running_var=None, cfg, params):
+def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=None, running_var=None, cfg, params):
     """Launch BatchNorm forward. Returns ``(y, saved_mean, saved_rstd)``.
 
     When ``training`` and running tensors are supplied, they are updated in place.
@@ -129,10 +157,19 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training,
     saved_rstd = torch.empty(spec.C, dtype=torch.float32, device=x3d.device)
 
     args = (
-        dyn(x3d), dyn(y), dyn(gamma), dyn(beta),
-        dyn(saved_mean), dyn(saved_rstd), dyn(running_mean), dyn(running_var),
-        cutlass.Int32(spec.C), cutlass.Int32(spec.N), cutlass.Int32(spec.S),
-        cutlass.Float32(eps), cutlass.Float32(momentum),
+        dyn(x3d),
+        dyn(y),
+        dyn(gamma),
+        dyn(beta),
+        dyn(saved_mean),
+        dyn(saved_rstd),
+        dyn(running_mean),
+        dyn(running_var),
+        cutlass.Int32(spec.C),
+        cutlass.Int32(spec.N),
+        cutlass.Int32(spec.S),
+        cutlass.Float32(eps),
+        cutlass.Float32(momentum),
     )
     ce = (cfg.block_threads, has_beta, bool(training), update_running)
     key = (params.io_dtype,) + ce

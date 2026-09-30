@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """High-level torch-tensor dispatch for the sm_100 norm backward kernels.
 
 Takes ``dy`` plus the forward's saved ``x``, ``gamma``, ``mean``, ``rstd``,
@@ -71,22 +74,17 @@ def norm_bprop(
         cfg = make_cfg(params, spec.M, staged_rows=2)  # backward stages X and DY
         x2d = x.reshape(spec.R, spec.M)
         dy2d = dy.reshape(spec.R, spec.M)
-        dx, dgamma, dbeta = _ROWWISE_KERNEL[variant].backward(
-            spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params
-        )
+        dx, dgamma, dbeta = _ROWWISE_KERNEL[variant].backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
         return dx.reshape(x.shape), dgamma, dbeta
 
     if variant == NormVariant.BATCH_NORM:
         spec = batchnorm_spec(x.shape)
         params = TemplateParams(variant=variant, io_dtype=io, has_beta=has_beta)
         eb = DTYPE_BYTES[io]
-        cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb),
-                  stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
+        cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb), stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
         dy3d = dy.reshape(spec.N, spec.C, spec.S)
-        dx, dgamma, dbeta = batchnorm_sm100.backward(
-            spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params
-        )
+        dx, dgamma, dbeta = batchnorm_sm100.backward(spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
         return dx.reshape(x.shape), dgamma, dbeta
 
     raise ValueError(f"unknown norm variant {variant}")

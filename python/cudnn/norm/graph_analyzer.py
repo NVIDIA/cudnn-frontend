@@ -322,8 +322,7 @@ def resolve_variant_pack(variant_pack: dict, binding: NormBinding) -> dict:
     keyed by ``id(ir_tensor)``. Mirrors ``cudnn.sdpa.graph_analyzer``."""
     if not isinstance(variant_pack, dict):
         raise TypeError(
-            "cudnn.norm: compiled plans are called with a variant-pack dict "
-            f"{{cudnn_tensor | uid | name: buffer}}; got {type(variant_pack).__name__}"
+            "cudnn.norm: compiled plans are called with a variant-pack dict " f"{{cudnn_tensor | uid | name: buffer}}; got {type(variant_pack).__name__}"
         )
     bound = binding.bound_tensors()
     by_obj = {id(t): t for t in bound}

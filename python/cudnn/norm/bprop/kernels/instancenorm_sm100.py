@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """InstanceNorm backward, sm_100.
 
 InstanceNorm is GroupNorm with ``num_groups == C``; its backward reuses the
@@ -12,6 +15,4 @@ from . import groupnorm_sm100
 
 def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     """Launch InstanceNorm backward. Returns ``(dx, dgamma, dbeta)``."""
-    return groupnorm_sm100.backward(
-        spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params
-    )
+    return groupnorm_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)

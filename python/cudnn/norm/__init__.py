@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """cudnn.norm: normalization ops backed by sm_100 CUTLASS-primitive kernels.
 
 Five variants (LayerNorm, RMSNorm, GroupNorm, InstanceNorm, BatchNorm), both

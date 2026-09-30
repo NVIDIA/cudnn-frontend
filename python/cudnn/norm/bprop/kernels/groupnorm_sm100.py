@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """GroupNorm backward, sm_100, CUTLASS primitives.
 
 Same backward math as LayerNorm (see :mod:`layernorm_sm100`) with the same
@@ -171,15 +174,45 @@ def _gn_bwd_kernel(
 
 @cute.jit
 def _gn_bwd_host(
-    mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta,
-    R: cutlass.Int32, gps: cutlass.Int32, cpg: cutlass.Int32, span: cutlass.Int32,
-    M: cutlass.Constexpr, V: cutlass.Constexpr, bt: cutlass.Constexpr,
-    elem_bytes: cutlass.Constexpr, stage_mode: cutlass.Constexpr, vec: cutlass.Constexpr,
+    mDY,
+    mX,
+    mGamma,
+    mMean,
+    mRstd,
+    mDX,
+    mDGamma,
+    mDBeta,
+    R: cutlass.Int32,
+    gps: cutlass.Int32,
+    cpg: cutlass.Int32,
+    span: cutlass.Int32,
+    M: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    bt: cutlass.Constexpr,
+    elem_bytes: cutlass.Constexpr,
+    stage_mode: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
 ) -> None:
     _gn_bwd_kernel(
-        mDY, mX, mGamma, mMean, mRstd, mDX, mDGamma, mDBeta, gps, cpg, span,
-        M, V, bt, elem_bytes, stage_mode, vec, has_beta,
+        mDY,
+        mX,
+        mGamma,
+        mMean,
+        mRstd,
+        mDX,
+        mDGamma,
+        mDBeta,
+        gps,
+        cpg,
+        span,
+        M,
+        V,
+        bt,
+        elem_bytes,
+        stage_mode,
+        vec,
+        has_beta,
     ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
 
 
@@ -195,10 +228,18 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
 
     args = (
-        dyn(dy2d), dyn(x2d), dyn(gamma), dyn(mean), dyn(rstd),
-        dyn(dx), dyn(dgamma), dyn(dbeta),
-        cutlass.Int32(spec.R), cutlass.Int32(spec.groups_per_sample),
-        cutlass.Int32(spec.channels_per_group), cutlass.Int32(spec.gamma_inner_span),
+        dyn(dy2d),
+        dyn(x2d),
+        dyn(gamma),
+        dyn(mean),
+        dyn(rstd),
+        dyn(dx),
+        dyn(dgamma),
+        dyn(dbeta),
+        cutlass.Int32(spec.R),
+        cutlass.Int32(spec.groups_per_sample),
+        cutlass.Int32(spec.channels_per_group),
+        cutlass.Int32(spec.gamma_inner_span),
     )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, has_beta)
     key = (params.io_dtype,) + ce
