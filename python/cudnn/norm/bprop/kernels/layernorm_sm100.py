@@ -253,6 +253,7 @@ def _ln_bwd_pipe_kernel(
     block_threads: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
     cache_xd: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
@@ -263,9 +264,9 @@ def _ln_bwd_pipe_kernel(
     warp = tid // 32
     lane = tid % 32
     smem = SmemAllocator()
-    xbuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * C), byte_alignment=16)
-    dybuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * C), byte_alignment=16)
-    sG = smem.allocate_tensor(cutlass.Int16, cute.make_layout(C), byte_alignment=16)
+    xbuf = smem.allocate_tensor(it_ty, cute.make_layout(STAGES * C), byte_alignment=16)
+    dybuf = smem.allocate_tensor(it_ty, cute.make_layout(STAGES * C), byte_alignment=16)
+    sG = smem.allocate_tensor(it_ty, cute.make_layout(C), byte_alignment=16)
     red = None
     if cutlass.const_expr(wn > 1):
         red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(wn * (2 if has_mean else 1)), byte_alignment=8)
@@ -274,12 +275,12 @@ def _ln_bwd_pipe_kernel(
     if tid == 0:
         for j in cutlass.range_constexpr(2 * STAGES + 1):
             nvvm.mbarrier_init(mbar.iterator + j, 1)
-        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * 2)
-        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * 2)
+        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * eb)
+        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * eb)
     cute.arch.sync_threads()
     while not nvvm.mbarrier_try_wait_parity(mbar.iterator + GBAR, 0):
         pass
-    NB: cutlass.Constexpr = C * 2
+    NB: cutlass.Constexpr = C * eb
     stride = ctas
     Mf = cutlass.Float32(C)
     rn = 1.0 / Mf
@@ -464,6 +465,7 @@ def _ln_bwd_pipe_host(
     block_threads: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
     cache_xd: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
@@ -495,6 +497,7 @@ def _ln_bwd_pipe_host(
         block_threads,
         et,
         it_ty,
+        eb,
         STAGES,
         cache_xd,
         has_mean,
@@ -529,6 +532,7 @@ def _ln_bwd_tiled_kernel(
     RPT: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
@@ -537,20 +541,20 @@ def _ln_bwd_tiled_kernel(
     lane = tid % 32
     TC: cutlass.Constexpr = RPT * C
     smem = SmemAllocator()
-    xbuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * TC), byte_alignment=16)
-    dybuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * TC), byte_alignment=16)
-    sG = smem.allocate_tensor(cutlass.Int16, cute.make_layout(C), byte_alignment=16)
+    xbuf = smem.allocate_tensor(it_ty, cute.make_layout(STAGES * TC), byte_alignment=16)
+    dybuf = smem.allocate_tensor(it_ty, cute.make_layout(STAGES * TC), byte_alignment=16)
+    sG = smem.allocate_tensor(it_ty, cute.make_layout(C), byte_alignment=16)
     mbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout(2 * STAGES + 1), byte_alignment=8)
     GBAR: cutlass.Constexpr = 2 * STAGES
     if tid == 0:
         for j in cutlass.range_constexpr(2 * STAGES + 1):
             nvvm.mbarrier_init(mbar.iterator + j, 1)
-        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * 2)
-        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * 2)
+        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * eb)
+        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * eb)
     cute.arch.sync_threads()
     while not nvvm.mbarrier_try_wait_parity(mbar.iterator + GBAR, 0):
         pass
-    NB: cutlass.Constexpr = TC * 2
+    NB: cutlass.Constexpr = TC * eb
     ntiles = R // RPT
     stride = ctas
     Cf = cutlass.Float32(C)
@@ -643,6 +647,7 @@ def _ln_bwd_tiled_host(
     RPT: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
     FB: cutlass.Constexpr,
     fgrid: cutlass.Constexpr,
@@ -668,6 +673,7 @@ def _ln_bwd_tiled_host(
         RPT,
         et,
         it_ty,
+        eb,
         STAGES,
     ).launch(grid=(ctas, 1, 1), block=(64, 1, 1), smem=smem_bytes)
     _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
@@ -679,11 +685,11 @@ _SM_COUNT = None
 _KPIPE = {}
 
 
-def _pipe_bwd_smem(C, wn, STAGES):
-    return 2 * STAGES * C * 2 + C * 2 + wn * 8 + (2 * STAGES + 1) * 8 + 64
+def _pipe_bwd_smem(C, wn, STAGES, eb):
+    return 2 * STAGES * C * eb + C * eb + wn * 8 + (2 * STAGES + 1) * 8 + 64
 
 
-def _bwd_cache_xd(ldgs, V, R, C, has_beta, wn):
+def _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb):
     """Whether pass2 caches xhat/dxhat in registers (skips the smem re-read). Costs
     (2+npb)*ldgs*V fp32 regs and lowers occupancy, so it's a win only when enough
     occupancy remains to hide latency at this work size. The crossover scales with the
@@ -694,7 +700,7 @@ def _bwd_cache_xd(ldgs, V, R, C, has_beta, wn):
     npb = 2 if has_beta else 1
     if (2 + npb) * ldgs * V > 120:
         return False
-    occ = max(1, _PIPE_SMEM_MAX // _pipe_bwd_smem(C, wn, 3))
+    occ = max(1, _PIPE_SMEM_MAX // _pipe_bwd_smem(C, wn, 3, eb))
     return R * C <= 24 * 1024 * 1024 * occ
 
 
@@ -735,15 +741,15 @@ def _bwd_pipe_cfg(C, eb):
     return (tpr, wn, ldgs, V)
 
 
-def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta):
+def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
     # Use the ACTUAL stage count (cached -> 3) so the smem bound matches what the kernel
     # allocates -- a fixed STAGES=3 bound would wrongly reject non-cached large C
     # (llama31 C=16384 actually runs at 2 = 160KB, but 3 = 229KB > cap).
-    STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta, wn))
-    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES) <= _PIPE_SMEM_MAX
+    STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb))
+    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES, eb) <= _PIPE_SMEM_MAX
 
 
-def _pipe_bwd_cap(R, wn, C, cache_xd):
+def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
     global _SM_COUNT
     if _SM_COUNT is None:
         import torch
@@ -760,7 +766,7 @@ def _pipe_bwd_cap(R, wn, C, cache_xd):
         #             (mixtral C4096 -> 3x) and larger C fewer (nemotronh C8192 -> 1x).
         #   rows   -- keep >=~6 rows/CTA so the software pipeline amortizes its prologue
         #             (8 was too aggressive -- capped deepseek-2048 to 1x vs its 2x opt).
-        smem = _pipe_bwd_smem(C, wn, 3)
+        smem = _pipe_bwd_smem(C, wn, 3, eb)
         occ = max(1, _PIPE_SMEM_MAX // smem)
         budget = max(1, (2 * 1024 * 1024) // (NSM * C))
         rows = max(1, R // (NSM * 6))
@@ -778,10 +784,11 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 
     tpr, wn, ldgs, V = wcfg
     R, C = spec.R, spec.M
-    cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta, wn)
+    eb = DTYPE_BYTES[params.io_dtype]
+    cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb)
     STAGES = _pipe_bwd_actual_stages(cache_xd)
     block_threads = (wn + 1) * 32
-    ctas = _pipe_bwd_cap(R, wn, C, cache_xd)
+    ctas = _pipe_bwd_cap(R, wn, C, cache_xd, eb)
     if mean is None:
         mean = rstd
 
@@ -800,8 +807,8 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     dbp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
-    it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
-    smem_bytes = _pipe_bwd_smem(C, wn, STAGES)
+    it_ty = _INT_TY[eb]
+    smem_bytes = _pipe_bwd_smem(C, wn, STAGES, eb)
     FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB
     # split the finalize's partition reduction across the y-grid so it isn't stuck on
@@ -812,7 +819,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     CHUNK = (ctas + nchunk - 1) // nchunk
 
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
-    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, cache_xd, spec.has_mean, has_beta, nchunk, CHUNK)
     fn = _KPIPE.get(key)
     if fn is None:
@@ -832,10 +839,11 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
 
     tpr, wn, ldgs, V = wcfg
     R, C = spec.R, spec.M
+    eb = DTYPE_BYTES[params.io_dtype]
     STAGES = 2
     RPT = 1
     for r in (8, 4, 2):
-        if R % r == 0 and 2 * STAGES * r * C * 2 <= _PIPE_SMEM_MAX:
+        if R % r == 0 and 2 * STAGES * r * C * eb <= _PIPE_SMEM_MAX:
             RPT = r
             break
     ntiles = R // RPT
@@ -853,10 +861,10 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
     if nchunk > ctas:
         nchunk = ctas
     CHUNK = (ctas + nchunk - 1) // nchunk
-    smem_bytes = 2 * STAGES * RPT * C * 2 + C * 2 + (2 * STAGES + 1) * 8 + 64
+    smem_bytes = 2 * STAGES * RPT * C * eb + C * eb + (2 * STAGES + 1) * 8 + 64
 
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma), cutlass.Int32(R), cutlass.Int32(ctas))
-    ce = (C, V, tpr, ldgs, RPT, et, it_ty, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    ce = (C, V, tpr, ldgs, RPT, et, it_ty, eb, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = ("tiled", params.io_dtype, C, V, tpr, ldgs, RPT, nchunk, CHUNK)
     fn = _KTILED.get(key)
     if fn is None:
@@ -886,7 +894,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0):
         # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline
         return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg)
-    if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta):
+    if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta, DTYPE_BYTES[params.io_dtype]):
         return _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg)
 
     if mean is None:  # RMSNorm has no centering; kernel ignores it when has_mean=False
