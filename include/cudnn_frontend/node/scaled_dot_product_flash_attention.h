@@ -2530,6 +2530,19 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
 #endif
         }
 
+        // dBias: gradient of the additive bias in the score-modifier subgraph (cuDNN 9.28.0).
+        if (has_output(output_names::dBias)) {
+            auto v928_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                      "dBias in the unified SDPA backward node requires cuDNN 9.28.0"};
+#if (CUDNN_VERSION >= 92800)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92800, v928_error);
+            CHECK_CUDNN_FRONTEND_ERROR(
+                set_tensor_desc(attributes.outputs, output_names::dBias, CUDNN_ATTR_OPERATION_SDPA_BWD_DBIAS_DESC));
+#else
+            return v928_error;
+#endif
+        }
+
         // Sink token, packed token totals and the score-modifier subgraph need cuDNN 9.21.0.
         bool const has_sink = has_input(input_names::SINK_TOKEN) || has_output(output_names::DSINK_TOKEN);
         bool const has_max_total =

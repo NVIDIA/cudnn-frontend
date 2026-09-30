@@ -1062,8 +1062,8 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             if (unified_sink_ok) {
                 allowed_input_names.insert(input_names::SINK_TOKEN);
             }
-            // Additive bias is applied to the recomputed scores in the kernel; its gradient (dBias) has no
-            // backend counterpart yet, so graphs that request dBias keep routing to the composite path.
+            // Additive bias is applied to the recomputed scores in the kernel; its gradient (dBias) is a node
+            // output backed by the same cuDNN release.
             bool const unified_bias_ok = effective_cudnn_ver >= 92800;
             if (unified_bias_ok) {
                 allowed_input_names.insert(input_names::Bias);
@@ -1085,10 +1085,14 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             if (unified_sink_ok) {
                 allowed_output_names.insert(output_names::DSINK_TOKEN);
             }
+            if (unified_bias_ok) {
+                allowed_output_names.insert(output_names::dBias);
+            }
             for (const auto& [key, value] : outputs) {
                 if (allowed_output_names.find(key) == allowed_output_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV, dSink"};
+                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV, dSink, "
+                            "dBias"};
                 }
             }
 

@@ -30,6 +30,7 @@ def make_config(
     s_q=512,
     s_kv=512,
     with_sink_token=False,
+    is_bias=False,
 ):
     cfg = ExecConfig(
         data_type=data_type,
@@ -38,7 +39,7 @@ def make_config(
         is_alibi=is_alibi,
         is_infer=is_infer,
         is_paged=False,
-        is_bias=False,
+        is_bias=is_bias,
         is_block_mask=False,
         is_padding=False,
         is_cu_seq_len=False,
@@ -112,6 +113,24 @@ def test_sdpa_dropout_bwd_unified(data_type, right_bound, s_q_s_kv, request, cud
     )
     # The unified forward does not generate Stats with dropout, so the forward runs on AUTO (composite) and only
     # the backward is pinned to the unified node.
+    cfg.bwd_implementation = cudnn.attention_implementation.UNIFIED
+    exec_sdpa(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("right_bound", [None, 0], ids=["no_mask", "causal"])
+@pytest.mark.parametrize("s_q_s_kv", [(512, 512), (300, 200)], ids=["s512", "s300x200"])
+def test_sdpa_dbias_bwd_unified(data_type, right_bound, s_q_s_kv, request, cudnn_handle):
+    """Bias gradient on the unified SDPA backward node, compared against the reference dBias."""
+    cfg = make_config(
+        data_type=data_type,
+        is_infer=False,
+        is_bias=True,
+        right_bound=right_bound,
+        s_q=s_q_s_kv[0],
+        s_kv=s_q_s_kv[1],
+    )
     cfg.bwd_implementation = cudnn.attention_implementation.UNIFIED
     exec_sdpa(cfg, request, cudnn_handle)
 

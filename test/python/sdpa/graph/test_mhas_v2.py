@@ -279,7 +279,10 @@ def test_sdpa_random_bwd_unified_L0(env_info, test_no, request, cudnn_handle):
 
     test.cfg.is_infer = False
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
-    test.cfg.with_dbias = False  # bias input only: dBias has no unified backend counterpart yet
+    # Half the bias draws also request dBias (drawn after the config, so the geometry of existing seeds is unchanged).
+    # The unified backward serves dBias on its SM80/SM90 variants (SM80 on Blackwell-class devices); graphs it cannot
+    # serve are waived as unsupported like the other draws.
+    test.cfg.with_dbias = bool(test.cfg.is_bias) and rng.random() < 0.5
     if test.cfg.is_dropout:
         # The unified forward does not generate Stats with dropout: run the forward on AUTO, pin only the backward.
         test.cfg.dropout_prob = 0.1

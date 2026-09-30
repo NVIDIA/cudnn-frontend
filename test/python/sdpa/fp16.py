@@ -545,8 +545,8 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
     bias_dim = (1, cfg.h_q, cfg.s_q, cfg.s_kv)
     bias_stride = (cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1)
     bias = graph.tensor(uid=int(TensorUid.bias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias else None
-    # with_dbias=False requests the bias input without its gradient (the unified backward applies the bias but has no
-    # dBias output yet); the dBias comparison below is skipped when the tensor is absent.
+    # with_dbias=False requests the bias input without its gradient; the dBias comparison below is skipped when the
+    # tensor is absent.
     dBias = graph.tensor(uid=int(TensorUid.dBias), dim=bias_dim, stride=bias_stride, data_type=cudnn_dtype) if cfg.is_bias and getattr(cfg, "with_dbias", True) and not(cfg.d_qk == 256 and cfg.d_v == 256) else None
     cfg.has_dbias = dBias is not None  # the allocation table always holds a dBias buffer; key the checks on the graph tensor
 
