@@ -390,6 +390,10 @@ lse = result["lse"]
 
 ### 5. Indexer Top-K
 
+For caller-owned output and allocation-free prepared BF16 execution on SM103
+and SM107, see [Prepared BF16 Indexer Top-K](indexer_top_k_varlen.md).
+That API also accepts a compression ratio in its eligible-length calculation.
+
 Radix top-K kernel for selecting candidate KV indices from indexer scores,
 with variable per-row effective length.
 

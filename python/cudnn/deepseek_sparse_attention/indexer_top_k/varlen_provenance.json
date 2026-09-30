@@ -1,0 +1,66 @@
+{
+  "contract": {
+    "alignment_bytes": 16,
+    "capabilities": [
+      [
+        10,
+        3
+      ],
+      [
+        10,
+        7
+      ]
+    ],
+    "cols": [
+      1,
+      262144
+    ],
+    "compress_ratio": [
+      1,
+      2147483647
+    ],
+    "length_dtype": "Int32, effective arithmetic signed Int64",
+    "nans": "unsupported within the effective eligible prefix; ignored outside it, including empty rows",
+    "next_n": "positive divisor of rows",
+    "output_dtype": "Int32",
+    "rows": [
+      1,
+      512
+    ],
+    "score_dtype": "BF16",
+    "ties": "unordered largest-value multiset; signed zeros are equal numerically",
+    "top_k": [
+      512,
+      1024,
+      2048
+    ],
+    "workspace_bytes": 0
+  },
+  "controlled_host_changes": [
+    "Add mandated _topk_kernel.set_name_prefix(\"cudnn\", remove_cutlass_symbol=True) immediately after device function.",
+    "Replace sample-tensor compile with metadata-only typed pointers and runtime Int32 row count. Construct compact score/length/output views in compiled host; N/K/NN/CR and all parent resource choices remain constexpr.",
+    "Preserve fixed declared shapes per API plan. Exclude runtime row/batch extents from compiled artifact key; share code across separate compatible plans.",
+    "Use existing compile_cached with module source digest, primitive parameters, explicit actual operand architecture and device ordinal; check executable positional entry.",
+    "Add DSL >=4.7 gate and SM107 >=4.8/target-support gate before private kernel import.",
+    "Validate current dtype/shape/contiguity/device, lazy flags, pointer alignment, observed storage spans and output aliases; no data reads, conversions, adapter kernels or GPU allocations in prepared build/execute.",
+    "Use shared stream_context/as_torch_stream including default sentinels. Record current operand allocations on launch stream, retain no tensors/pointers/streams or GPU workspace.",
+    "Provide separate allocating TupleDict wrapper and lazy public exports; existing IndexerTopK compute and API untouched."
+  ],
+  "frontend_base_commit": "c92f95a266c1c73741221c711c652c9abe4e3276",
+  "implementation": "Original indices-only BF16 variable-length Top-K; additive cuDNN Frontend prepared API",
+  "parent": {
+    "safe_kernel_sha256": "444f9f9500ee165d6b581c4f9c4bf43fee4876fe1b033e94e3fdb154610b9529",
+    "safety_repairs_already_in_parent": [
+      "Atomic publication of shared candidate overflow",
+      "Three speculative cached-load addresses clamped to initialized entries"
+    ]
+  },
+  "performance": "Performance depends on hardware, geometry, length distribution and cache regime; measure the public API for the intended workload.",
+  "preservation": "Exact source bytes from THREADS constants through decorated _topk_kernel definition; formatting disabled for this block.",
+  "preserved_device_block_sha256": "b3604b564b55375aa1195b95b883f50a5770623bf6609b0cfcba58d262804101",
+  "schema": 1,
+  "sources": {
+    "varlen_api.py": "b8f334dd39b6bf1be826a205bac1f82f590700161b853608eab2b4c02aa6c4dd",
+    "varlen_kernel.py": "9336c3dd3dbe5e7fba2fd428e23ba2edd54217372fec21d671b21a8bcf98bcfd"
+  }
+}

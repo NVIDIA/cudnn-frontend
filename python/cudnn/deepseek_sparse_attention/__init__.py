@@ -18,6 +18,8 @@ _SYMBOLS = {
     "compress_topk_cand_buffer_size": (".indexer_forward", "compress_topk_cand_buffer_size"),
     "compress_topk_cand_buffer_size_thd": (".indexer_forward", "compress_topk_cand_buffer_size_thd"),
     "IndexerTopK": (".indexer_top_k", "IndexerTopK"),
+    "IndexerTopKVarlen": (".indexer_top_k", "IndexerTopKVarlen"),
+    "indexer_top_k_varlen_wrapper": (".indexer_top_k", "indexer_top_k_varlen_wrapper"),
     "indexer_top_k_wrapper": (".indexer_top_k", "indexer_top_k_wrapper"),
     "local_to_global_wrapper": (".indexer_top_k", "local_to_global_wrapper"),
     "compactify_wrapper": (".indexer_top_k", "compactify_wrapper"),
