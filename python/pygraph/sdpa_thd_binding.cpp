@@ -127,24 +127,39 @@ enum HostSlot : size_t {
     VTablePtr,
     TableStrides,
     NumPages,
-    VTableStrides,
     OPartialPtr,
     LSEPartialPtr,
     PartialOStrides,
     NumHostSlots
 };
-constexpr std::array<const char *, NumHostSlots> host_slot_names = {
-    "q_ptr",           "k_ptr",           "v_ptr",
-    "o_ptr",           "q_strides",       "k_strides",
-    "v_strides",       "o_strides",       "thd_q_lens_ptr",
-    "thd_kv_lens_ptr", "lse_ptr",         "lse_ext",
-    "problem_size",    "sinks_ptr",       "meta_ptr",
-    "o_desc_ptr",      "stream",          "scale_softmax_log2",
-    "n_thd_units",     "block_table_ptr", "block_table_v_ptr",
-    "table_strides",   "n_pages",         "table_v_strides",
-    "o_partial_ptr",   "lse_partial_ptr", "partial_o_strides"};
-constexpr std::array<HostSlot, 4> pointer_slots = {QPtr, KPtr, VPtr, OPtr};
-constexpr std::array<HostSlot, 4> stride_slots  = {QStrides, KStrides, VStrides, OStrides};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
+                                                                    "k_ptr",
+                                                                    "v_ptr",
+                                                                    "o_ptr",
+                                                                    "q_strides",
+                                                                    "k_strides",
+                                                                    "v_strides",
+                                                                    "o_strides",
+                                                                    "thd_q_lens_ptr",
+                                                                    "thd_kv_lens_ptr",
+                                                                    "lse_ptr",
+                                                                    "lse_ext",
+                                                                    "problem_size",
+                                                                    "sinks_ptr",
+                                                                    "meta_ptr",
+                                                                    "o_desc_ptr",
+                                                                    "stream",
+                                                                    "scale_softmax_log2",
+                                                                    "n_thd_units",
+                                                                    "block_table_ptr",
+                                                                    "block_table_v_ptr",
+                                                                    "table_strides",
+                                                                    "n_pages",
+                                                                    "o_partial_ptr",
+                                                                    "lse_partial_ptr",
+                                                                    "partial_o_strides"};
+constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
+constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
 class SdpaThdBinder {
    public:
@@ -206,15 +221,9 @@ class SdpaThdBinder {
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
-            if (!paged_ && slot >= KTablePtr && slot <= VTableStrides) continue;
+            if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             if (splits_ == 1 && slot >= OPartialPtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
-            if (slot == VTableStrides && found == order.end()) {
-                // Existing half hosts share one K/V table-stride pair. Newer
-                // hosts may expose a separate V pair; retain that ABI choice.
-                index_[slot] = template_.size();
-                continue;
-            }
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -560,10 +569,8 @@ class SdpaThdBinder {
     bind_paged(py::tuple &frame, const std::vector<NativeOperandView> &facts, int64_t b) const {
         const auto &kt = required(facts, KTable), &vt = required(facts, VTable);
         const auto kg = table_geometry(kt, KTable, b), vg = table_geometry(vt, VTable, b);
-        if (kg.pages != vg.pages) invalid("paged K/V tables must share max_pages");
-        const bool separate_v_strides = index_[VTableStrides] < template_.size();
-        if (!separate_v_strides && (kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride))
-            invalid("this prepared host requires matching K/V table strides");
+        if (kg.pages != vg.pages || kg.batch_stride != vg.batch_stride || kg.page_stride != vg.page_stride)
+            invalid("paged K/V tables must share max_pages and strides");
         const auto ks = pool_geometry(facts[K], K), vs = pool_geometry(facts[V], V);
         if (facts[K].shape[0] != facts[V].shape[0]) invalid("K and V pools must hold the same number of pages");
         put(frame, KStrides, py::make_tuple(ks[0], ks[1], ks[2]));
@@ -571,7 +578,6 @@ class SdpaThdBinder {
         put(frame, KTablePtr, py::int_(kt.pointer));
         put(frame, VTablePtr, py::int_(vt.pointer));
         put(frame, TableStrides, py::make_tuple(kg.batch_stride, kg.page_stride));
-        if (separate_v_strides) put(frame, VTableStrides, py::make_tuple(vg.batch_stride, vg.page_stride));
         put(frame, NumPages, py::int_(facts[K].shape[0]));
         return multiply(kg.pages, page_size_);
     }
