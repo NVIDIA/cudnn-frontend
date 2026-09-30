@@ -223,6 +223,81 @@ def test_norm_custom_ops_compile(op_name):
     torch.testing.assert_close(actual, eager, atol=0.015625, rtol=0.015625)
 
 
+@pytest.mark.L0
+@pytest.mark.skipif(cudnn.backend_version() < 80906, reason="Normalization ops require cuDNN >= 8.9.6")
+@pytest.mark.parametrize("op_name,has_bias", [("layernorm", True), ("rmsnorm", False), ("rmsnorm", True)])
+def test_norm_ordered_bindings_rebind_and_replay(op_name, has_bias, monkeypatch):
+    """Reuse graphs with fresh operands and epsilon, then replay changed device data."""
+    import importlib
+
+    module = importlib.import_module(f"cudnn.ops.norm.{op_name}")
+    monkeypatch.setattr(module, "_fprop_cache", module.GraphCache())
+    monkeypatch.setattr(module, "_bprop_cache", module.GraphCache())
+    original_execute = cudnn.pygraph.execute
+
+    def execute(graph, values, workspace, *, handle, tensor_uids=None):
+        assert isinstance(values, (list, tuple)), "normalization wrapper rebuilt a UID mapping"
+        return original_execute(graph, values, workspace, handle=handle, tensor_uids=tensor_uids)
+
+    monkeypatch.setattr(cudnn.pygraph, "execute", execute)
+    torch.manual_seed(763)
+
+    def inputs():
+        x = torch.randn(8, 64, 1, 1, dtype=torch.float32, device="cuda")
+        scale = torch.randn(1, 64, 1, 1, dtype=torch.float32, device="cuda")
+        bias = torch.randn_like(scale) if has_bias else None
+        return x, scale, bias, torch.randn_like(x)
+
+    def run(values, eps):
+        x, scale, bias, dy = values
+        if op_name == "layernorm":
+            y, mean, inv_var = torch.ops.cudnn.layernorm(x, scale, bias, eps)
+            grads = torch.ops.cudnn.layernorm_bwd(dy, x, scale, mean, inv_var)
+            return (y, mean, inv_var, *grads)
+        y, inv_var = torch.ops.cudnn.rmsnorm(x, scale, eps, bias)
+        dx, dscale, dbias = torch.ops.cudnn.rmsnorm_bwd(dy, x, scale, inv_var, has_bias)
+        return (y, inv_var, dx, dscale, *((dbias,) if has_bias else ()))
+
+    def check(values, eps, actual):
+        x, scale, bias, dy = values
+        x_ref, scale_ref = (value.detach().clone().requires_grad_(True) for value in (x, scale))
+        bias_ref = bias.detach().clone().requires_grad_(True) if has_bias else None
+        if op_name == "layernorm":
+            mean = x_ref.mean(dim=1, keepdim=True)
+            inv_var = torch.rsqrt((x_ref - mean).square().mean(dim=1, keepdim=True) + eps)
+            y = (x_ref - mean) * inv_var * scale_ref + bias_ref
+            stats = (mean, inv_var)
+        else:
+            inv_var = torch.rsqrt(x_ref.square().mean(dim=1, keepdim=True) + eps)
+            y = x_ref * inv_var * scale_ref
+            if has_bias:
+                y = y + bias_ref
+            stats = (inv_var,)
+        targets = (x_ref, scale_ref, *((bias_ref,) if has_bias else ()))
+        grads = torch.autograd.grad(y, targets, dy)
+        for result, reference in zip(actual, (y, *stats, *grads)):
+            torch.testing.assert_close(result, reference, atol=1e-5, rtol=1e-5)
+
+    first = inputs()
+    check(first, 1e-5, run(first, 1e-5))
+    second = inputs()
+    # Epsilon is a CPU pass-by-value operand and may change without rebuilding.
+    eps = 0.125
+    check(second, eps, run(second, eps))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run(second, eps)
+        third = inputs()
+        for target, source in zip(second, third):
+            if target is not None:
+                target.copy_(source)
+        graph.replay()
+        check(second, eps, captured)
+    finally:
+        graph.reset()
+
+
 @pytest.mark.L1
 @pytest.mark.parametrize("op_name", ["layer_norm", "rms_norm"])
 def test_norm_custom_ops_are_thread_and_stream_safe(op_name):
