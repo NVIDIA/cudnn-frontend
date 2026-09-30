@@ -1086,6 +1086,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._thd_lse_token_major: bool = False
         self._thd_lse_head_stride: int = 0
         self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
+        self._thd_head_strides: dict = {}  # port role -> the caller's head stride (plan-time; D when compact)
 
     @staticmethod
     def _thd_total(capacity: int, declared: Optional[int]) -> int:
@@ -1107,13 +1108,14 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     @staticmethod
     def _packed_bshd(desc: TensorDesc) -> bool:
         """True when a logical-BHSD desc sits on PACKED BSHD rows the kernels can
-        bind directly: head stride D, element stride 1, and a token stride that
-        covers the row (``>= H*D``) and keeps every row 16-byte aligned (a
-        multiple of 8 fp16/bf16 elements -- the cp.async loads move 16-byte
-        chunks).  The token stride need not be compact: the kernels address a
-        row as ``token * token_stride + head * D`` with the port's own plan-time
-        stride, so a view into a wider per-token record (a K/V slice of an
-        interleaved ``[T, 2, H, D]`` buffer) is served at that stride.  The
+        bind directly: element stride 1, head stride ``>= D`` and token stride
+        ``>= H * head_stride``, each a multiple of 8 fp16/bf16 elements so every
+        head base stays 16-byte aligned (the cp.async loads move 16-byte
+        chunks).  Neither need be compact: the kernels address a row as
+        ``token * token_stride + head * head_stride`` with the port's own
+        plan-time strides, so a view into a wider per-token record (a K/V slice
+        of an interleaved ``[T, 2, H, D]`` buffer) or a head-interleaved record
+        is served at those strides.  The
         batch stride is not consulted -- a ragged port's sequences start at the
         ragged offsets, and the packed view rebuilds that axis from the token
         extent.  The token stride is always checked (the packed view walks every
@@ -1121,7 +1123,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         strides wildcard on a size-1 extent (the analyzer's convention)."""
         _, h, _, d = (int(x) for x in desc.shape)
         st = tuple(int(x) for x in desc.stride)
-        return (int(desc.shape[1]) == 1 or st[1] == d) and st[2] >= h * d and st[2] % 8 == 0 and (d == 1 or st[3] == 1)
+        hs = st[1] if h > 1 else d
+        head_ok = h == 1 or (hs >= d and hs % 8 == 0)
+        return head_ok and st[2] >= h * hs and st[2] % 8 == 0 and (d == 1 or st[3] == 1)
 
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided Stats/LSE buffer and return the
@@ -1233,9 +1237,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             # No staging leg: the kernels bind the caller's packed rows directly,
             # each port at its own plan-time token stride (the compiled fake
             # carries it).  Anything the row arithmetic cannot express -- a
-            # head stride other than D, a token stride below the row or off
-            # 16-byte alignment -- is a decline here, not a silent mis-bind.
+            # head or token stride below its extent or off 16-byte alignment --
+            # is a decline here, not a silent mis-bind.
             self._thd_token_strides = {}
+            self._thd_head_strides = {}
             for role, desc in (
                 ("q", self.q_desc),
                 ("k", self.k_desc),
@@ -1248,10 +1253,11 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             ):
                 self._value_error_if(
                     not self._packed_bshd(desc),
-                    f"SM80 bwd THD: {desc.name} must be packed BSHD rows (head stride D, element stride 1, "
-                    f"token stride >= H*D and a multiple of 8 elements); got {tuple(desc.stride)} (the packed path has no staging copy)",
+                    f"SM80 bwd THD: {desc.name} must be packed BSHD rows (element stride 1, head stride >= D and "
+                    f"token stride >= H * head stride, each a multiple of 8 elements); got {tuple(desc.stride)} (the packed path has no staging copy)",
                 )
                 self._thd_token_strides[role] = int(desc.stride[2])
+                self._thd_head_strides[role] = int(desc.stride[1]) if int(desc.shape[1]) > 1 else int(desc.shape[3])
             self._t_q_cap = self._thd_total(int(b) * int(s_qo), self.max_total_seq_len_q)
             self._t_kv_cap = self._thd_total(int(b) * int(s_kv), self.max_total_seq_len_kv)
             self._value_error_if(self._t_q_cap <= 0 or self._t_kv_cap <= 0, "SM80 bwd THD: the packed token capacities must be > 0")
@@ -1880,8 +1886,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # when the caller omits it. Default it here, as the SM120 and SM80
         # adapters do -- without this the row admits the graph, check_support
         # passes, and execute dies on `None * log2(e)`. Found by review on the
-        # d512 bring-up PR; regression test `test_default_attn_scale`.
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        # d512 bring-up PR; regression test `test_default_attn_scale`.  ONLY
+        # None defaults: an explicit attn_scale = 0.0 is a valid declared scale
+        # the analyzer preserves (uniform P -> dQ = dK = 0, dV = sum(dO) / S_kv);
+        # `or == 0.0` here ran it at 1/sqrt(d) (Codex on #1212, same clause in
+        # the sm107 adapter; host pin test_sdpa_bwd_dsl_sm107.py::
+        # test_explicit_zero_attn_scale_survives_the_adapters).
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape. The kernel's grid and workspace are tiled,
         # so a sequence length that is not a multiple runs on the next multiple

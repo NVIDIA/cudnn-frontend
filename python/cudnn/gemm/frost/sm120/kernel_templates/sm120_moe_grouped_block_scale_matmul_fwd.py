@@ -448,7 +448,6 @@ def _kernel(
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
         lane = cute.arch.lane_idx()
-        gemm_s = cutlass.Int32(M)
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         linear_idx = cutlass.Int32(0)
@@ -486,10 +485,7 @@ def _kernel(
                     if my_group < num_groups:
                         if my_group != 0:
                             my_begin = cutlass.Int32(first_token_arr[my_group])
-                        if my_group + 1 < num_groups:
-                            my_end = cutlass.Int32(first_token_arr[my_group + 1])
-                        else:
-                            my_end = gemm_s
+                        my_end = cutlass.Int32(first_token_arr[my_group + 1])
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * tiles_along_n
                         my_sf_blocks = cute.ceil_div(my_end - my_begin, 128)
                     prefix_tiles = my_tiles
@@ -1275,7 +1271,7 @@ def compile() -> Callable:
 
     fake_first_token_offset = make_fake_compact_tensor(
         offset_cutlass_dtype,
-        (sym_g,),
+        (cute.sym_int64(),),
         stride_order=(0,),
         assumed_align=offset_cutlass_dtype.width // 8,
     )

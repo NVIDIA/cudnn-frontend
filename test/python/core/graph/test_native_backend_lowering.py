@@ -182,11 +182,13 @@ def test_native_moe_grouped_matmul_lowers_to_backend():
     h = _handle()
     E, T, Wt, Hd = 8, 256, 64, 128
     fto = [i * (T // E) for i in range(E)]  # one contiguous token chunk per expert
+    if cudnn.backend_version() >= 92800:
+        fto.append(T)
 
     g = pygraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tok = g.tensor(dim=[1, T, Hd], stride=[T * Hd, Hd, 1], data_type=cudnn.data_type.BFLOAT16)
     wt = g.tensor(dim=[E, Hd, Wt], stride=[Hd * Wt, 1, Hd], data_type=cudnn.data_type.BFLOAT16)
-    off = g.tensor(dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    off = g.tensor(dim=[len(fto), 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(tok, wt, off, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT)
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
@@ -204,7 +206,7 @@ def test_native_moe_grouped_matmul_lowers_to_backend():
     token = tok_d.view(T, Hd).float()
     weight = torch.as_strided(wt_d.float(), (E, Hd, Wt), (Hd * Wt, 1, Hd))
     ref = torch.empty(T, Wt)
-    bounds = fto + [T]
+    bounds = fto + ([T] if len(fto) == E else [])
     for e in range(E):
         s, en = bounds[e], bounds[e + 1]
         if en > s:

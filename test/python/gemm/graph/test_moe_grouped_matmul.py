@@ -38,7 +38,7 @@ def get_compute_capability() -> int:
 #   weight  [E, H, N] stride [H*N, 1, H]  -> weight[e,h,n] = data[e*H*N + h + n*H]
 #                                             i.e. expert block is column-major [H,N]
 #   output  [1, T, N] row-major          -> output[t, n]  = data[t*N + n]
-# Expert e owns token rows [offset[e], offset[e+1]) with offset[E] := T.
+# Expert e owns [offset[e], offset[e+1]); an omitted final endpoint is T.
 # This turns the previously execute-only harness into a checked one, so silent
 # wrong-result / grouped-offset / empty-expert defects (NVBug 6192149-class,
 # 5921085 scatter OOB) are actually caught.
@@ -54,7 +54,7 @@ def _expert_weight_HN(weight_data, e, H, N):
 def moe_fwd_reference(token_data, weight_data, offsets, E, T, H, N):
     tok = token_data.view(T, H).float()
     out = torch.zeros(T, N, dtype=torch.float32, device=token_data.device)
-    bounds = list(offsets) + [T]
+    bounds = list(offsets) + ([T] if len(offsets) == E else [])
     for e in range(E):
         lo, hi = bounds[e], bounds[e + 1]
         if hi > lo:
@@ -66,7 +66,7 @@ def moe_bwd_reference(doutput_data, token_data, offsets, E, T, H, N):
     """dweight[e] = token[e-rows]^T @ doutput[e-rows], returned as [E, H, N] (column-major flat)."""
     tok = token_data.view(T, H).float()
     do = doutput_data.view(T, N).float()
-    bounds = list(offsets) + [T]
+    bounds = list(offsets) + ([T] if len(offsets) == E else [])
     dw = torch.zeros(E, H, N, dtype=torch.float32, device=token_data.device)
     for e in range(E):
         lo, hi = bounds[e], bounds[e + 1]
@@ -134,6 +134,8 @@ def test_bf16_moe_grouped_matmul_fwd(cudnn_handle):
         1800,
         1900,
     ]
+    if cudnn.backend_version() >= 92800:
+        first_token_offset_values.append(token_num)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -157,10 +159,9 @@ def test_bf16_moe_grouped_matmul_fwd(cudnn_handle):
         data_type=cudnn.data_type.BFLOAT16,
     )
 
-    # first_token_offset: [E, 1, 1], INT32
     tensor_first_token_offset = graph.tensor(
         name="first_token_offset",
-        dim=[num_experts, 1, 1],
+        dim=[len(first_token_offset_values), 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )
@@ -273,6 +274,8 @@ def test_bf16_moe_grouped_matmul_bwd(cudnn_handle):
         1800,
         1900,
     ]
+    if cudnn.backend_version() >= 92800:
+        first_token_offset_values.append(token_num)
 
     graph = cudnn.pygraph(
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -296,10 +299,9 @@ def test_bf16_moe_grouped_matmul_bwd(cudnn_handle):
         data_type=cudnn.data_type.BFLOAT16,
     )
 
-    # first_token_offset: [E, 1, 1], INT32
     tensor_first_token_offset = graph.tensor(
         name="first_token_offset",
-        dim=[num_experts, 1, 1],
+        dim=[len(first_token_offset_values), 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )
@@ -312,8 +314,7 @@ def test_bf16_moe_grouped_matmul_bwd(cudnn_handle):
         compute_data_type=cudnn.data_type.FLOAT,
         name="moe_grouped_matmul_bwd",
     )
-    # dweight shape [E, H, N] is inferred; column-major stride [H*N, 1, H]
-    tensor_dweight.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+    tensor_dweight.set_dim([num_experts, hidden_size, weight_size]).set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
     graph.validate()
     graph.build_operation_graph()
@@ -383,6 +384,8 @@ def test_bf16_moe_grouped_matmul_fwd_randomized(cudnn_handle, seed):
     offsets = _rand_offsets(num_experts, token_num, rng)
     if seed % 2 == 0 and num_experts >= 2:
         offsets[1] = 0  # expert 0 empty
+    if cudnn.backend_version() >= 92800:
+        offsets.append(token_num)
 
     torch.manual_seed(seed)
 
@@ -405,7 +408,7 @@ def test_bf16_moe_grouped_matmul_fwd_randomized(cudnn_handle, seed):
     )
     tensor_first_token_offset = graph.tensor(
         name="first_token_offset",
-        dim=[num_experts, 1, 1],
+        dim=[len(offsets), 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )

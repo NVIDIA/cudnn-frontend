@@ -562,6 +562,112 @@ def test_epsilon_equivalence(C):
 # Main — run representative configs when executed directly
 # ============================================================
 
+
+# ============================================================
+# CUDA graphs: stream capture and the native CUDA graph API
+# ============================================================
+
+
+def _built_oss_graph(num_tokens, C):
+    graph, X, scale, epsilon, Z = _build_rmsnorm_silu_graph(num_tokens, C)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
+    graph.check_support()
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+    return graph, X, scale, epsilon, Z
+
+
+def _run_donor_graph(C, handle):
+    """Build and run a second, unrelated OSS graph: it loads a fresh kernel library, which
+    is what reuses the resources of a library that was unloaded too early."""
+    num_tokens = 1560
+    graph, X, scale, epsilon, Z = _built_oss_graph(num_tokens, C)
+    x = torch.randn(num_tokens, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(1, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    z = torch.empty(num_tokens, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    eps = torch.full((1, 1, 1, 1), 1e-6, dtype=torch.float32, device="cpu")
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute({X: x, scale: w, epsilon: eps, Z: z}, workspace, handle=handle)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
+def test_stream_captured_graph_outlives_the_cudnn_graph():
+    """A CUDA graph captured from execute() keeps launching the engine's kernel after the
+    cudnn graph (the only owner of the engine and its loaded kernel library) is gone."""
+    import gc
+
+    torch.manual_seed(0)
+    C, num_tokens = 256, 1560
+    eps = 1e-6 / C
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
+    reference = rmsnorm_silu_reference(x, weight, eps)
+    z = torch.empty(num_tokens, C, dtype=torch.bfloat16, device="cuda")
+
+    stream = torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=stream.cuda_stream)
+
+    graph, X, scale, epsilon, Z = _built_oss_graph(num_tokens, C)
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    variant_pack = {
+        X: x.view(num_tokens, C, 1, 1),
+        scale: weight.view(1, C, 1, 1),
+        epsilon: torch.full((1, 1, 1, 1), eps, dtype=torch.float32, device="cpu"),
+        Z: z.view(num_tokens, C, 1, 1),
+    }
+    with torch.cuda.stream(stream):
+        graph.execute(variant_pack, workspace, handle=handle)  # warm-up, outside the capture
+    stream.synchronize()
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cuda_graph, stream=stream):
+        graph.execute(variant_pack, workspace, handle=handle)
+
+    del graph, X, scale, epsilon, Z, variant_pack
+    gc.collect()
+
+    for donor_C in (512, 1024, 64):
+        _run_donor_graph(donor_C, handle)
+        z.zero_()
+        cuda_graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isclose(z.float(), reference.float(), atol=2e-2, rtol=2e-2).all(), f"replay after donor C={donor_C} is wrong"
+
+    del cuda_graph
+    cudnn.destroy_handle(handle)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
+def test_native_cuda_graph_api_is_rejected():
+    """The OSS engine has no cuDNN execution plan to insert into a CUDA graph; populate and
+    update must say so instead of reaching for one."""
+    from cuda.bindings import runtime as cudart
+
+    C, num_tokens = 256, 1560
+    graph, X, scale, epsilon, Z = _built_oss_graph(num_tokens, C)
+    x = torch.randn(num_tokens, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(1, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    z = torch.empty(num_tokens, C, 1, 1, dtype=torch.bfloat16, device="cuda")
+    eps = torch.full((1, 1, 1, 1), 1e-6, dtype=torch.float32, device="cpu")
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    uid_to_ptr = {t.get_uid(): buf.data_ptr() for t, buf in ((X, x), (scale, w), (epsilon, eps), (Z, z))}
+    handle = cudnn.create_handle()
+    err, cuda_graph = cudart.cudaGraphCreate(0)
+    assert err == cudart.cudaError_t.cudaSuccess
+    try:
+        for api in ("populate_cuda_graph", "update_cuda_graph"):
+            with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="not backed by a cuDNN execution plan"):
+                getattr(graph, api)(handle, uid_to_ptr, workspace.data_ptr(), int(cuda_graph))
+    finally:
+        cudart.cudaGraphDestroy(cuda_graph)
+        cudnn.destroy_handle(handle)
+
+
 if __name__ == "__main__":
     if not _is_blackwell():
         print("Skipping — requires SM100 (Blackwell)")

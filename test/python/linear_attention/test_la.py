@@ -837,7 +837,8 @@ def test_bwd_split_initial_state(backend, variant):
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
     tensors = case_tensors(case)
     dO, grads = None, {}
-    for tag, kw in (("split", {}), ("uncut", {"batch_invariant": True})):
+    split_kw = {"enable_gate_decay_split": True} if variant == "kda" else {}
+    for tag, kw in (("split", split_kw), ("uncut", {"batch_invariant": True})):
         leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors.values()]
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):
@@ -863,7 +864,8 @@ def test_bwd_split_d_final_state(backend, variant, V):
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
     tensors = case_tensors(case)
     dO, dFinal, grads = None, None, {}
-    for tag, kw in (("split", {}), ("uncut", {"batch_invariant": True})):
+    split_kw = {"enable_gate_decay_split": True} if variant == "kda" else {}
+    for tag, kw in (("split", split_kw), ("uncut", {"batch_invariant": True})):
         leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors.values()]
         s0 = state0.detach().clone().requires_grad_(True)
         with waive_unsupported(backend, variant):

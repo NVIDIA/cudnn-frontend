@@ -965,7 +965,7 @@ def _build_multi_moe_chain(
             raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
-    num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
+    num_groups = int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0
     offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
 
     # Resolve each moe operand through any dequant, then dedup by PACKED data
@@ -1053,6 +1053,8 @@ def _build_multi_moe_chain(
         if _moe_geometry(a_ids[ai], b_ids[bi]) != geom0:
             raise ValueError("parallel MoE grouped matmuls must share shape / layout / dtype " "/ expert count; heterogeneous GEMMs are out of POC scope")
     M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
+    if E < 1 or num_groups < 1 or num_groups % E:
+        raise NotImplementedError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
     if moe_ops[0].moe_mode == "scatter":
         top_k = moe_ops[0].top_k
         if not isinstance(top_k, int) or top_k < 1 or top_k > E or M % top_k:

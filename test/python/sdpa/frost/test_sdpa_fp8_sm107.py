@@ -12,6 +12,8 @@ here happens before any compile). End-to-end coverage rides the existing
 is present (Rubin included) through the same adapter.
 """
 
+import re
+
 import pytest
 
 from frost_test_utils import requires_dsl
@@ -536,6 +538,27 @@ def test_fp8_envelope_mismatch_rules():
 
 
 # --- KV split on Rubin -------------------------------------------------------
+
+
+@pytest.mark.parametrize("pertensor", [True, False], ids=["fp8", "mxfp8"])
+def test_sm107_quantized_d512_o_store_levers(pertensor):
+    """The quantized d512 kernels stream their O TMA store per published chunk and pipeline the epilogue's TMEM readout behind
+    two bool module constants, ``O_STORE_STREAM`` / ``O_EPI_PIPELINE`` (both shipped True; either False is develop's form), through
+    the library op ``tile_dsl.tma.tma_store_subtile`` and the shared ``o_epilogue_convert_store`` -- no in-file copy of either.
+    The full source + SASS pins live in test_sdpa_fwd_dsl_sm107.py (test_sm107_d512_o_store_*); this row keeps the fp8 suite's
+    d512 coverage honest about the levers its kernels carry."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    mod = _load_sm100_kernel_module((512, 512), TemplateParams(dtype_qkv=_E4M3, dtype_o=_E4M3, cta_mma=2), fp8=True, pertensor=pertensor, rubin=True)
+    assert "sm107" in mod.__name__ and "d512" in mod.__name__
+    assert mod.O_STORE_STREAM is True and mod.O_EPI_PIPELINE is True
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = "\n".join(ln for ln in fh.read().splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count("O_STORE_STREAM: bool = ") == 1 and code.count("O_EPI_PIPELINE: bool = ") == 1
+    assert "tma_store_subtile(" in code and "o_epilogue_convert_store(" in code
+    assert "def _tma_store_subtile" not in code and "def _o_epi_convert_store" not in code
+    # fp8 O: an O block is 64 fp32 registers, so the pipelined batch must be ONE block (2 = 256 live registers = spills)
+    assert "O_EPI_LD_BATCH_FP32 = 64" in code and re.search(r"max\(\s*1,\s*O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE\s*\)", code)
 
 
 def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():

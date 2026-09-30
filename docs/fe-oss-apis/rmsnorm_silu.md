@@ -161,8 +161,12 @@ graph.execute(
 )
 ```
 
+### CUDA graphs
+
+`execute()` can be recorded with CUDA stream capture. The captured CUDA graph holds a reference to the engine, so the engine's runtime-compiled kernel stays loaded for as long as the CUDA graph, its clones, or any executable graph instantiated from it exist, even after the cuDNN graph is destroyed. The native CUDA graph API (`populate_cuda_graph()` / `update_cuda_graph()`) is not supported for this engine, since it has no cuDNN execution plan to insert; those calls fail with `GRAPH_NOT_SUPPORTED`.
+
 ---
 
 ## Tests
 
-- **`test/python/norm/graph/test_sm100_rms_norm_silu_graph_api.py`** — Full 120-config sweep (bf16 + FP8 + NVFP4) of the optimized problem shapes for VAE on B200
+- **`test/python/norm/graph/test_sm100_rms_norm_silu_graph_api.py`** — Full 120-config sweep (bf16 + FP8 + NVFP4) of the optimized problem shapes for VAE on B200, plus CUDA graph stream capture and native CUDA graph API behavior

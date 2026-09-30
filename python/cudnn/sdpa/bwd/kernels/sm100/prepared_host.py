@@ -11,7 +11,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
-from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import dot_do_o_host, dkv_reduce_host
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
 

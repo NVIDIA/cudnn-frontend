@@ -128,11 +128,11 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.pointwise import (
     exp2_mixed,
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.0: the MASK_NONE fast path uses manual tcgen05_ld + row_max_reduction.
+    # cc10.3+ (FUSED_LDTM_STAT) fuses load + row-max into tmem_load_max_reduction_x64.
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
     fp32_to_e2m1_pack,
@@ -211,6 +211,11 @@ _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N
 _E2E_CHUNK = CFG.TILE_N // CFG.N_BMM2_CHUNKS
 _E2E_ENABLED = bool(PARAMS.exp2_fma_split)
+# LDTM.STAT -- fused ``tcgen05.ld.red.f32.max`` (S_acc load + row-max in one op) --
+# is a cc10.3+ capability; cc10.0 lacks it and keeps the manual tcgen05_ld +
+# software row_max_reduction (default 0).  api_dsl sets it from the device
+# capability at compile time; a distinct value is a distinct specialization.
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # Emulated columns per row (32 of CFG.TILE_N=128 with the gate on, 0 off): the MUFU.EX2 the softmax
 # still issues per row per KV step is the alpha exp2 plus the non-emulated columns (97 on, 129 off).
 _E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
@@ -1646,7 +1651,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
-    tmem_ptr_i32,
+    tmem_base,
     bars,
     q_abs,
     eff_seqlen_kv,
@@ -1678,7 +1683,6 @@ def _softmax_kv_body(
     RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
-    tmem_base = tmem_ptr_i32.load()
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
     p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
     stats_addr = tmem_base + cutlass.Int32(stats_off)
@@ -1718,8 +1722,21 @@ def _softmax_kv_body(
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3+: fused HW row-max -- one tcgen05.ld.red.f32.max per 64-col chunk
+        # does the S_acc load AND the row-max in one op, returning 64 data regs
+        # plus the max at index CHUNK, dropping the software max tree.
+        # Unmasked tiles only: the fused .max reduces before a mask could be
+        # applied, so masked tiles keep the software path above.
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(N_CHUNKS)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
-        # SM100: manual row-max (no LDTM.STAT / tmem_load_max_reduction_tile) —
+        # cc10.0: manual row-max (no LDTM.STAT / tmem_load_max_reduction_x64) --
         # the masked path's pattern sans mask.  S_acc is FP32 regardless of dtype.
         raw_chunks = [
             nvvm.tcgen05_ld(
@@ -1738,10 +1755,6 @@ def _softmax_kv_body(
     # size= explicit — Vector.shape[0] is MLIR-typed after vec_concat.
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2
-
-    # sync the warpgroups before the stat-store.
-    if sub_tile_id == 1:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     # Online softmax with RESCALE_THRESHOLD skip.
     old_total_max = total_max
@@ -1775,6 +1788,17 @@ def _softmax_kv_body(
     # the same factor, so normalization cancels it (see P_CAST_LOG2_SCALE).
     reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
+    # Exp-burst mutual exclusion between the two softmax warpgroups (FA4-style
+    # ping-pong).  The two softmax warps on each SM sub-partition share ONE
+    # MUFU pipe: with both bursts in flight each runs at half rate and the
+    # S -> softmax -> P -> PV chain of every sub-tile stretches by a full burst
+    # (measured: the tensor pipe sat at 57 % vs cuDNN's 67 % on B300 fp8, with
+    # the softmax warps' biggest stall being the wait for S).  Named barrier 8
+    # admits WG0's burst, 9 admits WG1's; each WG arrives on the other's after
+    # its last exp2 (below), and WG1 arrives once on 8 before its loop as the
+    # bootstrap.  The S load, row-max and alpha publish above stay outside the
+    # gate so they overlap the other WG's burst.
+    nvvm.barrier_cta_sync(barrier_id=8 + sub_tile_id, thread_count=256)
     chunk_S_0 = reg_S[0:CHUNK].vec
     # exp2 split: the _E2E_PAIRS[chunk] columns on the FMA pipe, the rest on MUFU (see _E2E_FREQ).  Gated per arch
     # at trace time (_E2E_ENABLED): off, both chunks are the plain MUFU exp2 -- the develop spelling.
@@ -1782,6 +1806,8 @@ def _softmax_kv_body(
         chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK)
     else:
         chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    if cutlass.const_expr(N_CHUNKS != 2):
+        cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
     # Hoist chunk-0 sum before cast to overlap with cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
@@ -1800,6 +1826,8 @@ def _softmax_kv_body(
             deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
             deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        # Burst done: admit the other warpgroup's burst.
+        cute.arch.barrier_arrive(barrier_id=8 + (1 - sub_tile_id), number_of_threads=256)
         chunk_P_1_fp8 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
@@ -1811,9 +1839,6 @@ def _softmax_kv_body(
         )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-    if sub_tile_id == 0:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
@@ -1850,6 +1875,15 @@ def _softmax_warp_group(
     """
     # Wait on MMA's TMEM-publish bar BEFORE tmem_ptr_i32.load() — else stale base.
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+    if sub_tile_id == 1:
+        # Ping-pong bootstrap: WG0's first exp burst is admitted by WG1 (see
+        # _softmax_kv_body); every later admission comes from the other WG's
+        # burst end, so the two bursts alternate for the whole kernel.
+        cute.arch.barrier_arrive(barrier_id=8, number_of_threads=256)
+    # The base is published once and never changes: load it here, not per KV
+    # iteration (the per-iteration LDS + R2UR sat on the critical path right
+    # before every LDTM of S).
+    tmem_base_sm = tmem_ptr_i32.load()
 
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
@@ -1927,7 +1961,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1947,7 +1981,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1966,7 +2000,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -1985,7 +2019,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
-                    tmem_ptr_i32,
+                    tmem_base_sm,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -2122,14 +2156,13 @@ def _correction_warp_group(
         else:
             bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
+        tmem_base_iter = tmem_ptr_i32.load()  # published once; hoisted out of the KV loop
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
-            tmem_base_iter = tmem_ptr_i32.load()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 stats_off = LAYOUT.STATS_OFF + qs * LAYOUT.STATS_STRIDE
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
 
                 bars.mb_stat_full[qs].wait(stat_full_phase)
-
                 stats_addr = tmem_base_iter + cutlass.Int32(stats_off)
                 stats_vec = nvvm.tcgen05_ld(
                     "32x32b",
