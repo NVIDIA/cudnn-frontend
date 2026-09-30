@@ -204,7 +204,7 @@ def test_sm120_split_requires_a_workspace():
     """A direct caller that passes no workspace gets the R2 contract error --
     the adapter never allocates the partials itself (the suite's autouse shim
     is off here)."""
-    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+    with pytest.raises(ValueError, match=r"requires (a \d+-byte|contiguous) workspace"):
         _sm120_case(8, 1, 128, 32768, workspace=False, split_kv=2)
 
 

@@ -2295,6 +2295,7 @@ def _execute_rubin_mxfp8_glu(api, p, parameters):
         amax_tensor=p["amax"],
         norm_const_tensor=p["norm"],
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        workspace=ws(api),
         **rubin_mxfp8_weight_arguments(p),
         **parameters,
     )
