@@ -74,7 +74,11 @@ def main(batch: int = 1, seq_len: int = 512) -> None:
 
     # Declare the TRAINING forward, compile once, size the workspace (no slab and no O in it: the record holds them).
     blk = GatedAttentionBlockFwd(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, geom, save_for_backward=True)
-    blk.check_support()
+    try:
+        blk.check_support()  # a typed decline (an engine or feature this device / build does not serve) is a SKIP, not a failure
+    except NotImplementedError as exc:
+        print(f"[00] SKIP  gated attention block training forward: declined by check_support(): {exc}")
+        return
     blk.compile()
     workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
 
