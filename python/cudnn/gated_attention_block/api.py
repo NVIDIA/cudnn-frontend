@@ -816,7 +816,7 @@ def _plan_workspace(
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
-    ``want_saved`` / ``saved_gate_copy`` (appended, PR-G0): the TRAINING forward
+    ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
     (``save_for_backward=True``; bf16 / fp16 and out of place -- a quantized or
     in-place training carve is a typed ``ValueError`` here, mirroring the block's
     own declaration declines).  ``o`` is NOT reserved (the SDPA writes the
@@ -1084,29 +1084,40 @@ class SavedForBackward:
 
     A field left ``None`` means "recompute me", and the backward decides how
     from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy` --
-    EXCEPT ``rstd_q`` / ``rstd_k``, which are ``None`` iff
+    with two exceptions.  ``rstd_q`` / ``rstd_k`` are ``None`` iff
     ``geometry.qk_norm`` is False: there is no RMSNorm, stage (B6) does not
-    exist, and nothing could recompute them. The forward REQUIRES them to be
-    ``None`` in that case (and tensors otherwise), both directions typed.
+    exist, and nothing could recompute them; the forward REQUIRES them to be
+    ``None`` in that case (and tensors otherwise), both directions typed.  And
+    in the proj_slab save mode ``gate`` / ``q_pre`` / ``k_pre`` left ``None``
+    mean "a band of ``proj_slab``" (:func:`saved_slab_views` derives them, no
+    recompute) -- the only mode in which ``gate`` may be ``None`` at all.
     """
 
     h: torch.Tensor
-    gate: torch.Tensor  # compact [B,S,H_q,D], or a column VIEW of proj_slab (see saved_slab_views)
-    o: torch.Tensor  # PRE-gate O, compact [B,S,H_q,D]; the SDPA writes it directly under save_for_backward
+    # Compact [B,S,H_q,D] (the gate-copy save mode), or the GATE column VIEW of proj_slab (see saved_slab_views).  None is
+    # legal ONLY in the proj_slab save mode, where the band is derivable -- saved_slab_views(proj_slab, geometry, B, S)[1]
+    # -- so the record ALWAYS carries the GATE one way or the other (api_bwd.RecomputePolicy.RECOMPUTE_GATE stays reserved).
+    # Type widened from torch.Tensor: append-only compatible, the positional slot is unchanged.
+    gate: Optional[torch.Tensor]
+    o: torch.Tensor  # PRE-gate O, compact [B,S,H_q,D], 16-B aligned; the SDPA writes it directly under save_for_backward
     lse: torch.Tensor  # [B,H_q,S] fp32 natural log
     rstd_q: Optional[torch.Tensor]  # None iff geometry.qk_norm is False (positional slot kept: append-only)
     rstd_k: Optional[torch.Tensor]  # idem
     q_pre: Optional[torch.Tensor] = None
     k_pre: Optional[torch.Tensor] = None
-    # APPENDED (PR-G0). The caller-owned stage-(1) output, [B*S, n_qkvg] or [B, S, n_qkvg], act dtype, contiguous.
-    # When given: the forward's projection GEMM writes it (per-call pointer bind, zero copies) and gate / q_pre /
-    # k_pre / V are its column bands at geometry.qkvg_offsets -- pass them as saved_slab_views(...) or leave them
-    # None and let the backward derive them.  When None: the forward copies the GATE band into `gate` (compact)
-    # and q_pre / k_pre stay None unless the caller passes buffers for them (then they are copied too).
+    # APPENDED. The caller-owned stage-(1) output, [B*S, n_qkvg] or [B, S, n_qkvg], act dtype, contiguous, 16-B
+    # aligned.  The SAVE MODE is declared on the block -- GatedAttentionBlockFwd(saved_gate_copy=), because the workspace
+    # carve differs -- and execute() verifies the record agrees with it (a typed ValueError either way):
+    #   * proj_slab mode (saved_gate_copy=False, the default): proj_slab is REQUIRED.  The forward's projection GEMM
+    #     writes it (per-call pointer bind, zero copies) and gate / q_pre / k_pre / V are its column bands at
+    #     geometry.qkvg_offsets -- pass them as saved_slab_views(...) or leave them None and let the backward derive them.
+    #   * gate-copy mode (saved_gate_copy=True): proj_slab must be None.  The slab stays in the workspace and the forward
+    #     copies the GATE band into `gate` (compact); q_pre / k_pre stay None unless the caller passes buffers for them
+    #     (then they are copied too).
     proj_slab: Optional[torch.Tensor] = None
-    # APPENDED (PR-G0). The `seq_lens` tensor the forward was EXECUTED with (the same object; no copy, no D2H read), or None
+    # APPENDED. The `seq_lens` tensor the forward was EXECUTED with (the same object; no copy, no D2H read), or None
     # for a dense forward.  Lets the backward decline padding at check_support() time instead of silently consuming a save
-    # set whose dead entries carry O = 0 / LSE = -inf (review, lenses 1 + 3).  The record is frozen, so the CALLER puts it
+    # set whose dead entries carry O = 0 / LSE = -inf.  The record is frozen, so the CALLER puts it
     # here and the forward VERIFIES identity (execute: `saved.seq_lens is seq_lens`), the way saved.h and lse are verified.
     seq_lens: Optional[torch.Tensor] = None
 
@@ -1116,9 +1127,9 @@ def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeome
     head stride ``d_head``), each ``[B, S, heads, D]``.  No copy, no allocation.  The block's execute verifies that a
     SavedForBackward built from these aliases proj_slab (data_ptr + shape + strides), typed ValueError otherwise.
 
-    ``proj_slab`` is the caller's ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous stage-(1) output in the activation
-    dtype -- the slab :class:`GatedAttentionBlockFwd` writes under ``save_for_backward`` in the proj_slab save mode.
-    A wrong element count or a non-contiguous slab is a typed ``ValueError``.
+    ``proj_slab`` is the caller's ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous, 16-B-aligned stage-(1) output in
+    the activation dtype -- the slab :class:`GatedAttentionBlockFwd` TMA-stores under ``save_for_backward`` in the
+    proj_slab save mode.  A wrong element count, a non-contiguous or a misaligned slab is a typed ``ValueError``.
     """
     b, s = int(batch), int(seq_len)
     t, n, d = b * s, geometry.n_qkvg, geometry.d_head
@@ -1132,6 +1143,8 @@ def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeome
             f"proj_slab must be contiguous (the projection GEMM writes it as ONE row-major [B*S, n_qkvg] slab), got shape "
             f"{tuple(proj_slab.shape)} strides {tuple(proj_slab.stride())}"
         )
+    if proj_slab.data_ptr() % 16:
+        raise ValueError(f"proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={proj_slab.data_ptr():#x}")
     proj = proj_slab.view(t, n)
     # `_cols` gives the [T, h, d] band at token stride n; splitting T into (B, S) is a legal `.view` on it (dim-0 stride n
     # -> (S*n, n)), so every band keeps proj_slab's storage.
@@ -3788,8 +3801,11 @@ class GatedAttentionBlockFwd(APIBase):
 
     @staticmethod
     def _check_saved_tensor(name: str, ten, shape: tuple, dtype: torch.dtype, device, *, contiguous: bool = True) -> None:
-        """One caller-owned buffer of the record: a tensor of exactly ``shape`` / ``dtype`` on ``device`` (and compact when
-        ``contiguous``), typed and naming the field -- no launch, no device read."""
+        """One caller-owned buffer of the record: a tensor of exactly ``shape`` / ``dtype`` on ``device`` (compact when
+        ``contiguous``) whose base is 16-B aligned -- every one of them is a TMA-store or a 16-B vector-store target, and a
+        misaligned base (a ``[1:]`` slice of a caller arena passes count / dtype / contiguity) would fail UNTYPED at the
+        tensor-map encode or the launch, after earlier stages ran; the package precedent is ``kernels/proj_gemm.py``'s
+        output checks and :func:`_check_sf_blob`.  Typed and naming the field -- no launch, no device read."""
         if not isinstance(ten, torch.Tensor):
             raise ValueError(f"{name} must be a caller-owned {list(shape)} {dtype} tensor on {device}, got {type(ten).__name__}")
         if tuple(int(x) for x in ten.shape) != tuple(shape):
@@ -3800,6 +3816,8 @@ class GatedAttentionBlockFwd(APIBase):
             raise ValueError(f"{name} must live on h's device {device}, got {ten.device}")
         if contiguous and not ten.is_contiguous():
             raise ValueError(f"{name} must be contiguous (compact, the layout the kernels write), got strides {tuple(ten.stride())}")
+        if ten.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned (a TMA-store / 16-B vector-store target), got data_ptr={ten.data_ptr():#x}")
 
     def _check_saved_set(
         self, h: torch.Tensor, seq_lens: Optional[torch.Tensor], lse: Optional[torch.Tensor], saved: Optional[SavedForBackward]
@@ -3809,20 +3827,25 @@ class GatedAttentionBlockFwd(APIBase):
         device, and it runs on a DECLARED (uncompiled) block, so the contract is testable on any device.  ``execute``
         calls it BEFORE its first launch.
 
-        The contracts (IMPL § 1.1 items 1-7):
+        The contracts:
 
-        1. ``saved.rstd_q`` / ``rstd_k`` are tensors iff ``geometry.qk_norm`` (both directions).
+        1. ``saved.rstd_q`` / ``rstd_k`` are tensors iff ``geometry.qk_norm`` (both directions) -- and then ``[B, S, H_q]`` /
+           ``[B, S, H_kv]`` fp32 compact: the norm kernel writes them through raw fp32 pointer arithmetic over ``[T, H]``.
         2. ``saved.h`` IS ``h`` (same storage) -- the backward reads it for the projection wgrad and the Q/K recompute.
         3. ``saved.seq_lens`` IS the ``seq_lens`` this execute runs with (``is``, or both ``None``): the backward's
-           declaration-time padding decline (D5) rests on this identity, without a D2H read.
+           declaration-time padding decline rests on this identity, without a D2H read.
         4. ``saved.lse`` is ``[B, H_q, S]`` fp32 compact; ``lse=None`` defaults to it and an explicit ``lse`` must be that
            same storage (the SDPA adapter requires an LSE tensor once compiled with one).
         5. ``saved.o`` is compact ``[B, S, H_q, D]`` in the activation dtype: the SDPA writes the PRE-gate O there.
         6. proj_slab mode (``saved_gate_copy=False``): ``saved.proj_slab`` is REQUIRED (``B*S x n_qkvg`` elements, act dtype,
            contiguous, on ``h``'s device) and becomes the stage-(1) output; ``saved.gate`` / ``q_pre`` / ``k_pre``, when
-           given, must alias it exactly as :func:`saved_slab_views` spells (data_ptr, dtype, shape AND strides).
+           given, must alias it exactly as :func:`saved_slab_views` spells (data_ptr, dtype, shape AND strides) -- each may
+           be ``None`` here, the backward derives it from the slab.
         7. gate-copy mode (``saved_gate_copy=True``): ``saved.proj_slab`` must be ``None``, ``saved.gate`` is a compact
            ``[B, S, H_q, D]`` caller buffer the GATE band is copied into; ``q_pre`` / ``k_pre`` are copied only if given.
+        8. Every caller buffer a kernel WRITES -- ``proj_slab``, ``o``, ``lse``, ``rstd_*``, the gate-copy targets -- is
+           16-B aligned (:meth:`_check_saved_tensor`): they are TMA-store / 16-B vector-store targets, and a misaligned
+           base fails untyped at the tensor-map encode or the launch, after stage (1) already ran.
         """
         if saved is None:
             raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
@@ -3831,6 +3854,10 @@ class GatedAttentionBlockFwd(APIBase):
         if g.qk_norm:
             if saved.rstd_q is None or saved.rstd_k is None:
                 raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
+            # The norm kernel writes rstd by raw fp32 pointer arithmetic over [T, H]: a wrong count, dtype or layout here
+            # is a device OOB write or silently misplaced values, never an error.
+            self._check_saved_tensor("saved.rstd_q", saved.rstd_q, (b, s, g.h_q), torch.float32, dev)
+            self._check_saved_tensor("saved.rstd_k", saved.rstd_k, (b, s, g.h_kv), torch.float32, dev)
         elif saved.rstd_q is not None or saved.rstd_k is not None:
             raise ValueError(
                 "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
@@ -3898,6 +3925,8 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if ps.device != dev:
             raise ValueError(f"saved.proj_slab must live on h's device {dev}, got {ps.device}")
+        if ps.data_ptr() % 16:
+            raise ValueError(f"saved.proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={ps.data_ptr():#x}")
         want_q, want_gate, want_k, _want_v = saved_slab_views(ps, g, b, s)
         for nm, given, want in (("gate", saved.gate, want_gate), ("q_pre", saved.q_pre, want_q), ("k_pre", saved.k_pre, want_k)):
             if given is None:

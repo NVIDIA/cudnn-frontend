@@ -39,7 +39,12 @@ def pytest_collection_modifyitems(config, items):
     level (``test_block_end_to_end.py``, ``test_block_fp8.py``, ``test_block_mxfp8.py``, ``test_sdpa_stage_sm107.py``,
     ``test_proj_gemm.py``, ...); those stay as they are.  New modules spell ``requires_rubin = pytest.mark.requires_rubin``
     (a REGISTERED marker, see ``pytest_configure``) and get the same skip from here -- one definition of "Rubin" for
-    every module that lands from now on, instead of a copy per file."""
+    every module that lands HERE from now on, instead of a copy per file.
+
+    SCOPE: the modules under THIS directory (``test/python/gated_attention_block/cutedsl/``, where every gated-block
+    CuTeDSL module lives) -- pytest registers and applies the marker from this conftest only.  A module elsewhere that
+    spells ``@pytest.mark.requires_rubin`` gets an unregistered-marker warning and NO skip (its Rubin accept tests would
+    RUN, and fail to compile, on an A100 / GB200 host): give it its own ``skipif``, or land it here."""
     cc = _cc()
     if cc == _SM107:
         return

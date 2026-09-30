@@ -12,7 +12,7 @@ views alias ``proj_slab``, ``saved.h`` IS ``h``, ``saved.seq_lens`` IS the
 ``seq_lens`` the forward ran with, ``lse`` defaults to ``saved.lse`` -- are typed
 ``ValueError`` exceptions that fire before any launch.
 
-Two SAVE MODES ship (frost_dev/plans/gated_block_bprop_IMPL.md § 1.1, D2):
+Two SAVE MODES ship:
 
 * ``proj_slab`` (the declaration default): the stage-(1) GEMM writes the
   caller-owned ``saved.proj_slab`` and ``gate`` / ``q_pre`` / ``k_pre`` / ``v``
@@ -24,7 +24,9 @@ Two SAVE MODES ship (frost_dev/plans/gated_block_bprop_IMPL.md § 1.1, D2):
   saved, the backward recomputes the rest.
 
 Accept tests are ``requires_rubin`` (the block targets SM107 only); the reject
-and layout tests run anywhere, on a DECLARED block, without a compile.
+tests build CUDA tensors for a DECLARED block (``requires_cuda``: any CUDA
+device, no compile); the pure-layout tests (``saved_slab_views``,
+``_plan_workspace``) run anywhere, CPU included.
 """
 
 import dataclasses
@@ -56,7 +58,8 @@ def _cc():
     return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
 
 
-# The suite-wide marker, hoisted into cutedsl/conftest.py (registered there; the skip is applied at collection).
+# Hoisted into cutedsl/conftest.py (registered there; the skip is applied at collection) -- scoped to the modules under
+# that directory, which is where every gated-block CuTeDSL module lives.
 requires_rubin = pytest.mark.requires_rubin
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
@@ -145,8 +148,8 @@ def _run_training(geom_kw, batch, seq_len, *, save_mode, seq_lens=None, with_pre
 def test_saved_slab_views_are_strided_views_of_the_slab():
     """``(q_pre, gate, k_pre, v)`` as ``[B, S, heads, D]`` VIEWS: same storage, token stride ``n_qkvg``, head stride
     ``d_head``, storage offsets at ``qkvg_offsets`` -- and each equals the plain column slice of the ``[B, S, N]`` slab.
-    A ``[B, S, N]`` or ``[B*S, N]`` slab both spell the same views; a wrong element count or a non-contiguous slab is a
-    typed ``ValueError``."""
+    A ``[B, S, N]`` or ``[B*S, N]`` slab both spell the same views; a wrong element count, a non-contiguous slab or a
+    slab whose base is not 16-B aligned (the GEMM TMA-stores it) is a typed ``ValueError``."""
     g = GatedAttentionBlockGeometry(**_COMMON)
     b, s, n = 2, 8, g.n_qkvg
     slab = torch.randn(b * s, n, dtype=torch.bfloat16)
@@ -166,6 +169,18 @@ def test_saved_slab_views_are_strided_views_of_the_slab():
         saved_slab_views(torch.empty(b * s, n - 1, dtype=torch.bfloat16), g, b, s)
     with pytest.raises(ValueError, match="contiguous"):
         saved_slab_views(torch.empty(b * s, 2 * n, dtype=torch.bfloat16)[:, ::2], g, b, s)
+    with pytest.raises(ValueError, match="aligned"):  # right count, contiguous, base at an odd element offset (data_ptr % 16 == 2)
+        saved_slab_views(_odd_offset((b * s, n), dtype=torch.bfloat16, device="cpu"), g, b, s)
+
+
+def _odd_offset(shape, dtype, device="cuda"):
+    """A contiguous tensor of exactly ``shape`` / ``dtype`` whose base sits ONE element past an allocation: right count,
+    dtype, device and strides, but ``data_ptr() % 16 == itemsize`` -- the misaligned caller buffer the record checks
+    must refuse before a TMA store or a 16-B vector store hits it."""
+    n = 1
+    for x in shape:
+        n *= int(x)
+    return torch.empty(n + 1, device=device, dtype=dtype)[1:].view(*shape)
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +393,11 @@ def test_workspace_layout_under_want_saved(shape):
         _plan_workspace(g, b, s, torch.bfloat16, True, True, False, saved_gate_copy=True)
 
 
+@requires_cuda
 def test_training_block_declares_the_training_carve_and_the_gate_copy_stage():
     """The declared block's layout is the training carve of its save mode, and the gate-copy block -- and only it --
     builds the ``gate_compaction`` stage (a stage that never runs is not in ``_stages``).  ``saved_gate_copy=True``
-    without ``save_for_backward`` names the knob.  No compile."""
+    without ``save_for_backward`` names the knob.  Declaration only (CUDA inputs, no compile)."""
     blk_slab, _, _ = _declare(_COMMON, 1, 256, save_mode="proj_slab")
     blk_copy, _, _ = _declare(_COMMON, 1, 256, save_mode="gate_copy")
     assert blk_slab.save_for_backward and not blk_slab.inplace_qkv and blk_slab.saved_gate_copy is False
@@ -395,10 +411,11 @@ def test_training_block_declares_the_training_carve_and_the_gate_copy_stage():
     assert names_copy == ["qkv_gate_proj", "qk_norm_rope", "gate_compaction", "compact_v", "sdpa", "sigmoid_gate", "out_proj"], names_copy
     assert blk_copy._gate_copy is not None and blk_copy._gate_copy.heads == blk_copy.geom.h_q and blk_copy._gate_copy.has_gate is False
     assert blk_slab._gate_copy is None
+    # Only the constructor is under the `raises`: an error from the input builders must not pass as the pin.
+    geom = GatedAttentionBlockGeometry(**_COMMON)
+    inp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=256, dtype=torch.bfloat16)
+    out = torch.empty(1, 256, geom.d_model, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="saved_gate_copy"):
-        geom = GatedAttentionBlockGeometry(**_COMMON)
-        inp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=256, dtype=torch.bfloat16)
-        out = torch.empty(1, 256, geom.d_model, device="cuda", dtype=torch.bfloat16)
         GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom, saved_gate_copy=True)
 
 
@@ -460,8 +477,10 @@ def test_saved_views_must_alias_proj_slab():
 def test_saved_record_shape_and_mode_contracts_are_typed(save_mode):
     """The declared save mode and the record must agree (``proj_slab`` given iff the block was declared
     ``saved_gate_copy=False``), ``saved.o`` is compact ``[B, S, H_q, D]`` in the activation dtype on ``h``'s device,
-    ``saved.lse`` is ``[B, H_q, S]`` fp32, and in the gate-copy mode ``saved.gate`` is a compact caller buffer while
-    ``q_pre`` / ``k_pre`` are optional -- every miss is a ``ValueError`` naming the field."""
+    ``saved.lse`` is ``[B, H_q, S]`` fp32, ``saved.rstd_q`` / ``rstd_k`` are ``[B, S, H]`` fp32 compact (the norm kernel
+    writes them through raw pointer arithmetic), every caller buffer a kernel writes is 16-B aligned (a TMA store or a
+    16-B vector store lands on it), and in the gate-copy mode ``saved.gate`` is a compact caller buffer while ``q_pre`` /
+    ``k_pre`` are optional -- every miss is a ``ValueError`` naming the field."""
     b, s = 1, 256
     blk, inp, out = _declare(_COMMON, b, s, save_mode=save_mode)
     g = blk.geom
@@ -481,6 +500,28 @@ def test_saved_record_shape_and_mode_contracts_are_typed(save_mode):
         blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, lse=torch.empty(b, s, g.h_q, device="cuda", dtype=torch.float32)))
     with pytest.raises(ValueError, match="saved.lse"):
         blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, lse=good.lse.to(torch.bfloat16)))
+    # 16-B alignment of every caller buffer a kernel writes: right count, dtype, device and contiguity, but the base one
+    # element into an allocation -> refused, naming the field, before the TMA store / vector store would hit it.
+    with pytest.raises(ValueError, match=r"saved\.o.*aligned"):
+        blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, o=_odd_offset((b, s, g.h_q, g.d_head), torch.bfloat16)))
+    with pytest.raises(ValueError, match=r"saved\.lse.*aligned"):
+        blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, lse=_odd_offset((b, g.h_q, s), torch.float32)))
+    if g.qk_norm:
+        with pytest.raises(ValueError, match=r"saved\.rstd_q"):  # right bytes, wrong rank
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, rstd_q=good.rstd_q.view(b * s, g.h_q)))
+        with pytest.raises(ValueError, match=r"saved\.rstd_k"):  # wrong dtype: the kernel writes fp32 through a raw pointer
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, rstd_k=good.rstd_k.to(torch.bfloat16)))
+        with pytest.raises(ValueError, match=r"saved\.rstd_q.*aligned"):
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, rstd_q=_odd_offset((b, s, g.h_q), torch.float32)))
+    if save_mode == "proj_slab":
+        bad_slab = _odd_offset((b * s, g.n_qkvg), torch.bfloat16)
+        with pytest.raises(ValueError, match=r"saved\.proj_slab.*aligned"):
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, proj_slab=bad_slab, gate=None, q_pre=None, k_pre=None))
+    else:
+        with pytest.raises(ValueError, match=r"saved\.gate.*aligned"):
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, gate=_odd_offset((b, s, g.h_q, g.d_head), torch.bfloat16)))
+        with pytest.raises(ValueError, match=r"saved\.q_pre.*aligned"):
+            blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, q_pre=_odd_offset((b, s, g.h_q, g.d_head), torch.bfloat16)))
     if save_mode == "gate_copy":
         with pytest.raises(ValueError, match="saved.gate"):
             blk._check_saved_set(inp["h"], None, None, dataclasses.replace(good, gate=None))
@@ -515,7 +556,7 @@ def test_h_and_lse_identity_are_typed():
 @requires_cuda
 def test_saved_seq_lens_identity_is_typed():
     """``saved.seq_lens`` must be the very tensor ``execute`` runs with (``is``, or both None): the backward's
-    declaration-time padding decline (IMPL § 1.1 item 7, D5) rests on this identity, so a record that disagrees is a
+    declaration-time padding decline rests on this identity, so a record that disagrees is a
     ``ValueError`` naming ``seq_lens`` -- before any launch, and without a device read."""
     b, s = 2, 256
     blk, inp, out = _declare(_COMMON, b, s, seq_lens_present=True)
@@ -546,18 +587,9 @@ def test_saved_seq_lens_identity_is_typed():
 # ---------------------------------------------------------------------------
 
 
-@requires_rubin
-@_QK_NORM
-@_SAVE_MODE
-def test_saved_set_matches_the_oracle(qk_norm, save_mode):
-    """Every saved tensor against the fp32 oracle's copy of it: the four stage-(1) bands at one bf16 rounding of a
-    fp32-accumulated GEMM (``rtol 2**-7, atol 1e-3``), pre-gate ``O`` and ``LSE`` at the SDPA stage test's bounds
-    (``cos >= 0.999`` / ``atol 2e-2``), ``rstd`` at the norm test's bound (``rtol 1e-5, atol 1e-6`` against the oracle
-    norm of the block's OWN ``q_pre`` -- the kernel and the oracle round the GEMM differently, so the strict bound is
-    stated on equal inputs -- plus a loose cross-check against the oracle's rstd).  Gate-copy mode passes ``q_pre`` /
-    ``k_pre`` buffers so the copies are checked too."""
-    geom_kw = {**_COMMON, "qk_norm": qk_norm}
-    out, ref, blk, saved, inp = _run_training(geom_kw, batch=2, seq_len=512, save_mode=save_mode, with_pre=True)
+def _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, *, qk_norm, save_mode, batch, seq_len):
+    """The oracle comparison shared by the bf16 matrix and the fp16 arm: every saved tensor against the fp32 oracle's
+    copy of it, at the bounds ``test_saved_set_matches_the_oracle`` states."""
     g = blk.geom
     assert torch.isfinite(out.float()).all() and _cos(out, ref.out) > 0.999
     tol = dict(rtol=2**-7, atol=1e-3)
@@ -565,9 +597,9 @@ def test_saved_set_matches_the_oracle(qk_norm, save_mode):
     torch.testing.assert_close(saved.k_pre, ref.k_pre, **tol)
     torch.testing.assert_close(saved.gate, ref.gate, **tol)
     if save_mode == "proj_slab":
-        v = saved_slab_views(saved.proj_slab, g, 2, 512)[3]
+        v = saved_slab_views(saved.proj_slab, g, batch, seq_len)[3]
         torch.testing.assert_close(v, ref.v, **tol)
-        assert saved.gate.data_ptr() == saved.proj_slab.data_ptr() + g.qkvg_offsets[1] * 2, "gate is a view of the slab"
+        assert saved.gate.data_ptr() == saved.proj_slab.data_ptr() + g.qkvg_offsets[1] * saved.proj_slab.element_size(), "gate is a view of the slab"
     else:
         assert saved.proj_slab is None and saved.gate.is_contiguous()
     assert torch.isfinite(saved.o.float()).all()
@@ -581,10 +613,41 @@ def test_saved_set_matches_the_oracle(qk_norm, save_mode):
         _, rstd_k_ref = qk_norm_rope_reference(saved.k_pre, inp["w_k_norm"], inp["cos"], inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
         torch.testing.assert_close(saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(saved.rstd_q, ref.rstd_q, rtol=1e-2, atol=1e-3)
-        torch.testing.assert_close(saved.rstd_k, ref.rstd_k, rtol=1e-2, atol=1e-3)
+        # Cross-check against the oracle's OWN rstd, whose q_pre / k_pre come from torch's GEMM (a different fp32
+        # accumulation order rounds a few of the 256 elements to the other bf16 neighbour).  Measured on Rubin (cc 10.7,
+        # 204 SMs; B=2 S=512, this geometry, rstd in [1.79, 2.78]): max rel 1.88e-4 bf16 / 3.2e-5 fp16, ~1 % of rows
+        # above 1e-5 -- so rtol 1e-3 / atol 1e-5 is a 5x envelope of the effect, not a guess; the equal-input bound above is
+        # the strict one (max rel 1.2e-7 measured).  Row-to-row rstd varies ~4 %, so this still catches a row-indexing slip.
+        torch.testing.assert_close(saved.rstd_q, ref.rstd_q, rtol=1e-3, atol=1e-5)
+        torch.testing.assert_close(saved.rstd_k, ref.rstd_k, rtol=1e-3, atol=1e-5)
     else:
         assert saved.rstd_q is None and saved.rstd_k is None
+
+
+@requires_rubin
+@_QK_NORM
+@_SAVE_MODE
+def test_saved_set_matches_the_oracle(qk_norm, save_mode):
+    """Every saved tensor against the fp32 oracle's copy of it: the four stage-(1) bands at one bf16 rounding of a
+    fp32-accumulated GEMM (``rtol 2**-7, atol 1e-3``), pre-gate ``O`` and ``LSE`` at the SDPA stage test's bounds
+    (``cos >= 0.999`` / ``atol 2e-2``), ``rstd`` at the norm test's bound (``rtol 1e-5, atol 1e-6`` against the oracle
+    norm of the block's OWN ``q_pre`` -- the kernel and the oracle round the GEMM differently, so the strict bound is
+    stated on equal inputs -- plus a MEASURED-envelope cross-check against the oracle's rstd).  Gate-copy mode passes
+    ``q_pre`` / ``k_pre`` buffers so the copies are checked too."""
+    geom_kw = {**_COMMON, "qk_norm": qk_norm}
+    out, ref, blk, saved, inp = _run_training(geom_kw, batch=2, seq_len=512, save_mode=save_mode, with_pre=True)
+    _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, qk_norm=qk_norm, save_mode=save_mode, batch=2, seq_len=512)
+
+
+@requires_rubin
+@_SAVE_MODE
+def test_saved_set_matches_the_oracle_in_fp16(save_mode):
+    """The fp16 activation arm (``act_dtype`` keys every dtype check of the record contract and every kernel artifact):
+    the same oracle comparison at the same bounds, both save modes, ``qk_norm`` on.  Measured on Rubin (cc 10.7, 204 SMs)
+    before the bounds were adopted for fp16: bands max|diff| 9.8e-4 (one fp16 ulp at this magnitude), O 9.8e-4, LSE 1.9e-4."""
+    out, ref, blk, saved, inp = _run_training({**_COMMON, "qk_norm": True}, batch=2, seq_len=512, save_mode=save_mode, with_pre=True, dtype=torch.float16)
+    assert out.dtype == saved.o.dtype == saved.gate.dtype == saved.q_pre.dtype == saved.k_pre.dtype == torch.float16
+    _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, qk_norm=True, save_mode=save_mode, batch=2, seq_len=512)
 
 
 @requires_rubin
@@ -611,18 +674,40 @@ def test_out_is_bitwise_the_inference_block(save_mode):
 
 
 @requires_rubin
-def test_gate_copy_mode_populates_gate_only():
+def test_gate_copy_mode_populates_gate_only(monkeypatch):
     """``saved.proj_slab is None`` (``saved_gate_copy=True``): the compact ``saved.gate`` equals the proj_slab run's GATE
-    band BIT for bit (a copy, not a recompute); ``q_pre`` / ``k_pre`` are copied ONLY when the caller passed buffers,
-    and are the slab bands bitwise when they are; the block's stage list carries exactly one extra launch."""
+    band BIT for bit (a copy, not a recompute); ``q_pre`` / ``k_pre`` are copied ONLY when the caller passed buffers --
+    pinned by COUNTING the elementwise launches (proj_slab mode: V compaction + sigmoid gate; gate-copy: + the GATE
+    copy into ``saved.gate`` and nothing else; with ``q_pre`` / ``k_pre`` buffers: + one copy each, landing in those
+    buffers) -- and are the slab bands bitwise when they are; the block's stage list carries exactly one extra stage."""
+    from cudnn.gated_attention_block.kernels import elementwise as ew
+
+    launches = []  # (heads, has_gate, dst data_ptr) per elementwise launch; `_ElementwiseStage._run` imports the runner per call
+    real_run = ew.run_elementwise_gate
+
+    def counting_run(r, src, gate, dst, *, stream):
+        launches.append((int(r.h), bool(r.has_gate), dst.data_ptr()))
+        return real_run(r, src, gate, dst, stream=stream)
+
+    monkeypatch.setattr(ew, "run_elementwise_gate", counting_run)
     b, s = 2, 512
     _, _, blk_slab, saved_slab, _ = _run_training(_COMMON, b, s, save_mode="proj_slab")
+    slab_launches, launches[:] = list(launches), []
     out_gc, _, blk_gc, saved_gc, _ = _run_training(_COMMON, b, s, save_mode="gate_copy", with_pre=False)
-    assert saved_gc.proj_slab is None and saved_gc.q_pre is None and saved_gc.k_pre is None
+    gc_launches, launches[:] = list(launches), []
+    g = blk_gc.geom
+    assert [(h, hg) for h, hg, _ in slab_launches] == [(g.h_kv, False), (g.h_q, True)], slab_launches  # (3b) V compaction, (5) gate
+    assert [(h, hg) for h, hg, _ in gc_launches] == [(g.h_q, False), (g.h_kv, False), (g.h_q, True)], gc_launches  # + (3g) GATE copy only
+    assert gc_launches[0][2] == saved_gc.gate.data_ptr(), "the extra launch is not the GATE copy into saved.gate"
+    assert saved_gc.proj_slab is None
     assert saved_gc.gate.is_contiguous() and torch.equal(saved_gc.gate, saved_slab.gate), "the GATE copy is not the slab band"
     assert torch.equal(saved_gc.o, saved_slab.o) and torch.equal(saved_gc.lse, saved_slab.lse)
     assert len(blk_gc._stages) == len(blk_slab._stages) + 1 and "gate_compaction" in [st.name for st in blk_gc._stages]
     out_pre, _, _, saved_pre, _ = _run_training(_COMMON, b, s, save_mode="gate_copy", with_pre=True, sentinel=1.5e30)
+    pre_launches = list(launches)
+    # (3g) GATE copy, q_pre copy (h_q recipe), k_pre copy (the V-compaction h_kv recipe), (3b) V compaction, (5) gate.
+    assert [(h, hg) for h, hg, _ in pre_launches] == [(g.h_q, False), (g.h_q, False), (g.h_kv, False), (g.h_kv, False), (g.h_q, True)], pre_launches
+    assert [d for _, _, d in pre_launches[:3]] == [saved_pre.gate.data_ptr(), saved_pre.q_pre.data_ptr(), saved_pre.k_pre.data_ptr()]
     assert torch.equal(saved_pre.gate, saved_slab.gate)
     assert torch.equal(saved_pre.q_pre, saved_slab.q_pre) and torch.equal(saved_pre.k_pre, saved_slab.k_pre), "q_pre / k_pre copies are not the slab bands"
     assert not (saved_pre.q_pre == 1.5e30).any() and not (saved_pre.k_pre == 1.5e30).any()
@@ -632,9 +717,9 @@ def test_gate_copy_mode_populates_gate_only():
 @requires_rubin
 def test_training_forward_dead_entry_o_is_exactly_zero():
     """``seq_lens = [s, 0]``: the dead entry's saved ``O`` is EXACTLY zero (a SELECT in the SDPA epilogue, not residue),
-    its ``LSE`` is ``-inf`` (no floored ``-69.08``), and ``out[1] == 0`` -- sdpa-invariants § 1 / § 3 on the SAVED set,
-    asserted on the outputs directly (a diff against a NaN reference proves nothing).  ``saved.seq_lens`` is the very
-    tensor the forward ran with."""
+    its ``LSE`` is ``-inf`` (no floored ``-69.08``), and ``out[1] == 0`` -- the SDPA's empty-range contract (O = 0 by SELECT,
+    LSE = -inf, no denominator floor reaching either) on the SAVED set, asserted on the outputs directly (a diff against a
+    NaN reference proves nothing).  ``saved.seq_lens`` is the very tensor the forward ran with."""
     b, s = 2, 512
     lens = torch.tensor([s, 0], device="cuda", dtype=torch.int32)
     out, ref, blk, saved, _ = _run_training(_COMMON, b, s, save_mode="proj_slab", seq_lens=lens, sentinel=1.5e30)

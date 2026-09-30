@@ -180,9 +180,12 @@ Recommendation: `proj_slab` up to `S = 32K`, gate-copy beyond (the whole slab, 3
 Contracts verified before any launch, each a `ValueError` naming the field: `saved.h` is `h`'s storage; `saved.seq_lens`
 **is** the `seq_lens` tensor passed to `execute` (or both `None` -- the backward declines padding at declaration from this
 field, without a device read); `lse` (optional) is `saved.lse`'s storage; `saved.o` is compact `[B, S, H_q, D]` in the
-activation dtype; in the proj_slab mode `saved.gate` / `q_pre` / `k_pre`, when given, alias `saved.proj_slab` exactly as
-`saved_slab_views` spells them. A padded forward (`seq_lens`) is served: a dead entry (`seq_lens[b] == 0`) leaves
-`saved.o[b] == 0`, `saved.lse[b] == -inf` and `out[b] == 0` exactly.
+activation dtype; `saved.rstd_q` / `rstd_k` are `[B, S, H]` fp32 compact (present iff `geometry.qk_norm`); every caller
+buffer a kernel writes (`proj_slab`, `o`, `lse`, `rstd_*`, the gate-copy targets) is **16-byte aligned** -- they are TMA-store
+targets, and a slice at an odd element offset is refused here rather than failing untyped after stage (1) launched; in the
+proj_slab mode `saved.gate` / `q_pre` / `k_pre`, when given, alias `saved.proj_slab` exactly as `saved_slab_views` spells
+them (each may be `None` there: the backward derives it from the slab). A padded forward (`seq_lens`) is served: a dead
+entry (`seq_lens[b] == 0`) leaves `saved.o[b] == 0`, `saved.lse[b] == -inf` and `out[b] == 0` exactly.
 
 `execute()` allocates nothing, reads nothing back to the host and converts nothing: every intermediate is a
 strided view of the caller's workspace, sized honestly by `get_workspace_size()`, so the call is CUDA-graph
@@ -224,8 +227,10 @@ Quantization specs:
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None)` consumes the forward's `SavedForBackward(h, gate, o, lse,
 rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` (the two appended fields are what the training
-forward above fills: the saved stage-(1) slab, and the padding tensor the forward ran with -- a padded save set is a typed
-decline of the backward). `RecomputePolicy` chooses between re-running stage (1) for the pre-norm
+forward above fills: the saved stage-(1) slab, and the padding tensor the forward ran with -- a padded save set becomes a
+typed decline of the backward once the follow-up PR that lands the block backward adds it; `GatedAttentionBlockBwd` is a
+declaration-only stub today). `gate` may be `None` in the proj_slab save mode (it is a band of `proj_slab`).
+`RecomputePolicy` chooses between re-running stage (1) for the pre-norm
 Q/K (`RECOMPUTE_QK_PRE`, the default) and reading them from the save set (`SAVE_ALL`); which input gradients are
 wanted is fixed at build time because it decides which GEMMs exist. `need_dw_norms=None` follows
 `geometry.qk_norm`; asking for norm-weight gradients under `qk_norm=False` is a typed decline. The backward is
