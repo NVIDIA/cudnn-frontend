@@ -429,6 +429,8 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     km = api._k_mod
     compiled = api._compiled_kernel
     host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
+    if getattr(api, "paged_thd_split", False):
+        host = km._host_thd_split
     return _artifact_positional_order(compiled, host, km.__name__)
 
 
@@ -475,7 +477,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
     s.off_o_desc, s.scratch_bytes = int(plan.off_o_desc), int(plan.scratch_bytes)
-    s.split_workspace = None
+    s.split_workspace = getattr(plan, "split_workspace", None)
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._geometry_cache = None
@@ -513,7 +515,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant))
+    split_slots = {"lse_partial_ptr", "partial_o_strides"} if s.split_workspace is not None else set()
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant) - split_slots)
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
@@ -524,7 +527,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     if (
         not s.has_sink
         and not s.lse_padded
-        and api.split_kv == 1
+        and (api.split_kv == 1 or s.split_workspace is not None)
         and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
@@ -540,6 +543,16 @@ class ThdSplitWorkspace(NamedTuple):
     capacity: int
     off_o: int
     off_lse: int
+
+
+def thd_split_workspace(base_bytes: int, splits: int, capacity: int, heads: int, d_v: int):
+    """Fixed caller-owned partial regions shared by graph and standalone plans."""
+    if capacity <= 0 or capacity > _I32_MAX or splits <= 1:
+        raise ValueError("packed split requires positive Int32 capacity and split_kv > 1")
+    off_o = (base_bytes + 255) // 256 * 256
+    off_lse = off_o + splits * capacity * heads * d_v * 4
+    scratch_bytes = (off_lse + splits * capacity * heads * 4 + 255) // 256 * 256
+    return ThdSplitWorkspace(splits, capacity, off_o, off_lse), scratch_bytes
 
 
 def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_units: int) -> ThdLaunchSpec:
@@ -584,10 +597,7 @@ def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_uni
     # Regions remain fixed across calls. The compiled host uses compact actual
     # token strides inside them, avoiding a batch*max_sequence allocation.
     splits = int(km.CFG.SPLIT_KV)
-    off_o = (s.scratch_bytes + 255) // 256 * 256
-    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
-    s.split_workspace = ThdSplitWorkspace(splits, capacity, off_o, off_lse)
-    s.scratch_bytes = (off_lse + splits * capacity * s.qh * 4 + 255) // 256 * 256
+    s.split_workspace, s.scratch_bytes = thd_split_workspace(s.scratch_bytes, splits, capacity, s.qh, s.d_v)
     s.cga_tile_m = int(km.CGA_TILE_M)
     s._geometry_cache = None
     s.native = _pybind_module._SdpaThdBinder(s)

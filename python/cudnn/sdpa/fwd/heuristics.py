@@ -77,6 +77,7 @@ from cudnn.sdpa.fwd.engines import (
     EngineSpec,
     SdpaFwdKnobs,
     runtime_cga_choices,
+    paged_thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -1193,6 +1194,35 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def paged_thd_split_count(caps: Capabilities, facts) -> int:
+    """Measured fixed-graph split choice; one preserves the existing plan."""
+    if not (
+        paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.b == 1
+        and facts.h_q in (4, 8, 16)
+        and facts.h_q == 4 * facts.h_kv
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 16384
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return 1
+    # Per-rank query tiles bound parallel work. Keep at least four KV
+    # tiles per partition to amortize setup/combine on short contexts.
+    # These are fixed graph bounds, never global pool capacity or a D2H read.
+    units = _ceil_div(facts.s_q, 128) * facts.h_q
+    budget = min(16, max(1, 128 // units), max(1, _ceil_div(facts.s_kv, 128) // 4))
+    splits = 1 << (budget.bit_length() - 1)
+    return splits
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered concrete assignments and eligible runtime choice.
 
@@ -1339,6 +1369,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             # from the current bindings and keeps the same unsplit members for
             # larger queries / batches. Retain the smaller-workspace alternative.
             unique.insert(0, replace(adaptive, split_kv=None, split_kv_policy=split_policy))
+    splits = paged_thd_split_count(caps, facts)
+    if splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

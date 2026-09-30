@@ -233,6 +233,11 @@ _SPLIT_KV_FLAVORS = frozenset({"d128", "d192", "d256", "d512"})
 _CTA_MMA_FLAVORS = frozenset({"d128", "d192"})
 
 
+def supports_paged_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
+    """Packed partial ABI domain; Q=1 retains its existing ragged-decode leg."""
+    return device_cc == (10, 0) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1 and not padded_stats
+
+
 def supports_live_lpt(d_shape, *, fp8, thd, paged, bottom_right, window_left, window_right):
     """Geometry contract for the live-length THD policy; callers gate the device."""
     return d_shape == (256, 256) and not fp8 and thd and paged and bottom_right and window_left is None and window_right == 0

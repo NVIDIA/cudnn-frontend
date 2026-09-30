@@ -36,7 +36,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_live_lpt
+from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_live_lpt, supports_paged_thd_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -527,6 +527,25 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
     )
 
 
+def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """Fixed paged graph bounds whose packed partial workspace is plan-owned."""
+    return (
+        capabilities.sm_lo == 100
+        and (not facts.shape_overrides or (facts.max_total_seq_len_q is not None and 0 < facts.max_total_seq_len_q <= facts.b * facts.s_q))
+        and not facts.has_sink
+        and not facts.has_epilogue_gate
+        and supports_paged_thd_split(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            max_q=facts.s_q,
+            padded_stats=facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None,
+        )
+    )
+
+
 def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int]) -> Optional[str]:
     """Pure admission for the graph's normalized VariantPack executor.
 
@@ -568,7 +587,7 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         if (split_kv or 1) > 1:
             # Only the decode tile's ragged-Q leg splits a THD graph (its dense
             # prepared launch binds the packed Q / O / Stats from the offsets).
-            return None if _thd_decode_leg(capabilities, facts) else "prepared THD overrides cannot use split-KV"
+            return None if _thd_decode_leg(capabilities, facts) or paged_thd_split_domain(capabilities, facts) else "prepared THD overrides cannot use split-KV"
         return None
     if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
         return "prepared dense overrides require per-batch lengths, not prefix sums"
@@ -718,7 +737,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if knobs.split_kv not in (None, 1) or knobs.pack_gqa not in (None, False):
                 return "runtime CGA policy requires unsplit, unpacked execution"
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        if knobs.cga == 1 and facts.thd and not ragged_decode and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
+        paged_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and not knobs.pack_gqa and paged_thd_split_domain(capabilities, facts)
+        if paged_split and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False):
+            return "paged packed split requires the matching native cuDNN Frontend extension"
+        if (
+            knobs.cga == 1
+            and facts.thd
+            and not (ragged_decode or paged_split)
+            and capabilities.sm_lo == 100
+            and _selected_d_shape(capabilities, facts) == (128, 128)
+        ):
             return (
                 "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
                 "other THD (ragged) graphs run the cga2 prefill tile"
@@ -742,7 +770,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # Paged KV is padded by construction and its split composes with
             # the per-batch lengths (the decode path — B*H_kv is far below
             # the SM count), so it is exempt from the padded exclusion.
-            if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+            if (facts.thd and not (ragged_decode or paged_split)) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
                 return "split_kv > 1 serves dense, unpadded, sink-free graphs only (and the decode tile's ragged-Q leg)"
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded

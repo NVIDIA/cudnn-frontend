@@ -190,10 +190,11 @@ underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −
 off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA incl. partial
 packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head), KV split
 + combine, NATURAL
-/ LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
+/ LPT / LPT_L2. **THD on the decode tile: ragged-Q-over-paged-KV at one query, or native D128 packed split** (ʳᵠ:
 ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
-at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
-and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+at one token per sequence, nvbug 6607857; D128 paged packed split also admits
+`TILE_CGA_M=1` with `PACK_GQA=0` and `SPLIT_KV>1`; other ragged graphs keep
+`TILE_CGA_M=2` and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 rides it through the d128 envelope. Measured on B200 (graph path,
@@ -1302,3 +1303,14 @@ THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
 their existing admission boundaries. Remaining conversion layouts use prepared
 gather/scatter copies around a compact prepared plan. Standalone prepared calls
 require caller-owned workspace.
+
+
+SM100 exact D128 FP16/BF16 paged THD can select an unpacked single-CTA split
+with caller-owned packed partial O/LSE workspace. Graph and standalone execute
+share the native prepared binding, including NH/HN Stats and HND/NHD pools.
+Shape overrides require a declared positive packed-Q capacity bounded by the
+plan; unbounded overrides remain on existing plans. Automatic split counts use
+fixed graph descriptors only, with a bounded BF16 B1/GQA4 HND/page16 causal
+short-query domain; the unsplit candidates remain available. This extends a
+knob combination within the existing graph-eligibility row, not a new head
+shape, quantization, or GPU capability.

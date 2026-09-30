@@ -2076,6 +2076,8 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         chosen = {**knobs, cudnn.knob_type.SCHED_POLICY: policy}
         if geometry != "d256":
             chosen.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        if geometry == "d128_split":
+            chosen.update({cudnn.knob_type.PACK_GQA: 0, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: 4})
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         if geometry not in ("d256", "d128_split"):
@@ -2089,21 +2091,11 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
         workspace_bytes = g.get_workspace_size()
         if geometry == "d128_split":
-            # Internal lowering before automatic policy admission; the graph still
-            # binds real paged D128 facts through the native prepared executor.
-            from dataclasses import replace
-            from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
-
-            params = replace(api.template_params(), cta_mma=1, pack_gqa=False, split_kv=4)
-            module = _load_sm100_kernel_module((128, 128), params)
-            spec = prep_mod.build_thd_split_spec(
-                _plan(g)._prepared.spec, module, capacity=b * qcap, resident_units=torch.cuda.get_device_properties(0).multi_processor_count
-            )
-            _plan(g)._prepared.spec = spec
-            workspace_bytes = max(workspace_bytes, spec.scratch_bytes)
+            spec = _plan(g)._prepared.spec
             assert spec.native is not None and spec.split_workspace.splits == 4
-        else:
-            assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
+            assert api.paged_thd_split and api._thd_spec.split_workspace == spec.split_workspace
+            assert workspace_bytes == spec.scratch_bytes == api.scratch_workspace_bytes()
+        assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
         ws = torch.empty(max(workspace_bytes, 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
         g.execute(pack, ws, **kwargs)
@@ -2125,6 +2117,33 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
                 assert count == int(expected_pdl)
         captures.append(graph)
         workspaces.append(ws)
+        if geometry == "d128_split":
+            from cuda.bindings import driver as cuda_driver
+
+            def standalone(workspace):
+                api.execute(
+                    bufs["q"],
+                    bufs["k"],
+                    bufs["v"],
+                    bufs["o"],
+                    lse_tensor=bufs["lse"],
+                    seq_q_lens=bufs["cu_q"],
+                    seq_kv_lens=bufs["seq_kv"],
+                    block_table=bufs["k_table"][:, 0, :, 0],
+                    block_table_v=bufs["v_table"][:, 0, :, 0],
+                    workspace=workspace,
+                    current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+                )
+
+            with pytest.raises(ValueError, match="caller-owned workspace"):
+                standalone(None)
+            with pytest.raises(ValueError, match="requires a .* workspace"):
+                standalone(ws[:-1])
+            standalone(ws)
+            standalone_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(standalone_graph):
+                standalone(ws)
+            captures.append(standalone_graph)
     try:
         lengths = (
             (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025]))

@@ -43,6 +43,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_S
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
+    supports_paged_thd_split,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
@@ -1298,6 +1299,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # split combine placing the final O / Stats rows -- instead of the
         # prefill tile's THD leg.
         self.thd_decode_leg = False
+        self.paged_thd_split = False
 
     @property
     def _quantized_q_lens_abi(self) -> bool:
@@ -1500,6 +1502,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        self.paged_thd_split = bool(
+            self.cga == 1
+            and self.split_kv > 1
+            and not self.pack_gqa
+            and supports_paged_thd_split(
+                (int(d_qk), int(d_v)),
+                device_cc=self._device_cc,
+                fp8=self.q_desc.dtype in _SM100_FP8_DTYPES,
+                thd=self.thd,
+                paged=self.paged,
+                max_q=int(s_qo),
+                padded_stats=self.thd_stats_padded,
+            )
+        )
+        if self.paged_thd_split:
+            from cudnn import _pybind_module
+
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaThdBinder, "supports_paged_packed_split", False),
+                "paged packed split requires the matching native cuDNN Frontend extension",
+            )
+
         arch_error = cutedsl_arch_requirement_error(self._device_cc)
         self._not_implemented_error_if(arch_error is not None, arch_error)
         # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode; Rubin has
@@ -1670,7 +1694,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # S_q(max) == 1).  Mirrors the engine row's mismatch line; keep the two
         # in lockstep.
         self._not_implemented_error_if(
-            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not self.thd_decode_leg,
+            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not (self.thd_decode_leg or self.paged_thd_split),
             "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )
@@ -1750,7 +1774,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # recombined O). Structural limits mirror mismatch()'s
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
-                self.thd and not self.thd_decode_leg,
+                self.thd and not (self.thd_decode_leg or self.paged_thd_split),
                 "split_kv > 1 is dense-only (THD packs its own flat grid), except the decode tile's ragged-Q leg",
             )
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
@@ -2197,6 +2221,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # time, and execute() only binds pointers. has_lse=False compiles the LSE store
             # out; a split requires the in-kernel LSE (the per-split LSE is the combine weight).
             compile_fn = self._k_mod.compile_prepared if (self._prepared_fp8 or self._prepared_mxfp8) else self._k_mod.compile
+            if self.paged_thd_split:
+                compile_fn = self._k_mod.compile_thd_split
             self._compiled_kernel = compile_fn(**self._explicit_compile_kwargs())
             self._build_prepared_specs()
         elif self.thd:
@@ -2280,6 +2306,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _explicit_compile_kwargs(self) -> dict:
         """The compile key of an explicit-ABI template: only what specializes the
         traced code (every extent and stride is a runtime argument)."""
+        if self.paged_thd_split:
+            ps = self._paged_pool_stride(self.k_desc)
+            return dict(has_lse=self.lse_desc is not None, lse_kind="head" if self.thd_stats_head_major else "token", paged_hnd=ps[1] < ps[2])
         if not self.thd or self.thd_decode_leg:
             # The ragged-Q decode leg's in-kernel LSE is the dense split-major
             # partial slab; the combine writes the ragged Stats rows.
@@ -2335,7 +2364,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         self._thd_spec = self._dense_spec = None
         if self.thd and not self.thd_decode_leg:
-            if self.split_kv == 1:
+            if self.split_kv == 1 or self.paged_thd_split:
                 self._thd_spec = build_thd_spec(self, scale_softmax=None)
         else:
             # Dense plans and the ragged-Q decode leg (a dense split launch whose
@@ -2504,8 +2533,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # slots for the packed-total-clamped K/V runtime descriptors the
             # setup kernel writes (see the kernels' THD closures). Every THD
             # flavor carries those two now, not just FP8/MXFP8 (issue #624).
-            o_desc_slots = b + 3
-            return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+            return self._thd_workspace_layout()[1]
         if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
         if self.split_kv > 1:
@@ -2832,6 +2860,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q_decl = int(self.q_desc.shape[2])
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
+    def _thd_workspace_layout(self):
+        b, qh = self.batch_size, self.h_q
+        base = ws_align((4 * b + 4) * 4) + ws_align((b + 3) * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+        if self.paged_thd_split:
+            from cudnn.sdpa.fwd.prepared import thd_split_workspace
+
+            capacity = b * self.s_q_max
+            if self.max_total_seq_len_q is not None:
+                capacity = min(capacity, self.max_total_seq_len_q)
+            return thd_split_workspace(base, self.split_kv, capacity, qh, self.head_dim_v)
+        return None, base
+
     def _thd_plan(self):
         """The THD launch's per-plan constants — the operands' declared strides
         and row spans, the scratch layout, the unit count, the length form —
@@ -2844,6 +2884,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # units from a device-bounded counter. A bounded packed family benefits from
         # handing its short second wave directly to the hardware scheduler instead.
         env = units = self._thd_unit_envelope()
+        if self.paged_thd_split:
+            env = units = env * self.split_kv
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
             resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
@@ -2876,6 +2918,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             n_o_desc=(b + 3) * 16,
             off_o_desc=ws_align(n_meta * 4),
             scratch_bytes=self.scratch_workspace_bytes(),
+            split_workspace=self._thd_workspace_layout()[0],
             total_q=None if self.max_total_seq_len_q is None else max(int(self.max_total_seq_len_q), 0),
             total_kv=None if self.max_total_seq_len_kv is None else max(int(self.max_total_seq_len_kv), 0),
         )
@@ -2916,6 +2959,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         spec = self._thd_spec
         if spec is None:
             raise NotImplementedError("SdpaFwdDslSm100 (THD): this plan has no prepared launch (see _build_thd_spec)")
+        if spec.split_workspace is not None and workspace is None:
+            raise ValueError("prepared packed split requires caller-owned workspace")
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
         _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
         if workspace is not None:
