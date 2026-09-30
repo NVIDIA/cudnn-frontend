@@ -1689,13 +1689,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "D192 split_kv > 1 is validated only with cga=2",
         )
         # cga=1 on the d128 f16/bf16 flavor is the DECODE tile
-        # (sm100/decode_d128_f16.py), which carries no THD_VARLEN leg: a THD
-        # graph rides it only as the ragged-Q-over-paged-KV leg (thd_decode_leg,
-        # S_q(max) == 1).  Mirrors the engine row's mismatch line; keep the two
-        # in lockstep.
+        # (sm100/decode_d128_f16.py). Paged THD uses either the one-query
+        # ragged-Q leg or the native unpacked packed-split host. Mirrors the
+        # engine row's mismatch line; keep both admissions in lockstep.
         self._not_implemented_error_if(
             self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not (self.thd_decode_leg or self.paged_thd_split),
-            "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
+            "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )
         self._not_implemented_error_if(
@@ -1775,7 +1774,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
                 self.thd and not (self.thd_decode_leg or self.paged_thd_split),
-                "split_kv > 1 is dense-only (THD packs its own flat grid), except the decode tile's ragged-Q leg",
+                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native paged D128 packed split",
             )
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             # Paged KV is padded by construction; its split composes with the
