@@ -160,6 +160,12 @@ def test_nsa_swa_ordered_bindings_rebind(layout, with_stats, request, monkeypatc
     q, k, v, _, q_lens, kv_lens, _, _, max_q, max_kv = allocate_input_tensors(cfg)
     out, stats, _, _, _ = allocate_output_tensors(cfg)
     stats = stats if with_stats else None
+    ragged = {}
+    if layout == "thd":  # the plan never derives T,H,D offsets per execute: build them once, pass them in
+        q_off, k_off, v_off, o_off, stats_off = generate_ragged_offset(cfg)
+        ragged = dict(q_ragged_offset_tensor=q_off, k_ragged_offset_tensor=k_off, v_ragged_offset_tensor=v_off, o_ragged_offset_tensor=o_off)
+        if with_stats:
+            ragged["stats_ragged_offset_tensor"] = stats_off
     handle = cudnn.create_handle()
     swa = NSA.SlidingWindowAttention(
         q,
@@ -197,7 +203,7 @@ def test_nsa_swa_ordered_bindings_rebind(layout, with_stats, request, monkeypatc
             q, k, v = (torch.randn_like(tensor) for tensor in (q, k, v))
             out = torch.full_like(out, float("nan"))
             stats = torch.full_like(stats, float("nan")) if with_stats else None
-            swa.execute(q, k, v, out, stats, seq_len_q_tensor=q_lens, seq_len_kv_tensor=kv_lens, workspace=ws)
+            swa.execute(q, k, v, out, stats, seq_len_q_tensor=q_lens, seq_len_kv_tensor=kv_lens, workspace=ws, **ragged)
             assert len(calls) == iteration + 1
             bindings, workspace = calls[-1]
             expected = ((swa.q_cudnn, q), (swa.k_cudnn, k), (swa.v_cudnn, v), (swa.o_cudnn, out))
