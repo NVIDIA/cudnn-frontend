@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import math
 from typing import NamedTuple, Optional
 
@@ -150,11 +151,16 @@ def _as_bwd_original_qkv_layout(t: torch.Tensor) -> torch.Tensor:
 
 
 def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
-    if t.dim() != 3 or t.stride(2) != 1:
+    if t.dim() != 3 or t.data_ptr() % 16 != 0:
         return False
-    if t.data_ptr() % 16 != 0:
+    return _qkv_strides_supported(t.shape, t.stride())
+
+
+@functools.lru_cache(maxsize=1024)
+def _qkv_strides_supported(shape, strides) -> bool:
+    if strides[2] != 1:
         return False
-    dimensions = sorted((int(stride), int(size)) for size, stride in zip(t.shape, t.stride()) if size > 1)
+    dimensions = sorted((int(stride), int(size)) for size, stride in zip(shape, strides) if size > 1)
     covered_span = 1
     for stride, size in dimensions:
         if stride < covered_span:
@@ -162,7 +168,7 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
         covered_span += (size - 1) * stride
     # The backward kernel uses 128-bit global copy/TMA paths. For bf16/fp16,
     # token and head offsets must stay 8-element aligned.
-    return t.stride(0) % 8 == 0 and t.stride(1) % 8 == 0
+    return strides[0] % 8 == 0 and strides[1] % 8 == 0
 
 
 def _normalize_window(max_seqlen_k: int, window_size_left: int, window_size_right: int) -> tuple[int, int, bool, bool]:
@@ -653,6 +659,10 @@ def hstu_varlen_fwd_100_scratch_bytes(
     dispatch = _fwd_dispatch(
         q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, func, paged_kv, page_ids, page_indptrs, _q1_fwd_tuning_config
     )
+    return _fwd_scratch_bytes(dispatch, max_seqlen_q, max_seqlen_k)
+
+
+def _fwd_scratch_bytes(dispatch: _FwdDispatch, max_seqlen_q: int, max_seqlen_k: int) -> int:
     if dispatch.q2k_block_size is None:
         return 0
     return hstu_q2k_block_sparse_workspace_bytes(dispatch.batch_size, max_seqlen_q, max_seqlen_k, dispatch.q2k_block_size)
@@ -774,6 +784,7 @@ def hstu_varlen_fwd_100(
     workspace: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
     _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
+    _dispatch: Optional[_FwdDispatch] = None,
 ):
     """Run (or, with ``_compile_only``, just compile) the SM100 HSTU forward into ``out``.
 
@@ -781,8 +792,25 @@ def hstu_varlen_fwd_100(
     when ``func`` is given; it is not touched in compile-only mode.
     """
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
-    dispatch = _fwd_dispatch(
-        q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, func, paged_kv, page_ids, page_indptrs, _q1_fwd_tuning_config
+    # ``_dispatch``: the plan's check_support() result, valid because execute() pins every operand's layout to the plan.
+    dispatch = (
+        _dispatch
+        if _dispatch is not None
+        else _fwd_dispatch(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            window_size_left,
+            window_size_right,
+            func,
+            paged_kv,
+            page_ids,
+            page_indptrs,
+            _q1_fwd_tuning_config,
+        )
     )
 
     # Keep the public output in the standard contiguous (T, H, D) layout so
@@ -795,8 +823,9 @@ def hstu_varlen_fwd_100(
         raise ValueError("out must be contiguous")
     # q/k/v are read through mark_layout_dynamic(leading_dim=ndim-1) with 128-bit copies; anything
     # else is declined in HSTUFwdSm100.check_support (R5), never staged here.
-    for name, tensor in (("q", q), ("k", k), ("v", v)):
-        _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
+    if _dispatch is None:
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
 
     paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1]) if dispatch.is_paged else None
     if dispatch.compile_key not in hstu_varlen_fwd_100.compile_cache:
@@ -1148,6 +1177,7 @@ def hstu_varlen_bwd_100(
     workspace: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
     _q1_bwd_algorithm: str = "auto",
+    _dispatch: Optional[_BwdDispatch] = None,
 ):
     """Run (or, with ``_compile_only``, just compile) the SM100 HSTU backward into ``dq``/``dk``/``dv``.
 
@@ -1156,23 +1186,27 @@ def hstu_varlen_bwd_100(
     raise ``ValueError`` here and are declined by ``HSTUBwdSm100.check_support`` (R5).
     """
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
-    dispatch = _bwd_dispatch(
-        do,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dq,
-        dk,
-        dv,
-        window_size_left,
-        window_size_right,
-        func,
-        deterministic,
-        _q1_bwd_algorithm,
+    dispatch = (
+        _dispatch
+        if _dispatch is not None
+        else _bwd_dispatch(
+            do,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            window_size_left,
+            window_size_right,
+            func,
+            deterministic,
+            _q1_bwd_algorithm,
+        )
     )
     if dispatch.route == "q1_direct":
         return _hstu_varlen_bwd_q1_direct(
@@ -1218,10 +1252,11 @@ def hstu_varlen_bwd_100(
             _compile_only=_compile_only,
         )
 
-    for name, tensor in (("q", q), ("k", k), ("v", v), ("do", do)):
-        _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
-    for name, tensor in (("dq", dq), ("dk", dk), ("dv", dv)):
-        _require_native_layout(name, tensor, _supports_bwd_direct_grad_layout(tensor))
+    if _dispatch is None:
+        for name, tensor in (("q", q), ("k", k), ("v", v), ("do", do)):
+            _require_native_layout(name, tensor, _supports_bwd_original_qkv_layout(tensor))
+        for name, tensor in (("dq", dq), ("dk", dk), ("dv", dv)):
+            _require_native_layout(name, tensor, _supports_bwd_direct_grad_layout(tensor))
 
     total_q = q.shape[0]
     dq_out, dk_out, dv_out = dq, dk, dv

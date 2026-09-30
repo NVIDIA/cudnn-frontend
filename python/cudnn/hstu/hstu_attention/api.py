@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import nullcontext
+import functools
 import logging
 import math
 from typing import Optional, Tuple
@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from cuda.bindings import driver as cuda
 import torch
 
-from cudnn._torch_stream import as_torch_stream, copy_into_on_stream, record_streams
+from cudnn._torch_stream import as_torch_stream, copy_into_on_stream, device_context, record_streams, stream_context
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 
@@ -59,7 +59,12 @@ def _tensor_signature(tensor: Optional[torch.Tensor]):
 
 def _has_non_overlapping_strides(tensor: torch.Tensor) -> bool:
     """Conservatively validate non-overlap from host-visible tensor metadata."""
-    dimensions = sorted((int(stride), int(size)) for size, stride in zip(tensor.shape, tensor.stride()) if size > 1)
+    return _non_overlapping(tensor.shape, tensor.stride())
+
+
+@functools.lru_cache(maxsize=1024)
+def _non_overlapping(shape, strides) -> bool:
+    dimensions = sorted((int(stride), int(size)) for size, stride in zip(shape, strides) if size > 1)
     covered_span = 1
     for stride, size in dimensions:
         if stride < covered_span:
@@ -119,9 +124,7 @@ def _stream_context(
     stream: Optional[cuda.CUstream | torch.cuda.Stream],
     device: torch.device,
 ):
-    if stream is None:
-        return nullcontext()
-    return torch.cuda.stream(_as_torch_stream(stream, device))
+    return stream_context(stream, device)
 
 
 def _as_torch_stream(
@@ -207,7 +210,7 @@ def _allocate_workspace(
     workspace_bytes = api.scratch_workspace_bytes()
     if workspace_bytes == 0:
         return None
-    with torch.cuda.device(device), _stream_context(stream, device):
+    with device_context(device), _stream_context(stream, device):
         return torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 
 
@@ -277,6 +280,7 @@ class _HSTUBase(APIBase):
         self.is_causal = None
         self.is_local = None
         self._scratch_bytes = None
+        self._dispatch = None
 
     def scratch_workspace_bytes(self) -> int:
         """Bytes ``execute()`` carves from ``workspace`` (R2); valid once ``check_support()`` has passed."""
@@ -538,23 +542,22 @@ class HSTUFwdSm100(_HSTUBase):
         for name, tensor in (("q_tensor", q), ("k_tensor", self._sample_k), ("v_tensor", self._sample_v)):
             if not _interface._supports_bwd_original_qkv_layout(tensor):
                 _decline_layout(name, tensor, _NATIVE_INPUT_LAYOUT)
-        self._scratch_bytes = _interface.hstu_varlen_fwd_100_scratch_bytes(
+        self._dispatch = _interface._fwd_dispatch(
             q,
             self._sample_k,
             self._sample_v,
             self._sample_cu_seqlens_q,
-            self._sample_cu_seqlens_k,
             self.max_seqlen_q,
             self.max_seqlen_k,
             self.window_size[0],
             self.window_size[1],
-            self.alpha,
             self._sample_func,
             paged,
             page_ids,
             page_indptrs,
-            self.scaling_seqlen,
+            None,
         )
+        self._scratch_bytes = _interface._fwd_scratch_bytes(self._dispatch, self.max_seqlen_q, self.max_seqlen_k)
         self._is_supported = True
         return True
 
@@ -663,6 +666,7 @@ class HSTUFwdSm100(_HSTUBase):
                 self.scaling_seqlen,
                 out=o_tensor,
                 workspace=workspace,
+                _dispatch=self._dispatch,
             )
         _record_streams(
             (
@@ -795,6 +799,7 @@ class HSTUBwdSm100(_HSTUBase):
             ):
                 if not tensor.is_contiguous():
                     _decline_layout(name, tensor, _D256_BWD_LAYOUT)
+        self._dispatch = dispatch
         self._scratch_bytes = _interface._bwd_scratch_bytes(dispatch, q.shape[0], self.max_seqlen_q, self.max_seqlen_k)
         self._is_supported = True
         return True
@@ -893,6 +898,7 @@ class HSTUBwdSm100(_HSTUBase):
                 False,
                 self.scaling_seqlen,
                 workspace=workspace,
+                _dispatch=self._dispatch,
             )
         _record_streams(
             (
@@ -940,7 +946,7 @@ def hstu_attention_forward(
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
-    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+    with device_context(q_tensor.device), _stream_context(stream, q_tensor.device):
         q_tensor, k_tensor, v_tensor = (_stage_input(tensor, False, stream, q_tensor.device) for tensor in (q_tensor, k_tensor, v_tensor))
         o_tensor = torch.empty(
             q_tensor.shape,
@@ -1035,7 +1041,7 @@ def hstu_attention_backward(
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
     contiguous_only = _bwd_requires_contiguous(q_tensor, resolved_max_q, resolved_max_k, window_size, func_tensor)
-    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+    with device_context(q_tensor.device), _stream_context(stream, q_tensor.device):
         do_tensor, q_tensor, k_tensor, v_tensor = (
             _stage_input(tensor, contiguous_only, stream, q_tensor.device) for tensor in (do_tensor, q_tensor, k_tensor, v_tensor)
         )
@@ -1097,7 +1103,7 @@ def hstu_attention_backward(
         current_stream=stream,
         workspace=_allocate_workspace(api, q_tensor.device, stream),
     )
-    with torch.cuda.device(q_tensor.device):
+    with device_context(q_tensor.device):
         for caller, scratch in ((dq_caller, dq_tensor), (dk_caller, dk_tensor), (dv_caller, dv_tensor)):
             if caller is not None:
                 copy_into_on_stream(caller, scratch, stream, q_tensor.device)  # R1 staging: the destination is recorded first
