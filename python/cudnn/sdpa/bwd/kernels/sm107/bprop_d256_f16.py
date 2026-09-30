@@ -893,6 +893,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ============================================================================
 # Warp bodies, in pipeline order: TMA-LDG -> MMA -> softmax / dSoftmax -> TMA-STG -> scheduler
 # ============================================================================
