@@ -59,6 +59,11 @@ column slice of the ``[T, N]`` slab on the kernel path -- the caller hands
 a ``[T, W]`` slice; merging T with the columns is not). (2) Every operand is
 traced with ``assumed_align=16``: a band base ``qkvg_offsets[i] * 2 B`` must
 be 16-B aligned -- guaranteed by ``QKVG_TILE_ALIGN = 64`` elements (128 B).
+``run_sigmoid_gate_bwd`` refuses, on the host, any ``[T, H, D]`` operand off
+that 16-B grid (``_check_row_layout``: token stride a multiple of 8 elements,
+head stride D, unit element stride, 16-B base) and any operand off the launch
+device (``_check_one_cuda_device``); the token stride is SYMBOLIC in the
+artifact, so nothing past the host would.
 (3) Strides are ``Int32`` at the tvm-ffi boundary: a tensor whose token stride
 times T exceeds 2^31 elements is the DSL's limit, not this kernel's.
 """
@@ -355,6 +360,50 @@ def compile_sigmoid_gate_bwd(
     )
 
 
+def _check_row_layout(name: str, ten, d: int) -> None:
+    """The ``[T, H, D]`` layout contract the artifact cannot check for itself.
+
+    Every such operand is traced with a SYMBOLIC token stride
+    (``fake_rowmajor_dynamic_token_stride``: strides ``(N, D, 1)``) so one artifact
+    serves the compact tensors and the slab bands alike -- and nothing past this
+    point constrains ``N``. A lane moves ``ACCESS_BYTES`` per access, so the token
+    stride must be a whole number of accesses (``N % ELEMS_PER_ACCESS == 0``; the
+    head stride ``D`` already is, ``validate_shape``) on an ``ACCESS_BYTES``-aligned
+    base: a band of a slab whose width is not a multiple of ``ELEMS_PER_ACCESS``,
+    or a view at an odd storage offset, would reach the kernel and fault on odd
+    tokens with a misaligned ``ld/st.global.v4`` -- a sticky CUDA error, not a
+    wrong number. The block's bands are safe by construction (``n_qkvg`` and every
+    ``qkvg_offsets`` entry are multiples of ``QKVG_TILE_ALIGN`` = 64 elements);
+    this names anything else. A size-1 token or head dim enters no address
+    arithmetic, so torch's normalised stride there is admitted."""
+    t, h = int(ten.shape[0]), int(ten.shape[1])
+    s_t, s_h, s_e = (int(x) for x in ten.stride())
+    base_off = ten.data_ptr() % ACCESS_BYTES
+    ok = s_e == 1 and (h == 1 or s_h == d) and (t == 1 or s_t % ELEMS_PER_ACCESS == 0) and base_off == 0
+    if not ok:
+        raise ValueError(
+            f"{name} must be a [T, H, D] view with heads contiguous within a token -- strides (N, {d}, 1) with the token stride N a multiple of "
+            f"{ELEMS_PER_ACCESS} elements -- on a {ACCESS_BYTES}-B-aligned base (a lane moves {ACCESS_BYTES} B per access; anything else is a "
+            f"misaligned access on odd tokens); got strides {(s_t, s_h, s_e)}, base {base_off} B past a {ACCESS_BYTES}-B boundary"
+        )
+
+
+def _check_one_cuda_device(anchor_name: str, anchor, operands) -> None:
+    """Every bound operand on ONE CUDA device, the anchor's.
+
+    The kernel reads each operand through a device pointer. A CPU ``seq_lens``
+    (``torch.tensor(lens, dtype=torch.int32)`` with no ``device=``) passes the
+    dtype / rank / length checks and would be dereferenced as a HOST address --
+    an illegal-address fault at the next synchronize, sticky for the process --
+    and the same holds for any other operand left on the host or on another
+    device. Named here, before the launch."""
+    if not anchor.is_cuda:
+        raise ValueError(f"{anchor_name} must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {anchor.device}")
+    for name, ten in operands:
+        if ten is not None and ten.device != anchor.device:
+            raise ValueError(f"{name} must be on {anchor.device} with {anchor_name}, got {ten.device}")
+
+
 def _check_operand(r: SigmoidGateBwdRecipe, name: str, ten, t: int) -> None:
     if ten.dtype != r.dtype:
         # The tvm-ffi boundary also rejects this on cutlass-dsl >= 4.8, indexed by
@@ -366,6 +415,7 @@ def _check_operand(r: SigmoidGateBwdRecipe, name: str, ten, t: int) -> None:
         raise ValueError(f"{name} has D={int(ten.shape[2])} but this artifact was compiled for D={r.d}; D is fixed per artifact")
     if int(ten.shape[0]) != t:
         raise ValueError(f"{name} has T={int(ten.shape[0])} but dO_gated has T={t}; every operand covers the same tokens")
+    _check_row_layout(name, ten, r.d)
 
 
 def run_sigmoid_gate_bwd(r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None, seq_lens=None, *, s: Optional[int] = None, stream) -> None:
@@ -395,6 +445,7 @@ def run_sigmoid_gate_bwd(r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None,
             raise ValueError(f"s={s} must divide T={t} (T == B * s)")
         if int(seq_lens.numel()) != t // int(s):
             raise ValueError(f"seq_lens has {int(seq_lens.numel())} entries but T // s = {t // int(s)} batches")
+    _check_one_cuda_device("dog", dog, (("o", o), ("gate", gate), ("do", do), ("dg", dg), ("og", og), ("seq_lens", seq_lens)))
     n_rows = t * r.h
     n_blocks = (n_rows + r.rows_per_cta - 1) // r.rows_per_cta
     # The optional slots stay in the ABI even when they traced to None (the

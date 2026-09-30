@@ -96,7 +96,12 @@ the row traffic.
 slice of the ``[T, N]`` slab on the kernel path: the caller hands ``[T, H, D]``
 band views. (2) Every operand is traced with ``assumed_align=16``: a band base
 ``qkvg_offsets[i] * 2 B`` must be 16-B aligned -- ``QKVG_TILE_ALIGN = 64``
-elements (128 B) guarantees it. (3) Strides are ``Int32`` at the tvm-ffi
+elements (128 B) guarantees it. ``run_qk_norm_rope_bwd`` refuses, on the host,
+any ``[T, H, D]`` operand off that 16-B grid (``_check_row_layout``, shared with
+the gate backward: token stride a multiple of 8 elements, head stride D, unit
+element stride, 16-B base -- the token stride is SYMBOLIC in the artifact, so
+nothing past the host would) and any operand off the launch device
+(``_check_one_cuda_device``). (3) Strides are ``Int32`` at the tvm-ffi
 boundary (the 2^27-element caveat is the DSL's, not this kernel's).
 """
 
@@ -114,6 +119,7 @@ from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, lane_grou
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, ld_shared_v4, st_global, st_global_v4, st_shared_v4
 
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, _fake, fake_rowmajor_dynamic_token_stride, lanes_per_row, validate_shape, vec_chunks
+from .sigmoid_gate_bwd import _check_one_cuda_device, _check_row_layout
 
 DEFAULT_THREADS_PER_CTA = 128
 # rows_per_group is PER ARM, from its own A/B (Rubin, cc 10.7, 204 SMs, SM clock
@@ -871,6 +877,11 @@ def compile_qk_norm_rope_bwd(
     global _FAKE_STREAM
     if rows_per_group is None:
         rows_per_group = DEFAULT_ROWS_PER_GROUP if apply_norm else DEFAULT_ROWS_PER_GROUP_ROPE_ONLY
+    # A row count per lane group: 0 would trace lane groups that own no rows and record
+    # rows_per_cta == 0 (n_ctas_for then divides by it), a negative value a wrong CTA count,
+    # a non-int a float rows_per_cta -- refused before the device is queried or anything traced.
+    if not isinstance(rows_per_group, int) or rows_per_group < 1:
+        raise ValueError(f"rows_per_group must be an int >= 1, got {rows_per_group!r}")
     validate_shape(d, rope_dim, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"qk_norm_rope_bwd serves bf16/f16 only, got {dtype}")
@@ -1002,6 +1013,7 @@ def _check_dense(r: QkNormRopeBwdRecipe, name: str, ten, t: int, h: int) -> None
         raise ValueError(f"{name} has D={int(ten.shape[2])} but this artifact was compiled for D={r.d}; D is fixed per artifact")
     if int(ten.shape[0]) != t:
         raise ValueError(f"{name} has T={int(ten.shape[0])} but dq has T={t}; every operand covers the same tokens")
+    _check_row_layout(name, ten, r.d)
 
 
 def _check_fp32_plane(name: str, ten, shape: tuple) -> None:
@@ -1119,6 +1131,28 @@ def run_qk_norm_rope_bwd(
             raise ValueError(f"s={s} must divide T={t} (T == B * s)")
         if int(seq_lens.numel()) != t // int(s):
             raise ValueError(f"seq_lens has {int(seq_lens.numel())} entries but T // s = {t // int(s)} batches")
+    _check_one_cuda_device(
+        "dq",
+        dq,
+        (
+            ("dk", dk),
+            ("dv", dv),
+            ("x_q", xq),
+            ("x_k", xk),
+            ("rstd_q", rstd_q),
+            ("rstd_k", rstd_k),
+            ("w_q_norm", w_q),
+            ("w_k_norm", w_k),
+            ("cos", cos),
+            ("sin", sin),
+            ("out_q", out_q),
+            ("out_k", out_k),
+            ("out_v", out_v),
+            ("dw_partials_q", dw_partials_q),
+            ("dw_partials_k", dw_partials_k),
+            ("seq_lens", seq_lens),
+        ),
+    )
     # The optional slots stay in the ABI even when they traced to None (the
     # artifact folded out the loads / stores, not the parameters).
     r.compiled(
@@ -1175,6 +1209,7 @@ def run_dw_norm_reduce(r: QkNormRopeBwdRecipe, dw_partials_q, dw_partials_k, dw_
     n_q, n_k = int(dw_partials_q.shape[0]), int(dw_partials_k.shape[0])
     if n_q < 1 or n_k < 1:
         raise ValueError(f"the partial planes need at least one row each, got {n_q} / {n_k}")
+    _check_one_cuda_device("dw_partials_q", dw_partials_q, (("dw_partials_k", dw_partials_k), ("dw_q_norm", dw_q_norm), ("dw_k_norm", dw_k_norm)))
     n_blocks = (r.d + REDUCE_COLS - 1) // REDUCE_COLS
     r.reduce_compiled(
         dw_partials_q, dw_partials_k, dw_q_norm, dw_k_norm, cutlass.Int32(n_q), cutlass.Int32(n_k), cutlass.Int32(n_blocks), cuda.CUstream(int(stream))

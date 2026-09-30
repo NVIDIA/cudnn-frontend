@@ -30,6 +30,7 @@ from cudnn.gated_attention_block.kernels.sigmoid_gate_bwd import (  # noqa: E402
     run_sigmoid_gate_bwd,
     validate_shape,
 )
+from cudnn.gated_attention_block.kernels.qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS  # noqa: E402
 from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E402
 
 pytestmark = pytest.mark.L0
@@ -164,6 +165,51 @@ def test_recipe_refusals_are_typed_and_pre_compile():
     # compile-time: dtype
     with pytest.raises(ValueError, match="bf16/f16 only"):
         compile_sigmoid_gate_bwd(dtype=torch.float32, h=8, d=256, has_og=False, has_seq_lens=False)
+
+
+def test_launch_refuses_an_operand_off_the_16_byte_access_grid():
+    """Every ``[T, H, D]`` operand is traced with a SYMBOLIC token stride, so only the host can
+    check that the stride is a whole number of 16-B accesses: a band of a slab whose width is
+    not a multiple of ``ELEMS_PER_ACCESS`` (N = 8k + 4), a view at storage offset 1, or a
+    permuted layout would reach the kernel and fault on odd tokens (a sticky misaligned-address
+    CUDA error). Each is a typed ValueError naming the operand and its strides, before the
+    artifact is touched. (``test_gate_bwd_writes_the_gate_band_only`` launches through the same
+    check with the block's real GATE band views.)"""
+    r = SigmoidGateBwdRecipe(compiled=None, h=8, d=256, rows_per_cta=4, dtype=torch.bfloat16, has_og=False, has_seq_lens=False)
+    t, h, d = 4, 8, 256
+    x = torch.empty(t, h, d, dtype=torch.bfloat16)
+    odd = torch.empty(t, h * d + 4, dtype=torch.bfloat16)[:, : h * d].view(t, h, d)
+    assert odd.stride() == (h * d + 4, d, 1) and odd.stride(0) % ELEMS_PER_ACCESS == 4
+    with pytest.raises(ValueError, match=r"gate .*strides \(2052, 256, 1\)"):
+        run_sigmoid_gate_bwd(r, x, x, odd, x, x, None, None, stream=0)
+    shifted = torch.empty(t * h * d + ELEMS_PER_ACCESS, dtype=torch.bfloat16)[1 : 1 + t * h * d].view(t, h, d)
+    assert shifted.data_ptr() % ACCESS_BYTES == 2, "one bf16 element past a 16-B boundary"
+    with pytest.raises(ValueError, match=r"dg .*base 2 B past"):
+        run_sigmoid_gate_bwd(r, x, x, x, x, shifted, None, None, stream=0)
+    permuted = torch.empty(t, d, h, dtype=torch.bfloat16).transpose(1, 2)  # strides (d*h, 1, h)
+    with pytest.raises(ValueError, match=r"do .*strides \(2048, 1, 8\)"):
+        run_sigmoid_gate_bwd(r, x, x, x, permuted, x, None, None, stream=0)
+
+
+@requires_cuda
+def test_launch_refuses_operands_off_the_launch_device():
+    """The kernel dereferences every operand as a device pointer. A CPU ``seq_lens``
+    (``torch.tensor(lens, dtype=torch.int32)`` without ``device=``) passes the dtype / rank /
+    length checks and would be read as a HOST address -- an illegal-address fault at the next
+    synchronize, sticky for the process. Refused by name before the artifact is touched, as is
+    any other operand off the launch device."""
+    base = dict(compiled=None, h=8, d=256, rows_per_cta=4, dtype=torch.bfloat16)
+    with_sl = SigmoidGateBwdRecipe(has_og=False, has_seq_lens=True, **base)
+    with_og = SigmoidGateBwdRecipe(has_og=True, has_seq_lens=False, **base)
+    x = torch.empty(4, 8, 256, dtype=torch.bfloat16, device="cuda")
+    dev = x.device
+    with pytest.raises(ValueError, match=rf"seq_lens must be on {dev} .*got cpu"):
+        run_sigmoid_gate_bwd(with_sl, x, x, x, x, x, None, torch.tensor([2, 2], dtype=torch.int32), s=2, stream=0)
+    with pytest.raises(ValueError, match=rf"og must be on {dev} .*got cpu"):
+        run_sigmoid_gate_bwd(with_og, x, x, x, x, x, x.cpu(), None, stream=0)
+    c = x.cpu()
+    with pytest.raises(ValueError, match="dog must be a CUDA tensor"):
+        run_sigmoid_gate_bwd(with_og, c, c, c, c, c, c, None, stream=0)
 
 
 # ---------------------------------------------------------------------------

@@ -44,7 +44,8 @@ from cudnn.gated_attention_block.kernels.qk_norm_rope_bwd import (  # noqa: E402
     run_qk_norm_rope_bwd,
     validate_shape,
 )
-from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E402
+from cudnn.gated_attention_block.kernels.qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS  # noqa: E402
+from cudnn.gated_attention_block import QKVG_TILE_ALIGN, GatedAttentionBlockGeometry  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -256,6 +257,28 @@ def test_compile_time_refusals():
         compile_qk_norm_rope_bwd(**base, apply_norm=True, want_dw=True, n_ctas_policy="fixed:0")
 
 
+def test_compile_time_refuses_rows_per_group_below_one(monkeypatch):
+    """``rows_per_group`` is a row count per lane group. 0 would trace lane groups that own no
+    rows and record ``rows_per_cta == 0`` (``n_ctas_for`` then divides by it), a negative value
+    a wrong CTA count, a non-int a float ``rows_per_cta``: each is a typed ValueError before the
+    device is queried or the artifact traced. CPU-only: ``cute.compile`` is stubbed to FAIL, so
+    reaching it is the failure."""
+    from cudnn.gated_attention_block.kernels import qk_norm_rope_bwd as kern
+
+    def never(*a, **k):
+        raise AssertionError("cute.compile was reached for a refused rows_per_group")
+
+    monkeypatch.setattr(kern, "compiled_cache", {})
+    monkeypatch.setattr(kern, "reduce_cache", {})
+    monkeypatch.setattr(kern, "current_device", lambda: 0)
+    monkeypatch.setattr(kern, "multiprocessor_count", lambda dev: 100)
+    monkeypatch.setattr(kern.cute, "compile", never)
+    kw = dict(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, has_seq_lens=False, apply_norm=True, want_dw=True)
+    for bad in (0, -1, 2.0, "2"):
+        with pytest.raises(ValueError, match="rows_per_group must be an int >= 1"):
+            kern.compile_qk_norm_rope_bwd(**kw, rows_per_group=bad)
+
+
 def test_rows_per_group_default_resolves_per_arm(monkeypatch):
     """``rows_per_group=None`` -> 1 with the norm, 2 for the RoPE-only adjoint (each arm's
     measured optimum); an explicit value is honoured. CPU-only: ``cute.compile`` stubbed."""
@@ -399,6 +422,127 @@ def test_execute_refusals_are_typed_and_pre_compile():
         run_dw_norm_reduce(normed, pq, pk, torch.empty(256), torch.empty(256), stream=0, t=1)
     with pytest.raises(ValueError, match=r"dw_partials_k must be a contiguous fp32 \[1, 256\]"):
         run_dw_norm_reduce(normed, pq[:2], pk, torch.empty(256), torch.empty(256), stream=0, t=1)
+
+
+# A hand-built recipe (no compile) for the host-only launch checks: norm arm, no dW partials.
+_HOST_RECIPE = dict(
+    reduce_compiled=None, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, rows_per_cta=4, apply_norm=True, want_dw=False, n_ctas_cap=4, dtype=torch.bfloat16
+)
+
+
+def _launch_operands(t, h_q, h_kv, d, rope_dim, dtype, device):
+    """A complete, layout-clean operand set for ``_HOST_RECIPE`` (compact ``[T, H, D]`` everywhere)."""
+    q = torch.empty(t, h_q, d, dtype=dtype, device=device)
+    k = torch.empty(t, h_kv, d, dtype=dtype, device=device)
+    w = torch.ones(d, dtype=dtype, device=device)
+    tab = torch.empty(t, rope_dim, dtype=dtype, device=device)
+    rq, rk = torch.empty(t, h_q, device=device), torch.empty(t, h_kv, device=device)
+    return dict(dq=q, dk=k, dv=k, xq=q, xk=k, rstd_q=rq, rstd_k=rk, w_q=w, w_k=w, cos=tab, sin=tab, out_q=q, out_k=k, out_v=k)
+
+
+def _host_launch(r, ops, **over):
+    a = {**ops, **over}
+    run_qk_norm_rope_bwd(
+        r,
+        a["dq"],
+        a["dk"],
+        a["dv"],
+        a["xq"],
+        a["xk"],
+        a["rstd_q"],
+        a["rstd_k"],
+        a["w_q"],
+        a["w_k"],
+        a["cos"],
+        a["sin"],
+        a["out_q"],
+        a["out_k"],
+        a["out_v"],
+        a.get("dw_partials_q"),
+        a.get("dw_partials_k"),
+        a.get("seq_lens"),
+        s=a.get("s"),
+        stream=0,
+    )
+
+
+def test_execute_refuses_a_dense_operand_off_the_16_byte_access_grid():
+    """Every ``[T, H, D]`` operand is traced with a SYMBOLIC token stride, so only the host can
+    check that the stride is a whole number of 16-B accesses: a band of a slab whose width is
+    not a multiple of ``ELEMS_PER_ACCESS`` (N = 8k + 4), a view at storage offset 1, or a
+    permuted layout would reach the kernel and fault on odd tokens (a sticky misaligned-address
+    CUDA error). Each is a typed ValueError naming the operand and its strides, before the
+    artifact is touched."""
+    r = QkNormRopeBwdRecipe(compiled=None, has_seq_lens=False, **_HOST_RECIPE)
+    t, h_q, h_kv, d = 4, 8, 2, 256
+    ops = _launch_operands(t, h_q, h_kv, d, 64, torch.bfloat16, "cpu")
+    odd = torch.empty(t, h_q * d + 4, dtype=torch.bfloat16)[:, : h_q * d].view(t, h_q, d)
+    assert odd.stride() == (h_q * d + 4, d, 1) and odd.stride(0) % ELEMS_PER_ACCESS == 4
+    with pytest.raises(ValueError, match=r"x_q .*strides \(2052, 256, 1\)"):
+        _host_launch(r, ops, xq=odd)
+    shifted = torch.empty(t * h_kv * d + ELEMS_PER_ACCESS, dtype=torch.bfloat16)[1 : 1 + t * h_kv * d].view(t, h_kv, d)
+    assert shifted.data_ptr() % ACCESS_BYTES == 2, "one bf16 element past a 16-B boundary"
+    with pytest.raises(ValueError, match=r"out_k .*base 2 B past"):
+        _host_launch(r, ops, out_k=shifted)
+    permuted = torch.empty(t, d, h_q, dtype=torch.bfloat16).transpose(1, 2)  # strides (d*h_q, 1, h_q)
+    with pytest.raises(ValueError, match=r"dq .*strides \(2048, 1, 8\)"):
+        _host_launch(r, ops, dq=permuted)
+
+
+@requires_cuda
+def test_execute_admits_the_blocks_compact_and_band_views():
+    """The block's real operands pass the layout check: compact ``[T, H, D]`` tensors and the
+    proj_slab / dqkvg bands (token stride N = n_qkvg, base at a ``qkvg_offsets`` column), both
+    multiples of ``QKVG_TILE_ALIGN`` = 64 elements (128 B), so the 16-B access grid holds for
+    every geometry the block admits; a size-1 token dim (torch normalises its stride) too. A
+    recording stub stands in for the artifact: the launch is reached once per layout."""
+    calls = []
+    r = QkNormRopeBwdRecipe(compiled=lambda *a: calls.append(a), has_seq_lens=False, **_HOST_RECIPE)
+    h_q, h_kv, d, rope_dim = 8, 2, 256, 64
+    geom = GatedAttentionBlockGeometry(d_model=h_q * d, h_q=h_q, h_kv=h_kv, d_head=d, rope_dim=rope_dim)
+    o_q, o_g, o_k, o_v = geom.qkvg_offsets
+    n = geom.n_qkvg
+    assert QKVG_TILE_ALIGN % ELEMS_PER_ACCESS == 0 and n % ELEMS_PER_ACCESS == 0 and all(o % ELEMS_PER_ACCESS == 0 for o in geom.qkvg_offsets)
+    for t in (3, 1):
+        ops = _launch_operands(t, h_q, h_kv, d, rope_dim, torch.bfloat16, "cuda")
+        _host_launch(r, ops)  # compact
+        slab = torch.empty(t, n, dtype=torch.bfloat16, device="cuda")
+        dqkvg = torch.empty(t, n, dtype=torch.bfloat16, device="cuda")
+        bands = dict(
+            xq=slab[:, o_q:o_g].view(t, h_q, d),
+            xk=slab[:, o_k:o_v].view(t, h_kv, d),
+            out_q=dqkvg[:, o_q:o_g].view(t, h_q, d),
+            out_k=dqkvg[:, o_k:o_v].view(t, h_kv, d),
+            out_v=dqkvg[:, o_v:].view(t, h_kv, d),
+        )
+        if t > 1:
+            assert bands["xq"].stride() == (n, d, 1)
+        _host_launch(r, ops, **bands)  # the strided bands
+    assert len(calls) == 4
+
+
+@requires_cuda
+def test_execute_refuses_operands_off_the_launch_device():
+    """The kernel dereferences every operand as a device pointer. A CPU ``seq_lens``
+    (``torch.tensor(lens, dtype=torch.int32)`` without ``device=``) passes the dtype / rank /
+    length checks and would be read as a HOST address -- an illegal-address fault at the next
+    synchronize, sticky for the process. Refused by name before the artifact is touched, as is
+    any other operand off the launch device; the reduce launch checks its planes the same way."""
+    t = 4
+    ops = _launch_operands(t, 8, 2, 256, 64, torch.bfloat16, "cuda")
+    dev = ops["dq"].device
+    with_sl = QkNormRopeBwdRecipe(compiled=None, has_seq_lens=True, **_HOST_RECIPE)
+    with pytest.raises(ValueError, match=rf"seq_lens must be on {dev} .*got cpu"):
+        _host_launch(with_sl, ops, seq_lens=torch.tensor([2, 2], dtype=torch.int32), s=2)
+    with pytest.raises(ValueError, match=rf"x_k must be on {dev} .*got cpu"):
+        _host_launch(with_sl, ops, xk=ops["xk"].cpu(), seq_lens=torch.tensor([2, 2], dtype=torch.int32, device=dev), s=2)
+    dense = QkNormRopeBwdRecipe(compiled=None, has_seq_lens=False, **_HOST_RECIPE)
+    with pytest.raises(ValueError, match="dq must be a CUDA tensor"):
+        _host_launch(dense, _launch_operands(t, 8, 2, 256, 64, torch.bfloat16, "cpu"))
+    reduce = QkNormRopeBwdRecipe(compiled=None, has_seq_lens=False, **{**_HOST_RECIPE, "want_dw": True})
+    pq, pk = torch.empty(4, 256, device=dev), torch.empty(2, 256, device=dev)
+    with pytest.raises(ValueError, match=rf"dw_k_norm must be on {dev} .*got cpu"):
+        run_dw_norm_reduce(reduce, pq, pk, torch.empty(256, device=dev), torch.empty(256), stream=0)
 
 
 # ---------------------------------------------------------------------------
