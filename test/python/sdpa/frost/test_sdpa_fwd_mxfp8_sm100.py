@@ -1212,6 +1212,7 @@ def test_mxfp8_masks(in_key, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 row has no d64 flavor (exact native shapes only: d_shapes without (64, 64), d_pad_multiple=0)")
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", list(_MASKS))
 @torch_fork_set_rng(seed=0)

@@ -89,11 +89,14 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_native_shapes():
     """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
     INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
-    (sm107/prefill_d192_d128_fp8.py), so both arch lines now carry all four
-    native flavors and the two shape sets are identical."""
+    (sm107/prefill_d192_d128_fp8.py), so both arch lines carry all four d >= 128
+    native flavors.  The SM100 line additionally carries the native d64 leg (the
+    d128 FP8 file at TemplateParams.d_flavor=64); Rubin has no d64 sibling and
+    keeps d64 on the d128 envelope, so the two shape sets differ by exactly that
+    flavor."""
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) | {(64, 64)}
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
@@ -114,12 +117,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
     # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
-    # now carries all four per-tensor FP8 flavors, d192xd128 included, so the
-    # two rows agree on d_shapes.  They still differ on THD, split-KV, PackGQA
-    # and the scheduler domain -- which is the point of splitting the rows.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    # now carries all four d >= 128 per-tensor FP8 flavors, d192xd128 included.
+    # The native d64 leg (the d128 FP8 file at TemplateParams.d_flavor=64) is
+    # SM100-only -- api_dsl._SM107_FP8_KERNEL_FILES has no (64, 64), so a d64
+    # graph rides the d128 envelope on Rubin and the row must not name a flavor
+    # its split / PackGQA / scheduler domains never build.  The rows still
+    # differ on THD, split-KV, PackGQA and the scheduler domain -- which is the
+    # point of splitting the rows.
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in sm107.d_shapes
+    assert (64, 64) not in sm107.d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
