@@ -260,6 +260,7 @@ def _warp_fwd_pipe_kernel(
     block_threads: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
@@ -270,9 +271,9 @@ def _warp_fwd_pipe_kernel(
     lane = tid % 32
 
     smem = SmemAllocator()
-    xbuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * C), byte_alignment=16)
-    sG = smem.allocate_tensor(cutlass.Int16, cute.make_layout(C), byte_alignment=16)
-    sB = smem.allocate_tensor(cutlass.Int16, cute.make_layout(C), byte_alignment=16) if cutlass.const_expr(has_beta) else None
+    xbuf = smem.allocate_tensor(it_ty, cute.make_layout(STAGES * C), byte_alignment=16)
+    sG = smem.allocate_tensor(it_ty, cute.make_layout(C), byte_alignment=16)
+    sB = smem.allocate_tensor(it_ty, cute.make_layout(C), byte_alignment=16) if cutlass.const_expr(has_beta) else None
     red = None
     if cutlass.const_expr(wn > 1):
         red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(wn * (2 if has_mean else 1)), byte_alignment=8)
@@ -283,11 +284,11 @@ def _warp_fwd_pipe_kernel(
     if tid == 0:
         for j in cutlass.range_constexpr(2 * STAGES + npb):
             nvvm.mbarrier_init(mbar.iterator + j, 1)
-        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * 2)
-        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * 2)
+        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * eb)
+        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * eb)
         if cutlass.const_expr(has_beta):
-            nvvm.mbarrier_arrive_expect_tx(mbar.iterator + (GBAR + 1), C * 2)
-            nvvm.cp_async_bulk_shared_cluster_global(sB.iterator, mBi.iterator, mbar.iterator + (GBAR + 1), C * 2)
+            nvvm.mbarrier_arrive_expect_tx(mbar.iterator + (GBAR + 1), C * eb)
+            nvvm.cp_async_bulk_shared_cluster_global(sB.iterator, mBi.iterator, mbar.iterator + (GBAR + 1), C * eb)
     cute.arch.sync_threads()
     while not nvvm.mbarrier_try_wait_parity(mbar.iterator + GBAR, 0):
         pass
@@ -295,7 +296,7 @@ def _warp_fwd_pipe_kernel(
         while not nvvm.mbarrier_try_wait_parity(mbar.iterator + (GBAR + 1), 0):
             pass
 
-    NB: cutlass.Constexpr = C * 2
+    NB: cutlass.Constexpr = C * eb
     stride = ctas
     Cf = cutlass.Float32(C)
     rn = 1.0 / Cf
@@ -410,6 +411,7 @@ def _warp_fwd_pipe_host(
     block_threads: cutlass.Constexpr,
     et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr,
+    eb: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
@@ -438,6 +440,7 @@ def _warp_fwd_pipe_host(
         block_threads,
         et,
         it_ty,
+        eb,
         STAGES,
         has_mean,
         has_beta,
@@ -487,8 +490,8 @@ _PIPE_SMEM_MAX = 228 * 1024
 _USE_PIPE = True  # test override
 
 
-def _pipe_smem(C, has_beta, wn, STAGES):
-    return STAGES * C * 2 + (2 if has_beta else 1) * C * 2 + wn * 8 + (2 * STAGES + (2 if has_beta else 1)) * 8 + 64
+def _pipe_smem(C, has_beta, wn, STAGES, eb):
+    return STAGES * C * eb + (2 if has_beta else 1) * C * eb + wn * 8 + (2 * STAGES + (2 if has_beta else 1)) * 8 + 64
 
 
 def _pipe_stages(C):
@@ -507,8 +510,8 @@ def _pipe_cap(full_ctas, C):
     return min(full_ctas, _SM_COUNT * mult)
 
 
-def _pipe_eligible(C, wn, has_beta):
-    return _USE_PIPE and wn > 1 and _pipe_smem(C, has_beta, wn, _pipe_stages(C)) <= _PIPE_SMEM_MAX
+def _pipe_eligible(C, wn, has_beta, eb):
+    return _USE_PIPE and wn > 1 and _pipe_smem(C, has_beta, wn, _pipe_stages(C), eb) <= _PIPE_SMEM_MAX
 
 
 def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
@@ -519,7 +522,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
     has_beta = beta is not None
     R, C = spec.R, spec.M
 
-    if _pipe_eligible(C, wn, has_beta):
+    if _pipe_eligible(C, wn, has_beta, DTYPE_BYTES[params.io_dtype]):
         return _forward_pipe(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params, has_beta=has_beta)
 
     ctas = _persist_cap((R + rpc - 1) // rpc, block_threads, wn, ldgs)  # persistent grid
@@ -566,11 +569,12 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta):
         beta = gamma  # unused (not bulk-loaded) when has_beta is False
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
-    it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
-    smem_bytes = _pipe_smem(C, has_beta, wn, STAGES)
+    eb = DTYPE_BYTES[params.io_dtype]
+    it_ty = _INT_TY[eb]
+    smem_bytes = _pipe_smem(C, has_beta, wn, STAGES, eb)
 
     args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd), cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
-    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, spec.has_mean, has_beta, smem_bytes)
+    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, spec.has_mean, has_beta, smem_bytes)
     key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, spec.has_mean, has_beta)
     fn = _KCACHE.get(key)
     if fn is None:
