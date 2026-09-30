@@ -609,3 +609,57 @@ def test_wrong_major_view_is_a_typed_refusal():
     w_wide = torch.zeros(dm, hd + 64, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=r"B \(w\).*strides \(\d+, 1088, 1\) but the plan declared"):
         run_dgrad_gemm(dg, dy, w_wide[:, :hd], torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)
+
+
+def test_wrong_output_dtype_is_a_typed_refusal():
+    """The OUTPUT's dtype is checked like A's and W's: a ``dw`` / ``dx`` / ``out`` whose dtype is
+    not the plan's ``out_dtype`` is a ``ValueError`` naming the plan and both dtypes, raised by
+    ``run_proj_gemm`` -- so the forward and both backward drivers share the gate -- before any
+    route.  Why: the graph carries C's dtype and the JIT binds a pointer, so a same-size f16
+    buffer on a bf16 plan would be filled with bf16 bit patterns (wrong values, no error), and a
+    NARROWER buffer (an e4m3 ``[T, N]`` on a bf16 plan, half the bytes) would have 2-byte stores
+    run past its allocation.  A spy stands in for the JIT to prove nothing launched.  Hand-built
+    plans, so this runs on any device; a plan with no ``out_dtype`` (the stream-routing probes)
+    checks nothing, exactly as for A / W."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import run_proj_gemm
+
+    class _SpyJit:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, vp, **kw):
+            self.calls.append(vp)
+
+    t, dm, hd = 256, 512, 1024
+    narrow = _FP8 if _FP8 is not None else torch.uint8  # a 1-byte output buffer on a 2-byte plan
+    dy = torch.zeros(t, dm, device="cuda", dtype=torch.bfloat16)
+    x = torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(dm, hd, device="cuda", dtype=torch.bfloat16)
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    # (1) wgrad: a same-size f16 dw on a bf16 plan -- it passes the shape / stride gates and is refused by dtype.
+    mn = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=dm, k=t, n=hd, label="mn", dtype=torch.bfloat16, out_dtype=torch.bfloat16, a_major="m", b_major="n")
+    mn.jit = _SpyJit()
+    with pytest.raises(ValueError, match=r"^mn: out is torch\.float16 but this plan was built for torch\.bfloat16; refusing to reinterpret the bytes$"):
+        run_wgrad_gemm(mn, dy, x, torch.zeros(dm, hd, device="cuda", dtype=torch.float16), ws)
+    # (2) dgrad: a NARROWER dx (1 B/elem) on the bf16 plan -- the case whose stores would overrun the buffer.
+    dg = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=dm, n=hd, label="dg", dtype=torch.bfloat16, out_dtype=torch.bfloat16, a_major="k", b_major="n")
+    dg.jit = _SpyJit()
+    with pytest.raises(ValueError) as ei:
+        run_dgrad_gemm(dg, dy, w, torch.zeros(t, hd, device="cuda", dtype=narrow), ws)
+    assert str(ei.value) == f"dg: out is {narrow} but this plan was built for torch.bfloat16; refusing to reinterpret the bytes"
+    # (3) the forward's entry point shares the gate: a K-major plan through run_proj_gemm directly.
+    fwd = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=hd, n=dm, label="fwd", dtype=torch.bfloat16, out_dtype=torch.bfloat16)
+    fwd.jit = _SpyJit()
+    with pytest.raises(ValueError, match=r"^fwd: out is torch\.float16 but this plan was built for torch\.bfloat16"):
+        run_proj_gemm(fwd, x, w, torch.zeros(t, dm, device="cuda", dtype=torch.float16), ws)
+    assert not (mn.jit.calls or dg.jit.calls or fwd.jit.calls), "a mismatched output reached the launch"
+    # (4) the declared dtype passes the gate and reaches the (spy) launch, once per call.
+    run_wgrad_gemm(mn, dy, x, torch.zeros(dm, hd, device="cuda", dtype=torch.bfloat16), ws)
+    run_dgrad_gemm(dg, dy, w, torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)
+    run_proj_gemm(fwd, x, w, torch.zeros(t, dm, device="cuda", dtype=torch.bfloat16), ws)
+    assert [len(p.jit.calls) for p in (mn, dg, fwd)] == [1, 1, 1]
+    # (5) a hand-built plan with no out_dtype (the stream-routing probes) checks nothing -- as for A / W.
+    probe = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=hd, n=dm, label="probe")
+    probe.jit = _SpyJit()
+    run_proj_gemm(probe, x, w, torch.zeros(t, dm, device="cuda", dtype=torch.float16), ws)
+    assert len(probe.jit.calls) == 1

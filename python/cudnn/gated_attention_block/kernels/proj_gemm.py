@@ -1451,14 +1451,24 @@ def run_proj_gemm(
     invariant under a ``swap_ab`` tile config (which swaps the binding's LISTS).
 
     **Operand dtype and fp4 extent are CHECKED here** (``a.dtype == plan.dtype``,
-    ``w.dtype == plan.w_dtype``; an e2m1 side's storage ``shape[-1] * 2 == K``).  The
-    graph carries the dtypes and the kernel binds a pointer, so before this a bf16
-    ``w`` handed to an fp8 plan was silently REINTERPRETED byte-for-byte -- the one
-    deliberate tightening the fp4 widening brings, because a ``[N, K]`` fp4 tensor
-    (logical shape) and a ``[N, K/2]`` one (storage) are one wrong bind apart.
+    ``w.dtype == plan.w_dtype``, ``out.dtype == plan.out_dtype``; an e2m1 side's storage
+    ``shape[-1] * 2 == K``).  The graph carries the dtypes and the kernel binds a pointer,
+    so before this a bf16 ``w`` handed to an fp8 plan was silently REINTERPRETED
+    byte-for-byte -- the one deliberate tightening the fp4 widening brings, because a
+    ``[N, K]`` fp4 tensor (logical shape) and a ``[N, K/2]`` one (storage) are one wrong
+    bind apart.  The output gate is the same rule on C: its stores are typed by the plan,
+    so a same-size buffer of another dtype would hold wrong bit patterns and a narrower
+    one would be overrun -- refused by name before any route, for the forward and both
+    backward drivers alike.
     """
     _check_operand(plan, a, "a", plan.dtype)
     _check_operand(plan, w, "w", plan.w_dtype if plan.w_dtype is not None else plan.dtype)
+    # The OUTPUT too: the graph carries C's dtype and the kernel's stores use it, so a same-size f16
+    # buffer on a bf16 plan would hold bf16 bit patterns (wrong values, no error) and a narrower one
+    # (an e4m3 slab) would be overrun by 2-byte stores.  Shared by the forward and both backward
+    # drivers; a hand-built plan with no out_dtype (the routing probes) checks nothing, as for A / W.
+    if out is not None and plan.out_dtype is not None and out.dtype != plan.out_dtype:
+        raise ValueError(f"{plan.label}: out is {out.dtype} but this plan was built for {plan.out_dtype}; refusing to reinterpret the bytes")
     if plan.block_scale:
         sf_a3, sf_w3 = _sf_view(plan, sf_a, "sf_a", plan.m), _sf_view(plan, sf_w, "sf_w", plan.n)
     elif sf_a is not None or sf_w is not None:
@@ -1676,7 +1686,7 @@ def _check_view_against_declaration(plan: ProjGemmPlan, operand: str, what: str,
             f"{plan.a_major if operand == 'A' else plan.b_major}-major with strides {declared}: the view's stride-1 axis is not the declared "
             f"contiguous axis {contig}. Build the plan with the matching a_major / b_major, or hand the driver the un-transposed storage"
         )
-    if any(s != d for s, d, e in zip(stride, declared, shape) if e != 1):
+    if any(s != d for s, d, e in zip(stride, declared, shape, strict=True) if e != 1):  # all rank 3: shape == dims was checked above
         raise ValueError(
             f"{plan.label}: {operand} ({what}) view has strides {stride} but the plan declared {declared}; the drivers bind exactly the declared "
             "layout on every route -- the graph route would read a padded / strided view as the declared layout, and the JIT re-labels B into "
