@@ -179,8 +179,11 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
 
 def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
-    """A causal per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] on the SM100
-    row (the L2-budget rule).  The Rubin d128 flavor claims the same three
+    """A causal per-tensor FP8 graph ranks [LPT, LPT_L2, NATURAL] on the SM100
+    row: the L2-budget rule leads with LPT_L2 only from 8 MiB of K+V per head
+    (heuristics._SM100_D128_LPT_L2_MIN_BYTES), and this head is 1 MiB, so its
+    K/V stays L2-resident under any walk and plain LPT keeps the balance.  The
+    Rubin d128 flavor claims the same three
     policies since 2026-09-14, but these facts have h_q == h_kv -- no K/V
     sharing for LPT_L2 to group -- and a 1.2-wave grid, so the Rubin rule leads
     with plain LPT and keeps the other two as autotune runners (measured on the
@@ -212,14 +215,15 @@ def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
-    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
-    # the SM100 rule groups against, so LPT_L2 leads there.  The Rubin row's
-    # d128 domain is {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has
-    # nothing to group, and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves,
-    # so the Rubin rule leads with LPT.  Both rows keep every domain member in
-    # the ranking (autotune), and neither proposes anything outside it.
+    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
+    # d64 rows' 8 MiB floor for LPT_L2's head grouping, so plain LPT leads there
+    # (LPT_L2 stays the first autotune runner).  The Rubin row's d128 domain is
+    # {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has nothing to group,
+    # and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves, so the Rubin rule
+    # leads with LPT as well.  Both rows keep every domain member in the ranking
+    # (autotune), and neither proposes anything outside it.
     assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
 
     # Both d128 remap specializations template-LOAD (the decode is correct
     # since #1001 and bit-identical to NATURAL -- the Rubin e2e below).

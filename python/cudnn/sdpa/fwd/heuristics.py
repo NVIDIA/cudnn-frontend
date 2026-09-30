@@ -745,6 +745,10 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 # tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
 # cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
 _D128_DECODE_TILE_ROWS = 128
+# The d64 f16 decode tile's Q rows (api_dsl._D64_DECODE_TILE_ROWS): the one d64 leg
+# narrower than the flavor's 256-row cga1 prefill, selected by the adapter once
+# S_q x packed heads fit it (and the cga knob is unset or 1).
+_D64_DECODE_TILE_ROWS = 128
 
 
 def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
@@ -864,7 +868,15 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
-        if facts.is_fp8 and cga == 1:
+        if _selected_d_shape(caps, facts) == (64, 64):
+            # The native d64 flavor is a TILES_Q=2 prefill on every row that has
+            # it (f16, per-tensor FP8, MXFP8): 256 rows at cga1, the width its
+            # rows run (config_sm100.CfgD64; an unset knob means that width, not
+            # CfgD128's cga2 default).  Only its f16 decode tile is narrower (128
+            # rows): _split_launch keys that off the packed row count, and the
+            # pack decision is the same either way (S_q x G <= 128 is < 256).
+            return cga_tile_m(64, 1 if cga is None else cga)
+        if (facts.is_fp8 or facts.is_mxfp8) and cga == 1:
             # The quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows); only
             # the f16 flavor's cga1 is the 128-row decode tile cga_tile_m models.
             return 256
@@ -1014,6 +1026,16 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
     width per cluster (the count the model's constants were fitted with);
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    if (
+        _sm100_f16(caps, facts)
+        and not facts.thd
+        and cga in (None, 1)
+        and _selected_d_shape(caps, facts) == (64, 64)
+        and facts.s_q * pack_g <= _D64_DECODE_TILE_ROWS
+    ):
+        # The d64 f16 decode tile (api_dsl._d64_decode_tile): one 128-row Q tile
+        # per CTA once S_q x packed heads fit it, in place of the 256-row prefill.
+        rows = _D64_DECODE_TILE_ROWS
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
     if _sm100_f16(caps, facts):
