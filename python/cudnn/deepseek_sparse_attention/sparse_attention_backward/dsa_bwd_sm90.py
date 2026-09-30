@@ -33,18 +33,19 @@ from cudnn.deepseek_sparse_attention.utils.sm90.bwd_barriers import NamedBarrier
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
 from cudnn.deepseek_sparse_attention.utils.sm90.bwd_tile_scheduler import (
     ParamsBase,
+    SingleTileHeadFastScheduler,
     SingleTileScheduler,
     TileSchedulerArguments,
 )
 from cudnn.deepseek_sparse_attention.utils.sm90.primitives import (
     atomic_add_fp32,
-    atomic_add_fp32x4,
     convert_layout_acc_frgA,
     cvt_f16,
     get_smem_store_atom,
     make_acc_tensor_frgA_view,
     make_acc_tensor_mn_view,
     predicate_k,
+    red_add_fp32x4,
     select,
     transpose_view,
     warp_reduce,
@@ -764,9 +765,9 @@ class FlashAttentionDSABackwardSm90:
             (self.tile_m, 64),
         )
 
-        # One CTA per query and query-head tile. The final head tile may be
-        # smaller than tile_m; TMA predicates the unused rows in that case.
-        TileScheduler = SingleTileScheduler
+        # One CTA per query/head tile; TMA predicates the final partial head tile.
+        # num_splits=1; defaults: is_split_kv=False, cluster_shape_mn=(1, 1).
+        TileScheduler = SingleTileHeadFastScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.size(mQ.shape[3]),
             cute.size(mQ.shape[2]) * self.qhead_tiles,
@@ -1371,15 +1372,17 @@ class FlashAttentionDSABackwardSm90:
 
     # Scatter AtomicAdd — write dKV accumulator fragment to
     # per-row interleaved fake-col layout in gmem indexed by topK_idx,
-    # using float4 atomics with coalesced access pattern.
+    # using float4 atomics that cover full 128-byte lines.
     #
     # Interleaved layout per row (hdim_chunk=64):
     #   Per N-tile group (4 ranks × 4 values = 16 f32):
     #     [rank0: 4 vals][rank1: 4 vals][rank2: 4 vals][rank3: 4 vals]
     #   Repeated for 4 N-tiles → 64 values per row.
     #
-    # This ensures 4 threads sharing a row write to consecutive 16-byte
-    # blocks, achieving coalesced 64-byte access per float4 iteration.
+    # Lanes l and l ^ 4 hold fragment rows 2i and 2i + 1. For each 128-byte
+    # line (two N-tiles) they swap one float4: the even-row lane writes the
+    # first N-tile of both rows, the odd-row lane the second. A warp's float4
+    # atomic then covers 4 rows × 128 B instead of 8 rows × 64 B.
     @cute.jit
     def scatter_dkv_atomic(
         self,
@@ -1393,46 +1396,55 @@ class FlashAttentionDSABackwardSm90:
         thr_mma: cute.TiledMma,  # thread's MMA slice
         tidx: Int32,
     ):
-        """Scatter acc to dKVAccum rows via topK_idx with coalesced float4 atomics.
+        """Scatter acc to dKVAccum rows via topK_idx with full-line float4 atomics.
 
         Interleaved fake-col addressing:
           fake_pos = (c4 * 4_ranks + rank) * 4 + (c % 4)
                    = c4 * 16 + rank * 4 + (c % 4)
         where c4 = c // 4 (N-tile index), rank = tidx % 4.
         """
+        # The lane pairing follows the SM90 accumulator layout of the (tile_n, 64) dKV tile.
+        assert not self.dKV_swapAB, "full-line scatter pairs dKV rows across lanes l and l ^ 4"
         tile_shape = (self.tile_n, self.hdim_chunk)
-        cDKV = cute.make_identity_tensor(tile_shape if const_expr(not self.dKV_swapAB) else tile_shape[::-1])
-        tScDKV_mn = make_acc_tensor_mn_view(thr_mma.partition_C(cDKV), transpose=self.dKV_swapAB)
-        ROW = 0 if const_expr(not self.dKV_swapAB) else 1
+        cDKV = cute.make_identity_tensor(tile_shape)
+        tScDKV_mn = make_acc_tensor_mn_view(thr_mma.partition_C(cDKV))
 
-        acc_mn = make_acc_tensor_mn_view(acc, transpose=self.dKV_swapAB)
+        acc_mn = make_acc_tensor_mn_view(acc)
         nrow = const_expr(cute.size(acc_mn.shape[0]))
         ncol = const_expr(cute.size(acc_mn.shape[1]))
+        assert nrow == 2 and ncol == 16
 
         rank = tidx % 4
+        row_parity = tScDKV_mn[0, 0][0] % 2
+        is_even_row = row_parity == 0
 
         for r in cutlass.range_constexpr(nrow):
-            local_row = tScDKV_mn[r, 0][ROW]
-            global_topk_row = n_block * self.tile_n + local_row
-            if global_topk_row < topK:
-                global_kv_row = mTopkIdxs_cur[global_topk_row]
-                row_is_valid = global_kv_row >= 0 and global_kv_row < max_seqlen_kv
-                if row_is_valid:
-                    row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
+            # Pair (2i, 2i + 1) holding fragment row r: this lane writes N-tile
+            # 2 * line (even row) or 2 * line + 1 (odd row) of both rows.
+            pair_ptr = []
+            pair_is_valid = []
+            for i in cutlass.range_constexpr(2):
+                local_row = tScDKV_mn[r, 0][0] - row_parity + i
+                global_topk_row = n_block * self.tile_n + local_row
+                global_kv_row = Int32(-1)
+                if global_topk_row < topK:
+                    global_kv_row = mTopkIdxs_cur[global_topk_row]
+                pair_is_valid.append(global_topk_row < topK and global_kv_row >= 0 and global_kv_row < max_seqlen_kv)
+                row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
+                pair_ptr.append(mdKVaccum_cur.iterator + row_base + row_parity * 16 + rank * 4)
 
-                    # Each group of 4 MN-view cols maps to one N-tile.
-                    # Interleaved: fake_pos = c4 * 16 + rank * 4
-                    for c4 in cutlass.range_constexpr(ncol // 4):
-                        fake_offset = const_expr(c4) * 16 + rank * 4
-                        c = const_expr(c4 * 4)
-                        target_ptr = mdKVaccum_cur.iterator + row_base + fake_offset
-                        atomic_add_fp32x4(
-                            acc_mn[r, c + 0],
-                            acc_mn[r, c + 1],
-                            acc_mn[r, c + 2],
-                            acc_mn[r, c + 3],
-                            target_ptr,
-                        )
+            # One 128-byte line holds N-tiles c4 = 2 * line and 2 * line + 1.
+            for line in cutlass.range_constexpr(ncol // 8):
+                pair_vals = [[], []]
+                for k in cutlass.range_constexpr(4):
+                    lo = acc_mn[r, line * 8 + k]
+                    hi = acc_mn[r, line * 8 + 4 + k]
+                    # Every lane joins the swap, including lanes with invalid rows.
+                    other = cute.arch.shuffle_sync_bfly(hi if is_even_row else lo, offset=4)
+                    pair_vals[0].append(lo if is_even_row else other)
+                    pair_vals[1].append(other if is_even_row else hi)
+                for i in cutlass.range_constexpr(2):
+                    red_add_fp32x4(*pair_vals[i], pair_ptr[i] + line * 32, pair_is_valid[i])
 
     @cute.jit
     def _wg0_one_n_block(

@@ -196,6 +196,42 @@ def atomic_add_fp32x4(
 
 
 @dsl_user_op
+def red_add_fp32x4(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    gmem_ptr: cute.Pointer,
+    pred: cutlass.Boolean,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Predicated float4 reduction via red.relaxed.gpu.global.add.v4.f32.
+
+    Requires `gmem_ptr` to be 16-byte aligned; nothing is written where `pred` is false.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint().ir_value(loc=loc, ip=ip),
+            Float32(a0).ir_value(loc=loc, ip=ip),
+            Float32(a1).ir_value(loc=loc, ip=ip),
+            Float32(a2).ir_value(loc=loc, ip=ip),
+            Float32(a3).ir_value(loc=loc, ip=ip),
+            cutlass.Boolean(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "@$5 red.relaxed.gpu.global.add.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f,b",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     """Return the gmem pointer to element at `coord` in tensor `x`."""
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
