@@ -19,10 +19,9 @@ def _relative_l2(actual, expected):
 
 
 def _reference(x, Wg, Wu, Wd, starts):
-    S = x.shape[1]
-    output = torch.empty_like(x)
-    for expert, begin in enumerate(starts):
-        end = starts[expert + 1] if expert + 1 < len(starts) else S
+    output = torch.zeros_like(x)
+    for expert, begin in enumerate(starts[: Wg.shape[0]]):
+        end = starts[expert + 1]
         if begin == end:
             continue
         token = x[:, begin:end]
@@ -48,12 +47,19 @@ def test_swiglu_moe_is_public():
     reason="FROST SwiGLU MoE requires SM100-SM119",
 )
 def test_swiglu_moe_forward_and_all_gradients_with_empty_expert():
+    import cudnn
+
+    if cudnn.backend_version() < 92800:
+        pytest.skip("Explicit wgrad endpoints require the updated cuDNN backend")
     E, H, I = 4, 128, 256
     group_sizes = [64, 0, 96, 32]
     starts, total = [], 0
     for size in group_sizes:
         starts.append(total)
         total += size
+
+    starts.append(total)
+    total += 32  # Unused capacity must not contribute to forward or gradients.
 
     torch.manual_seed(7)
     base = (
@@ -73,6 +79,8 @@ def test_swiglu_moe_forward_and_all_gradients_with_empty_expert():
     expected.backward(dout)
 
     assert _relative_l2(actual, expected) < 1e-2
+    assert torch.count_nonzero(actual[:, starts[-1] :]) == 0
+    assert torch.count_nonzero(actual_inputs[0].grad[:, starts[-1] :]) == 0
     for name, got, ref in zip(("dx", "dWg", "dWu", "dWd"), actual_inputs, reference_inputs):
         error = _relative_l2(got.grad, ref.grad)
         assert error < 1e-2, f"{name} relative L2 error {error.item():.3e}"
@@ -84,6 +92,6 @@ def test_swiglu_moe_validates_public_layout():
     Wg = torch.empty(2, 32, 16, dtype=torch.bfloat16)
     Wu = torch.empty_like(Wg)
     Wd = torch.empty(2, 16, 32, dtype=torch.bfloat16)
-    offsets = torch.tensor([0, 4], dtype=torch.int32)
+    offsets = torch.tensor([0, 4, 8], dtype=torch.int32)
     with pytest.raises(ValueError, match="must be a CUDA tensor"):
         swiglu_moe(x, Wg, Wu, Wd, offsets)

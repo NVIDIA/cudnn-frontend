@@ -982,7 +982,9 @@ class PersistentDenseGemmKernel:
                 32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_ab12_stage,
+                # One committed group reads two AB12 slots and one C slot.
+                # Limit pending groups by both physical buffer lifetimes.
+                num_stages=min(self.num_ab12_stage // 2, self.num_c_stage),
                 producer_group=c_producer_group,
             )
 
@@ -1068,7 +1070,7 @@ class PersistentDenseGemmKernel:
                     # Store AB12 and C to shared memory
                     ab12_buffer0 = (num_prev_subtiles + subtile_idx) % self.num_ab12_stage
                     ab12_buffer1 = (num_prev_subtiles + subtile_idx + 1) % self.num_ab12_stage
-                    c_buffer = (num_prev_subtiles + subtile_idx // 2) % self.num_c_stage
+                    c_buffer = ((num_prev_subtiles + subtile_idx) // 2) % self.num_c_stage
 
                     cute.copy(
                         tiled_copy_r2s,

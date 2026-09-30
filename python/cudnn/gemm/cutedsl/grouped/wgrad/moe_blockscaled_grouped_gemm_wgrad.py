@@ -51,6 +51,7 @@ from ..moe_utils import (
     MoEWeightMode,
     WGradInputOrder,
     WgradSfTensormapConstructor,
+    acquire_tma_desc,
 )
 from ..moe_sched_extension import (
     WgradScaledGemmSchedExtension,
@@ -1046,6 +1047,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     offs,
                     work_tile_info,
                 )
+                for desc_name, desc_ptr in (
+                    ("a", desc_ptr_a),
+                    ("b", desc_ptr_b),
+                    ("sfa", desc_ptr_sfa),
+                    ("sfb", desc_ptr_sfb),
+                ):
+                    if cutlass.const_expr(desc_ptr is not None):
+                        acquire_tma_desc(desc_workspace.get_ptr(desc_name, work_tile_info.expert_idx))
 
                 # with cute.arch.elect_one():
                 #     cute.printf(
@@ -1463,6 +1472,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     offs,
                     work_tile_info,
                 )
+                if cutlass.const_expr(desc_ptr_c is not None):
+                    acquire_tma_desc(desc_workspace.get_ptr("c", work_tile_info.expert_idx))
 
                 gC_mnl = cute.local_tile(
                     real_c,

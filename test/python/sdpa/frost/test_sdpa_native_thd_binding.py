@@ -26,7 +26,9 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     s.decl = {name: (h, 128, h * 128, 128, 1, h * 128) for name, h in (("q", 8), ("k", 2), ("v", 2), ("o", 8))}
-    s.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
+    # The native binder serves half hosts, whose K/V tables share one stride
+    # pair. The global prepared vocabulary also includes quantized-only slots.
+    s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.template[s.index["lse_ext"]] = s.lse_head_stride
@@ -257,3 +259,125 @@ def test_native_asymmetric_head_dims_and_int64_runtime_token_strides():
     frame = _equal(s, facts)
     assert frame[s.index["q_strides"]] == (token_stride, token_stride, 192)
     assert frame[s.index["problem_size"]][3] == 16
+
+
+def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2):
+    s, facts, frames = _fixture(dtype=dtype, layout=layout)
+    s.paged, s.paged_hnd, s.page_size, s.kh = True, hnd, 16, kh
+    s.lens_form = 1  # cumulative Q, direct per-sequence KV lengths
+    facts["kv_lens"] = facts["kv_lens"]._replace(shape=(4,), strides=(1,), span=4)
+    for role in ("k", "v"):
+        s.decl[role] = (kh, 128, kh * 128, 128, 1, kh * 128)
+        strides = (16 * kh * 128, 16 * 128, 128, 1) if hnd else (16 * kh * 128, 128, kh * 128, 1)
+        facts[role] = facts[role]._replace(shape=(8, kh, 16, 128), strides=strides, span=8 * kh * 16 * 128)
+    shape, strides = ((4, 1, 4, 1), (4, 4, 1, 1)) if table_rank == 4 else ((4, 4), (4, 1))
+    for i, role in enumerate(("block_table", "block_table_v")):
+        facts[role] = prep.BufferFacts(0x40000 + i * 0x1000, "int32", (2, 0), 16, shape, strides)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    return s, facts, frames
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("table_rank", [2, 4])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_native_paged_matches_python_and_rebinds(hnd, layout, table_rank, dtype):
+    s, facts, _ = _paged_fixture(hnd, layout, table_rank, dtype)
+    original = tuple(s.template)
+    first = _equal(s, facts)
+    changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
+    for role in ("k", "v"):
+        f = changed[role]
+        bs = 2**32 + f.strides[0]
+        changed[role] = f._replace(strides=(bs, *f.strides[1:]), span=7 * bs + f.strides[0])
+    for role in ("block_table", "block_table_v"):
+        f = changed[role]
+        changed[role] = f._replace(shape=(4, 4), strides=(0, 2**33), span=-1)
+    second = _equal(s, changed, workspace=0x50000, stream=29)
+    assert first[s.index["problem_size"]][4] == 64
+    assert second[s.index["table_strides"]] == (0, 2**33)
+    assert second[s.index["block_table_ptr"]] == changed["block_table"].ptr
+    assert second[s.index["k_strides"]][0] > 2**32
+    assert tuple(s.template) == original
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("role", ["k", "v", "block_table", "block_table_v"])
+@pytest.mark.parametrize("defect", ["span", "dtype", "device", "pointer", "stride", "shape", "missing"])
+def test_native_paged_revalidates_each_call(hnd, role, defect, monkeypatch):
+    s, facts, frames = _paged_fixture(hnd)
+    _equal(s, facts)
+    f = facts[role]
+    if defect == "missing":
+        changed = dict(facts)
+        del changed[role]
+    else:
+        is_pool = role in ("k", "v")
+        update = {
+            "span": dict(span=f.span - 1),
+            "dtype": dict(dtype="float32"),
+            "device": dict(device=(2, 1)),
+            "pointer": dict(ptr=f.ptr + 1),
+            "stride": dict(strides=(f.strides[0] + 1, *f.strides[1:])) if is_pool else dict(strides=(4, 4, -1, 1)),
+            "shape": dict(shape=(0, *f.shape[1:])),
+        }[defect]
+        changed = dict(facts, **{role: f._replace(**update)})
+    with pytest.raises(ValueError):
+        _reference(s, changed)
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"))
+    with pytest.raises(ValueError):
+        prep.bind_thd(s, changed, 0x30000, 17, 17)
+    assert frames == []
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+def test_native_paged_singleton_strides_and_empty_q(hnd):
+    s, facts, _ = _paged_fixture(hnd=hnd, kh=1)
+    for role in ("k", "v"):
+        f = facts[role]
+        # The head axis is not stepped. Preserve the compiled ordering kind.
+        hs = 2**35 if hnd else 128
+        facts[role] = f._replace(shape=(1, 1, 16, 128), strides=(2**37, hs, 128, 1), span=2048)
+    _equal(s, facts)
+    empty = dict(facts, q=facts["q"]._replace(shape=(0,), strides=(1,), span=0))
+    del empty["block_table"]
+    del empty["block_table_v"]
+    assert _equal(s, empty) is None
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("table_rank", [2, 4])
+def test_native_paged_shared_table_stride_contract(hnd, table_rank):
+    s, facts, _ = _paged_fixture(hnd=hnd, table_rank=table_rank)
+    _equal(s, facts)
+
+    # Distinct table pointers are valid, but the half host has one stride pair.
+    stride = 2**33
+    shape, strides = ((4, 1, 4, 1), (1, 1, stride, 1)) if table_rank == 4 else ((4, 4), (1, stride))
+    v = facts["block_table_v"]._replace(ptr=0x90000, shape=shape, strides=strides, span=3 * stride + 4)
+    changed = dict(facts, block_table_v=v)
+    for bind in (_reference, _native):
+        with pytest.raises(ValueError):
+            bind(s, changed)
+    changed["block_table"] = v._replace(ptr=0xA0000)
+    frame = _equal(s, changed)
+    assert frame[s.index["table_strides"]] == (1, stride)
+    assert frame[s.index["block_table_v_ptr"]] == v.ptr
+    assert frame[s.index["block_table_ptr"]] == 0xA0000
+    # Shared geometry still requires checking each table's observed span.
+    changed["block_table_v"] = v._replace(span=v.span - 1)
+    for bind in (_reference, _native):
+        with pytest.raises(ValueError):
+            bind(s, changed)
+
+
+def test_native_nonpaged_host_does_not_require_paged_slots():
+    """SM120's nonpaged host omits page tables entirely."""
+    s, facts, _ = _fixture()
+    slots = {"block_table_ptr", "block_table_v_ptr", "table_strides", "n_pages"}
+    kept = [(n, value) for n, value in zip(s.order, s.template) if n not in slots]
+    s.order = [n for n, _ in kept]
+    s.template = [value for _, value in kept]
+    s.index = {n: i for i, n in enumerate(s.order)}
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    _equal(s, facts)

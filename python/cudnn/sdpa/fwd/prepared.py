@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""SM100/SM107/SM120 half and SM100 FP8 launches, prepared once and bound per call.
+"""SM100/SM107/SM120 half and per-tensor FP8 launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
@@ -18,7 +18,7 @@ Three owners, one implementation each:
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. Nonpaged f16 THD without sinks/padded Stats binds
+binder selected at prepare time. F16 THD without sinks/padded Stats binds
 normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import inspect
 import math
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
+from cudnn.datatypes import _DLPACK_FP4_CODE_BITS
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
 
@@ -45,6 +47,7 @@ _DLPACK_CUDA = 2
 _DLPACK_CPU = 1
 _I32_MAX = 2**31 - 1
 _DTYPE_BY_CODE = {(code, bits): name for name, (code, bits) in _buffers.DTYPES.items()}
+_DTYPE_BY_CODE[_DLPACK_FP4_CODE_BITS] = "float4_e2m1fn_x2"
 
 
 class BufferFacts(NamedTuple):
@@ -74,10 +77,8 @@ def facts_of_tensor(t) -> Optional[BufferFacts]:
     if t is None:
         return None
     shape, strides = tuple(t.shape), tuple(t.stride())
-    n = 1
-    for e in shape:
-        n *= int(e)
-    span = n if (n == 0 or t.is_contiguous()) else 1 + sum((int(s) - 1) * int(st) for s, st in zip(shape, strides))
+    n = int(t.numel())
+    span = n if (n == 0 or t.is_contiguous()) else int(1 + sum((s - 1) * st for s, st in zip(shape, strides)))
     dev = t.device
     device = (_DLPACK_CUDA, int(dev.index if dev.index is not None else 0)) if dev.type == "cuda" else (_DLPACK_CPU, 0)  # a known CPU tensor is not "unknown"
     return BufferFacts(t.data_ptr(), str(t.dtype).split(".")[-1], device, span, shape, strides)
@@ -96,25 +97,175 @@ _QUANT_ROLES = ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
 _QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
 
 
+class BlockOutputSpec(NamedTuple):
+    geometry: Tuple[int, int, int, int]
+    nbytes: int
+    pack: int
+    has_scale: bool
+
+
 class QuantizedLaunchSpec(NamedTuple):
     has_amax: bool
     scratch_offset: int  # unused amax and an identity scale, in caller-owned workspace
+    sf_sizes: Tuple[int, ...] = ()  # opaque F8_128x4 tile byte sizes; empty for per-tensor FP8
+    block_output: Optional[BlockOutputSpec] = None
 
 
-def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None):
+def _quant_spec(api):
+    if not (getattr(api, "_prepared_mxfp8", False) or getattr(api, "_prepared_fp8", False)):
+        return None
+    block = None
+    if api.o_block_scale:
+        plane, row_b, col_h, cols = api._sfo_geometry
+        b, h, rows = int(api.batch_size), int(api.h_q), int(api.sf_o_desc.shape[2])
+        needed = b * h * plane if plane else ((b * rows + 127) // 128 * 128) * cols
+        block = BlockOutputSpec((plane, row_b, col_h, cols), needed, 2 if api.o_block_scale == 16 else 1, bool(api.has_scale_o))
+    sizes = ()
+    if getattr(api, "_prepared_mxfp8", False):
+        km = api._k_mod
+        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
+    return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
+
+
+def _quant_roles(quant):
+    roles = (("sf_q", "sf_k", "sf_v")[: len(quant.sf_sizes)] + ("amax_o",)) if quant.sf_sizes else _QUANT_ROLES
+    if quant.block_output is not None:
+        roles += ("sf_o",) + (("scale_o",) if quant.sf_sizes else ())
+    return roles
+
+
+def _quant_slots(quant):
+    if quant is None:
+        return frozenset()
+    slots = frozenset(("sf_q_ptr", "sf_k_ptr", "sf_v_ptr", "sf_tiles", "amax_o_ptr", "scale_o_ptr")) if quant.sf_sizes else _QUANT_SLOTS
+    return slots | {"sf_o_ptr"}
+
+
+def _bind_block_output(spec, facts):
+    block = spec.quant.block_output
+    f = facts.get("sf_o")
+    if block is None:
+        if f is not None:
+            raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
+        return None
+    if f is None:
+        raise ValueError("cudnn.sdpa: block-scaled output requires sf_o")
+    _on_plan_device(spec, "sf_o", f)
+    if _buffers.DTYPE_ITEMSIZE.get(f.dtype) != 1:
+        raise ValueError("cudnn.sdpa: sf_o requires byte storage")
+    _sf_byte_count(f.shape, f.strides, f.dtype)
+    # Token-major graph declarations omit the final 128-row atom padding.
+    # Its capacity comes from the producer's observed storage, not logical
+    # numel. Bare addresses retain the unknown-span caller contract.
+    if 0 <= f.span < block.nbytes:
+        raise ValueError("cudnn.sdpa: sf_o storage does not cover the compiled atom layout")
+    if not f.ptr or f.ptr % 16:
+        raise ValueError("cudnn.sdpa: sf_o must be 16-byte aligned")
+    for name, other in facts.items():
+        if name == "sf_o" or other is None or not other.numel:
+            continue
+        width = _buffers.DTYPE_ITEMSIZE[other.dtype]
+        span = other.span if other.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(other.shape, other.strides))
+        if f.ptr < other.ptr + span * width and other.ptr < f.ptr + block.nbytes:
+            raise ValueError(f"cudnn.sdpa: sf_o overlaps {name}")
+    return f.ptr
+
+
+@lru_cache(maxsize=256)
+def _sf_byte_count(shape, strides, dtype):
+    """Opaque reordered SF must be gap-free storage, in any axis permutation."""
+    if len(shape) != len(strides) or any(n < 0 or st < 0 for n, st in zip(shape, strides)):
+        raise ValueError("cudnn.sdpa: MXFP8 SF geometry must have matching nonnegative extents and strides")
+    width = _buffers.DTYPE_ITEMSIZE.get(dtype)
+    if width is None:
+        raise ValueError(f"cudnn.sdpa: unsupported MXFP8 SF storage dtype {dtype}")
+    if 0 in shape:
+        return 0
+    extent = 1
+    for stride, size in sorted((st, n) for n, st in zip(shape, strides) if n > 1):
+        if stride != extent:
+            raise ValueError("cudnn.sdpa: MXFP8 SF requires dense non-overlapping storage in physical order")
+        extent *= size
+    return extent * width
+
+
+def _bind_mxfp8_scales(spec, facts):
+    patches, tiles = {}, []
+    thd = isinstance(spec, ThdLaunchSpec)
+    for name, heads, size in zip(("sf_q", "sf_k", "sf_v"), (spec.qh, spec.kh, spec.kh), spec.quant.sf_sizes):
+        f = facts.get(name)
+        if f is None:
+            raise ValueError(f"cudnn.sdpa: MXFP8 requires {name}")
+        _on_plan_device(spec, name, f)
+        nbytes = _sf_byte_count(f.shape, f.strides, f.dtype)
+        if 0 <= f.span * _buffers.DTYPE_ITEMSIZE[f.dtype] < nbytes:
+            raise ValueError(f"cudnn.sdpa: {name} observed storage is too small")
+        if nbytes and (not f.ptr or f.ptr % _ALIGN_TMA):
+            raise ValueError(f"cudnn.sdpa: {name} must be 16-byte aligned")
+        row = heads * size
+        if thd:
+            if nbytes % row:
+                raise ValueError(f"cudnn.sdpa: {name} must hold whole packed SF tile rows")
+            count = nbytes // row
+            # Zero storage is legal only for a zero-capacity operand. Its SF
+            # descriptor binds NULL with one dead tile, never an owned dummy.
+            operand = facts[name[-1]]
+            if count == 0 and operand.numel and operand.span != 0:
+                raise ValueError(f"cudnn.sdpa: empty {name} requires zero-capacity {name[-1]}")
+        elif getattr(spec, "paged", False) and name != "sf_q":
+            # K/V SF pools page with K/V: page_size / 128 tiles per (page, head).
+            count = spec.page_size // 128
+            if nbytes != int(facts["k"].shape[0]) * row * count:
+                raise ValueError(f"cudnn.sdpa: {name} size does not match the {int(facts['k'].shape[0])}-page pool")
+        else:
+            count = ((spec.s_q_max if name == "sf_q" else spec.s_k_max) + 127) // 128
+            if nbytes != spec.b * row * count:
+                raise ValueError(f"cudnn.sdpa: {name} size does not match the compiled dense geometry")
+        if count > _I32_MAX:
+            raise ValueError(f"cudnn.sdpa: {name} tile count exceeds Int32")
+        patches[name + "_ptr"] = f.ptr if nbytes else 0
+        tiles.append(max(1, count))
+    if len(tiles) == 2:
+        if facts.get("sf_v") is not None:
+            raise ValueError("cudnn.sdpa: PV-BF16 does not consume sf_v")
+        patches["sf_v_ptr"] = None
+        tiles.append(0)
+    elif tiles[1] != tiles[2]:
+        raise ValueError("cudnn.sdpa: sf_k and sf_v must have the same packed tile count")
+    patches["sf_tiles"] = tuple(tiles)
+    return patches
+
+
+def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_softmax_log2=None, stage_inputs=None):
     """Bind the shared geometry and runtime FP8 scalars before initializing or launching.
 
     Scales remain device pointers. The compiled host unscales a requested amax on the
     same stream; an unrequested amax uses the plan's declared scratch word. Standalone
     callers may omit scales (identity), while graph bindings require their declared UIDs.
+    Return whether attention launched, for standalone empty-THD diagnostics.
     """
     quant = spec.quant
     if not workspace_ptr or workspace_ptr % _ALIGN_TMA:
         raise ValueError("cudnn.sdpa: prepared FP8 requires an aligned caller workspace")
-    patches = {}
+    if quant.block_output is not None and quant.block_output.pack == 2:
+        o = facts.get("o")
+        if o is not None:
+            if o.dtype not in ("float4_e2m1fn_x2", "uint8"):
+                raise ValueError("cudnn.sdpa: NVFP4 O requires packed FP4 or byte storage")
+            # Both native graph facts and the torch packed carrier already
+            # report byte-slot geometry. Never divide that geometry again.
+            facts = dict(facts, o=o._replace(dtype="uint8"))
+    patches = _bind_mxfp8_scales(spec, facts) if quant.sf_sizes else {}
+    if quant.block_output is not None or facts.get("sf_o") is not None:
+        patches["sf_o_ptr"] = _bind_block_output(spec, facts)
+    if quant.sf_sizes:
+        patches["scale_o_ptr"] = None
+        if quant.block_output is not None and (facts.get("scale_o") is not None) != quant.block_output.has_scale:
+            raise ValueError("cudnn.sdpa: scale_o presence must match the block-output specialization")
     identity = workspace_ptr + quant.scratch_offset + 4
     needs_identity = False
-    for name in _QUANT_ROLES:
+    scalar_roles = (("amax_o",) + (("scale_o",) if quant.block_output is not None and quant.block_output.has_scale else ())) if quant.sf_sizes else _QUANT_ROLES
+    for name in scalar_roles:
         f = facts.get(name)
         if f is None:
             if name == "amax_o":
@@ -131,7 +282,7 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
             ptr = f.ptr
         patches[name + "_ptr"] = ptr
     # Scalar output must not overwrite any input or caller output. Workspace alias
-    # detection is kept byte-based: Q/K/V are one byte, O is two, scales are four.
+    # detection uses each operand's declared element width, including FP8 O.
     amax = patches["amax_o_ptr"]
     if facts.get("amax_o") is not None and workspace_ptr < amax + 4 and amax < workspace_ptr + quant.scratch_offset + 8:
         raise ValueError("cudnn.sdpa: prepared FP8 workspace overlaps amax_o")
@@ -145,24 +296,47 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         if span <= 0:
             continue
         width = _buffers.DTYPE_ITEMSIZE[f.dtype]
+        # Token-major declarations omit trailing atom padding. Even a bare
+        # address promises that compiled extent, so it cannot alias scratch.
+        if name == "sf_o" and quant.block_output is not None:
+            span = max(span, quant.block_output.nbytes)
         scratch_end = workspace_ptr + quant.scratch_offset + 8
         if workspace_ptr < f.ptr + span * width and f.ptr < scratch_end:
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace overlaps {name}")
         if amax < f.ptr + span * width and f.ptr < amax + 4:
             raise ValueError(f"cudnn.sdpa: amax_o overlaps {name}")
+    combine_args = None
     if isinstance(spec, ThdLaunchSpec):
         frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
+    elif spec.combine is not None:
+        frame, combine_args = bind_dense_split(spec, facts, workspace_ptr, stream, stream_int)
+        # The quantized combine appends its scalar pointers before the stream;
+        # the half and ragged pointer ABIs remain unchanged.
+        combine_args = (*combine_args[:-1], amax if quant.has_amax else None, patches.get("scale_o_ptr"), stream)
+        if not quant.sf_sizes and spec.combine.output_dtype in ("float8_e4m3fn", "float8_e5m2"):
+            # FP8 rounding and scale_o belong to the final combine, once.
+            # The main host None-specializes its scale to one. Avoid an
+            # identity memset (and its captured engine dependency) per call.
+            patches["scale_o_ptr"] = None
     else:
         frame = bind_dense(spec, facts, stream, stream_int)
+    if stage_inputs is not None:
+        stage_inputs()  # All binding checks precede the existing input conversions.
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
-    _buffers.memset_zero_async(amax, 4, stream_int)
     if frame is not None:
         for name, ptr in patches.items():
             frame[spec.index[name]] = ptr
         if scale_softmax_log2 is not None:
             frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
         spec.fn(*frame)
+        if combine_args is not None:
+            spec.combine.fn(*combine_args)
+    else:
+        # No addressable Q token: there is no compiled host launch to reset
+        # its reduction output, but Amax_O must still describe the empty O.
+        _buffers.memset_zero_async(amax, 4, stream_int)
+    return frame is not None
 
 
 class ThdLaunchSpec:
@@ -213,11 +387,11 @@ class ThdLaunchSpec:
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
-    "block_table_ptr block_table_v_ptr table_strides stream".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides stream".split()
 )
 
 
@@ -253,7 +427,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    host = km._host_prepared if getattr(api, "_prepared_fp8", False) else km._host
+    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
     order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
@@ -276,7 +450,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
-    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+    s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
@@ -322,10 +496,11 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("block_table_ptr", None)
     put("block_table_v_ptr", None)
     put("table_strides", (0, 0))
+    put("table_v_strides", (0, 0) if s.paged else None)
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - (_QUANT_SLOTS if s.quant is not None else frozenset()))
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
@@ -334,8 +509,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
     if (
-        not s.paged
-        and not s.has_sink
+        not s.has_sink
         and not s.lse_padded
         and api.split_kv == 1
         and not getattr(api, "_prepared_fp8", False)
@@ -348,7 +522,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     return s
 
 
-_NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
+_NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks", "block_table", "block_table_v")
 _NATIVE_THD_INDICES = tuple(range(len(_NATIVE_THD_ROLES)))
 
 
@@ -378,6 +552,7 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softm
     """
     from cudnn import _pybind_module
 
+    buffers = tuple(buffers) + (None,) * (len(_NATIVE_THD_ROLES) - len(buffers))
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
@@ -511,6 +686,42 @@ def _on_plan_device(spec, name: str, f: BufferFacts) -> None:
         raise ValueError(f"cudnn.sdpa: " + (f"{name} must be on CUDA device {spec.device_index} (this plan's); got DLPack device {f.device}"))
 
 
+@lru_cache(maxsize=256)
+def _paged_pool_layout(shape, strides, elem_bytes, hnd, kh, page_size, d):
+    """Cache pure geometry only; addresses and observed storage are checked per call."""
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    if len(shape) != 4 or any(n <= 0 for n in shape) or shape[1] != kh or shape[2] != page_size or shape[3] != d:
+        raise ValueError(f"a page pool is (n_pages, {kh}, {page_size}, {d}); got {shape}")
+    if strides[3] != 1:
+        raise ValueError("the page pool's head dim must be contiguous")
+    if (strides[1] > strides[2]) != hnd:
+        raise ValueError(f"this artifact was compiled for {'HND' if hnd else 'NHD'} page pools; got strides {strides}")
+    # Match dense TMA admission in storage order, including singleton axes.
+    ordered_shape = (shape[0], shape[2], shape[1], shape[3]) if hnd else shape
+    ordered_strides = (strides[0], strides[2], strides[1], strides[3]) if hnd else strides
+    bound = dense_bind_strides(ordered_shape, ordered_strides, elem_bytes)
+    if bound is None:
+        raise ValueError(f"page-pool strides must be covering and 16-byte aligned; got {shape} / {strides}")
+    bs, ss, hs = (bound[0], bound[2], bound[1]) if hnd else bound
+    need = (shape[0] - 1) * bs + (page_size - 1) * ss + (kh - 1) * hs + d
+    return (bs, ss, hs), need
+
+
+@lru_cache(maxsize=256)
+def _paged_table_layout(shape, strides):
+    """Normalize immutable table geometry; pointer/span checks stay per call."""
+    if len(shape) == 4:
+        if shape[1] != 1 or shape[3] != 1:
+            raise ValueError(f"must be (B, 1, max_pages, 1); got {shape}")
+        shape, strides = (shape[0], shape[2]), (strides[0], strides[2])
+    if len(shape) != 2 or any(n <= 0 for n in shape):
+        raise ValueError(f"must be nonempty (B, max_pages); got {shape}")
+    if any(st < 0 for st in strides):
+        raise ValueError(f"requires nonnegative strides; got {strides}")
+    return shape, strides
+
+
 def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, Optional[BufferFacts]], k: BufferFacts, v: BufferFacts, b: int) -> int:
     """Bind the page pools and tables of a paged launch; returns SKV = max_pages * page_size. Shared by
     the THD and dense binders (one implementation of the paged domain)."""
@@ -524,48 +735,47 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     _on_plan_device(spec, "paged_attention_k_table", bt)
     _on_plan_device(spec, "paged_attention_v_table", btv)
 
-    def table(name, f):
-        if len(f.shape) == 4:  # the graph's (B, 1, max_pages, 1) declaration
-            shape, strides = (int(f.shape[0]), int(f.shape[2])), (int(f.strides[0]), int(f.strides[2]))
-        else:
-            shape, strides = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
-        if len(shape) != 2:
-            raise ValueError(f"cudnn.sdpa: " + (f"{name} must be (B, max_pages); got {f.shape}"))
-        return shape, strides
-
-    (tb, max_pages), table_strides = table("paged_attention_k_table", bt)
-    (tbv, max_pages_v), table_strides_v = table("paged_attention_v_table", btv)
+    for name, table in (("paged_attention_k_table", bt), ("paged_attention_v_table", btv)):
+        if not table.ptr or table.ptr % _ALIGN_F32:
+            raise ValueError(f"cudnn.sdpa: {name} must have a non-null, 4-byte-aligned address")
+    try:
+        (tb, max_pages), table_strides = _paged_table_layout(bt.shape, bt.strides)
+    except ValueError as error:
+        raise ValueError(f"cudnn.sdpa: paged_attention_k_table {error}") from error
+    try:
+        (tbv, max_pages_v), table_strides_v = _paged_table_layout(btv.shape, btv.strides)
+    except ValueError as error:
+        raise ValueError(f"cudnn.sdpa: paged_attention_v_table {error}") from error
     if tb < b or tbv < b:
         raise ValueError(f"cudnn.sdpa: " + (f"the page tables describe {tb} / {tbv} sequences; this call runs {b}"))
-    if max_pages_v != max_pages or table_strides_v != table_strides:
-        raise ValueError(
-            f"cudnn.sdpa: "
-            + ("paged_attention_k_table and paged_attention_v_table must share (max_pages) and strides: the host walks both with one stride pair")
-        )
-    # the host addresses rows 0..B-1 and pages 0..max_pages-1 of BOTH tables
-    need = (b - 1) * table_strides[0] + (max_pages - 1) * table_strides[1] + 1
-    if bt.span >= 0 and bt.span < need:
-        raise ValueError(f"cudnn.sdpa: " + (f"paged_attention_k_table spans {bt.span} elements; ({b}, {max_pages}) with strides {table_strides} needs {need}"))
-    if btv.span >= 0 and btv.span < need:
-        raise ValueError(f"cudnn.sdpa: " + (f"paged_attention_v_table spans {btv.span} elements; ({b}, {max_pages}) with strides {table_strides} needs {need}"))
+    if max_pages_v != max_pages:
+        raise ValueError("cudnn.sdpa: paged_attention_k_table and paged_attention_v_table must share max_pages")
+    if "table_v_strides" not in ix and table_strides_v != table_strides:
+        raise ValueError("cudnn.sdpa: this prepared host requires matching K/V table strides")
+    # Each table keeps its own observed storage bound and physical geometry.
+    for name, table, strides in (("k", bt, table_strides), ("v", btv, table_strides_v)):
+        need = (b - 1) * strides[0] + (max_pages - 1) * strides[1] + 1
+        if table.span >= 0 and table.span < need:
+            raise ValueError(f"cudnn.sdpa: paged_attention_{name}_table spans {table.span} elements; ({b}, {max_pages}) with strides {strides} needs {need}")
     # the pools: (n_pages, KH, page_size, D) containers, head dim contiguous, one page count for K and V,
     # and the in-page layout kind the artifact was compiled for (its TMA descriptors order (row, head) by it)
+    pool_strides = {}
     for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
-        if len(f.shape) != 4 or int(f.shape[1]) != spec.kh or int(f.shape[2]) != spec.page_size or int(f.shape[3]) != d:
-            raise ValueError(f"cudnn.sdpa: " + (f"{name}: a page pool is (n_pages, {spec.kh}, {spec.page_size}, {d}); got {tuple(f.shape)}"))
-        if int(f.strides[3]) != 1:
-            raise ValueError(f"cudnn.sdpa: " + (f"{name}: the page pool's head dim must be contiguous"))
-        if _pool_is_hnd(f) != spec.paged_hnd:
-            raise ValueError(
-                f"cudnn.sdpa: " + (f"{name}: this artifact was compiled for {'HND' if spec.paged_hnd else 'NHD'} page pools; got strides {tuple(f.strides)}")
-            )
+        try:
+            strides, need = _paged_pool_layout(f.shape, f.strides, _buffers.DTYPE_ITEMSIZE[f.dtype], spec.paged_hnd, spec.kh, spec.page_size, d)
+        except ValueError as error:
+            raise ValueError(f"cudnn.sdpa: {name}: {error}") from error
+        if f.span >= 0 and f.span < need:
+            raise ValueError(f"cudnn.sdpa: {name}: page pool spans {f.span} elements; its effective geometry needs {need}")
+        pool_strides[name] = strides
     if int(k.shape[0]) != int(v.shape[0]):
         raise ValueError(f"cudnn.sdpa: " + (f"K and V pools must hold the same number of pages; got {k.shape[0]} and {v.shape[0]}"))
     t_kv = max_pages * spec.page_size
-    frame[ix["k_strides"]] = (int(k.strides[0]), int(k.strides[2]), int(k.strides[1]))
-    frame[ix["v_strides"]] = (int(v.strides[0]), int(v.strides[2]), int(v.strides[1]))
+    frame[ix["k_strides"]], frame[ix["v_strides"]] = pool_strides["k"], pool_strides["v"]
     frame[ix["block_table_ptr"]], frame[ix["block_table_v_ptr"]] = bt.ptr, btv.ptr
     frame[ix["table_strides"]] = (int(table_strides[0]), int(table_strides[1]))
+    if "table_v_strides" in ix:
+        frame[ix["table_v_strides"]] = (int(table_strides_v[0]), int(table_strides_v[1]))
     frame[ix["n_pages"]] = int(k.shape[0])
     return t_kv
 
@@ -748,7 +958,7 @@ class PreparedThdLaunch:
             uids["block_table"] = binding.paged_k_table.get_uid()
             uids["block_table_v"] = binding.paged_v_table.get_uid()
         if spec.quant is not None:
-            for name in _QUANT_ROLES:
+            for name in _quant_roles(spec.quant):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
@@ -786,11 +996,11 @@ class PreparedThdLaunch:
 # Constants written at build, and slots bind_dense writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
     "lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
     "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr o_desc_ptr problem_size seq_q_lens_addr "
-    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides n_pages gate_ptr gate_strides ragged_q_addr stream".split()
+    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr stream".split()
 )
 
 
@@ -879,7 +1089,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s = DenseLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
-    s.quant = QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset()) if getattr(api, "_prepared_fp8", False) else None
+    s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
@@ -893,6 +1103,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
     if s.split > 1:  # the main kernel writes the split-major partial slabs, in the partial dtype
         s.expect["o"] = str(api._partial_torch_dtype()).split(".")[-1]
+    if s.quant is not None and s.quant.block_output is not None and s.quant.block_output.pack == 2:
+        s.expect["o"] = "uint8"
     s.elem_bytes = {n: _buffers.DTYPE_ITEMSIZE[t] for n, t in s.expect.items()}
     s.has_lse = (api.lse_desc is not None) or s.split > 1
     s.has_sink = bool(api.has_sink)
@@ -915,6 +1127,11 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # compile neither (both fields are the FP8 flavors'), so this pins nothing today and guards their joining.
     params = getattr(km, "PARAMS", None)
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
+    if s.quant is not None and (s.quant.sf_sizes or s.quant.block_output is not None):
+        s.shape_fixed = s.lpt_grid_fixed = True  # dense SF batch/head pitches are plan-fixed
+        if s.paged:
+            # K/V SF pools page with K/V, so S_kv follows the block table. Batch and S_q stay pinned.
+            s.shape_fixed = False
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
@@ -935,6 +1152,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             stats_log2=api.stats_log2,
             ragged=s.ragged,
             ragged_i64=s.ragged_i64,
+            quantized=s.quant is not None,
+            has_amax=s.quant.has_amax if s.quant is not None else False,
+            has_scale_o=api._split_scale_o() if s.quant is not None else False,
+            has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
         )
         fn = positional_entry(owner)
         if fn is None:
@@ -971,6 +1192,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("block_table_ptr", None)
     put("block_table_v_ptr", None)
     put("table_strides", (0, 0))
+    put("table_v_strides", (0, 0) if s.paged else None)
     put("n_pages", 0)
     put("gate_ptr", None)
     put("gate_strides", (0, 0, 0))
@@ -978,7 +1200,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("ragged_q_div", s.ragged_divs[0] if s.ragged else 1)
     if s.ragged and "ragged_q_addr" not in s.index:
         raise NotImplementedError(f"{km.__name__}: the ragged-Q decode leg needs the ragged_q_addr host slot")
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE - (_QUANT_SLOTS if s.quant is not None else frozenset()))
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD_DENSE - _FILLED_PER_CALL_DENSE - _quant_slots(s.quant))
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
@@ -1047,6 +1269,41 @@ class _DenseRole(NamedTuple):
     s: int
 
 
+@lru_cache(maxsize=256)
+def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, name):
+    """Cache geometry only; current addresses, device, dtype and span stay per-call."""
+    if len(shape) != 4:
+        raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(shape)}")
+    b, h, seq, dd = (int(x) for x in shape)
+    if h != heads or dd != d:
+        raise ValueError(f"cudnn.sdpa: {name}: this plan was built for {heads} heads of dim {d}; got {tuple(shape)}")
+    if b < 1 or b > b_max:
+        raise ValueError(f"cudnn.sdpa: {name}: batch {b} is outside this plan's envelope (1..{b_max})")
+    if seq < 1 or seq > s_max:
+        raise ValueError(f"cudnn.sdpa: {name}: sequence length {seq} is outside this plan's envelope (1..{s_max})")
+    # ONE layout predicate for admission and execution (the lowering's attach decision uses it too):
+    # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    if tma:
+        bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in strides), elem_bytes)
+    else:
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+        if not dense_layout_ok(shape, strides):
+            raise ValueError(f"cudnn.sdpa: {name}: split output needs contiguous D and non-overlapping strides; got {shape} / {strides}")
+        st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(shape, strides))
+        bound = st[0], st[2], st[1]
+    if bound is None:
+        raise ValueError(
+            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be "
+            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+        )
+    bs, ss, hs = bound
+    need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
+    return (bs, ss, hs), b, seq, need
+
+
 def _dense_role(
     spec: DenseLaunchSpec,
     facts: Dict[str, Optional[BufferFacts]],
@@ -1072,38 +1329,24 @@ def _dense_role(
     align = _ALIGN_TMA if tma else _buffers.DTYPE_ITEMSIZE[expect]
     if f.ptr % align != 0:
         raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {align}-byte aligned; got data_ptr() % {align} == {f.ptr % align}")
-    if len(f.shape) != 4:
-        raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(f.shape)}")
-    b, h, seq, dd = (int(x) for x in f.shape)
-    if h != heads or dd != d:
-        raise ValueError(f"cudnn.sdpa: {name}: this plan was built for {heads} heads of dim {d}; got {tuple(f.shape)}")
-    if b < 1 or b > spec.b * b_mult:
-        raise ValueError(f"cudnn.sdpa: {name}: batch {b} is outside this plan's envelope (1..{spec.b * b_mult})")
-    if seq < 1 or seq > s_max:
-        raise ValueError(f"cudnn.sdpa: {name}: sequence length {seq} is outside this plan's envelope (1..{s_max})")
-    # ONE layout predicate for admission and execution (the lowering's attach decision uses it too):
-    # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-    if tma:
-        bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in f.strides), _buffers.DTYPE_ITEMSIZE[expect])
-    else:
-        from cudnn.sdpa.graph_analyzer import dense_layout_ok
-
-        if not dense_layout_ok(f.shape, f.strides):
-            raise ValueError(f"cudnn.sdpa: {name}: split output needs contiguous D and non-overlapping strides; got {f.shape} / {f.strides}")
-        st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(f.shape, f.strides))
-        bound = st[0], st[2], st[1]
-    if bound is None:
-        raise ValueError(
-            f"cudnn.sdpa: {name}: shape {tuple(f.shape)} strides {tuple(f.strides)} is not a layout the kernel binds zero-copy: the head dim must be "
-            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
-        )
-    bs, ss, hs = bound
-    need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
+    bound, b, seq, need = _dense_role_layout(tuple(f.shape), tuple(f.strides), heads, d, s_max, spec.b * b_mult, _buffers.DTYPE_ITEMSIZE[expect], tma, name)
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; its geometry {tuple(f.shape)} / {tuple(f.strides)} needs {need}")
-    return _DenseRole(f.ptr, (bs, ss, hs), b, seq)
+    return _DenseRole(f.ptr, bound, b, seq)
+
+
+@lru_cache(maxsize=256)
+def _dense_lse_layout(shape, strides, b, s_q, qh):
+    """Stats layout/envelope validation contains no runtime storage observations."""
+    sh, st = tuple(int(x) for x in shape), tuple(int(x) for x in strides)
+    if len(sh) == 4 and sh[3] == 1:
+        sh, st = sh[:3], st[:3]
+    if len(sh) != 3 or sh[0] < b or sh[1] != qh or sh[2] < s_q:
+        raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {qh}, {s_q}[, 1]) or larger; got {tuple(shape)}")
+    need = (b - 1) * st[0] + (qh - 1) * st[1] + (s_q - 1) * st[2] + 1
+    if not _covering((b, qh, s_q), st):
+        raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
+    return (st[0], st[1], st[2]), need
 
 
 def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: int, *, required: bool):
@@ -1116,17 +1359,10 @@ def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: i
             raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
         if lse.ptr % _ALIGN_F32 != 0:
             raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-        sh, st = tuple(int(x) for x in lse.shape), tuple(int(x) for x in lse.strides)
-        if len(sh) == 4 and sh[3] == 1:
-            sh, st = sh[:3], st[:3]
-        if len(sh) != 3 or sh[0] < b or sh[1] != spec.qh or sh[2] < s_q:
-            raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {spec.qh}, {s_q}[, 1]) or larger; got {tuple(lse.shape)}")
-        need = (b - 1) * st[0] + (spec.qh - 1) * st[1] + (s_q - 1) * st[2] + 1
+        strides, need = _dense_lse_layout(tuple(lse.shape), tuple(lse.strides), b, s_q, spec.qh)
         if lse.span >= 0 and lse.span < need:
             raise ValueError(f"cudnn.sdpa: lse_tensor spans {lse.span} elements; its geometry needs {need}")
-        if not _covering((b, spec.qh, s_q), st):
-            raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
-        return lse.ptr, (st[0], st[1], st[2])
+        return lse.ptr, strides
     elif lse is not None:
         raise ValueError("cudnn.sdpa: this specialization was compiled without a Stats output; construct the API without sample_lse")
 
@@ -1155,7 +1391,8 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         q = _dense_role(spec, facts, "q", spec.qh, spec.d_qk, spec.s_q_max, spec.expect["q"])
         b, s_q = q.b, q.s
         frame[ix["q_ptr"]], frame[ix["q_strides"]] = q.ptr, q.strides
-    o = _dense_role(spec, facts, "o", spec.qh, spec.d_v, spec.s_q_max, spec.expect["o"], b_mult=spec.split)
+    o_d = spec.d_v // (spec.quant.block_output.pack if spec.quant is not None and spec.quant.block_output is not None else 1)
+    o = _dense_role(spec, facts, "o", spec.qh, o_d, spec.s_q_max, spec.expect["o"], b_mult=spec.split)
     if o.b != b * spec.split or o.s != s_q:
         raise ValueError(
             f"cudnn.sdpa: o is ({o.b}, {spec.qh}, {o.s}, {spec.d_v}) but q runs batch {b} x seq {s_q}" + (f" ({spec.split} splits)" if spec.split > 1 else "")
@@ -1396,7 +1633,7 @@ class PreparedDenseLaunch:
             if spec.combine is not None and spec.combine.has_stats:
                 uids["ragged_lse"] = binding.ragged_stats.get_uid()
         if spec.quant is not None:
-            for name in _QUANT_ROLES:
+            for name in _quant_roles(spec.quant):
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()

@@ -23,7 +23,7 @@ from typing import Literal, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute.typing import AddressSpace, Pointer
 from cutlass.cutlass_dsl import dsl_user_op, Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
@@ -102,6 +102,18 @@ def store_tma_desc(
     # dst_llvm_ptr = dest_ptr.to_llvm_ptr(loc=loc, ip=ip)
     dst_llvm_ptr = dest_ptr.llvm_ptr
     llvm.store(store_struct, dst_llvm_ptr, alignment=TensormapDescBytes, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def acquire_tma_desc(raw_ptr: Pointer, *, loc=None, ip=None) -> None:
+    """Make one descriptor written by an earlier kernel visible to this thread's TMA ops.
+
+    The TMA descriptor cache survives across kernel launches, so without this a
+    TMA op may use a stale copy of whatever descriptor previously occupied
+    ``raw_ptr`` (e.g. on CUDA-graph replay or when a workspace is reused). The
+    fence covers exactly one 128-byte descriptor.
+    """
+    cpasync.fence_tma_desc_acquire(gmem_ptr_to_generic(raw_ptr, loc=loc, ip=ip), loc=loc, ip=ip)
 
 
 def _get_tma_field_attr_name(atom_type: ir.Type) -> str:

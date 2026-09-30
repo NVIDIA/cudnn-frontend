@@ -301,6 +301,14 @@ def _run(
                     tail = got[:, :, sq:, :]
                     torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
 
+    # Reuse the independently checked case for prepared-binding regressions.
+    from types import SimpleNamespace
+
+    refs = dict(t, dq=dq_t, dk=dk_t, dv=dv_t)
+    return SimpleNamespace(
+        graph=g, refs=refs, pack=pack, workspace=ws, expected=tuple(x.clone() for x in (dq, dk, dv)), reference=(dq_r, dk_r, dv_r), scale=scale
+    )
+
 
 # --------------------------------------------------------------------------- #
 # ACCEPT -- every capability the row claims                                    #

@@ -1682,3 +1682,432 @@ def test_sdpa_bwd_dsl_sm120_det_2kernel_d256():
         for run_i, o2 in enumerate(runs[1:], start=1):
             for grad in ("dq_tensor", "dk_tensor", "dv_tensor"):
                 assert torch.equal(o2[grad], runs[0][grad]), f"run {run_i}: {grad} is not bitwise reproducible (det_2kernel d256)"
+
+
+def _prepared_bwd_case(dtype=torch.bfloat16, route="gqa", wide=None, wide_span=False):
+    """Capture the public graph call, retaining its actual buffers and pinned route."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import cudnn
+
+    torch.manual_seed(903)
+    b, h, s = (5 if wide_span else 2), 4, 128
+    d = 64 if route == "relay" else 128
+    hk = h if route == "mha" else 2
+    tensors = {name: _bhsd(b, heads, s, d, dtype) for name, heads in (("q", h), ("k", hk), ("v", hk), ("do", h))}
+    o, stats, dq, dk, dv, _ = _ref_bwd(**{name: tensors[name] for name in ("q", "k", "v", "do")}, scale=d**-0.5, is_causal=True)
+    tensors.update(o=_bhsd(b, h, s, d, dtype, empty=True).copy_(o), stats=stats)
+    expected = dict(zip(("dq", "dk", "dv"), (dq, dk, dv)))
+    tensors.update({name: torch.empty_like(tensors[src]).fill_(float("nan")) for name, src in (("dq", "q"), ("dk", "k"), ("dv", "v"))})
+    if wide is not None:
+        src = tensors[wide]
+        strides = ((2**30 if wide_span else 2**32) + src.stride(0), *src.stride()[1:])
+        elements = 1 + sum((n - 1) * st for n, st in zip(src.shape, strides))
+        guard = 2**31 if wide_span else 0
+        free, _ = torch.cuda.mem_get_info()
+        if (elements + guard) * src.element_size() + 512 * 2**20 > free:
+            pytest.skip("physical Int64 probe needs room for one wide buffer")
+        backing = torch.empty(elements + guard, device="cuda", dtype=src.dtype)
+        # Signed Int32 product wrap can point before the view's origin. Keep
+        # those addresses in an allocated guard and seed the addressed rows.
+        if wide_span:
+            import ctypes
+
+            for batch in range(b):
+                decoy = guard + ctypes.c_int32(batch * strides[0]).value
+                backing.as_strided((1, *src.shape[1:]), src.stride(), decoy).fill_(float("nan"))
+        else:
+            backing.as_strided(src.shape, src.stride()).fill_(float("nan"))
+        tensors[wide] = backing.as_strided(src.shape, strides, guard).copy_(src)
+    calls = []
+    original = cudnn.pygraph.execute
+
+    def record(graph, *args, **kwargs):
+        calls.append((graph, args, kwargs))
+        return original(graph, *args, **kwargs)
+
+    from contextlib import ExitStack
+    import sys
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(cudnn.pygraph, "execute", record))
+        if route == "det2k" and wide in ("k", "dq"):
+            # Declared noncompact K/dQ selects relay at D128 too.
+            stack.enter_context(patch.object(sys.modules[__name__], "_expect_det_2k", return_value=False))
+        result = _run_bwd_graph(
+            *(tensors[name] for name in ("q", "k", "v", "o", "do", "stats")),
+            scale=d**-0.5,
+            is_causal=True,
+            deterministic=route in ("relay", "det2k"),
+            grads=tuple(tensors[name] for name in ("dq", "dk", "dv")),
+        )
+    assert result[-1] == ENGINE
+    graph, (pack, workspace), kwargs = calls[-1]
+    assert not kwargs
+    refs = {name: next(ref for ref, buf in pack.items() if buf is tensor) for name, tensor in tensors.items()}
+    return SimpleNamespace(graph=graph, pack=pack, workspace=workspace, tensors=tensors, refs=refs, expected=expected, scale=d**-0.5, dtype=dtype)
+
+
+def _check_prepared_bwd(case, tensors=None, expected=None):
+    tensors = case.tensors if tensors is None else tensors
+    expected = case.expected if expected is None else expected
+    for name in ("dq", "dk", "dv"):
+        torch.testing.assert_close(tensors[name], expected[name], **_tolerances(case.dtype))
+
+
+@requires_dsl
+class TestPreparedSm120Bwd:
+    @pytest.mark.L0
+    @pytest.mark.parametrize("dbias_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("hk", [4, 2])
+    def test_auxiliary_rebind_and_explicit_stream_capture(self, dbias_dtype, hk):
+        """Bias reset, conversion and sink reduction belong to the handle stream."""
+        from unittest.mock import patch
+        import cudnn
+
+        torch.manual_seed(1903)
+        b, h, s, d = 2, 4, 128, 64
+        inputs = {name: _bhsd(b, heads, s, d, torch.bfloat16) for name, heads in (("q", h), ("k", hk), ("v", hk), ("do", h))}
+        bias = torch.randn(1, h, s, s, dtype=torch.float32, device="cuda")
+        sink = torch.randn(1, h, 1, 1, dtype=torch.float32, device="cuda")
+        padding = ([128, 73], [99, 117])
+        lengths = [torch.tensor(values, dtype=torch.int32, device="cuda") for values in padding]
+        o, stats, *_ = _ref_bwd(**inputs, scale=d**-0.5, is_causal=True, bias=bias, sink_token=sink, padding=padding)
+        o = _bhsd(b, h, s, d, torch.bfloat16, empty=True).copy_(o)
+        dbias = torch.empty_like(bias, dtype=dbias_dtype)
+        calls = []
+        original = cudnn.pygraph.execute
+
+        def record(graph, *args, **kwargs):
+            calls.append((graph, args))
+            return original(graph, *args, **kwargs)
+
+        with patch.object(cudnn.pygraph, "execute", record):
+            outputs = _run_bwd_graph(
+                *(inputs[name] for name in ("q", "k", "v")),
+                o,
+                inputs["do"],
+                stats,
+                scale=d**-0.5,
+                is_causal=True,
+                deterministic=False,
+                bias_gpu=bias,
+                dbias_gpu=dbias,
+                sink_gpu=sink,
+                seq_q_lens=lengths[0],
+                seq_kv_lens=lengths[1],
+            )
+        graph, (pack, workspace) = calls[-1]
+        rebound = {ref: buf.clone() for ref, buf in pack.items()}
+        by_pointer = {buf.data_ptr(): rebound[ref] for ref, buf in pack.items()}
+        current = lambda buf: by_pointer[buf.data_ptr()]
+        current(bias).mul_(0.5)
+        current(sink).add_(0.25)
+        padding = ([101, 64], [127, 83])
+        for buf, values in zip(lengths, padding):
+            current(buf).copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+        ref_o, ref_stats, dq, dk, dv, aux = _ref_bwd(
+            *(current(inputs[name]) for name in ("q", "k", "v", "do")),
+            scale=d**-0.5,
+            is_causal=True,
+            bias=current(bias),
+            sink_token=current(sink),
+            padding=padding,
+        )
+        current(o).copy_(ref_o)
+        current(stats).copy_(ref_stats)
+        out = [current(tensor) for tensor in (*outputs[:4], dbias)]
+        expected = [dq, dk, dv, aux.dsink, aux.dbias]
+        workspace = torch.empty_like(workspace).fill_(0xBD)
+        stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        other.wait_stream(torch.cuda.current_stream())
+        handle = cudnn.create_handle()
+        cudnn.set_stream(handle, stream.cuda_stream)
+        capture = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(other):
+                graph.execute(rebound, workspace, handle=handle)
+            torch.cuda.current_stream().wait_stream(stream)
+            for actual, ref in zip(out, expected):
+                torch.testing.assert_close(actual.float(), ref.float(), **_tolerances(torch.bfloat16))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.graph(capture, stream=stream):
+                with torch.cuda.stream(other):
+                    graph.execute(rebound, workspace, handle=handle)
+            for tensor in out:
+                tensor.fill_(float("nan"))
+            workspace.fill_(0xBD)
+            capture.replay()
+            for actual, ref in zip(out, expected):
+                torch.testing.assert_close(actual.float(), ref.float(), **_tolerances(torch.bfloat16))
+        finally:
+            capture.reset()
+            cudnn.destroy_handle(handle)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+    def test_rebind_and_replay(self, dtype, route):
+        case = _prepared_bwd_case(dtype, route)
+        _check_prepared_bwd(case)
+        rebound = {name: tensor.clone() for name, tensor in case.tensors.items()}
+        rebound["q"].mul_(0.75)
+        rebound["do"].mul_(1.25)
+        o, stats, dq, dk, dv, _ = _ref_bwd(*(rebound[name] for name in ("q", "k", "v", "do")), scale=case.scale, is_causal=True)
+        rebound["o"].copy_(o)
+        rebound["stats"].copy_(stats)
+        expected = dict(zip(("dq", "dk", "dv"), (dq, dk, dv)))
+        pack = {case.refs[name]: tensor for name, tensor in rebound.items()}
+        workspace = torch.empty_like(case.workspace).fill_(0xBD)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            case.graph.execute(pack, workspace)
+        torch.cuda.current_stream().wait_stream(stream)
+        _check_prepared_bwd(case, rebound, expected)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                case.graph.execute(pack, workspace)
+            for name in ("dq", "dk", "dv"):
+                rebound[name].fill_(float("nan"))
+            workspace.fill_(0xBD)
+            graph.replay()
+            _check_prepared_bwd(case, rebound, expected)
+        finally:
+            graph.reset()
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+    def test_execute_has_no_tensor_views_or_jit(self, route, monkeypatch):
+        import cutlass.cute as cute
+        from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+        case = _prepared_bwd_case(route=route)
+        case.graph.execute(case.pack, case.workspace)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("prepared backward rebuilt tensor operands, allocated or compiled")
+
+        with monkeypatch.context() as patcher:
+            for name in ("view", "reshape", "as_strided", "transpose"):
+                patcher.setattr(torch.Tensor, name, forbidden)
+            for name in ("empty", "empty_like", "zeros", "zeros_like"):
+                patcher.setattr(torch, name, forbidden)
+            patcher.setattr(WorkspaceCarver, "__init__", forbidden)
+            patcher.setattr(cute, "compile", forbidden)
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.graph.execute(case.pack, case.workspace)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L1
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"])
+    @pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+    @pytest.mark.parametrize("wide_span", [False, True], ids=["wide_stride", "wide_product"])
+    def test_physical_batch_stride_above_int32(self, role, route, wide_span):
+        # The two-kernel route requires compact K/dQ; those declarations select
+        # relay, which must still honor the same pointer/stride contract.
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        case = _prepared_bwd_case(route=route, wide=role, wide_span=wide_span)
+        assert (case.tensors[role].shape[0] - 1) * case.tensors[role].stride(0) > 2**32
+        _check_prepared_bwd(case)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                case.graph.execute(case.pack, case.workspace)
+            for name in ("dq", "dk", "dv"):
+                case.tensors[name].fill_(float("nan"))
+            case.workspace.fill_(0xBD)
+            graph.replay()
+            _check_prepared_bwd(case)
+        finally:
+            graph.reset()
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k"])
+    def test_standalone_and_graph_bind_same_operands(self, route):
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case(route=route)
+        api = SdpaBwdDslSm120(
+            **{"sample_" + name: value for name, value in case.tensors.items()},
+            is_causal=True,
+            deterministic=route in ("relay", "det2k"),
+            scale_softmax=case.scale,
+        )
+        api.check_support()
+        api.compile()
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda").fill_(0xBD)
+        for name in ("dq", "dk", "dv"):
+            case.tensors[name].fill_(float("nan"))
+        api.execute(**{name + "_tensor": value for name, value in case.tensors.items()}, workspace=workspace)
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+    def test_standalone_rejects_changed_layout_before_launch(self, role):
+        from dataclasses import replace
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case()
+        api = SdpaBwdDslSm120(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=case.scale)
+        api.check_support()
+        api.compile()
+        launches = []
+        api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+        args = {name + "_tensor": value for name, value in case.tensors.items()}
+        args[role + "_tensor"] = case.tensors[role].contiguous()
+        assert args[role + "_tensor"].stride() != case.tensors[role].stride()
+        with pytest.raises(ValueError, match="runtime geometry"):
+            api.execute(**args, workspace=case.workspace)
+        assert not launches
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "stats", "dq", "dk", "dv"])
+    @pytest.mark.parametrize("ordered", [False, True])
+    def test_graph_accepts_strided_raw_storage(self, role, ordered):
+        case = _prepared_bwd_case()
+        tensor = case.tensors[role]
+        backing = torch.empty(tensor.numel() + 2, device="cuda", dtype=tensor.dtype)
+        declared = backing.as_strided(tensor.shape, tensor.stride()).copy_(tensor)
+        raw = backing[::2]
+        assert not raw.is_contiguous()
+        case.pack[case.refs[role]] = raw
+        case.tensors[role] = declared
+        for name in ("dq", "dk", "dv"):
+            case.tensors[name].fill_(float("nan"))
+        if ordered:
+            items = list(reversed(list(case.pack.items())))
+            case.graph.execute([buffer for _, buffer in items], case.workspace, tensor_uids=[ref.get_uid() for ref, _ in items])
+        else:
+            case.graph.execute(case.pack, case.workspace)
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("role", ["q", "stats", "dq"])
+    @pytest.mark.parametrize("ordered", [False, True])
+    def test_graph_fixed_plan_override_validation(self, role, ordered, monkeypatch):
+        from dataclasses import replace
+
+        case = _prepared_bwd_case()
+        ref = case.refs[role]
+        kwargs = dict(override_uids=[ref.get_uid()], override_shapes=[list(ref.get_dim())], override_strides=[list(ref.get_stride())])
+        pack = case.pack
+        if ordered:
+            items = list(reversed(list(pack.items())))
+            kwargs["tensor_uids"] = [tensor.get_uid() for tensor, _ in items]
+            pack = [buffer for _, buffer in items]
+        case.graph.execute(pack, case.workspace, **kwargs)
+        _check_prepared_bwd(case)
+        plan = case.graph._compiled_plans[case.graph._plan_index]
+        launches = []
+        monkeypatch.setattr(plan._prepared, "spec", replace(plan._prepared.spec, fn=lambda *args: launches.append(args)))
+        kwargs["override_shapes"][0][2] //= 2
+        with pytest.raises(ValueError, match="runtime geometry"):
+            case.graph.execute(pack, case.workspace, **kwargs)
+        assert not launches
+
+    @pytest.mark.L0
+    def test_standalone_accepts_flat_contiguous_stats(self):
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case()
+        api = SdpaBwdDslSm120(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=case.scale)
+        api.check_support()
+        api.compile()
+        args = {name + "_tensor": value for name, value in case.tensors.items()}
+        args["stats_tensor"] = case.tensors["stats"].view(-1)
+        for name in ("dq", "dk", "dv"):
+            case.tensors[name].fill_(float("nan"))
+        api.execute(**args, workspace=case.workspace)
+        _check_prepared_bwd(case)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("failure", ["stats_numel", "stats_contiguity"])
+    def test_standalone_retains_stats_validation(self, failure):
+        from dataclasses import replace
+        from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+        case = _prepared_bwd_case()
+        api = SdpaBwdDslSm120(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=case.scale)
+        api.check_support()
+        api.compile()
+        launches = []
+        api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+        stats = case.tensors["stats"]
+        bad = torch.empty(stats.numel() + 1, device="cuda", dtype=stats.dtype)
+        if failure == "stats_contiguity":
+            bad = torch.empty((*stats.shape[:-1], 2), device="cuda", dtype=stats.dtype)[..., :1]
+        args = {name + "_tensor": value for name, value in case.tensors.items()}
+        args["stats_tensor"] = bad
+        with pytest.raises(ValueError, match="stats_tensor"):
+            api.execute(**args, workspace=case.workspace)
+        assert not launches
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("failure", ["missing", "dtype", "device", "span", "alignment", "extra", "workspace_alias", "geometry", "strided_lengths"])
+    def test_validate_before_any_stage(self, failure, monkeypatch):
+        from dataclasses import replace
+        from cudnn.sdpa.bwd import prepared
+        from cudnn.sdpa.fwd.prepared import facts_of_tensor
+
+        observed = []
+        execute = prepared.execute
+
+        def observe(spec, *args, **kwargs):
+            observed.append(spec)
+            return execute(spec, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(prepared, "execute", observe)
+            case = _prepared_bwd_case()
+        assert observed, "the graph did not take prepared backward"
+        launches = []
+        spec = replace(observed[-1], fn=lambda *args: launches.append(args))
+        facts = {name: facts_of_tensor(value) for name, value in case.tensors.items()}
+        workspace = case.workspace.data_ptr()
+        geometry = None
+        if failure == "missing":
+            facts.pop("q")
+        elif failure == "dtype":
+            facts["q"] = facts["q"]._replace(dtype="float32")
+        elif failure == "device":
+            facts["q"] = facts["q"]._replace(device=(1, 0))
+        elif failure == "span":
+            facts["q"] = facts["q"]._replace(span=1)
+        elif failure == "alignment":
+            facts["q"] = facts["q"]._replace(ptr=facts["q"].ptr + 2)
+        elif failure == "extra":
+            facts["sink"] = facts["stats"]
+        elif failure == "workspace_alias":
+            workspace = facts["q"].ptr
+        elif failure == "geometry":
+            geometry = tuple((op.shape, op.strides) if op is not None else None for op in spec.operands)
+            facts["q"] = facts["q"]._replace(shape=(1, *facts["q"].shape[1:]))
+        elif failure == "strided_lengths":
+            operands = list(spec.operands)
+            operands[9] = prepared.Operand("int32", (2,), (1,), 2, 4, 4)
+            spec = replace(spec, operands=tuple(operands))
+            lengths = torch.tensor([128, 0, 64, 0], device="cuda", dtype=torch.int32)[::2]
+            facts["seq_q"] = facts_of_tensor(lengths)
+        with pytest.raises(ValueError):
+            execute(spec, facts, workspace, torch.cuda.current_stream().cuda_stream, geometry=geometry)
+        assert not launches
+
+
+@requires_dsl
+@pytest.mark.L0
+@pytest.mark.parametrize("route", ["mha", "gqa", "relay", "det2k", "aux_fp32", "aux_io"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm120", route, dtype, tmp_path)
