@@ -374,22 +374,21 @@ def _validate_forward(node) -> None:
                 raise _not_supported("sdpa_mxfp8: scale_o must be a FLOAT tensor.")
 
     if node.node_type == NodeType.SDPA_MXFP8:
-        _validate_mxfp8_descales(node, q, k, v, s_kv if s_kv is not None else k.get_dim()[2])
+        _validate_mxfp8_descales(node, q, k, v)
 
 
-def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
-    """MXFP8 block-scale descale tensors: F8_128x4 reordering and batch/head dims matching
-    their base operand."""
-    b, h_q, _, d = q.get_dim()
-    h_k, h_v = k.get_dim()[1], v.get_dim()[1]
+def _validate_mxfp8_descales(node, q, k, v) -> None:
+    """MXFP8 descale tensors: F8_128x4 reordering and leading dims matching their base
+    operand (page pools under paged KV)."""
+    d = q.get_dim()[3]
     block_size = 32  # MXFP8 block size is fixed at 32
     d_scale = (d + block_size - 1) // block_size
-    s_scale = (s_kv + block_size - 1) // block_size
+    s_scale = (v.get_dim()[2] + block_size - 1) // block_size
 
-    for port, h, small_axis, small_min in (
-        ("descale_q", h_q, 3, d_scale),
-        ("descale_k", h_k, 3, d_scale),
-        ("descale_v", h_v, 2, s_scale),
+    for port, base, small_axis, small_min in (
+        ("descale_q", q, 3, d_scale),
+        ("descale_k", k, 3, d_scale),
+        ("descale_v", v, 2, s_scale),
     ):
         t = node.inputs.get(port)
         if t is None:
@@ -400,9 +399,8 @@ def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
         if getattr(t.get_reordering_type(), "name", None) != "F8_128x4":
             raise ValueError(f"MXFP8 SDPA requires {cap} to have F8_128x4 reordering")
         dim = t.get_dim()
-        if dim[0] != b or dim[1] != h:
-            base = port.split("_")[1].upper()
-            raise ValueError(f"MXFP8 SDPA: {cap} batch/head dimensions must match {base}")
+        if dim[0] != base.get_dim()[0] or dim[1] != base.get_dim()[1]:
+            raise ValueError(f"MXFP8 SDPA: {cap} batch/head dimensions must match {port.split('_')[1].upper()}")
         if dim[small_axis] < small_min:
             what = "d_scale" if small_axis == 3 else "s_scale"
             raise ValueError(f"MXFP8 SDPA: {cap} {what} dimension too small (expected >= {small_min})")

@@ -12,7 +12,7 @@ os.environ.setdefault(
     "expandable_segments:True,garbage_collection_threshold:0.6",
 )
 
-# The JAX interop tests (fe_api/**/test_*_jax.py) initialize XLA in the same pytest
+# The JAX interop tests (**/test_*_jax.py) initialize XLA in the same pytest
 # process as the torch suites; XLA's default 75%-of-GPU preallocation starves later
 # torch tests of memory (CUDA_ERROR_OUT_OF_MEMORY at kernel-compile time). Must be set
 # before jax initializes its backend.
@@ -36,6 +36,9 @@ except (ImportError, OSError):
     pass
 
 import cudnn
+
+# Rule 8 detectors (recipes R9 / R11) for the frontend-only API directories.
+from rule8_detector import _execute_never_blocks_the_host, compile_allocates_nothing  # noqa: E402,F401
 
 # cudart via cuda-python instead of torch: torch is optional, and startup must
 # not create a CUDA context so per-worker CUDA_VISIBLE_DEVICES routing works.

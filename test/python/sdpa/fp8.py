@@ -950,6 +950,13 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         int(GraphFwdUid.o_amax): o_amax_gpu,
     }
 
+    if not is_ragged:
+        # Allocations/reference use BSHD; graph declarations use BHSD. Bind
+        # explicit views even when H == S, where equal shapes hide the swap
+        # and the normalized operand correctly retains the producer strides.
+        for uid in (GraphFwdUid.q, GraphFwdUid.k, GraphFwdUid.v, GraphFwdUid.o):
+            variant_pack[int(uid)] = variant_pack[int(uid)].transpose(1, 2)
+
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu

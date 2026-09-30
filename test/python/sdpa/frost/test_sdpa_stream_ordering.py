@@ -157,8 +157,10 @@ def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
     )
     assert api.check_support()
     api.compile()
+    budget = api.scratch_workspace_bytes()
+    workspace = torch.empty(budget, device=dev, dtype=torch.uint8) if budget else None
 
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=output, amax_o=amax, **execute_args)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=output, amax_o=amax, workspace=workspace, **execute_args)
     torch.cuda.synchronize()
     expected_output, expected_amax = output.clone(), amax.clone()
 
@@ -174,6 +176,7 @@ def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
         o_tensor=output,
         amax_o=amax,
         current_stream=cuda_driver.CUstream(side.cuda_stream),
+        workspace=workspace,
         **execute_args,
     )
     torch.cuda.synchronize()
