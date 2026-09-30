@@ -405,6 +405,64 @@ def test_graph_thd_head_major_stats_bounds_overallocated_q_without_declared_tota
     assert torch.isnan(vp[o][0, 240:]).all()
 
 
+@pytest.mark.parametrize("stats_layout", ["head_major", "token_major", "none"])
+@pytest.mark.parametrize("overallocated_side", ["q", "kv"])
+def test_graph_thd_accepts_overallocated_buffers_without_declared_total(stats_layout, overallocated_side):
+    torch.manual_seed(7)
+    lens_q, lens_kv = (144, 96), (160, 128)
+    graph, vp, nodes, (cu_q, cu_kv) = _make_graph(
+        lens_q,
+        lens_kv,
+        declare_total=False,
+        cap_extra=160,
+        stats_layout="head_major" if stats_layout == "none" else stats_layout,
+        stats_output=stats_layout != "none",
+    )
+    q, k, v, o, stats = nodes
+    # Keep only one side over-allocated, beyond even B * S_max, so each
+    # capacity bug is exercised independently with unchanged legal lengths.
+    for node in (k, v) if overallocated_side == "q" else (q, o):
+        vp[node] = vp[node][:, : cu_kv[-1] if node is k or node is v else cu_q[-1]]
+    if stats_layout == "token_major":
+        # Without a declared total, token-major Stats covers the planned Q
+        # envelope, while only the live rows may be written.
+        vp[stats] = torch.full((len(lens_q) * max(lens_q), 2), float("nan"), dtype=torch.float32, device="cuda")
+    workspace = _plan(graph)
+
+    def check():
+        for batch in range(len(lens_q)):
+            qs = vp[q][0, cu_q[batch] : cu_q[batch + 1]].transpose(0, 1).double()
+            ks = vp[k][0, cu_kv[batch] : cu_kv[batch + 1]].transpose(0, 1).double()
+            vs = vp[v][0, cu_kv[batch] : cu_kv[batch + 1]].transpose(0, 1).double()
+            scores = (qs @ ks.transpose(-1, -2)) / math.sqrt(128)
+            actual = vp[o][0, cu_q[batch] : cu_q[batch + 1]].transpose(0, 1).float()
+            torch.testing.assert_close(actual, (scores.softmax(-1) @ vs).float(), rtol=1e-2, atol=4e-3)
+            if stats_layout != "none":
+                actual_stats = vp[stats][cu_q[batch] : cu_q[batch + 1]].T if stats_layout == "token_major" else vp[stats][0, :, cu_q[batch] : cu_q[batch + 1]]
+                torch.testing.assert_close(actual_stats, scores.logsumexp(-1).float(), rtol=3e-2, atol=5e-2)
+        for node, total in ((q, cu_q[-1]), (k, cu_kv[-1]), (v, cu_kv[-1]), (o, cu_q[-1])):
+            assert torch.isnan(vp[node][0, total:]).all()
+        if stats_layout == "token_major":
+            assert torch.isnan(vp[stats][cu_q[-1] :]).all()
+
+    graph.execute(vp, workspace)
+    torch.cuda.synchronize()
+    check()
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(captured):
+            graph.execute(vp, workspace)
+        vp[v].mul_(0.5)
+        vp[o].fill_(float("nan"))
+        if stats_layout != "none":
+            vp[stats].fill_(float("nan"))
+        captured.replay()
+        torch.cuda.synchronize()
+        check()
+    finally:
+        captured.reset()
+
+
 def test_graph_thd_head_major_stats_accepts_strided_view():
     graph, vp, nodes, _ = _make_graph((144, 96), (160, 128), stats_layout="head_major_padded")
     vp[nodes[4]] = vp[nodes[4]][:, :, :240]

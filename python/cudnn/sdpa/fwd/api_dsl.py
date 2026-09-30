@@ -4442,7 +4442,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         t_kv = min(capacity(k_tensor, self.k_desc), capacity(v_tensor, self.v_desc))
         if self.max_total_seq_len_kv is not None:
             t_kv = min(t_kv, self.max_total_seq_len_kv)
-        self._value_error_if(t_q > self._t_q_cap or t_kv > self._t_kv_cap, "SM80 THD token extent exceeds the planned envelope")
+        # Planned capacities bound live totals (caller contract); extra
+        # allocation beyond them is never addressed.
+        t_q = min(t_q, self._t_q_cap)
+        t_kv = min(t_kv, self._t_kv_cap)
 
         lse = None
         if lse_tensor is not None:
