@@ -86,22 +86,77 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
     return o_ref, stats_ref
 
 
+def _validate_quantize_ds(quantize_ds):
+    """``True`` -> "1x32", ``False`` -> "fp32", ``(32, 32)`` / ``[32, 32]`` -> ``(32, 32)``; anything else raises."""
+    if quantize_ds is True:
+        return "1x32"
+    if quantize_ds is False:
+        return "fp32"
+    if isinstance(quantize_ds, (tuple, list)) and len(quantize_ds) == 2 and all(type(v) is int for v in quantize_ds):
+        if tuple(quantize_ds) != (32, 32):
+            raise ValueError(f"compute_ref_backward: the only tile-quantized dS arm is quantize_ds=(32, 32); got {tuple(quantize_ds)}")
+        return (32, 32)
+    raise ValueError(f"compute_ref_backward: quantize_ds must be True (1x32 both ways), False (fp32 dS) or (32, 32) (one E8M0 per tile); got {quantize_ds!r}")
+
+
+def _quantize_ds_tiles(dS, tile, fp8_dtype):
+    """Quantize ``dS[b, h, s_q, n]`` with ONE E8M0 scale per ``tile`` = (tq, tk) elements and dequantize it back to fp32:
+    ``quantize_blocks`` on the tile's ``tq * tk``-vector (its amax -> ``e8m0_ceil(amax * fp32(1/max))`` -> ``exp2_rcp``
+    -> clamp -> fp8 -> ``* 2^(e-127)``).  Sequences that are not multiples of the tile are zero-padded (a zero never
+    raises a tile's amax, so the partial tiles quantize exactly as they would unpadded) and sliced back."""
+    from .mxfp8_quant import e8m0_to_float, quantize_blocks
+
+    tq, tk = tile
+    b, h, s_q, n = dS.shape
+    pad_q, pad_k = (-s_q) % tq, (-n) % tk
+    x = dS.float()
+    if pad_q or pad_k:
+        x = torch.nn.functional.pad(x, (0, pad_k, 0, pad_q))
+    nq, nk = (s_q + pad_q) // tq, (n + pad_k) // tk
+    tiles = x.reshape(b, h, nq, tq, nk, tk).permute(0, 1, 2, 4, 3, 5).reshape(b, h, nq, nk, tq * tk)
+    codes, e = quantize_blocks(tiles, fp8_dtype)
+    deq = codes.float() * e8m0_to_float(e).unsqueeze(-1)
+    out = deq.reshape(b, h, nq, nk, tq, tk).permute(0, 1, 2, 4, 3, 5).reshape(b, h, s_q + pad_q, n + pad_k)
+    return out[:, :, :s_q, :n]
+
+
 def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, dO_fp8, dO_t_fp8, attn_scale,
                          sf_q_ref, sf_q_t_ref, sf_k_ref, sf_k_t_ref, sf_v_ref, sf_dO_ref, sf_dO_t_ref,
                          torch_itype=torch.float8_e4m3fn, torch_otype=torch.bfloat16,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None):
+                         stats=None, quantize_ds=True):
     """
     Compute backward pass reference for MXFP8 SDPA.
 
     If sink_token is provided, the virtual sink is included in softmax normalization
     and dSink_token is computed: dS_sink = -p_sink * D (no attn_scale), then summed
     over batch and query dimensions.
+
+    ``quantize_ds`` (appended, default = the behaviour before it existed) selects how dS
+    enters the dQ / dK products -- the three dS policies of the SM107 MXFP8 d=256 backward:
+
+    * ``True``: cuDNN's convention and the SM100 chain's -- dS rounded to ``torch_itype`` per
+      1x32 block along BOTH orientations (``quantize_to_mxfp8``: along kv into dQ, along q into
+      dK); the structural twin of an exact-1x32-both-ways kernel dS policy.
+    * ``False``: dS stays fp32 into both products -- the reference for a chain whose dQ / dK
+      consume dS in a wider dtype (a bf16-dS bring-up chain), the same recipe as
+      ``fp8_ref.compute_ref_backward(quantize_ds=False)`` for the sm107 per-tensor fp8 row's
+      bf16-dS twin: an e4m3-dS reference misreports such a chain by its own rounding noise
+      (measured there at 0.56 % of dQ / 0.54 % of dK outside atol).  dV is untouched.
+    * ``(32, 32)``: ONE E8M0 per 32 x 32 (q x kv) tile of dS, the same dequantized tile feeding
+      dQ and dK (a one-scale-per-tile kernel dS policy): the tile's amax -> ``e8m0_ceil(amax * fp32(1/max))`` ->
+      ``exp2_rcp`` -> clamp -> ``torch_itype`` -> dequant, exactly ``quantize_blocks`` on the
+      1024-vector of the tile; sequences that are not multiples of 32 are zero-padded to the
+      tile grid (a zero never raises a tile's amax) and sliced back.
+
+    Anything else is refused (``ValueError``): the policy is numerics-changing and must be
+    spelled, never inferred.
     """
     b, h_q, s_q, d_qk = q_fp8.shape
     _, h_k, s_kv, _ = k_fp8.shape
     _, h_v, _, d_vo = v_fp8.shape
     device = q_fp8.device
+    ds_mode = _validate_quantize_ds(quantize_ds)
 
     # Dequantize for BMM1 (Q @ K^T): D-dimension scale factors
     q_dq = _dequant(q_fp8, sf_q_ref)
@@ -170,14 +225,21 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         # dS = P * (dP - D) * attn_scale
         dS = p * (dP - D) * attn_scale
 
-        # MXFP8 scales are per 32 elements along either axis, so quantizing this
-        # 128-wide KV block gives exactly the full-matrix quantization.
-        dS_fp8, sf_dS_ref, _, dS_fp8_t, sf_dS_t_ref, _ = quantize_to_mxfp8(
-            dS, b, h_q, s_q, n, block_size=32, fp8_dtype=torch_itype
-        )
-        # D-quantized dS (along s_kv) and S-quantized dS (along s_q)
-        dS_fp32 = _dequant(dS_fp8, sf_dS_ref)
-        dS_fp32_t = _dequant(dS_fp8_t, sf_dS_t_ref)
+        if ds_mode == "1x32":
+            # MXFP8 scales are per 32 elements along either axis, so quantizing this
+            # 128-wide KV block gives exactly the full-matrix quantization.
+            dS_fp8, sf_dS_ref, _, dS_fp8_t, sf_dS_t_ref, _ = quantize_to_mxfp8(
+                dS, b, h_q, s_q, n, block_size=32, fp8_dtype=torch_itype
+            )
+            # D-quantized dS (along s_kv) and S-quantized dS (along s_q)
+            dS_fp32 = _dequant(dS_fp8, sf_dS_ref)
+            dS_fp32_t = _dequant(dS_fp8_t, sf_dS_t_ref)
+        elif ds_mode == "fp32":
+            # quantize_ds=False: the fp32 dS feeds both products (the wider-dS chain's twin)
+            dS_fp32 = dS_fp32_t = dS
+        else:
+            # quantize_ds=(32, 32): one E8M0 per 32x32 tile, shared by both orientations
+            dS_fp32 = dS_fp32_t = _quantize_ds_tiles(dS, ds_mode, torch_itype)
 
         # P @ dO -> dV; dS @ K -> dQ; dS^T @ Q -> dK (GQA reduction inside _kv_reduce)
         dV[:, :, start:end, :] = _kv_reduce(p_fp8, dO_t_dq, h_v)

@@ -149,11 +149,46 @@ def mbar_arrive_on_peer(mb, peer_cta_id, pred=None):
 
 @cute.jit
 def arrive_on_leader(mb, leader_cta_id, cta_group: int):
+    """RELAXED cluster-scope arrive on the leader's mbar: for data the arrive does NOT have to order -- an async-proxy TMEM
+    write (``tcgen05_st``) already completed by ``tcgen05_wait(STORE)``, or a count-only credit.  The relaxed form is what
+    keeps ptxas from draining (``MEMBAR.ALL.GPU`` + ``CGAERRBAR`` before every arrive).  For a
+    lane-written SMEM operand the peer reads, use :func:`arrive_on_leader_release`."""
     if cutlass.const_expr(cta_group == 1):
         nvvm.mbarrier_arrive(mb)
     else:
         peer_mb = nvvm.mapa(mb, leader_cta_id)
         nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+
+
+@cute.jit
+def arrive_on_leader_release(mb, leader_cta_id, cta_group: int):
+    """RELEASE arrive on the leader's mbar -- ``mbarrier.arrive.release.cta.shared::cluster.b64`` on the mapa'd leader
+    barrier (cga1: the plain local arrive, so the call site needs no ``CTA_MMA`` guard).
+
+    WHAT IT ORDERS: this thread's GENERIC SMEM stores (a ``store_swizzled`` / ``st.shared`` of an MMA operand into the
+    follower's own slab) that a ``fence_proxy("async.shared", space="cta")`` has made visible to the async proxy, before
+    the leader's ``mbarrier.try_wait.parity.acquire`` returns and its ``cta_group::2`` MMA reads that slab in place.  The
+    relaxed :func:`arrive_on_leader` cannot publish such stores -- the peer-issued MMA may read the slab stale (a
+    load-dependent first-launch race); the SM100 dkdv MXFP8 chain ships exactly this pattern as its P ``producer_commit``
+    (``cute.arch.mbarrier_arrive(mb, dst_rank)`` = the DSL's default remote arrive, ``.release`` at CTA scope), and the
+    shared scheduler credit uses the same ``.release.cta.shared::cluster`` form at 0 ``CGAERRBAR``.
+
+    WHY NOT ``.release.cluster``: a cluster-scope release on a per-iteration path makes ptxas emit ``MEMBAR.ALL.GPU`` +
+    ``CGAERRBAR`` ahead of the arrive -- a kernel-wide drain per arrive site (removing that drain took a cga2 kernel
+    from 47 % to 92 % of SOL).  The CTA-scope release across CTAs is the DSL's own "historical" default for a remote arrive
+    -- formally WEAKER than cluster scope.  PINNED today (``test_tile_dsl_release_arrive.py``): the PTX form,
+    ``CGAERRBAR == MEMBAR.ALL.GPU == 0`` in SASS, and a single-launch 2-CTA publish whose leader reads the follower's
+    slab through a generic ``ld.shared::cluster``.  NOT YET PINNED: the async-proxy consumer this helper exists for -- a
+    peer-issued ``cta_group::2`` MMA over a lane-written slab under load.  That micro-probe (12 fresh processes x
+    {relaxed, release.cta} x {follower nanosleep 0 / 2 us}, recording the three exit-code counts and max|diff| per cell)
+    is a MERGE GATE for the first
+    ``Producer.LEADER_RELEASE`` consumer; until it lands, treat the form as the DSL's default, not as verified
+    sufficient.  Lane ledger: same as :func:`arrive_on_leader` (one arrive per calling lane -- nothing here elects)."""
+    if cutlass.const_expr(cta_group == 1):
+        nvvm.mbarrier_arrive(mb)
+    else:
+        peer_mb = nvvm.mapa(mb, leader_cta_id)
+        nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA, relaxed=False)
 
 
 @cute.jit
@@ -188,6 +223,10 @@ class Producer(enum.IntEnum):
     TMA_LOAD = 1
     MMA_COMMIT = 2
     LEADER = 3
+    # A LEADER-waited mbar whose arrive PUBLISHES the arriving lanes' generic SMEM stores (a lane-written MMA operand the
+    # leader's MMA reads across the pair): the .release.cta cross-CTA arrive of arrive_on_leader_release.  LEADER stays the
+    # relaxed form for tcgen05_st / TMEM data ordered by tcgen05_wait(STORE).  Appended (append-only enum).
+    LEADER_RELEASE = 4
 
 
 class Scope(enum.IntEnum):
@@ -267,6 +306,17 @@ class MBarrier:
             if cta_group is None:
                 raise TypeError("MBarrier(producer=MMA_COMMIT).arrive() requires " "cta_group= (Python compile-time int).")
             commit_mma(self.smem_ptr, mcast_mask, cta_group, pred=pred)
+
+        elif cutlass.const_expr(self.producer == int(Producer.LEADER_RELEASE)):
+            if cta_group is None or leader_cta_id is None:
+                raise TypeError("MBarrier(producer=LEADER_RELEASE).arrive() requires " "cta_group= AND leader_cta_id=.")
+            if cutlass.const_expr(pred is not None):
+                raise TypeError(
+                    "MBarrier(producer=LEADER_RELEASE).arrive() does NOT support pred=. "
+                    "Use arrive_on_peer(pred=) for a predicated cross-CTA arrive, "
+                    "or keep the `if elect_sync():` branch."
+                )
+            arrive_on_leader_release(self.smem_ptr, leader_cta_id, cta_group)
 
         else:
             if cta_group is None or leader_cta_id is None:

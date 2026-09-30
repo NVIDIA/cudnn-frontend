@@ -177,6 +177,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
 )
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.sdpa.kernels._mxfp8_sf import build_columnwise_sf_desc, build_rowwise_sf_desc, sf_peer_split, sf_tma_rows
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_store_tile,
@@ -1083,13 +1084,13 @@ def _tmaldg_warp_group(
     tma_k_sf = GmemTileTma(tma_k_sf_desc)
     tma_v_sf = GmemTileTma(tma_v_sf_desc)
 
-    SF_TMA_ROW_BYTES = 128
-    K_SF_BYTES_PER_PEER = SF_SMEM_SIZE_K // CFG.CTA_MMA
-    V_SF_BYTES_PER_PEER = SF_SMEM_SIZE_V // CFG.CTA_MMA
-    K_SF_ROWS_PER_PEER = K_SF_BYTES_PER_PEER // SF_TMA_ROW_BYTES
-    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_BYTES_PER_PEER)
-    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_BYTES_PER_PEER)
-    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_ROWS_PER_PEER)
+    # cga2 peer split of the K / V SF slabs -- bytes in SMEM, 128-B rows in the
+    # descriptor (sdpa/kernels/_mxfp8_sf.py); the offsets fold to 0 under cga1.
+    K_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_K, CFG.CTA_MMA)
+    V_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_V, CFG.CTA_MMA)
+    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_SPLIT.bytes_per_peer)
+    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_SPLIT.bytes_per_peer)
+    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_SPLIT.rows_per_peer)
     # V's SF descriptor is D-plane-major (host), so the peer split is a plane
     # coord, not a row offset (K, being rowwise, keeps the row form).
     v_sf_peer_plane = cta_in_pair * cutlass.Int32(V_SF_PLANES_PER_PEER)
@@ -2614,10 +2615,9 @@ def _host(
     vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
     stride_order = (3, 2, 1, 0)
 
-    SF_TMA_ROW_BYTES = 128
-    SF_NUM_ROWS_Q = SF_SMEM_SIZE_Q // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_K = SF_SMEM_SIZE_K // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_V = SF_SMEM_SIZE_V // SF_TMA_ROW_BYTES
+    SF_NUM_ROWS_Q = sf_tma_rows(SF_SMEM_SIZE_Q)
+    SF_NUM_ROWS_K = sf_tma_rows(SF_SMEM_SIZE_K)
+    SF_NUM_ROWS_V = sf_tma_rows(SF_SMEM_SIZE_V)
 
     def _tma_swz(byte_w: int):
         return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
@@ -2688,72 +2688,32 @@ def _host(
     _q_sf_num_tiles = total_q_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else sq_sf_tiles
     _kv_sf_num_tiles = total_kv_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else skv_sf_tiles
 
-    def _build_sf_desc(sf_tensor, num_tiles, sf_smem_size, num_rows_box, num_heads):
-        sf_base = cutlass.Int64(sf_tensor.iterator.toint())
-        tile_stride_16 = sf_smem_size // 16
-        return tmap.create_tensor_map_tiled(
-            global_address=sf_base,
-            dtype=cutlass.Uint8,
-            global_dims=[
-                SF_TMA_ROW_BYTES,
-                sf_smem_size // SF_TMA_ROW_BYTES,
-                num_tiles,
-                num_heads,
-                _B_SF,
-            ],
-            global_strides=[
-                SF_TMA_ROW_BYTES // 16,
-                tile_stride_16,
-                cutlass.Int64(num_tiles) * tile_stride_16,
-                cutlass.Int64(num_heads) * cutlass.Int64(num_tiles) * tile_stride_16,
-            ],
-            box_dims=[SF_TMA_ROW_BYTES, num_rows_box, 1, 1, 1],
-            swizzle=tmap.TensorMapSwizzle.none,
-            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-        )
-
-    tma_q_sf_desc = _build_sf_desc(sf_q_tensor, _q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
-    tma_k_sf_desc = _build_sf_desc(sf_k_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K // CFG.CTA_MMA, KH)
-    # V's SF is the COLUMNWISE (transposed-operand) quantization, and its GMEM
-    # layout is NOT the per-tile-contiguous one Q/K use.  The F8_128x4 atom rule
-    # is applied to the transposed scale matrix [D, S/32], so the atom grid is
-    # (D/128) x (b*KH*S/128) laid out ROW-MAJOR -- the D-block index is the
-    # OUTER one, and the SF_NUM_BLOCKS_V D-planes are separated by a whole plane
-    # of `v_sf_groups` atoms, a stride that GROWS WITH S.  Q/K are rowwise:
-    # their atom grid is (b*QH*S/128) x (D/128), so THEIR D-blocks are per-tile
-    # contiguous and _build_sf_desc is right for them.
-    #
-    # At d=128 there is exactly ONE D-plane, so the two layouts coincide -- which
-    # is why the d128 MXFP8 sibling passes with the per-tile form, and why d256
-    # was correct at S=128 (one KV tile => one group) and wrong from S=256 on.
-    # Mirrors sm100/prefill_d256_mxfp8.py's dense/THD stride split.
-    _v_sf_groups = cutlass.Int64(_B_SF) * cutlass.Int64(KH) * _kv_sf_num_tiles
-    if cutlass.const_expr(CFG.THD_VARLEN):
-        # THD packs both D-planes of a (head, sequence tile) contiguously.
-        _v_plane_stride_16 = SF_BYTES_PER_BLOCK // 16
-        _v_tile_stride_16 = SF_SMEM_SIZE_V // 16
-    else:
-        _v_plane_stride_16 = (_v_sf_groups * SF_BYTES_PER_BLOCK) // 16
-        _v_tile_stride_16 = SF_BYTES_PER_BLOCK // 16
-    tma_v_sf_desc = tmap.create_tensor_map_tiled(
-        global_address=cutlass.Int64(sf_v_tensor.iterator.toint()),
-        dtype=cutlass.Uint8,
-        global_dims=[
-            SF_TMA_ROW_BYTES,
-            SF_BYTES_PER_BLOCK // SF_TMA_ROW_BYTES,
-            SF_NUM_BLOCKS_V,
-            _kv_sf_num_tiles,
-            KH * _B_SF,
-        ],
-        global_strides=[
-            SF_TMA_ROW_BYTES // 16,
-            _v_plane_stride_16,
-            _v_tile_stride_16,
-            cutlass.Int64(_kv_sf_num_tiles) * _v_tile_stride_16,
-        ],
-        box_dims=[SF_TMA_ROW_BYTES, SF_BYTES_PER_BLOCK // SF_TMA_ROW_BYTES, V_SF_PLANES_PER_PEER, 1, 1],
-        swizzle=tmap.TensorMapSwizzle.none,
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    # SF TMA descriptors (sdpa/kernels/_mxfp8_sf.py).  Q / K are ROWWISE: their
+    # atom grid is per-(b, h, s_tile) contiguous, one tile's slab per box.  V's SF
+    # is the COLUMNWISE (transposed-operand) quantization whose D-plane index is
+    # the OUTER atom index -- the SF_NUM_BLOCKS_V planes of one tile sit a whole
+    # plane of `b * KH * tiles` atoms apart, a stride that GROWS WITH S (dense);
+    # THD packs both planes of a (head, sequence tile) contiguously.  At d=128 the
+    # two layouts coincide (the d128 sibling reads V through the rowwise form);
+    # d256 was correct at S=128 (one KV tile => one group) and wrong from S=256 on
+    # until it took the columnwise form.  Mirrors sm100/prefill_d256_mxfp8.py's
+    # dense/THD stride split.  The box walks V_SF_PLANES_PER_PEER planes per load.
+    tma_q_sf_desc = build_rowwise_sf_desc(
+        sf_q_tensor, num_tiles=_q_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_Q, num_rows_box=SF_NUM_ROWS_Q, num_heads=QH, num_batches=_B_SF
+    )
+    tma_k_sf_desc = build_rowwise_sf_desc(
+        sf_k_tensor, num_tiles=_kv_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_K, num_rows_box=SF_NUM_ROWS_K // CFG.CTA_MMA, num_heads=KH, num_batches=_B_SF
+    )
+    tma_v_sf_desc = build_columnwise_sf_desc(
+        sf_v_tensor,
+        num_tiles=_kv_sf_num_tiles,
+        num_heads=KH,
+        num_batches=_B_SF,
+        num_planes=SF_NUM_BLOCKS_V,
+        planes_per_box=V_SF_PLANES_PER_PEER,
+        sf_bytes_per_block=SF_BYTES_PER_BLOCK,
+        sf_smem_size=SF_SMEM_SIZE_V,
+        thd_varlen=bool(CFG.THD_VARLEN),
     )
 
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
