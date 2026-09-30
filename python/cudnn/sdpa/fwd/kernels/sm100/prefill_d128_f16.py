@@ -751,11 +751,22 @@ def _paged_load_tile(
     """
     bt = cutlass.make_array_view(block_table_tensor)
     last_live = cute.math.max(n_pages_b - cutlass.Int32(1), cutlass.Int32(0))
+    if cutlass.const_expr(n_boxes > 1):
+        # Read adjacent page-table entries with one coalesced warp load.
+        # Extra lanes repeat the last box; all table accesses retain the
+        # live-page clamp. Each original TMA receives its page via shfl.
+        lane_box = cute.math.min((cute.arch.thread_idx()[0] % cutlass.Int32(32)), cutlass.Int32(n_boxes - 1))
+        lane_row = kv_tile * cutlass.Int32(CFG.TILE_N) + row_off + lane_box * cutlass.Int32(box_rows)
+        lane_slot = lane_row // cutlass.Int32(PAGE_SIZE)
+        lane_page = cutlass.Int32(bt[batch_idx, cute.math.min(lane_slot, last_live)])
     for j in cutlass.range_constexpr(n_boxes):
         g = kv_tile * cutlass.Int32(CFG.TILE_N) + row_off + cutlass.Int32(j * box_rows)
         slot = g // cutlass.Int32(PAGE_SIZE)
         row_in_page = g % cutlass.Int32(PAGE_SIZE)
-        page_live = cutlass.Int32(bt[batch_idx, cute.math.min(slot, last_live)])
+        if cutlass.const_expr(n_boxes > 1):
+            page_live = cute.arch.shuffle_sync(lane_page, j)
+        else:
+            page_live = cutlass.Int32(bt[batch_idx, cute.math.min(slot, last_live)])
         in_range = slot < n_pages_b
         page = cutlass.Int32(arith.select(in_range.ir_value(), page_live.ir_value(), cutlass.Int32(-1).ir_value()))
         tma_load_tile(
