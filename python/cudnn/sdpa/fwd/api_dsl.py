@@ -1725,6 +1725,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"paged KV for per-tensor FP8 is wired on the d128 / d64 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
+                self._fp8 and not self._pertensor and self.flavor == (64, 64),
+                "paged KV for MXFP8 is not validated on the native d64 flavor (dense / unsplit / unpaged only; the row's paged_d_shapes leaves (64, 64) out)",
+            )
+            self._not_implemented_error_if(
                 not self._fp8 and f"d{self.flavor[0]}" not in _SM100_PAGED_KV_FLAVORS,
                 f"paged KV is wired on the {sorted(_SM100_PAGED_KV_FLAVORS)} flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
@@ -1765,6 +1769,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
                 "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 d128 (the other SM107 siblings carry no SplitHelpers)",
             )
+            # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
+            # (split_d_shapes leaves (64, 64) out); mirror it here.
+            self._not_implemented_error_if(
+                self._fp8 and not self._pertensor and self.flavor == (64, 64),
+                "split_kv > 1 for MXFP8 is not validated on the native d64 flavor (dense / unsplit / unpaged only)",
+            )
 
         swa_left = self.window_size_left
         self._value_error_if(
@@ -1791,8 +1801,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
         # Keep direct construction aligned with each quantized family's THD
-        # kernels; graph routing enforces the same per-family shape domain.
-        _thd_fp8_shapes = set(_SM100_FP8_KERNEL_FILES if self._pertensor else _SM100_MXFP8_KERNEL_FILES)
+        # kernels; graph routing enforces the same per-family shape domain.  The
+        # native d64 leg of both families is dense-only (the rows' thd_d_shapes
+        # leave (64, 64) out: the packed THD lowering is not validated at
+        # d_flavor=64), so it is excluded here as well.
+        _thd_fp8_shapes = set(_SM100_FP8_KERNEL_FILES if self._pertensor else _SM100_MXFP8_KERNEL_FILES) - {(64, 64)}
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
             f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
@@ -1978,10 +1991,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         padding, causal bottom-right, SWA, right band, sink, Stats natural or
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
         128-row tile -- S_q = 1 decode and MTP.  Everything else (THD, larger
-        S_q) stays on the prefill tile.  d128 keys the same tile off cga1; d64
-        cannot, because cga1 IS its prefill width.
+        S_q, an explicit cga2) stays on the prefill tile.  d128 keys the same
+        tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
         if self._fp8 or self.thd or self.flavor != (64, 64) or self._device_cc == (10, 7):
+            return False
+        if self.cga not in (None, 1):
+            # An explicit cga2 is the prefill pipeline (the f16 row admits both
+            # widths at d64): the decode tile is cga1-only (make_cfg_d64_decode),
+            # so a pinned or autotuned cga2 must not reach it through this flag.
             return False
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS

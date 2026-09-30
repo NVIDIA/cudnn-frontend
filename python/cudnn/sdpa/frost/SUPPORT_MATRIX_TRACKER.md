@@ -159,8 +159,8 @@ MMA as d=512.
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
 | Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |
-| **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈᵗ (d128 envelope) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |
-| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (d128 envelope) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | mxfp8 only | ❌ |
+| **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | mxfp8 only | ❌ |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ᵈ⁶⁴ **d64 decode tile.** The same `sm100/decode_d128_f16.py` tile at
@@ -171,7 +171,9 @@ tile per CTA, one softmax warpgroup, three KV stages — at the narrow extents,
 prefill width (a 512-row cga2 cluster wastes most of a narrow diagonal band), so
 the two legs cannot be told apart by the cga knob, and one template record must
 never name two kernels. `SdpaFwdDslSm100._d64_decode_tile` sets it, mirroring
-`_decode_q_tile` for the d256 tile.
+`_decode_q_tile` for the d256 tile, and only with the cga knob unset or 1: the
+tile is cga1-only (`make_cfg_d64_decode`), so an explicit `cga=2` selects the
+prefill pipeline instead.
 
 ᵈᵗ **d128 decode tile (`sm100/decode_d128_f16.py`, f16/bf16).** The (128, 128) flavor of
 `sdpa_fwd_prefill_sm100` has two tiles behind the `TILE_CGA_M` knob: `2` is the prefill
@@ -246,9 +248,9 @@ gate is the flavor the lowering SELECTS — the smallest covering envelope — n
 dims: d=64 is **native** (paged wired on the d64 flavor), d=192/192 and mixed dims such as (256, 128) or
 (64, 192) ride the d256 one, (192, 128) is **native** on d192×d128 and shapes below it
 such as (136, 72) ride its envelope; a d512-envelope selection ((512, 512), (512, 128),
-...) is declined on f16/bf16 until that kernel wires the specialization. On the FP8 row only the
-d128 selection is wired (`d_qk, d_v <= 128`; d=64 rides the d128 FP8 envelope — exact in
-FP8); a d192×d128 or d256 FP8 selection is declined. The K and V pools may
+...) is declined on f16/bf16 until that kernel wires the specialization. On the FP8 row the
+d128 and native d64 selections are wired (`d_qk, d_v <= 128`: d ≤ 64 selects the (64, 64) flavor, larger
+the d128 one — both exact in FP8); a d192×d128 or d256 FP8 selection is declined. The K and V pools may
 differ in row width (d192×d128: a 192-wide K pool and a 128-wide V pool behind
 separate block tables) and must share the in-page layout. The graph is cuDNN's own
 paged-cache contract: K/V are page pools `[num_pages, H_kv, page_size, D]` — HND
@@ -501,20 +503,24 @@ MXFP8 uses the packed per-sequence tile-padded scale-factor layout.
 ⁵ Every forward kernel trims dense padded Q natively; there is no `dense_seq_q_trim` capability any more -- a graph with per-batch Q lengths compiles the trim specialization on every row.
 ⁶ Served through the padded path with synthesized full-length KV lengths, or
 natively when the causal band covers the KV tail.
-⁷ **d=64 is NATIVE on SM100 for f16/bf16; quantized still rides the d128
-envelope.** `_SM100_FLAVORS` now leads with `(64, 64)`, so `_pick_flavor(64, 64)`
-returns `(64, 64)` and an f16/bf16 graph compiles `sm100/prefill_d128_f16.py` at
-`TILE_K = TILE_O = 64` (`TemplateParams.d_flavor`, `config_sm100.CfgD64`) — the
-contraction is no longer zero-padded 64 → 128, which was costing ~2× the MMA
-work on both BMM1 and BMM2. FP8 and MXFP8 keep the d128 kernel: their candidate
-pools are filtered to the flavors that have a quantized kernel, and `(64, 64)`
-has none, so `_pick_flavor(64, 64, candidates=...)` still returns `(128, 128)`
-for them. The native flavor carries the same graph contract as the envelope it
-replaced — paged KV, split-KV and the 128-row decode tile are all wired at d64
-(ᵖ, ᵈᵗ) rather than handed back to d128.
+⁷ **d=64 is NATIVE on SM100/SM103 for every forward dtype.** `_SM100_FLAVORS`
+leads with `(64, 64)`, so `_pick_flavor(64, 64)` returns `(64, 64)`: an f16/bf16
+graph compiles `sm100/prefill_d128_f16.py`, a per-tensor FP8 graph
+`sm100/prefill_d128_fp8.py` and an MXFP8 graph `sm100/prefill_d128_mxfp8.py`, each
+at `TILE_K = TILE_O = 64` (`TemplateParams.d_flavor`, `config_sm100.CfgD64`; the
+quantized kernel-file maps `_SM100_FP8_KERNEL_FILES` / `_SM100_MXFP8_KERNEL_FILES`
+list `(64, 64)`) — the contraction is no longer zero-padded 64 → 128, which was
+costing ~2× the MMA work on both BMM1 and BMM2. The f16/bf16 flavor carries the
+same graph contract as the envelope it replaced — paged KV, split-KV and the
+128-row decode tile are all wired at d64 (ᵖ, ᵈ⁶⁴) rather than handed back to
+d128. The per-tensor FP8 leg is cga1 with paged KV and split-KV; the MXFP8 leg is
+cga1 and dense / unsplit / unpaged (that row's `paged_d_shapes`, `split_d_shapes`
+and `thd_d_shapes` leave `(64, 64)` out, and `check_support` declines the same).
+Rubin (SM107) has no d64 sibling and keeps the d128 envelope (ⁱ).
 ⁸ MXFP8 sets `d_pad_multiple=0` (exact native shapes only — the scale-factor
-plumbing is not audited for envelope zero-padding), so a d=64 MXFP8 graph is
-declined at plan time rather than padded.
+plumbing is not audited for envelope zero-padding), so an MXFP8 graph off every
+native flavor's exact head dims — `(64, 64)` is one since ⁷ — is declined at plan
+time rather than padded.
 ᵇ **`sdpa_bwd_sm100` — the d512 (DSv4) backward, and the ONLY FROST backward on
 this arch: d ∈ (256, 512], multiples of 8, f16/bf16.** It is one engine over one
 head-dim band, not a per-flavor column, so it does not follow the FPROP columns
@@ -1238,10 +1244,10 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM120, SM107, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
 | THD forward | SM80 |
-| **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is now native (⁷): f16/bf16 prefill, decode (ᵈ⁶⁴), paged and split-KV all run the d64 geometry; fp8 / mxfp8 still ride the d128 envelope |
+| **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
-| d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
+| d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |

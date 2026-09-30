@@ -1358,12 +1358,16 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            # Both lines now carry all four native flavors: Rubin gained its
+            # Both lines carry the four d >= 128 native flavors: Rubin gained its
             # d192x128 FP8 sibling (sm107/prefill_d192_d128_fp8.py).
-            # (64, 64) is a NATIVE flavor, not an envelope: the d128 FP8 file at
-            # TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of zero-filling
-            # a 128-wide tile for gpt-oss-class head dims (api_dsl._SM100_FP8_KERNEL_FILES).
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            # (64, 64) is a NATIVE flavor of the SM100 line only, not an envelope:
+            # the d128 FP8 file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor)
+            # instead of zero-filling a 128-wide tile for gpt-oss-class head dims
+            # (api_dsl._SM100_FP8_KERNEL_FILES).  Rubin has no d64 sibling
+            # (api_dsl._SM107_FP8_KERNEL_FILES), so its row keeps d64 on the d128
+            # envelope -- listing the shape here would make _selected_d_shape name
+            # a flavor the split / PackGQA / scheduler domains below never build.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)} | (set() if rubin_row else {(64, 64)})),
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
