@@ -3356,7 +3356,6 @@ def build_descs_body(
 @cute.kernel
 def frost_gdn2_bprop_prologue(
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[cuda.tensor_map.TensorMap],
     base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
@@ -3388,7 +3387,6 @@ def frost_gdn2_bprop_prologue(
     dwo: cute.Tensor,
     dbo: cute.Tensor,
     state_checkpoints: cute.Tensor,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor | None,
@@ -3396,7 +3394,7 @@ def frost_gdn2_bprop_prologue(
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
     """Two-CTA prologue. Under ``run_order`` this kernel is the first
-    work-item-table consumer, so block 0 LPT-orders the table and zeroes both
+    work-item-table consumer, so block 0 synthesizes and LPT-orders the uncut table and zeroes both
     consumers' scheduler rings via :func:`order_body`; block 1 builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
     per array."""
@@ -3414,7 +3412,7 @@ def frost_gdn2_bprop_prologue(
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
             order_body(
-                order_gen,
+                True,
                 b_t,
                 ORDER_THREADS,
                 ORDER_ELEMENTS,
@@ -3422,7 +3420,7 @@ def frost_gdn2_bprop_prologue(
                 n_heads_out,
                 n_heads_out * n_batch,
                 cu_seqlens,
-                mStaging,
+                None,
                 mCount,
                 mWorkItems,
                 mScheduler,
@@ -3473,7 +3471,6 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -3489,14 +3486,13 @@ def prologue(
     dbo: cute.Tensor,
     state_checkpoints: cute.Tensor,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor,
     scheduler_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue. LPT-orders the work items (when this kernel is
+    """One-launch prologue. Synthesizes and LPT-orders the uncut work items (when this kernel is
     the table's first consumer) and builds the 14 per-batch TMA-descriptor
     arrays into ``tensormap_workspace``."""
     h_q = q.shape[1]
@@ -3553,7 +3549,6 @@ def prologue(
 
     frost_gdn2_bprop_prologue(
         run_order,
-        order_gen,
         b_t,
         base_q,
         base_k,
@@ -3585,7 +3580,6 @@ def prologue(
         dwo,
         dbo,
         state_checkpoints,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_all,

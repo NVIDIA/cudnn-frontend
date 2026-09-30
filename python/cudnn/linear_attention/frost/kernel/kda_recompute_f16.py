@@ -1878,7 +1878,6 @@ def build_descs_body(
 @cute.kernel
 def frost_kda_recompute_prologue(
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     gen_intervals: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
@@ -1891,7 +1890,6 @@ def frost_kda_recompute_prologue(
     v: cute.Tensor,
     gate: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor | None,
     mScheduler: cute.Tensor | None,
@@ -1900,7 +1898,7 @@ def frost_kda_recompute_prologue(
     seed_span_chunks: cutlass.Int32,
 ) -> None:
     """Two-CTA prologue. Block 0 owns the item phase: under ``run_order`` this
-    kernel is the first work-item-table consumer, so it LPT-orders the table
+    kernel is the first work-item-table consumer, so it synthesizes and LPT-orders the uncut table
     and zeroes both consumers' scheduler rings via :func:`order_body`; under
     ``gen_intervals`` it synthesizes one checkpoint-seeded work item per
     ``seed_span_chunks`` chunks (a whole number of checkpoint intervals) of
@@ -1934,7 +1932,7 @@ def frost_kda_recompute_prologue(
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
             order_body(
-                order_gen,
+                True,
                 b_t,
                 ORDER_THREADS,
                 ORDER_ELEMENTS,
@@ -1942,7 +1940,7 @@ def frost_kda_recompute_prologue(
                 n_heads_out,
                 n_heads_out * n_batch,
                 cu_seqlens,
-                mStaging,
+                None,
                 mCount,
                 mWorkItems,
                 mScheduler,
@@ -1973,14 +1971,12 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     gen_intervals: cutlass.Constexpr[bool],
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor | None,
     scheduler_all: cute.Tensor | None,
@@ -1989,7 +1985,7 @@ def prologue(
     seed_span_chunks: cutlass.Int32,
     stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue: LPT-order the work items (when ``run_order``) and
+    """One-launch prologue: synthesize and LPT-order the uncut work items (when ``run_order``) and
     build the per-batch K/V/Gate/checkpoint TMA-descriptor arrays into
     ``tensormap_workspace``."""
     h_k = k.shape[1]
@@ -2028,7 +2024,6 @@ def prologue(
         )
     frost_kda_recompute_prologue(
         run_order,
-        order_gen,
         gen_intervals,
         b_t,
         base_k,
@@ -2041,7 +2036,6 @@ def prologue(
         v,
         gate,
         state_checkpoints,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_all,
@@ -2563,7 +2557,6 @@ def get_compiled_cache(
     seed_identity: bool,
     v_is_zero: bool,
     run_order: bool,
-    order_gen: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2677,7 +2670,6 @@ def chunk_kda_recompute(
     work_count=None,
     scheduler_counter=None,
     scheduler_all=None,
-    work_item_scratch=None,
     order_in_prologue: bool = False,
     seed_identity: bool = False,
     v_is_zero: bool = False,
@@ -2775,7 +2767,6 @@ def chunk_kda_recompute(
     if scheduler_counter is None:
         raise ValueError("scheduler_counter is required")
     run_order = order_in_prologue
-    order_gen = order_in_prologue and work_item_scratch is None
     if run_order and scheduler_all is None:
         raise ValueError("order in the prologue requires scheduler_all (the prologue zeroes both consumers' scheduler rings)")
 
@@ -2818,7 +2809,6 @@ def chunk_kda_recompute(
         seed_identity,
         v_is_zero,
         run_order,
-        order_gen,
     )
 
     if "compiled" not in cache:
@@ -2903,10 +2893,6 @@ def chunk_kda_recompute(
         state_checkpoints_placeholder = None
         if state_checkpoints_for_descs is not None:
             state_checkpoints_placeholder = from_dlpack(state_checkpoints_for_descs, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        staging_placeholder = None
-        if run_order and not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2919,14 +2905,12 @@ def chunk_kda_recompute(
             io_dtype,
             CFG.B_T,
             run_order,
-            order_gen,
             gen_intervals,
             k_placeholder,
             v_placeholder,
             gate_placeholder,
             state_checkpoints_placeholder,
             cu_placeholder,
-            staging_placeholder,
             work_count_placeholder,
             work_items_placeholder,
             scheduler_placeholder,
@@ -2943,7 +2927,6 @@ def chunk_kda_recompute(
             gate,
             state_checkpoints_for_descs,
             cu_seqlens,
-            work_item_scratch if run_order else None,
             work_count,
             work_items,
             scheduler_all if (run_order or gen_intervals) else None,
@@ -2990,7 +2973,6 @@ def run_recompute(
     work_count,
     scheduler_counter,
     scheduler_all,
-    work_item_scratch,
     tensormap_workspace,
     checkpoint_every_n_tokens,
     stream,
@@ -3010,7 +2992,6 @@ def run_recompute(
             gate,
             output_state_checkpoints,
             cu_seqlens,
-            work_item_scratch,
             work_count,
             work_items,
             scheduler_all if cache["prologue_scheduler_all"] else None,

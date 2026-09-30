@@ -5,16 +5,16 @@
 
 import inspect
 import math
-from types import SimpleNamespace
 
 import cutlass as ct
 import cutlass.cute as cute
 
-from .common import gate_bwd, head_reduce, piece_chain, split_k
+from .common import gate_bwd, head_reduce, piece_chain
 from .kernel import kda_chain_backward_f16 as chain_bwd
 from .kernel import kda_chain_forward_f16 as chain_fwd
-from .kernel import kda_warmup_backward_f16 as warmup_bwd
-from .kernel import kda_warmup_forward_f16 as warmup_fwd
+from .kernel import kda_prefill_f16
+from .kernel import kda_uncut_backward_f16 as uncut_bwd
+from .kernel import kda_uncut_forward_f16 as uncut_fwd
 
 
 def contiguous_view(pointer, shape):
@@ -43,7 +43,7 @@ def make_launcher(plan, names):
     state = node.inputs.get("initial_state")
     state_tensor = state if state is not None else node.outputs.get("final_state")
     state_dtype = types[state_tensor.get_data_type().name] if state_tensor is not None else ct.Float32
-    chain, split = plan.chain, plan.split
+    chain = plan.chain
     checkpoint = plan.checkpoint_cadence if is_bwd else plan.checkpoint
     saved = plan.has_state_checkpoints
     coarse = is_bwd and plan.coarse_checkpoints
@@ -54,7 +54,7 @@ def make_launcher(plan, names):
         l2norm=plan.use_qk_l2norm,
         safe_gate=safe_gate,
         log_gate=log_gate,
-        gate_scale_log2=plan.gate_lower_bound * split_k.RCP_LN2,
+        gate_scale_log2=plan.gate_lower_bound * kda_prefill_f16.LOG2_E,
         beta_sigmoid=plan.use_beta_sigmoid,
         allow_neg_eigval=plan.allow_neg_eigval,
         max_active_clusters=plan.num_sm,
@@ -66,16 +66,14 @@ def make_launcher(plan, names):
         config.update(
             recompute=needs_recompute,
             recompute_orders=not coarse,
-            recompute_order_gen=not coarse and not split,
             coarse=coarse,
             bwd_orders=saved,
-            bwd_order_gen=not split,
             seed_span_chunks=span // plan.b_t,
             seed_every_n=checkpoint if coarse else 0,
         )
     else:
         config.update(
-            order_gen=not split,
+            num_sms=plan.num_sm,
             tiles_per_head=plan.tiles_per_head,
             prep=plan.prep,
         )
@@ -116,7 +114,7 @@ def make_launcher(plan, names):
         host = chain_bwd.chain_backward_host if is_bwd else chain_fwd.chain_forward_host
     else:
         if is_bwd:
-            config["recompute_cfg"], config["bprop_cfg"] = warmup_bwd.build_configs(
+            config["recompute_cfg"], config["bprop_cfg"] = uncut_bwd.build_configs(
                 io_dtype,
                 ct.Float32 if coarse else state_dtype,
                 gate_dtype,
@@ -129,7 +127,7 @@ def make_launcher(plan, names):
                 **flags,
             )
         else:
-            config["prefill_cfg"], config["prep_cfg"] = warmup_fwd.build_configs(
+            config["prefill_cfg"], config["prep_cfg"] = uncut_fwd.build_configs(
                 io_dtype,
                 state_dtype,
                 gate_dtype,
@@ -140,23 +138,7 @@ def make_launcher(plan, names):
                 prep=plan.prep,
                 **flags,
             )
-        facts = split_k.split_table_facts(
-            SimpleNamespace(shape=tuple(g.dim), dtype={ct.Float16: "float16", ct.BFloat16: "bfloat16", ct.Float32: "float32"}[gate_dtype]),
-            SimpleNamespace(shape=tuple(node.inputs["cu_seqlens"].dim)),
-            split=split,
-            n_tiles=plan.n_tiles,
-            ideal_chunks=plan.ideal,
-            num_sms=plan.num_sm,
-            b_t=plan.b_t,
-            log2_threshold=None,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            gate_lower_bound=plan.gate_lower_bound if safe_gate else None,
-            expand_num=1,
-        )
-        config.update(facts._asdict())
-        config["log2_thresh"] = facts.log2_threshold
-        host = warmup_bwd.warmup_backward_host if is_bwd else warmup_fwd.warmup_forward_host
+        host = uncut_bwd.uncut_backward_host if is_bwd else uncut_fwd.uncut_forward_host
     parameters = inspect.signature(host).parameters
     scalar_types = {name: p.annotation for name, p in parameters.items() if p.annotation in (ct.Int32, ct.Float32)}
     regions = plan.workspace_regions
@@ -239,26 +221,13 @@ def make_launcher(plan, names):
                     final_indices=None,
                 )
         else:
-            staging = w.get("item_scratch")
-            args.update(
-                gate_table=g if split else None,
-                a_log_table=a,
-                dt_bias_table=dt,
-                cu_seqlens_table=cu,
-                work_items_table=w["work_items"],
-                work_count=w["work_count"],
-                work_count_table=w["work_count"],
-                item_scratch=staging,
-                chunk_scratch=w.get("chunk_scratch"),
-            )
+            args.update(work_count=w["work_count"])
             if is_bwd:
                 args.update(
                     state_in=state0 if needs_recompute and not coarse else None,
                     dstate_in=ports.get("d_final_state"),
                     series_items=(w["work_items_recompute"] if coarse else w["work_items"]) if needs_recompute else None,
                     series_count=(w["work_count_recompute"] if coarse else w["work_count"]) if needs_recompute else None,
-                    staging_recompute=staging if needs_recompute and not coarse else None,
-                    staging_bprop=staging if saved else None,
                     scheduler_all=w["scheduler_all"],
                     scheduler_all_recompute=w["scheduler_all"] if needs_recompute else None,
                     scheduler_all_bprop=w["scheduler_all"] if saved else None,
@@ -274,7 +243,6 @@ def make_launcher(plan, names):
                     state_out=ports.get("final_state"),
                     seed_indices=None,
                     final_indices=None,
-                    staging=staging,
                     scheduler=w["scheduler"],
                     workspace=w["tensormaps"],
                     prep_k_decay=w.get("prep_k_decay"),
