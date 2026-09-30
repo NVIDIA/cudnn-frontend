@@ -1183,7 +1183,8 @@ class WorkspaceCarver:
             # reshape(-1) would copy a strided view: a hidden allocation carved into instead of the caller's buffer.
             raise ValueError(f"cudnn: {owner} workspace must be contiguous; got shape {tuple(workspace.shape)} strides {tuple(workspace.stride())}")
         flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.view(-1)
+        if flat.dim() != 1:
+            flat = flat.view(-1)
         if flat.numel() < required:
             raise ValueError(
                 f"cudnn: {owner} requires a {required}-byte workspace; the provided "
@@ -1202,8 +1203,9 @@ class WorkspaceCarver:
         if end > self._flat.numel():
             raise ValueError(f"cudnn: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
         self._off = start + ws_align(nbytes)
+        chunk = self._flat if start == 0 and end == self._flat.numel() else self._flat[start:end]
         try:
-            return self._flat[start:end].view(dtype)
+            return chunk.view(dtype)
         except RuntimeError as exc:
             raise ValueError(f"cudnn: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
 
