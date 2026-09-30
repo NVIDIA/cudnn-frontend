@@ -17,7 +17,7 @@ import torch
 import cudnn  # noqa: F401 -- import-order requirement, see test/python/conftest.py
 from cudnn.linear_attention import kimi_delta_attention
 
-from .test_kda_sm90_cuda import fwd_graph, make_case, requires_hopper, workspace_for
+from linear_attention.hopper.test_kda_sm90_cuda import fwd_graph, make_case, requires_hopper, workspace_for
 
 pytestmark = [
     pytest.mark.L0,
