@@ -194,6 +194,26 @@ class SdpaDenseBinder {
         auto result = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::error_already_set();
     }
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict &auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    const std::vector<int64_t> &indices,
+                    py::object stream) {
+        auto read = read_ordered_binding(
+            schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+        // Supplied workspace is observed even when this bounded plan needs no
+        // scratch. Python completes unsupported producer protocols before the
+        // same binder runs; malformed buffers never trigger another executor.
+        if (!read[1].cast<py::list>().empty() || read[2].is_none()) return read;
+        execute(read[0], indices, std::move(stream));
+        return py::none();
+    }
 
    private:
     void
@@ -221,12 +241,13 @@ class SdpaDenseBinder {
             return cached;
         std::vector<int64_t> shape(f.shape.begin(), f.shape.end()), strides(f.stride.begin(), f.stride.end());
         if (strides.empty()) {
-            strides.resize(shape.size());
+            strides.reserve(shape.size());
             int64_t value = 1;
             for (size_t i = shape.size(); i-- > 0;) {
-                strides[i] = value;
-                value      = multiply(value, shape[i]);
+                strides.push_back(value);
+                value = multiply(value, shape[i]);
             }
+            std::reverse(strides.begin(), strides.end());
         }
         if (strides.size() != shape.size()) invalid("operand shape and stride must have the same rank");
         if (cached.valid && cached.shape == shape && cached.strides == strides && cached.batch == b &&
@@ -326,7 +347,19 @@ init_sdpa_dense_binding(py::module_ &m) {
     py::class_<SdpaDenseBinder>(m, "_SdpaDenseBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
-        .def("execute", &SdpaDenseBinder::execute, py::arg("pack"), py::arg("indices"), py::arg("stream"));
+        .def("execute", &SdpaDenseBinder::execute, py::arg("pack"), py::arg("indices"), py::arg("stream"))
+        .def("execute_ordered",
+             &SdpaDenseBinder::execute_ordered,
+             py::arg("schema"),
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace"),
+             py::arg("override_uids"),
+             py::arg("override_shapes"),
+             py::arg("override_strides"),
+             py::arg("indices"),
+             py::arg("stream"));
 }
 }  // namespace python_bindings
 }  // namespace cudnn_frontend

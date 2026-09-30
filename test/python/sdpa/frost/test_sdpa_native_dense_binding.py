@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Host-only native/Python dense binding differential contracts; no kernel launch."""
+"""Native/Python binding contracts and bounded SM100 graph execution checks."""
 
 import ast
 from pathlib import Path
@@ -190,14 +190,15 @@ def test_native_dense_graph_hot_path_does_not_materialize_python_facts(monkeypat
     launch = prep.PreparedDenseLaunch.__new__(prep.PreparedDenseLaunch)
     launch.spec = s
     launch._roles = prep._NATIVE_DENSE_ROLES
-    launch._indices = tuple(range(len(launch._roles)))
+    launch._uids = tuple(range(len(launch._roles)))
+    launch._indices = None
     launch._native_indices = None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph path rebuilt Python facts"))
     monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph path used Python binder"))
-    launch.execute(SimpleNamespace(native=_pack(facts)), 0, 17, 17)
+    launch.execute(SimpleNamespace(native=_pack(facts), index_of=launch._uids.index), 0, 17, 17)
     changed = dict(facts, q=facts["q"]._replace(span=1))
     with pytest.raises(ValueError):
-        launch.execute(SimpleNamespace(native=_pack(changed)), 0, 23, 23)
+        launch.execute(SimpleNamespace(native=_pack(changed), index_of=launch._uids.index), 0, 23, 23)
     assert len(frames) == 1
 
 
@@ -272,7 +273,7 @@ def test_native_dense_shared_table_stride_host_contract():
 
 
 @pytest.mark.parametrize("paged", [False, True])
-def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch):
+def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch, request):
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
@@ -304,8 +305,13 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     tables.append(tables[0].flip(2).clone())
     inputs = [q, k, v, q_lens, kv_lens] + (tables if paged else [])
     handle = cudnn.create_handle()
+    request.addfinalizer(lambda: cudnn.destroy_handle(handle))
     graph = cudnn.pygraph(
-        handle=handle, io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT
+        handle=handle,
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=True,
     )
     desc = [graph.tensor_like(t).set_uid(i + 1) for i, t in enumerate(inputs)]
     kwargs = dict(paged_attention_k_table=desc[5], paged_attention_v_table=desc[6], paged_attention_max_seq_len_kv=sk) if paged else {}
@@ -324,14 +330,28 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"))
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     uids = tuple(range(1, len(inputs) + 1)) + (100, 101)
+    completions = []
+    finish = graph._finish_ordered
 
-    def call():
+    def complete(*args):
+        completions.append(1)
+        return finish(*args)
+
+    monkeypatch.setattr(graph, "_finish_ordered", complete)
+
+    def call(buffers=None, call_uids=None, call_workspace=None, **overrides):
         cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
-        graph.execute((*inputs, o, lse), workspace, handle=handle, tensor_uids=uids)
+        graph.execute(
+            (*inputs, o, lse) if buffers is None else buffers,
+            workspace if call_workspace is None else call_workspace,
+            handle=handle,
+            tensor_uids=uids if call_uids is None else call_uids,
+            **overrides,
+        )
 
-    def check():
+    def check(active_batch=b):
         torch.cuda.synchronize()
-        for i in range(b):
+        for i in range(active_batch):
             keys, vals = inputs[1][i].transpose(0, 1), inputs[2][i].transpose(0, 1)
             length = int(inputs[4][i].item())
             if paged:
@@ -353,6 +373,67 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     finally:
         torch.cuda.set_sync_debug_mode("default")
     check()
+    assert not completions, "native ordered tensors rebuilt a Python VariantPack"
+
+    class PythonBuffer:
+        # A supported producer without the native exchange protocol must finish
+        # the current observation before calling the same validated binder.
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.shape, self.dtype, self.device = tensor.shape, tensor.dtype, tensor.device
+
+        def data_ptr(self):
+            return self.tensor.data_ptr()
+
+        def stride(self):
+            return self.tensor.stride()
+
+        def element_size(self):
+            return self.tensor.element_size()
+
+    for wrap_workspace in (False, True):
+        poison()
+        if wrap_workspace:
+            call(call_workspace=PythonBuffer(workspace))
+        else:
+            call(buffers=(PythonBuffer(inputs[0]), *inputs[1:], o, lse))
+        check()
+    assert len(completions) == 2
+    completions.clear()
+
+    # Even this zero-scratch plan validates a workspace supplied by the caller.
+    # Both invalid calls otherwise have valid writable outputs, so poisoning
+    # detects an accidental launch without risking an invalid device address.
+    for invalid in ("duplicate_uid", "strided_workspace"):
+        poison()
+        with pytest.raises(ValueError):
+            if invalid == "duplicate_uid":
+                call(call_uids=(uids[1], *uids[1:]))
+            else:
+                call(call_workspace=torch.empty(8, device="cuda", dtype=torch.uint8)[::2])
+        torch.cuda.synchronize()
+        assert torch.all(o_storage == 123).item()
+        assert torch.isnan(lse).all().item()
+        call(buffers=tuple(reversed((*inputs, o, lse))), call_uids=tuple(reversed(uids)))
+        check()
+    completions.clear()
+
+    # The same artifact accepts a smaller batch through overrides and then
+    # returns to the declared batch. Pool capacities stay unchanged when paged.
+    smaller = tuple(t if paged and i in (1, 2) else t[:1] for i, t in enumerate((*inputs, o, lse)))
+    poison()
+    call(
+        buffers=smaller,
+        override_uids=uids,
+        override_shapes=tuple(tuple(t.shape) for t in smaller),
+        override_strides=tuple(tuple(t.stride()) for t in smaller),
+    )
+    check(active_batch=1)
+    assert torch.all(o_storage[1:] == 123).item()
+    call()
+    check()
+    assert not completions
+
     owners = (inputs, o_storage, lse, workspace)
     inputs = [t.clone() for t in inputs]
     o_storage = torch.empty_like(o_storage)
@@ -378,8 +459,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     poison()
     capture.replay()
     check()
+    assert not completions
     del capture, owners
-    cudnn.destroy_handle(handle)
 
 
 def test_native_dense_unknown_storage_contract_is_preserved():

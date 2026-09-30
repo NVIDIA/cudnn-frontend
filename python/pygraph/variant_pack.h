@@ -52,6 +52,19 @@ struct NativeExecutionBindings {
 NativeExecutionBindings
 read_native_execution_bindings(pybind11::handle pack);
 
+// The same observation/validation used by Python ordered normalization. A
+// nonempty unread list or a None workspace extent asks Python to finish this
+// exact result before launch; errors propagate instead of choosing a new path.
+pybind11::tuple
+read_ordered_binding(pybind11::handle schema,
+                     pybind11::handle buffers,
+                     pybind11::handle tensor_uids,
+                     const pybind11::dict &auto_bindings,
+                     pybind11::handle workspace,
+                     pybind11::handle override_uids,
+                     pybind11::handle override_shapes,
+                     pybind11::handle override_strides);
+
 void
 init_variant_pack(pybind11::module_ &);
 

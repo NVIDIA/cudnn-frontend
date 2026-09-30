@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import functools
 
+from . import _pybind_module
+
+_native_context = getattr(_pybind_module, "_try_ensure_current_context", None)
+
 
 @functools.lru_cache(maxsize=1)
 def _driver():
@@ -96,6 +100,13 @@ def _runtime_device():
 
 
 def ensure_current_context(stream=None, device=None) -> None:
+    """Bind the calling thread to the work's context in one native crossing."""
+    if _native_context is not None and _native_context(None if stream is None else int(stream), None if device is None else int(device)):
+        return
+    _ensure_current_context_python(stream, device)
+
+
+def _ensure_current_context_python(stream=None, device=None) -> None:
     """Bind the context this work runs in to the calling thread.
 
     A driver-API launch reads the calling thread's context stack; an autograd

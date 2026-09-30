@@ -1662,17 +1662,21 @@ class PreparedDenseLaunch:
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        if getattr(self.spec, "native", None) is not None:
+            roles = dict(zip(self._roles, self._indices))
+            self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_DENSE_ROLES)
+        return self._indices
+
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
         if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+            indices = self._prepare_indices(pack.index_of)
         if getattr(self.spec, "native", None) is not None:
-            if self._native_indices is None:
-                roles = dict(zip(self._roles, indices))
-                self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_DENSE_ROLES)
             self.spec.native.execute(pack.native, self._native_indices, stream)
             return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
