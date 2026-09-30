@@ -36,6 +36,7 @@ COVERED_DIRS = frozenset(
         ("causal_conv1d", "cutedsl"),
         ("core", "cutedsl"),
         ("core", "jax"),
+        ("deepseek_sparse_attention", "cutedsl"),
         ("engram", "cutedsl"),
         ("gemm", "cutedsl"),
         ("gemm", "jax"),
