@@ -665,6 +665,7 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale: Float32,
         stream: cuda.CUstream,
     ):
+        """Prepare TMA descriptors and launch the SM90 DSA backward kernel."""
         self._check_type(*(t.element_type for t in (mQ, mKV, mdO, mLSE, mdPsum, mdQ, mdKV)))
 
         # Assume all strides are divisible by 128 bits except the last stride.
