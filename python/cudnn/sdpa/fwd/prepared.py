@@ -574,10 +574,10 @@ def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_uni
     if (
         (km.CFG.TILE_K, km.CFG.TILE_O, bool(km.CFG.PAGED_KV)) != (base.d_qk, base.d_v, base.paged)
         or not km.CFG.THD_VARLEN
-        or km.CFG.PACK_GQA
+        or (km.CFG.PACK_GQA and not paged_d128)
         or (base.paged and km.CFG.PAGE_SIZE != base.page_size)
     ):
-        raise ValueError("prepared packed split module must match the graph head dimensions, paging and unpacked THD contract")
+        raise ValueError("prepared packed split module must match the graph head dimensions, paging and supported THD packing contract")
     if capacity <= 0 or capacity > _I32_MAX or resident_units <= 0 or resident_units > _I32_MAX or km.CFG.SPLIT_KV <= 1:
         raise ValueError("packed split requires positive Int32 capacity and split_kv > 1")
     dtype = "bfloat16" if km.CFG.DTYPE_QKV == 2 else "float16"

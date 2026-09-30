@@ -737,7 +737,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if knobs.split_kv not in (None, 1) or knobs.pack_gqa not in (None, False):
                 return "runtime CGA policy requires unsplit, unpacked execution"
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        paged_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and not knobs.pack_gqa and paged_thd_split_domain(capabilities, facts)
+        paged_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and paged_thd_split_domain(capabilities, facts)
         if paged_split and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False):
             return "paged packed split requires the matching native cuDNN Frontend extension"
         if (
@@ -748,7 +748,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and _selected_d_shape(capabilities, facts) == (128, 128)
         ):
             return (
-                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
+                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or exact D128 with split_kv > 1; "
                 "other THD (ragged) graphs run the cga2 prefill tile"
             )
         if ragged_decode and (knobs.split_kv is None or knobs.split_kv < 2):

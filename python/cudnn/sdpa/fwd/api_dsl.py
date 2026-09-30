@@ -496,10 +496,8 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_single_q"
-    elif (
-        flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1 and not params.pack_gqa))
-    ):
-        # The single-CTA tile also owns unpacked paged THD split members.
+    elif flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1)):
+        # The single-CTA tile also owns paged THD split members.
         # Public admission remains with the engine and its workspace policy.
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_decode"
@@ -1505,7 +1503,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.paged_thd_split = bool(
             self.cga == 1
             and self.split_kv > 1
-            and not self.pack_gqa
             and supports_paged_thd_split(
                 (int(d_qk), int(d_v)),
                 device_cc=self._device_cc,
@@ -1606,6 +1603,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
+                and not self.paged_thd_split
                 and not (
                     self._device_cc != (10, 7)
                     and not self._fp8
@@ -1613,7 +1611,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.cga in (None, 2)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA prefill requires a pre-Rubin SM100 half d128 cga2 unsplit plan",
+                "THD PackGQA prefill requires a pre-Rubin SM100 half d128 cga2 unsplit or cga1 paged split plan",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every

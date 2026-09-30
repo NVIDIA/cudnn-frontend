@@ -193,7 +193,9 @@ packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head),
 / LPT / LPT_L2. **THD on the decode tile: ragged-Q-over-paged-KV at one query, or native D128 packed split** (ʳᵠ:
 ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
 at one token per sequence, nvbug 6607857; D128 paged packed split also admits
-`TILE_CGA_M=1` with `PACK_GQA=0` and `SPLIT_KV>1`; other ragged graphs keep
+`TILE_CGA_M=1` with `PACK_GQA=0/1` and `SPLIT_KV>1`; packing counts token tiles
+while partial O/Stats retain unpacked query heads. Default split/packing selection
+is unchanged; other ragged graphs keep
 `TILE_CGA_M=2` and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256

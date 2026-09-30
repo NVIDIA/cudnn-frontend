@@ -2019,7 +2019,7 @@ def _launch(
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CGA_TILE_M),
+            cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
@@ -2296,10 +2296,9 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
         CFG.THD_VARLEN
         and SPLIT_KV > 1
         and CFG.TILE_O == 128
-        and not CFG.PACK_GQA
-        and ((CFG.TILE_K == 192 and not PAGED_KV) or (CFG.TILE_K == 128 and PAGED_KV))
+        and ((CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA) or (CFG.TILE_K == 128 and PAGED_KV))
     ):
-        raise ValueError("packed split requires nonpaged D192 or unpacked paged D128 THD")
+        raise ValueError("packed split requires unpacked nonpaged D192 or paged D128 THD")
     if lse_kind not in ("head", "token"):
         raise ValueError("prepared packed split Stats must be head- or token-major")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
