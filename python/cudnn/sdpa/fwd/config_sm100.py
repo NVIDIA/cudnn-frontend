@@ -314,7 +314,13 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.split_kv > 1:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
-        if k.thd_varlen and not (flavor == "d128" and k.single_q_head_dim == 192 and k.cta_mma == 1 and not fp8 and not k.paged_kv):
+        if k.thd_varlen and not (
+            flavor == "d128"
+            and k.cta_mma == 1
+            and not fp8
+            and not k.pack_gqa
+            and ((k.single_q_head_dim == 192 and not k.paged_kv) or (k.single_q_head_dim == 128 and k.paged_kv))
+        ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
             # The sink logit is folded into the softmax denominator in the
@@ -1716,7 +1722,10 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (not cfg.THD_VARLEN or (cfg.TILE_K == 192 and not cfg.PAGED_KV), "single-Q THD: nonpaged D192 only"),
+        (
+            not cfg.THD_VARLEN or ((cfg.TILE_K == 192 and not cfg.PAGED_KV) or (cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1 and not cfg.PACK_GQA)),
+            "single-Q THD: nonpaged D192 or unpacked paged D128 split only",
+        ),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
             "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
@@ -1737,8 +1746,9 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
     cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
     S_q(max) == 1), and the adapter routes exactly those combinations here;
-    D192 THD uses the same pipeline with two KV stages and unsplit nonpaged
-    inputs. Anything else raising below is a gap in those gates.
+    D192 THD uses the same pipeline with two KV stages. Unpacked paged
+    D128 THD uses its split entry and caller-owned packed partials. Anything
+    else raising below is a gap in those gates.
     """
     _validate_params("d128", params)
     if params.cta_mma != 1:
@@ -1748,8 +1758,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     d_qk = params.single_q_head_dim
     if d_qk not in (128, 192):
         raise ValueError("single-Q tile: QK width must be 128 or 192")
-    if params.thd_varlen and (d_qk != 192 or params.paged_kv):
-        raise ValueError("single-Q THD: nonpaged D192 only")
+    if params.thd_varlen and not ((d_qk == 192 and not params.paged_kv) or (d_qk == 128 and params.paged_kv and params.split_kv > 1 and not params.pack_gqa)):
+        raise ValueError("single-Q THD: nonpaged D192 or unpacked paged D128 split only")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)

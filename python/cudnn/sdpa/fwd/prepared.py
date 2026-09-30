@@ -553,8 +553,18 @@ def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_uni
 
     if not getattr(_pybind_module._SdpaThdBinder, "supports_packed_split", False):
         raise NotImplementedError("packed split requires the matching native cuDNN Frontend extension")
-    if (base.d_qk, base.d_v) != (192, 128) or base.paged or base.has_sink or base.lse_padded or base.quant is not None:
-        raise ValueError("prepared packed split requires nonpaged half D192/V128 with packed Stats")
+    paged_d128 = base.paged and (base.d_qk, base.d_v) == (128, 128)
+    if paged_d128 and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_packed_split", False):
+        raise NotImplementedError("paged packed split requires the matching native cuDNN Frontend extension")
+    if not (paged_d128 or (not base.paged and (base.d_qk, base.d_v) == (192, 128))) or base.has_sink or base.lse_padded or base.quant is not None:
+        raise ValueError("prepared packed split requires paged D128 or nonpaged D192/V128 half inputs with packed Stats")
+    if (
+        (km.CFG.TILE_K, km.CFG.TILE_O, bool(km.CFG.PAGED_KV)) != (base.d_qk, base.d_v, base.paged)
+        or not km.CFG.THD_VARLEN
+        or km.CFG.PACK_GQA
+        or (base.paged and km.CFG.PAGE_SIZE != base.page_size)
+    ):
+        raise ValueError("prepared packed split module must match the graph head dimensions, paging and unpacked THD contract")
     if capacity <= 0 or capacity > _I32_MAX or resident_units <= 0 or resident_units > _I32_MAX or km.CFG.SPLIT_KV <= 1:
         raise ValueError("packed split requires positive Int32 capacity and split_kv > 1")
     dtype = "bfloat16" if km.CFG.DTYPE_QKV == 2 else "float16"
@@ -563,7 +573,7 @@ def build_thd_split_spec(base: ThdLaunchSpec, km, *, capacity: int, resident_uni
     if getattr(base, "split_workspace", None) is not None:
         raise ValueError("prepare a split member from the unsplit graph contract")
     s = copy(base)
-    compiled = km.compile_thd_split(has_lse=s.has_lse, lse_kind="head" if s.lse_head_major else "token")
+    compiled = km.compile_thd_split(has_lse=s.has_lse, lse_kind="head" if s.lse_head_major else "token", paged_hnd=s.paged_hnd)
     s.fn, s.owner, s.order = _artifact_positional_order(compiled, km._host_thd_split, km.__name__)
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [base.template[base.index[name]] if name in base.index else None for name in s.order]

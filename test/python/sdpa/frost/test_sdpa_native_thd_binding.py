@@ -932,3 +932,52 @@ def test_native_nonpaged_host_does_not_require_paged_slots():
     s.index = {n: i for i, n in enumerate(s.order)}
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("splits", [4, 16])
+def test_native_paged_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+    """The split composes with paging without caching pointers or weakening spans."""
+    s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
+    s.cga_tile_m = 128
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    s.template[s.index["n_thd_units"]] = 148
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    original = tuple(s.template)
+    first = _equal(s, facts, workspace=0x4000000, stream=17)
+    changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
+    second = _equal(s, changed, workspace=0x8000000, stream=29)
+    assert first[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+    assert second[s.index["lse_partial_ptr"]] == 0x8000000 + off_lse
+    assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
+    assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    assert tuple(s.template) == original
+    s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
+    assert frames[-1] == tuple(second)
+    for role in ("k", "v", "block_table", "block_table_v"):
+        invalid = dict(changed, **{role: changed[role]._replace(span=1)})
+        for bind in (_native, _reference):
+            with pytest.raises(ValueError):
+                bind(s, invalid)
+    saved = tuple(first)
+    for bind in (_native, _reference):
+        with pytest.raises(ValueError, match="non-null workspace"):
+            bind(s, facts, workspace=0)
+    assert tuple(first) == saved
+
+
+def test_native_paged_packed_split_rejects_other_head_geometry():
+    s, _, _ = _paged_fixture()
+    s.cga_tile_m, s.d_qk = 128, 192
+    s.split_workspace = prep.ThdSplitWorkspace(4, 16, 8192, 8192 + 4 * 16 * s.qh * 128 * 4)
+    s.scratch_bytes = s.split_workspace.off_lse + 4 * 16 * s.qh * 4
+    with pytest.raises(ValueError, match="packed split geometry"):
+        cudnn._pybind_module._SdpaThdBinder(s)

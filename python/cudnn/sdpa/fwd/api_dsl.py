@@ -495,10 +495,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_single_q"
-    elif flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen:
-        # TILE_CGA_M=1 on the d128 f16/bf16 flavor IS the decode tile (see
-        # config_sm100.CfgD128Decode).  Dense only: THD at cga1 is declined
-        # upstream (engines.mismatch / check_support), never routed here.
+    elif (
+        flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1 and not params.pack_gqa))
+    ):
+        # The single-CTA tile also owns unpacked paged THD split members.
+        # Public admission remains with the engine and its workspace policy.
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_decode"
     elif getattr(params, "decode_q_tile", 0):

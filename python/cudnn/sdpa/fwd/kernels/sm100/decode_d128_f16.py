@@ -63,7 +63,8 @@ three packed heads read one KV head), KV split with fp32 partials for
 and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  The
 D192/128 THD leg uses device-built metadata, per-sequence O descriptors,
 packed Stats and the live-unit scheduler. Its wider Q/K use two KV stages
-to fit shared memory. D128 retains the existing decode contract. Ragged Q/O/Stats over
+to fit shared memory. Unpacked D128 THD over paged K/V also uses the packed
+split entry, with the same device metadata and combine. Ragged Q/O/Stats over
 PAGED K/V at ``S_q(max) == 1`` -- FlashInfer's prefill-style graph at one token
 per sequence -- rides ``CFG.RAGGED_Q`` instead: the dense grid stays (one unit
 per (packed head, batch, split)), the TMA-LDG warp reads this batch's Q ragged
@@ -2218,6 +2219,11 @@ def _host_thd_split(
     lse_partial_ptr: cute.Pointer,
     partial_o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_kind: cutlass.Constexpr[str],
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    n_pages: cutlass.Int32,
+    paged_hnd: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """One prepared host owns setup, split attention and final packed combine.
@@ -2252,16 +2258,16 @@ def _host_thd_split(
         thd_kv_lens_ptr,
         thd_lens_form,
         o_partial_ptr,
-        None,
-        None,
-        (cutlass.Int64(0), cutlass.Int64(0)),
-        cutlass.Int32(0),
+        block_table_ptr,
+        block_table_v_ptr,
+        table_strides,
+        n_pages,
         cutlass.Int64(0),
         cutlass.Int32(1),
-        192,
-        128,
+        CFG.TILE_K,
+        CFG.TILE_O,
         "dense",
-        False,
+        paged_hnd,
         False,
         stream,
     )
@@ -2284,10 +2290,16 @@ def _host_thd_split(
 
 
 @lru_cache(maxsize=None)
-def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head") -> Callable:
+def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_K == 192 and CFG.TILE_O == 128 and not PAGED_KV):
-        raise ValueError("prepared packed split requires nonpaged D192/V128 THD with split_kv > 1")
+    if not (
+        CFG.THD_VARLEN
+        and SPLIT_KV > 1
+        and CFG.TILE_O == 128
+        and not CFG.PACK_GQA
+        and ((CFG.TILE_K == 192 and not PAGED_KV) or (CFG.TILE_K == 128 and PAGED_KV))
+    ):
+        raise ValueError("packed split requires nonpaged D192 or unpacked paged D128 THD")
     if lse_kind not in ("head", "token"):
         raise ValueError("prepared packed split Stats must be head- or token-major")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
@@ -2321,6 +2333,11 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head") -> Callab
         P(cutlass.Float32, 4),
         strides,
         lse_kind,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        (cutlass.Int64(0), cutlass.Int64(0)),
+        i32,
+        paged_hnd,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

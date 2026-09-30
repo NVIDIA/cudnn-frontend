@@ -1995,7 +1995,10 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-@pytest.mark.parametrize("geometry,stats_layout", [("d256", "NH"), ("d128_packed", "NH"), ("d128_packed", "HN"), ("d128_short", "NH"), ("d128_long", "NH")])
+@pytest.mark.parametrize(
+    "geometry,stats_layout",
+    [("d256", "NH"), ("d128_packed", "NH"), ("d128_packed", "HN"), ("d128_short", "NH"), ("d128_long", "NH"), ("d128_split", "NH"), ("d128_split", "HN")],
+)
 def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, geometry, stats_layout):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
     import inspect
@@ -2005,6 +2008,8 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("Live-length scheduler is initially admitted only on SM100")
     b, h, hk, d, qcap, kcap = (3, 8, 1, 256, 1025, 2304) if geometry == "d256" else (1, 32, 8, 128, 2049, 2560)
+    if geometry == "d128_split":
+        b, h, hk, d, qcap, kcap = 3, 8, 2, 128, 1025, 2304
     if geometry == "d128_short":
         qcap = 1025
     elif geometry == "d128_long":
@@ -2073,17 +2078,33 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
             chosen.update({cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
-        if geometry != "d256":
+        if geometry not in ("d256", "d128_split"):
             spec = _plan(g)._prepared.spec
             resident = torch.cuda.get_device_properties(0).multi_processor_count // 2
             # Independent worklist oracle: every 128-token tile has eight packed heads.
             work = len({(row // 128, head // 4) for row in range(qcap) for head in range(h)})
             expanded = dtype == torch.bfloat16 and page == 16 and policy == 1 and resident < work <= 2 * resident
             assert spec.template[spec.index["n_thd_units"]] == (work if expanded else min(resident, ((qcap + 511) // 512) * h))
-        expected_pdl = geometry != "d256" and dtype == torch.bfloat16 and page == 16 and policy == 1
+        expected_pdl = geometry not in ("d256", "d128_split") and dtype == torch.bfloat16 and page == 16 and policy == 1
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
-        assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
-        ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+        workspace_bytes = g.get_workspace_size()
+        if geometry == "d128_split":
+            # Internal lowering before automatic policy admission; the graph still
+            # binds real paged D128 facts through the native prepared executor.
+            from dataclasses import replace
+            from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+            params = replace(api.template_params(), cta_mma=1, pack_gqa=False, split_kv=4)
+            module = _load_sm100_kernel_module((128, 128), params)
+            spec = prep_mod.build_thd_split_spec(
+                _plan(g)._prepared.spec, module, capacity=b * qcap, resident_units=torch.cuda.get_device_properties(0).multi_processor_count
+            )
+            _plan(g)._prepared.spec = spec
+            workspace_bytes = max(workspace_bytes, spec.scratch_bytes)
+            assert spec.native is not None and spec.split_workspace.splits == 4
+        else:
+            assert api._explicit_compile_kwargs().get("use_pdl", False) == expected_pdl
+        ws = torch.empty(max(workspace_bytes, 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
         g.execute(pack, ws, **kwargs)
         graph = torch.cuda.CUDAGraph(**({"keep_graph": True} if keep_graph else {}))
@@ -2107,7 +2128,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     try:
         lengths = (
             (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025]))
-            if geometry == "d256"
+            if geometry in ("d256", "d128_split")
             else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]))
         )
         for ql, kl in lengths:
