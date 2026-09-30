@@ -145,6 +145,8 @@ def flash_attn_bwd_sm90(
 
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     carver = WorkspaceCarver(workspace, flash_attn_bwd_sm90_workspace_size(total_S_q, total_S_kv, head_dim, num_head), _WORKSPACE_OWNER)
+    if workspace.device != q.device:
+        raise ValueError(f"{_WORKSPACE_OWNER} workspace must be on q's device {q.device}, got {workspace.device}")
     dpsum = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     lse_log2 = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     dkv_accum = carver.take(seqlen_k_rounded * head_dim_rounded, torch.float32).view(1, num_head_kv, seqlen_k_rounded * head_dim_rounded)

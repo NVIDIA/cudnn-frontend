@@ -1959,6 +1959,34 @@ def test_DSA_sparse_attention_backward_sm90_scales_ds_before_conversion(dtype, k
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=878)
+def test_DSA_sparse_attention_backward_sm90_rejects_a_workspace_on_another_device(monkeypatch):
+    """R2: a CPU (or other-device) caller workspace is rejected before its first consumer."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    device = torch.device("cuda")
+    head_dim, num_heads, s_q, s_kv, topk = 576, 32, 4, 256, 128
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(s_q, num_heads, head_dim, device=device).to(torch.bfloat16)
+    kv = torch.randn(s_kv, head_dim, device=device).to(torch.bfloat16)
+    attn_sink = torch.zeros((num_heads,), dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out)
+    nbytes = _interface_sm90.flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads)
+    monkeypatch.setattr(_interface_sm90, "memset_zero_async", lambda *args: pytest.fail("a CPU workspace reached its first consumer"))
+    with pytest.raises(ValueError, match="workspace must be on q's device"):
+        DSA.sparse_attention_backward_wrapper(
+            q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale=softmax_scale, workspace=torch.empty(nbytes, dtype=torch.uint8)
+        )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=436)
 @pytest.mark.parametrize("compact", [True, False], ids=["compact", "non-compact"])
 def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(compact):

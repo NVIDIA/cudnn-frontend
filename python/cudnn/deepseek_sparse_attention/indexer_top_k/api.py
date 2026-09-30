@@ -202,6 +202,8 @@ class IndexerTopK(APIBase):
 
         kernel_module = _kernel_module()
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "IndexerTopK")
+        if workspace.device != device:
+            raise ValueError(f"IndexerTopK workspace must be on input_values' device {device}, got {workspace.device}")
         buffer = carver.take(n_rows * buffer_numbers * num_cols, torch.int32).view(n_rows, buffer_numbers, num_cols)
         self._value_error_if(
             buffer.data_ptr() % kernel_module.BUFFER_ALIGN != 0,

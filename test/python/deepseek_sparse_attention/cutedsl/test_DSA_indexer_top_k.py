@@ -181,6 +181,8 @@ def test_DSA_indexer_top_k_execute_requires_outputs_and_workspace():
         op.execute(input_values, seq_lens, indices, values, workspace=torch.empty(required - 1, dtype=torch.uint8, device="cuda"))
     with pytest.raises(ValueError, match="32-byte aligned"):
         op.execute(input_values, seq_lens, indices, values, workspace=torch.empty(required + 16, dtype=torch.uint8, device="cuda")[16:])
+    with pytest.raises(ValueError, match="workspace must be on input_values' device"):
+        op.execute(input_values, seq_lens, indices, values, workspace=torch.empty(required, dtype=torch.uint8))
     op.execute(input_values, seq_lens, indices, values, workspace=workspace)
 
     # return_val=False: a provided-but-uncompiled out_values must raise, not be ignored.
