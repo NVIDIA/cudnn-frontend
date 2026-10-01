@@ -2058,6 +2058,27 @@ def test_record_and_operand_contracts_are_typed():
         res_e4.blk.check_support()
 
 
+@requires_cuda
+def test_a_quantized_record_handed_through_with_its_e4m3_h_is_a_typed_decline():
+    """The per-tensor FP8 / MXFP8 training forward keeps ``saved.h`` as the caller's e4m3 codes; this bf16 backward consumes
+    such a record given the DEQUANTIZED bf16 ``h`` (``dataclasses.replace(saved, h=...)``, the accept test
+    ``test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle``).  Handed the record as written, it raises
+    a ``ValueError`` naming the record and that contract -- not the generic dtype mismatch -- at declaration and at execute,
+    before any launch, on any CUDA device; the dequantized-h record passes the same check."""
+    from cudnn.gated_attention_block.api_bwd import _check_saved_record
+
+    res = _declare_bwd(dict(_COMMON), 1, 256)
+    blk, saved = res.blk, res.saved
+    as_written = dataclasses.replace(saved, h=saved.h.to(torch.float8_e4m3fn))
+    blk._samples["saved"] = as_written
+    with pytest.raises(ValueError, match="e4m3 codes") as ei:
+        blk.check_support()
+    assert "dataclasses.replace(saved, h=h_dequantized)" in str(ei.value) and "DEQUANTIZED torch.bfloat16 h" in str(ei.value)
+    with pytest.raises(ValueError, match="e4m3 codes"):
+        _check_saved_record(as_written, blk.geom, 1, 256, torch.bfloat16, saved.h.device, at="execute")
+    _check_saved_record(saved, blk.geom, 1, 256, torch.bfloat16, saved.h.device, at="execute")
+
+
 @pytest.mark.skipif(_cc() == _SM107, reason="the everywhere-reject twin runs on every part BUT Rubin")
 @requires_cuda
 def test_declines_every_arch_but_rubin():

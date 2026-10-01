@@ -161,7 +161,8 @@ normed Q/K out of place into two compact bf16 workspace slots (+17 KiB/token at 
 slab, and the quantize stages read those slots, so the slab keeps the pre-norm bands the backward differentiates; the launch
 count (9) and the bytes moved are unchanged, and `out`, `o`, `lse` and the GATE / V bands are bitwise the quantized inference
 forward's. `GatedAttentionBlockBwd` (bf16 / fp16) consumes such a record given the **dequantized** bf16 `h` and weights
-(`dataclasses.replace(saved, h=h_dequantized)`); the native fp8 / mxfp8 backward is a follow-up.
+(`dataclasses.replace(saved, h=h_dequantized)`; a record handed through with its e4m3 `h` is a typed `ValueError` naming that
+contract); the native fp8 / mxfp8 backward is a follow-up.
 
 ```python
 from cudnn.gated_attention_block import SavedForBackward, saved_slab_views
