@@ -292,6 +292,18 @@ a_is_m_major = bool(PARAMS.a_is_m_major)
 # so A's blocked-workspace row offset lands on K in the first case and on M in
 # the second, and B's token offset is cu_q in the first and cu_k in the second.
 _THD_MM = bool(getattr(PARAMS, "thd_varlen", False))
+# ... with ONE exception the operand major cannot express: which TOKEN axis the blocked
+# workspace's ROWS are (`MatmulTemplateParams.thd_rows_kv`, appended 2026-10-01; read through
+# getattr like `epi_mode`, so a record built before the field existed renders the q-major
+# workspace it always did).  The row-offset placement above holds in both layouts (the blocked
+# row axis is K for an m-major A and M for a k-major A); the TOKEN side does not: on a kv-major
+# workspace (rows = packed kv tokens, the sm107 d256 chain) the k-major dK GEMM reduces over q
+# tokens and the m-major dQ GEMM over kv tokens -- the opposite pairing.  `_THD_K_IS_KV` =
+# "is this GEMM's K axis the kv token axis": every token-side selection below keys on it.  At
+# the default (q-major rows) it equals `not a_is_m_major`, the pre-field spelling, so the SM100
+# THD renderings are unchanged.
+_THD_ROWS_KV = bool(getattr(PARAMS, "thd_rows_kv", False))
+_THD_K_IS_KV = a_is_m_major == _THD_ROWS_KV
 # This GEMM's OWN descriptor scratch: one clipped output descriptor per
 # sequence, then the packed-total-clamped B operand.  Built in `_host`, which is
 # the only place that knows these descriptors' box, swizzle and dim order -- for
@@ -641,8 +653,9 @@ def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
     row_off = cutlass.Int32(meta[row0 + tile_b])
     a_k_off = row_off if cutlass.const_expr(a_is_m_major) else cutlass.Int32(0)
     a_m_off = cutlass.Int32(0) if cutlass.const_expr(a_is_m_major) else row_off
-    b_k_off = q_tok if cutlass.const_expr(a_is_m_major) else k_tok
-    k_len = s_q if cutlass.const_expr(a_is_m_major) else s_kv
+    # The token side of the reduction: kv tokens (B at cu_k, s_kv) or q tokens (B at cu_q, s_q) -- see `_THD_K_IS_KV`.
+    b_k_off = k_tok if cutlass.const_expr(_THD_K_IS_KV) else q_tok
+    k_len = s_kv if cutlass.const_expr(_THD_K_IS_KV) else s_q
     nkt = (k_len + cutlass.Int32(cta_tile_mnk[2] - 1)) // cutlass.Int32(cta_tile_mnk[2])
     return a_k_off, a_m_off, b_k_off, nkt
 
@@ -1872,17 +1885,19 @@ def _bprop_matmul_bh_sm100_kernel(
         # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
         # makes when it bases each sequence's descriptor.
         _thd_meta = cutlass.make_array_view(meta_t) if cutlass.const_expr(_THD_MM) else None
+        # C rows are the M-axis tokens = the side the reduction does NOT run over (`_THD_K_IS_KV`: K over kv tokens ->
+        # C = q rows at cu_q; K over q tokens -> C = kv rows at cu_k).
         _thd_c_cu0 = (
-            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(a_is_m_major) else n_batch)
+            (n_batch if cutlass.const_expr(_THD_K_IS_KV) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
-        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over S_q
-        # for the m-major dV/dK GEMMs and over S_kv for the k-major dQ one,
-        # exactly opposite to which axis each writes.  Used only to detect a
-        # zero-length reduction; see `_thd_k_len` in the loop.
+        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over the
+        # token axis `_THD_K_IS_KV` names, exactly opposite to which axis each
+        # GEMM writes.  Used only to detect a zero-length reduction; see
+        # `_thd_k_len` in the loop.
         _thd_k_cu0 = (
-            (n_batch if cutlass.const_expr(a_is_m_major) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
+            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(_THD_K_IS_KV) else n_batch)
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
@@ -2158,9 +2173,10 @@ def _thd_patch_descs_kernel(
         meta = cutlass.make_array_view(meta_t)
         cu_q0 = n_batch
         cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
-        # dV/dK write kv rows and read q tokens; dQ is the mirror.
-        c_cu0 = cu_k0 if cutlass.const_expr(a_is_m_major) else cu_q0
-        b_cu0 = cu_q0 if cutlass.const_expr(a_is_m_major) else cu_k0
+        # C rows are the side the reduction does not run over, B's tokens the side it does (`_THD_K_IS_KV`): on the q-major
+        # workspace dV/dK write kv rows and read q tokens and dQ is the mirror; the kv-major workspace flips the pairing.
+        c_cu0 = cu_q0 if cutlass.const_expr(_THD_K_IS_KV) else cu_k0
+        b_cu0 = cu_k0 if cutlass.const_expr(_THD_K_IS_KV) else cu_q0
         emit_seq_descs(
             base_c_desc,
             desc_words,

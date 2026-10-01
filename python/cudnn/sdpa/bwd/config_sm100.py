@@ -257,6 +257,17 @@ class MatmulTemplateParams:
     # The two SF tensors ride as TRAILING ``Optional[cute.Tensor]`` arguments of the template's ``_host`` (``sfa_0``,
     # ``sfb_0``); the kernel's two SF tensor-map parameters are None-specialized away when this is False.
     block_scale: bool = False
+    # THD: which TOKEN axis the blocked S/dS workspace's ROWS are (appended; requires ``thd_varlen``).  False = the SM100
+    # d512 chain's Q-major workspace (rows = packed q tokens, so the k-major dQ GEMM's A offset lands on M and its B is K at
+    # ``cu_k``; the m-major dV / dK GEMMs' A offset lands on K and their B is dO / Q at ``cu_q``).  True = a KV-major
+    # workspace blocked over packed kv tokens (the sm107 d256 chain): the ROW-OFFSET placement is unchanged (the blocked row
+    # axis is K for an m-major A and M for a k-major A in both layouts) but the token side FLIPS -- the k-major dK GEMM
+    # reduces over q tokens (B = Q at ``cu_q``, ``k_len = s_q``, C = dK rows at ``cu_k``) and the m-major dQ GEMM over kv
+    # tokens (B = K at ``cu_k``, ``k_len = s_kv``, C = dQ rows at ``cu_q``).  Keyed on the operand major alone (the
+    # pre-field spelling) the dK GEMM would pair its Q operand with ``cu_k`` and reduce over ``s_kv``: finite, plausible,
+    # wrong for every sequence but the first.  At the default every keyed expression equals the pre-field one, so the
+    # SM100 THD renderings stay PTX-identical.
+    thd_rows_kv: bool = False
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -372,6 +383,11 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(
             f"SDPA bwd stage 3: b_head_group > 1 ({bhg}) has no THD / varlen leg (the packed B descriptor's head extent was not validated there; "
             f"the sm107 d256 chain that uses it is dense BSHD only)."
+        )
+    if bool(getattr(params, "thd_rows_kv", False)) and not params.thd_varlen:
+        raise ValueError(
+            "SDPA bwd stage 3: thd_rows_kv names the token axis of the THD blocked workspace's rows and means nothing on a dense rendering "
+            "-- it requires thd_varlen=True."
         )
     if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
         # The causal K-trim assumes the workspace is one dense rectangle per
