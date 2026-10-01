@@ -147,9 +147,11 @@ def test_base_record_and_4x1_config_are_unchanged():
     was), ``TemplateParams2x2`` is a SUBCLASS with defaulted extras, and ``make_cfg_d512`` still renders the role-split
     geometry: TILE_M 128, two sub-groups, 28 scheduler arrivers, no cluster-span field."""
     base_fields = set(TemplateParams.__dataclass_fields__)
-    assert not base_fields & {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes"}
+    levers = {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes", "stages_acc"}
+    assert not base_fields & levers
     assert issubclass(TemplateParams2x2, TemplateParams)
-    assert set(TemplateParams2x2.__dataclass_fields__) == base_fields | {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes"}
+    assert set(TemplateParams2x2.__dataclass_fields__) == base_fields | levers
+    assert make_cfg_d512_2x2(TemplateParams2x2(stages_acc=4)).STAGES_ACC == 4 and tmem_cols_2x2(make_cfg_d512_2x2(TemplateParams2x2(stages_acc=4))) == 512
     assert TemplateParams2x2() != TemplateParams()  # a different record -> a different template digest
     cfg = make_cfg_d512(TemplateParams())
     assert isinstance(cfg, CfgBwdD512) and not hasattr(cfg, "CLUSTER_Q_ROWS") and not hasattr(cfg, "Q_BLOCKS_PER_CLUSTER")

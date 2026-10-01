@@ -775,6 +775,9 @@ class TemplateParams2x2(TemplateParams):
     d_chunk: int = 64
     # Usable dynamic SMEM of the target device (the validator's cap).
     smem_cap_bytes: int = _SM100_MAX_DYN_SMEM
+    # S_acc / dS_acc parity slots: 2 (256 TMEM columns) or 4 (512 = the whole TMEM, the free lever that decouples
+    # compute jitter from the MMA and makes the pair's cta_group::2 alloc claim every column, as the 4x1 does).
+    stages_acc: int = 2
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1062,7 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     cast_stages = int(getattr(params, "cast_stages", 1))
     d_chunk = int(getattr(params, "d_chunk", 64))
     smem_cap = int(getattr(params, "smem_cap_bytes", _SM100_MAX_DYN_SMEM))
+    stages_acc = int(getattr(params, "stages_acc", 2))
     if d_chunk <= 0 or 512 % d_chunk != 0:
         raise ValueError(f"bwd d512 2x2: d_chunk must be a positive divisor of 512; got {d_chunk}")
     cfg = CfgBwdD512x2(
@@ -1067,6 +1071,7 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
         D_CHUNK=d_chunk,
         N_CHUNKS=512 // d_chunk,
         STAGES_KV=stages_kv,
+        STAGES_ACC=stages_acc,
         CAST_STAGES=cast_stages,
         SMEM_CAP_BYTES=smem_cap,
         MASK_FLAGS=_mask_flags_from(params),
