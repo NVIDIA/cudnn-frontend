@@ -185,7 +185,8 @@ def indexer_fwd(
            ``(total_q, n_heads_q, head_dim)`` [BF16]
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` or THD
            ``(total_k, n_heads_kv, head_dim)`` [BF16]
-        w: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)`` [BF16]
+        w: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)``
+           [BF16 or FP32 with precision="bf16"; BF16 with precision="mxfp8"]
         ratio: compression ratio (int), default 4
         qhead_per_kv_head: auto inferred if None
         out: optional dense-score output (must be ``None`` for the compressed
@@ -221,6 +222,8 @@ def indexer_fwd(
     """
     current_stream = resolve_stream(current_stream)
     precision = precision.lower()
+    if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
+        raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
     if num_threads != 384:
@@ -434,9 +437,11 @@ def _indexer_fwd_bound(
         raise ValueError(f"ratio must be > 0, got {ratio}")
 
     if precision == "bf16":
-        for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
+        for tensor, name in ((q, "q"), (k, "k")):
             assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
             assert tensor.is_cuda, f"{name} must be on CUDA device"
+        assert w.dtype in (torch.bfloat16, torch.float32), f"w must be bfloat16 or float32, got {w.dtype}"
+        assert w.is_cuda, "w must be on CUDA device"
         if q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
             raise ValueError("q_scale, k_scale, and scale padded cu_seqlens are only valid " "with precision='mxfp8'")
     else:
@@ -661,6 +666,7 @@ def _indexer_fwd_bound(
     compile_key = (
         "bf16",
         q.dtype,
+        w.dtype,
         head_dim,
         qhead_per_kv_head,
         ratio,

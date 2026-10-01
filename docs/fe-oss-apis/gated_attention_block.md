@@ -131,9 +131,67 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             w_o_sf=None)         # required iff MxQuantSpec.o_fp4, refused otherwise
 ```
 
-Every appended argument (`sample_w_o_sf`, `w_o_sf`) sits at the end with a `None` default, so positional callers of the
-bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typed
-`ValueError` names the missing half).
+Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`) sits at the end with a default, so positional
+callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together
+(a typed `ValueError` names the missing half).
+
+#### Training forward (`save_for_backward=True`)
+
+bf16 / fp16 only, out of place (`inplace_qkv` defaults to `False` there; `fuse_norm_rope` / `fuse_gate` / `quant` are typed
+declines). The block **writes through** the caller-owned `SavedForBackward` record wherever the backward needs a tensor,
+with the same kernels as inference (`out` is bitwise the inference block's): the projection GEMM writes `saved.proj_slab`,
+the SDPA writes the **pre-gate** `saved.o` and `saved.lse`, norm+RoPE writes `saved.rstd_q` / `rstd_k`, and the sigmoid gate
+lands out of place in the workspace. `execute()` still allocates nothing.
+
+```python
+from cudnn.gated_attention_block import SavedForBackward, saved_slab_views
+
+B, S, T = h.shape[0], h.shape[1], h.shape[0] * h.shape[1]
+g = geometry
+blk = GatedAttentionBlockFwd(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, g, save_for_backward=True,
+                             seq_lens_present=seq_lens is not None)          # saved_gate_copy=False: the proj_slab save mode
+blk.check_support(); blk.compile()
+workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)  # no slab, no O: the record holds them
+
+proj_slab = torch.empty(T, g.n_qkvg, dtype=h.dtype, device=h.device)         # [B*S, n_qkvg] (or [B, S, n_qkvg]), contiguous
+q_pre, gate, k_pre, v = saved_slab_views(proj_slab, g, B, S)                 # zero-copy [B, S, heads, D] views of its bands
+saved = SavedForBackward(
+    h=h,                                                                     # the SAME tensor execute() runs on (verified)
+    gate=gate, q_pre=q_pre, k_pre=k_pre,                                     # the views above, or None (the backward derives them)
+    o=torch.empty(B, S, g.h_q, g.d_head, dtype=h.dtype, device=h.device),    # PRE-gate O, compact
+    lse=torch.empty(B, g.h_q, S, dtype=torch.float32, device=h.device),      # natural-log LSE; `lse=` at execute is optional
+    rstd_q=torch.empty(B, S, g.h_q, dtype=torch.float32, device=h.device),   # both None iff geometry.qk_norm is False
+    rstd_k=torch.empty(B, S, g.h_kv, dtype=torch.float32, device=h.device),
+    proj_slab=proj_slab,
+    seq_lens=seq_lens,                                                       # the SAME tensor passed to execute(seq_lens=), or None
+)
+blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens=seq_lens, saved=saved)
+```
+
+A runnable version of this recipe, self-checked against torch on the record alone (the slab is `h @ W_qkvg^T`, `rstd_*` are the
+RMSNorm statistics of the pre-norm bands, `out` is `(o * sigmoid(gate)) @ W_o^T`):
+[`samples/frost/gated_attention_block/00_training_forward.py`](../../samples/frost/gated_attention_block/00_training_forward.py).
+
+Two **save modes**, chosen at declaration because the workspace carve differs (`execute` checks that the record agrees):
+
+| mode | declaration | what is saved | forward cost |
+|---|---|---|---|
+| **proj_slab** (default) | `saved_gate_copy=False`; `saved.proj_slab` REQUIRED | the whole stage-(1) slab (34 KiB/token at the 397B geometry): `gate`, `q_pre`, `k_pre` and V are its column bands, nothing to recompute | none -- the GEMM writes the slab in place of the workspace one (6 launches, the inference chain's) |
+| **gate-copy** | `saved_gate_copy=True`; `saved.proj_slab=None`, `saved.gate` a compact `[B, S, H_q, D]` buffer | the GATE band (16 KiB/token); `q_pre` / `k_pre` only if you pass buffers for them (else the backward recomputes them from `h`, `RecomputePolicy.RECOMPUTE_QK_PRE`) | one extra elementwise launch per copied band; the workspace keeps its slab |
+
+Recommendation: `proj_slab` up to `S = 32K`, gate-copy beyond (the whole slab, 34 KiB/token at the 397B geometry, is about twice the GATE band alone).
+
+Contracts verified before any launch, each a `ValueError` naming the field: `saved.h` is `h`'s storage; `saved.seq_lens`
+**is** the `seq_lens` tensor passed to `execute` (or both `None` -- the backward declines padding at declaration from this
+field, without a device read); `lse` (optional) is `saved.lse`'s storage; `saved.o` is compact `[B, S, H_q, D]` in the
+activation dtype; `saved.rstd_q` / `rstd_k` are `[B, S, H]` fp32 compact (present iff `geometry.qk_norm`); every caller
+buffer a kernel writes (`proj_slab`, `o`, `lse`, `rstd_*`, the gate-copy targets) is **16-byte aligned** -- they are TMA-store
+targets, and a slice at an odd element offset is refused here rather than failing untyped after stage (1) launched; in the
+proj_slab mode `saved.gate` / `q_pre` / `k_pre`, when given, alias `saved.proj_slab` exactly as `saved_slab_views` spells
+them (each may be `None` there: the backward derives it from the slab). The refusal runs the other way too: `saved=` on a
+block declared **without** `save_for_backward` is a `ValueError` naming the knob -- an inference forward writes none of the
+record's tensors, so a silently ignored record would reach the backward uninitialised. A padded forward (`seq_lens`) is
+served: a dead entry (`seq_lens[b] == 0`) leaves `saved.o[b] == 0`, `saved.lse[b] == -inf` and `out[b] == 0` exactly.
 
 `execute()` allocates nothing, reads nothing back to the host and converts nothing: every intermediate is a
 strided view of the caller's workspace, sized honestly by `get_workspace_size()`, so the call is CUDA-graph
@@ -174,7 +232,11 @@ Quantization specs:
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None)` consumes the forward's `SavedForBackward(h, gate, o, lse,
-rstd_q, rstd_k, q_pre=None, k_pre=None)`. `RecomputePolicy` chooses between re-running stage (1) for the pre-norm
+rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` (the two appended fields are what the training
+forward above fills: the saved stage-(1) slab, and the padding tensor the forward ran with -- a padded save set becomes a
+typed decline of the backward once the follow-up PR that lands the block backward adds it; `GatedAttentionBlockBwd` is a
+declaration-only stub today). `gate` may be `None` in the proj_slab save mode (it is a band of `proj_slab`).
+`RecomputePolicy` chooses between re-running stage (1) for the pre-norm
 Q/K (`RECOMPUTE_QK_PRE`, the default) and reading them from the save set (`SAVE_ALL`); which input gradients are
 wanted is fixed at build time because it decides which GEMMs exist. `need_dw_norms=None` follows
 `geometry.qk_norm`; asking for norm-weight gradients under `qk_norm=False` is a typed decline. The backward is

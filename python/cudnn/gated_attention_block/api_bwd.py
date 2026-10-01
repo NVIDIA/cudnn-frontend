@@ -134,13 +134,14 @@ class RecomputePolicy(Enum):
 
     ``RECOMPUTE_GATE``
         RESERVED -- not servable against the current schema. It would
-        additionally drop ``gate`` from the save set and re-run its slice too
+        additionally drop the GATE from the save set and re-run its slice too
         (another 16 GiB saved; the same GEMM, so at that point it is a full
-        stage-(1) recompute). But ``SavedForBackward.gate`` is a MANDATORY field
-        and the stage-(1) GEMM always produces the GATE columns, so today there
-        is nothing to drop. It
-        becomes real when that field is widened to ``Optional`` (a type
-        widening, append-only compatible) and the forward learns to skip the
+        stage-(1) recompute). But the training forward ALWAYS saves the GATE
+        -- as the compact ``gate`` (gate-copy save mode) or as a band of
+        ``proj_slab`` (proj_slab save mode, where ``gate`` may be ``None``
+        because ``saved_slab_views(proj_slab, ...)[1]`` derives it) -- and the
+        stage-(1) GEMM always produces the GATE columns, so today there is
+        nothing to drop. It becomes real when the forward learns to skip the
         GATE columns; until then :meth:`GatedAttentionBlockBwd.check_support`
         declines it rather than recomputing a tensor that is present.
 
@@ -530,7 +531,8 @@ class GatedAttentionBlockBwd(APIBase):
         Declines that belong here: a ``SavedForBackward`` missing a tensor the
         chosen :class:`RecomputePolicy` does not rebuild (``SAVE_ALL`` with a
         ``None`` ``q_pre`` / ``k_pre``); ``RecomputePolicy.RECOMPUTE_GATE``
-        (reserved -- ``gate`` is a mandatory field today); ``lse`` absent (the
+        (reserved -- the GATE is always saved today, as ``gate`` or as a
+        ``proj_slab`` band); ``lse`` absent (the
         forward ran inference-only); a ``need_*`` combination that leaves no
         work; a dtype outside the precision roadmap.
         """

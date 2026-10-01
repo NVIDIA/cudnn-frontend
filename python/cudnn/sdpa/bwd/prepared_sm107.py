@@ -114,6 +114,9 @@ def _config(api):
         bool(api._zero_ws),
         api.dtype.itemsize,
         api._bpe_ds,  # the dS workspace's bytes per element (fp8 row: 1 = e4m3, 2 = the bf16 twin)
+        # the dQ rendering's B head group (`MatmulTemplateParams.b_head_group`, copied off the record in `compile()`): the GQA
+        # group = one dQ launch per chunk, 1 = one per group member (`prepared_host._stage3`)
+        int(api._dq_b_head_group),
     )
 
 
