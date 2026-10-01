@@ -27,6 +27,7 @@ tests run anywhere.
 """
 
 import functools
+import os
 import sys
 
 import pytest
@@ -50,15 +51,15 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     run_wgrad_gemm,
 )
 
-_SM107 = (10, 7)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from gated_block_stream_probe import park_the_default_stream  # noqa: E402
+
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
 
-
-def _cc():
-    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
-
-
-requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
+# The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection) -- switched from the per-module
+# skipif copy when this module was next touched.
+requires_rubin = pytest.mark.requires_rubin
 
 
 # ---------------------------------------------------------------------------
@@ -150,17 +151,6 @@ def _plan(kind: str, m: int, k: int, n: int, dtype: torch.dtype, split_k: int = 
     list, so the tests below share plans rather than rebuild them."""
     majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
     return build_proj_gemm(m=m, k=k, n=n, dtype=dtype, label=f"{kind}_{m}x{k}x{n}_{str(dtype).replace('torch.', '')}_sk{split_k}", split_k=split_k, **majors)
-
-
-def _park_the_default_stream(seconds: float = 0.5) -> None:
-    """Enqueue a long spin on torch's CURRENT (default) stream so that anything wrongly launched
-    there runs LATE -- after a side stream is long done (test_block_end_to_end.py's probe)."""
-    if hasattr(torch.cuda, "_sleep"):
-        torch.cuda._sleep(int(seconds * 2.0e9))  # cycles at ~2 GHz
-        return
-    x = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-    for _ in range(16):
-        x = x @ x
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +474,7 @@ def test_stream_threading(how):
     dw = torch.zeros_like(dw_ref)
     side = torch.cuda.Stream()
     torch.cuda.synchronize()
-    _park_the_default_stream()
+    park_the_default_stream()
     if how == "ambient":
         with torch.cuda.stream(side):
             run_wgrad_gemm(plan, dy, x, dw, ws)

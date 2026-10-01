@@ -627,6 +627,24 @@ has no replacement. The plumbing that makes a request expressible is in place
 user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
+The SM100 half-precision D128/D256 THD decoders honor the existing
+`SCHED_POLICY` values 0/1/2 over the live work list: NATURAL visits ascending Q
+blocks within each head, LPT visits descending Q blocks across heads, and
+LPT_L2 keeps a KV-sharing head group together while reversing its Q blocks.
+The kernel reads current GPU lengths, so the same policy handles full and
+prefix requests under a retained capture without a host length read,
+additional setup launch, or replan.
+
+For D256, Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
+causal attention without a left window, single-sequence full-prefill
+envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page size 16/128,
+and no sink or epilogue gate. Requesting Stats does not change this preference.
+That plan keeps LPT when its live lengths become prefix chunks; it does not
+switch policies at the full/prefix boundary. Other D256 THD defaults stay NATURAL.
+The separate D128 THD PackGQA/LPT preference is preserved.
+This changes scheduling within FROST, not engine placement, and adds no new
+scheduler policy value.
+
 If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.

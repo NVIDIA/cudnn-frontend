@@ -171,12 +171,20 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
 
 @pytest.mark.L0
 def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
-    """The adapter's twin of the engine row's domain (keep the three in lockstep)."""
+    """The adapter's twin of the engine row's domain (keep the three in lockstep).
+    cga1 on the d128 f16/bf16 flavor IS the decode tile; the quantized families
+    have no decode tile -- per-tensor FP8 d128 also builds at cga1, but as its
+    256-row prefill CTA (the dense unsplit leg the heuristics run there), and
+    MXFP8 d128 keeps the cga2 pair."""
     from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
 
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 0)) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 3)) == (1, 2)
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0)) == (2,), "the fp8 families keep the prefill tile"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True) == (
+        1,
+        2,
+    ), "per-tensor FP8 d128: cga1 is a prefill CTA, not a decode tile"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (2,), "MXFP8 d128 keeps the prefill pair"
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (2,), "no Rubin sibling of the decode tile"
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
 
@@ -239,7 +247,7 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
     # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
     assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
-    # d64 rides the d128 envelope, decode tile included.
+    # d64 runs its native flavor at cga1, its own decode tile included (TemplateParams.decode_tile).
     assert all(p.knobs.cga == 1 for p in _plans(_facts(h_kv=8, d_qk=64, d_v=64)))
     # MHA decode (no group to pack).
     assert all(p.knobs.cga == 1 for p in _plans(_facts(h_q=8, h_kv=8)))
@@ -258,10 +266,12 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
-    # A causal prefill keeps its measured LPT_L2 primary: the decode NATURAL rule is decode-shaped only.
-    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+    # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
+    # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
+    # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
 
-    assert _plans(_facts(s_q=2048, causal=True, padded=False))[0].knobs.sched_policy == SCHED_LPT_L2
+    assert _plans(_facts(s_q=2048, causal=True, padded=False))[0].knobs.sched_policy == SCHED_LPT
 
 
 @pytest.mark.L0

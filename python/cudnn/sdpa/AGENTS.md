@@ -34,6 +34,13 @@ head-major, never dense-padded.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Under THD PackGQA, setup and decoding count **token** tiles
+(`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
+Changing only one side misses or aliases rows. The packing/capture tests
+exercise partial groups and protect untouched tails with sentinels.
+A bounded second wave is a plan-time tuning choice; compute its workload
+from packed token tiles, rather than unpacked tiles times all query heads.
+
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 
@@ -216,6 +223,21 @@ overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Prepared THD launch bounds and setup
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
 
 ## Heuristic geometry regressions
 
