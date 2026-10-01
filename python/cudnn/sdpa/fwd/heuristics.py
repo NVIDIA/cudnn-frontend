@@ -56,6 +56,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_FP16,
     SCHED_LPT,
     SCHED_LPT_L2,
+    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -502,6 +503,22 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
+            # Measured B200 full-prefill envelopes. Runtime lengths may still
+            # become prefix chunks after capture; policy 3 reads them on GPU.
+            # Keep mixed batches and 32K envelopes on the existing default.
+            if (
+                SCHED_LPT_IF_FULL in domain
+                and facts.dtype == cudnn.data_type.BFLOAT16
+                and (facts.d_qk, facts.d_v) == (256, 256)
+                and facts.b == 1
+                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+                and facts.s_q == facts.s_kv
+                and facts.page_size in (16, 128)
+                and not (facts.has_sink or facts.has_epilogue_gate)
+            ):
+                # Packed Stats use the same measured full/prefix scheduling.
+                primary = SCHED_LPT_IF_FULL
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
