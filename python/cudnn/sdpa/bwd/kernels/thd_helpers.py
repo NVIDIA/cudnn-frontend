@@ -126,13 +126,18 @@ def build_thd_meta_kernel(
 
     The metadata a kernel that takes ``cu_seqlens`` on device needs and
     nothing else: no blocked-workspace row offsets, no batch ranking, no claim
-    counter.  One thread does the serial cumsum (B is small); no warp
-    primitives, so it runs on every architecture the SDPA kernels do -- the
-    SM80 backward reads ``cu_q`` / ``cu_k`` straight out of this buffer.
+    counter. One warp builds the two prefixes for batches; B <= 1 retains
+    the single-thread path. The SM80 backward reads ``cu_q`` / ``cu_k``
+    straight out of this buffer.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    if tidx == cutlass.Int32(0):
-        write_thd_meta(cutlass.make_array_view(meta_t), cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+    meta = cutlass.make_array_view(meta_t)
+    if n_batch <= cutlass.Int32(1):
+        if tidx == cutlass.Int32(0):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+    elif tidx < cutlass.Int32(32):
+        write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, cutlass.Int32(tidx), store_lengths=False)
+        write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, cutlass.Int32(tidx), store_lengths=True)
 
 
 build_thd_meta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
