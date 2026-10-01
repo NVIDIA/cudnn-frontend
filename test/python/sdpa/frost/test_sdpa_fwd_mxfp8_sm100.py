@@ -2493,3 +2493,21 @@ class TestStagedMxfp8:
     test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
     test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
     test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@_skip_thd_mxfp8_on_rubin
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("cu_lens", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_batched_setup(batch, cu_lens):
+    """Parallel setup crosses warp chunks and descriptor-owner strides.
+
+    Zero Q/KV lengths and NaN-poisoned capacity tails exercise prefix publication,
+    per-request O extents, and packed-total K/V clamps together.
+    """
+    q_lens = [([0, 1, 17, 65, 129][i % 5]) for i in range(batch)]
+    kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
+    out, ref, amax, _ = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", torch.float16, scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
+    _check(out, ref, torch.float16, "e4m3")
+    assert abs(amax.item() - ref.abs().max().item()) <= 0.03

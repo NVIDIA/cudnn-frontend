@@ -185,6 +185,30 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+**Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
+
+- A setup kernel may publish K/V maps once before attention. Acquire each map
+  in every consuming loader warp before its persistent loop, including both
+  CTAs of a pair, before disabling the per-load acquire. A fence in another
+  CTA is insufficient; cluster or stream ordering does not replace it.
+- Repeat the acquire on every launch and graph replay. A map rewritten or
+  selected inside the loop needs acquisition at the corresponding boundary.
+  Preserve the shared TMA helpers' safe default for other callers.
+- Check fresh bindings and changed device-side lengths after capture, with
+  NaN-filled K/V capacity tails and independent O/LSE references.
+  `test_thd_tensormaps_rebind_and_replay` covers D128, D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D192/D512 FP8
+  and D128/D192 MXFP8, including both E4M3 and E5M2 inputs. The same probe
+  covers all four half/FP8 widths on SM107 (including FP8 D256); unsupported
+  SM107 MXFP8 THD and D192 half single-CTA configurations are skipped.
+- O slabs within one work item share a map. Acquire before the first slab
+  inside the existing live-work guard; retain store commit/wait and pipeline
+  synchronization for every slab. Reuse across work items requires reacquiring
+  whenever the selected batch/map changes. Exercise empty and repeated work items
+  with the existing `thd_over_launched_units_are_dead` and
+  `thd_multi_unit_per_cta` regressions.
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: `fwd/kernels/sm100/prefill_d512_f16_2x2.py` (`TemplateParams.mma_2x2`). Each lesson names the
@@ -216,10 +240,12 @@ runnable detector in `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; a
   2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
   (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
   o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
-  The poll is two-phase (`POLL_TIGHT_ITERS` = 32 tight tests, then a TIMER `nanosleep(POLL_SLEEP_NS=128)` between
-  tests): a tight loop on the MMA / TMA-LDG warp starves the compute warps sharing its SMSP (the backward ran 2.2x
-  slower with it); the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never
-  parks on the barrier.
+  The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
+  `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
+  between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
+  warps sharing its SMSP when the waits are long (the d512 backward ran 2.2x slower with it; it ships 128 / 128), while
+  the forwards' short waits lose nothing to it (SM100 forward 32 / 128, cc 10.7 forward tight 1 / 0, each measured);
+  the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never parks on the barrier.
 - **A fixed TMEM column is NOT protected by a ring it rides.** Per-ring-step payload goes in per-SLOT columns (alpha
   at `384 + s`, tile stats at `386 + 2s`): a fixed stats pair is protected only if the next writer waits the SAME
   slot's empty, and an EMPTY tile (one ring step) waits the other slot's -- the slow-arm correction then read
@@ -245,6 +271,21 @@ overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Prepared THD launch bounds and setup
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
 
 ## Heuristic geometry regressions
 

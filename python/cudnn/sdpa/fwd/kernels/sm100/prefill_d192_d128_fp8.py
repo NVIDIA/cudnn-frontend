@@ -352,7 +352,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 # THD metadata and descriptor setup. D192 exposes K as a rank-5 tensor map
 # (three 64-element D chunks), so its sequence extent is descriptor dimension
 # 1; V remains rank-4 with sequence extent dimension 2.
-from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
@@ -1427,7 +1427,8 @@ def _tmastg_warp_group(
                             q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
                             cutlass.Int32(0),
                         )
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     o_batch = _partial_batch(batch_idx, split_idx, n_batch)
                     tma_store_tile(
@@ -2952,7 +2953,7 @@ def _host(
             n_thd_units,
             1,
             2,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (

@@ -421,6 +421,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # THD flat-grid decode, packed offsets, and runtime descriptor setup. The
 # helpers fold to dense identity when THD is disabled.
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
+    THD_SETUP_THREADS,
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
     thd_decode_unit,
     TENSOR_MAP_QWORDS,
@@ -1707,7 +1708,8 @@ def _tmastg_warp_group(
                     if batch_idx < n_batch:
                         o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                         o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     tma_store_tile(
                         sO[qs],
@@ -3469,7 +3471,7 @@ def _host(
             n_thd_units,
             1,
             2,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (

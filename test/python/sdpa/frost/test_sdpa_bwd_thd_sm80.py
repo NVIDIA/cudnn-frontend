@@ -1090,3 +1090,11 @@ def test_reject_thd_dense_stats():
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     reason = mismatch(spec.capabilities, facts)
     assert reason is not None and "dense per-batch stats" in reason, reason
+
+
+@pytest.mark.parametrize("batch", [33, 129])
+def test_graph_thd_parallel_prefix_batches(batch):
+    """Warp tails, empty requests and poisoned capacity after the packed rows."""
+    q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
+    kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
+    _run_graph(q, kv, h=2, d=128, poison=True, pad_cap=256)
