@@ -59,7 +59,7 @@ def test_DSA_indexer_forward_api_is_split_from_top_k():
     assert DSA.indexer_forward_top_k_wrapper is indexer_forward.indexer_forward_top_k_wrapper
 
 
-def _allocate_inputs(cfg):
+def _allocate_inputs(cfg, weight_dtype=torch.bfloat16):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -71,12 +71,16 @@ def _allocate_inputs(cfg):
     q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device="cuda")
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device="cuda")
+    if weight_dtype == torch.float32:
+        # A coherent sub-BF16 offset makes silent downcasting observable in scores.
+        w = (w.abs() + 1).float() + 2**-10
     return q, k, w
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_forward_params
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
 def test_DSA_indexer_forward_wrapper(
     dtype,
     acc_dtype,
@@ -84,6 +88,8 @@ def test_DSA_indexer_forward_wrapper(
     qhead_per_kv_head,
     ratio,
     request,
+    weight_dtype,
+    monkeypatch,
 ):
     try:
         from cudnn import DSA
@@ -102,26 +108,33 @@ def test_DSA_indexer_forward_wrapper(
         s_kv_default=512,
         min_compute_capability=90,
     )
-    q, k, w = _allocate_inputs(cfg)
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("Indexer forward requires Hopper or Blackwell")
+    q, k, w = _allocate_inputs(cfg, weight_dtype)
     q_causal_offsets = torch.full((cfg["b"],), 4, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    try:
+    from cudnn.deepseek_sparse_attention.indexer_forward import _interface, _interface_sm90
+
+    interface = _interface_sm90 if torch.cuda.get_device_capability()[0] == 9 else _interface
+    monkeypatch.setattr(interface, "_compile_cache", {})
+    other_dtype = torch.float32 if weight_dtype == torch.bfloat16 else torch.bfloat16
+    # Exercise both cache-population orders at fixed Q/K shape, then reuse the first.
+    for weights in (w, w.to(other_dtype), w):
         result = DSA.indexer_forward_wrapper(
             q,
             k,
-            w,
+            weights,
             ratio=ratio,
             qhead_per_kv_head=qhead_per_kv_head,
             q_causal_offsets=q_causal_offsets,
             stream=stream,
         )
-    except (ValueError, NotImplementedError, RuntimeError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
-
-    scores = result["scores"]
-    if not cfg["skip_ref"]:
-        check_ref_indexer_forward(q, k, w, scores, ratio, q_causal_offsets=q_causal_offsets)
+        if not cfg["skip_ref"]:
+            check_ref_indexer_forward(q, k, weights, result["scores"], ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64)
+    if weight_dtype == torch.float32 and not cfg["skip_ref"]:
+        rounded = ref_indexer_forward(q, k, w.bfloat16(), ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64)
+        assert not torch.allclose(result["scores"], rounded, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.L0
@@ -306,8 +319,12 @@ def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(
 @torch_fork_set_rng(seed=14)
 @pytest.mark.parametrize("h_q", [16, 32, 64])
 @pytest.mark.parametrize("ratio", [1, 4])
-@pytest.mark.parametrize("recompute", [False, True])
-def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
+@pytest.mark.parametrize(
+    "recompute,weight_dtype",
+    [(False, torch.bfloat16), (False, torch.float32), (True, torch.bfloat16)],
+    ids=["forward-w-bf16", "forward-w-fp32", "recompute-w-bf16"],
+)
+def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute, weight_dtype):
     try:
         from cudnn import DSA
     except ImportError:
@@ -336,6 +353,8 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
     q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device)
+    if weight_dtype == torch.float32:
+        w = (w.abs() + 1).float() + 2**-10
     q_causal_offsets = torch.tensor(
         [0, 0, *[s_k * ratio - s_q for s_q, s_k in shapes[2:]]],
         dtype=torch.int32,
@@ -375,6 +394,7 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute):
             scores[q0:q1, :s_k].unsqueeze(0),
             ratio,
             q_causal_offsets=q_causal_offsets[batch : batch + 1],
+            compute_dtype=torch.float64,
         )
         scores_ref = ref_indexer_forward(
             q[q0:q1].unsqueeze(0),
@@ -721,3 +741,44 @@ def test_DSA_indexer_forward_wrapper_fp8_sm90_thd_matches_dequant_reference():
         )
         if s_k < max(k_lengths):
             assert bool(torch.isneginf(result["scores"][q0:q1, s_k:]).all())
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
+def test_DSA_indexer_forward_class_head_weight_contract(monkeypatch, weight_dtype):
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.indexer_forward import api
+
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("IndexerForward class API requires Blackwell")
+    q = torch.empty(1, 1, 64, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty(1, 4, 1, 128, dtype=torch.bfloat16, device="cuda")
+    w = torch.empty(1, 1, 64, dtype=weight_dtype, device="cuda")
+    out = torch.empty(1, 1, 4, dtype=torch.float32, device="cuda")
+    plan = DSA.IndexerForward(q, k, w, out, ratio=1, qhead_per_kv_head=64)
+    plan.compile()
+
+    def unexpected_launch(*args, **kwargs):
+        raise AssertionError("Mismatched head-weight dtype must be rejected before launch")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(api, "indexer_fwd_sm100", unexpected_launch)
+        wrong_dtype = torch.float32 if weight_dtype == torch.bfloat16 else torch.bfloat16
+        with pytest.raises(ValueError, match="W dtype mismatch"):
+            plan.execute(q, k, w.to(wrong_dtype), out)
+
+    if weight_dtype == torch.float32:
+        from cudnn.deepseek_sparse_attention.indexer_forward import _interface
+
+        strided_w = torch.empty(1, 1, 128, dtype=weight_dtype, device="cuda")[..., ::2]
+        with pytest.raises(NotImplementedError, match="stride"):
+            DSA.IndexerForward(q, k, strided_w, out, ratio=1).check_support()
+
+        def unexpected_normalization(*args, **kwargs):
+            raise AssertionError("Unsupported FP32 W stride must be rejected before normalization")
+
+        monkeypatch.setattr(_interface, "_maybe_contiguous", unexpected_normalization)
+        with pytest.raises(NotImplementedError, match="stride"):
+            DSA.indexer_forward_wrapper(q, k, strided_w, ratio=1)
+        with pytest.raises(NotImplementedError, match="stride"):
+            DSA.indexer_forward_top_k_wrapper(q, k, strided_w, top_k=1, ratio=1)

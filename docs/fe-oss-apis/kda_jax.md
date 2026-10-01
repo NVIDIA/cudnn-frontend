@@ -143,7 +143,7 @@ checkpoints; any positive multiple of 16 fitting signed INT32 is supported.
 | Safe gate | `lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`; default bound -5, allowed [-5, 0); omitted parameters mean 0 |
 | Beta | Direct write strength, or sigmoid of logits; `allow_neg_eigval=True` multiplies sigmoid by 2 and requires sigmoid enabled |
 | Q/K normalization | Optional in-kernel L2 normalization |
-| Scheduling | Frost automatic piece-chain / decay-warmup / value-dimension split / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
+| Scheduling | Frost automatic piece-chain / value-dimension split / uncut selection, shared with torch; `batch_invariant=True` uses Frost's batch-independent length rule |
 | Checkpoints | Cadence 0 (backward recomputes), 16, or coarser positive multiples of 16 (seeded recomputation) |
 | Transformations | Eager, jit, first-order grad/vjp, recurrent scan |
 

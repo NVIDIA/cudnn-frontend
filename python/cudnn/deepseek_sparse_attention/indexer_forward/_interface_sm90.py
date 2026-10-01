@@ -67,8 +67,10 @@ def _validate_common(
         assert q_scale.is_cuda and k_scale.is_cuda, "q_scale and k_scale must be CUDA tensors"
     else:
         raise ValueError(f"precision must be 'bf16' or 'fp8', got {precision!r}")
-    expected_w_dtypes = (torch.bfloat16, torch.float32) if use_fp8_scales else (torch.bfloat16,)
+    expected_w_dtypes = (torch.bfloat16, torch.float32)
     assert w.dtype in expected_w_dtypes, f"w must be one of {expected_w_dtypes}, got {w.dtype}"
+    if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
+        raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     assert q.is_cuda and k.is_cuda and w.is_cuda, "q, k, w must be CUDA tensors"
 
 
@@ -95,6 +97,7 @@ def indexer_fwd(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port.
 
+    ``precision="bf16"`` accepts BF16 Q/K and BF16 or FP32 W.
     ``precision="fp8"`` is the Hopper 1x128 descale path: Q/K are
     ``torch.float8_e4m3fn`` and ``q_scale``/``k_scale`` are FP32 descale
     tensors with one value per token/head.  W may be BF16, or FP32 when it has
