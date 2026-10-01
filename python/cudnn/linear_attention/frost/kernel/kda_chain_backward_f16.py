@@ -284,7 +284,6 @@ def chain_backward_host(
         )
     kda_bprop_f16.host(
         bprop_cfg,
-        False,
         q_ratio,
         k_ratio,
         v_ratio,

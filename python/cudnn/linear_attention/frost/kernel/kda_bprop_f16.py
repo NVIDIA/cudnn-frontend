@@ -133,9 +133,6 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 
 USE_PDL = True
-# Keep enough resident workers to spread small uncut workloads across the GPU
-# while avoiding the idle workers of a full-SM persistent launch.
-BPROP_GRID_FLOOR = 96
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
@@ -3378,7 +3375,6 @@ def prologue(
 @cute.jit
 def host(
     cfg: cutlass.Constexpr,
-    right_size_grid: cutlass.Constexpr[bool],
     q_ratio: cutlass.Int32,
     k_ratio: cutlass.Int32,
     v_ratio: cutlass.Int32,
@@ -3406,14 +3402,7 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     n_desc = num_sequences
-    grid_clusters = cutlass.Int32(cfg.max_active_clusters)
-    if cutlass.const_expr(right_size_grid):
-        work_items_without_splits = cutlass.Int32(num_sequences) * cutlass.Int32(beta.shape[1])
-        grid_clusters = cutlass.min(
-            cutlass.Int32(cfg.max_active_clusters),
-            cutlass.max(cutlass.Int32(BPROP_GRID_FLOOR), work_items_without_splits),
-        )
-    grid_shape = (grid_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_bprop(
         cfg,
         q_ratio,

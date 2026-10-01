@@ -147,7 +147,6 @@ def uncut_backward_host(
     )
     kda_bprop_f16.host(
         bprop_cfg,
-        True,
         q_ratio,
         k_ratio,
         v_ratio,
