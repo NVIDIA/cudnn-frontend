@@ -580,6 +580,65 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
+def _tma_issue_k(sK, tma_k, bars, k_state, kv_loop, kv_head_idx, row_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem):
+    """Both 32 KiB d-half sub-chunks of K tile ``kv_loop`` (this CTA's 64 kv rows): wait the slot, leader expect_tx of
+    the PAIR's 64 KiB, issue my share (2 of 4 subtiles to me + twin under KV_SHARE=2, all 4 own-bit otherwise)."""
+    kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+    for dh in cutlass.range_constexpr(2):
+        bars.mb_k_empty[k_state.idx].wait(k_state.phase)
+        bars.mb_k_full[k_state.idx].arrive(n_bytes=kSubTransactionBytes, pred=is_leader & nvvm.elect_sync())
+        if cutlass.const_expr(KV_SHARE == 2):
+            tma_load_subtiles(
+                sK[k_state.idx].shifted(k_share_smem),
+                tma_k(cutlass.Int32(dh * K_SUB_COLS) + k_share_col, kv_head_idx, kv_row_base + row_off, tma_batch),
+                bars.mb_k_full[k_state.idx].smem_ptr,
+                0,
+                K_SUBTILES_PER_ISSUER,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=kv_mcast_mask,
+            )
+        else:
+            tma_load_tile(
+                sK[k_state.idx],
+                tma_k(cutlass.Int32(dh * K_SUB_COLS), kv_head_idx, kv_row_base + row_off, tma_batch),
+                bars.mb_k_full[k_state.idx].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=kv_mcast_mask,
+            )
+        k_state = advance(k_state, CFG.STAGES_K_SUB)
+    return k_state
+
+
+@cute.jit
+def _tma_issue_v(sV, tma_v, bars, v_state, kv_loop, kv_head_idx, v_col_off, kv_seq_off, tma_batch, is_leader, kv_mcast_mask, v_share_col, v_share_smem):
+    """Both 32 KiB 128-col sub-chunks of V tile ``kv_loop`` (128 kv rows x this CTA's d_v [256*cta_in_pair + 128c, +128))."""
+    kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+    for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+        bars.mb_v_empty[v_state.idx].wait(v_state.phase)
+        bars.mb_v_full[v_state.idx].arrive(n_bytes=vSubTransactionBytes, pred=is_leader & nvvm.elect_sync())
+        if cutlass.const_expr(KV_SHARE == 2):
+            tma_load_subtiles(
+                sV[v_state.idx].shifted(v_share_smem),
+                tma_v(v_col_off + cutlass.Int32(c * V_SUB_COLS) + v_share_col, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                bars.mb_v_full[v_state.idx].smem_ptr,
+                0,
+                V_SUBTILES_PER_ISSUER,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=kv_mcast_mask,
+            )
+        else:
+            tma_load_tile(
+                sV[v_state.idx],
+                tma_v(v_col_off + cutlass.Int32(c * V_SUB_COLS), kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                bars.mb_v_full[v_state.idx].smem_ptr,
+                cta_group=CFG.CTA_MMA,
+                mcast_mask=kv_mcast_mask,
+            )
+        v_state = advance(v_state, CFG.STAGES_V_SUB)
+    return v_state
+
+
+@cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,
     tma_k_desc,
@@ -676,56 +735,26 @@ def _tmaldg_warp_group(
                 mcast_mask=q_mcast_mask,
             )
 
+            # Issue order mirrors the MMA's one-iteration BMM1 lookahead: K(kv_left) prologue, then per iteration
+            # K(kv+1) BEFORE V(kv), V(kv_right-1) tail.  K(kv+1) must never queue behind V(kv): V(kv)'s slot is
+            # released by BMM2(kv-1), and the K(kv+1) issue would then wait for that completion and land its
+            # whole L2 round trip on BMM1(kv+1) (MEASURED: the K-after-V order ran dense H128 S8K at 24.86 ms,
+            # 0.70x of the role split).  The K prologue precedes the O u V gate so the next tile's K / BMM1
+            # overlap the previous tile's epilogue and O store.
+            k_state = _tma_issue_k(sK, tma_k, bars, k_state, kv_left, kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem)
+
             # O u V alias: the first V load of this tile overwrites the previous tile's O staging.
             bars.mb_o_empty.wait(o_empty_for_v_state.phase)
             o_empty_for_v_state = advance(o_empty_for_v_state, 1)
 
-            for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
-                kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
-                for dh in cutlass.range_constexpr(2):
-                    bars.mb_k_empty[k_state.idx].wait(k_state.phase)
-                    bars.mb_k_full[k_state.idx].arrive(n_bytes=kSubTransactionBytes, pred=is_leader & nvvm.elect_sync())
-                    if cutlass.const_expr(KV_SHARE == 2):
-                        tma_load_subtiles(
-                            sK[k_state.idx].shifted(k_share_smem),
-                            tma_k(cutlass.Int32(dh * K_SUB_COLS) + k_share_col, kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
-                            bars.mb_k_full[k_state.idx].smem_ptr,
-                            0,
-                            K_SUBTILES_PER_ISSUER,
-                            cta_group=CFG.CTA_MMA,
-                            mcast_mask=kv_mcast_mask,
-                        )
-                    else:
-                        tma_load_tile(
-                            sK[k_state.idx],
-                            tma_k(cutlass.Int32(dh * K_SUB_COLS), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
-                            bars.mb_k_full[k_state.idx].smem_ptr,
-                            cta_group=CFG.CTA_MMA,
-                            mcast_mask=kv_mcast_mask,
-                        )
-                    k_state = advance(k_state, CFG.STAGES_K_SUB)
-                for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
-                    bars.mb_v_empty[v_state.idx].wait(v_state.phase)
-                    bars.mb_v_full[v_state.idx].arrive(n_bytes=vSubTransactionBytes, pred=is_leader & nvvm.elect_sync())
-                    if cutlass.const_expr(KV_SHARE == 2):
-                        tma_load_subtiles(
-                            sV[v_state.idx].shifted(v_share_smem),
-                            tma_v(V_COL_OFFSET_PEER + cutlass.Int32(c * V_SUB_COLS) + v_share_col, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
-                            bars.mb_v_full[v_state.idx].smem_ptr,
-                            0,
-                            V_SUBTILES_PER_ISSUER,
-                            cta_group=CFG.CTA_MMA,
-                            mcast_mask=kv_mcast_mask,
-                        )
-                    else:
-                        tma_load_tile(
-                            sV[v_state.idx],
-                            tma_v(V_COL_OFFSET_PEER + cutlass.Int32(c * V_SUB_COLS), kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
-                            bars.mb_v_full[v_state.idx].smem_ptr,
-                            cta_group=CFG.CTA_MMA,
-                            mcast_mask=kv_mcast_mask,
-                        )
-                    v_state = advance(v_state, CFG.STAGES_V_SUB)
+            for kv_loop in cutlass.range(kv_left, kv_right - cutlass.Int32(1), 1, unroll=1):
+                k_state = _tma_issue_k(
+                    sK, tma_k, bars, k_state, kv_loop + cutlass.Int32(1), kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem
+                )
+                v_state = _tma_issue_v(sV, tma_v, bars, v_state, kv_loop, kv_head_idx, V_COL_OFFSET_PEER, kv_seq_off, tma_batch, is_leader, kv_mcast_mask, v_share_col, v_share_smem)
+            v_state = _tma_issue_v(
+                sV, tma_v, bars, v_state, kv_right - cutlass.Int32(1), kv_head_idx, V_COL_OFFSET_PEER, kv_seq_off, tma_batch, is_leader, kv_mcast_mask, v_share_col, v_share_smem
+            )
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
