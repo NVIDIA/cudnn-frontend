@@ -213,10 +213,6 @@ def build_warmup_forward(
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
-    # Reuse is profitable when a sequence supplies more heads than the persistent
-    # grid; smaller shapes retain the original acquire path. Include the choice
-    # in the cache key because the launch otherwise supports dynamic head counts.
-    reuse_batch_tensormaps = DK == 64 and DV == 64 and tiles_per_head == 1 and int(gate.shape[1]) > int(num_sm)
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -262,7 +258,6 @@ def build_warmup_forward(
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
         int(tiles_per_head),
-        reuse_batch_tensormaps,
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -282,7 +277,6 @@ def build_warmup_forward(
             expand_num=expand_num,
             tiles_per_head=tiles_per_head,
         )
-        prefill_cfg.reuse_batch_tensormaps = reuse_batch_tensormaps
 
         gate_table_placeholder = None
         dt_bias_table_placeholder = None
