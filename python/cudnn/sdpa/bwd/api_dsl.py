@@ -1773,6 +1773,14 @@ _SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
 # not a knob and not an env var: it must never differ per plan.  The DQ_SINGLE_LAUNCH precedent (api_dsl_sm107).
 STAGE2_2X2: bool = False
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
+# The Rubin line as ``engines._RUBIN`` spells it (cc 10.7 up to the SM100 line's end): the 2x2 twin's ring levers
+# (8 chunk stages / 2 cast stages / 325 KiB) follow the line, not the one cc that exists today.
+_RUBIN_SM = (107, 119)
+
+
+def _rubin_line(sm: int) -> bool:
+    """True for a device on the Rubin line (``major * 10 + minor`` in ``_RUBIN_SM``)."""
+    return _RUBIN_SM[0] <= sm <= _RUBIN_SM[1]
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
@@ -2063,6 +2071,42 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             total += 2 * ws_align(_kv_rows * self.h_q * self.head_dim_qk * self._bpe)
         return total
 
+    # --- stage-2 template selection -------------------------------------------
+    # The row's name: the spec's, the prepared artifact's symbol (``frost_<name>_prepared``, Rule 6) and the launch
+    # spec's.  A subclass that is its own engine row (the cc 10.7 d512 row, ``api_dsl_sm107_d512``) overrides it.
+    _NAME = "sdpa_bwd_sm100"
+    # The template-module cache tag of this row's stage-2 rendering (``load_template``): one per row, because the tag
+    # keys the cache and the test fixtures spy on it to learn which stage-2 FILE served a plan.
+    _STAGE2_TAG = "sdpa_bwd_sm100_stage2"
+
+    def _stage2_file(self) -> str:
+        """The stage-2 kernel FILE this row renders (relative to ``kernels/``): the 4x1 role split unless the module
+        constant ``STAGE2_2X2`` selects the twin.  A subclass pins its own file here."""
+        return _SM100_STAGE2_FILE_2X2 if STAGE2_2X2 else _SM100_STAGE2_FILE
+
+    def _stage2_record(self, stage2_fields: dict):
+        """The stage-2 template record for ``stage2_fields`` (dtype / mask / THD) on this row and device.
+
+        The 4x1 role split takes the base ``TemplateParams`` exactly as it always did (its PTX md5 is pinned).  The 2x2
+        twin's ring levers follow the device's SMEM: 4 chunk stages / 1 cast stage fit SM100's 227 KiB, 8 / 2 fill the
+        Rubin line's 325 KiB (``_rubin_line``).  The ``TemplateParams2x2`` record is built only on the twin path, so the
+        base record (and its digest) is untouched.  A subclass that always renders one arm overrides this."""
+        from cudnn.sdpa.bwd.config_sm100 import TemplateParams
+
+        if not STAGE2_2X2:
+            return TemplateParams(**stage2_fields)
+        from cudnn.frost.device import compute_capability, resolve_device
+        from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
+
+        _major, _minor = compute_capability(resolve_device(self.q_desc.device))
+        _rubin = _rubin_line(_major * 10 + _minor)
+        return TemplateParams2x2(
+            **stage2_fields,
+            stages_kv=8 if _rubin else 4,
+            cast_stages=2 if _rubin else 1,
+            **({"smem_cap_bytes": SM107_USABLE_DYN_SMEM_2X2} if _rubin else {}),
+        )
+
     # --- compilation ---------------------------------------------------------
     def compile(self) -> None:
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
@@ -2078,7 +2122,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             CAUSAL_K_LO,
             CAUSAL_K_NONE,
             MatmulTemplateParams,
-            TemplateParams,
             vec_bytes_epi_for,
         )
 
@@ -2090,25 +2133,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             bottom_right=self.causal_bottom_right,
             thd_varlen=self.thd,
         )
-        if STAGE2_2X2:
-            # The 2x2 twin's ring levers follow the device's SMEM: 4 chunk stages / 1 cast stage fit SM100's 227 KiB,
-            # 8 / 2 fill Rubin's 325 KiB.  Built only on this path, so the base record (and its digest) is untouched.
-            from cudnn.frost.device import compute_capability, resolve_device
-            from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
-
-            _major, _minor = compute_capability(resolve_device(self.q_desc.device))
-            _rubin = _major * 10 + _minor == 107
-            stage2_params = TemplateParams2x2(
-                **stage2_fields,
-                stages_kv=8 if _rubin else 4,
-                cast_stages=2 if _rubin else 1,
-                **({"smem_cap_bytes": SM107_USABLE_DYN_SMEM_2X2} if _rubin else {}),
-            )
-            stage2_file = _SM100_STAGE2_FILE_2X2
-        else:
-            stage2_params = TemplateParams(**stage2_fields)
-            stage2_file = _SM100_STAGE2_FILE
-        stage2_mod = load_template(_sm100_kernel_path(stage2_file), stage2_params, tag="sdpa_bwd_sm100_stage2")
+        stage2_mod = load_template(_sm100_kernel_path(self._stage2_file()), self._stage2_record(stage2_fields), tag=self._STAGE2_TAG)
         # Stage 2's write block = the cluster's q span: 256 on both datapaths (the 2x2 config spells it out; the 4x1
         # config's TILE_M * CTA_MMA is the same number, read through the default).
         gran = getattr(stage2_mod.CFG, "CLUSTER_Q_ROWS", stage2_mod.CFG.TILE_M * stage2_mod.CFG.CTA_MMA)
