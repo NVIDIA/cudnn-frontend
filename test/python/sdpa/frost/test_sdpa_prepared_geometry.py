@@ -16,6 +16,7 @@ def _fixture(*, padded_stats=False):
     b, h, hk, sq, sk, d = 4, 8, 2, 4, 128, 128
     spec = prep.ThdLaunchSpec()
     spec.b, spec.qh, spec.kh, spec.d_qk, spec.d_v = b, h, hk, d, d
+    spec.cga_tile_m = 512
     spec.paged, spec.lens_form = False, 3
     spec.has_lse, spec.has_sink = padded_stats, False
     spec.lse_padded, spec.lse_head_major = padded_stats, False
@@ -28,6 +29,7 @@ def _fixture(*, padded_stats=False):
     spec.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
     spec.index = {name: i for i, name in enumerate(spec.order)}
     spec.template = [None] * len(spec.order)
+    spec.template[spec.index["n_thd_units"]] = b * h
     facts = {}
     for i, (name, heads, seq) in enumerate((("q", h, sq), ("k", hk, sk), ("v", hk, sk), ("o", h, sq))):
         facts[name] = prep.BufferFacts(0x1000 * (i + 1), "bfloat16", (2, 0), b * heads * seq * d, (b, heads, seq, d), (seq * heads * d, d, heads * d, 1))
