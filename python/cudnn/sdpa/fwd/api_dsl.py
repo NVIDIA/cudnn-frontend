@@ -3319,20 +3319,17 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 tensor = self._checked_cu_seq_lens(tensor, name) if cumulative else self._checked_seq_lens(tensor, name)
             lengths.append(tensor)
         sink = None if sinks is None else self._checked_sinks_1d(sinks)
-        # The launch ABI keeps both seq-lens slots tensors; a cached dummy fills an unread one.
-        device = q_tensor.device
-        with _torch_stream_context(stream, device):
-            dummy = self._dummy("seq_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+        # A seq-lens slot the plan does not read is compiled out and binds None.
         if self.thd:
             # One chunk, bound as seq_kv_lens; the launcher refuses a base off the 128-byte tensor-map boundary.
             nbytes = self.scratch_workspace_bytes()
             meta = WorkspaceCarver(workspace, nbytes, "SdpaFwdDslSm90").take(nbytes // 4, torch.int32)
             lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
-            seq_q, seq_kv = dummy, meta
+            seq_q, seq_kv = None, meta
             # thd_max_sq (the plan-time S_q envelope), thd_q_lens, thd_kv_lens, thd_lens_form.
             thd = (cutlass.Int32(self.s_q_max), *lengths, cutlass.Int32(lens_form))
         else:
-            seq_q, seq_kv = (dummy if tensor is None else tensor for tensor in lengths)
+            seq_q, seq_kv = lengths
             thd = (cutlass.Int32(0), None, None, None)
         self._compiled_kernel(*data, lse, sink, seq_q, seq_kv, cutlass.Float32(scale), *thd, stream)
         self._logger.debug("execute completed")
