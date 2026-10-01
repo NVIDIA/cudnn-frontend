@@ -92,6 +92,16 @@ def _zero_bytes(t: cute.Tensor, n16: cutlass.Constexpr[int]):
         i += cutlass.Int64(blocks) * _THREADS
 
 
+@cute.jit
+def _zero_ds(ds_full, config: cutlass.Constexpr, stream):
+    """Zero ONE chunk's dS workspace (``[b_chunk, qh_chunk, S_kv_pad, S_q_pad]`` in the dS dtype) -- the fill the adapter asks
+    for (``api_dsl_sm107._stage3_needs_zero_fill``): once per execute ahead of every chunk (``_stage2_inputs``), or ahead of
+    EACH chunk under the caller's per-batch kv lengths (``host_f16``)."""
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
+    n16 = bc * hc * skvp * sqp * bpe_ds // 16
+    _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+
+
 _zero_bytes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
@@ -543,11 +553,13 @@ def _stage2_inputs(
     # two-sided K-trim the stage-3 GEMMs read only the tiles the main kernel wrote (it rounds every kv block's q range
     # outward to the GEMMs' 256-row pair), so no mask needs it -- except the untrimmed twin (every tile read) and a top-left
     # window with S_q > roundup(S_kv + W, 256), where the q pairs past the last kv block's window are written by nobody.
-    # The skipped set is the same for every chunk.
+    # The skipped set is the same for every chunk -- under the UNIFORM length.  With the caller's per-batch lengths it is per
+    # BATCH (the bottom-right band moves with seq_kv_lens[b]), so `host_f16` zeroes ahead of EACH chunk instead: a workspace
+    # slot a later chunk's batch reuses would otherwise hold the earlier batch's dS in the tiles the later band does not
+    # write (measured as a dead batch coming back with non-zero dQ / dK behind a live one).
     ds_full = _scratch(workspace, regions[R_DS], ds_dtype)
-    if cutlass.const_expr(zero_ws):
-        n16 = bc * hc * skvp * sqp * bpe_ds // 16
-        _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+    if cutlass.const_expr(zero_ws and seq_kv_lens is None):
+        _zero_ds(ds_full, config, stream)
     return q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full
 
 
@@ -748,6 +760,11 @@ def host_f16(
         bb = bi * bc
         for ci in range(h // hc):
             hb = ci * hc
+            # Per-batch kv lengths: the dS zero-fill goes ahead of EACH chunk's kernel (`_stage2_inputs` skipped its once-per-execute
+            # fill) -- under bottom-right the skipped set is per batch, and this slot may still hold the previous chunk's batch in
+            # the tiles this batch's narrower band does not write.
+            if cutlass.const_expr(zero_ws and seq_kv_ptr is not None):
+                _zero_ds(ds_full, config, stream)
             # STAGE 2: head_base / batch_base offset every full-tensor read; dS stays chunk-local.
             main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
             # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.

@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -435,8 +436,8 @@ def test_padding_mask_graph_always_carries_seq_len_q(monkeypatch):
     from cudnn.sdpa import graph_analyzer as ga
 
     monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
-    with pytest.raises((ValueError, RuntimeError, cudnn.cudnnGraphNotSupportedError)):
-        g, _t, _outs = _half_bwd_graph(padded="kv")
+    g, _t, _outs = _half_bwd_graph(padded="kv")
+    with pytest.raises(ValueError, match="Padding mask requires"):
         g.validate()
     g, _t, _outs = _half_bwd_graph(padded=True)
     facts = ga.analyze(g)
@@ -1005,15 +1006,31 @@ def test_adapter_per_batch_kv_lengths_with_a_ragged_s_kv_gqa_and_window():
 
 
 @requires_rubin
-def test_adapter_per_batch_kv_lengths_bottom_right_fills_the_workspace():
+@pytest.mark.parametrize("chunks", [1, 2], ids=["one-chunk", "two-batch-chunks"])
+@pytest.mark.parametrize("left", [None, 200], ids=["no-window", "window-200"])
+def test_adapter_per_batch_kv_lengths_bottom_right_fills_the_workspace(monkeypatch, left, chunks):
     """Bottom-right causal with per-batch lengths: the kernel's diagonal is ``len_b - S_q`` per batch (negative for the
     300-length entry: its first 212 query rows have no key and read as dead rows) while the stage-3 K-trim is computed from
-    the uniform ``S_kv - S_q``, so the GEMMs can reach tiles the kernel's narrower band never wrote.
-    ``_stage3_needs_zero_fill(per_batch_kv=True)`` keeps the whole-chunk zero-fill for exactly this arm; the workspace is
-    poisoned with 0xFF (NaN) so a tile read without the fill would land NaN in dQ / dK."""
-    lens = [1024, 700, 300, 0]
-    run = _run_adapter(b=4, hq=2, sq=512, skv=1024, kv_lens=lens, causal=True, bottom_right=True, poison=float("nan"), ws_poison=0xFF).check()
+    the uniform ``S_kv - S_q``.  Three rules keep the GEMMs reading only zeros or what the kernel wrote, each with a cell here:
+    ``_stage3_needs_zero_fill(per_batch_kv=True)`` keeps the dS zero-fill (the trim reaches tiles a shorter batch's band never
+    wrote; the workspace is poisoned with 0xFF = NaN so a tile read without the fill lands NaN in dQ / dK);
+    ``_stage3_trim_window`` drops the window from the trim (``window-200``: with the uniform window edge the GEMMs SKIPPED the
+    shorter batches' live tiles -- dQ cosine 0.65, their max|diff| = max|ref|); and the fill runs ahead of every chunk
+    (``two-batch-chunks``: the budget is shrunk so B = 4 runs as two batch chunks x two head chunks, slot 0 holding 1024 then
+    700 and slot 1 holding 300 then a DEAD batch -- with one fill per execute the dead batch came back with dQ 2.1 / dK 2.8
+    of stale dS and the 700-length one 0.16 / 0.24 off).  Every cell: the oracle composes the same lengths and band, dead rows
+    exact zeros."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    b, hq, sq, skv, dt = 4, 2, 512, 1024, torch.bfloat16
+    lens = [1024, 300, 700, 0]
+    if chunks > 1:
+        # `_sm107_chunks` shrinks heads first, then the batch: at this budget (two per-(batch, head) slabs) B = 4, H = 2 chunks
+        # as b_chunk = 2, qh_chunk = 1 -- four launches over the one workspace slot pair.
+        monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", (b // chunks) * sq * skv * torch.tensor([], dtype=dt).element_size())
+    run = _run_adapter(b=b, hq=hq, sq=sq, skv=skv, dt=dt, kv_lens=lens, causal=True, bottom_right=True, left=left, poison=float("nan"), ws_poison=0xFF).check()
     assert run.api._zero_ws is True, "bottom-right under per-batch lengths must zero-fill the dS workspace"
+    assert (run.api._b_chunk, run.api._qh_chunk) == ((b, hq) if chunks == 1 else (b // chunks, 1)), (run.api._b_chunk, run.api._qh_chunk)
     _assert_dead_kv_rows_exactly_zero(run, lens)
 
 
@@ -2014,7 +2031,7 @@ def test_half_adapter_admits_per_batch_kv_lengths():
     the lengths alone (a tile-multiple S_kv), the workspace plan is unchanged (the ``seq_kv`` region stays carved -- fixed
     ABI), the prepared spec carries the lengths as its tenth operand, and the stage-3 zero-fill returns for exactly the
     bottom-right arms (the per-batch diagonal moves the kernel's band under the GEMMs' uniform trim) and nothing else."""
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, _stage3_needs_zero_fill
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, _stage3_needs_zero_fill, _stage3_trim_window
     from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16, ROLES_F16
 
     api = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True)
@@ -2037,6 +2054,23 @@ def test_half_adapter_admits_per_batch_kv_lengths():
     assert not _stage3_needs_zero_fill(False, 199, False, 1024, 1024, 256, per_batch_kv=True)
     assert not _stage3_needs_zero_fill(False, None, False, 512, 1024, 256, per_batch_kv=True)
     assert not _stage3_needs_zero_fill(True, None, True, 512, 1024, 256), "uniform lengths: the two-sided trim reads only what was written (unchanged)"
+    # The stage-3 trim's window under per-batch lengths: dropped for bottom-right (a window edge anchored on the uniform
+    # diagonal would skip a shorter batch's live tiles), kept for top-left bands and for every uniform-length graph.
+    assert _stage3_trim_window(199, True, True, True) is None
+    assert _stage3_trim_window(None, True, True, True) is None
+    assert _stage3_trim_window(199, True, False, True) == 199
+    assert _stage3_trim_window(199, False, False, True) == 199
+    assert _stage3_trim_window(199, True, True, False) == 199
+    # ... and the half row's records take it: bottom-right + window + per-batch lengths render the plain bottom-right band
+    # (`causal_window == 0`, the diagonal kept) where the uniform-length twin keeps the window.
+    mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
+    br_window = dict(sq=512, skv=1024, is_causal=True, causal_bottom_right=True, window_size_left=199)
+    dk, dq = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, **br_window)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (0, 0) and dk.causal_diag and dq.causal_diag and dk.causal_shift == dq.causal_shift == 512
+    dk, dq = _adapter(SdpaBwdDslSm107, **br_window)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (199, 199) and dk.causal_shift == dq.causal_shift == 512
+    dk, dq = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, sq=512, skv=1024, is_causal=True, window_size_left=199)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (199, 199) and dk.causal_shift == dq.causal_shift == 0, "a top-left band keeps its window"
 
 
 def test_half_adapter_execute_requires_the_lengths_exactly_when_planned(monkeypatch):

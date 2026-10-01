@@ -62,12 +62,21 @@ Per-batch kv lengths (``seq_kv_lens_present=True`` at construction, then
 ``execute(seq_kv_lens=<[B] int32>)``): the HALF row binds the caller's lengths in place of
 the uniform fill and the same padded-mask arm reads ``seq_kv_lens[b]`` -- a kv row at or
 past its batch's length is select-dead (P = 0 -> dS = dV = 0 exactly; a zero length is a
-dead batch whose dQ / dK / dV come back as exact zeros, whatever its LSE holds).  Under
-bottom-right causal the diagonal becomes per batch (``seq_kv_lens[b] - S_q``, the
-forward's convention), so the stage-3 K-trim -- computed from the uniform ``S_kv - S_q``
--- can reach tiles the kernel's narrower band did not write; :func:`_stage3_needs_zero_fill`
-keeps the whole-chunk zero-fill for exactly that case (a top-left band does not move with
-the length).  The fp8 / MXFP8 bodies take ONE uniform ``seqlen_kv_real``, so their adapters
+dead batch whose dQ / dK / dV come back as exact zeros, whatever its LSE holds).
+``seq_kv_lens[b]`` must satisfy ``0 <= len <= S_kv``: device data the host cannot validate
+without a synchronization, so an out-of-range value is the caller's contract violation (as
+on the forward).  Under bottom-right causal the diagonal becomes per batch
+(``seq_kv_lens[b] - S_q``, the forward's convention) while the stage-3 K-trim is computed
+from the uniform ``S_kv - S_q``, and three rules keep the GEMMs reading only zeros or what
+the kernel wrote: :func:`_stage3_needs_zero_fill` keeps the dS zero-fill for exactly that
+arm (the trim can reach tiles a shorter batch's band did not write);
+:func:`_stage3_trim_window` drops a sliding window from the trim (a window edge anchored on
+the uniform diagonal would SKIP live tiles of a shorter batch -- dQ / dK missing, finite, no
+crash); and the fill runs ahead of EVERY batch / head chunk rather than once per execute
+(``prepared_host.host_f16``: the skipped set is per batch, so a chunk's workspace slot may
+hold the previous batch's dS in tiles the next batch's narrower band does not write).  A
+top-left band does not move with the length and needs none of the three.  The fp8 / MXFP8
+bodies take ONE uniform ``seqlen_kv_real``, so their adapters
 decline per-batch lengths; no body threads per-batch Q lengths (``seq_q_lens``), and a
 GRAPH padding mask always carries ``seq_len_q`` as well (the frontend requires both), which
 is why every row keeps ``Capabilities.padded = False`` and the graph form stays declined at
@@ -388,6 +397,9 @@ def _stage3_needs_zero_fill(
     the GEMMs' trim is computed from the uniform ``S_kv - S_q``, so a batch whose length is short of S_kv has a band the
     trim's K range can reach below (dK) or past (dQ) -- tiles the kernel never wrote, every cell of them masked.  The fill
     makes those reads exact zeros; a top-left band (causal or window) does not move with the length, so it needs nothing.
+    Two companions of this case live elsewhere: the trim drops a sliding window for it (``_stage3_trim_window``), and the
+    prepared host runs the fill ahead of every chunk, not once per execute (``prepared_host.host_f16``) -- the skipped set is
+    per BATCH, so a later chunk's batch would otherwise read the previous batch's dS out of its workspace slot.
 
     Dense (no mask) never needs it: every tile is written.  The fill is a whole-chunk ``cudaMemset``-class kernel outside
     the harness's kernel-time filter -- 0.44 ms per 8K backward when it ran under every mask (MASK_FLOPS.md).
@@ -404,6 +416,28 @@ def _stage3_needs_zero_fill(
         last_written_q = -(-(s_kv_pad + int(window)) // gran) * gran
         return s_q_pad > last_written_q
     return False
+
+
+def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool, per_batch_kv: bool) -> Optional[int]:
+    """The sliding window the stage-3 K-trim may use: the graph's ``window_left``, or None -- the window dropped from the
+    trim -- under PER-BATCH kv lengths with bottom-right causal.
+
+    The kernel anchors BOTH band edges on the per-batch diagonal (``seq_kv_lens[b] - S_q``: ``bprop_d256_f16._mask_p_chunk``,
+    ``_q_loop_bounds``), the GEMMs on the uniform one (``S_kv - S_q``: ``bprop_matmul_blackwell._causal_k_range``).  The CAUSAL
+    edge survives the mismatch: it rounds outward from the uniform diagonal, which sits at or past every per-batch one
+    (``len_b <= S_kv``), so the plain bottom-right range is a superset of every batch's band and whatever it reaches beyond
+    the kernel's band is the zero-fill's (``_stage3_needs_zero_fill``).  The WINDOW edge does not: for a batch shorter than
+    S_kv the live dS tiles sit past the uniform window's ``k_hi`` on dK and below its ``k_lo`` on dQ, and the GEMMs skip
+    them -- that batch's dQ / dK come back missing most of their mass, finite, no crash (measured on Rubin at lengths
+    [1024, 700, 300, 0], S_q 512, S_kv 1024, window 200: dQ cosine 0.65 against the oracle, the two shorter batches'
+    max|diff| equal to max|ref|; the same shape without the window, and with a top-left window, exact).  So the trim reads
+    the plain bottom-right band for that arm -- the kernel still writes only its per-batch window band, the fill makes the
+    rest exact zeros -- at the cost of the window's trim on stage 3 for that arm alone.  A top-left band does not move with
+    the length and keeps its window; so does every uniform-length graph.
+    """
+    if per_batch_kv and causal and bottom_right and window is not None:
+        return None
+    return window
 
 
 def _bshd_physical_ok(desc: TensorDesc) -> bool:
@@ -618,13 +652,15 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _stage3_records(self, mod, tile_mn):
         """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+        # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
+        window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
         return _stage3_params(
             _DTYPE_CODE[self._ds_dtype],
             bool(self.is_causal),
             shift,
             _cfg.kv_pad_rows(mod.CFG),
             cgrp_tile_mn=tile_mn,
-            window=self.window_size_left,
+            window=window,
             gqa_group=self._gqa_group,
         )
 
@@ -704,7 +740,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         tensors (``prepared_sm107.execute_standalone``).  Every operand must carry the plan's
         geometry; the workspace is the caller's (``scratch_workspace_bytes()`` bytes).
         ``seq_kv_lens`` ([B] int32, contiguous, on the plan's device) is required exactly when
-        the plan was built with ``seq_kv_lens_present=True`` (module doc)."""
+        the plan was built with ``seq_kv_lens_present=True`` (module doc); every entry must
+        satisfy ``0 <= len <= S_kv`` -- device data, not validated here."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self.compile()
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens)
@@ -1228,4 +1265,5 @@ __all__ = [
     "STAGE3_CAUSAL_TRIM",
     "STAGE3_D256_TILE",
     "_stage3_needs_zero_fill",
+    "_stage3_trim_window",
 ]

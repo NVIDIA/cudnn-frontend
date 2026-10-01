@@ -939,7 +939,9 @@ requires them — and no body threads per-batch Q lengths, so the graph form is 
 rather than served while ignoring the q lengths; the f16 body does read per-batch kv
 lengths, which the half row's STANDALONE adapter serves — `seq_kv_lens_present=True`
 + `execute(seq_kv_lens=)`, the same padded-mask arm, dead rows / batches exact zeros,
-bottom-right keeps the dS zero-fill for its per-batch diagonal; the fp8 body takes one
+bottom-right keeps the dS zero-fill for its per-batch diagonal — ahead of every chunk, and
+with a sliding window dropped from the stage-3 trim, so the GEMMs read the plain
+bottom-right band there; the fp8 body takes one
 uniform `seqlen_kv_real`, so its adapter declines them too; tests
 `test_sdpa_bwd_dsl_sm107.py::test_adapter_per_batch_kv_lengths*`,
 `::test_adapter_dead_kv_entry_is_exactly_zero`, `::test_padding_mask_graph_always_carries_seq_len_q`),
@@ -994,7 +996,9 @@ lowering). **Declined, each asserted by a test:** `amax_dQ / dK / dV` requested 
 outputs — the backend's canonical MXFP8 backward graph declares them
 (`test/python/sdpa/mxfp8.py`), so this is a documented parity gap (AGENTS Rule 9): the
 row produces no amax; E5M2; fp16 gradients; bottom-right at a ragged
-S_q; dense padding masks; sink / dSink; bias / dBias; right-band widening; THD;
+S_q; padding masks (the graph form, which carries `seq_len_q`, and per-batch kv lengths
+on the standalone surface — this body takes one uniform `seqlen_kv_real`); sink / dSink;
+bias / dBias; right-band widening; THD;
 `dense_flex`; decode shapes; `use_deterministic_algorithm` (no atomics anywhere in the
 chain; the shared decline reason no longer blames "fp32 atomics" — it reads "this engine
 has not claimed the two-run bitwise guarantee"; the two-run bitwise pin

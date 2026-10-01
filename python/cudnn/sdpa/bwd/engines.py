@@ -1041,8 +1041,12 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arms no body
+        # threads (per-batch Q lengths; per-batch kv lengths on the fp8 / MXFP8 bodies).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1220,8 +1224,12 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arms no body
+        # threads (per-batch Q lengths; per-batch kv lengths on the fp8 / MXFP8 bodies).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
         # A plan fact: which amax pointers the prepared artifact binds (None-specialized otherwise).
         amax_requested=tuple(name for name, t in amaxes.items() if t is not None),
     )

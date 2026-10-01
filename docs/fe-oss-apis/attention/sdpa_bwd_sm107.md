@@ -186,9 +186,15 @@ padded-mask specialization then reads `seq_kv_lens[b]` in place of the uniform
 length: every kv row at or past its batch's length is select-dead (dS = dV = 0
 exactly), a length of 0 is a dead batch whose dQ / dK / dV are exact zeros whatever
 its Stats rows hold (0 or `-inf`), and under bottom-right causal the diagonal is per
-batch (`seq_kv_lens[b] − S_q`) — the one arm for which the chain keeps the dS
-workspace zero-fill, since the GEMMs' K-trim is computed from the uniform
-`S_kv − S_q`. The **graph** padding mask stays declined on every row: a padded
+batch (`seq_kv_lens[b] − S_q`) while the GEMMs' K-trim is computed from the uniform
+`S_kv − S_q` — so for that arm the chain keeps the dS workspace zero-fill, runs it ahead
+of every batch / head chunk (a chunk's workspace slot may hold the previous batch's dS in
+tiles the next batch's narrower band does not write), and drops a sliding window from the
+stage-3 trim (a window edge anchored on the uniform diagonal would skip live tiles of a
+shorter batch): the GEMMs read the plain bottom-right band there. Every entry must satisfy
+`0 <= seq_kv_lens[b] <= S_kv` — device data the host does not validate; an out-of-range
+value is the caller's contract violation, as on the forward. The **graph** padding mask
+stays declined on every row: a padded
 `sdpa_backward` graph carries `seq_len_q` as well as `seq_len_kv` (the frontend
 requires both) and no body threads per-batch Q lengths, so serving the graph form
 would mean ignoring the q lengths. The fp8 and MXFP8 bodies take one uniform real kv

@@ -281,8 +281,13 @@ def test_capabilities_match_what_is_implemented():
     assert not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
-        assert not getattr(c, deferred), f"{deferred} is deferred to PR-2c (plan Q4): claim it together with its accept test here and the tracker line"
+    for deferred in ("sink", "dsink", "deterministic"):
+        assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
+    assert not c.padded, (
+        "padded stays declined on the graph: a padded backward graph carries seq_len_q (the frontend requires both lengths) and no body "
+        "threads per-batch Q lengths; this body takes ONE uniform seqlen_kv_real, so the half row's standalone per-batch kv lengths are "
+        "declined here too (test_fp8_adapter_declines_per_batch_kv_lengths)"
+    )
 
 
 # =========================================================================== REJECT -- asserted on REAL graphs (host, fake cc 10.7)

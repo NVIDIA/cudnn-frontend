@@ -1134,8 +1134,13 @@ def test_row_capabilities_match_what_is_implemented():
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "the sm107 rows have no tile axis ({} is the complete record)"
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
+    for deferred in ("sink", "dsink", "deterministic"):
         assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
+    assert not c.padded, (
+        "padded stays declined on the graph: a padded backward graph carries seq_len_q (the frontend requires both lengths) and no body "
+        "threads per-batch Q lengths; this body takes ONE uniform seqlen_kv_real, so the half row's standalone per-batch kv lengths are "
+        "declined here too (test_reject_padding_mask)"
+    )
 
 
 def test_row_ships_the_p_b_chain_and_the_sf_pad_staging():
