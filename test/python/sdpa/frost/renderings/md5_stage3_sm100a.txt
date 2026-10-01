@@ -1,14 +1,17 @@
-# PTX md5 of the SM100 d512 chain's ten stage-3 renderings (`bwd/kernels/bprop_matmul_blackwell.py` at the default
-# (512, 512) row, the records EXACTLY as `SdpaBwdDslSm100.compile` spells them: both operand majors x {dense, causal, causal
-# bottom-right 512, THD} bf16 + the dense fp16 pair), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 (origin/develop merged
-# into vagarwalla/frost-d256-2x2; the stage-3 template there is develop's) on 2026-10-01 BEFORE any stage-3 edit
-# (lanes2/stage3_gemm/md5_stage3_pre_edit_run{1,2}.txt, rendered twice, identical).  The probe is
-# `_SM100_PTX_PROBE` over `_SM100_STAGE3_RECORDS` in the cc 10.7 backward suite, where the pin lives (its B=1 H=8 S=1024 D=256 shapes: the THD pair folds
-# the probe's strides into its setup kernel, so those two md5s depend on the shapes; the other eight do not).  The PTX text is a
-# function of the DSL build: test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list compares only when the installed
-# DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.  The two `*_512x256` lines are the
-# (512, 256) row's dense renderings (what the chain renders for dense BSHD S_kv <= 4096 since the tile rule landed), rendered on
-# the same date from the same tree (lanes2/stage3_gemm/md5_stage3_pre_edit_run2.txt extras).
+# PTX md5 of the SM100 d512 chain's stage-3 renderings (`bwd/kernels/bprop_matmul_blackwell.py`), the records EXACTLY as
+# `SdpaBwdDslSm100.compile` spells them, CUTE_DSL_ARCH=sm_100a: the TEN default (512, 512)-row renderings -- both operand majors
+# x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair -- rendered from d4b024671 (origin/develop merged
+# into vagarwalla/frost-d256-2x2; the stage-3 template there is develop's) on 2026-10-01 BEFORE any stage-3 edit, twice,
+# identical; plus the EIGHT `*_512x256` lines: the (512, 256) row's renderings of the eight BSHD records, which the chain renders
+# by default for BSHD at padded max(S_q, S_kv) <= 4096 on cc 10.0 .. 10.6 since the tile rule
+# (`api_dsl._sm100_stage3_cgrp_tile_mn`) landed -- rendered twice from the same tree + rule on the same date, identical, with
+# the ten (512, 512) lines re-rendering byte-identical alongside them (a row choice is a template PARAMETER; it changes no
+# default rendering).  The probe is `_SM100_PTX_PROBE` over `_SM100_STAGE3_RECORDS` in the cc 10.7 backward suite, where the pin
+# lives (its B=1 H=8 S=1024 D=256 shapes: the THD pair folds the probe's strides into its setup kernel, so those two md5s depend
+# on the shapes; the other sixteen do not).  Which names must be here is DERIVED from the rule by
+# test_stage3_md5_record_is_committed_and_complete (`_stage3_default_tiles`), not hand-kept.  The PTX text is a function of the
+# DSL build: test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list compares only when the installed DSL matches
+# the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
 dsl=nvidia-cutlass-dsl 4.7.0
 stage3 sm_100a lo_dense rc=0 ptx_md5=34bc834735dfa2216dd972bff483ff18
 stage3 sm_100a hi_dense rc=0 ptx_md5=e190516bf1e057043237b657b4772d86
@@ -22,3 +25,9 @@ stage3 sm_100a lo_dense_fp16 rc=0 ptx_md5=55a9ed26ae049dd3b38e8607e025ecb8
 stage3 sm_100a hi_dense_fp16 rc=0 ptx_md5=5a205ffa0564265c03fef7d6762cd2d8
 stage3 sm_100a lo_dense_512x256 rc=0 ptx_md5=a33a6f01a4a1a253cb967cab3dc8caae
 stage3 sm_100a hi_dense_512x256 rc=0 ptx_md5=0637284273b71c6eb5087d2946ca6aa2
+stage3 sm_100a lo_causal_512x256 rc=0 ptx_md5=39c6beb1c7d01a4bb3badfd711ab6c25
+stage3 sm_100a hi_causal_512x256 rc=0 ptx_md5=69088f92ac7ac7761c4663be2b569d9c
+stage3 sm_100a lo_causal_br512_512x256 rc=0 ptx_md5=e4d06a669b8bf26ec26052633b8877c0
+stage3 sm_100a hi_causal_br512_512x256 rc=0 ptx_md5=944eccd0a7991052c9d143e31848a1d5
+stage3 sm_100a lo_dense_fp16_512x256 rc=0 ptx_md5=a96d5f731334340db5d03747ce6404c5
+stage3 sm_100a hi_dense_fp16_512x256 rc=0 ptx_md5=692ad5656537cc45b7c601d3dfba930d
