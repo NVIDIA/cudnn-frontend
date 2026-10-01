@@ -174,13 +174,37 @@ def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
+def stage2_datapath(request, monkeypatch):
+    """Both stage-2 datapaths of the chain: the cga4x1 role split (``bprop_d512_f16.py``, what ships) and the fused
+    2x2 twin (``bprop_d512_f16_2x2.py``, ``api_dsl.STAGE2_2X2``).  The twin is a module constant read at compile()
+    time, so flipping it here reaches every plan the test builds; the 4x1 arm runs with the constant at its default
+    (not merely unpatched) so the pair is a real A/B.  A spy on ``load_template`` records which stage-2 FILE served
+    the plan -- the two kernels share a symbol name, so the file is the only honest witness."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
+    served = []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == "sdpa_bwd_sm100_stage2":
+            served.append(path.rsplit("/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    yield request.param
+    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
+    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
+
+
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
-def test_dense(dt):
+def test_dense(dt, stage2_datapath):
     _run(dt=dt)
 
 
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
-def test_causal_dtypes(dt):
+def test_causal_dtypes(dt, stage2_datapath):
     """Both dtypes through the masked path too: the causal chain reads the
     workspace back in the io dtype, so a dtype mix-up shows up here and not in
     the dense case."""
@@ -188,53 +212,61 @@ def test_causal_dtypes(dt):
 
 
 @pytest.mark.parametrize("d", [264, 320, 384, 511 - 7, _D])
-def test_head_dim_band(d):
+def test_head_dim_band(d, stage2_datapath):
     """d in (256, 512], any multiple of 8. 264 and 504 are not multiples of 16,
     which narrows the stage-3 epilogue store vector from 32 B to 16 B."""
     _run(sq=256, skv=256, d=d)
 
 
 @pytest.mark.parametrize("hq,hkv", [(8, 8), (8, 4), (8, 2), (8, 1), (6, 3)])
-def test_gqa_mqa(hq, hkv):
+def test_gqa_mqa(hq, hkv, stage2_datapath):
     _run(hq=hq, hkv=hkv, sq=256, skv=256)
 
 
-def test_causal_top_left():
+def test_causal_top_left(stage2_datapath):
     _run(keep=_causal_keep(512, 512), use_causal_mask=True)
 
 
-def test_causal_bottom_right():
+def test_causal_bottom_right(stage2_datapath):
     _run(keep=_causal_keep(512, 512, bottom_right=True), use_causal_mask_bottom_right=True)
 
 
-def test_causal_bottom_right_rectangular():
+def test_causal_bottom_right_rectangular(stage2_datapath):
     """S_kv > S_q shifts the diagonal, which the stage-3 K-trim has to follow."""
     _run(sq=512, skv=1024, keep=_causal_keep(512, 1024, bottom_right=True), use_causal_mask_bottom_right=True)
 
 
-def test_sliding_window():
+def test_sliding_window(stage2_datapath):
     _run(keep=_causal_keep(512, 512, left=256), use_causal_mask=True, diagonal_band_left_bound=256)
 
 
-def test_right_band_widening():
+def test_right_band_widening(stage2_datapath):
     """`diagonal_band_right_bound` alone -- passing use_causal_mask with it
     forces the bound back to 0 and the widening is silently dropped."""
     _run(keep=_causal_keep(512, 512, right=64), diagonal_band_right_bound=64)
 
 
 @pytest.mark.parametrize("sq,skv", [(500, 500), (300, 200), (257, 129), (384, 640)])
-def test_non_tile_multiple_seqlens(sq, skv):
+def test_non_tile_multiple_seqlens(sq, skv, stage2_datapath):
     """Neither S_q nor S_kv has to be a tile multiple: the compile shape rounds
     up and the tail is masked."""
     _run(sq=sq, skv=skv)
 
 
 @pytest.mark.parametrize("sq,skv", [(500, 500), (1000, 1000)])
-def test_non_tile_multiple_causal(sq, skv):
+def test_non_tile_multiple_causal(sq, skv, stage2_datapath):
     _run(sq=sq, skv=skv, keep=_causal_keep(sq, skv), use_causal_mask=True)
 
 
-def test_default_attn_scale():
+def test_upper_half_masked_columns(stage2_datapath):
+    """The 2x2 lane-map detector: ``S_kv = 96`` in a 128-wide tile masks EXACTLY the upper 64-column half of every
+    kv tile.  Under the fused kernel the two halves live in different warps (``col_half = warp // 2``); a wrong
+    lane -> (row, half) map gives correct dense output and wrong masked columns, which no symmetric random dense
+    case can see.  (Padding is served by rounding the compile shape up and masking the tail.)"""
+    _run(sq=128, skv=96)
+
+
+def test_default_attn_scale(stage2_datapath):
     """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d).
 
     The adapter used to leave `scale_softmax` at None and die in execute with
@@ -686,7 +718,7 @@ def _check_prepared(case, tensors=None, expected=None):
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("hkv", [4, 2])
-def test_prepared_sm100_rebind_stream_and_replay(dtype, causal, hkv):
+def test_prepared_sm100_rebind_stream_and_replay(dtype, causal, hkv, stage2_datapath):
     case = _prepared_case(dtype=dtype, causal=causal, hkv=hkv, chunks=True)
     tensors = {name: value.clone() for name, value in case.tensors.items()}
     pack = {case.refs[name]: value for name, value in tensors.items()}
@@ -822,3 +854,276 @@ def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_p
     from prepared_bwd_cache_utils import check_backward_artifact_reload
 
     check_backward_artifact_reload("sm100", route, dtype, tmp_path)
+
+
+@pytest.mark.parametrize("route", ["dense_2x2", "thd_2x2"])
+def test_prepared_backward_artifact_reloads_in_fresh_process_2x2(route, tmp_path):
+    """The twin's artifact (its own template digest, so its own cache entry) exports and reloads in a second process
+    with JIT forbidden; the child flips ``api_dsl.STAGE2_2X2`` before building the plan."""
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm100", route, "bfloat16", tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# The 2x2 stage-2 twin: byte-identical default, bitwise twin, SASS pins       #
+# --------------------------------------------------------------------------- #
+
+import hashlib as _hashlib
+import json as _json
+import os as _os
+import re as _re
+import subprocess as _subprocess
+import sys as _sys
+import textwrap as _textwrap
+from pathlib import Path as _Path
+
+from frost_test_utils import arch_known_to_the_dsl, assert_no_new_spills, run_sass_probe, sass_probe_source
+
+# Stage-2 renderings of the SM100 d512 chain, by the fields `SdpaBwdDslSm100.compile` spells (dense / causal / fp16 / THD).
+_STAGE2_4X1_RECORDS = {
+    "dense_bf16": dict(dtype_qkv=2),
+    "causal_bf16": dict(dtype_qkv=2, window_right=0),
+    "dense_fp16": dict(dtype_qkv=3),
+    "thd_bf16": dict(dtype_qkv=2, thd_varlen=True),
+}
+# A host-only trace-compile of ONE stage-2 template's `_host` over fixed fake layouts (B=1 H=8 S=1024 d=512); the md5 of
+# the dumped PTX is the rendering's identity (PTX, not cubin: ptxas renames uniform registers run to run).  The same probe
+# serves the SASS pins (it is the only thing that compiles stage 2 outside the prepared chain).
+_STAGE2_PROBE_BODY = r"""
+import cutlass
+import cutlass.cute as cute
+from cudnn.frost.template_loader import load_template
+from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+from cudnn.sdpa.bwd.config_sm100 import TemplateParams, TemplateParams2x2
+kernel_file, twin = params_kw.pop("kernel_file"), params_kw.pop("twin")
+params = TemplateParams2x2(**params_kw) if twin else TemplateParams(**params_kw)
+mod = load_template(_sm100_kernel_path(kernel_file), params, tag="stage2_probe")
+print("DESC_VERSION", int(getattr(mod, "DESC_VERSION", 0)))
+print("CLUSTER_Q_ROWS", int(getattr(mod.CFG, "CLUSTER_Q_ROWS", mod.CFG.TILE_M * mod.CFG.CTA_MMA)))
+print("N_CHUNKS", int(getattr(mod.CFG, "N_CHUNKS", 0)))
+io = cutlass.Float16 if int(params.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
+B, H, S, D = 1, 8, 1024, 512
+PROBLEM = (B, H, S, S, H, H, S, S, 37 if params.thd_varlen else 0)
+
+@cute.jit
+def probe(entry: cutlass.Constexpr, q_ptr: cute.Pointer, k_ptr: cute.Pointer, v_ptr: cute.Pointer, do_ptr: cute.Pointer, s_ptr: cute.Pointer,
+          ds_ptr: cute.Pointer, lse_ptr: cute.Pointer, dd_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer, stream):
+    bshd = cute.make_layout((B, S, H, D), stride=(S * H * D, H * D, D, 1))
+    ws = cute.make_layout((B, H, S, S), stride=(H * S * S, S * S, S, 1))
+    row = cute.make_layout((B, H, S), stride=(H * S, S, 1))
+    entry(cute.make_tensor(q_ptr, bshd), cute.make_tensor(k_ptr, bshd), cute.make_tensor(v_ptr, bshd), cute.make_tensor(do_ptr, bshd),
+          cute.make_tensor(s_ptr, ws), cute.make_tensor(ds_ptr, ws), cute.make_tensor(lse_ptr, row), cute.make_tensor(dd_ptr, row),
+          cute.make_tensor(meta_ptr, cute.make_layout((5 * B + 5,), stride=(1,))), cute.make_tensor(desc_ptr, cute.make_layout((64,), stride=(1,))),
+          PROBLEM, cutlass.Float32(0.5), cutlass.Float32(0.7), cutlass.Float32(0.5), cutlass.Int32(0), cutlass.Int32(0), stream)
+
+def ptr(t, align=16):
+    return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+cute.compile(probe, mod._host, ptr(io), ptr(io), ptr(io), ptr(io), ptr(io), ptr(io), ptr(cutlass.Float32, 4), ptr(cutlass.Float32, 4),
+             ptr(cutlass.Int32, 4), ptr(cutlass.Int64, 8), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+             options="--enable-tvm-ffi --gpu-arch " + arch)
+"""
+_STAGE2_PTX_PROBE = _textwrap.dedent(r"""
+    import glob, hashlib, json, os, sys
+    dump, arch, params_json = sys.argv[1], sys.argv[2], sys.argv[3]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "ptx"
+    os.environ["CUTE_DSL_ARCH"] = arch
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    params_kw = json.loads(params_json)
+    %(body)s
+    ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
+    if not ptxs:
+        print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
+    print("PTX_MD5", hashlib.md5(open(ptxs[-1], "rb").read()).hexdigest())
+    """) % {"body": _textwrap.dedent(_STAGE2_PROBE_BODY)}
+
+
+def _stage2_md5_record():
+    """``frost_dev/results/bwd_d512_2x2/renderings/md5_stage2_4x1_sm100a.txt`` of this checkout or of the main checkout
+    (a worktree's frost_dev is untracked) -- the LOCAL-ONLY record of the 4x1 stage-2 PTX md5s, rendered from the tree
+    BEFORE the 2x2 twin landed (develop a3eed7d04, DSL 4.7.0).  Lines: ``stage2_4x1 sm_100a <record> rc=0 ptx_md5=<md5>``."""
+    root = _Path(__file__).resolve().parents[4]
+    roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
+    for r in roots:
+        f = r / "frost_dev" / "results" / "bwd_d512_2x2" / "renderings" / "md5_stage2_4x1_sm100a.txt"
+        if f.is_file():
+            return f
+    return None
+
+
+@pytest.mark.parametrize("record", list(_STAGE2_4X1_RECORDS))
+def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
+    """The 4x1 stage-2 rendering is PTX-IDENTICAL to the tree before the 2x2 twin: the twin is a sibling FILE with its own
+    config record, ``make_bwd_decode`` reads the cluster span through ``getattr`` with the 4x1 defaults, and the adapter's
+    ``gran`` getattr folds to the same 256.  Compared against the local-only pre-edit record (skipped where absent, like the
+    stage-3 pin); a host trace-compile for sm_100a, no device."""
+    f = _stage2_md5_record()
+    if f is None:
+        pytest.skip("no local pre-edit PTX md5 record (frost_dev/results/bwd_d512_2x2/renderings/md5_stage2_4x1_sm100a.txt)")
+    want = {}
+    for ln in f.read_text().splitlines():
+        m = _re.match(r"stage2_4x1 sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    if not arch_known_to_the_dsl("sm_100a"):
+        pytest.skip("this cutlass-dsl has no sm_100a")
+    dump = tmp_path / f"sm100a_stage2_4x1_{record}"
+    dump.mkdir()
+    script = dump / "ptx_probe.py"
+    script.write_text(_STAGE2_PTX_PROBE)
+    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False)
+    proc = _subprocess.run([_sys.executable, str(script), str(dump), "sm_100a", _json.dumps(kw)], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_100a trace-compile of the 4x1 stage-2 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION")))
+    assert out["CLUSTER_Q_ROWS"] == "256"
+    got = out["PTX_MD5"].strip()
+    print(f"\nSM100 stage-2 4x1 {record}: PTX md5 {got} (pre-edit {want[record]})")
+    assert got == want[record], f"{record}: PTX md5 {got} != the pre-edit record's {want[record]} -- the 4x1 stage-2 rendering changed"
+
+
+def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **sdpa_kwargs):
+    """Build + pin + execute with ``STAGE2_2X2 = twin``; return int16 views of dQ / dK / dV and of the S / dS workspace
+    regions, plus the stage-2 file that served the plan."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", twin)
+    served = []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == "sdpa_bwd_sm100_stage2":
+            served.append(path.rsplit("/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
+    idx = _plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
+    for x in (dq, dk, dv):
+        x.fill_(float("nan"))
+    g.execute(
+        {
+            t["q"]: tensors["q"],
+            t["k"]: tensors["k"],
+            t["v"]: tensors["v"],
+            t["o"]: tensors["o"],
+            t["do"]: tensors["do"],
+            t["stats"]: tensors["stats"],
+            dq_t: dq,
+            dk_t: dk,
+            dv_t: dv,
+        },
+        ws,
+    )
+    torch.cuda.synchronize()
+    # The prepared workspace: [delta f32 | S | dS | ...], every region 128-B aligned (prepared_sm100.compile_plan).
+    api = g._compiled_plans[g._plan_index]
+    align = lambda n: (n + 127) // 128 * 128
+    delta = align(b * hq * (-(-sq // 128) * 128) * 4)
+    region = align(b * api._qh_chunk * api._sq_pad * api._skv_pad * 2)
+    s_ws, ds_ws = ws[delta : delta + region].clone(), ws[delta + region : delta + 2 * region].clone()
+    assert served == ["bprop_d512_f16_2x2.py" if twin else "bprop_d512_f16.py"], served
+    return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)] + [s_ws, ds_ws]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024),
+        dict(b=1, hq=8, hkv=8, sq=2048, skv=2048, use_causal_mask=True),
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024, use_causal_mask=True, diagonal_band_left_bound=256),
+        dict(b=2, hq=4, hkv=4, sq=768, skv=1280, use_causal_mask_bottom_right=True),
+        dict(b=1, hq=8, hkv=2, sq=1024, skv=1024),
+        dict(b=1, hq=4, hkv=4, sq=1024, skv=1024, dt=torch.float16),
+    ],
+    ids=["dense", "causal_2k", "swa", "br_rect_b2", "gqa", "dense_fp16"],
+)
+def test_stage2_2x2_is_bitwise_the_role_split(monkeypatch, case):
+    """The fused 2x2 stage 2 produces BITWISE the same S / dS workspace -- and therefore bitwise the same dQ / dK / dV --
+    as the cga4x1 role split.  Expected, not hoped: the eight chained K = 64 MMA chunks accumulate into one fp32 TMEM
+    accumulator exactly like one K = 512 chain (probe ss_slabs S3, bitwise over two seeds), the exp2 / mask / dS product
+    are the same instructions over the same fp32 values (the role split shipped S at fp32), and stage 3 is untouched.
+    So any mismatch here is a real bug (a lane map, a chunk descriptor, a stale ring slot), never accumulation noise --
+    which is why this is ``torch.equal`` on int16 views and not a tolerance.  Three twin launches are also bitwise with
+    each other (determinism).  Shapes are tile multiples: skipped causal tiles are zero-filled on both arms."""
+    case = dict(case)
+    dt = case.pop("dt", torch.bfloat16)
+    b, hq, hkv, sq, skv = (case.pop(k) for k in ("b", "hq", "hkv", "sq", "skv"))
+    d = _D
+    torch.manual_seed(1811)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    keep = None
+    if case.get("use_causal_mask") or case.get("use_causal_mask_bottom_right"):
+        keep = _causal_keep(sq, skv, bottom_right=bool(case.get("use_causal_mask_bottom_right")), left=case.get("diagonal_band_left_bound"))
+    o_ref, lse, all_masked, _, _, _ = _reference(q, k, v, do, keep, hq // hkv)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=stats)
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt, **case)
+    base = _twin_capture(monkeypatch, False, tensors, **kw)
+    twin = _twin_capture(monkeypatch, True, tensors, **kw)
+    for name, x in zip(("dQ", "dK", "dV"), twin):
+        # Both arms writing the same NaN-poisoned (never stored) rows would be bit-equal too; the twin's gradients must be finite.
+        assert torch.isfinite(x.view(dt).float()).all(), f"{name}: the 2x2 twin left non-finite values"
+    for name, x, y in zip(("dQ", "dK", "dV", "S_ws", "dS_ws"), base, twin):
+        n_bad = (x != y).sum().item()
+        assert n_bad == 0, f"{name}: {n_bad} of {x.numel()} int16 words differ between the role split and the 2x2 twin"
+    for _ in range(2):
+        again = _twin_capture(monkeypatch, True, tensors, **kw)
+        for name, x, y in zip(("dQ", "dK", "dV", "S_ws", "dS_ws"), twin, again):
+            assert torch.equal(x, y), f"{name}: the 2x2 twin is not deterministic across launches"
+
+
+# SASS pins of the 2x2 twin (host trace-compile, no device): the register split reached the binary (USETMAXREG), no spills
+# in the 40-register roles beyond the measured count, no GPU-scope drain before a cluster arrive, two tcgen05.ld per kv body
+# (S_acc and dS_acc, one x64 each), 64 tcgen05.mma per kv body (8 chunks x 4 k-steps x 2 BMMs), no DSMEM bulk copy.  The
+# counts are MEASURED on the branch's own toolchain (DSL 4.7.0, CUDA 13.3 ptxas) and bounded by SPILL_TOLERANCE.
+_STAGE2_2X2_SASS_COUNTS = {
+    "STL": ("STL",),
+    "LDL": ("LDL",),
+    "USETMAXREG": ("USETMAXREG",),
+    "MEMBAR_GPU": ("MEMBAR.ALL.GPU",),
+    "CGAERRBAR": ("CGAERRBAR",),
+    "LDTM": ("LDTM",),
+    "UTCHMMA": ("UTCHMMA",),
+    "UTMALDG": ("UTMALDG",),
+    "UBLKCP": ("UBLKCP",),
+    "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
+}
+_STAGE2_2X2_SPILL_PINS = {"sm_100a": {"STL": 0, "LDL": 0}, "sm_107a": {"STL": 0, "LDL": 0}}
+
+
+@pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_107a", "dense"), ("sm_107a", "causal")])
+def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
+    """Also the Rule S6 trace-compile of the Rubin arm (8-stage ring, 2 cast stages, 320 KiB, DESC_VERSION 0) from whatever
+    GPU runs this suite: ``CUTE_DSL_ARCH=sm_107a`` needs no device.  Skips where the DSL predates sm_107a."""
+    from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
+
+    masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256)}
+    params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
+    if arch == "sm_107a":
+        params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+    probe = run_sass_probe(
+        tmp_path, probe_src=sass_probe_source(_STAGE2_PROBE_BODY, counts=_STAGE2_2X2_SASS_COUNTS), arch=arch, params=params, tag=f"stage2_2x2_{arm}"
+    )
+    st = probe.stats
+    n_bodies = 1 if arm == "dense" else 3  # the three-range split traces the kv body once per range
+    assert probe.expect["DESC_VERSION"] == 0 and probe.expect["CLUSTER_Q_ROWS"] == 256 and probe.expect["N_CHUNKS"] == 8
+    assert st["USETMAXREG"] > 0, st
+    assert st["MEMBAR_GPU"] == 0 and st["CGAERRBAR"] == 0, st
+    assert st["UBLKCP"] == 0, f"no DSMEM bulk copy survives the fusion: {st}"
+    assert st["LDTM"] == 2 * n_bodies, f"two tcgen05.ld (S_acc, dS_acc) per kv body: {st}"
+    assert st["UTCHMMA"] == 64 * n_bodies, f"8 chunks x 4 k-steps x 2 BMMs per kv body: {st}"
+    assert st["UTMALDG"] > 0, st
+    assert_no_new_spills(st, _STAGE2_2X2_SPILL_PINS[arch], tag=f"{arch} {arm}: ")
