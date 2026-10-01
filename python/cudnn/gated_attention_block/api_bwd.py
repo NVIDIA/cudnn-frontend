@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated attention block, backward -- the UNFUSED assembly (bf16 / fp16, proj_slab save mode).
+"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record: the unfused assembly plus its first fused step.
 
 Read :mod:`cudnn.gated_attention_block.api` first. This module is defined
 against that file's :class:`~cudnn.gated_attention_block.api.SavedForBackward`
@@ -65,6 +65,18 @@ Two corrections to the first skeleton, both load-bearing:
   reads and one launch saved). It is still the filler: it depends on nothing
   the SDPA backward produces.
 
+**Fusion knob: ``fuse_gate_bwd`` (default False).**  The SDPA backward's first
+launch is ``delta = rowsum(dO * O)`` over the very ``dO`` B3 just wrote and the
+``O`` it just read; with the knob the gate-backward kernel emits ``delta`` as a
+fourth output (``kernels/sigmoid_gate_bwd.py``: the bf16-ROUNDED ``dO`` it
+stores, summed in the chain's own ``dot_do_o`` order, the pad rows zeroed) into a
+block-owned fp32 ``[B, H_q, S_pad]`` region, and the adapter is built with
+``external_delta=True`` and handed that tensor -- one launch and one read each of
+``O`` and ``dO`` fewer, the adapter's own ``delta`` region gone from its scratch.
+Bitwise the unfused block (same fp32 operations in the same order; pinned by
+``test_fused_gate_bwd_is_bitwise_the_unfused_block``), so it is a performance
+knob in the Rule-9 sense: the same function under either value.
+
 Launch table (one stream; ``g = h_q / h_kv``, ``c`` = the adapter's head
 chunks, ``q`` = the adapter's dQ GEMM launches per chunk -- 1 under its
 single-launch dQ rendering (``MatmulTemplateParams.b_head_group = g``, the
@@ -72,25 +84,28 @@ shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
 
     #   stage                           launches
     1   B2  run_dgrad_gemm              1
-    2   B3  sigmoid_gate_bwd            1
+    2   B3  sigmoid_gate_bwd            1            (+ delta = rowsum(dO * O) as a 4th output under fuse_gate_bwd)
     3   B1  run_wgrad_gemm              1            (need_dw_o)
     4   Q/K recompute (_QkNormRope)     1
     5   V compaction (_VCompaction)     1
     6   B4  SdpaBwdDslSm107.execute     3 + c*(2+q)  fill_i32 + dot_do_o + c x [main + dK GEMM + q x dQ GEMM] + dkv_reduce (g > 1)
                                           + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads),
                                           + 2 fold copy-outs when GQA and kv-padded (+1 when MHA and kv-padded);
-                                          MHA (g = 1): no dkv_reduce -> 2 + 3c
+                                          MHA (g = 1): no dkv_reduce -> 2 + 3c;
+                                          fuse_gate_bwd: no dot_do_o (external_delta) -> 2 + c*(2+q)
     7   B5+B6 qk_norm_rope_bwd          1
     8   dW_norm reduce                  1            (need_dw_norms)
     9   B7  run_wgrad_gemm              1            (need_dw_qkvg)
     10  B8  run_dgrad_gemm              1            (need_dh)
                                        ---
                                         12 + c*(2+q)  -- 15 at the test geometry (h_q=8, h_kv=2, q=1; 22 at S=1000), 15 / 18 at 397B (c=1 / 2)
+                                        11 + c*(2+q)  under fuse_gate_bwd -- 14 / 21 at the test geometry, 14 / 17 at 397B
 
 The count is CHECKED by CUPTI in the tests (``test_launch_count_is_honest``:
-15 / 22 at the test geometry, MEASURED on Rubin cc 10.7), never quoted from
-this formula: the padded / zero-fill / MHA arms change it, and ``q`` is read
-off the adapter's dQ record (``prepared_host._dq_launches``), never assumed.
+15 / 22 at the test geometry, 14 / 21 with ``fuse_gate_bwd``, MEASURED on Rubin
+cc 10.7), never quoted from this formula: the padded / zero-fill / MHA arms
+change it, and ``q`` is read off the adapter's dQ record
+(``prepared_host._dq_launches``), never assumed.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
 ``T = B*S``; every region is a slot of the CALLER's one uint8 buffer)::
@@ -104,8 +119,9 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     recompute_v       [T, H_kv, D]      act     _VCompaction                 B4
     dq / dk / dv      compact           act     B4                           B5+B6
     dw_partials_q/k   [n_ctas_x, D]     fp32    B5+B6         need_dw_norms  the reduce   (EXACTLY n_ctas_for(recipe, T) rows)
-    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta, ONE dS chunk, pads, GQA partials)
+    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
+    delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -155,6 +171,7 @@ across devices. This is a contract decision, not an implementation detail.
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -301,6 +318,9 @@ class _BwdIntermediates:
     n_ctas_k: int = 0
     sdpa_bwd_bytes: int = 0  # the adapter's slice length (the region is padded to the carve alignment)
     gemm_scratch_bytes: int = 0
+    # APPENDED with fuse_gate_bwd: B3's delta = rowsum(dO * O) for the adapter's external_delta; -1 / () when the knob is off
+    delta: int = -1  # [B, H_q, S_pad] fp32 (the adapter's external_delta_shape)
+    delta_shape: tuple = ()
 
 
 def _plan_bwd_workspace(
@@ -315,6 +335,7 @@ def _plan_bwd_workspace(
     gemm_scratch_bytes: int = 0,
     n_ctas_q: int = 0,
     n_ctas_k: int = 0,
+    delta_shape: Optional[tuple] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -324,7 +345,9 @@ def _plan_bwd_workspace(
     artifacts do, which is why :meth:`GatedAttentionBlockBwd.get_workspace_size`
     requires ``compile()`` first. ``need`` = ``{"dw_o", "dw_norms"}`` flags
     (missing = True); ``policy`` is kept for the gate-copy follow-up's recompute slabs (a
-    ``proj_slab`` record carves none).
+    ``proj_slab`` record carves none).  ``delta_shape`` (``fuse_gate_bwd``: the adapter's
+    ``external_delta_shape``, ``(B, H_q, S_pad)``) carves the fp32 ``delta`` region B3 writes
+    and B4 reads; None carves none (the adapter keeps its own).
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
@@ -357,6 +380,12 @@ def _plan_bwd_workspace(
     sdpa_bwd_ws = layout.add(int(sdpa_bwd_bytes))
     gemm_scratch_bytes = max(int(gemm_scratch_bytes), 1)
     gemm_scratch = layout.add(gemm_scratch_bytes)
+    delta = -1
+    if delta_shape is not None:
+        delta_shape = tuple(int(x) for x in delta_shape)
+        if len(delta_shape) != 3 or delta_shape[0] != b or delta_shape[1] != geom.h_q or delta_shape[2] < s:
+            raise ValueError(f"delta_shape must be the adapter's (B={b}, H_q={geom.h_q}, S_pad >= {s}), got {delta_shape}")
+        delta = layout.add(int(math.prod(delta_shape)) * 4)
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -378,6 +407,8 @@ def _plan_bwd_workspace(
         n_ctas_k=int(n_ctas_k),
         sdpa_bwd_bytes=int(sdpa_bwd_bytes),
         gemm_scratch_bytes=gemm_scratch_bytes,
+        delta=delta,
+        delta_shape=tuple(delta_shape) if delta_shape is not None else (),
     )
 
 
@@ -536,20 +567,25 @@ class _SigmoidGateBwd(_Stage):
     would be mask-made ones, and with ``S_q == S_kv`` a causal / windowed row
     always keeps its diagonal (``window_left == 0`` is declined first).
 
-    **Fusion status:** folds into the SDPA-backward prologue cheaply (with the
-    ``dot_do_o`` pre-pass, a later PR) -- it is per-element on ``dO``, which
-    that kernel already reads.
+    **Fusion status: the SDPA backward's ``dot_do_o`` pre-pass is folded in HERE
+    under ``fuse_gate_bwd``** (``want_delta``): a fourth output ``delta[b, h, q] =
+    rowsum(dO * O)`` in the chain's own order over the bf16-rounded ``dO`` this
+    kernel stores, so the adapter (``external_delta=True``) skips its first launch
+    and its second read of ``O`` and ``dO``; bitwise the unfused chain.  The other
+    direction -- folding this kernel into the SDPA backward's prologue -- stays
+    untaken: ``dO`` is read under two tilings there (``_OutProjDgrad``).
 
     Kernel: ``kernels/sigmoid_gate_bwd.py`` (plain LDG/STG, any CuTe-DSL device).
     """
 
     name = "sigmoid_gate_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool) -> None:
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool, want_delta: bool = False) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.want_og = bool(want_og)
+        self.want_delta = bool(want_delta)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -562,14 +598,19 @@ class _SigmoidGateBwd(_Stage):
     def compile(self) -> None:
         from .kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd
 
-        self._recipe = compile_sigmoid_gate_bwd(dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False)
+        self._recipe = compile_sigmoid_gate_bwd(
+            dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False, has_delta=self.want_delta
+        )
 
-    def execute(self, dog, o, gate, do, dg, og, *, stream) -> None:
+    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None) -> None:
+        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta."""
         from .kernels.sigmoid_gate_bwd import run_sigmoid_gate_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_sigmoid_gate_bwd(self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, stream=stream)
+        run_sigmoid_gate_bwd(
+            self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, s=self.seq_len if delta is not None else None, stream=stream, delta=delta
+        )
 
 
 class _SdpaBwd(_Stage):
@@ -602,15 +643,21 @@ class _SdpaBwd(_Stage):
     Masks: the block's ``is_causal`` / ``causal_bottom_right`` / ``window_left``
     (> 0) / ``window_right`` (0) map one-to-one onto the adapter's; what the row
     cannot serve is declined by the block first, naming its own field.
+
+    **Fusion status:** under ``fuse_gate_bwd`` (``external_delta``) the adapter is
+    built with ``external_delta=True`` and :meth:`execute` hands it B3's ``delta``
+    region, so the chain's ``dot_do_o`` launch does not exist and its scratch has
+    no ``delta`` region (``delta_shape`` is the adapter's contract for the carve).
     """
 
     name = "sdpa_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, device) -> None:
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, device, external_delta: bool = False) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.device = device
+        self.external_delta = bool(external_delta)
         self._impl = None
 
     def _build_impl(self):
@@ -637,7 +684,15 @@ class _SdpaBwd(_Stage):
             deterministic=False,
             scale_softmax=float(g.scale),
             seq_kv_lens_present=False,
+            external_delta=self.external_delta,
         )
+
+    @property
+    def delta_shape(self) -> tuple:
+        """The adapter's ``external_delta_shape`` -- ``(B, H_q, S_pad)`` fp32, the region B3 fills under ``fuse_gate_bwd``."""
+        if self._impl is None:
+            self._impl = self._build_impl()
+        return tuple(int(x) for x in self._impl.external_delta_shape)
 
     def check_support(self) -> None:
         if self.dtype not in _ACT_DTYPES:
@@ -665,8 +720,9 @@ class _SdpaBwd(_Stage):
             self._impl = self._build_impl()
         self._impl.compile()
 
-    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream) -> None:
-        """Every io tensor COMPACT ``[B, S, H, D]``; transposed here into the ``(B, H, S, D)`` view the binder demands."""
+    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta=None) -> None:
+        """Every io tensor COMPACT ``[B, S, H, D]``; transposed here into the ``(B, H, S, D)`` view the binder demands.
+        ``delta`` (``external_delta`` only): B3's fp32 ``[B, H_q, S_pad]`` region, the adapter's ``delta_tensor``."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
         self._impl.execute(
@@ -681,6 +737,7 @@ class _SdpaBwd(_Stage):
             dv.transpose(1, 2),
             workspace=workspace,
             current_stream=cuda.CUstream(int(stream)),
+            delta_tensor=delta,
         )
 
 
@@ -955,6 +1012,10 @@ class GatedAttentionBlockBwd(APIBase):
         # The dtype of dW_q_norm / dW_k_norm.  P0 serves fp32 ONLY (the kernel writes fp32
         # partials and the reduce fp32 [D] outputs; a cast would be an extra launch nobody measured).
         dw_norm_dtype: torch.dtype = torch.float32,
+        # Fusion knob (module docstring, "Fusion knob"): the gate-backward kernel also emits the SDPA backward's
+        # delta = rowsum(dO * O), and the adapter is built with external_delta=True -- one launch and one read each of
+        # O and dO fewer, bitwise the unfused block.  Performance-only: the same function under either value.
+        fuse_gate_bwd: bool = False,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -984,6 +1045,7 @@ class GatedAttentionBlockBwd(APIBase):
         self.need_dh, self.need_dw_qkvg, self.need_dw_o = bool(need_dh), bool(need_dw_qkvg), bool(need_dw_o)
         self.seq_lens_present = bool(seq_lens_present)
         self.dw_norm_dtype = dw_norm_dtype
+        self.fuse_gate_bwd = bool(fuse_gate_bwd)
         # The declaration's samples, re-read by check_support (shapes / dtypes / the record's presence facts; no device read).
         self._samples = dict(
             dy=sample_dy,
@@ -999,11 +1061,11 @@ class GatedAttentionBlockBwd(APIBase):
         t, dm, hd, n = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg
         # Stages, in launch order.  Building them costs no device work; the GEMM stages get a plan at compile().
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=act, label="out_proj_dgrad")
-        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o)
+        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=self.fuse_gate_bwd)
         self._out_proj_wgrad = _OutProjWgrad(m=dm, k=t, n=hd, dtype=act, label="out_proj_wgrad") if self.need_dw_o else None
         self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
         self._compact_v = _VCompaction(g, batch=b, seq_len=s, dtype=act)
-        self._sdpa = _SdpaBwd(g, batch=b, seq_len=s, dtype=act, device=self.device)
+        self._sdpa = _SdpaBwd(g, batch=b, seq_len=s, dtype=act, device=self.device, external_delta=self.fuse_gate_bwd)
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
         self._qkv_gate_wgrad = _QkvGateWgrad(m=n, k=t, n=dm, dtype=act, label="qkv_gate_wgrad") if self.need_dw_qkvg else None
         self._qkv_gate_dgrad = _QkvGateDgrad(m=t, k=n, n=dm, dtype=act, label="qkv_gate_dgrad") if self.need_dh else None
@@ -1169,6 +1231,8 @@ class GatedAttentionBlockBwd(APIBase):
         ``qh_chunk x S_q_pad x S_kv_pad x e`` (4.25 / 8.50 / 33.0 GiB at S = 8K /
         16K / 32K, 397B, B=1) + ``(n_ctas_q + n_ctas_k) x D x 4`` dW partials +
         ``max(plan.workspace_bytes)`` (12 MiB at the test geometry, 0 at 397B).
+        Under ``fuse_gate_bwd`` the adapter's ``delta`` moves out of its scratch
+        into the block's own ``delta`` region of the same size (``B x H_q x S_pad x 4``).
         Honest and never exceeded.
         """
         if self._ws is None:
@@ -1219,6 +1283,7 @@ class GatedAttentionBlockBwd(APIBase):
             gemm_scratch_bytes=gemm_scratch,
             n_ctas_q=n_ctas_q,
             n_ctas_k=n_ctas_k,
+            delta_shape=self._sdpa.delta_shape if self.fuse_gate_bwd else None,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -1256,11 +1321,13 @@ class GatedAttentionBlockBwd(APIBase):
             (B2) out_proj_dgrad     dy, w_o                     -> ws.do_gated
             (B3) sigmoid_gate_bwd   ws.do_gated, saved.o,
                                     proj_slab[GATE]             -> ws.do_gated (in place), ws.dqkvg[GATE], ws.o_gated
+                                                                   (+ ws.delta = rowsum(dO * O) under fuse_gate_bwd)
             (B1) out_proj_wgrad     dy, ws.o_gated              -> dw_o
                  qk_norm_rope       proj_slab[Q], [K]           -> ws.recompute, ws.recompute_k   (post-norm / post-RoPE)
                  compact_v          proj_slab[V]                -> ws.recompute_v
             (B4) sdpa_bwd           ws.do_gated, ws.recompute*,
-                                    saved.o, saved.lse          -> ws.dq, ws.dk, ws.dv   (COMPACT)
+                                    saved.o, saved.lse
+                                    (+ ws.delta: no dot_do_o)   -> ws.dq, ws.dk, ws.dv   (COMPACT)
             (B5+B6) qk_norm_rope_bwd ws.dq/dk/dv, proj_slab[Q], [K],
                                     saved.rstd_*, w_*_norm      -> ws.dqkvg[Q], [K], [V]; ws.dw_partials_*
                  dw_norm reduce     ws.dw_partials_*            -> dw_q_norm, dw_k_norm       (qk_norm only)
@@ -1357,6 +1424,7 @@ class GatedAttentionBlockBwd(APIBase):
         plane_k = _view(workspace, ws.dw_partials_k, (ws.n_ctas_k, d), torch.float32) if self.need_dw_norms else None
         sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
         gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
+        delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if self.fuse_gate_bwd else None
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         q_pre_b = _cols(proj, o_q, g.h_q, d)
         gate_b = _cols(proj, o_g, g.h_q, d)
@@ -1366,8 +1434,8 @@ class GatedAttentionBlockBwd(APIBase):
 
         # (B2) dO_gated = dY @ W_o
         self._out_proj_dgrad.execute(dy2, w_o, do_gated.view(t, hd), gemm_ws, stream=stream)
-        # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o)
-        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream)
+        # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o), delta = rowsum(dO * O) (fuse_gate_bwd)
+        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream, delta=delta)
         # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists
         if self.need_dw_o:
             self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
@@ -1388,6 +1456,7 @@ class GatedAttentionBlockBwd(APIBase):
             dv.view(b, s, g.h_kv, d),
             workspace=sdpa_ws,
             stream=stream,
+            delta=delta,
         )
         # (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials
         norm = g.qk_norm
@@ -1446,6 +1515,7 @@ def gated_attention_block_backward(
     seq_lens: Optional[torch.Tensor] = None,
     recompute: RecomputePolicy = RecomputePolicy.RECOMPUTE_QK_PRE,
     current_stream: Optional[cuda.CUstream] = None,
+    fuse_gate_bwd: bool = False,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -1464,7 +1534,8 @@ def gated_attention_block_backward(
     allocator orders a buffer's reuse only against the stream it was allocated
     on, so a workspace allocated on the ambient stream for a side-stream launch
     would be freed into the ambient pool at return and handed to the caller's
-    next allocation while the backward is still writing it.
+    next allocation while the backward is still writing it.  ``fuse_gate_bwd``
+    (appended, default off) is the block's fusion knob, part of the cache key.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1497,6 +1568,7 @@ def gated_attention_block_backward(
         need_dw_norms,
         recompute,
         seq_lens is not None or saved.seq_lens is not None,
+        bool(fuse_gate_bwd),
     )
     blk = _BWD_CACHE.get(key)
     if blk is None:
@@ -1516,6 +1588,7 @@ def gated_attention_block_backward(
             need_dw_o=need_dw_o,
             need_dw_norms=need_dw_norms,
             seq_lens_present=(seq_lens is not None) or (saved.seq_lens is not None),
+            fuse_gate_bwd=fuse_gate_bwd,
         )
         blk.check_support()
         blk.compile()

@@ -108,6 +108,25 @@ quantize passes) -- from device pointers and the caller's workspace, and records
 straight into it (``engines.lower_dsl_bwd*`` -> ``PreparedBwdLaunch``); :meth:`execute` is
 the standalone twin over torch tensors.  No torch op runs on the execute path.
 
+**An externally computed delta (half row only).**  ``SdpaBwdDslSm107(external_delta=True)``
+declares that the caller hands stage 1's result to ``execute(..., delta_tensor=)``: a
+contiguous fp32 ``[B, H_q, S_q_pad]`` tensor (``external_delta_shape``; ``S_q_pad`` =
+``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``) on the plan's device, 16-B
+aligned, holding the RAW ``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate
+backward produces it while it already reads O and dO, in ``dot_do_o``'s own reduction order
+(``gated_attention_block/kernels/sigmoid_gate_bwd.py``), so the fused and the unfused block are
+bitwise equal.  Under the flag the chain launches no ``dot``, reads O once less, and the
+workspace carve has no ``delta`` region (``scratch_workspace_bytes()`` shrinks by it); the
+operand is validated like Stats before any bind (dtype, shape, strides, device, alignment --
+each a typed ``ValueError``), and a plan built without the flag refuses a delta (Rule 1,
+both directions).  A plan fact, not an eligibility fact: ``Capabilities`` and the graph path
+are untouched (no graph declares a delta; the prepared launch frames the slot as absent).
+The fp8 and MXFP8 rows decline the flag -- their delta is the dot of their own payloads
+(the DEscaled fp8 dot of the scaled pre-pass; the ``o_f16`` / ``dO_f16`` ports' dot), computed
+by their own pre-pass.  The flag composes with the per-batch kv lengths above: two
+independent plan facts, each deciding its own appended operand slot (the lengths, then the
+delta), and a plan built with both takes both at ``execute``.
+
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
 descale_q/k/v/dO/s, scale_s and scale_dP, publishes ``dS_q = e4m3(dS * scale_dP)`` (dS
@@ -457,6 +476,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # kv lengths are served (module doc); the fp8 / MXFP8 bodies take one uniform ``seqlen_kv_real`` and their rows say False.
     _PER_BATCH_KV_LENS = True
 
+    def __init__(self, *args, external_delta: bool = False, **kwargs) -> None:
+        """``external_delta`` (appended, default off): the caller computes stage 1's ``delta = rowsum(dO * O)`` and hands it to
+        :meth:`execute` as ``delta_tensor`` (module docstring, "An externally computed delta"); the chain then launches no
+        ``dot`` and carves no ``delta`` region.  A plan fact -- it decides the artifact and the workspace -- so it is fixed at
+        construction, like ``amax_requested`` on the fp8 row."""
+        self.external_delta = bool(external_delta)
+        super().__init__(*args, **kwargs)
+
     # --- geometry ------------------------------------------------------------------
     def _initialize_implementation(self) -> None:
         q_shape = tuple(int(x) for x in self.q_desc.shape)  # logical BHSD
@@ -588,9 +615,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         sqp, skvp = self._sq_pad, self._skv_pad
         kv_rows = skvp if self._kv_padded else skv
         gqa = self._gqa_group > 1
-        plan = [
-            # stage 1's delta: [B, H_q, ceil128(S_q)] fp32 -- dot_do_o writes the rounded extent, zeros past S_q
-            ("delta", (b, h, sqp), torch.float32),
+        plan = []
+        if not self.external_delta:
+            # stage 1's delta: [B, H_q, ceil128(S_q)] fp32 -- dot_do_o writes the rounded extent, zeros past S_q.  Under
+            # external_delta the caller's tensor of the same shape (`external_delta_shape`) replaces the region.
+            plan.append(("delta", (b, h, sqp), torch.float32))
+        plan += [
             # the dS workspace of one launch: [b_chunk, qh_chunk, S_kv_pad, S_q_pad], kv-major
             ("ds_ws", (self._b_chunk, self._qh_chunk, skvp, sqp), self._ds_dtype),
             # stage 2's per-batch kv lengths (read only under the padded arm) + stage 3's dead THD ABI slot
@@ -623,9 +653,47 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         return [(name, math.prod(shape), dtype) for name, shape, dtype in self._scratch_shapes()]
 
     def scratch_workspace_bytes(self) -> int:
-        """A pure function of the compile geometry (delta + one dS chunk + padded staging +
-        GQA partials): the artifact carves all of it from the caller's buffer."""
+        """A pure function of the compile geometry (delta -- unless ``external_delta`` -- + one dS chunk +
+        padded staging + GQA partials): the artifact carves all of it from the caller's buffer."""
         return sum(ws_align(numel * dtype.itemsize) for _name, numel, dtype in self._scratch_plan())
+
+    @property
+    def external_delta_shape(self) -> tuple:
+        """The delta's contract, ``(B, H_q, S_q_pad)``: what stage 1 writes into the workspace region, and what
+        ``execute(delta_tensor=)`` must carry under ``external_delta`` -- fp32, contiguous, zeros on the pad rows
+        ``[S_q, S_q_pad)``, 16-B aligned, on the plan's device."""
+        return (self.batch_size, self.h_q, self._sq_pad)
+
+    def _check_external_delta(self, delta_tensor) -> None:
+        """The ``delta_tensor`` contract at execute, host-only and before any bind: both directions of the plan fact, then
+        the exact ``dot_do_o`` layout (a strided or padded-differently delta would be read as garbage by the main kernel's
+        stats prefetch, never a fault)."""
+        n = self._NAME
+        if not self.external_delta:
+            self._value_error_if(
+                delta_tensor is not None,
+                f"{n}: delta_tensor was given but this plan was built with external_delta=False (its own dot_do_o pre-pass computes delta); pass None",
+            )
+            return
+        self._value_error_if(
+            delta_tensor is None,
+            f"{n}: delta_tensor is required by this plan (external_delta=True): fp32 contiguous {self.external_delta_shape} on the plan's device",
+        )
+        shape = tuple(int(x) for x in delta_tensor.shape)
+        self._value_error_if(
+            delta_tensor.dtype != torch.float32,
+            f"{n}: delta_tensor must be fp32 (the chain's dot_do_o layout), got {delta_tensor.dtype}",
+        )
+        self._value_error_if(
+            shape != tuple(self.external_delta_shape) or not delta_tensor.is_contiguous(),
+            f"{n}: delta_tensor must be a CONTIGUOUS [B, H_q, S_q_pad] = {self.external_delta_shape} tensor (S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past "
+            f"S_q), got shape {shape} with strides {tuple(delta_tensor.stride())}",
+        )
+        self._value_error_if(
+            not delta_tensor.is_cuda or delta_tensor.device != self.q_desc.device,
+            f"{n}: delta_tensor must be on the plan's device {self.q_desc.device}, got {delta_tensor.device}",
+        )
+        self._value_error_if(delta_tensor.data_ptr() % 16 != 0, f"{n}: delta_tensor base must be 16-byte aligned, got {delta_tensor.data_ptr():#x}")
 
     # --- compilation -------------------------------------------------------------------
     def _template_params(self):
@@ -735,16 +803,22 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         dsink_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
+        delta_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """The standalone twin of the graph plan: the same prepared artifact, bound from torch
         tensors (``prepared_sm107.execute_standalone``).  Every operand must carry the plan's
         geometry; the workspace is the caller's (``scratch_workspace_bytes()`` bytes).
         ``seq_kv_lens`` ([B] int32, contiguous, on the plan's device) is required exactly when
         the plan was built with ``seq_kv_lens_present=True`` (module doc); every entry must
-        satisfy ``0 <= len <= S_kv`` -- device data, not validated here."""
+        satisfy ``0 <= len <= S_kv`` -- device data, not validated here.  ``delta_tensor``
+        (appended) is required exactly when the plan was built with ``external_delta=True``:
+        fp32 contiguous ``external_delta_shape`` on the plan's device (module docstring, "An
+        externally computed delta").  The two are independent plan facts: a plan built with
+        both takes both."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
+        self._check_external_delta(delta_tensor)
         self.compile()
-        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens)
+        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
@@ -779,6 +853,11 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
 
     def _check_support_family(self) -> None:
         n = self._NAME
+        self._value_error_if(
+            self.external_delta,
+            f"{n}: external_delta is not served on the fp8 row: its delta is the DEscaled dot of the fp8 O / dO payloads (descale_o * descale_dO), "
+            "computed by its own scaled pre-pass; only the bf16 / fp16 row takes a caller's delta",
+        )
         self._value_error_if(self.grad_dtype not in _FP8_GRAD_DTYPES, f"{n}: dQ/dK/dV dtype {self.grad_dtype} not in {_FP8_GRAD_DTYPES}")
         self._value_error_if(
             self.dk_desc.dtype != self.grad_dtype or self.dv_desc.dtype != self.grad_dtype,
@@ -1048,6 +1127,11 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     # --- capability backstop ---------------------------------------------------------
     def _check_support_family(self) -> None:
         n = self._NAME
+        self._value_error_if(
+            self.external_delta,
+            f"{n}: external_delta is not served on the mxfp8 row: its delta is the dot of its own f16 ports (o_f16 / dO_f16), computed by its own "
+            "pre-pass; only the bf16 / fp16 row takes a caller's delta",
+        )
         self._value_error_if(
             self.p_scale_log2 != _cfg.MXFP8_P_SCALE_LOG2,
             f"{n}: p_scale_log2 is pinned to {_cfg.MXFP8_P_SCALE_LOG2} (the kernel folds the P scale byte {127 - _cfg.MXFP8_P_SCALE_LOG2} at trace "

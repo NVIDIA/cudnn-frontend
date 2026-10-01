@@ -2045,7 +2045,8 @@ def test_half_adapter_admits_per_batch_kv_lengths():
     assert "k_pad" in [n for n, _n, _d in ragged._scratch_plan()], "a ragged S_kv keeps its zero-filled K / V staging under per-batch lengths"
     for kw in (dict(is_causal=True), dict(is_causal=True, causal_bottom_right=True), dict(is_causal=True, window_size_left=199), dict(hq=4, hkv=2)):
         assert _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, **kw).check_support(), kw
-    assert ROLES_F16[-1] == "seq_kv" and ATTRIBUTES_F16[-1] == "seq_len_kv" and len(ROLES_F16) == len(ATTRIBUTES_F16) == 10
+    # Slot 9 is the lengths (a graph attribute); slot 10, appended after it, is the standalone-only external delta.
+    assert ROLES_F16[9] == "seq_kv" and ATTRIBUTES_F16[9] == "seq_len_kv" and len(ROLES_F16) == len(ATTRIBUTES_F16) == 11
     # The zero-fill rule under per-batch lengths: bottom-right only (with or without a window); top-left bands and dense never.
     assert _stage3_needs_zero_fill(True, None, True, 512, 1024, 256, per_batch_kv=True)
     assert _stage3_needs_zero_fill(True, 199, True, 512, 1024, 256, per_batch_kv=True)
@@ -2145,6 +2146,171 @@ def test_fp8_adapter_backstop_and_workspace(monkeypatch):
     api.o_desc = _adapter_desc((2, 2, 512, _D), torch.bfloat16, "o")
     with pytest.raises(ValueError, match="FP8 payload"):
         api.check_support()
+
+
+def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region():
+    """``external_delta=True`` (appended, default off) declares that the caller computes stage 1's delta: the carve loses its
+    ``delta`` region (exactly ``ws_align(B * H_q * S_q_pad * 4)`` bytes), the contract shape is ``external_delta_shape`` =
+    ``(B, H_q, S_q_pad)`` on both plans, Capabilities and the rest of the plan are untouched; the fp8 and mxfp8 rows decline
+    the flag typed (their delta is the dot of their own payloads -- the descaled fp8 dot of the scaled pre-pass, the o_f16 /
+    dO_f16 ports' dot -- and the mxfp8 row inherits ``__init__`` / ``_scratch_shapes`` from the half row, so without its own
+    decline the flag would drop the ``delta`` region its host still carves and die untyped at trace).  The carve under BOTH
+    appended plan facts is pinned here too: ``seq_kv_lens_present`` keeps the ``seq_kv`` region carved (fixed ABI, no new
+    scratch) and ``external_delta`` drops only ``delta``, so the combined plan is exactly the delta's bytes smaller than the
+    lengths-only plan and carves what the delta-only plan carves."""
+    from test_sdpa_bwd_mxfp8_sm107 import _mxfp8_adapter
+
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    own = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True)
+    ext = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, external_delta=True)
+    assert own.check_support() and ext.check_support()
+    assert own.external_delta is False and ext.external_delta is True
+    names, ext_names = ([n for n, _n, _d in api._scratch_plan()] for api in (own, ext))
+    assert names[0] == "delta" and "delta" not in ext_names and ext_names == names[1:]
+    assert own.external_delta_shape == ext.external_delta_shape == (2, 8, 512), "S_q_pad = S_q rounded up to the 128-row q tile"
+    assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
+    assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
+    e4m3 = torch.float8_e4m3fn
+    with pytest.raises(ValueError, match="external_delta is not served on the fp8 row"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True).check_support()
+    with pytest.raises(ValueError, match="external_delta is not served on the mxfp8 row"):
+        _mxfp8_adapter(external_delta=True).check_support()
+    assert _mxfp8_adapter().external_delta is False and "delta" in [n for n, _n, _d in _mxfp8_adapter()._scratch_plan()]
+    # Both plan facts at once (the compiled twin is the Rubin test_adapter_per_batch_kv_lengths_compose_with_the_gate_kernels_external_delta)
+    lengths_only = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, seq_kv_lens_present=True)
+    both = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, seq_kv_lens_present=True, external_delta=True)
+    assert lengths_only.check_support() and both.check_support()
+    assert (lengths_only.seq_kv_lens_present, lengths_only.external_delta, both.seq_kv_lens_present, both.external_delta) == (True, False, True, True)
+    both_names = [n for n, _n, _d in both._scratch_plan()]
+    assert [n for n, _n, _d in lengths_only._scratch_plan()] == names, "the lengths add no scratch: the seq_kv region stays carved"
+    assert "seq_kv" in both_names and "delta" not in both_names and both_names == ext_names, "the combined carve is the delta-only carve"
+    assert lengths_only.scratch_workspace_bytes() == own.scratch_workspace_bytes()
+    assert lengths_only.scratch_workspace_bytes() - both.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
+    assert both.external_delta_shape == (2, 8, 512)
+
+
+def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_absent():
+    """The graph binder (``prepared.PreparedBwdLaunch``) reads every spec attribute STRICTLY off the ``SdpaBinding`` -- a
+    misspelled role in a ``BwdLaunchSpec`` still fails at plan build, never as a silent None -- and frames as absent exactly the
+    roles listed in ``BwdLaunchSpec.standalone_only_roles``: the half row's caller-provided ``delta`` (``prepared_sm107.EXTERNAL_DELTA_ROLE``),
+    which no graph declares and no other sm107 role list carries.  Host-only (fake binding, no artifact)."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import BwdLaunchSpec, PreparedBwdLaunch
+
+    class _Bound:
+        def __init__(self, uid, dim, stride):
+            self.uid, self.dim, self.stride = uid, dim, stride
+
+        def get_uid(self):
+            return self.uid
+
+        def get_dim(self):
+            return self.dim
+
+        def get_stride(self):
+            return self.stride
+
+    delta = prepared_sm107.EXTERNAL_DELTA_ROLE
+    assert delta == "delta" and prepared_sm107.ROLES_F16[-1] == prepared_sm107.ATTRIBUTES_F16[-1] == delta
+    assert delta not in prepared_sm107.ROLES_FP8 + prepared_sm107.ROLES_MXFP8, "only the half row has the standalone-only slot"
+    binding = SimpleNamespace(q=_Bound(11, (1, 2, 512, 256), (262144, 256, 512, 1)), stats=_Bound(12, (1, 2, 512, 1), (1024, 512, 1, 1)))
+    base = dict(artifact=None, fn=None, operands=(), workspace_bytes=0, device_index=0, scale=1.0, name="probe")
+    spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,))
+    launch = PreparedBwdLaunch(spec, binding)
+    assert launch._roles == ["q", "stats"] and launch._uids == [11, 12]
+    assert launch._geometry[:2] == (((1, 2, 512, 256), (262144, 256, 512, 1)), ((1, 2, 512, 1), (1024, 512, 1, 1))) and launch._geometry[2] is None
+    with pytest.raises(AttributeError, match="delta"):  # the same slot without the declaration: strict, as every other role
+        PreparedBwdLaunch(replace(spec, standalone_only_roles=()), binding)
+    with pytest.raises(AttributeError, match="statz"):  # a misspelled role is still a plan-build failure, declaration or not
+        PreparedBwdLaunch(replace(spec, attributes=("q", "statz", delta)), binding)
+    assert BwdLaunchSpec(**base).standalone_only_roles == (), "the default: every role is a graph attribute"
+
+
+def test_prepared_sm107_bind_holds_the_two_appended_slots_independently():
+    """``prepared.bind`` over the half row's eleven-slot operand tuple, slot by slot.  For each of the four specializations of
+    the two appended slots (slot 9 ``seq_kv`` x slot 10 ``delta``, each None-specialized or an operand) and each of the four
+    execute shapes (each buffer given or not), bind accepts exactly the matching shape -- the frame carries the two pointers in
+    the slots' order -- and refuses the other three with a ValueError naming the slot: ``was not compiled into this
+    specialization`` for a buffer the plan did not ask for, ``is required by this specialization`` for one it did (slot 9
+    reported first when both are off).  ``bind`` only builds the frame, so nothing launches; the launch spec is hand-built with the
+    nine tensor slots None-specialized, so this runs on any CUDA device -- the compiled plans' twin is the Rubin
+    ``test_adapter_per_batch_kv_lengths_compose_with_the_gate_kernels_external_delta``."""
+    from itertools import product
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import BwdLaunchSpec, Operand, bind
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
+
+    b, hq, s_pad = 3, 2, 512
+    roles, attributes = prepared_sm107.ROLES_F16, prepared_sm107.ATTRIBUTES_F16
+    assert roles[9] == "seq_kv" and roles[10] == prepared_sm107.EXTERNAL_DELTA_ROLE and len(roles) == len(attributes) == 11
+    seq_kv_op = Operand("int32", (b,), (1,), b, 4, 4)
+    delta_op = Operand("float32", (b, hq, s_pad), (hq * s_pad, s_pad, 1), b * hq * s_pad, 16, 4)
+    lens = torch.tensor([512, 300, 0], dtype=torch.int32, device="cuda")
+    delta = torch.zeros(b, hq, s_pad, device="cuda")
+    ws = torch.empty(16, device="cuda", dtype=torch.uint8)
+    for with_lens, with_delta in product((False, True), repeat=2):
+        operands = (None,) * 9 + (seq_kv_op if with_lens else None, delta_op if with_delta else None)
+        spec = BwdLaunchSpec(
+            None,
+            None,
+            operands,
+            0,
+            0,
+            1.0,
+            "probe",
+            length_form=False,
+            roles=roles,
+            attributes=attributes,
+            scale_log2=False,
+            standalone_only_roles=(prepared_sm107.EXTERNAL_DELTA_ROLE,),
+        )
+        for give_lens, give_delta in product((False, True), repeat=2):
+            facts = {"seq_kv": facts_of_tensor(lens if give_lens else None), "delta": facts_of_tensor(delta if give_delta else None)}
+            if (give_lens, give_delta) == (with_lens, with_delta):
+                frame = bind(spec, facts, ws.data_ptr(), 0)
+                assert frame[:9] == [None] * 9
+                assert frame[9] == (lens.data_ptr() if with_lens else None) and frame[10] == (delta.data_ptr() if with_delta else None)
+                continue
+            slot, given = ("seq_kv", give_lens) if give_lens != with_lens else ("delta", give_delta)
+            verb = "was not compiled into this specialization" if given else "is required by this specialization"
+            with pytest.raises(ValueError, match=f"{slot} {verb}"):
+                bind(spec, facts, ws.data_ptr(), 0)
+
+
+def test_half_adapter_external_delta_execute_contract_fires_before_compile():
+    """At execute, BEFORE ``compile()`` (no artifact, no launch -- so it runs on any CUDA host): both directions of the plan
+    fact, then the exact ``dot_do_o`` layout -- fp32, contiguous ``(B, H_q, S_q_pad)`` (the PADDED extent, zeros past S_q),
+    the plan's device, a 16-byte base -- each a ValueError naming ``delta_tensor``.  The Rubin half of the claim is
+    ``test_external_delta_is_bitwise_the_chains_own_pre_pass``."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    own = _adapter(SdpaBwdDslSm107, b=1, hq=4, hkv=2, sq=500, skv=512, is_causal=True)
+    ext = _adapter(SdpaBwdDslSm107, b=1, hq=4, hkv=2, sq=500, skv=512, is_causal=True, external_delta=True)
+    dummy = torch.empty(1, device="cuda")  # never bound: every reject below fires before the bind
+    args = {name + "_tensor": dummy for name in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv")}
+    args["workspace"] = dummy
+    good = torch.zeros(1, 4, 512, device="cuda")
+    with pytest.raises(ValueError, match="external_delta=False"):
+        own.execute(**args, delta_tensor=good)
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.execute(**args)
+    with pytest.raises(ValueError, match="must be fp32"):
+        ext.execute(**args, delta_tensor=good.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="CONTIGUOUS"):
+        ext.execute(**args, delta_tensor=torch.zeros(1, 4, 1024, device="cuda")[:, :, ::2])
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[B, H_q, S_q_pad\] = \(1, 4, 512\)"):
+        ext.execute(**args, delta_tensor=torch.zeros(1, 4, 500, device="cuda"))  # the REAL S_q: the chain's layout is the padded one
+    with pytest.raises(ValueError, match="plan's device"):
+        ext.execute(**args, delta_tensor=torch.zeros(1, 4, 512))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        ext.execute(**args, delta_tensor=torch.zeros(1 * 4 * 512 + 1, device="cuda")[1:].view(1, 4, 512))
+    assert own._compiled is None and ext._compiled is None, "a reject must fire before compile()"
 
 
 @requires_rubin
@@ -2423,6 +2589,219 @@ def test_prepared_sm107_standalone_rejects_changed_layout(role):
     assert args[role + "_tensor"].stride() != case.tensors[role].stride()
     with pytest.raises(ValueError, match="runtime geometry"):
         api.execute(**args, workspace=case.workspace)
+    assert not launches
+
+
+@requires_rubin
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("sq", [512, 500], ids=["aligned", "padded"])
+def test_external_delta_is_bitwise_the_chains_own_pre_pass(dt, sq):
+    """A standalone plan built with ``external_delta=True`` and fed the delta the chain's OWN first launch wrote (read back
+    out of a sibling plan's workspace region) returns dQ / dK / dV ``torch.equal`` the sibling's -- the same artifact minus
+    the ``dot`` launch, reading the caller's tensor where the sibling reads its region.  Also pinned: the sibling's pad rows
+    are the zeros the contract asks the caller for; the external plan launches exactly one kernel fewer (CUPTI, when
+    available); a wrong-shape delta on the compiled plan is refused with no launch."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+
+    b, hq, hkv, skv = 2, 4, 2, 512
+    group = hq // hkv
+    gen = torch.Generator(device="cpu").manual_seed(3)
+
+    def draw(bb, s_, h):
+        return torch.randn(bb, s_, h, _D, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+
+    q, do, k, v = draw(b, sq, hq), draw(b, sq, hq), draw(b, skv, hkv), draw(b, skv, hkv)
+    keep = _causal_keep(sq, skv)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    o = _bshd_empty(b, sq, hq, _D, dt)
+    o.copy_(o64.to(dt))
+    lse = lse64.float()
+    if all_masked is not None:
+        lse = lse.masked_fill(all_masked, 0.0)
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    samples = dict(tensors, dq=_bshd_empty(b, sq, hq, _D, dt), dk=_bshd_empty(b, skv, hkv, _D, dt), dv=_bshd_empty(b, skv, hkv, _D, dt))
+
+    def build(external):
+        api = SdpaBwdDslSm107(**{"sample_" + name: value for name, value in samples.items()}, is_causal=True, scale_softmax=_D**-0.5, external_delta=external)
+        api.check_support()
+        api.compile()
+        return api
+
+    def run(api, delta=None):
+        grads = dict(
+            dq=_bshd_empty(b, sq, hq, _D, dt, fill=float("nan")),
+            dk=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+            dv=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+        )
+        ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8).fill_(0xBD)
+        api.execute(
+            **{name + "_tensor": value for name, value in tensors.items()},
+            **{name + "_tensor": value for name, value in grads.items()},
+            workspace=ws,
+            delta_tensor=delta,
+        )
+        torch.cuda.synchronize()
+        return grads, ws
+
+    own, ext = build(False), build(True)
+    # slot 9 (the per-batch kv lengths) stays None-specialized on both plans; slot 10 is the delta, bound on the external plan only
+    assert own._prepared.roles[9] == "seq_kv" and own._prepared.operands[9] is None and ext._prepared.operands[9] is None
+    assert own._prepared.operands[10] is None and ext._prepared.operands[10] is not None and own._prepared.roles[10] == prepared_sm107.EXTERNAL_DELTA_ROLE
+    grads_own, ws_own = run(own)
+    for name, want in zip(("dq", "dk", "dv"), (dq_r, dk_r, dv_r)):
+        _check(name, grads_own[name], want, dt)
+    # the chain's own delta: region R_DELTA of the sibling's carve, [B, H_q, S_q_pad] fp32, zeros on the pad rows
+    offset, shape, _strides = prepared_sm107._regions(own, prepared_sm107._REGION_SLOTS_F16)[0][R_DELTA]
+    assert shape == own.external_delta_shape == ext.external_delta_shape == (b, hq, -(-sq // 128) * 128)
+    delta = ws_own[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, sq:], torch.zeros_like(delta[:, :, sq:]))
+    grads_ext, _ws_ext = run(ext, delta)
+    for name in ("dq", "dk", "dv"):
+        assert torch.equal(grads_ext[name], grads_own[name]), f"{name}: the external-delta plan differs from the chain's own"
+    # one launch fewer: the `dot` kernel
+    try:
+        from torch.profiler import ProfilerActivity, profile
+
+        counts = []
+        for api, d_ in ((own, None), (ext, delta)):
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                run(api, d_)
+            names = [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+            counts.append(len(names))
+        if counts[0]:
+            assert counts[1] == counts[0] - 1, counts
+            print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    except Exception as exc:  # noqa: BLE001 -- CUPTI absent: the bitwise pin above stands on its own
+        print(f"\nlaunch count unverified here ({type(exc).__name__})")
+    # the compiled plan refuses a wrong delta before any launch
+    launches = []
+    ext._prepared = replace(ext._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match="CONTIGUOUS"):
+        run(ext, delta[:, :, :sq].contiguous() if sq % 128 else delta.transpose(1, 2))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        run(ext, None)
+    assert not launches
+
+
+@requires_rubin
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_adapter_per_batch_kv_lengths_compose_with_the_gate_kernels_external_delta(dt):
+    """A plan built with BOTH appended plan facts -- ``seq_kv_lens_present=True`` (slot 9, the caller's per-batch kv lengths)
+    and ``external_delta=True`` (slot 10, the caller's delta) -- fed the delta the gated block's sigmoid-gate backward kernel
+    emits (``has_delta``: ``rowsum(dO * O)`` over the dO it stored, in ``dot_do_o``'s order) together with the lengths, returns
+    dQ / dK / dV ``torch.equal`` the UNFUSED per-batch-lengths plan's (``seq_kv_lens_present=True`` alone, its own ``dot``
+    launch) over the same dO and lengths; that run is itself held to the fp64 oracle composing the lengths and the causal band,
+    dead kv rows exactly zero.  Lengths [512, 300, 0] on S_kv = 512 (a full, a ragged and a DEAD entry); S_q = 500 is ragged
+    too (S_q_pad = 512), so the gate kernel's zeroed pad tail is what the contract asks for.  Also pinned: the gate kernel's
+    delta is the chain's own bit for bit (read back from the unfused plan's ``R_DELTA`` region); the slots -- both bound on
+    the combined plan, exactly one on each single-fact sibling; and the compiled plans' refusals, each a ValueError before
+    any launch -- the combined plan refuses an execute missing either operand, each single-fact plan refuses the other's."""
+    from dataclasses import replace
+
+    from cudnn.gated_attention_block.kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd, run_sigmoid_gate_bwd
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    b, hq, hkv, sq, skv = 3, 4, 2, 500, 512
+    lens = [512, 300, 0]
+    group = hq // hkv
+    s_pad = -(-sq // 128) * 128
+    gen = torch.Generator(device="cpu").manual_seed(5)
+
+    def draw(bb, s_, h):
+        return torch.randn(bb, s_, h, _D, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+
+    q, k, v = draw(b, sq, hq), draw(b, skv, hkv), draw(b, skv, hkv)
+    keep = _per_batch_keep(sq, skv, lens, causal=True)
+    # The forward's O (storage-rounded) is what the gate kernel reads, together with the gated output's upstream gradient.
+    o64, lse64, all_masked, _dq, _dk, _dv = _reference64(q, k, v, torch.zeros_like(q), keep, group)
+    o = _bshd_empty(b, sq, hq, _D, dt)
+    o.copy_(o64.to(dt))
+    # The gate kernel's token-major [T, H, D] operands ARE the BSHD storage of O / dO (T = B * S_q; the per-batch s = S_q).
+    o_tok = o.permute(0, 2, 1, 3).reshape(b * sq, hq, _D)
+    dog = torch.randn(b * sq, hq, _D, generator=gen).to(device="cuda", dtype=dt)
+    gate = (torch.randn(b * sq, hq, _D, generator=gen) * 3.0).to(device="cuda", dtype=dt)
+    do_tok, dg = torch.empty_like(dog), torch.empty_like(dog)
+    delta_gate = torch.full((b, hq, s_pad), float("nan"), device="cuda", dtype=torch.float32)
+    recipe = compile_sigmoid_gate_bwd(dtype=dt, h=hq, d=_D, has_og=False, has_seq_lens=False, has_delta=True)
+    run_sigmoid_gate_bwd(recipe, dog, o_tok, gate, do_tok, dg, s=sq, stream=torch.cuda.current_stream().cuda_stream, delta=delta_gate)
+    torch.cuda.synchronize()
+    assert torch.isfinite(delta_gate).all() and torch.equal(delta_gate[:, :, sq:], torch.zeros_like(delta_gate[:, :, sq:]))
+    do = do_tok.view(b, sq, hq, _D).permute(0, 2, 1, 3)
+    _o, _lse, _am, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    stats = lse64.float().masked_fill(all_masked, 0.0).unsqueeze(-1).contiguous()
+    lens_t = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=stats)
+
+    def build(**flags):
+        samples = {"sample_" + name: value for name, value in tensors.items()}
+        samples.update(sample_dq=_bshd_empty(b, sq, hq, _D, dt), sample_dk=_bshd_empty(b, skv, hkv, _D, dt), sample_dv=_bshd_empty(b, skv, hkv, _D, dt))
+        api = SdpaBwdDslSm107(**samples, is_causal=True, scale_softmax=_D**-0.5, **flags)
+        api.check_support()
+        api.compile()
+        return api
+
+    def run(api, **appended):
+        grads = dict(
+            dq=_bshd_empty(b, sq, hq, _D, dt, fill=float("nan")),
+            dk=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+            dv=_bshd_empty(b, skv, hkv, _D, dt, fill=float("nan")),
+        )
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+        api.execute(
+            **{name + "_tensor": value for name, value in tensors.items()},
+            **{name + "_tensor": value for name, value in grads.items()},
+            workspace=ws,
+            **appended,
+        )
+        torch.cuda.synchronize()
+        return grads, ws
+
+    lengths_only, both, delta_only = build(seq_kv_lens_present=True), build(seq_kv_lens_present=True, external_delta=True), build(external_delta=True)
+    for api, bound in ((lengths_only, (True, False)), (both, (True, True)), (delta_only, (False, True))):
+        spec = api._prepared
+        assert spec.roles[9] == "seq_kv" and spec.roles[10] == prepared_sm107.EXTERNAL_DELTA_ROLE and len(spec.operands) == 11
+        assert (spec.operands[9] is not None, spec.operands[10] is not None) == bound
+    assert both.external_delta_shape == (b, hq, s_pad)
+    assert lengths_only.scratch_workspace_bytes() - both.scratch_workspace_bytes() == ws_align(b * hq * s_pad * 4), "the carve lost exactly the delta region"
+    # the unfused per-batch-lengths run: the oracle's, dead rows exact zeros
+    grads_ref, ws_ref = run(lengths_only, seq_kv_lens=lens_t)
+    for name, want in zip(("dq", "dk", "dv"), (dq_r, dk_r, dv_r)):
+        _check(name, grads_ref[name], want, dt)
+    _assert_dead_kv_rows_exactly_zero(types.SimpleNamespace(outs=[tuple(grads_ref[name] for name in ("dq", "dk", "dv"))]), lens)
+    # the gate kernel's delta is the chain's own: region R_DELTA of the unfused plan's carve, [B, H_q, S_q_pad] fp32
+    offset, shape, _strides = prepared_sm107._regions(lengths_only, prepared_sm107._REGION_SLOTS_F16)[0][R_DELTA]
+    assert shape == (b, hq, s_pad)
+    delta_chain = ws_ref[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape)
+    assert torch.equal(
+        delta_gate, delta_chain
+    ), f"the gate kernel's delta differs from the chain's dot_do_o: max|diff|={(delta_gate - delta_chain).abs().max().item():.3e}"
+    # the combined plan: the same artifact minus the dot launch, both appended operands bound
+    grads_both, _ws = run(both, seq_kv_lens=lens_t, delta_tensor=delta_gate)
+    for name in ("dq", "dk", "dv"):
+        assert torch.equal(grads_both[name], grads_ref[name]), f"{name}: the combined plan differs from the unfused per-batch-lengths run"
+    # the refusals on the compiled plans, each before any launch
+    launches = []
+    for api in (lengths_only, both, delta_only):
+        api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match="exactly when"):
+        run(both, delta_tensor=delta_gate)  # the lengths missing
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        run(both, seq_kv_lens=lens_t)  # the delta missing
+    with pytest.raises(ValueError, match="external_delta=False"):
+        run(lengths_only, seq_kv_lens=lens_t, delta_tensor=delta_gate)  # a delta the plan did not ask for
+    with pytest.raises(ValueError, match="exactly when"):
+        run(delta_only, seq_kv_lens=lens_t, delta_tensor=delta_gate)  # lengths the plan did not ask for
     assert not launches
 
 

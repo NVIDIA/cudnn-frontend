@@ -17,13 +17,21 @@ from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.fwd.api_dsl import ws_align
 from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
 
-# The half row binds the nine tensor operands plus, appended, the per-batch kv lengths (``seq_kv`` / ``SdpaBinding.seq_len_kv``;
-# an operand only when the plan was built with ``seq_kv_lens_present`` -- the standalone surface -- None-specialized otherwise).
+# The half row binds the nine tensor operands plus two APPENDED slots, in the order they landed, each an operand exactly when
+# its plan fact says so and None-specialized otherwise (the fixed-ABI rule the fp8 row's amax operands follow: ``bind()``
+# requires an operand the plan asked for and refuses one it did not, slot by slot, the two independent of each other):
+#   slot 9   ``seq_kv`` / ``SdpaBinding.seq_len_kv`` -- the caller's ``[B]`` int32 per-batch kv lengths under
+#            ``seq_kv_lens_present`` (the standalone surface; a graph attribute, read strictly).
+#   slot 10  ``delta`` -- STANDALONE-ONLY: the caller's ``[B, H_q, S_q_pad]`` fp32 ``rowsum(dO * O)`` under
+#            ``SdpaBwdDslSm107(external_delta=True)``.  No graph binding carries it -- ``SdpaBinding`` has no such field, so the
+#            half row's spec declares it ``standalone_only_roles`` and ``PreparedBwdLaunch`` frames it as absent -- and the
+#            graph plan keeps the chain's own ``dot`` launch.
 # The fp8 row appends the twelve scalar descales / scales of ``sdpa_fp8_backward`` and the four requested-only amax outputs;
-# their role names ARE the ``SdpaBinding`` field names.  The fp8 / MXFP8 bodies take ONE uniform real kv length, so their
-# rows bind no lengths operand.
-ROLES_F16 = ROLES[:9] + ("seq_kv",)
-ATTRIBUTES_F16 = ATTRIBUTES[:9] + ("seq_len_kv",)
+# their role names ARE the ``SdpaBinding`` field names.  The fp8 / MXFP8 bodies take ONE uniform real kv length and compute
+# their own delta, so their rows bind neither appended slot.
+EXTERNAL_DELTA_ROLE = "delta"
+ROLES_F16 = ROLES[:9] + ("seq_kv", EXTERNAL_DELTA_ROLE)
+ATTRIBUTES_F16 = ATTRIBUTES[:9] + ("seq_len_kv", EXTERNAL_DELTA_ROLE)
 FP8_SCALARS = (
     "descale_q",
     "descale_k",
@@ -180,23 +188,48 @@ def _dsl_dtype(torch_dtype):
     return {"bfloat16": cutlass.BFloat16, "float16": cutlass.Float16, "float8_e4m3fn": cutlass.Float8E4M3FN}[_dtype_name(torch_dtype)]
 
 
+def _delta_geometry(api):
+    """The delta's ``(shape, strides)``: ``[B, H_q, S_q_pad]`` fp32 contiguous -- the ``dot_do_o`` layout, whether the chain
+    carves it (``api._scratch_shapes()``'s ``delta`` entry) or the caller provides it (``external_delta_shape``)."""
+    shape = tuple(int(x) for x in api.external_delta_shape)
+    return shape, (shape[1] * shape[2], shape[2], 1)
+
+
 def compile_plan(api, main, mm_dk, mm_dq):
     """The half row's spec.  ``main`` / ``mm_dk`` / ``mm_dq`` are the loaded templates (their ``_host`` functions are baked into the
-    artifact; their ``FROST_SOURCE_DIGEST`` keys it together with the plan's geometry and carve)."""
+    artifact; their ``FROST_SOURCE_DIGEST`` keys it together with the plan's geometry and carve).  Two appended operands follow
+    the nine tensors, each bound exactly when its plan fact says so and independent of the other: slot 9, the caller's ``[B]``
+    int32 per-batch kv lengths under ``seq_kv_lens_present``; slot 10, under ``external_delta``, the caller's delta (fp32, 16-B
+    aligned, ``B * H_q * S_q_pad`` elements -- its exact layout is checked by ``SdpaBwdDslSm107.execute`` before the bind), with
+    which the carve has no ``delta`` region and the artifact launches no ``dot``."""
     from .kernels.sm107.prepared_host import compile_host_f16
 
     geometry, operands = _tensor_operands(api)
-    # The caller's per-batch kv lengths: a contiguous [B] int32 operand exactly when the plan was built with seq_kv_lens_present
-    # (bind() then requires it, and refuses one on a plan built without -- the fixed-ABI rule the fp8 row's amax operands follow).
+    # Slot 9, the caller's per-batch kv lengths: a contiguous [B] int32 operand exactly when the plan was built with
+    # seq_kv_lens_present (bind() then requires it, and refuses one on a plan built without -- the fixed-ABI rule the fp8 row's
+    # amax operands follow).
     seq_kv_present = bool(api.seq_kv_lens_present)
-    operands.append(Operand("int32", (api.batch_size,), (1,), api.batch_size, 4, 4) if seq_kv_present else None)
+    seq_kv_shape, seq_kv_strides = (api.batch_size,), (1,)
+    operands.append(Operand("int32", seq_kv_shape, seq_kv_strides, api.batch_size, 4, 4) if seq_kv_present else None)
+    # Slot 10, the caller's delta: the same rule under external_delta, independent of slot 9.
+    delta_shape, delta_strides = _delta_geometry(api)
+    external = bool(api.external_delta)
+    operands.append(Operand("float32", delta_shape, delta_strides, math.prod(delta_shape), 16, 4) if external else None)
+    # geometry[i] is operand i's static layout for EVERY slot, the two appended ones included (the sm80 host's convention, so the
+    # next appended slot inherits no off-by-one): host_f16 views the lengths with geometry[9] and the delta with geometry[10] (the
+    # dot_do_o layout the carved region has too).  Both entries ride whether or not their operand is bound, and both key the artifact.
+    geometry += ((seq_kv_shape, seq_kv_strides), (delta_shape, delta_strides))
     regions, offset = _regions(api, _REGION_SLOTS_F16)
     config = _config(api)
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm, seq_kv_present))
-    entry = compile_host_f16(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, seq_kv_present=seq_kv_present)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False)
+    key = repr(
+        (tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm, seq_kv_present, external)
+    )
+    entry = compile_host_f16(
+        main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, seq_kv_present=seq_kv_present, external_delta=external
+    )
+    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
 
 
 def compile_plan_fp8(api, main, mm_dk, mm_dq):
@@ -258,7 +291,7 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True)
 
 
-def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2):
+def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=()):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
@@ -275,6 +308,7 @@ def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2):
         roles=roles,
         attributes=attributes,
         scale_log2=scale_log2,
+        standalone_only_roles=tuple(standalone_only_roles),
     )
 
 
