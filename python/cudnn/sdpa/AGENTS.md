@@ -413,67 +413,6 @@ Backward (d512 stage 2):
   39.1-clk 2SM M=128 N=128 K=16 rate, stage 3 at 4096 MAC/clk/SM). Probe before
   planning an A/B: `g.create_execution_plans` raises `cudnnGraphNotSupportedError`
   with the backend's decline reasons when no engine proposes a plan.
-
-## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
-
-Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
-2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
-comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
-
-- **Read "residual vs the MMA floor" off the CLOCK RATIO, not off byte counters.**  `ncu --clock-control base` locks the SM
-  clock to base (684 MHz here) and leaves DRAM / L2 at speed, so a kernel that sits at its MMA floor under NCU but takes 1.3x the
-  cycles at the full clock is memory-LATENCY bound (the memory side is 1.69x slower relative to the SMs at 1155 MHz); one whose
-  cycle count is clock-invariant is issue / occupancy bound.  The (512,512) row: 1.09 M cycles per S8K launch under NCU = 96.5 %
-  tensor duty on its 136 active SMs, 1.41 M cycles at 1155 MHz (CUPTI us x NVML MHz) = the whole "1.35x unattributed residual";
-  S2K: 0.595 M vs 0.609 M (1.02x) -- the "S-dependent 14 %" IS this term.  Bytes per FLOP and DRAM % of peak are flat across S,
-  so `dram__bytes_read` alone says "nothing to see".  Detector: `ncu --clock-control base --metrics
-  sm__cycles_elapsed.avg,sm__cycles_active.avg,sm__ctas_launched.sum -k regex:_bprop_matmul_bh_sm100_kernel --launch-skip <two
-  backwards' worth of GEMM launches> --launch-count 3` on the chain, then `elapsed(full) / elapsed(base)` with
-  `elapsed(full) = CUPTI median us x NVML MHz`.
-- **Residency and idle SMs under CLC are direct metrics.**  `launch__cluster_max_active` (Occupancy section) is the co-resident
-  cluster count at the launch's SMEM (34 four-CTA clusters at 231 KiB/CTA, 74 two-CTA), `sm__ctas_launched.sum` is how many CTAs
-  CLC actually launched to serve the grid (136 = 34 x 4), and `sm__ctas_launched.min = 0` means SMs sat idle for the whole launch
-  (12 of 148 on the 2x2 row; 0 on the 2x1 row).  `launch__waves_per_multiprocessor` does not account for clusters (6.92 for a
-  7.53 -> 8-round launch); compute rounds as `tiles / cluster_max_active`.
-- **A structural gain measured at base clock need not survive the full clock.**  The (512,256) row (cluster 2x1, no A multicast,
-  A read twice from DRAM) is -12 % elapsed vs (512,512) under NCU at 684 MHz and +0.1..+0.8 % at 1155 MHz at dense S8K (three
-  CLEAN in-process A/Bs; +7.5 % at causal S8K), while at S2K / S4K -- where the launch is MMA-bound at full clock -- the same
-  -11.5 / -11.6 % (dense) and -6.4 % (causal S2K) appear in every round.  Always close with the full-clock A/B (`bwd_bench.py --ab`
-  in the lane: every arm built once, timed round-robin, bitwise-checked).  Outcome: the SM100 d512 chain keys the row on the
-  padded max(S_q, S_kv) and the device cc (`api_dsl._sm100_stage3_cgrp_tile_mn`, (512,256) for BSHD at <= 4096 on cc 10.0..10.6);
-  detectors `test_sdpa_bwd_dsl_sm100.py::test_stage3_cluster_tile_rule_by_sequence_length`,
-  `::test_stage3_small_s_tile_is_bitwise_the_wide_row` (a spy pins which row each arm loaded; the whole causal family and the
-  4096 / 4224 boundary as served) and `::test_stage3_tile_rule_reads_the_device_cc`.  Behind a (512,256) GEMM at S8K the
-  UNCHANGED stage-2 kernel ran +13-15 % slower in three CLEAN slots (wall == CUPTI sum; per-arm clock mean within 1 % on the
-  dense telemetry slot) -- a chain-level effect no per-kernel metric predicted; measure the whole chain, not the kernel.
-- **A plan-time rule measured on one board needs a compute-capability term, because adapters INHERIT `compile`.**  The cc 10.7
-  d512 row's adapter subclasses `SdpaBwdDslSm100` and overrides `check_support` and the stage-2 record only, so a tile
-  rule keyed on S alone in `SdpaBwdDslSm100.compile` would have flipped that row's default on a board where it was never rendered
-  or run (review of the (512,256) rule).  Resolve the cc once per compile through one seam (`SdpaBwdDslSm100._device_cc`, the
-  prepared host's own `compute_capability(resolve_device(q.device))`) and gate on an explicit inclusive range
-  (`_SM100_STAGE3_SMALL_S_CC = (100, 106)`).  Detectors: the faked-cc host pin in the UNGATED suite
-  (the cc 10.7 backward suite's `::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line` -- the SM100 suite is module-gated
-  to SM 10.0..10.6 and never runs on another lane) and the GPU pin that fakes the seam on the board it does run on
-  (`test_sdpa_bwd_dsl_sm100.py::test_stage3_tile_rule_reads_the_device_cc`: `_device_cc` -> (10, 7) must load (512,512)).
-  Grep tripwire for the next rule: `grep -n "compute_capability\|_device_cc" python/cudnn/sdpa/bwd/api_dsl.py` --
-  every plan-time branch on the device must go through the seam.
-- **Two refuted memory-side levers, so nobody re-tries them blind:** (1) a non-power-of-two S / dS workspace row stride
-  (`_skv_pad + 64`, 16 KiB -> 16.1 KiB) is +5 % SLOWER on stage 3 at dense S8K and neutral elsewhere; (2) TMA L2 promotion
-  (`l2_128b` / `l2_256b`) on the A / B operand descriptors is +1-2 % slower.  Both diffs are kept as patches in the lane dir
-  (`kv_stride_pad_lever.patch`, `tma_l2_promotion_lever.patch`) with their detectors; a descriptor hint does not change the kernel
-  PTX (the md5 record stays valid), a carve change does not change the templates either.
-- **Tile-row twins are `torch.equal`, and a bench that draws its own dO per build is not a twin test.**  The (512,256) row is
-  bitwise the (512,512) row (same per-pair work and k walk; the 2x2 row only multicasts A to a second pair), but
-  `bench_baselines.build_bwd` draws a fresh random dO per call, so an unseeded second build "proved" the rows differ by 1e-4.
-  Re-seed before every build you compare.
-- **A pin whose record is local-only has never run.**  The stage-3 PTX md5 pin read `frost_dev/.../md5_develop_sm100a.txt`, absent
-  in every checkout -> it skipped everywhere until the record was committed under `test/python/sdpa/frost/renderings/` with a
-  `dsl=` line (`md5_stage2_4x1_sm100a.txt`, `md5_stage3_sm100a.txt`); `test_stage3_md5_record_is_committed_and_complete` is the
-  tripwire, `ab_stages` 4 -> 3 on the (512,512) row the RED proof.  And a completeness test that compares the record against a
-  HAND-KEPT dict pins whatever the hand remembered: the tile rule made eight renderings default renderings and two were pinned.
-  Derive the expected set from the rule (`_stage3_default_tiles` walks `_sm100_stage3_cgrp_tile_mn` over S x cc per record) so
-  a rule that grows a row demands its renderings.
-
 - **Attribute a floor gap with in-kernel clocks before touching a wait, and
   quote cycles, not nominal-clock wall time.** Both SM100 d512 stage-2
   kernels carry a default-off attribution lever (`TemplateParams2x2.debug_clk`
@@ -517,6 +456,66 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
   never compare two ARMS run in a fixed order on a power-capped board without
   an in-run thermal control: the matrix's `4x1, twin` order timed the
   IDENTICAL stage-3 GEMMs 10-25 % slower in the second arm at S >= 8K.
+
+## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
+
+Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
+2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
+comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
+
+- **Read "residual vs the MMA floor" off the CLOCK RATIO, not off byte counters.**  `ncu --clock-control base` locks the SM
+  clock to base (684 MHz here) and leaves DRAM / L2 at speed, so a kernel that sits at its MMA floor under NCU but takes 1.3x the
+  cycles at the full clock is memory-LATENCY bound (the memory side is 1.69x slower relative to the SMs at 1155 MHz); one whose
+  cycle count is clock-invariant is issue / occupancy bound.  The (512,512) row: 1.09 M cycles per S8K launch under NCU = 96.5 %
+  tensor duty on its 136 active SMs, 1.41 M cycles at 1155 MHz (CUPTI us x NVML MHz) = the whole "1.35x unattributed residual";
+  S2K: 0.595 M vs 0.609 M (1.02x) -- the "S-dependent 14 %" IS this term.  Bytes per FLOP and DRAM % of peak are flat across S,
+  so `dram__bytes_read` alone says "nothing to see".  Detector: `ncu --clock-control base --metrics
+  sm__cycles_elapsed.avg,sm__cycles_active.avg,sm__ctas_launched.sum -k regex:_bprop_matmul_bh_sm100_kernel --launch-skip <two
+  backwards' worth of GEMM launches> --launch-count 3` on the chain, then `elapsed(full) / elapsed(base)` with
+  `elapsed(full) = CUPTI median us x NVML MHz`.
+- **Residency and idle SMs under CLC are direct metrics.**  `launch__cluster_max_active` (Occupancy section) is the co-resident
+  cluster count at the launch's SMEM (34 four-CTA clusters at 231 KiB/CTA, 74 two-CTA), `sm__ctas_launched.sum` is how many CTAs
+  CLC actually launched to serve the grid (136 = 34 x 4), and `sm__ctas_launched.min = 0` means SMs sat idle for the whole launch
+  (12 of 148 on the 2x2 row; 0 on the 2x1 row).  `launch__waves_per_multiprocessor` does not account for clusters (6.92 for a
+  7.53 -> 8-round launch); compute rounds as `tiles / cluster_max_active`.
+- **A structural gain measured at base clock need not survive the full clock.**  The (512,256) row (cluster 2x1, no A multicast,
+  A read twice from DRAM) is -12 % elapsed vs (512,512) under NCU at 684 MHz and +0.1..+0.8 % at 1155 MHz at dense S8K (three
+  CLEAN in-process A/Bs; +7.5 % at causal S8K), while at S2K / S4K -- where the launch is MMA-bound at full clock -- the same
+  -11.5 / -11.6 % (dense) and -6.4 % (causal S2K) appear in every round.  Always close with the full-clock A/B (`bwd_bench.py --ab`
+  in the lane: every arm built once, timed round-robin, bitwise-checked).  Outcome: the SM100 d512 chain keys the row on the
+  padded max(S_q, S_kv) and the device cc (`api_dsl._sm100_stage3_cgrp_tile_mn`, (512,256) for BSHD at <= 4096 on cc 10.0..10.6);
+  detectors `test_sdpa_bwd_dsl_sm100.py::test_stage3_cluster_tile_rule_by_sequence_length`,
+  `::test_stage3_small_s_tile_is_bitwise_the_wide_row` (a spy pins which row each arm loaded; the whole causal family and the
+  4096 / 4224 boundary as served) and `::test_stage3_tile_rule_reads_the_device_cc`.  Behind a (512,256) GEMM at S8K the
+  UNCHANGED stage-2 kernel ran +13-15 % slower in three CLEAN slots (wall == CUPTI sum; per-arm clock mean within 1 % on the
+  dense telemetry slot) -- a chain-level effect no per-kernel metric predicted; measure the whole chain, not the kernel.
+- **A plan-time rule measured on one board needs a compute-capability term, because adapters INHERIT `compile`.**  The cc 10.7
+  d512 row's adapter subclasses `SdpaBwdDslSm100` and overrides `check_support` and the stage-2 file / record only, so a tile
+  rule keyed on S alone in `SdpaBwdDslSm100.compile` would have flipped that row's default on a board where it was never rendered
+  or run (review of the (512,256) rule).  Resolve the cc once per compile through one seam (`SdpaBwdDslSm100._device_cc`, the
+  prepared host's own `compute_capability(resolve_device(q.device))`) and gate on an explicit inclusive range
+  (`_SM100_STAGE3_SMALL_S_CC = (100, 106)`).  Detectors: the faked-cc host pin in the UNGATED suite
+  (the cc 10.7 backward suite's `::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line` -- the SM100 suite is module-gated
+  to SM 10.0..10.6 and never runs on another lane) and the GPU pin that fakes the seam on the board it does run on
+  (`test_sdpa_bwd_dsl_sm100.py::test_stage3_tile_rule_reads_the_device_cc`: `_device_cc` -> (10, 7) must load (512,512)).
+  Grep tripwire for the next rule: `grep -n "compute_capability\|_device_cc" python/cudnn/sdpa/bwd/api_dsl.py` --
+  every plan-time branch on the device must go through the seam.
+- **Two refuted memory-side levers, so nobody re-tries them blind:** (1) a non-power-of-two S / dS workspace row stride
+  (`_skv_pad + 64`, 16 KiB -> 16.1 KiB) is +5 % SLOWER on stage 3 at dense S8K and neutral elsewhere; (2) TMA L2 promotion
+  (`l2_128b` / `l2_256b`) on the A / B operand descriptors is +1-2 % slower.  Both diffs are kept as patches in the lane dir
+  (`kv_stride_pad_lever.patch`, `tma_l2_promotion_lever.patch`) with their detectors; a descriptor hint does not change the kernel
+  PTX (the md5 record stays valid), a carve change does not change the templates either.
+- **Tile-row twins are `torch.equal`, and a bench that draws its own dO per build is not a twin test.**  The (512,256) row is
+  bitwise the (512,512) row (same per-pair work and k walk; the 2x2 row only multicasts A to a second pair), but
+  `bench_baselines.build_bwd` draws a fresh random dO per call, so an unseeded second build "proved" the rows differ by 1e-4.
+  Re-seed before every build you compare.
+- **A pin whose record is local-only has never run.**  The stage-3 PTX md5 pin read `frost_dev/.../md5_develop_sm100a.txt`, absent
+  in every checkout -> it skipped everywhere until the record was committed under `test/python/sdpa/frost/renderings/` with a
+  `dsl=` line (`md5_stage2_4x1_sm100a.txt`, `md5_stage3_sm100a.txt`); `test_stage3_md5_record_is_committed_and_complete` is the
+  tripwire, `ab_stages` 4 -> 3 on the (512,512) row the RED proof.  And a completeness test that compares the record against a
+  HAND-KEPT dict pins whatever the hand remembered: the tile rule made eight renderings default renderings and two were pinned.
+  Derive the expected set from the rule (`_stage3_default_tiles` walks `_sm100_stage3_cgrp_tile_mn` over S x cc per record) so
+  a rule that grows a row demands its renderings.
 
 ## Output initialization regressions
 

@@ -1290,8 +1290,8 @@ _STAGE3_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage
 
 
 def _renderings_dir():
-    """``frost_dev/results/bwd_d256_sm107/parity/renderings`` of this checkout or of the main checkout (a worktree's
-    frost_dev is untracked) -- the local-only PTX md5 record of the stage-3 renderings."""
+    """-> the local-only develop PTX md5 list FILE (``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt``
+    of this checkout or of the main checkout -- a worktree's frost_dev is untracked) when it exists, else the committed record."""
     root = Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
@@ -1319,12 +1319,11 @@ def _stage3_md5_record(record):
     ``renderings/md5_stage3_sm100a.txt`` (so the pin gates in every checkout and in CI like the stage-2 record), unless a
     checkout's local-only develop list (``_renderings_dir``) has the record -- that list predates the GQA records, so the
     override is PER RECORD, never a blanket one that would turn the six ``hi_*_gqa<g>`` pins into failures."""
-    d = _renderings_dir()
-    if d is not None and (d / "md5_develop_sm100a.txt").is_file():
-        f = d / "md5_develop_sm100a.txt"
-        dsl, want = _parse_md5_list(f)
+    f_local = _renderings_dir()
+    if f_local is not None and f_local != _STAGE3_MD5_RECORD and f_local.is_file():
+        dsl, want = _parse_md5_list(f_local)
         if record in want:
-            return f, dsl, want
+            return f_local, dsl, want
     f = _STAGE3_MD5_RECORD
     dsl, want = _parse_md5_list(f) if f.is_file() else (None, {})
     return f, dsl, want

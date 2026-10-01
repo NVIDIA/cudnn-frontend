@@ -2190,10 +2190,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
 
         if not STAGE2_2X2:
             return TemplateParams(**stage2_fields)
-        from cudnn.frost.device import compute_capability, resolve_device
         from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
 
-        _major, _minor = compute_capability(resolve_device(self.q_desc.device))
+        _major, _minor = self._device_cc()
         _rubin = _rubin_line(_major * 10 + _minor)
         return TemplateParams2x2(
             **stage2_fields,

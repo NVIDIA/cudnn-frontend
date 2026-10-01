@@ -1,11 +1,12 @@
 # PTX md5 of the SM100 d512 chain's stage-3 GEMM renderings (bwd/kernels/bprop_matmul_blackwell.py), CUTE_DSL_ARCH=sm_100a.
 # Consumed by test_sdpa_bwd_dsl_sm107.py::test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list, whose
 # `_SM100_PTX_PROBE` (S 1024, H 8, B 1, D 256; `MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32,
-# **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that test, in two
-# independent runs (the rendering is a host trace-compile; the test harness itself needs a CUDA device), from the tree at
-# d4b024671 -- the base of the GQA single-dQ-launch port, BEFORE any source change of that port.
+# **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that test in two
+# independent runs (the rendering is a host trace-compile; the test harness itself needs a CUDA device) -- the ten (512, 512)
+# MHA lines from the tree at d4b024671 (the base of every stage-3 edit on this branch, BEFORE any of them), every other line
+# from its first rendering on the branch that added it, as stated per kind below.
 #
-# Two kinds of line, stated separately because they prove different things:
+# Four kinds of line, stated separately because they prove different things:
 #   * the TEN base records (both operand majors x dense / causal / causal bottom-right 512 / THD bf16 + the dense fp16
 #     pair) are EXACTLY what `SdpaBwdDslSm100.compile` spells for its mm_lo / mm_hi records (no cgrp_tile_mn, no band
 #     field, b_head_group left at its default 1).  They pin the chain's DEFAULT renderings byte-for-byte: a source change
@@ -29,7 +30,6 @@
 #     byte-identical alongside), the GQA `hi_*_gqa<g>_512x256` ones from their first (twice-identical) rendering on the
 #     integrated branch.  Which names must be here is DERIVED from the rule by
 #     test_stage3_md5_record_is_committed_and_complete (`_stage3_default_tiles`), not hand-kept.
-#
 #
 # The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and
 # skips otherwise.  To refresh after a deliberate rendering change, run the consuming test with the new md5s written here
