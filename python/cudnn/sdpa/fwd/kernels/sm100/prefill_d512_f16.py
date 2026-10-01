@@ -82,6 +82,7 @@ from cudnn.frost.tile_dsl.tma import (
     tma_store_tile,
     tma_store_commit,
     tma_store_wait,
+    tma_tensormap_acquire,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -1763,6 +1764,10 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below stays branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes these packed-total maps once before attention.
+        # Every consuming loader warp acquires them before its tile loop.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     else:
@@ -1849,6 +1854,7 @@ def _tmaldg_warp_group(
                         bars.mb_tma_k_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not CFG.THD_VARLEN,
                     )
                     kv_state = advance(kv_state, CFG.STAGES_KV)
             else:
@@ -1865,6 +1871,7 @@ def _tmaldg_warp_group(
                         bars.mb_tma_v_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not CFG.THD_VARLEN,
                     )
                     kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1949,6 +1956,9 @@ def _tmastg_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
+    # Each per-sequence O map is immutable for this launch.
+    last_o_batch = cutlass.Int32(-1)
+
     while is_valid_tile > cutlass.Int32(0):
         if is_sg1:
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1970,8 +1980,11 @@ def _tmastg_warp_group(
                     # the store; the barrier protocol below still runs.
                     if batch_idx < n_batch:
                         o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                        if batch_idx != last_o_batch:
+                            tma_tensormap_acquire(o_desc_ptr)
+                            last_o_batch = batch_idx
                         o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), q_head_idx, q_row_coord, cutlass.Int32(0))
-                        tma_store_tile(sO[0], o_slice)
+                        tma_store_tile(sO[0], o_slice, acquire=False)
                 else:
                     tma_store_tile(
                         sO[0],
