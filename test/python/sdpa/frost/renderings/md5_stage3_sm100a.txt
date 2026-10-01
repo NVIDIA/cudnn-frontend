@@ -1,0 +1,20 @@
+# PTX md5 of the SM100 d512 chain's ten stage-3 renderings (`bwd/kernels/bprop_matmul_blackwell.py` at the default
+# (512, 512) row, the records EXACTLY as `SdpaBwdDslSm100.compile` spells them: both operand majors x {dense, causal, causal
+# bottom-right 512, THD} bf16 + the dense fp16 pair), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 (origin/develop merged
+# into vagarwalla/frost-d256-2x2; the stage-3 template there is develop's) on 2026-10-01 BEFORE any stage-3 edit
+# (lanes2/stage3_gemm/md5_stage3_pre_edit_run{1,2}.txt, rendered twice, identical).  The probe is
+# test_sdpa_bwd_dsl_sm107.py::_SM100_PTX_PROBE over _SM100_STAGE3_RECORDS (its B=1 H=8 S=1024 D=256 shapes: the THD pair folds
+# the probe's strides into its setup kernel, so those two md5s depend on the shapes; the other eight do not).  The PTX text is a
+# function of the DSL build: test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list compares only when the installed
+# DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage3 sm_100a lo_dense rc=0 ptx_md5=34bc834735dfa2216dd972bff483ff18
+stage3 sm_100a hi_dense rc=0 ptx_md5=e190516bf1e057043237b657b4772d86
+stage3 sm_100a lo_causal rc=0 ptx_md5=8c396e0f0fb56d706659027dd6c54e28
+stage3 sm_100a hi_causal rc=0 ptx_md5=558be611ef8a35c1ea7d3bf852c8618d
+stage3 sm_100a lo_causal_br512 rc=0 ptx_md5=bb13f7fa5cc5e610c425d44235b62934
+stage3 sm_100a hi_causal_br512 rc=0 ptx_md5=c8715d539b3a7f70cbf0656d6cb8c8b1
+stage3 sm_100a lo_thd rc=0 ptx_md5=2a72770425d4c3a3b4240e071b88a8c5
+stage3 sm_100a hi_thd rc=0 ptx_md5=df65855bb68092bd4d5c4610dae17748
+stage3 sm_100a lo_dense_fp16 rc=0 ptx_md5=55a9ed26ae049dd3b38e8607e025ecb8
+stage3 sm_100a hi_dense_fp16 rc=0 ptx_md5=5a205ffa0564265c03fef7d6762cd2d8

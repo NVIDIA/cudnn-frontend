@@ -1278,16 +1278,36 @@ def test_kernels_round_the_masked_q_range_to_the_stage3_pair():
         assert "q_hi = cute.math.max(hi, q_lo + cutlass.Int32(1))" in fn, f"{family}: the never-empty clamp must stay AFTER the rounding"
 
 
-def _renderings_dir():
-    """``frost_dev/results/bwd_d256_sm107/parity/renderings`` of this checkout or of the main checkout (a worktree's
-    frost_dev is untracked) -- the local-only PTX md5 record of the stage-3 renderings."""
+_STAGE3_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage3_sm100a.txt"
+
+
+def _stage3_md5_record():
+    """The COMMITTED record ``renderings/md5_stage3_sm100a.txt`` -- the SM100 d512 chain's ten stage-3 PTX md5s rendered
+    from the tree BEFORE any stage-3 tile-row edit (d4b024671, the develop template) -- so the byte-identity pin gates in
+    every checkout and in CI, not only on the box that rendered it (the previous record was local-only and absent
+    everywhere; the pin skipped on every lane).  A local ``frost_dev/results/bwd_d256_sm107/parity/renderings/
+    md5_develop_sm100a.txt`` (this checkout's or the main checkout's) overrides it for re-rendering experiments.  Lines:
+    ``dsl=<distribution> <version>`` (the DSL build the PTX is a function of) and ``stage3 sm_100a <record> rc=0 ptx_md5=<md5>``
+    (the local record spells its first word differently; only the rest is matched)."""
     root = Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
-        d = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings"
-        if (d / "md5_develop_sm100a.txt").is_file():
-            return d
-    return None
+        f = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings" / "md5_develop_sm100a.txt"
+        if f.is_file():
+            return f
+    return _STAGE3_MD5_RECORD
+
+
+def _parse_stage3_md5_record(f):
+    """-> (dsl line or None, {record: md5})."""
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
 
 
 # The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them (no cgrp_tile_mn, no band
@@ -1354,25 +1374,36 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
 """)
 
 
+def test_stage3_md5_record_is_committed_and_complete():
+    """The pin's baseline is in the tree (the previous record was local-only, so the pin skipped on every lane): a DSL
+    line and exactly the ten record names the probe renders."""
+    assert _STAGE3_MD5_RECORD.is_file(), _STAGE3_MD5_RECORD
+    dsl, want = _parse_stage3_md5_record(_STAGE3_MD5_RECORD)
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert set(want) == set(_SM100_STAGE3_RECORDS), (sorted(want), sorted(_SM100_STAGE3_RECORDS))
+
+
 @pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
 def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
-    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to develop's: every field this branch appended to
-    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``) defaults to what the
-    SM100 adapter never spells, so its records render byte-for-byte what they always did.  The develop list is the
-    LOCAL-ONLY record ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` (re-rendered from
-    develop with the same DSL; skipped where absent, like the reference-dump pins); the rendering is a host trace-compile
-    for sm_100a of the exact record.  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to the pre-edit tree's: every field appended to
+    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``) and
+    every ``_TileRow`` edit defaults to what the SM100 adapter never spells, so its records render byte-for-byte what they
+    always did.  Compared against the COMMITTED record (``renderings/md5_stage3_sm100a.txt``, rendered from d4b024671; a
+    local ``frost_dev/.../md5_develop_sm100a.txt`` overrides it); skips only when the installed DSL build is not the one the
+    record names (the PTX text is a function of it).  The rendering is a host trace-compile for sm_100a of the exact record.
+    A PTX md5, not a cubin one: ptxas renames uniform registers run to run.  RED-proven: ``ab_stages`` 4 -> 3 on the
+    (512, 512) row fails ``lo_dense`` (lanes2/stage3_gemm/red_md5_pin.log)."""
     import json
 
-    d = _renderings_dir()
-    if d is None:
-        pytest.skip("no local develop PTX md5 list (frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt)")
-    want = {}
-    for ln in (d / "md5_develop_sm100a.txt").read_text().splitlines():
-        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    from cudnn.frost.buffers import cutedsl_state
+
+    f = _stage3_md5_record()
+    dsl, want = _parse_stage3_md5_record(f)
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)}) of {f}"
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     dump = tmp_path / f"sm100a_stage3_{record}"
@@ -1384,8 +1415,8 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CONST")))
     assert out["CONST"] == "causal_window 0 causal_diag True", f"the SM100 record rendered a band: {out['CONST']}"
     got = out["PTX_MD5"].strip()
-    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
-    assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"
+    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (pre-edit record {want[record]} from {f.name})")
+    assert got == want[record], f"{record}: PTX md5 {got} != the pre-edit record's {want[record]} ({f}) -- the SM100 chain's stage-3 rendering changed"
 
 
 def test_stage3_b_head_group_default_folds_out_of_the_template():
