@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pointer hosts for the SM107 (Rubin) d=256 backward chains -- the half row and the per-tensor FP8 row.
+"""Pointer hosts for the SM107 (Rubin) d=256 backward chains -- the half row, the per-tensor FP8 row and the MXFP8 row.
 
 One ``@cute.jit`` host per row runs the WHOLE chain from device pointers and the caller's workspace: the padding
 copies, the ``seq_kv`` fill and the dS zero-fill (kernels of this artifact, not torch ops), ``dot`` (delta), the
 per-chunk main kernel + the two stage-3 GEMMs, and the GQA fold (half) / the fold + FP8 epilogue (fp8: dV always, dK
 under GQA; with the e4m3 dS workspace the GEMMs' own epilogue descales -- and quantizes dQ / MHA dK -- so no Q / K
-upcast and no dQ / dK fold pass runs; the bf16-dS twin keeps the upcasts and all three fold passes).  Every tensor
+upcast and no dQ / dK fold pass runs; the bf16-dS twin keeps the upcasts and all three fold passes).  The MXFP8 row
+(``host_mxfp8``) adds the zero-filled scale-factor pad staging (``_pad_sf_atoms``) ahead of the main kernel and, per its
+dS policy, either the SF-aware ``e4m3 x 2^(e-127) -> bf16`` dequant of the columnwise q_T / k_T ahead of the bf16
+stage-3 GEMMs (P-c, bf16 dS) or the block-scale GEMM arm over the kernel's two 1x32-scaled e4m3 dS payloads + E8M0
+atoms and the columnwise q_T / k_T with their own scale factors (P-b, ``_stage3_block_scale``; no dequant pass).  Every tensor
 the chain touches is a view built here from a pointer + a plan-time geometry (``_view``) or from a workspace region
 (``_scratch``); nothing is allocated, nothing synchronizes, so the compiled artifact rebinds per call, follows the
 handle's stream and captures into a CUDA graph.  ``prepared_sm107.compile_plan`` builds the geometry / regions and
@@ -28,6 +32,7 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
+from cudnn.sdpa.bwd.config_sm107 import DS_SF_P_B, DS_SF_P_C, DS_SF_POLICY_DEFAULT, MX_BLOCK, SF_ATOM_BYTES, SF_ATOM_ROWS
 from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS, DOT_Q_TILE, dkv_reduce_host, dot_do_o_host, dot_do_o_scaled_host, fold_quant_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 
@@ -39,8 +44,30 @@ _D = 256  # d_qk = d_v of both rows (the bodies hardcode the tile)
 R_DELTA, R_DS, R_SEQ_KV, R_DESC, R_Q_PAD, R_DO_PAD, R_LSE_PAD, R_K_PAD, R_V_PAD = range(9)
 R_DV_PART, R_DK_PART, R_DK_FOLD, R_DV_FOLD = 9, 10, 11, 12  # half row
 R_FP8_DV_PART, R_FP8_DK_PART, R_DQ_WS, R_Q_BF16, R_K_BF16, R_AMAX_SCRATCH = 9, 10, 11, 12, 13, 14  # fp8 row
+# MXFP8 row (both dS chains): 0..8 shared, then the dO_T staging copy, the five zero-filled SF pad slabs (Q side: rows / groups past
+# S_q_real; kv side: rows past S_kv_real up to the kernel's 256-row pad), the two dequantized bf16 stage-3 operands (the bf16-dS
+# chain's; None under the block-scaled default), the partials.
+R_DOT_PAD, R_SF_Q_PAD, R_SF_DO_PAD, R_SF_DOT_PAD, R_SF_K_PAD, R_SF_V_PAD, R_QT_BF16, R_KT_BF16 = 9, 10, 11, 12, 13, 14, 15, 16
+R_MX_DV_PART, R_MX_DK_PART, R_MX_DK_FOLD, R_MX_DV_FOLD = 17, 18, 19, 20
+# MXFP8 row, the block-scaled dS chain (P-b; appended): the second e4m3 dS payload (ds_dq, scaled per 32-kv block -- the first,
+# ds_dk, is R_DS), the two F8_128x4 E8M0 atom tensors (sf_ds_dk [B, H_chunk, S_kv/128, S_q/128, 512], sf_ds_dq the transpose), and
+# the columnwise q_T / k_T SF pad slabs the block-scale GEMMs' SFB reads when S_q / S_kv is ragged (None under P-c).
+R_MX_DS_DQ, R_MX_SF_DS_DK, R_MX_SF_DS_DQ, R_MX_SF_QT_PAD, R_MX_SF_KT_PAD = 21, 22, 23, 24, 25
 N_REGIONS_F16 = 13
 N_REGIONS_FP8 = 15
+N_REGIONS_MXFP8 = 26
+# The F8_128x4 atom geometry is the config's (``config_sm107.SF_ATOM_BYTES`` = 512 B per 128-row x 4-group atom, ``SF_ATOM_ROWS``
+# = 128, ``MX_BLOCK`` = 32), never re-literaled here.  Atoms per 128-row tile of one (b, h): the columnwise SF tensor has one atom per
+# D-PLANE (``_D // SF_ATOM_ROWS``), the rowwise one per 4-group d-chunk (``(_D // MX_BLOCK) // 4``) -- the two coincide (both = D / 128)
+# because an atom is 128 rows x 4 groups x 32 elements = 128 x 128 elements either way; ``_SF_ATOMS_PER_TILE`` is that count, derived.
+# (No module-level assert -- engine-contract "no module-level asserts"; the equality (_D // MX_BLOCK) // 4 == _D // SF_ATOM_ROWS is
+# pinned by test_sdpa_bwd_mxfp8_sm107.py::test_sf_pad_staging_geometry_derives_from_the_config.)
+_SF_ATOMS_PER_TILE = _D // SF_ATOM_ROWS  # 2 at d = 256
+# The MXFP8 row's zero-filled SF pad staging (``_pad_sf_atoms``).  True = what ships.  False = the RED half of the
+# poisoned-SF-pad tests: the kernel reads the producer's undefined pad bytes as they are, so a
+# 0xFF (E8M0 NaN) there lands NaN in dV / dS.  A module constant read at plan build (part of the artifact's cache key), never
+# a knob: it must never differ per plan.
+MXFP8_STAGE_SF_PADS: bool = True
 # amax scratch slots (fp32 [8]): 0..3 = the four amax outputs the graph left virtual, 4 = the main kernel's own dV amax
 # (recomputed by the fold pass over the folded value; the kernel's copy is never read).
 AMAX_SLOT_DP, AMAX_SLOT_DV_KERNEL = 3, 4
@@ -196,14 +223,120 @@ def _cast_fp8_to_bf16(src: cute.Tensor, dst: cute.Tensor, n: cutlass.Constexpr[i
 _cast_fp8_to_bf16.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+@cute.jit
+def _e8m0_scale(e: cutlass.Int32) -> cutlass.Float32:
+    """Biased E8M0 byte -> the EXACT fp32 dequant scale ``2^(e - 127)`` (the oracle's ``mxfp8_quant.e8m0_to_float``): the bit pattern
+    ``e << 23`` for ``1 <= e <= 254``; ``e == 0`` is the fp32 SUBNORMAL 2^-127 (``0x00400000``, not +0.0: an all-zero block's payload is
+    0 either way, a non-zero payload under byte 0 -- amax below 448 x 2^-127 -- dequantizes to its true tiny value as in the oracle);
+    ``e == 255`` is NaN (E8M0 NaN; a poisoned pad byte must surface as non-finite, never as +inf x 0 = NaN by accident).
+
+    ``e`` must be the UNSIGNED byte, 0..255 (``_sf_byte``): the DSL's ``raw_ptr`` carries Int8, so a bare ``.load().to(Int32)`` of a
+    byte >= 128 (a block whose amax exceeds 448 -- legal MXFP8, E8M0 128..254) arrives as ``e - 256`` and ``(e - 256) << 23`` is
+    ``0x80000000 | (e << 23)``: the RIGHT magnitude with a FLIPPED sign, finite and plausible, and the 255 sentinel unreachable (0xFF
+    reads -1 -> -inf).  Found by review 2026-09-30 on the sm_107a PTX (``ld.global.s8`` straight into ``shl.b32 23``, no mask); the
+    unit-normal test data (|x| < 6 -> e <= 127) had never produced such a byte.  Pinned by the all-256-bytes Rubin test and the
+    zero-extending byte-load PTX pin (the mask folds into ``ld.global.b8``; an ``s8`` load needs an ``and.b32 255``) in
+    ``test_sdpa_bwd_mxfp8_sm107.py``."""
+    bits = e << 23
+    if e == cutlass.Int32(0):
+        bits = cutlass.Int32(0x00400000)
+    if e == cutlass.Int32(255):
+        bits = cutlass.Int32(0x7FC00000)
+    return bits.bitcast(cutlass.Float32)
+
+
+@cute.jit
+def _sf_byte(ptr) -> cutlass.Int32:
+    """The E8M0 byte at ``ptr`` (an Int8 ``raw_ptr``) as an UNSIGNED Int32 in 0..255 -- the mask undoes the Int8 sign-extension
+    (see :func:`_e8m0_scale`).  Every SF byte that reaches arithmetic goes through here."""
+    return ptr.load().to(cutlass.Int32) & cutlass.Int32(0xFF)
+
+
+@cute.kernel
+def _dequant_mxfp8_to_bf16(src: cute.Tensor, sf: cute.Tensor, dst: cute.Tensor, columnwise: cutlass.Constexpr[bool]):
+    """``dst = bf16(e4m3(src) x 2^(e - 127))`` over a compact ``[B, S_pad, H, D]`` MXFP8 payload whose E8M0 scale factors ``sf`` are cuDNN
+    F8_128x4 atoms -- the SF-aware twin of :func:`_cast_fp8_to_bf16` (which applies NO scale), the bf16 stage-3 operand of the MXFP8
+    row's P-c chain (``dK = dS . Q_T``, ``dQ = dS^T . K_T`` over the dequantized COLUMNWISE q_T / k_T).  EXACT: an e4m3 value (3 mantissa
+    bits) times a power of two is a bf16 value (7 bits), the exponent range covered.
+
+    The atom rule (``test/python/sdpa/mxfp8_quant.py`` ``_swizzle_128x4``; the descriptors of ``sdpa/kernels/_mxfp8_sf.py``): a 512-B atom
+    holds a 128 (rows) x 4 (32-element groups) block of the logical scale matrix at byte ``(r % 32) * 16 + (r // 32) * 4 + c``.
+      columnwise (scales along S; ``sf`` = the ``[B, H, 8, S_pad]`` bytes of the kernel ABI): logical matrix ``[D, S/32]`` per (b, h) ->
+        rows r = d % 128 in D-plane ``d // 128``, groups c = (s // 32) % 4 in tile ``s // 128``; atoms are D-PLANE-major over the WHOLE
+        tensor: atom = ``(plane * B*H*T + (b*H + h) * T + s // 128) * 512`` (the plane stride grows with S -- mma-tma-matrix.md s7).
+      rowwise (scales along D; ``sf`` = ``[B, H, S_pad, 8]``): logical ``[S, D/32]`` per (b, h) -> r = s % 128, c = (d // 32) % 4, atoms
+        per (b, h, tile) contiguous, the two d-chunks (groups 0-3 / 4-7) at +0 / +512: atom = ``((b*H + h) * T + s // 128) * 1024 +
+        ((d // 32) // 4) * 512``.
+    ``S`` is the payload's row extent -- the padded ``S_pad`` (the bring-up driver) or the graph's REAL length (the prepared host:
+    the caller's q_T / k_T are real-extent tensors) -- and the SF tensor holds ``T = ceil(S / 128)`` atoms per (b, h) per plane (the
+    F8_128x4 rule pads rows to 128; the adapter's byte-count check pins it), so a ragged S walks its real rows against the same
+    atoms.  Eight consecutive d per thread (an 8-byte fp8 load, a 16-byte bf16 store); the eight columnwise bytes of one
+    thread sit 16 B apart inside ONE atom (8 divides 128), the rowwise eight share ONE byte.  A bring-up / host-side pass: the SF
+    gathers hit L1 (one atom serves 128 x 128 elements); its perf is a follow-up (the shipped block-scaled chain launches no dequant pass).
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    blocks, _, _ = cute.arch.grid_dim()
+    B, S, H, D = dst.shape
+    T = (S + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS
+    total = B * S * H * D // 8
+    src_ptr = src.iterator.raw_ptr()
+    sf_ptr = sf.iterator.raw_ptr()
+    dst_ptr = dst.iterator.raw_ptr()
+    i = cutlass.Int64(bid) * _THREADS + tid
+    while i < total:
+        pos = i * 8
+        d0 = pos % D
+        row = pos // D  # (b * S + s) * H + h
+        h = row % H
+        bs = row // H
+        s = bs % S
+        b = bs // S
+        v = (src_ptr + pos).load(count=8)
+        if cutlass.const_expr(columnwise):
+            plane = d0 // SF_ATOM_ROWS
+            atom = (plane * (B * H * T) + (b * H + h) * T + s // SF_ATOM_ROWS) * SF_ATOM_BYTES
+            c = (s // MX_BLOCK) % 4
+            r0 = d0 % SF_ATOM_ROWS
+            # r = r0 + e for element e: the eight bytes sit 16 B apart inside one atom (r0 % 8 == 0, so (r // 32) is one value).
+            # The (r % 32) * 16 + (r // 32) * 4 + c byte rule is the F8_128x4 atom's own (fixed literals, not geometry).
+            base = atom + (r0 // 32) * 4 + c
+            out = cutlass.Vector.from_elements(
+                tuple((v[e].to(cutlass.Float32) * _e8m0_scale(_sf_byte(sf_ptr + (base + ((r0 % 32) + e) * 16)))).to(cutlass.BFloat16) for e in range(8)),
+                cutlass.BFloat16,
+            )
+            (dst_ptr + pos).store(out, alignment=16)
+        else:
+            g = d0 // MX_BLOCK
+            atom = ((b * H + h) * T + s // SF_ATOM_ROWS) * (_SF_ATOMS_PER_TILE * SF_ATOM_BYTES) + (g // 4) * SF_ATOM_BYTES
+            r = s % SF_ATOM_ROWS
+            sc = _e8m0_scale(_sf_byte(sf_ptr + (atom + (r % 32) * 16 + (r // 32) * 4 + (g % 4))))
+            out = cutlass.Vector.from_elements(tuple((v[e].to(cutlass.Float32) * sc).to(cutlass.BFloat16) for e in range(8)), cutlass.BFloat16)
+            (dst_ptr + pos).store(out, alignment=16)
+        i += cutlass.Int64(blocks) * _THREADS
+
+
+_dequant_mxfp8_to_bf16.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def dequant_mxfp8_to_bf16_host(src: cute.Tensor, sf: cute.Tensor, dst: cute.Tensor, columnwise: cutlass.Constexpr[bool], stream):
+    """Launch :func:`_dequant_mxfp8_to_bf16` over the compact ``[B, S_pad, H, D]`` payload ``src`` (e4m3) into ``dst`` (bf16, same shape)
+    with the F8_128x4 SF bytes ``sf`` (``columnwise`` selects the atom rule).  The host of the MXFP8 P-c chain calls it once per stage-3
+    operand (q_T, k_T); the bring-up driver pins it bitwise against the torch dequant."""
+    _dequant_mxfp8_to_bf16(src, sf, dst, columnwise).launch(grid=_grid_16b(dst, 2), block=(_THREADS, 1, 1), stream=stream)
+
+
 # --- view helpers ---------------------------------------------------------------------------------------------------------
 
 
 @cute.jit
 def _window(tensor: cute.Tensor, dim: cutlass.Constexpr, begin, count: cutlass.Constexpr, step: cutlass.Constexpr = 1):
-    """``tensor`` narrowed along ``dim`` to ``count`` entries starting at ``begin``, every ``step``-th (a view: ``t[..., begin::step, ...]``)."""
-    shape = tuple(count if i == dim else tensor.shape[i] for i in range(4))
-    strides = tuple(tensor.stride[i] * step if i == dim else tensor.stride[i] for i in range(4))
+    """``tensor`` narrowed along ``dim`` to ``count`` entries starting at ``begin``, every ``step``-th (a view: ``t[..., begin::step, ...]``);
+    any rank (the 4-D operands, the block-scale arm's 5-D scale-factor views)."""
+    rank = len(tensor.shape)
+    shape = tuple(count if i == dim else tensor.shape[i] for i in range(rank))
+    strides = tuple(tensor.stride[i] * step if i == dim else tensor.stride[i] for i in range(rank))
     return cute.make_tensor(tensor.iterator + cutlass.Int64(begin) * tensor.stride[dim], cute.make_layout(shape, stride=strides))
 
 
@@ -219,17 +352,33 @@ def _permuted(tensor: cute.Tensor, order: cutlass.Constexpr):
 
 
 @cute.jit
-def _matmul(entry: cutlass.Constexpr, a, b, output, heads: cutlass.Constexpr, batches: cutlass.Constexpr, meta, desc, stream, epi: cutlass.Constexpr = None):
+def _matmul(
+    entry: cutlass.Constexpr,
+    a,
+    b,
+    output,
+    heads: cutlass.Constexpr,
+    batches: cutlass.Constexpr,
+    meta,
+    desc,
+    stream,
+    epi: cutlass.Constexpr = None,
+    sf: cutlass.Constexpr = None,
+):
     """One ``(batch, head)``-batched stage-3 GEMM: ``a`` / ``b`` / ``output`` already in the template's ``(M|N, K, H, B)`` / ``(M, N, H, B)``
     order.  The problem tuple is the retired ``matmul_bh``'s, widened to Int64 before the descriptor's byte products; the grid's M
     is A's M (dense: the operands' shared extent).  ``epi`` = the fp8 arm's ``(descale_0, descale_1, scale_out, amax)`` fp32 [1]
     tensors (``scale_out`` / ``amax`` None outside EPI_QUANT / for an unrequested amax); None = a rendering without an epilogue,
-    called with the SM100 chain's positional seven arguments."""
+    called with the SM100 chain's positional seven arguments.  ``sf`` (appended) = the block-scale arm's ``(sfa, sfb)`` -- the A
+    operand's F8_128x4 atoms as ``(512 B, K tiles, M tiles, H, B)`` and the columnwise B scale factors as ``(512 B, D planes, K
+    tiles, H, B)``, uint8 views with BYTE strides -- passed as the template's two trailing operands (no epilogue: the MMA dequantizes)."""
     problem = tuple(
         cutlass.Int64(x)
         for x in (a.shape[0], b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
     )
-    if cutlass.const_expr(epi is None):
+    if cutlass.const_expr(sf is not None):
+        entry(problem, a, b, output, meta, desc, stream, None, None, None, None, sf[0], sf[1])
+    elif cutlass.const_expr(epi is None):
         entry(problem, a, b, output, meta, desc, stream)
     else:
         entry(problem, a, b, output, meta, desc, stream, epi[0], epi[1], epi[2], epi[3])
@@ -249,6 +398,91 @@ def _pad_copy(src: cute.Tensor, dst: cute.Tensor, itemsize: cutlass.Constexpr[in
     """Launch ``_pad_rows`` over the word views of two compact ``[B, S, H, D]`` tensors (rows past ``src``'s extent read as zero)."""
     d = _words(dst, itemsize)
     _pad_rows(_words(src, itemsize), d).launch(grid=(min((cute.size(d) // 4 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+
+
+@cute.kernel
+def _pad_sf_atoms(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    s_real: cutlass.Constexpr[int],
+    groups: cutlass.Constexpr[int],
+    t_src: cutlass.Constexpr[int],
+    t_dst: cutlass.Constexpr[int],
+    columnwise: cutlass.Constexpr[bool],
+):
+    """``dst`` = the F8_128x4 scale-factor atoms of ``src`` with every byte that scales a PAD position zeroed -- the MXFP8 row's
+    zero-filled SF pad staging (sdpa-invariants s2).
+
+    The producer's SF tensor covers ``ceil128(S_real)`` rows / groups and its pad bytes are producer-defined: a 0xFF there is an
+    E8M0 NaN, and the kernel READS the pad positions (``S[kv, q_pad] = 0 x NaN`` on the Q side -- the +inf-LSE / SELECT-zero P no
+    longer saves BMM2 from folding NaN x dO_T into dV on every kv row; on the kv side the descriptors span the tensor's padded
+    tiles, so a poisoned pad tile lands NaN in the dead rows' dS).  MEASURED 2026-09-30 on Rubin: 131072 / 131072 dV NaN at S_q 160 with
+    poisoned Q-side pads, 458752 dS NaN at S_kv 800 with poisoned kv pads; zero-filled pads -> every gate green (both RED-then-green).
+
+    ``groups`` = B * H of the tensor; ``t_src`` / ``t_dst`` = its tiles per (b, h) in the source (``ceil128(S_real) / 128``) and in the
+    kernel's extent (``S_pad / 128``: equal on the Q side, ``>=`` on the kv side where the kernel pads to 256 rows and the atoms to
+    128 -- a whole zero tile is appended there).  Byte ``(r % 32) * 16 + (r // 32) * 4 + c`` of an atom scales row ``r`` (of 128),
+    group ``c`` (of 4) (``test/python/sdpa/mxfp8_quant.py::_swizzle_128x4``):
+      rowwise (scales along D; ``[B, H, S, 8]``): atoms ``((g * T + tile) * _SF_ATOMS_PER_TILE + chunk)`` (one atom per 4-group d-chunk,
+        D / 128 of them), position ``s = tile * 128 + r`` -> pad iff ``s >= s_real``;
+      columnwise (scales along S; ``[B, H, 8, S]``): atoms ``plane * (groups * T) + g * T + tile`` (D-plane-major over the whole tensor,
+        the plane stride grows with S -- rules/mma-tma-matrix.md s7), group ``tile * 4 + c`` -> pad iff its first element
+        ``(tile * 4 + c) * 32 >= s_real``.
+    One byte per thread step: the tensors are 1/32 of a payload, and consecutive columnwise bytes belong to different groups.
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    blocks, _, _ = cute.arch.grid_dim()
+    src_ptr = src.iterator.raw_ptr()
+    dst_ptr = dst.iterator.raw_ptr()
+    total = groups * t_dst * _SF_ATOMS_PER_TILE * SF_ATOM_BYTES
+    i = cutlass.Int64(bid) * _THREADS + tid
+    while i < total:
+        off = i % SF_ATOM_BYTES
+        atom = i // SF_ATOM_BYTES
+        r = (off // 16) + ((off % 16) // 4) * 32  # the F8_128x4 atom's byte rule, inverted (fixed literals, not geometry)
+        c = off % 4
+        if cutlass.const_expr(columnwise):
+            plane = atom // (groups * t_dst)
+            rest = atom % (groups * t_dst)
+            g = rest // t_dst
+            tile = rest % t_dst
+            keep = ((tile * 4 + c) * MX_BLOCK < s_real) & (tile < t_src)
+            src_atom = plane * (groups * t_src) + g * t_src + tile
+        else:
+            g = atom // (_SF_ATOMS_PER_TILE * t_dst)
+            rest = atom % (_SF_ATOMS_PER_TILE * t_dst)
+            tile = rest // _SF_ATOMS_PER_TILE
+            chunk = rest % _SF_ATOMS_PER_TILE
+            keep = (tile * SF_ATOM_ROWS + r < s_real) & (tile < t_src)
+            src_atom = (g * t_src + tile) * _SF_ATOMS_PER_TILE + chunk
+        v = cutlass.Int8(0)  # raw byte pointers load / store Int8 (the type the DSL's raw_ptr carries); a pure byte copy, sign-agnostic
+        if keep:
+            v = (src_ptr + (src_atom * SF_ATOM_BYTES + off)).load()
+        (dst_ptr + i).store(v)
+        i += cutlass.Int64(blocks) * _THREADS
+
+
+_pad_sf_atoms.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _pad_sf(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    s_real: cutlass.Constexpr[int],
+    groups: cutlass.Constexpr[int],
+    t_src: cutlass.Constexpr[int],
+    t_dst: cutlass.Constexpr[int],
+    columnwise: cutlass.Constexpr[bool],
+    stream,
+):
+    """Launch :func:`_pad_sf_atoms`: ``src`` the caller's F8_128x4 SF bytes (any view; only the base address is read), ``dst`` the
+    ``groups * t_dst * _SF_ATOMS_PER_TILE`` atoms of the kernel-facing slab."""
+    total = groups * t_dst * _SF_ATOMS_PER_TILE * SF_ATOM_BYTES
+    _pad_sf_atoms(src, dst, s_real, groups, t_src, t_dst, columnwise).launch(
+        grid=(min((total + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream
+    )
 
 
 @cute.jit
@@ -356,6 +590,87 @@ def _dq_launches(group: int, dq_b_head_group: int) -> int:
             f"({group}, one launch per chunk); nothing in between pairs every Q head with its K head"
         )
     return group // dq_b_head_group
+
+
+@cute.jit
+def _sf_planes_view(sf: cute.Tensor, planes: cutlass.Constexpr, tiles: cutlass.Constexpr, heads: cutlass.Constexpr, batches: cutlass.Constexpr):
+    """The block-scale GEMM arm's SFB view of a COLUMNWISE F8_128x4 scale tensor (``sdpa.kernels._mxfp8_sf``: D-plane-major atoms, the
+    plane stride = ``batches * heads * tiles`` atoms -- it GROWS with S): ``(512 B atom, D planes, S/128 tiles, H, B)`` over the
+    tensor's base with BYTE strides ``(1, B * H * tiles * 512, 512, tiles * 512, H * tiles * 512)``.  ``tiles`` is the SF tensor's OWN
+    ``ceil128(S) / 128`` (the producer's padded extent), never the kernel's 256-row pad."""
+    shape = (SF_ATOM_BYTES, planes, tiles, heads, batches)
+    strides = (1, batches * heads * tiles * SF_ATOM_BYTES, SF_ATOM_BYTES, tiles * SF_ATOM_BYTES, heads * tiles * SF_ATOM_BYTES)
+    return cute.make_tensor(sf.iterator, cute.make_layout(shape, stride=strides))
+
+
+@cute.jit
+def _stage3_block_scale(
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    ds_dk,
+    ds_dq,
+    sf_ds_dk,
+    sf_ds_dq,
+    q_T,
+    sf_q_T,
+    k_T,
+    sf_k_T,
+    dk_out,
+    dq_out,
+    bb,
+    bc: cutlass.Constexpr,
+    hb,
+    hc: cutlass.Constexpr,
+    group: cutlass.Constexpr,
+    meta,
+    desc,
+    stream,
+):
+    """The block-scaled dS chain's stage 3 (``MatmulTemplateParams.block_scale``): dK = ds_dk . q_T and dQ = ds_dq^T . k_T for one
+    (batch, head) chunk, every operand a view.  ``ds_dk`` / ``ds_dq`` are the chunk's REAL-extent ``[bc, hc, S_kv, S_q]`` e4m3 payloads
+    (scaled per 32-q block / per 32-kv block), ``sf_ds_dk`` ``[bc, hc, S_kv/128, S_q/128, 512]`` and ``sf_ds_dq`` ``[bc, hc, S_q/128,
+    S_kv/128, 512]`` their F8_128x4 atoms (the workspace contract; the padded tile grid -- the GEMM visits only the real K tiles),
+    ``q_T`` / ``k_T`` the full columnwise-quantized ``[B, S, H, D]`` payloads and ``sf_q_T`` / ``sf_k_T`` their ``_sf_planes_view``.
+    dK: A = ds_dk[kv, q] (M, K, H, B) K-major, SFA atoms (512, K = q tiles, M = kv tiles, H, B); B = q_T (D, q, H, B), SFB the q_T
+    planes view windowed to the chunk's heads.  dQ: A = ds_dq^T[q, kv] (M, K, H, B) M-major, SFA (512, K = kv tiles, M = q tiles,
+    H, B); B = k_T (D, kv, H_kv, B), SFB the k_T planes view -- under GQA once per group member over every ``group``-th Q head,
+    the atoms windowed the same way.  EPI_NONE: the MMA dequantizes both operands, the accumulator is the true-unit gradient."""
+    q_c = _window(_window(q_T, 0, bb, bc), 2, hb, hc)  # [bc, S_q, hc, D]
+    sfq_c = _window(_window(sf_q_T, 4, bb, bc), 3, hb, hc)  # (512, planes, q tiles, hc, bc)
+    dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
+    _matmul(
+        mm_dk,
+        _permuted(ds_dk, (2, 3, 1, 0)),
+        _permuted(q_c, (3, 1, 2, 0)),
+        _permuted(dk_c, (1, 3, 2, 0)),
+        hc,
+        bc,
+        meta,
+        desc,
+        stream,
+        None,
+        (_permuted(sf_ds_dk, (4, 3, 2, 1, 0)), sfq_c),
+    )
+    kv_n = hc // group
+    k_c = _window(_window(k_T, 0, bb, bc), 2, hb // group, kv_n)  # [bc, S_kv, kv_n, D]
+    sfk_c = _window(_window(sf_k_T, 4, bb, bc), 3, hb // group, kv_n)  # (512, planes, kv tiles, kv_n, bc)
+    for member in range(group):
+        a_g = _window(ds_dq, 1, member, kv_n, group)  # ds_dq[:, member::group] -> [bc, kv_n, S_kv, S_q]
+        sfa_g = _window(sf_ds_dq, 1, member, kv_n, group)  # [bc, kv_n, S_q/128, S_kv/128, 512]
+        o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, kv_n, group)  # dq[bs, :, hb+member::group] -> [bc, S_q, kv_n, D]
+        _matmul(
+            mm_dq,
+            _permuted(a_g, (3, 2, 1, 0)),
+            _permuted(k_c, (3, 1, 2, 0)),
+            _permuted(o_g, (1, 3, 2, 0)),
+            kv_n,
+            bc,
+            meta,
+            desc,
+            stream,
+            None,
+            (_permuted(sfa_g, (4, 3, 2, 1, 0)), sfk_c),
+        )
 
 
 # --- the half row --------------------------------------------------------------------------------------------------------
@@ -603,6 +918,267 @@ def host_fp8(
         fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, stream)
 
 
+# --- the MXFP8 row (the block-scaled P-b chain, the default, and the bf16-dS P-c twin) ----------------------------------------
+
+
+@cute.jit
+def host_mxfp8(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    q_T_ptr: cute.Pointer,
+    k_T_ptr: cute.Pointer,
+    do_T_ptr: cute.Pointer,
+    do_f16_ptr: cute.Pointer,
+    sf_q_ptr: cute.Pointer,
+    sf_q_T_ptr: cute.Pointer,
+    sf_k_ptr: cute.Pointer,
+    sf_k_T_ptr: cute.Pointer,
+    sf_v_ptr: cute.Pointer,
+    sf_do_ptr: cute.Pointer,
+    sf_do_T_ptr: cute.Pointer,
+    workspace: cute.Pointer,
+    scale_log2: cutlass.Float32,
+    scale: cutlass.Float32,
+    main: cutlass.Constexpr,
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    stage_sf_pads: cutlass.Constexpr,
+    stream: driver.CUstream,
+    ds_sf_policy: cutlass.Constexpr = DS_SF_POLICY_DEFAULT,
+):
+    """The MXFP8 row's chain (``sdpa_mxfp8_backward`` at d = 256 on Rubin; ``sm107/bprop_d256_mxfp8.py``) under the dS policy
+    ``ds_sf_policy`` (appended, default ``DS_SF_POLICY_DEFAULT``; ``DS_SF_P_B`` = the block-scaled chain that ships, ``DS_SF_P_C`` = the
+    bf16-dS oracle twin):
+
+        stage 0  zero-padded staging of Q / dO / dO_T / K / V (+inf LSE) as the other rows, PLUS the zero-filled SF pad slabs
+                 (``_pad_sf_atoms``: the producer's pad bytes are undefined and the kernel reads them -- a NaN there is NaN dV)
+        stage 1  delta = rowsum(dO_f16 * o_f16) in TRUE units (the half row's ``dot_do_o`` arm)
+        stage 2  per head chunk: the main kernel -- S = K.Q^T and dP = V.dO^T with the block scales dequantizing IN the MMA,
+                 P = exp2(S * scale * log2e - LSE * log2e) from the exact fp32 Stats, e4m3(P * 2^8) into the TMEM P ring, dV += P.dO_T
+                 (bf16 per-Q-head partials, TRUE units), dS = scale * P (dP - delta) from the fp32 P -> P-c: the bf16 kv-major
+                 workspace; P-b: two e4m3 payloads (ds_dk scaled per 32-q block, ds_dq per 32-kv block) + their E8M0 atoms
+        stage 3  dK = dS . Q_T and dQ = dS^T . K_T: P-c the bf16 renderings over the EXACTLY dequantized bf16 q_T / k_T
+                 (``dequant_mxfp8_to_bf16_host``, the columnwise payloads and their SF); P-b the block-scale GEMM arm over the e4m3
+                 payloads + atoms and the columnwise q_T / k_T with their own scale factors (``_stage3_block_scale``: no dequant pass,
+                 the MMA dequantizes; a ragged S_q / S_kv re-stages the q_T / k_T scale factors with their pad groups zeroed)
+        stage 4  GQA fold of the per-Q-head dK / dV partials (``dkv_reduce``, fixed order); real-row copy-out under kv padding
+
+    No per-tensor scale, no amax (a graph requesting amax outputs is declined, typed).  Gradients are bf16 (the bf16 GEMM writes its io dtype)."""
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
+    fp8 = cutlass.Float8E4M3FN
+    half = cutlass.BFloat16
+    # The dS policy is a compile-time fact of the artifact (folded into its cache key): the dS workspace dtype, the operands the
+    # kernel binds and the stage-3 arm all follow it; P-c traces exactly the chain it did before P-b existed.
+    p_b = ds_sf_policy == DS_SF_P_B
+    ds_dtype = fp8 if cutlass.const_expr(p_b) else half
+    q = _view(q_ptr, geometry[0])
+    k = _view(k_ptr, geometry[1])
+    v = _view(v_ptr, geometry[2])
+    o_f16 = _view(o_ptr, geometry[3])
+    do = _view(do_ptr, geometry[4])  # the ROWWISE e4m3 dO (the dP operand)
+    stats = _view(stats_ptr, geometry[5])
+    dq = _view(dq_ptr, geometry[6])
+    dk = _view(dk_ptr, geometry[7])
+    dv = _view(dv_ptr, geometry[8])
+    q_T = _view(q_T_ptr, geometry[9])
+    k_T = _view(k_T_ptr, geometry[10])
+    do_T = _view(do_T_ptr, geometry[11])  # the COLUMNWISE e4m3 dO (the dV operand)
+    do_f16 = _view(do_f16_ptr, geometry[12])
+    sf_q = _view(sf_q_ptr, geometry[13])
+    sf_q_T = _view(sf_q_T_ptr, geometry[14])
+    sf_k = _view(sf_k_ptr, geometry[15])
+    sf_k_T = _view(sf_k_T_ptr, geometry[16])
+    sf_v = _view(sf_v_ptr, geometry[17])
+    sf_do = _view(sf_do_ptr, geometry[18])
+    sf_do_T = _view(sf_do_T_ptr, geometry[19])
+    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [B, H, S_q_pad]
+    desc = _scratch(workspace, regions[R_DESC], cutlass.Int64)
+    q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, fp8, ds_dtype, stream)
+    group = h // hk
+    q_padded = regions[R_Q_PAD] is not None
+    kv_padded = regions[R_K_PAD] is not None
+    t_kv_sf = (skv + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS  # the kv SF tensors' OWN tile count (ceil128(S_kv) / 128), the dQ GEMM's K tiles
+    # STAGE 0 (MXFP8 half): dO_T pads like dO; the Q-side SF slabs are re-staged with the rows / groups past S_q zeroed (they sit at
+    # the kernel's q pad already: S_q_pad == ceil128(S_q)); the kv-side slabs grow to the kernel's 256-row pad with rows past S_kv zeroed.
+    do_T_k, sf_q_k, sf_do_k, sf_do_T_k = do_T, sf_q, sf_do, sf_do_T
+    t_q = sqp // SF_ATOM_ROWS
+    if cutlass.const_expr(q_padded):
+        do_T_k = _scratch(workspace, regions[R_DOT_PAD], fp8)
+        _pad_copy(do_T, do_T_k, itemsize, stream)
+        if cutlass.const_expr(stage_sf_pads):
+            sf_q_k = _scratch(workspace, regions[R_SF_Q_PAD], cutlass.Uint8)
+            sf_do_k = _scratch(workspace, regions[R_SF_DO_PAD], cutlass.Uint8)
+            sf_do_T_k = _scratch(workspace, regions[R_SF_DOT_PAD], cutlass.Uint8)
+            _pad_sf(sf_q, sf_q_k, sq, b * h, t_q, t_q, False, stream)
+            _pad_sf(sf_do, sf_do_k, sq, b * h, t_q, t_q, False, stream)
+            _pad_sf(sf_do_T, sf_do_T_k, sq, b * h, t_q, t_q, True, stream)
+    sf_k_k, sf_v_k = sf_k, sf_v
+    if cutlass.const_expr(kv_padded):
+        # The kv slab MUST grow to the kernel's 256-row extent even in the RED twin (the descriptors span it, and a tile past the
+        # caller's tensor is out-of-bounds memory, not a numerics probe); the switch removes only the zeroing of the producer's own pad
+        # rows -- the RED twin copies them verbatim by declaring every row inside the producer's ceil128 extent "real".
+        t_kv_src = (skv + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS
+        t_kv_dst = skvp // SF_ATOM_ROWS
+        sf_k_k = _scratch(workspace, regions[R_SF_K_PAD], cutlass.Uint8)
+        sf_v_k = _scratch(workspace, regions[R_SF_V_PAD], cutlass.Uint8)
+        kv_real = skv if cutlass.const_expr(stage_sf_pads) else t_kv_src * SF_ATOM_ROWS
+        _pad_sf(sf_k, sf_k_k, kv_real, b * hk, t_kv_src, t_kv_dst, False, stream)
+        _pad_sf(sf_v, sf_v_k, kv_real, b * hk, t_kv_src, t_kv_dst, False, stream)
+
+    # STAGE 1: delta in TRUE units over the half-precision O / dO (zeros past S_q: the kernel's finite-delta-pad ABI).
+    dot_do_o_host(o_f16, do_f16, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+
+    if cutlass.const_expr(p_b):
+        # P-b.  The kernel's second payload and the two E8M0 atom tensors (the first payload, ds_dk, is ``ds_full`` = R_DS); under
+        # a mask geometry that reads tiles the kernel never writes (``zero_ws``) they are zeroed like the first payload -- a zero
+        # SF byte is the scale 2^-127 and 0 x 2^-127 is exactly 0, so an unwritten tile contributes nothing to dK / dQ.
+        ds_dq_full = _scratch(workspace, regions[R_MX_DS_DQ], fp8)
+        sf_ds_dk = _scratch(workspace, regions[R_MX_SF_DS_DK], cutlass.Uint8)
+        sf_ds_dq = _scratch(workspace, regions[R_MX_SF_DS_DQ], cutlass.Uint8)
+        if cutlass.const_expr(zero_ws):
+            n16 = bc * hc * skvp * sqp * bpe_ds // 16
+            _zero_bytes(ds_dq_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+            n16_sf = bc * hc * (skvp // SF_ATOM_ROWS) * (sqp // SF_ATOM_ROWS) * SF_ATOM_BYTES // 16
+            _zero_bytes(sf_ds_dk, n16_sf).launch(grid=(min((n16_sf + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+            _zero_bytes(sf_ds_dq, n16_sf).launch(grid=(min((n16_sf + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+        # The stage-3 B operands are the COLUMNWISE e4m3 q_T / k_T themselves; their scale factors reach the block-scale MMA as
+        # WHOLE F8_128x4 atoms (the dequant pass that read real extents only is gone), so where S_q / S_kv is ragged the producer's
+        # undefined pad groups are re-staged zeroed (a 0xFF there is 0 x NaN in the MMA), at the SF tensor's own ceil128 tile count.
+        sf_qT_k, sf_kT_k = sf_q_T, sf_k_T
+        if cutlass.const_expr(q_padded and stage_sf_pads):
+            sf_qT_k = _scratch(workspace, regions[R_MX_SF_QT_PAD], cutlass.Uint8)
+            _pad_sf(sf_q_T, sf_qT_k, sq, b * h, t_q, t_q, True, stream)
+        if cutlass.const_expr(kv_padded and stage_sf_pads):
+            sf_kT_k = _scratch(workspace, regions[R_MX_SF_KT_PAD], cutlass.Uint8)
+            _pad_sf(sf_k_T, sf_kT_k, skv, b * hk, t_kv_sf, t_kv_sf, True, stream)
+        sf_qT_planes = _sf_planes_view(sf_qT_k, d // SF_ATOM_ROWS, t_q, h, b)
+        sf_kT_planes = _sf_planes_view(sf_kT_k, d // SF_ATOM_ROWS, t_kv_sf, hk, b)
+    else:
+        # The stage-3 B operands: the COLUMNWISE q_T / k_T (blocks along the contraction axis) dequantized EXACTLY to bf16.
+        q_T_bf16 = _scratch(workspace, regions[R_QT_BF16], half)  # [B, S_q, H, D]
+        k_T_bf16 = _scratch(workspace, regions[R_KT_BF16], half)  # [B, S_kv, H_kv, D]
+        dequant_mxfp8_to_bf16_host(q_T, sf_q_T, q_T_bf16, True, stream)
+        dequant_mxfp8_to_bf16_host(k_T, sf_k_T, k_T_bf16, True, stream)
+
+    # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
+    dv_k = _scratch(workspace, regions[R_MX_DV_PART], half) if cutlass.const_expr(regions[R_MX_DV_PART] is not None) else dv
+    dk_tgt = _scratch(workspace, regions[R_MX_DK_PART], half) if cutlass.const_expr(regions[R_MX_DK_PART] is not None) else dk
+    dk_real = _extent(dk_tgt, (b, skv, h, d))
+    ds = _extent(ds_full, (b, hc, skv, sq))
+    for ci in range(h // hc):
+        hb = ci * hc
+        # STAGE 2 (whole batch in-grid; head_base walks the chunks).  seqlen_kv_real / seqlen_q_real are the REAL lengths: the
+        # padded-kv mask arm's bound and the MASK_Q_PAD band (both fold out when the extents are tile multiples).  The dS operands
+        # follow the policy (the kernel's Launch ABI, ONE positional shape): P-c binds the bf16 ds_ws and None for the four
+        # appended operands; P-b binds None for ds_ws and the two e4m3 payloads + two atom tensors.  ``stream`` is the LAST
+        # positional and the appended operands precede it -- the ABI appends, so a caller that forgets them hands the stream to
+        # ``ds_dk`` and launches with none.
+        if cutlass.const_expr(p_b):
+            main(
+                q_k,
+                k_k,
+                v_k,
+                do_k,
+                do_T_k,
+                dv_k,
+                None,
+                lse_k,
+                delta,
+                sf_q_k,
+                sf_k_k,
+                sf_v_k,
+                sf_do_k,
+                sf_do_T_k,
+                (b, h, hk, sqp, skvp, hc),
+                scale,
+                scale_log2,
+                hb,
+                skv,
+                sq,
+                ds_full,
+                ds_dq_full,
+                sf_ds_dk,
+                sf_ds_dq,
+                stream,
+            )
+            # STAGE 3: the block-scale arm over the e4m3 payloads + atoms and the columnwise q_T / k_T + their SF; TRUE-unit bf16 out.
+            # Its dQ runs once per GQA group member (the SFB descriptor is indexed per A / C head); the dQ record's b_head_group == 1
+            # is pinned by validate_matmul_params and by prepared_sm107.compile_plan_mxfp8 when the plan is built.
+            _stage3_block_scale(
+                mm_dk,
+                mm_dq,
+                ds,
+                _extent(ds_dq_full, (b, hc, skv, sq)),
+                sf_ds_dk,
+                sf_ds_dq,
+                q_T,
+                sf_qT_planes,
+                k_T,
+                sf_kT_planes,
+                dk_real,
+                dq,
+                0,
+                b,
+                hb,
+                hc,
+                group,
+                seq_kv,
+                desc,
+                stream,
+            )
+        else:
+            main(
+                q_k,
+                k_k,
+                v_k,
+                do_k,
+                do_T_k,
+                dv_k,
+                ds_full,
+                lse_k,
+                delta,
+                sf_q_k,
+                sf_k_k,
+                sf_v_k,
+                sf_do_k,
+                sf_do_T_k,
+                (b, h, hk, sqp, skvp, hc),
+                scale,
+                scale_log2,
+                hb,
+                skv,
+                sq,
+                None,
+                None,
+                None,
+                None,
+                stream,
+            )
+            # STAGE 3 at bf16 over the dequantized columnwise operands; the outputs are TRUE-unit bf16.
+            _stage3(mm_dk, mm_dq, ds, q_T_bf16, k_T_bf16, dk_real, dq, 0, b, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
+
+    # STAGE 4: fold the per-Q-head partials onto the KV heads (fixed order); copy real rows out of a padded staging.
+    if cutlass.const_expr(group > 1):
+        dk_out = _scratch(workspace, regions[R_MX_DK_FOLD], half) if cutlass.const_expr(kv_padded) else dk
+        dv_out = _scratch(workspace, regions[R_MX_DV_FOLD], half) if cutlass.const_expr(kv_padded) else dv
+        dkv_reduce_host(dk_tgt, dv_k, dk_out, dv_out, d, d, group, half, False, stream)
+        if cutlass.const_expr(kv_padded):
+            _pad_copy(dk_out, dk, 2, stream)
+            _pad_copy(dv_out, dv, 2, stream)
+    elif cutlass.const_expr(kv_padded):
+        _pad_copy(dv_k, dv, 2, stream)
+
+
 # --- compilation -----------------------------------------------------------------------------------------------------------
 
 
@@ -666,4 +1242,38 @@ def compile_host_fp8(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, 
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
         symbol="frost_sdpa_bwd_sm107_fp8_prepared",
+    )
+
+
+def compile_host_mxfp8(main, mm_dk, mm_dq, config, geometry, regions, sm, cache_key, stage_sf_pads=True, ds_sf_policy=DS_SF_POLICY_DEFAULT):
+    """The MXFP8 row's artifact: e4m3 payloads (q, k, v, dO, q_T, k_T, dO_T), bf16 o_f16 / dO_f16 / dQ / dK / dV, fp32 Stats and
+    seven uint8 F8_128x4 scale-factor blobs (``geometry`` carries each as a flat byte view: only the base address is read).
+    ``stage_sf_pads`` = ``MXFP8_STAGE_SF_PADS`` as the plan read it (the caller folds it into ``cache_key``); ``ds_sf_policy``
+    (appended, default ``DS_SF_POLICY_DEFAULT``) = the adapter's dS policy -- ``DS_SF_P_B`` the block-scaled chain that ships, ``DS_SF_P_C``
+    the bf16-dS oracle twin -- likewise keyed."""
+    _check_target(sm)
+    if ds_sf_policy not in (DS_SF_P_C, DS_SF_P_B):
+        raise ValueError(f"SM107 MXFP8 bwd: ds_sf_policy must be DS_SF_P_C ({DS_SF_P_C}) or DS_SF_P_B ({DS_SF_P_B}); got {ds_sf_policy}")
+    fp8, half = cutlass.Float8E4M3FN, cutlass.BFloat16
+    args = [_ptr(fp8), _ptr(fp8), _ptr(fp8), _ptr(half), _ptr(fp8), _ptr(cutlass.Float32, 4), _ptr(half), _ptr(half), _ptr(half)]
+    args += [_ptr(fp8), _ptr(fp8), _ptr(fp8), _ptr(half)]
+    args += [_ptr(cutlass.Uint8) for _ in range(7)]
+    return compile_cached(
+        host_mxfp8,
+        *args,
+        _ptr(cutlass.Uint8),
+        cutlass.Float32(1),
+        cutlass.Float32(1),
+        main,
+        mm_dk,
+        mm_dq,
+        tuple(config),
+        geometry,
+        regions,
+        bool(stage_sf_pads),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        int(ds_sf_policy),
+        options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
+        cache_key=cache_key,
+        symbol="frost_sdpa_bwd_sm107_mxfp8_prepared",
     )

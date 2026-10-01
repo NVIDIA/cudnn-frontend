@@ -51,6 +51,19 @@ from frost_test_utils import _SM, arch_known_to_the_dsl, assert_no_new_spills, n
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module probes Rubin rows on non-Rubin hosts too (the analyzer's cc faked to 10.7).  bwd mismatch() now carries the
+    # fwd rows' sm_107a DSL gate (AGENTS.md Rule 7), so match the fake device with a fake compiler target -- exactly as the
+    # fwd suites do; real Rubin runs use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _ENGINE = "sdpa_bwd_sm107"
 _FP8_ENGINE = "sdpa_bwd_sm107_fp8"
 _FAMILY_NAME = "frost_sdpa_bwd"
@@ -73,8 +86,10 @@ _TOL = {torch.bfloat16: dict(atol=5e-2, rtol=5e-2), torch.float16: dict(atol=2e-
 _BF16_ULP_REL = 2.0**-7
 
 # ---------------------------------------------------------------------------- the two kernel bodies (plan s1; the fp8 row shares this module's static pins)
-_KERNEL_FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py"}
-_TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8"}
+# The MXFP8 body (its own module is test_sdpa_bwd_mxfp8_sm107.py) shares
+# every family-parametrized static pin and SASS pin below.
+_KERNEL_FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+_TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8", "mxfp8": "sdpa_bwd_sm107_main_mxfp8"}
 _FAMILIES = tuple(_KERNEL_FILES)
 
 
@@ -1733,7 +1748,9 @@ def test_half_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_
     assert total == api.scratch_workspace_bytes() == sum(ws_align(n * d.itemsize) for _, n, d in plan) > 0
     assert ("q_pad" in names) == (api.s_q_max % 128 != 0) and ("k_pad" in names) == (api.s_k_max % 256 != 0)
     assert ("dk_part" in names) == (api.h_q != api.h_kv)
-    assert api._b_chunk * api._qh_chunk * api._skv_pad * api._sq_pad * 2 <= 4 << 30 or api._qh_chunk == api._gqa_group
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_WS_BUDGET_BYTES
+
+    assert api._b_chunk * api._qh_chunk * api._skv_pad * api._sq_pad * 2 <= _SM107_WS_BUDGET_BYTES or api._qh_chunk == api._gqa_group
 
 
 @pytest.mark.parametrize(
@@ -2329,7 +2346,13 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(family):
 # handshakes) -- the pin records that classification as the (ring, idle) site COUNTS so a re-classified, re-literalled or
 # newly added site cannot drift in silently, and forbids the spin on the two waits every body parks in for a whole tile:
 # the scheduler payload and ``mb_tmem_dealloc``.  None = not yet pinned (the body is still moving): structural check only.
-_RING_WAIT_SITES = {"f16": (23, 15), "fp8": (17, 24)}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes
+_RING_WAIT_SITES = {
+    "f16": (23, 15),
+    "fp8": (17, 24),
+    "mxfp8": (20, 25),
+}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes; mxfp8 = the fp8 body's sites + the mb_p_sf_consumed ring wait (before the P store) and its end-of-kernel drain,
+# + 2 SOURCE sites: the MMA warp's loop Q.K block (its s_acc_empty + q_full waits) is spelled once per S issue order under
+# cutlass.const_expr(S_LOOKAHEAD) -- one arm traces, so a binary still has 18 ring waits (test_sdpa_bwd_mxfp8_sm107 pins the per-arm count).
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc",)
 
 
@@ -2443,7 +2466,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
-    FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py"}
+    FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640)}
     params = TemplateParams(dtype_qkv=DTYPE_BF16 if family == "f16" else DTYPE_E4M3, **MASKS[mask])
     mod = load_template(_sm100_kernel_path(FILES[family]), params, tag="sdpa_bwd_sm107_main_" + family)
@@ -2551,6 +2574,10 @@ _SASS_PIN_ROWS = [
     # from ABOVE by the window (the same call the f16 body makes), the SWA term joins the causal one in the bit-word mask
     # arm.  Its SASS is the causal row's plus the trim arithmetic (+32 lines, every other pinned count identical, 2026-09-28).
     pytest.param("fp8", "causal_swa", id="fp8-causal-swa"),
+    # The MXFP8 body at the bare record (the FMUL arm of the P quantizer, the block-scaled dS default P-b): the fp8 rows' pins
+    # hold for it too; its own arms (fused scaled cvt, MASK_Q_PAD, the bf16-dS twin) are pinned in test_sdpa_bwd_mxfp8_sm107.py.
+    pytest.param("mxfp8", "dense", id="mxfp8-dense"),
+    pytest.param("mxfp8", "causal", id="mxfp8-causal"),
 ]
 # The masked rows of the above: the mask form pin (rules/frost-tile-dsl.md s10d) applies to them only.
 _MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
@@ -2564,6 +2591,8 @@ _SPILL_PINS = {
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
     ("fp8", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "causal_swa"): {"STL": 0, "LDL": 0},
+    ("mxfp8", "dense"): {"STL": 0, "LDL": 0},  # 2026-09-30: REG 168, 0 / 0 on every arm
+    ("mxfp8", "causal"): {"STL": 0, "LDL": 0},
 }
 # One trace-compile per (family, mask) per session: every pin below reads the same SASS, so the probe runs once and
 # the tests share its counts (a compile is 20-60 s; the dump dir of the FIRST caller holds the cubin).
@@ -2823,3 +2852,81 @@ def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask, arm):
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
     assert smem["smem_a_0"] < _SMEM_DESC_V0_LIMIT and smem["smem_b_0"] < _SMEM_DESC_V0_LIMIT, smem
     assert smem["total"] <= _SM100_OPTIN_SMEM, smem
+
+
+# =========================================================================== the stage-2 dS workspace budget (host)
+
+
+def test_every_sm107_row_chunks_against_the_one_8_gib_budget():
+    """ONE stage-2 dS workspace budget for every sm107 row and dS policy -- ``_SM107_WS_BUDGET_BYTES``, 8 GiB, no per-row or
+    per-policy constant (the MXFP8 row used to carry its own) and no adapter override of ``_ws_budget_bytes``.  A chunking
+    constant only: the plan's workspace is the chunk's whole carve.  The arithmetic its comment states, pinned at B=1 H=128:
+    8K bf16 / fp16 dS (2 B per element) 64 heads = 2 launches, e4m3 dS (1 B) 128 heads = 1 launch; what 4 GiB gave next to it
+    (32 / 64 heads); at 16K every row still chunks (16 / 32 heads).  Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz) measured the
+    head-chunk cost at that shape: the bf16-dS chain forced from 32-head to 16-head chunks lost 0.9 % dense / 6.6 % causal."""
+    import inspect
+
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl import _SM100_WS_BUDGET_BYTES
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8, SdpaBwdDslSm107Mxfp8, _sm107_chunks
+
+    assert sm107._SM107_WS_BUDGET_BYTES == 8 << 30 == 2 * _SM100_WS_BUDGET_BYTES, "8 GiB on the Rubin line; the SM100 chain keeps its 4 GiB"
+    assert not hasattr(sm107, "_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES"), "one budget, one name"
+    for cls in (SdpaBwdDslSm107Fp8, SdpaBwdDslSm107Mxfp8):
+        assert "_ws_budget_bytes" not in vars(cls), f"{cls.__name__} overrides the budget: one source of truth"
+    assert inspect.signature(_sm107_chunks).parameters["budget"].default == sm107._SM107_WS_BUDGET_BYTES
+    e4m3 = torch.float8_e4m3fn
+    half = _adapter(SdpaBwdDslSm107, b=1, hq=128, hkv=128, sq=8192, skv=8192)
+    fp8 = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=128, hkv=128, sq=8192, skv=8192, dt=e4m3, grad_dt=e4m3)
+    assert half._ws_budget_bytes() == fp8._ws_budget_bytes() == 8 << 30
+    assert (half._b_chunk, half._qh_chunk) == (1, 64), "bf16 dS at 8K H=128: 64-head chunks, 2 launches"
+    assert (fp8._b_chunk, fp8._qh_chunk) == (1, 128), "e4m3 dS at 8K H=128: the whole head set, 1 launch"
+    assert half.scratch_workspace_bytes() >= 64 * 8192 * 8192 * 2 and fp8.scratch_workspace_bytes() >= 128 * 8192 * 8192, "the carve holds the chunk"
+    assert _sm107_chunks(1, 128, 1, 8192, 8192, 2, budget=4 << 30) == (1, 32) and _sm107_chunks(
+        1, 128, 1, 8192, 8192, 1, budget=4 << 30, batch_chunking=False
+    ) == (1, 64)
+    assert _sm107_chunks(1, 128, 1, 16384, 16384, 2) == (1, 16) and _sm107_chunks(1, 128, 1, 16384, 16384, 1, batch_chunking=False) == (
+        1,
+        32,
+    ), "16K still chunks"
+    assert _sm107_chunks(2, 128, 1, 16384, 16384, 2) == (2, 8), "heads shrink first: the batch stays whole while any head chunk fits at the full batch"
+
+
+def test_plan_declines_typed_when_the_workspace_exceeds_what_the_caller_can_hold(monkeypatch):
+    """The budget is a CHUNKING constant: the plan reports the chunk's whole carve through ``get_workspace_size()`` and the caller
+    allocates it -- there is no adapter-side device-memory refusal.  A caller that cannot hold it bounds the ranked list with
+    ``deselect_workspace_greater_than(free)`` (the free-memory query is the caller's; mocked here), and the pinned row then declines
+    TYPED at build time -- ``cudnnGraphNotSupportedError`` naming the bytes and the bound -- before any launch; it never runs under
+    a smaller carve.  The same graph with the bound at the requirement builds, and reports exactly the adapter's carve.  Host-only:
+    the analyzer's device is faked to cc 10.7 and the adapter's JIT ``compile`` is a no-op (the decision needs the SIZE, not a
+    kernel), so no kernel is traced and nothing can launch."""
+    from cudnn.sdpa import _plan as plan_mod
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)  # host-only: the descriptor helper asks for the device even on a CUDA-less runner
+    monkeypatch.setattr(SdpaBwdDslSm107, "compile", lambda self: None)  # size only: _prepared stays None, the plan's bytes come from scratch_workspace_bytes()
+
+    def _never(*_a, **_k):
+        raise AssertionError("a declined plan must not launch")
+
+    monkeypatch.setattr(plan_mod._FrostSdpaPlan, "execute", _never)
+    monkeypatch.setattr(SdpaBwdDslSm107, "execute", _never)
+    shape = dict(b=1, hq=2, hkv=2, sq=512, skv=512)
+    need = _adapter(SdpaBwdDslSm107, **shape).scratch_workspace_bytes()
+    assert need > 0
+    # the caller's free-memory query says less than the carve -> typed decline, no launch
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (need - 1, 32 << 30))
+    g, _t, _outs = _build_graph(dt=torch.bfloat16, scale="default", **shape)
+    select_engine(g, _ENGINE)
+    free, _total = torch.cuda.mem_get_info()
+    g.deselect_workspace_greater_than(free)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=rf"needs {need} workspace bytes, over the {free} limit"):
+        g.build_plans()
+    # the bound at the requirement: the plan builds and reports the adapter's carve, byte for byte
+    g2, _t2, _outs2 = _build_graph(dt=torch.bfloat16, scale="default", **shape)
+    select_engine(g2, _ENGINE)
+    g2.deselect_workspace_greater_than(need)
+    g2.build_plans()
+    assert g2.get_workspace_size() == need

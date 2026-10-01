@@ -1207,16 +1207,18 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128), (256, 256)])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
-    """Rubin e2e for the MXFP8 d128 / d192x128 kernels (row-sum-in-MMA since
+    """Rubin e2e for the MXFP8 d128 / d192x128 / d256 kernels (row-sum-in-MMA since
     #1059): the PUBLISHED Stats is the fp32 log-sum-exp of the block-scaled
     problem the kernel saw, not the log of the quantized-P sum that
     normalizes O -- cuDNN's mxfp8 backward recomputes P = exp(S - Stats), and
     the fp8 twin lost a dK row to exactly that (test_mhas_v2 fp8_bwd_ragged
     test31).  (1) LSE within 1e-4 of the exact value from the DEQUANTIZED
-    inputs; (2) O bit-identical with and without Stats."""
+    inputs; (2) O bit-identical with and without Stats.  The (256, 256) row is
+    the forward the d=256 MXFP8 BACKWARD (`sdpa_bwd_sm107_mxfp8`) recomputes P
+    from (the exact-LSE contract pinned in ``test_sdpa_bwd_mxfp8_sm107.py``)."""
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):

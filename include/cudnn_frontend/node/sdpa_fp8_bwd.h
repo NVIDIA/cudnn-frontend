@@ -27,10 +27,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
 
    private:
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
-    // MXFP8 with d_qk == d_v == 256 on Blackwell. This shape has NO cuDNN
-    // backend plan; it is served only by the frontend-only FROST engine
-    // (sdpa_bwd_sm100_mxfp8, opt-in). Recorded so override_heuristics_query()
-    // does not pin a backend engine id that cannot finalize.
+    // MXFP8 with d_qk == d_v == 256 on Blackwell and Rubin. This shape has NO cuDNN
+    // backend plan; it is served only by the frontend-only FROST engines
+    // (sdpa_bwd_sm100_mxfp8 on SM 10.0-10.6, sdpa_bwd_sm107_mxfp8 on SM 10.7-11.9;
+    // both opt-in). Recorded so override_heuristics_query() does not pin a backend
+    // engine id that cannot finalize.
     mutable bool is_d256_mxfp8_on_blackwell = false;  // Will be edited in pre_validate_node()
     // Per-tensor FP8 with d_qk == d_v == 256 on the Rubin line (SM 10.7-11.9). No cuDNN
     // backend plan serves it either; it is admitted for the frontend-only FROST
@@ -200,8 +201,9 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         // validate basic dimension requirements
         if(prop_major >= 10) {
             // MXFP8 with d_qk == d_v == 256 is served by the frontend-only FROST
-            // SM100 engine (sdpa_bwd_sm100_mxfp8, opt-in), not by a cuDNN
-            // backend plan -- admitted here so that engine can claim it; see
+            // engines (sdpa_bwd_sm100_mxfp8 on SM 10.0-10.6, sdpa_bwd_sm107_mxfp8 on
+            // the Rubin line SM 10.7-11.9; both opt-in), not by a cuDNN backend plan
+            // -- admitted here so those engines can claim it; see
             // override_heuristics_query().
             bool const d256_mxfp8_frost = is_mxfp8_scaling() && (d_qk == 256) && (d_v == 256);
             // Per-tensor FP8 with d_qk == d_v == 256 on the Rubin line (SM 10.7-11.9) is
@@ -302,6 +304,10 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         // Auto-route to deterministic algorithm for cases where non-deterministic is not supported on Blackwell:
         // 1. MXFP8 backward - requires deterministic (STAGES=2)
         // 2. FP8 backward with d_qk <= 192 and d_v <= 128 - requires deterministic
+        // NOTE: prop_major == 10 also covers the Rubin line (SM 10.7-11.9 has major 10 / 11), so every MXFP8
+        // backward graph on cc 10.7 carries this attribute too. The frontend-only FROST rows that serve the
+        // d_qk == d_v == 256 MXFP8 shape there (sdpa_bwd_sm107_mxfp8) read the graph's build-time kwargs, not
+        // this attribute, and decline use_deterministic_algorithm=True until their two-run pin lands.
         bool const is_mxfp8 = is_mxfp8_scaling();
         bool const is_supported_dims = (d_qk <= 192) && (d_v <= 128);
         if ((prop_major == 10) && !attributes.is_deterministic_algorithm) {
@@ -459,7 +465,10 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 error_code_t::ATTRIBUTE_NOT_SET,
                 "MXFP8 SDPA: Descale_K_T s_scale dimension too small (expected >= " + std::to_string(s_kv_scale) + ")");
 
-            // Validate dimension consistency for SF_V: [b, h_v, s_kv_scale_padded, d_v_padded]
+            // Validate dimension consistency for SF_V. NOTE: Descale_V is the ROWWISE (along-d) scale of V in the
+            // backward -- the reference math below dequantizes V exactly like K (block_size {1, 32} over the swapped
+            // dims), and both the backend and the FROST MXFP8 rows (sdpa_bwd_sm100_mxfp8, sdpa_bwd_sm107_mxfp8) bind
+            // the rowwise tensor [b, h_v, s_kv_padded(128), d_v_scale_padded(4)]; the ">=" check below passes it.
             auto const& sf_v_dim = descale_v->get_dim();
             RETURN_CUDNN_FRONTEND_ERROR_IF(sf_v_dim[0] != b || sf_v_dim[1] != h_v,
                                            error_code_t::ATTRIBUTE_NOT_SET,

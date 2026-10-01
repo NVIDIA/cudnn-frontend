@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Plan-time geometry, workspace regions and launch spec for the SM107 d=256 backward pointer hosts.
 
-The two rows (``sdpa_bwd_sm107``, ``sdpa_bwd_sm107_fp8``) join the prepared-launch contract of ``bwd/prepared.py``:
+The three rows (``sdpa_bwd_sm107``, ``sdpa_bwd_sm107_fp8``, ``sdpa_bwd_sm107_mxfp8``) join the prepared-launch contract of ``bwd/prepared.py``:
 ``compile_plan`` turns an adapter's fixed plan facts into a ``BwdLaunchSpec`` whose ``fn`` is the positional tvm-ffi
 entry of ONE compiled artifact (``kernels/sm107/prepared_host.py``) that runs the whole chain from device pointers.
 Per call, ``bind()`` validates every operand against its ``Operand`` and hands the artifact a flat pointer frame; the
@@ -38,6 +38,13 @@ FP8_SCALARS = (
 FP8_AMAX = ("amax_dQ", "amax_dK", "amax_dV", "amax_dP")
 ROLES_FP8 = ROLES[:9] + FP8_SCALARS + FP8_AMAX
 ATTRIBUTES_FP8 = ATTRIBUTES[:9] + FP8_SCALARS + FP8_AMAX
+# The MXFP8 row appends the ``sdpa_mxfp8_backward`` ports the half node lacks: the transposed-quantization payloads, the
+# half-precision dO and the seven F8_128x4 scale tensors (the SM100 MXFP8 adapter's role / attribute spelling; the attributes
+# are the ``SdpaBinding`` field names).  ``o`` carries the ``o_f16`` port, ``do`` the ROWWISE e4m3 dO.
+MXFP8_PAYLOADS = ("q_T", "k_T", "do_T", "do_f16")
+MXFP8_SF = ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
+ROLES_MXFP8 = ROLES[:9] + MXFP8_PAYLOADS + MXFP8_SF
+ATTRIBUTES_MXFP8 = ATTRIBUTES[:9] + ("q_T", "k_T", "dO_T", "dO_f16", "sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_dO", "sf_dO_T")
 
 # Workspace region slots the hosts index (``prepared_host.R_*``), by ``_scratch_plan`` name.
 _REGION_SLOTS_F16 = ("delta", "ds_ws", "seq_kv", "desc_words", "q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "dv_part", "dk_part", "dk_fold", "dv_fold")
@@ -58,27 +65,64 @@ _REGION_SLOTS_FP8 = (
     "k_bf16",
     "amax_scratch",
 )
+# The MXFP8 row's slots (``prepared_host.R_DOT_PAD .. R_MX_DV_FOLD``): the shared nine, the dO_T staging copy, the five zero-filled SF
+# pad slabs, the two dequantized bf16 stage-3 operands and the half row's partial / fold set.
+_REGION_SLOTS_MXFP8 = (
+    "delta",
+    "ds_ws",
+    "seq_kv",
+    "desc_words",
+    "q_pad",
+    "do_pad",
+    "lse_pad",
+    "k_pad",
+    "v_pad",
+    "do_T_pad",
+    "sf_q_pad",
+    "sf_do_pad",
+    "sf_doT_pad",
+    "sf_k_pad",
+    "sf_v_pad",
+    "q_T_bf16",
+    "k_T_bf16",
+    "dv_part",
+    "dk_part",
+    "dk_fold",
+    "dv_fold",
+    # appended: the block-scaled dS chain (P-b) -- the second e4m3 payload, the two E8M0 atom tensors, the columnwise q_T / k_T
+    # SF pads the block-scale GEMMs read (None under P-c, and where the shape is not ragged)
+    "ds_dq",
+    "sf_ds_dk",
+    "sf_ds_dq",
+    "sf_qT_pad",
+    "sf_kT_pad",
+)
 
 
 def _dtype_name(torch_dtype) -> str:
     return str(torch_dtype).split(".")[-1]
 
 
-def _tensor_operands(api):
-    """``(geometry, operands)`` of the nine tensor roles: the kernels' compact ``[B, S, H, D]`` view of the declared
-    logical-BHSD / BSHD-physical descriptors (a permute), and the contiguous ``[B, H, S_q]`` Stats."""
+def _payload_operand(desc, role):
+    """``(geometry, Operand)`` of one tensor role: the kernels' compact ``[B, S, H, D]`` view of a declared logical-BHSD /
+    BSHD-physical descriptor (a permute), or the contiguous ``[B, H, S_q]`` Stats."""
+    shape, strides = tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride)
+    if role == "stats":
+        geom, alignment = (shape[:3], strides[:3]), 4
+    else:
+        geom, alignment = (tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))), 16
+    shape, strides = geom
+    span = 0 if not math.prod(shape) else 1 + sum((n - 1) * st for n, st in zip(shape, strides))
+    return geom, Operand(_dtype_name(desc.dtype), shape, strides, span, alignment, desc.dtype.itemsize)
+
+
+def _tensor_operands(api, roles=ROLES[:9]):
+    """``(geometry, operands)`` of the tensor roles ``roles`` (default: the nine shared ones) -- see :func:`_payload_operand`."""
     geometry, operands = [], []
-    for role in ROLES[:9]:
-        desc = getattr(api, role + "_desc")
-        shape, strides = tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride)
-        if role == "stats":
-            geom, alignment = (shape[:3], strides[:3]), 4
-        else:
-            geom, alignment = (tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))), 16
+    for role in roles:
+        geom, op = _payload_operand(getattr(api, role + "_desc"), role)
         geometry.append(geom)
-        shape, strides = geom
-        span = 0 if not math.prod(shape) else 1 + sum((n - 1) * st for n, st in zip(shape, strides))
-        operands.append(Operand(_dtype_name(desc.dtype), shape, strides, span, alignment, desc.dtype.itemsize))
+        operands.append(op)
     return tuple(geometry), operands
 
 
@@ -166,6 +210,47 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8, ATTRIBUTES_FP8, scale_log2=True)
 
 
+def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
+    """The MXFP8 row's spec: the nine shared tensors, the four extra payloads (BSHD geometry) and the seven scale-factor tensors
+    as OPAQUE byte blobs (``Operand.opaque_bytes``: the graph may declare any dims with the right F8_128x4 byte total -- the
+    C++ node rewrites two of their strides before lowering, so nothing but the byte count is trusted; the SM100 adapter's rule)."""
+    from .kernels.sm107 import prepared_host as _host
+
+    geometry, operands = _tensor_operands(api, ROLES[:9] + MXFP8_PAYLOADS)
+    geometry = list(geometry)
+    for name in MXFP8_SF:
+        count = api._sf_expected_bytes(name)
+        geometry.append(((count,), (1,)))
+        operands.append(Operand("int8", (count,), (1,), count, 16, 1, opaque_bytes=True))
+    regions, offset = _regions(api, _REGION_SLOTS_MXFP8)
+    config = _config(api)
+    sm = _sm(api)
+    stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
+    ds_sf_policy = int(api._ds_policy)  # the adapter's dS policy (P-c bf16 dS | P-b block-scaled e4m3 dS): selects the chain the artifact runs
+    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
+        # The block-scale arm indexes its B scale-factor descriptor per A / C head and launches dQ once per GQA group member
+        # (prepared_host._stage3_block_scale); a dQ record grouped by the GQA head (the plain renderings' single launch) would pair
+        # Q heads with the wrong K head -- refuse here, in plain Python, before anything is compiled.
+        raise ValueError(
+            f"sdpa_bwd_sm107_mxfp8: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
+            f"got {api._dq_b_head_group}"
+        )
+    key = repr(
+        (
+            tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
+            config,
+            tuple(geometry),
+            regions,
+            _dtype_name(api.grad_dtype),
+            sm,
+            stage_sf_pads,
+            ds_sf_policy,
+        )
+    )
+    entry = _host.compile_host_mxfp8(main._host, mm_dk._host, mm_dq._host, config, tuple(geometry), regions, sm, key, stage_sf_pads, ds_sf_policy)
+    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True)
+
+
 def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
@@ -203,13 +288,14 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
     geometry = []
     for i, op in enumerate(spec.operands):
         geom = None
-        if i < 9 and op is not None:
+        if op is not None and not op.opaque_bytes:
             if i == 5:
                 stats = facts["stats"]
                 if stats is not None and (not stats.contiguous or stats.numel != math.prod(op.shape)):
                     raise ValueError(f"{spec.name}: Stats must be contiguous with {math.prod(op.shape)} elements")
-            else:
-                # The declared logical-BHSD geometry of the kernels' [B, S, H, D] operand view.
+            elif len(op.shape) == 4:
+                # The declared logical-BHSD geometry of the kernels' [B, S, H, D] operand view (the nine shared roles and the
+                # MXFP8 row's four extra payloads); the fp8 row's [1] scalars and the opaque SF blobs bind by facts alone.
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
     execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
