@@ -17,10 +17,13 @@ from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.fwd.api_dsl import ws_align
 from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
 
-# The half row binds the nine tensor operands.  The fp8 row appends the twelve scalar descales / scales of
-# ``sdpa_fp8_backward`` and the four requested-only amax outputs; their role names ARE the ``SdpaBinding`` field names.
-ROLES_F16 = ROLES[:9]
-ATTRIBUTES_F16 = ATTRIBUTES[:9]
+# The half row binds the nine tensor operands plus, appended, the per-batch kv lengths (``seq_kv`` / ``SdpaBinding.seq_len_kv``;
+# an operand only when the plan was built with ``seq_kv_lens_present`` -- the standalone surface -- None-specialized otherwise).
+# The fp8 row appends the twelve scalar descales / scales of ``sdpa_fp8_backward`` and the four requested-only amax outputs;
+# their role names ARE the ``SdpaBinding`` field names.  The fp8 / MXFP8 bodies take ONE uniform real kv length, so their
+# rows bind no lengths operand.
+ROLES_F16 = ROLES[:9] + ("seq_kv",)
+ATTRIBUTES_F16 = ATTRIBUTES[:9] + ("seq_len_kv",)
 FP8_SCALARS = (
     "descale_q",
     "descale_k",
@@ -183,12 +186,16 @@ def compile_plan(api, main, mm_dk, mm_dq):
     from .kernels.sm107.prepared_host import compile_host_f16
 
     geometry, operands = _tensor_operands(api)
+    # The caller's per-batch kv lengths: a contiguous [B] int32 operand exactly when the plan was built with seq_kv_lens_present
+    # (bind() then requires it, and refuses one on a plan built without -- the fixed-ABI rule the fp8 row's amax operands follow).
+    seq_kv_present = bool(api.seq_kv_lens_present)
+    operands.append(Operand("int32", (api.batch_size,), (1,), api.batch_size, 4, 4) if seq_kv_present else None)
     regions, offset = _regions(api, _REGION_SLOTS_F16)
     config = _config(api)
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm))
-    entry = compile_host_f16(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key)
+    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm, seq_kv_present))
+    entry = compile_host_f16(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, seq_kv_present=seq_kv_present)
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False)
 
 
