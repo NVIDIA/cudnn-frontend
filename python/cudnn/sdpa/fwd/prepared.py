@@ -368,6 +368,7 @@ class ThdLaunchSpec:
         "lse_head_stride",
         "lse_stride",
         "s_q_max",
+        "cga_tile_m",
         "total_q",
         "total_kv",
         "n_q_lens",
@@ -461,6 +462,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.lse_head_stride = int(api.thd_stats_head_stride or 0)
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
+    s.cga_tile_m = int(plan.cga_tile_m)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
@@ -912,7 +914,13 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
     if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
         frame[ix["lse_ext"]] = t_q
-    frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)  # units / workspace are sized for spec.b >= geo.b
+    frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
+    # For B nonnegative lengths with sum <= T, sum(ceil(length / tile)) is
+    # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
+    # device lengths may change during replay within this captured bound.
+    # Keep a persistent kernel's smaller resident-cluster limit as well.
+    units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
 
     sinks = facts.get("sinks")
     if spec.has_sink:

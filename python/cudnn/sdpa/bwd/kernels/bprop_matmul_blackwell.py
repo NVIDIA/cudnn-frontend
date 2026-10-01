@@ -75,7 +75,7 @@ from cutlass.base_dsl.typing import Pointer
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, opaque_f32_zero
-from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
+from cudnn.frost.tile_dsl.thd import THD_SETUP_THREADS, TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
 from cudnn.sdpa.bwd.config_sm100 import (
     CAUSAL_K_HI,
     CAUSAL_K_LO,
@@ -1922,20 +1922,34 @@ def _thd_patch_descs_kernel(
       ``max_total_seq_len`` cannot do this job: it is a maximum, while the row
       that must read zero is ``cu_*[B]``, which changes every step.
 
-    One elected thread; the release fence publishes both to the TMA proxy and
+    Elected warp leaders build disjoint descriptors; each writer publishes to the TMA proxy and
     the kernel boundary orders them before the GEMM reads them.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+    nthreads, _, _ = cute.arch.block_dim()
+    warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+    if nvvm.elect_sync():
         meta = cutlass.make_array_view(meta_t)
         cu_q0 = n_batch
         cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
         # dV/dK write kv rows and read q tokens; dQ is the mirror.
         c_cu0 = cu_k0 if cutlass.const_expr(a_is_m_major) else cu_q0
         b_cu0 = cu_q0 if cutlass.const_expr(a_is_m_major) else cu_k0
-        emit_seq_descs(base_c_desc, desc_words, meta, c_cu0, c_tensor, n_batch, c_row_stride, seq_ord=_THD_MM_SEQ_ORD)
+        emit_seq_descs(
+            base_c_desc,
+            desc_words,
+            meta,
+            c_cu0,
+            c_tensor,
+            n_batch,
+            c_row_stride,
+            seq_ord=_THD_MM_SEQ_ORD,
+            first_batch=warp,
+            batch_step=cutlass.Int32(nthreads) // 32,
+        )
         b_total = cutlass.Int32(meta[b_cu0 + n_batch])
-        emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
+        if warp == cutlass.Int32(0):
+            emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -2158,7 +2172,7 @@ def _host(
             meta_t,
             n_batch,
             out_stride_m_0,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
 
     launch = _bprop_matmul_bh_sm100_kernel(
         problem_size[0],
