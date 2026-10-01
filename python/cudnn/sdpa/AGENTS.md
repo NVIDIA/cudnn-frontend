@@ -30,9 +30,22 @@ head-major, never dense-padded.**
   stride_s, h_q)` — the one classifier the fwd adapters, the bwd probe and the
   bwd lowering share; never re-implement the stride test inline (Rule 3's
   "suspect duplicated logic first").
+- For override-enabled prepared half plans, HN remains the compiled layout
+  kind but its head stride is an execution binding. A changing packed token
+  total must not become a new graph or compile key. Validate the effective
+  stride against observed storage, retain independent invocation frames,
+  and replay an older capture after binding a different stride. The detector
+  is `test_hn_stride_override_reuses_plan_and_old_capture`; the native/Python
+  differential detector also checks concurrent frames. Standalone and
+  non-override graph plans retain the declared-stride contract.
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+- Under THD PackGQA, both worklist setup and decoding count **token** tiles
+  (`CGA_TILE_M / PACK_G`), while every Stats store uses the unpacked query
+  head of its row. Updating only the store or only the worklist leaves the
+  other half wrong. `test_dsl_sm100_thd_pack_gqa_stats_capture` checks both;
+  its tail sentinels and partial groups expose missed or aliased rows.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
@@ -201,3 +214,43 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+Packed storage capacity and per-sequence tile work are different bounds: one
+128-row sequence and two 64-row sequences have the same packed total, but use
+one and two 128-row tiles. Adaptive split families must bound both from host
+metadata without reading device prefixes. Check equal-total batch variants,
+workspace equality across members, and replay after moving live rows between
+previously empty sequences. `test_batched_split_policy_bounds_tiles_and_preserves_frames`
+and `test_thd_balanced_split_record_rebind_and_capture` are the detectors.
+
+## Persistent THD launch admission
+
+A kernel using `scheduler_warp_loop_persistent` must declare `THD_PERSISTENT`
+so the host launch is ordinarily sized to resident clusters. A measured
+plan-time exception may launch a bounded second wave; keep its admission
+separate from the safety envelope. Under PackGQA, count token tiles of
+`CGA_TILE_M / PACK_G`, not unpacked tiles times all query heads: the latter
+can put a nonaligned sequence into the wrong wave-count regime. Do not infer
+ragged work from the batch's declared maximum alone. Bound the live workload
+with GPU metadata; retain host-known capacity bounds under graph replay.
+Dead initial clusters must exit uniformly before TMEM allocation and barrier
+initialization. A dead-unit O-store guard alone does not prove that an empty
+producer/consumer pipeline can drain repeatedly. Repeated overlaunch replay can expose a hang after hundreds of initially
+correct invocations; validate the dead initial-unit path explicitly.
+`test_sm107_f16_thd_declares_its_persistent_scheduler` catches missing host
+wiring; the THD overlaunch, multi-unit, zero-length and capture tests exercise
+the device contract.
+
+
+## Setup/main programmatic dependencies
+
+PDL may overlap an independent kernel prologue with metadata setup, but every
+consumer must wait before reading live metadata or patched tensor maps. Keep
+the producer's proxy-release and the consumer's tensor-map acquire; PDL does
+not replace those fences. A following setup must still wait for the preceding
+attention to finish before reusing its workspace. Derive admission from graph
+facts at plan time, not device lengths or per-execute Python dispatch. A small
+single-request gain does not establish a batched gain; retain long-prefix
+controls. `test_live_lpt_paged_capture_changes_full_and_prefix_lengths` checks
+O/Stats after length changes and repeated empty replay, and checks actual
+programmatic graph edges when Torch and CUDA Python expose them.

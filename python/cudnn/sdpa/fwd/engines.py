@@ -27,16 +27,16 @@ from __future__ import annotations
 
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
 
-from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_live_lpt, supports_paged_thd_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -101,6 +101,14 @@ class SdpaFwdKnobs:
     is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
     into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
     ``Capabilities.softmax_precisions`` in :func:`mismatch`.
+
+    ``cga_policy=1`` retains both compiled cluster widths on eligible SM100
+    half D192/V128 THD override plans: one CTA when the bound fits one wave,
+    two otherwise. ``cga_policy=2`` instead compares resident wave counts,
+    preferring one CTA on a tie; its pair acquires the immutable runtime K/V
+    descriptors once before the persistent loop. The public record carries ``CGA_POLICY``
+    instead of ``TILE_CGA_M``. A fixed width and a runtime policy are mutually exclusive;
+    omitting both retains ordinary plan-time default selection.
     """
 
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
@@ -111,6 +119,8 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
+    cga_policy: Optional[int] = None  # runtime width policy, mutually exclusive with cga
+    split_kv_policy: Optional[int] = None  # runtime split policy, mutually exclusive with split_kv
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -121,6 +131,8 @@ class SdpaFwdKnobs:
         ("cga", "TILE_CGA_M"),
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
+        ("cga_policy", "CGA_POLICY"),
+        ("split_kv_policy", "SPLIT_KV_POLICY"),
     )
 
     def to_public(self) -> dict:
@@ -307,6 +319,8 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    cga_policies: frozenset[int] = frozenset()
+    split_kv_policies: frozenset[int] = frozenset()
     # Shape-specific CGA domains for rows that lower several native flavors.
     # ``cgas`` remains the default. A split-specific entry further narrows the
     # domain for split-KV plans without changing the unsplit public domain.
@@ -387,6 +401,10 @@ class Capabilities:
     # pack_gqa_partial_d_shapes (append-only contract above; the same test
     # pins it).
     paged_d_shapes: Optional[frozenset] = None
+    # Native THD prefill flavors whose worklist and Stats index packed query
+    # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
+    # Appended to preserve positional construction of existing capabilities.
+    thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -509,6 +527,25 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
     )
 
 
+def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """Fixed paged graph bounds whose packed partial workspace is plan-owned."""
+    return (
+        capabilities.sm_lo == 100
+        and (not facts.shape_overrides or (facts.max_total_seq_len_q is not None and 0 < facts.max_total_seq_len_q <= facts.b * facts.s_q))
+        and not facts.has_sink
+        and not facts.has_epilogue_gate
+        and supports_paged_thd_split(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            max_q=facts.s_q,
+            padded_stats=facts.stats_t is not None and getattr(facts.stats_t, "ragged_offset", None) is None,
+        )
+    )
+
+
 def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int]) -> Optional[str]:
     """Pure admission for the graph's normalized VariantPack executor.
 
@@ -548,9 +585,9 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         if facts.has_epilogue_gate:
             return "prepared THD overrides cannot use an epilogue gate"
         if (split_kv or 1) > 1:
-            # Only the decode tile's ragged-Q leg splits a THD graph (its dense
-            # prepared launch binds the packed Q / O / Stats from the offsets).
-            return None if _thd_decode_leg(capabilities, facts) else "prepared THD overrides cannot use split-KV"
+            # Ragged-Q decode binds offsets through its dense launch. The
+            # paged D128 THD leg instead owns bounded packed partial regions.
+            return None if _thd_decode_leg(capabilities, facts) or paged_thd_split_domain(capabilities, facts) else "prepared THD overrides cannot use split-KV"
         return None
     if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
         return "prepared dense overrides require per-batch lengths, not prefix sums"
@@ -604,11 +641,26 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     d256 kernel that honours LPT next to flavors that do not.
     """
     selected = _selected_d_shape(capabilities, facts)
+    domain = capabilities.sched_policies
     if selected is not None:
         for shape, shape_domain in capabilities.sched_policies_by_d_shape:
             if shape == selected:
-                return shape_domain
-    return capabilities.sched_policies
+                domain = shape_domain
+                break
+    if SCHED_LPT_IF_FULL in domain and not (
+        facts.device_cc == (10, 0)
+        and supports_live_lpt(
+            selected,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            bottom_right=facts.bottom_right,
+            window_left=facts.window_left,
+            window_right=(facts.right_bound or 0) if facts.causal else None,
+        )
+    ):
+        domain = domain - {SCHED_LPT_IF_FULL}
+    return domain
 
 
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
@@ -656,19 +708,47 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
+            (knobs.cga_policy, capabilities.cga_policies, "cga_policy"),
+            (knobs.split_kv_policy, capabilities.split_kv_policies, "split_kv_policy"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
         # cga1 on the SM100 line's d128 f16/bf16 flavor IS the decode tile
-        # (sm100/decode_d128_f16.py, TILES_Q=1), which carries no THD_VARLEN
-        # leg: a ragged graph rides it only as the ragged-Q-over-paged-KV leg
-        # (_thd_decode_leg) and keeps the cga2 prefill tile otherwise.
+        # (sm100/decode_d128_f16.py, TILES_Q=1). Paged THD uses the one-query
+        # ragged-Q leg or the native unpacked packed-split host; other ragged
+        # graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
+        if knobs.split_kv_policy is not None:
+            if knobs.split_kv_policy in (3, 4):
+                if not runtime_cga_choices(capabilities, facts) or facts.h_q not in (4, 8, 16) or facts.h_kv != facts.h_q:
+                    return "runtime split policy3 or policy4 requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv in {4, 8, 16}"
+            elif not runtime_cga_choices(capabilities, facts) or facts.h_q != 16 or facts.h_kv != 16:
+                return "runtime split policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph with H_q=H_kv=16"
+            if knobs.split_kv is not None:
+                return "split_kv and split_kv_policy are mutually exclusive, including split_kv=1"
+            if knobs.cga_policy not in (1, 2):
+                return "runtime split policy requires an explicit cga_policy for its unsplit members"
+        if knobs.cga_policy is not None:
+            if not runtime_cga_choices(capabilities, facts):
+                return "runtime CGA policy requires an SM100 half D192/V128 nonpaged unmasked THD override graph"
+            if knobs.cga is not None:
+                return "cga and cga_policy are mutually exclusive"
+            if knobs.split_kv not in (None, 1) or knobs.pack_gqa not in (None, False):
+                return "runtime CGA policy requires unsplit, unpacked execution"
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        if knobs.cga == 1 and facts.thd and not ragged_decode and capabilities.sm_lo == 100 and _selected_d_shape(capabilities, facts) == (128, 128):
+        paged_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and paged_thd_split_domain(capabilities, facts)
+        if paged_split and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False):
+            return "paged packed split requires the matching native cuDNN Frontend extension"
+        if (
+            knobs.cga == 1
+            and facts.thd
+            and not (ragged_decode or paged_split)
+            and capabilities.sm_lo == 100
+            and _selected_d_shape(capabilities, facts) == (128, 128)
+        ):
             return (
-                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
+                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or exact D128 with split_kv > 1; "
                 "other THD (ragged) graphs run the cga2 prefill tile"
             )
         if ragged_decode and (knobs.split_kv is None or knobs.split_kv < 2):
@@ -690,8 +770,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # Paged KV is padded by construction and its split composes with
             # the per-batch lengths (the decode path — B*H_kv is far below
             # the SM count), so it is exempt from the padded exclusion.
-            if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
-                return "split_kv > 1 serves dense, unpadded, sink-free graphs only (and the decode tile's ragged-Q leg)"
+            if (facts.thd and not (ragged_decode or paged_split)) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+                return (
+                    "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native paged D128 packed split"
+                )
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
@@ -712,8 +794,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd and not ragged_decode:
-                return "PackGQA is currently not supported for THD/ragged graphs (except the decode tile's ragged-Q leg)"
+            if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
+                return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if facts.has_epilogue_gate:
                 # The gate tile is one TMA box per (head, Q tile); a packed
                 # tile interleaves (token, head) rows the box cannot address.
@@ -1033,6 +1115,8 @@ def _sm100_spec() -> EngineSpec:
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
+            cga_policies=frozenset({1, 2}),
+            split_kv_policies=frozenset({1, 2, 3, 4}),
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -1075,7 +1159,7 @@ def _sm100_spec() -> EngineSpec:
             # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
             # scale-factor paths are validated against relaxed layouts.
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -1101,6 +1185,7 @@ def _sm100_spec() -> EngineSpec:
             # 96/8 -> 4 heads per token row-group); d192x128 / d512 pack the
             # whole group only.
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
+            thd_pack_gqa_d_shapes=SM100_THD_PACK_GQA_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -1769,12 +1854,81 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     return facts, mismatch(spec.capabilities, facts, knobs)
 
 
+def runtime_cga_choices(capabilities: Capabilities, facts) -> bool:
+    """The measured graph domain whose live geometry may outgrow its first tile.
+
+    This changes the lowering strategy, not graph eligibility. Both concrete
+    widths are already served by this engine; all masks and other targets
+    retain their existing concrete plans until separately measured.
+    """
+    return (
+        1 in capabilities.cga_policies
+        and facts.device_cc == (10, 0)
+        and facts.shape_overrides
+        and facts.thd
+        and (facts.d_qk, facts.d_v) == (192, 128)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and not (facts.has_paged_kv or facts.has_sink or facts.has_epilogue_gate or facts.causal or facts.right_band_widening)
+        and facts.window_left is None
+    )
+
+
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     """Lower ``spec`` for ``graph``, or raise the bare ineligibility reason (the
     caller — the engine — names itself in the message)."""
     facts, reason = analyze_for(spec, graph, knobs)
     if reason is not None:
         raise ValueError(reason)
+    if knobs is not None and knobs.cga_policy in (1, 2):
+        from copy import copy
+        from cudnn.sdpa.fwd.prepared import PreparedThdChoices, build_thd_split_spec
+
+        variants = [
+            spec.lower(
+                spec,
+                facts,
+                replace(knobs, cga=cga, cga_policy=None, split_kv=1, pack_gqa=False, split_kv_policy=None),
+                thd_pair_acquire=knobs.cga_policy == 2 and cga == 2,
+            )
+            for cga in (1, 2)
+        ]
+        selected = variants[0]
+        prepared = [v.prepared for v in variants]
+        workspace = max(v.workspace_bytes for v in variants)
+        if knobs.split_kv_policy in (1, 2, 3, 4):
+            from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+            from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+            if knobs.split_kv_policy in (3, 4):
+                members = ((128, 128 // facts.h_q), (256, 64 // facts.h_q))
+                if knobs.split_kv_policy == 4:
+                    members += ((512, 32 // facts.h_q),)
+                    if facts.h_q in (4, 8):
+                        # Keep the same partial-workspace budget while giving
+                        # eight short sequences fewer independent KV partitions.
+                        members += ((1024, 16 // facts.h_q),)
+            else:
+                members = ((128 if knobs.split_kv_policy == 1 else 256, 8),)
+            for capacity, splits in members:
+                km = _load_sm100_kernel_module(
+                    (192, 128),
+                    TemplateParams(
+                        dtype_qkv=2 if facts.dtype == cudnn.data_type.BFLOAT16 else 3,
+                        cta_mma=1,
+                        split_kv=splits,
+                        thd_varlen=True,
+                        seq_kv_lens_present=True,
+                        stats_log2=facts.has_stats_log2,
+                        sched_policy=knobs.sched_policy or 0,
+                    ),
+                )
+                split = copy(prepared[0])
+                split.spec = build_thd_split_spec(split.spec, km, capacity=capacity, resident_units=facts.device_sm_count)
+                prepared.append(split)
+                workspace = max(workspace, split.spec.scratch_bytes)
+        selected.prepared = PreparedThdChoices(tuple(prepared), facts.device_sm_count, knobs.cga_policy, knobs.split_kv_policy)
+        selected.workspace_bytes = workspace
+        return selected
     return spec.lower(spec, facts, knobs)
 
 
@@ -1829,6 +1983,8 @@ def lower_dsl_prefill(
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
     api_type: str = _SM100,
+    *,
+    thd_pair_acquire: bool = False,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -1944,7 +2100,13 @@ def lower_dsl_prefill(
         reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
         if reason is not None:
             raise NotImplementedError(reason)
-    api.compile()
+    # The wave policy retains a pair variant for larger launches, where the
+    # one-time descriptor acquire is measured to help. Do not change fixed
+    # two-CTA requests or policy 1: their low-parallelism populations differ.
+    if thd_pair_acquire:
+        api.compile(thd_pair_acquire=True)
+    else:
+        api.compile()
     # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
     # decode-shaped "decode_d256_f16"), when the adapter records one.
     kernel_template = getattr(api, "kernel_template", None)
@@ -2201,7 +2363,7 @@ def lower_dsl_prefill(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch, PreparedThdLaunch
 
         if facts.thd and getattr(api, "_thd_spec", None) is not None:
-            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding)
+            _execute.prepared = PreparedThdLaunch(api._thd_spec, binding, stats_stride_override=facts.shape_overrides)
         elif getattr(api, "_dense_spec", None) is not None:
             # Dense plans, and the decode tile's ragged-Q leg (a dense split
             # launch whose Q / O / Stats rows come from the bound ragged offsets).

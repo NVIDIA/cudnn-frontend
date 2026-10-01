@@ -102,6 +102,10 @@ def _combine_kernel(
     # short buffer or a bad offset can never store outside the caller's bytes.
     ragged_o_cap: cutlass.Int32 = 0,
     ragged_lse_cap: cutlass.Int32 = 0,
+    # Packed THD partials use batch=1 and SQ as their token capacity. The
+    # setup kernel supplies the live packed total; never read unwritten tail
+    # partials or overwrite the caller's output padding.
+    total_q: Optional[cute.Tensor] = None,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
@@ -109,8 +113,12 @@ def _combine_kernel(
     head = cute.arch.block_idx()[1]
     batch = cute.arch.block_idx()[2]
 
+    if cutlass.const_expr(total_q is not None):
+        if q_row >= cutlass.make_array_view(total_q)[0]:
+            nvvm.exit()
+
     # A warp past S_q (last block only) has no row; there is no block-level
-    # barrier below, so it simply falls through.  Everything inside is
+    # barrier below, so it simply falls through. Everything inside is
     # warp-uniform except the per-lane column guard.
     if q_row < s_q:
         op = cutlass.make_array_view(o_partial)
@@ -290,6 +298,99 @@ def _combine_kernel(
 _combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+@cute.kernel
+def _combine_packed_kernel(
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_out: cute.Tensor,
+    lse_out: Optional[cute.Tensor],
+    total_q: cute.Tensor,
+    n_splits: cutlass.Int32,
+    stats_log2: cutlass.Constexpr[bool],
+) -> None:
+    """Four packed rows per CTA; each warp reuses split weights across D.
+
+    Packed partials have no per-sequence padding or batch coordinate. The
+    device total guards their unwritten tail before any partial is read.
+    Final O/Stats retain the caller's strides and partial Stats stay in ln.
+    """
+    thread = cute.arch.thread_idx()[0]
+    lane = thread % 32
+    row = cute.arch.block_idx()[0] * 4 + thread // 32
+    head = cute.arch.block_idx()[1]
+    if (row >= o_partial.shape[1]) | (row >= cutlass.make_array_view(total_q)[0]):
+        # Warp-uniform, with no CTA barriers in this kernel.
+        nvvm.exit()
+    op = cutlass.make_array_view(o_partial)
+    lp = cutlass.make_array_view(lse_partial)
+    oo = cutlass.make_array_view(o_out)
+    neg_inf = cutlass.Float32(NEG_INF)
+    parallel = n_splits <= 32
+    m = neg_inf
+    m_safe = cutlass.Float32(0.0)
+    all_dead = m == neg_inf
+    den = cutlass.Float32(0.0)
+    lane_weight = cutlass.Float32(0.0)
+    if parallel:
+        lane_lse = neg_inf
+        if lane < n_splits:
+            lane_lse = cutlass.Float32(lp[lane, head, row])
+        m = lane_lse
+        for bit in cutlass.range_constexpr(5):
+            m = cute.math.max(m, cute.arch.shuffle_sync_bfly(m, 1 << bit))
+        all_dead = m == neg_inf
+        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+        if lane_lse > neg_inf:
+            lane_weight = cute.math.exp(lane_lse - m_safe, fastmath=True)
+        den = lane_weight
+        for bit in cutlass.range_constexpr(5):
+            den = den + cute.arch.shuffle_sync_bfly(den, 1 << bit)
+    else:
+        # Preserve arbitrary runtime split counts for internal prepared users.
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            m = cute.math.max(m, cutlass.Float32(lp[split, head, row]))
+        all_dead = m == neg_inf
+        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            partial_lse = cutlass.Float32(lp[split, head, row])
+            if partial_lse > neg_inf:
+                den = den + cute.math.exp(partial_lse - m_safe, fastmath=True)
+    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+    inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
+    for d_base in cutlass.range(0, o_partial.shape[3], 128, unroll=1):
+        acc = cute.make_rmem_tensor((4,), cutlass.Float32)
+        acc.fill(0.0)
+        for split in cutlass.range(0, n_splits, 1, unroll=1):
+            weight = cutlass.Float32(0.0)
+            if parallel:
+                weight = cute.arch.shuffle_sync(lane_weight, split)
+            else:
+                partial_lse = cutlass.Float32(lp[split, head, row])
+                if partial_lse > neg_inf:
+                    weight = cute.math.exp(partial_lse - m_safe, fastmath=True)
+            # Dead splits may have non-finite payloads: skip their loads;
+            # multiplication by zero would not remove a NaN contribution.
+            if weight > cutlass.Float32(0.0):
+                for slot in cutlass.range_constexpr(4):
+                    d = d_base + lane + slot * 32
+                    if d < o_partial.shape[3]:
+                        acc[slot] = acc[slot] + weight * cutlass.Float32(op[split, row, head, d])
+        for slot in cutlass.range_constexpr(4):
+            d = d_base + lane + slot * 32
+            if d < o_partial.shape[3]:
+                oo[0, row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
+    if cutlass.const_expr(lse_out is not None):
+        if lane == 0:
+            value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
+            value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
+            if cutlass.const_expr(stats_log2):
+                value = value * cutlass.Float32(1.4426950408889634)
+            cutlass.make_array_view(lse_out)[0, head, row] = value
+
+
+_combine_packed_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _launch_combine(
     o_partial: cute.Tensor,
@@ -307,6 +408,7 @@ def _launch_combine(
     ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stream: _cuda_driver.CUstream = None,
+    total_q: Optional[cute.Tensor] = None,
 ) -> None:
     """One launch for both ABIs: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
@@ -336,6 +438,7 @@ def _launch_combine(
         cutlass.Int32(ragged_divs[2]),
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
+        total_q,
     ).launch(
         grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
         block=[THREADS, 1, 1],
@@ -367,6 +470,30 @@ def _host_ptr(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+
+
+@cute.jit
+def _host_ptr_packed(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    total_q_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Combine compact [split, packed token, head, D] partials (B must be 1)."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    total_q = cute.make_tensor(total_q_ptr, cute.make_layout((1,), stride=(1,)))
+    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2).launch(
+        grid=((problem_size[2] + 3) // 4, problem_size[1], 1), block=[THREADS, 1, 1], stream=stream
+    )
 
 
 @cute.jit
@@ -473,6 +600,7 @@ def compile_ptr(
     has_amax: bool = False,
     has_scale_o: bool = False,
     has_scale_o_input: bool = True,
+    packed: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -481,8 +609,9 @@ def compile_ptr(
     in BHS order, the three ragged-offset pointers (``ragged``: (B+1,) Q / O /
     Stats offsets, int32 or -- ``ragged_i64`` -- int64; None-specialized off
     otherwise) and their elements-per-token divisors. Every stride is Int64,
-    including singleton dimensions. All pointer entries share the reduction
-    and launch. The quantized dense entry appends Amax/scale
+    including singleton dimensions. Packed partials use a row-per-warp reduction
+    and append the device-total-Q pointer; other entries share the existing
+    reduction and launch. The quantized dense entry appends Amax/scale
     pointers; half and ragged entries keep their existing positional ABI.
     ``has_scale_o_input=False`` removes the scalar input and Amax unscale
     launch for MXFP8. Per-tensor FP8 retains both by default.
@@ -495,6 +624,8 @@ def compile_ptr(
         raise ValueError("scaled combine requires a scale_o input")
     if quantized and ragged:
         raise ValueError("the quantized pointer entry serves dense split launches")
+    if packed and (ragged or quantized):
+        raise ValueError("packed THD partials require the half pointer entry without ragged final placement")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
@@ -513,7 +644,9 @@ def compile_ptr(
         (cutlass.Int64(0),) * 4,
         (cutlass.Int64(0),) * 3,
     )
-    if quantized:
+    if packed:
+        entry, extra = _host_ptr_packed, (P(cutlass.Int32),)
+    elif quantized:
         entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o))
     elif ragged:
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the

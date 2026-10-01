@@ -93,6 +93,12 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Wide host strides must stay wide through device setup arguments.** An Int64 pointer host can still truncate a stride while launching a descriptor-setup kernel. Check casts at the launch site and the setup parameter, not just the host signature. Exercise two live sequences with a physical row stride above `2**32` and poisoned output; a singleton-axis or binder-only probe never steps the truncated address. `test_thd_output_row_stride_above_int32_reaches_device_descriptors` checks numerical output and replay. Cover every served arch/flavor: a pre-Rubin-only marker hid narrowing in all four SM107 half hosts. `test_mhas_v2.py::test_sdpa_thd_output_stride_int64` is collected by both CI arch selections and checks native and Python binding independently, including D192/D128.
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
+- **A runtime kernel choice needs a persisted policy, not a missing knob.**
+  Rebuild the public `(engine_id, knobs)` record on a fresh graph and bind
+  inputs that select both artifacts. Keep old captures alive, exercise both
+  artifacts concurrently with separate streams/workspaces, and verify that a
+  fixed knob conflicts with the policy instead of being silently overridden.
+  `test_thd_runtime_cga_record_rebind_and_capture` covers this contract.
 
 ### Confirm you are testing the code you edited
 
@@ -262,6 +268,25 @@ Prepared admission must respect the adapter's exact device support even when
 the row spans later compute capabilities. Include future-cc rejection controls
 alongside the supported device in `test_prepared_fp8_override_capability_envelope`.
 
+### Prepared THD launch bounds
+
+When staging a Python source tree with a separately built extension, record
+`cudnn._pybind_module.__file__` and its SHA256 as well as `cudnn.__file__`.
+The Python version and import path do not identify the native binding. A stale
+extension can silently select a compatibility fallback: for native HN override
+measurements, require `_SdpaThdBinder.supports_stats_stride_override` before
+timing, and run `test_native_dynamic_hn_stride_keeps_invocation_frames_independent`.
+Preserve the fallback measurements separately rather than relabeling them as
+the current native path after replacing the binary.
+
+A shape-override cache envelope can be much larger than the live batch.
+Numerical tests do not detect a launch full of dead units. Check the bound
+against current host-known capacity while retaining the immutable artifact
+and any persistent resident-grid cap; never read device lengths to shrink it.
+`test_native_thd_launch_bound_uses_current_capacity` catches the stale grid;
+`test_thd_cache_shape_grid_tracks_runtime_capacity` checks O and packed Stats
+while changing batches and device lengths under capture/replay.
+
 ### Concurrent prepared frames versus SDK initialization
 
 CuTe DSL 4.7.0/4.7.1 can leak the runtime's process-global initialization lock
@@ -410,8 +435,8 @@ shared-stride constraint for a host whose ABI still has only one stride pair.
 A shared kernel imported as an ordinary module has no template-loader digest.
 Calling `template_key` there otherwise returns `None` and silently bypasses
 persistent caching. Give the module a source identity and require fresh-process
-reload of the whole chain, including split combine and both pointer/tensor
-calling conventions; forbidding JIT only around the attention kernel misses it.
+reload of the whole chain, including split combine and every supported pointer
+calling convention; forbidding JIT only around the attention kernel misses it.
 
 For staged pointer launches, validate aliases against the original caller operands
 before replacing them with workspace views. The core binder only sees gathered
@@ -488,7 +513,6 @@ angles, signed zero and nonfinite inputs. Keep real Int64 stride and product
 overflow checks on the angle input, with wrapped addresses inside allocated
 guard storage, plus changed-angle replay and fresh-process artifact reload.
 
-
 A CuTeDSL `cutlass.Array` scalar index is a flat element offset; even a
 one-element tuple takes that path. For non-contiguous rank-one prefixes,
 form the element offset explicitly in Int64 before indexing. A contiguous-only
@@ -551,3 +575,22 @@ the sequence/head index by the element stride. A metadata value may retain
 an Int32 sequence-length contract while its storage address requires Int64.
 `test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
 changed-value replay and zero-copy token-major backward Stats.
+
+### Single-CTA persistent SDPA validation
+
+Numerical success does not establish that a one-CTA launch may use DSMEM async
+stores. Exercise the scheduler with repeated claims (for example
+`test_dsl_sm100_thd_d192_d128_multi_unit_per_cta[1]`) under both Compute Sanitizer
+memcheck and racecheck. The single-CTA producer publishes locally; all payload
+reads must precede the warp's returned slot credit. A typed 128-bit vector load
+may be scalarized when some components are unused, so inspect the emitted
+instructions before relying on an indivisible-load claim. Preserve the failing
+sanitizer log and rerun the same case after the fix.
+
+A sanitizer API failure can precede the kernel: PyTorch's expandable allocator
+probes fabric-handle support with `cuMemCreate`, which may fail when the runtime
+has no IMEX channel. Retain that first log and rerun with
+`PYTORCH_ALLOC_CONF=expandable_segments:False` (and the legacy
+`PYTORCH_CUDA_ALLOC_CONF` alias) before attributing the failure to SDPA. Keep
+API error reporting enabled; this control isolates the allocator probe rather
+than suppressing actual launch or memory errors.

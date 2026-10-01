@@ -621,6 +621,19 @@ has no replacement. The plumbing that makes a request expressible is in place
 user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
+The SM100 half-precision D256 flavor additionally offers `SCHED_POLICY=3`
+(`SCHED_LPT_IF_FULL`) for paged THD bottom-right causal attention without a
+left window. For each sequence, the kernel reads the current GPU Q and KV
+lengths: equal lengths use the longest-row-first LPT order; a prefix chunk
+keeps NATURAL's head-major order. This is a performance-only choice over the
+same live work list, with no host length read, additional setup launch, or
+replan when captured lengths change. Existing policies 0/1/2 retain their
+meaning. Heuristic A prefers policy 3 only for BF16 exact-D256, single-sequence
+full-prefill envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page
+size 16/128, and no Stats, sink, or epilogue gate. Other THD defaults stay
+NATURAL; this changes scheduling within FROST, not engine placement. Other
+geometries and devices decline policy 3 before compilation.
+
 If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.

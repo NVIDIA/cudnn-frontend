@@ -1050,8 +1050,9 @@ def test_dsl_sm100_q_trim_rejects_non_cuda_lengths(monkeypatch, length_device):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("storage_order", [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0), None])
+@pytest.mark.parametrize("pack_gqa", [False, pytest.param(True, marks=_skip_pack_gqa_on_rubin)], ids=["unpacked", "packed"])
 @torch_fork_set_rng(seed=0)
-def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order):
+def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order, pack_gqa):
     """A padded Stats whose (b, h, s_max) storage order is (h, s_max, b) --
     logical strides (1, s_max*b, b). The order and its inverse differ, and the
     wrong one pins the h axis to stride 1 in the compiled fake, so the kernel
@@ -1061,12 +1062,13 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     b, h, s, d = 2, 4, 256, 128
-    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    q = _bhsd(b, h, s, d, torch.float16)
+    k, v = (_bhsd(b, 1 if pack_gqa else h, s, d, torch.float16) for _ in range(2))
     o = torch.empty_like(q)
     lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
 
-    def run(lse):
-        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True)
+    def run(lse, packed=False):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True, pack_gqa=packed)
         assert api.check_support()
         api.compile()
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse)
@@ -1081,7 +1083,7 @@ def test_dsl_sm100_thd_padded_stats_in_a_non_self_inverse_layout(storage_order):
         strides[axis] = span
         span *= shape[axis]
     hsb = torch.empty_strided(shape, strides, dtype=torch.float32, device="cuda").fill_(float("nan"))
-    api = run(hsb)
+    api = run(hsb, packed=pack_gqa)
     # The prepared host carries the caller's actual strides, including gaps;
     # no compact fake tensor or inverse permutation is left to infer them.
     assert api._thd_spec.lse_stride == tuple(strides)
@@ -1865,6 +1867,8 @@ def _run_dsl_thd_graph(
     check_stats=False,
     stats_layout="token_major",
     cu_lens=False,
+    pack_gqa=None,
+    capture=False,
 ):
     """Build + execute a packed THD/varlen graph; returns the flat packed O
     storage buffer — plus, with ``check_stats``, the flat Stats storage and
@@ -1960,11 +1964,21 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
-    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    g.execute(vp, workspace)
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g.execute(vp, workspace)
+        # The replay must write the live region itself, not inherit eager O/LSE.
+        o_stor.fill_(_THD_SENTINEL)
+        if stats_stor is not None:
+            stats_stor.fill_(_THD_SENTINEL)
+        graph.replay()
     torch.cuda.synchronize()
     return (o_stor, stats_stor, t_cap) if check_stats else o_stor
 
@@ -2032,7 +2046,19 @@ def _combo_thd(d, dtype, H_q, H_kv, scale, sink_t, mask):
 
 
 def _run_thd_stats_case(
-    *, seq_lens_q, seq_lens_kv, d=128, dtype=torch.float16, H_q=8, H_kv=8, mask="causal", with_sink=False, stats_layout="token_major", cu_lens=False
+    *,
+    seq_lens_q,
+    seq_lens_kv,
+    d=128,
+    dtype=torch.float16,
+    H_q=8,
+    H_kv=8,
+    mask="causal",
+    with_sink=False,
+    stats_layout="token_major",
+    cu_lens=False,
+    pack_gqa=None,
+    capture=False,
 ):
     """Run a THD (ragged) graph with generate_stats and check O and the ragged
     Stats against per-sequence references, in the declared Stats layout."""
@@ -2073,6 +2099,8 @@ def _run_thd_stats_case(
         check_stats=True,
         stats_layout=stats_layout,
         cu_lens=cu_lens,
+        pack_gqa=pack_gqa,
+        capture=capture,
     )
 
     if T_q == 0:
@@ -2103,6 +2131,32 @@ def _run_thd_stats_case(
         else:
             got_lse = packed_stats[cu_q[i] : cu_q[i + 1]].t().unsqueeze(0)  # (T_i, H) -> (1, H, T_i)
         torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    assert (o_stor[T_q * H_q * d :] == _THD_SENTINEL).all(), "wrote beyond packed O"
+    stats_tail = stats_stor.view(H_q, t_cap)[:, T_q:] if stats_layout == "head_major" else stats_stor[T_q * H_q :]
+    assert (stats_tail == _THD_SENTINEL).all(), "wrote beyond packed Stats"
+
+
+@pytest.mark.L0
+@_skip_pack_gqa_on_rubin
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize("H_q,H_kv", [(32, 8), (64, 8), (48, 8), (96, 8), (256, 1)])
+@torch_fork_set_rng(seed=30)
+def test_dsl_sm100_thd_pack_gqa_stats_capture(dtype, stats_layout, H_q, H_kv):
+    """Packed worklists and LSE stores handle tails, partial groups and empty KV."""
+    _run_thd_stats_case(
+        seq_lens_q=[257, 0, 513],
+        seq_lens_kv=[1025, 0, 0],
+        dtype=dtype,
+        H_q=H_q,
+        H_kv=H_kv,
+        mask="causal_br",
+        stats_layout=stats_layout,
+        cu_lens=True,
+        pack_gqa=True,
+        capture=True,
+    )
 
 
 @pytest.mark.L0
@@ -2415,7 +2469,8 @@ def test_dsl_sm100_thd_cu_nonzero_base_normalized():
 
 @pytest.mark.L1
 @torch_fork_set_rng(seed=43)
-def test_dsl_sm100_thd_d192_d128_device_meta():
+@pytest.mark.parametrize("cga", [None, pytest.param(1, marks=pytest.mark.skipif(_SM == 107, reason="D192 cga1 exceeds the Rubin shared-memory envelope")), 2])
+def test_dsl_sm100_thd_d192_d128_device_meta(cga):
     """d192/d128 (native MLA head dims) THD through the device-meta +
     envelope path: per-sequence numerics via the direct API — the graph THD
     harness assumes d_qk == d_v, so this flavor's THD leg is pinned here."""
@@ -2429,7 +2484,7 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
     q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
     v = _bhsd(b, h, s, d_v, dtype)
     o = torch.zeros_like(v)
-    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cga=cga)
     assert api.check_support()
     api.compile()
     seq_lens = [200, 150]
@@ -2453,7 +2508,8 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=44)
-def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
+@pytest.mark.parametrize("cga", [None, pytest.param(1, marks=pytest.mark.skipif(_SM == 107, reason="D192 cga1 exceeds the Rubin shared-memory envelope")), 2])
+def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch, cga):
     """d192/d128 THD where a cluster claims more than one unit (issue #618).
 
     The sibling device_meta case is one unit per cluster, so it never re-enters
@@ -2470,7 +2526,7 @@ def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
     q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
     v = _bhsd(b, h, s, d_v, dtype)
     o = torch.zeros_like(v)
-    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cga=cga)
     assert api.check_support()
     api.compile()
     seq_lens = [1024, 768]
@@ -2490,6 +2546,108 @@ def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
         ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
         torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
         off += length
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the D192 one-Q-tile pipeline is pre-Rubin")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "h,hk,dq,dv,mask,with_sink,stats",
+    [
+        (4, 4, 192, 128, "none", False, True),
+        (8, 2, 192, 128, "br", False, True),
+        (8, 2, 192, 128, "swa", True, True),
+        (6, 2, 160, 96, "br", True, True),
+        (16, 2, 144, 120, "swa", False, True),
+        (4, 4, 192, 128, "band", False, True),
+        (4, 4, 192, 128, "none", False, False),
+    ],
+)
+@torch_fork_set_rng(seed=5350)
+def test_dsl_sm100_thd_d192_single_q_admitted_features(monkeypatch, dtype, h, hk, dq, dv, mask, with_sink, stats):
+    """The cga1 replacement preserves masks, head envelopes and unpacked GQA on replay."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    b, sq, sk = 3, 256, 512
+    q_src = torch.randn(b * sq, h, dq, device="cuda", dtype=dtype)
+    k_src = torch.randn(b * sk, hk, dq, device="cuda", dtype=dtype)
+    v_src = torch.randn(b * sk, hk, dv + 32, device="cuda", dtype=dtype)
+    q, k, v_storage = q_src.clone(), k_src.clone(), v_src.clone()
+    v = v_storage[..., 32:]
+    out = torch.full((b * sq, h, dv), 77.0, device="cuda", dtype=dtype)
+    hn = mask in ("br", "band")
+    lse = torch.full((h, b * sq) if hn else (b * sq, h), 77.0, device="cuda") if stats else None
+    lse_view = lse.as_strided((b, h, sq, 1), (sq, b * sq, 1, 1) if hn else (sq * h, 1, h, 1)) if stats else None
+    views = [x.view(b, length, heads, dim).transpose(1, 2) for x, length, heads, dim in ((q, sq, h, dq), (k, sk, hk, dq), (v, sk, hk, dv), (out, sq, h, dv))]
+    sink = torch.randn(h, device="cuda") if with_sink else None
+    causal, br = mask != "none", mask in ("br", "swa")
+    left, right = (63 if mask == "swa" else None), (17 if mask == "band" else 0)
+    api = SdpaFwdDslSm100(
+        *views,
+        sample_lse=lse_view,
+        thd=True,
+        cga=1,
+        pack_gqa=False,
+        is_causal=causal,
+        causal_bottom_right=br,
+        window_size_left=left,
+        window_size_right=right if causal else None,
+        has_sink=with_sink,
+        stats_log2=hn,
+        scale_softmax=dq**-0.5,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._k_mod.CGA_TILE_M == 128
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    q_lens, k_lens = (torch.empty(b, dtype=torch.int32, device="cuda") for _ in range(2))
+
+    def prepare(ql, kl, factor):
+        for dst, src, count in ((q, q_src, sum(ql)), (k, k_src, sum(kl)), (v_storage, v_src, sum(kl))):
+            dst.copy_(src * factor)
+            dst[count:].fill_(float("nan"))
+        q_lens.copy_(torch.tensor(ql, dtype=torch.int32))
+        k_lens.copy_(torch.tensor(kl, dtype=torch.int32))
+        out.fill_(77)
+        if stats:
+            lse.fill_(77)
+
+    def execute():
+        api.execute(*views, lse_tensor=lse_view, sinks=sink, seq_q_lens=q_lens, seq_kv_lens=k_lens, workspace=workspace)
+
+    def check(ql, kl):
+        qo = ko = 0
+        for nq, nk in zip(ql, kl):
+            if nq:
+                qb, kb, vb = (x[start : start + count].transpose(0, 1).unsqueeze(0) for x, start, count in ((q, qo, nq), (k, ko, nk), (v, ko, nk)))
+                expected, expected_lse = _ref_sdpa_full(
+                    qb, kb, vb, scale=dq**-0.5, is_causal=causal, bottom_right=br, band_right=right, swa_window=left, sinks=sink, return_stats=True
+                )
+                torch.testing.assert_close(out[qo : qo + nq].transpose(0, 1).unsqueeze(0), expected, atol=0.012, rtol=0.012)
+                if stats:
+                    got = lse[:, qo : qo + nq] if hn else lse[qo : qo + nq].T
+                    torch.testing.assert_close(got, expected_lse[0] * (math.log2(math.e) if hn else 1), atol=1e-3, rtol=1e-3)
+            qo += nq
+            ko += nk
+        assert torch.all(out[qo:] == 77)
+        if stats:
+            assert torch.all((lse[:, qo:] if hn else lse[qo:]) == 77)
+
+    ql, kl = [129, 7, 0], [257, 0, 33]
+    prepare(ql, kl, 1.0)
+    execute()
+    torch.cuda.synchronize()
+    check(ql, kl)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        execute()
+    ql, kl = [1, 255, 7], [0, 311, 19]
+    prepare(ql, kl, 0.7)
+    graph.replay()
+    torch.cuda.synchronize()
+    check(ql, kl)
 
 
 @pytest.mark.L0

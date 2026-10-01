@@ -7,6 +7,8 @@ production fallback for native plans. No test pins a heuristic or timing.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +21,7 @@ pytestmark = [pytest.mark.L0]
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s = prep.ThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
+    s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
     s.has_lse, s.lse_head_major = layout is not None, layout == "HN"
     s.lse_head_stride, s.lse_stride = (16 if layout == "HN" else 0), None
@@ -31,6 +34,7 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
+    s.template[s.index["n_thd_units"]] = 32
     s.template[s.index["lse_ext"]] = s.lse_head_stride
     s.template[s.index["scale_softmax_log2"]] = 0.125
     s._geometry_cache, s.native = None, None
@@ -64,6 +68,495 @@ def _equal(s, facts, **kwargs):
     if actual is not None:
         assert list(actual) == reference
     return actual
+
+
+def _choice_fixture(dtype="bfloat16", layout="HN", qh=16, kh=2):
+    base, _, _ = _fixture(dtype, layout)
+    base.b, base.qh, base.kh, base.d_qk, base.d_v = 8, qh, kh, 192, 128
+    base.total_q, base.total_kv, base.quant = None, None, None
+    base.s_q_max, base.lse_head_stride, base.lse_stride_override = 65536, 0, True
+    base.decl = {role: (h, d, h * d, d, 1, h * d) for role, h, d in (("q", qh, 192), ("k", kh, 192), ("v", kh, 128), ("o", qh, 128))}
+    variants, launches = [], []
+    for i, tile in enumerate((128, 512)):
+        spec = copy(base)
+        spec.cga_tile_m = tile
+        spec.template = list(base.template)
+        spec.template[spec.index["n_thd_units"]] = 1024
+        spec.fn = lambda *frame, index=i: launches.append((index, frame))
+        spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+        variants.append(spec)
+    return variants, launches
+
+
+def _choice_facts(spec, batch, max_q, total, max_kv=64):
+    facts = {}
+    for i, role in enumerate(("q", "k", "v", "o")):
+        h, d = spec.decl[role][:2]
+        sq = max_q if role in ("q", "o") else max_kv
+        tokens = total if role in ("q", "o") else batch * sq
+        facts[role] = prep.BufferFacts(0x1000 * (i + 1), spec.expect[role], (2, 0), tokens * h * d, (batch, h, sq, d), (sq * h * d, d, h * d, 1))
+    for i, role in enumerate(("q_lens", "kv_lens")):
+        facts[role] = prep.BufferFacts(0x10000 + i * 0x1000, "int32", (2, 0), batch + 1, (batch + 1,), (1,))
+    if spec.has_lse:
+        strides = (spec.qh * total, total, 1, 1) if spec.lse_head_major else (spec.qh * max_q, 1, spec.qh, 1)
+        facts["lse"] = prep.BufferFacts(0x20000, "float32", (2, 0), spec.qh * total, (batch, spec.qh, max_q, 1), strides)
+    return facts
+
+
+def _packed_split_fixture(layout="HN", splits=8):
+    variants, launches = _choice_fixture(layout=layout)
+    s = variants[0]
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    s.template[s.index["n_thd_units"]] = 148
+    off_o, capacity = 8192, 512
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    return s, launches
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 4, 8])
+def test_packed_split_binds_fixed_regions_and_independent_frames(layout, splits):
+    s, launches = _packed_split_fixture(layout, splits)
+    saved = []
+    for batch, total in ((1, 64), (1, 129), (4, 257), (2, 512)):
+        facts = _choice_facts(s, batch, total, total)
+        workspace = 0x4000000 * (1 + len(saved))
+        frame = _equal(s, facts, workspace=workspace, stream=29 + len(saved))
+        assert frame[s.index["o_partial_ptr"]] == workspace + s.split_workspace.off_o
+        assert frame[s.index["lse_partial_ptr"]] == workspace + s.split_workspace.off_lse
+        assert frame[s.index["partial_o_strides"]] == (total * s.qh * 128, s.qh * 128, 128)
+        assert frame[s.index["n_thd_units"]] == min(148, ((total - 1) // 128 + batch) * s.qh * splits)
+        saved.append((frame, tuple(frame)))
+        s.native.execute(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, workspace, 29 + len(saved) - 1)
+        assert launches[-1][1] == tuple(frame)
+        assert all(tuple(old) == unchanged for old, unchanged in saved)
+    assert s.template[s.index["o_partial_ptr"]] is None
+    assert s.template[s.index["lse_partial_ptr"]] is None
+
+
+def test_packed_split_rejects_capacity_before_launch_and_keeps_empty_semantics():
+    s, launches = _packed_split_fixture()
+    facts = _choice_facts(s, 1, 513, 513)
+    for binder in (_native, _reference):
+        with pytest.raises(ValueError, match="packed Q capacity"):
+            binder(s, facts)
+        empty = dict(facts, q=facts["q"]._replace(span=0))
+        assert binder(s, empty) is None
+        valid = _choice_facts(s, 1, 64, 64)
+        with pytest.raises(ValueError, match="non-null workspace"):
+            binder(s, valid, workspace=0)
+    assert not launches
+
+
+@pytest.mark.parametrize("bad", ["capacity", "offset", "overlap", "reservation", "overflow", "tile"])
+def test_packed_split_rejects_invalid_workspace_contract(bad):
+    s, _ = _packed_split_fixture()
+    if bad == "capacity":
+        s.split_workspace = s.split_workspace._replace(capacity=0)
+    elif bad == "offset":
+        s.split_workspace = s.split_workspace._replace(off_o=4096)
+    elif bad == "overlap":
+        s.split_workspace = s.split_workspace._replace(off_lse=s.split_workspace.off_o)
+    elif bad == "reservation":
+        s.scratch_bytes -= 1
+    elif bad == "overflow":
+        s.split_workspace = s.split_workspace._replace(splits=2**62)
+    else:
+        s.cga_tile_m = 512
+    with pytest.raises(ValueError, match="packed split|int64"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+def test_cga_policy_cannot_silently_acquire_split_semantics():
+    split, _ = _packed_split_fixture()
+    variants, _ = _choice_fixture()
+    with pytest.raises(ValueError, match="unsplit"):
+        cudnn._pybind_module._SdpaThdPlanChoices(split, variants[1], 148, 2)
+
+
+def _split_member(base, launches, splits, capacity, index):
+    split = copy(base)
+    split.order = list(split.order) + ["lse_partial_ptr", "partial_o_strides"]
+    split.index = {name: i for i, name in enumerate(split.order)}
+    split.template = list(split.template) + [None, None]
+    split.template[split.index["n_thd_units"]] = 148
+    off_lse = 8192 + splits * capacity * split.qh * 128 * 4
+    split.split_workspace = prep.ThdSplitWorkspace(splits, capacity, 8192, off_lse)
+    split.scratch_bytes = off_lse + splits * capacity * split.qh * 4
+    split.fn = lambda *frame: launches.append((index, frame))
+    split.native = cudnn._pybind_module._SdpaThdBinder(split)
+    return split
+
+
+def _split_policy_fixture(dtype="bfloat16", layout="HN", capacity=128):
+    variants, launches = _choice_fixture(dtype, layout, kh=16)
+    split = _split_member(variants[0], launches, 8, capacity, 2)
+    return [*variants, split], launches
+
+
+@pytest.mark.parametrize("heads,short_splits,long_splits", [(4, 32, 16), (8, 16, 8), (16, 8, 4)])
+@pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
+def test_balanced_split_policy_binds_four_artifacts_and_keeps_old_frames(heads, short_splits, long_splits, dtype, layout):
+    variants, launches = _choice_fixture(dtype, layout, qh=heads, kh=heads)
+    variants += [_split_member(variants[0], launches, short_splits, 128, 2), _split_member(variants[0], launches, long_splits, 256, 3)]
+    assert variants[2].scratch_bytes == variants[3].scratch_bytes == 8192 + 16384 * (128 + 1) * 4
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 3, variants[3])
+    cases = [(1, q, 32768, selected) for q, selected in ((1, 2), (64, 2), (127, 2), (128, 2), (129, 3), (255, 3), (256, 3), (257, 0))]
+    cases += [(1, 128, 32767, 0), (1, 129, 131072, 3), (2, 64, 32768, 0), (1, 32768 // heads, 32768, 1)]
+    saved = []
+    for batch, total, kv, expected in cases:
+        facts = _choice_facts(variants[0], batch, total, total, kv)
+        workspace, stream = 0x4000000 * (len(saved) + 1), 31 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        assert list(frame) == _reference(variants[index], facts, workspace, stream)
+        assert choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(frame))
+        saved.append((frame, tuple(frame)))
+        assert all(tuple(old) == original for old, original in saved)
+
+
+@pytest.mark.parametrize("heads,reduced", [(4, False), (8, False), (16, False), (4, True), (8, True)])
+@pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
+def test_batched_split_policy_bounds_tiles_and_preserves_frames(heads, reduced, dtype, layout):
+    variants, launches = _choice_fixture(dtype, layout, qh=heads, kh=heads)
+    variants += [
+        _split_member(variants[0], launches, splits // heads, capacity, index) for index, capacity, splits in ((2, 128, 128), (3, 256, 64), (4, 512, 32))
+    ]
+    if reduced:
+        variants.append(_split_member(variants[0], launches, 16 // heads, 1024, 5))
+    assert {v.scratch_bytes for v in variants[2:]} == {8192 + 16384 * (128 + 1) * 4}
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 4, *variants[3:])
+    batch_member = 5 if reduced else 4
+    # Recorded policy boundaries, including storage and max-Q bounds that give
+    # different tile counts for the same packed total. No heuristic rank golden.
+    cases = [(1, q, q, 8192, 3 if member == 2 and heads < 16 else member) for q, member in ((1, 2), (128, 2), (129, 3), (256, 3), (257, 4), (512, 4), (513, 0))]
+    if heads < 16:
+        cases += [(1, 128, 128, 131072 // heads - 1, 3), (1, 128, 128, 131072 // heads, 2)]
+    cases += [
+        (2, 64, 128, 32768, 3),
+        (2, 256, 512, 8192, 4),
+        (4, 32, 128, 8192, 4),
+        (4, 128, 512, 8192, 4),
+        (4, 129, 512, 8192, 4 if heads < 16 else 0),
+        (5, 1, 5, 32768, 4 if heads < 16 else 0),
+        (8, 16, 128, 8192, batch_member if heads < 16 else 0),
+        (8, 64, 512, 8192, batch_member if heads < 16 else 0),
+        (8, 128, 256, 4096, batch_member if heads < 16 else 0),
+        (8, 65, 520, 8192, 0),
+        (1, 128, 128, 8191, 3),
+        (1, 128, 128, 2047, 0),
+        (1, 128, 128, 2048, 3),
+        (1, 256, 256, 2048, 3),
+        (1, 512, 512, 2048, 4 if heads < 16 else 0),
+        (4, 32, 128, 2048, 4 if heads < 16 else 0),
+        (8, 16, 128, 2048, batch_member if heads == 4 else 0),
+        (1, 128, 128, 4095, 3),
+        (1, 512, 512, 4095, 4 if heads < 16 else 0),
+        (1, 128, 128, 4096, 3),
+        (4, 32, 128, 4096, 4),
+        (1, 32768 // heads, 32768 // heads, 32768, 1),
+    ]
+    saved = []
+    for batch, max_q, total, kv, expected in cases:
+        facts = _choice_facts(variants[0], batch, max_q, total, kv)
+        workspace, stream = 0x4000000 * (len(saved) + 1), 31 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        assert list(frame) == _reference(variants[index], facts, workspace, stream)
+        assert choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(frame))
+        saved.append((frame, tuple(frame)))
+        assert all(tuple(old) == original for old, original in saved)
+
+    outside_batch = prep._native_pack_from_facts(_choice_facts(variants[0], 9, 1, 9, 32768))
+    with pytest.raises(ValueError, match="batch capacity"):
+        choices.bind(outside_batch, prep._NATIVE_THD_INDICES, 0x4000000, 31)
+
+
+@pytest.mark.parametrize("bad", ["missing", "unrecorded", "capacity", "splits", "contract", "same_member"])
+def test_batched_split_policy_rejects_incomplete_members(bad):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    small = _split_member(variants[0], launches, 16, 128, 2)
+    large = _split_member(variants[0], launches, 8, 256, 3)
+    wide = _split_member(variants[0], launches, 4, 512, 4)
+    policy = 4
+    if bad == "missing":
+        wide = None
+    elif bad == "unrecorded":
+        policy = 3
+    elif bad == "capacity":
+        wide.split_workspace = wide.split_workspace._replace(capacity=256)
+    elif bad == "splits":
+        wide.split_workspace = wide.split_workspace._replace(splits=8)
+    elif bad == "contract":
+        wide.total_q = 512
+    elif bad == "same_member":
+        wide = large
+    with pytest.raises(ValueError, match="split policy|plan choices must share"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, 2, small, policy, large, wide)
+
+
+@pytest.mark.parametrize(
+    "bad", ["missing", "unrecorded", "small_capacity", "large_capacity", "small_splits", "large_splits", "contract", "heads", "same_member"]
+)
+def test_balanced_split_policy_rejects_incomplete_or_incompatible_members(bad):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    small = _split_member(variants[0], launches, 16, 128, 2)
+    large = _split_member(variants[0], launches, 8, 256, 3)
+    policy = 3
+    if bad == "missing":
+        large = None
+    elif bad == "same_member":
+        large = small
+    elif bad == "unrecorded":
+        policy = 2
+    elif bad == "small_capacity":
+        small.split_workspace = small.split_workspace._replace(capacity=256)
+    elif bad == "large_capacity":
+        large.split_workspace = large.split_workspace._replace(capacity=128)
+    elif bad == "small_splits":
+        small.split_workspace = small.split_workspace._replace(splits=8)
+    elif bad == "large_splits":
+        large.split_workspace = large.split_workspace._replace(splits=16)
+    elif bad == "contract":
+        large.total_q = 64
+    else:
+        for member in (*variants, small, large):
+            member.qh = member.kh = 32
+    with pytest.raises(ValueError, match="split policy|plan choices must share"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, 2, small, policy, large)
+
+
+def test_balanced_split_requires_matching_native_support_without_breaking_older_policies(monkeypatch):
+    variants, launches = _choice_fixture(kh=16)
+    variants += [_split_member(variants[0], launches, 8, 128, 2), _split_member(variants[0], launches, 4, 256, 3)]
+    members = [SimpleNamespace(spec=s, _roles=("q",), _uids=(1,)) for s in variants]
+    calls = []
+
+    def old_factory(*args):
+        calls.append(args)
+        assert len(args) == 6
+        return object()
+
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
+    prep.PreparedThdChoices(members[:3], 148, policy=2, split_policy=1)
+    with pytest.raises(NotImplementedError, match="matching native"):
+        prep.PreparedThdChoices(members, 148, policy=2, split_policy=3)
+    assert len(calls) == 1
+
+
+def test_batched_split_requires_matching_native_support_without_breaking_balanced_policy(monkeypatch):
+    variants, launches = _choice_fixture(kh=16)
+    variants += [_split_member(variants[0], launches, splits, capacity, index) for index, capacity, splits in ((2, 128, 8), (3, 256, 4), (4, 512, 2))]
+    members = [SimpleNamespace(spec=s, _roles=("q",), _uids=(1,)) for s in variants]
+    calls = []
+
+    def old_factory(*args):
+        calls.append(args)
+        assert len(args) == 7
+        return object()
+
+    old_factory.supports_balanced_split = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
+    prep.PreparedThdChoices(members[:4], 148, policy=2, split_policy=3)
+    with pytest.raises(NotImplementedError, match="matching native"):
+        prep.PreparedThdChoices(members, 148, policy=2, split_policy=4)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("bad", ["unrecorded", "capacity", "splits", "contract", "heads"])
+def test_reduced_batch_split_rejects_incompatible_member(bad):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    variants += [
+        _split_member(variants[0], launches, splits, capacity, index) for index, capacity, splits in ((2, 128, 16), (3, 256, 8), (4, 512, 4), (5, 1024, 2))
+    ]
+    policy = 4
+    if bad == "unrecorded":
+        policy = 3
+        variants[4] = None
+    elif bad == "capacity":
+        variants[5].split_workspace = variants[5].split_workspace._replace(capacity=512)
+    elif bad == "splits":
+        variants[5].split_workspace = variants[5].split_workspace._replace(splits=4)
+    elif bad == "contract":
+        variants[5].total_q = 512
+    else:
+        for variant in variants:
+            variant.qh = variant.kh = 16
+    with pytest.raises(ValueError, match="split policy|plan choices must share"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], policy, *variants[3:])
+
+
+def test_reduced_batch_split_requires_matching_native_support_without_breaking_existing_members(monkeypatch):
+    variants, launches = _choice_fixture(qh=8, kh=8)
+    variants += [
+        _split_member(variants[0], launches, splits, capacity, index) for index, capacity, splits in ((2, 128, 16), (3, 256, 8), (4, 512, 4), (5, 1024, 2))
+    ]
+    members = [SimpleNamespace(spec=s, _roles=("q",), _uids=(1,)) for s in variants]
+    calls = []
+
+    def old_factory(*args):
+        calls.append(args)
+        assert len(args) == 8
+        return object()
+
+    old_factory.supports_batched_split = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdPlanChoices", old_factory)
+    prep.PreparedThdChoices(members[:5], 148, policy=2, split_policy=4)
+    with pytest.raises(NotImplementedError, match="matching native"):
+        prep.PreparedThdChoices(members, 148, policy=2, split_policy=4)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("dtype,layout", [("bfloat16", "HN"), ("float16", "NH"), ("bfloat16", None)])
+@pytest.mark.parametrize("cga_policy", [1, 2])
+@pytest.mark.parametrize("split_policy", [1, 2])
+def test_split_policy_binds_selected_artifact_without_mutating_old_frames(dtype, layout, cga_policy, split_policy):
+    capacity = 128 if split_policy == 1 else 256
+    variants, launches = _split_policy_fixture(dtype, layout, capacity)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, cga_policy, variants[2], split_policy)
+    saved = []
+    # This pins the explicitly recorded policy contract, not heuristic ranking.
+    cases = [(1, total, 32768, 2 if total <= capacity else 0) for total in (64, 128, 129, 255, 256, 257)]
+    cases += [(1, capacity, 131072, 2), (1, 64, 32767, 0), (2, 64, 32768, 0), (1, 2048, 32768, 1)]
+    for batch, total, kv, expected in cases:
+        facts = _choice_facts(variants[0], batch, total, total, kv)
+        workspace, stream = 0x4000000 * (len(saved) + 1), 31 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        assert list(frame) == _reference(variants[index], facts, workspace, stream)
+        assert choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(frame))
+        saved.append((frame, tuple(frame)))
+        assert all(tuple(old) == original for old, original in saved)
+    empty = dict(facts, q=facts["q"]._replace(span=0))
+    before = len(launches)
+    assert not choices.execute(prep._native_pack_from_facts(empty), prep._NATIVE_THD_INDICES, workspace, stream)
+    assert len(launches) == before
+
+
+@pytest.mark.parametrize("role,updates", [("q", {"device": (1, 0)}), ("kv_lens", {"span": 1}), ("o", {"ptr": 0x4001}), ("lse", {"dtype": "bfloat16"})])
+def test_split_policy_preserves_selected_binder_validation(role, updates):
+    variants, launches = _split_policy_fixture()
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants[:2], 148, 2, variants[2], 1)
+    facts = _choice_facts(variants[0], 1, 64, 64, 32768)
+    facts[role] = facts[role]._replace(**updates)
+    with pytest.raises(ValueError):
+        choices.execute(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, 0x4000000, 31)
+    assert not launches
+
+
+@pytest.mark.parametrize("bad", ["unrecorded", "unknown", "missing", "capacity", "splits", "contract"])
+@pytest.mark.parametrize("split_policy", [1, 2])
+def test_split_policy_rejects_incompatible_or_unrecorded_members(bad, split_policy):
+    variants, _ = _split_policy_fixture(capacity=128 if split_policy == 1 else 256)
+    single, pair, split = variants
+    policy = split_policy
+    if bad == "unrecorded":
+        policy = 0
+    elif bad == "unknown":
+        policy = 5
+    elif bad == "missing":
+        split = None
+    elif bad == "capacity":
+        split.split_workspace = split.split_workspace._replace(capacity=256 if split_policy == 1 else 128)
+    elif bad == "splits":
+        split.split_workspace = split.split_workspace._replace(splits=4)
+    else:
+        split.total_q = 64
+    with pytest.raises(ValueError, match="split policy|plan choices must share|split member"):
+        cudnn._pybind_module._SdpaThdPlanChoices(single, pair, 148, 2, split, policy)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_plan_choices_keep_frames_and_explicit_artifacts_independent(dtype, layout, policy):
+    variants, launches = _choice_fixture(dtype, layout)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    saved = []
+    for batch, maximum, total, expected in ((1, 1024, 1024, 0), (2, 513, 640, 0), (1, 2048, 2048, 1), (4, 128, 319, 0), (8, 512, 4096, 1)):
+        facts = _choice_facts(variants[0], batch, maximum, total)
+        workspace, stream = 0x30000 + len(saved) * 0x1000, 17 + len(saved)
+        pack = prep._native_pack_from_facts(facts)
+        index, frame = choices.bind(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert index == choices.select_index(pack, prep._NATIVE_THD_INDICES) == expected
+        reference = _reference(variants[index], facts, workspace, stream)
+        assert list(frame) == reference
+        saved.append((frame, tuple(frame)))
+        choices.execute(pack, prep._NATIVE_THD_INDICES, workspace, stream)
+        assert launches[-1] == (index, tuple(reference))
+        assert all(tuple(old) == unchanged for old, unchanged in saved)
+    empty = dict(facts, q=facts["q"]._replace(span=0))
+    before = len(launches)
+    assert not choices.execute(prep._native_pack_from_facts(empty), prep._NATIVE_THD_INDICES, workspace, stream)
+    assert len(launches) == before
+
+
+@pytest.mark.parametrize(
+    "role,updates",
+    [
+        ("q", {"device": (1, 0)}),
+        ("q", {"dtype": "float32"}),
+        ("o", {"ptr": 0x4001}),
+        ("q_lens", {"span": 0}),
+        ("kv_lens", {"shape": (3,)}),
+        ("lse", {"dtype": "bfloat16"}),
+        ("lse", {"span": 3}),
+        ("k", {"ptr": 0x2001}),
+    ],
+)
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_plan_choices_preserve_runtime_rejections(role, updates, policy):
+    variants, launches = _choice_fixture()
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    for total in (1024, 2048):
+        facts = _choice_facts(variants[0], 1, total, total)
+        facts[role] = facts[role]._replace(**updates)
+        for variant in variants:
+            with pytest.raises(ValueError):
+                _native(variant, facts)
+        with pytest.raises(ValueError):
+            choices.execute(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, 0x30000, 17)
+    assert launches == []
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_native_cga_policy_preserves_one_wave_and_equal_wave_rules(policy):
+    variants, _ = _choice_fixture(qh=32)
+    choices = cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+    # Two packed sequences fit in two waves of either geometry. Policy1
+    # preserves its original pair choice; policy2 selects single on this tie.
+    facts = _choice_facts(variants[0], 2, 513, 640)
+    assert choices.select_index(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES) == (1 if policy == 1 else 0)
+    # One sequence with 1024 rows needs two single waves but one pair wave.
+    facts = _choice_facts(variants[0], 1, 1024, 1024)
+    assert choices.select_index(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES) == 1
+
+
+@pytest.mark.parametrize("policy", [0, 3])
+def test_native_cga_policy_rejects_unknown_values(policy):
+    variants, _ = _choice_fixture()
+    with pytest.raises(ValueError, match="unknown native THD CGA policy"):
+        cudnn._pybind_module._SdpaThdPlanChoices(*variants, 148, policy)
+
+
+def test_native_plan_choices_reject_incompatible_specializations():
+    variants, _ = _choice_fixture()
+    for name, value in (("qh", 32), ("total_q", 2048), ("device_index", 1), ("lse_stride_override", False)):
+        changed = copy(variants[1])
+        setattr(changed, name, value)
+        with pytest.raises(ValueError, match="plan choices must share"):
+            cudnn._pybind_module._SdpaThdPlanChoices(variants[0], changed, 148)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -223,7 +716,9 @@ def test_native_unknown_metadata_span_keeps_the_bare_pointer_contract():
     _equal(s, changed)
 
 
-@pytest.mark.parametrize("field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2)])
+@pytest.mark.parametrize(
+    "field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2), ("cga_tile_m", 0)]
+)
 def test_native_rejects_malformed_plan(field, value):
     s, _, _ = _fixture()
     setattr(s, field, value)
@@ -259,6 +754,62 @@ def test_native_asymmetric_head_dims_and_int64_runtime_token_strides():
     frame = _equal(s, facts)
     assert frame[s.index["q_strides"]] == (token_stride, token_stride, 192)
     assert frame[s.index["problem_size"]][3] == 16
+
+
+@pytest.mark.parametrize("batch,tokens,expected_limit", [(1, 8192, 128), (4, 512, 32), (4, 1, 32)])
+def test_native_thd_launch_bound_uses_current_capacity(batch, tokens, expected_limit):
+    """A cache-shape envelope must not launch millions of dead THD units."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    declared_units = 4096 * 128 * s.qh
+    s.template[s.index["n_thd_units"]] = declared_units
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for role in ("q", "o"):
+        facts[role] = facts[role]._replace(shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+    for role in ("q_lens", "kv_lens"):
+        facts[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+    before = list(s.template)
+    frame = _equal(s, facts)
+    assert frame[s.index["n_thd_units"]] <= expected_limit
+    assert frame[s.index["n_thd_units"]] >= s.qh
+    assert s.template == before, "launch bounds belong to the invocation, not the shared plan"
+
+
+def test_native_thd_launch_bound_retains_persistent_cap():
+    s, facts, _ = _fixture(layout=None)
+    s.template[s.index["n_thd_units"]] = 7
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    assert _equal(s, facts)[s.index["n_thd_units"]] == 7
+    assert s.template[s.index["n_thd_units"]] == 7
+
+
+def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
+    s, facts, recorded = _fixture(layout="HN")
+    s.lse_stride_override = True
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+
+    def run(i):
+        stride = 16 + i
+        changed = dict(facts)
+        changed["lse"] = facts["lse"]._replace(ptr=0x20000 + 0x1000 * i, shape=(1, 8, stride), strides=(8 * stride, stride, 1), span=8 * stride)
+        frame = _equal(s, changed, stream=17 + i)
+        assert frame[s.index["lse_ext"]] == stride
+        assert s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x30000, 17 + i)
+        return frame
+
+    with ThreadPoolExecutor(2) as pool:
+        frames = list(pool.map(run, range(8)))
+    assert len(recorded) == 8
+    for i, frame in enumerate(frames):
+        assert frame[s.index["lse_ext"]] == 16 + i
+        assert frame[s.index["lse_ptr"]] == 0x20000 + 0x1000 * i
+    assert s.template[s.index["lse_ext"]] == s.lse_head_stride == 16
+    for updates in ({"span": 127}, {"strides": (128, 17, 1)}, {"strides": (128, 0, 1)}, {"strides": (128, 16, 2)}):
+        changed = dict(facts, lse=facts["lse"]._replace(**updates))
+        with pytest.raises(ValueError):
+            _native(s, changed)
+        with pytest.raises(ValueError):
+            _reference(s, changed)
 
 
 def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2):
@@ -381,3 +932,76 @@ def test_native_nonpaged_host_does_not_require_paged_slots():
     s.index = {n: i for i, n in enumerate(s.order)}
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("splits", [4, 16])
+def test_native_paged_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+    """The split composes with paging without caching pointers or weakening spans."""
+    s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
+    s.cga_tile_m = 128
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    s.template[s.index["n_thd_units"]] = 148
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    original = tuple(s.template)
+    first = _equal(s, facts, workspace=0x4000000, stream=17)
+    changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
+    second = _equal(s, changed, workspace=0x8000000, stream=29)
+    assert first[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+    assert second[s.index["lse_partial_ptr"]] == 0x8000000 + off_lse
+    assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
+    assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    assert tuple(s.template) == original
+    s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
+    assert frames[-1] == tuple(second)
+    for role in ("k", "v", "block_table", "block_table_v"):
+        invalid = dict(changed, **{role: changed[role]._replace(span=1)})
+        for bind in (_native, _reference):
+            with pytest.raises(ValueError):
+                bind(s, invalid)
+    saved = tuple(first)
+    for bind in (_native, _reference):
+        with pytest.raises(ValueError, match="non-null workspace"):
+            bind(s, facts, workspace=0)
+    assert tuple(first) == saved
+
+
+def test_native_paged_packed_split_rejects_other_head_geometry():
+    s, _, _ = _paged_fixture()
+    s.cga_tile_m, s.d_qk = 128, 192
+    s.split_workspace = prep.ThdSplitWorkspace(4, 16, 8192, 8192 + 4 * 16 * s.qh * 128 * 4)
+    s.scratch_bytes = s.split_workspace.off_lse + 4 * 16 * s.qh * 4
+    with pytest.raises(ValueError, match="packed split geometry"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_native_paged_batch_capacity_survives_geometry_cache_hits(capacity):
+    """A B1 plan stays B1; a larger plan can repeatedly bind smaller batches."""
+    s, facts, _ = _paged_fixture()
+    s.b = capacity
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for batch in (1, 2, 1, 2):
+        changed = dict(facts)
+        for role in ("q", "o"):
+            f = facts[role]
+            changed[role] = f._replace(shape=(batch, *f.shape[1:]), span=batch * 4 * s.qh * s.d_qk)
+        for role, size in (("q_lens", batch + 1), ("kv_lens", batch)):
+            changed[role] = facts[role]._replace(shape=(size,), span=size)
+        for role in ("block_table", "block_table_v"):
+            changed[role] = facts[role]._replace(shape=(batch, 4), strides=(4, 1), span=batch * 4)
+        if batch > capacity:
+            for bind in (_native, _reference):
+                with pytest.raises(ValueError, match="prepared for|batch capacity"):
+                    bind(s, changed)
+        else:
+            frame = _equal(s, changed)
+            assert frame[s.index["problem_size"]][0] == batch

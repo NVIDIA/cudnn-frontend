@@ -155,6 +155,7 @@ MMA as d=512.
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | ✅ᵐ partial (d128 envelope) | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |
+| THD prefill + PackGQA (f16/bf16, CGA2, unsplit)ᵐ | ❌ | ✅ native, partial | ❌ | ❌ | ❌ | — |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
@@ -189,10 +190,13 @@ underflows in fp32 for sink ≤ −104, which used to give `O = NaN`, `LSE = −
 off, and its graph-path twin pin it) — Stats incl. base-2, PackGQA incl. partial
 packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head), KV split
 + combine, NATURAL
-/ LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
+/ LPT / LPT_L2. **THD on the decode tile: ragged-Q-over-paged-KV at one query, or native D128 packed split** (ʳᵠ:
 ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
-at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
-and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+at one token per sequence, nvbug 6607857; D128 paged packed split also admits
+`TILE_CGA_M=1` with `PACK_GQA=0/1` and `SPLIT_KV>1`; packing counts token tiles
+while partial O/Stats retain unpacked query heads. Default split/packing selection
+is unchanged; other ragged graphs keep
+`TILE_CGA_M=2` and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 rides it through the d128 envelope. Measured on B200 (graph path,
@@ -477,6 +481,19 @@ group is declined there). Validated on B200: `test_sdpa_fwd_paged_sm100.py`
 (graph + kernel, G = 12 / 6 / 5 / 3, S_q 1–8 bottom-right causal, HND / NHD),
 `test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_pack_gqa_partial_group` (dense,
 d128 / d256, Stats), and the `test_mhas_v2.py` paged partial-pack sweeps.
+
+THD prefill also supports packing at **native (128, 128), f16/bf16,
+CGA2, split-KV=1** on SM100/SM103, including paged KV. The capability field
+`thd_pack_gqa_d_shapes` keeps other shapes and engine rows fail-closed;
+the separate ragged-Q decode tile retains its existing contract. The GPU
+worklist counts token tiles after packing and every packed Stats layout
+indexes the actual query head. `test_dsl_sm100_thd_pack_gqa_stats_capture`
+checks token-major and head-major O/LSE, partial GQA groups, non-tile-aligned
+lengths, empty sequences and CUDA Graph replay with poisoned outputs.
+`test_paged_graph_thd_pack_gqa` covers HND/NHD pools and partial groups;
+the padded-Stats stride test compares packed and unpacked plans in all
+storage orders. Heuristics prefer packing for causal THD with GQA4/GQA8;
+other supported THD groups remain available as explicit tuning candidates.
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
@@ -1288,3 +1305,14 @@ THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
 their existing admission boundaries. Remaining conversion layouts use prepared
 gather/scatter copies around a compact prepared plan. Standalone prepared calls
 require caller-owned workspace.
+
+
+SM100 exact D128 FP16/BF16 paged THD can select an unpacked single-CTA split
+with caller-owned packed partial O/LSE workspace. Graph and standalone execute
+share the native prepared binding, including NH/HN Stats and HND/NHD pools.
+Shape overrides require a declared positive packed-Q capacity bounded by the
+plan; unbounded overrides remain on existing plans. Automatic split counts use
+fixed graph descriptors only, with a bounded BF16 B1/GQA4 HND/page16 causal
+short-query domain; the unsplit candidates remain available. This extends a
+knob combination within the existing graph-eligibility row, not a new head
+shape, quantization, or GPU capability.

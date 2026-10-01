@@ -20,10 +20,8 @@ Geometry is FROST's ``make_cfg_d192`` (d_qk=192, d_v=128) as-is.
 Same body as ``sm107/prefill_d128_f16.py`` -- the pre-upstream base kernel is
 flavor-generic (it served llama/dsv3/gptoss off one file by swapping
 sdpa_config_<flavor>), and CfgD192/CfgD128 have identical field sets, so
-the ONLY difference is the config factory. the pre-upstream helper would give
-STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST gives 2; the deeper ring is a
-PERF lever and this port is for FUNCTIONAL coverage first, so it is deliberately
-not taken here.
+the configuration factory supplies the flavor-specific geometry. The f16
+D192 KV ring stays two stages deep to respect the shared-memory budget.
 
 Original pre-upstream header follows.
 
@@ -35,16 +33,12 @@ Same kernel shape as the C++ source: pipeline, TMEM/SMEM layout,
 barrier inventory + init counts, scheduler, warp dispatch, register
 split match.  Canonical reference port; reaches ~0.99x C++ TFLOPS.
 
-THD / varlen is **NOT** ported.  The pre-upstream body carried a packed-varlen
-entry point (``CFG.THD_VARLEN=1``: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord
-offset, per-batch O TMA-descriptor array, packed ``[1,QH,T]`` LSE), but its
-setup-kernel call site still speaks the pre-upstream 7-arg contract against a
-14-arg helper and the metadata layout differs (3B+2 vs 4B+4).  ``compile()``
-raises on ``CFG.THD_VARLEN`` rather than half-serving it, ``config_sm107``
-rejects THD for f16/bf16, and no engine row advertises it.  Only the dense
-``[B,S,H,D]`` path is served.
+THD / varlen uses packed operands, the shared 4B+4 metadata setup, and a
+persistent device claim counter. The host caps its launch to resident clusters;
+clusters with no initial live unit exit before entering the barrier pipeline.
 """
 
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 import os
 import sys
@@ -221,6 +215,8 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# The THD body claims work from a device counter; launch only resident clusters.
+THD_PERSISTENT = True
 
 
 # lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
@@ -331,6 +327,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.

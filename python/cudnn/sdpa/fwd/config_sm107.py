@@ -423,6 +423,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
+    if k.thd_pair_acquire:
+        raise ValueError("thd_pair_acquire is an SM100 lowering, not a Rubin template mode")
     # Fused epilogue gate FIRST, so an interaction decline names the feature the
     # caller asked for (`TemplateParams(epilogue_gate=True, split_kv=2)` reads
     # "epilogue_gate is dense, unsplit ...", not the generic Rubin split

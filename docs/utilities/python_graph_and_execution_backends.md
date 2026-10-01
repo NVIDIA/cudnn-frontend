@@ -740,6 +740,76 @@ only to decline is why `closed_under` existed.
   kernels take no tuning decision (linear attention) lists `{}`, which IS its
   complete record. A knob-less plan whose engine picks inside `build_plan` is a
   bug: the record would replay a different kernel after the pick changes.
+- A runtime selection strategy is recorded explicitly too. On SM100 (CC10.0),
+  half/BF16 nonpaged, unmasked D192/V128 THD graphs with shape overrides may
+  use `CGA_POLICY=1` instead of `TILE_CGA_M`. The plan compiles both widths up
+  front and chooses CGA1 when its host-known Q tile bound fits one SM wave,
+  CGA2 otherwise. `CGA_POLICY=2` compares the bounded resident wave counts
+  instead: CGA1 uses up to one cluster per SM, CGA2 one per pair of SMs, and
+  CGA1 wins a tie. Its two-CTA artifact acquires the setup kernel's immutable
+  K/V tensor maps once before the persistent loop; fixed widths and policy 1
+  retain their existing acquire schedule. Both policies are unsplit and unpacked. Their integers
+  identify these rules; a different rule needs a different policy value. A fixed
+  `TILE_CGA_M` and `CGA_POLICY` are mutually exclusive, and omitting both does
+  not opt into runtime selection. The record round-trips through
+  `get_engine_and_knobs_at_index` / `create_execution_plan`, including JSON
+  integer keys. Workspace covers either artifact, each invocation binds fresh
+  pointers, and CUDA Graph capture fixes the selected launch; replay does not
+  reconsider changing device lengths. No execution-time compilation or
+  device-to-host length read is involved.
+- `SPLIT_KV_POLICY=1` explicitly adds a third, eight-way packed split artifact
+  to `CGA_POLICY=1` or `2`, for the same graph domain with `H_q=H_kv=16`.
+  At binding, it selects that artifact only for one sequence, host-observed
+  packed Q capacity in `[1, 128]`, and KV capacity at least 32768; otherwise
+  the recorded CGA policy selects its unsplit artifact. This experimental
+  policy is not proposed by normal heuristics. Any fixed `SPLIT_KV` request,
+  including `1` (off), conflicts with it. The plan reserves partial O/LSE for
+  128 packed rows in caller workspace and compiles setup, attention and combine
+  together. It does not allocate, compile or read lengths back during execution.
+  Padded capacities may choose a different artifact from exact-length buffers.
+  CUDA Graph replay retains the artifact selected during capture even when
+  device prefixes change. A different selection rule needs a new policy value.
+- `SPLIT_KV_POLICY=2` keeps the same graph domain, eight-way split and KV
+  threshold, but extends the host-observed packed Q capacity through 256.
+  It reserves partial O/LSE for 256 packed rows. Policy 1 retains its 128-row
+  selection and workspace contract; neither policy is proposed by normal
+  heuristics. The selected artifact is still fixed at capture time.
+- `SPLIT_KV_POLICY=3` adds two packed split members for the same graph domain
+  with `H_q=H_kv` in `{4, 8, 16}`. For one sequence and KV capacity at least
+  32768, host-observed Q capacity `[1, 128]` selects `128/H_q` splits with
+  128 reserved rows; `[129, 256]` selects `64/H_q` splits with 256 reserved
+  rows. Other calls retain the recorded unsplit CGA choice. Both members
+  reserve the same partial O/LSE size (16384 head-rows), so caller workspace
+  covers their maximum rather than their sum. The graph builds all artifacts
+  once, and each invocation independently binds its selected member.
+  Capture retains that choice; device length changes during replay do not
+  reselect. Normal heuristics may propose a supported split policy alongside
+  the unsplit alternative; graph placement still determines whether a FROST plan leads.
+  Policies 1 and 2 retain their original H16 selection and workspace contracts.
+- `SPLIT_KV_POLICY=4` retains those two members and adds `32/H_q` splits
+  with 512 reserved packed rows. It admits up to eight sequences with total
+  observed KV capacity at least `4096 * batch`, or `2048 * batch` when the
+  unsplit tile bound across heads occupies at most a quarter of the SMs.
+  It chooses the smallest
+  reserved Q capacity covering both packed Q storage and a host-visible
+  upper bound of one or two 128-row tiles across sequences. The third
+  member covers up to four tiles, or a larger bound when those tiles across
+  heads occupy at most half the device's SM count. Thus two
+  64-row sequences select the second member, while four 32-row sequences
+  select the third. H4/H8 plans additionally prepare `16/H_q` splits with
+  1024 reserved packed rows. Eight sequences can select this reduced split
+  member within the same 512-row and tile bounds; it avoids excessive
+  partitioning when those sequences already supply many independent tiles.
+  H16 retains its unsplit choice for eight 16-row sequences on a 148-SM B200.
+  The first member
+  additionally needs observed KV capacity
+  of at least `131072 / H_q`; below it the second member avoids excessive
+  partitioning. Larger capacities or tile bounds retain the recorded
+  unsplit CGA choice. All split members reserve the same 16384 partial
+  head-rows, so the additional member does not enlarge caller workspace. This
+  experimental policy is proposed by normal heuristics. Policies 1–3
+  retain their previous selection rules; capture still fixes one launch,
+  with no execution-time compilation or device-to-host length read.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
   (`softmax_precision`) is an **op attribute** declared in the op spec's

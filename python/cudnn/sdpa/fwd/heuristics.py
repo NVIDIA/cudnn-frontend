@@ -6,9 +6,10 @@
 :func:`recommend` is the family's ENTIRE heuristic surface — the PURE core:
 ``(kind, facts, offered) -> [PlanConfig]``. Backend-blind, graph-blind,
 import-light. For every offered cell whose capability row admits the facts,
-the cell's rule emits an ORDERED list of COMPLETE knob assignments (every
-axis the row declares a domain for carries a concrete value; ``None`` only on
-undeclared axes), each re-validated through ``mismatch(caps, facts, knobs)``
+the cell's rule emits an ORDERED list of knob assignments. Axes are concrete
+except the CGA width of a runtime-choice plan: an override-enabled SM100 half
+D192/V128 THD plan may retain both compiled widths, explicitly recording
+``CGA_POLICY=2`` instead of a fixed width. Every assignment is re-validated through ``mismatch(caps, facts, knobs)``
 — a set is honored or never listed. The same engine appears once per
 surviving set. Standalone callers (wrappers, autotuners) invoke this directly
 with a hand-built :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing
@@ -56,6 +57,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_FP16,
     SCHED_LPT,
     SCHED_LPT_L2,
+    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -74,6 +76,8 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
+    runtime_cga_choices,
+    paged_thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -471,10 +475,8 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
-    The PRIMARY reproduces what each adapter's internal derivation historically
-    chose for the graph path, so promoting the decision into the ranked list
-    changes nothing for a caller that builds the first plan; the remaining
-    domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
+    The PRIMARY follows the measured preference for the graph's shape; the
+    remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
     standalone wrapper users who bypass ranking.
     """
@@ -486,12 +488,37 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:
-        # A ragged batch carries its own scheduler: it walks the LIVE units
-        # through batch_remap over a machine-sized grid. The LPT decodes map a
-        # linear tile id onto a dense rectangular tile space, so ranking them
-        # here would hand THD a decode built for a geometry it does not have --
-        # and spend autotune slots on it. Same exclusion the adapters apply to
-        # their standalone-wrapper derivation.
+        # A ragged batch walks LIVE units through batch_remap over a
+        # machine-sized grid. Only flavors with a THD policy decoder can tune
+        # its ordering; the dense rectangular LPT decoder cannot serve it.
+        # D128/D192/D256 half THD implements policy ordering within the live list.
+        # Expose alternatives for tuning and prefer live-length policies only
+        # for the measured prefill families below.
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (192, 128), (256, 256)):
+            primary = SCHED_NATURAL
+            if SCHED_LPT in domain and _prefer_thd_pack_gqa(caps, facts) and facts.window_left is None and not (facts.right_band_widening or facts.has_sink):
+                # Packing does not remove the causal load imbalance: order the
+                # live token tiles by their GPU-resident lengths. The decoder
+                # still uses current lengths when a cached full-prefill plan
+                # replays a prefix chunk, including tiny Q and low TP heads.
+                primary = SCHED_LPT
+            # Measured B200 full-prefill envelopes. Runtime lengths may still
+            # become prefix chunks after capture; policy 3 reads them on GPU.
+            # Keep mixed batches and 32K envelopes on the existing default.
+            if (
+                SCHED_LPT_IF_FULL in domain
+                and facts.dtype == cudnn.data_type.BFLOAT16
+                and (facts.d_qk, facts.d_v) == (256, 256)
+                and facts.b == 1
+                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+                and facts.s_q == facts.s_kv
+                and facts.page_size in (16, 128)
+                and not (facts.has_sink or facts.has_epilogue_gate)
+            ):
+                # Packed Stats use the same measured full/prefix scheduling.
+                primary = SCHED_LPT_IF_FULL
+            return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
@@ -584,12 +611,31 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     return [chosen, *runners]
 
 
+def _thd_q_tile_bound(batch_size: int, s_q: int, tile_rows: int, total_q: Optional[int] = None) -> int:
+    """Bound the sum of per-sequence tiles without reading device lengths.
+
+    A nonempty sequence needs one token for its first tile, then ``tile_rows``
+    more tokens for each additional tile. Both the per-sequence maximum and
+    the optional packed capacity constrain the number of live tiles.
+    """
+    tiles = batch_size * _ceil_div(s_q, tile_rows)
+    if total_q is not None:
+        tokens = max(int(total_q), 0)
+        tiles = min(tiles, tokens, (tokens + batch_size * (tile_rows - 1)) // tile_rows)
+    return tiles
+
+
 def select_d192_auto_knobs(
     params: Sm100TemplateParams,
     *,
     pertensor: bool,
     s_q: int,
     s_kv: int,
+    batch_size: int = 0,
+    h_q: int = 0,
+    device_sm_count: int = 0,
+    device_cc: Optional[tuple[int, int]] = None,
+    max_total_seq_len_q: Optional[int] = None,
 ) -> tuple[int, int]:
     """Select the measured D192 scheduler and CGA defaults.
 
@@ -643,7 +689,23 @@ def select_d192_auto_knobs(
         elif masked:
             mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
     mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
-    return sched_policy, 1 if pt_cga1 or mx_cga1 else 2
+    # The half THD cga1 pipeline carries 128 Q rows instead of cga2's 512.
+    # It wins when its finer grid still fits in one resident wave. Use the
+    # declared per-sequence bound, not packed capacity or live device lengths;
+    # rebinding lengths must not choose another tile or trigger compilation.
+    # Masked and other-architecture crossovers have not been measured here.
+    half_thd_cga1 = (
+        params.dtype_qkv in (DTYPE_FP16, DTYPE_BF16)
+        and params.thd_varlen
+        and not params.paged_kv
+        and not params.pack_gqa
+        and window_left is None
+        and window_right is None
+        and device_cc == (10, 0)
+        and min(batch_size, h_q, s_q, s_kv, device_sm_count) > 0
+        and h_q * _thd_q_tile_bound(batch_size, s_q, 128, max_total_seq_len_q) <= device_sm_count
+    )
+    return sched_policy, 1 if pt_cga1 or mx_cga1 or half_thd_cga1 else 2
 
 
 def select_d256_auto_knobs(
@@ -707,6 +769,7 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
         sched_policy=sched_policy,
         thd_varlen=facts.thd,
         split_kv=split_kv,
+        paged_kv=facts.has_paged_kv,
     )
 
 
@@ -774,7 +837,17 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-    selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+    selected_sched, selected_cga = select_d192_auto_knobs(
+        params,
+        pertensor=facts.is_fp8,
+        s_q=facts.s_q,
+        s_kv=facts.s_kv,
+        batch_size=facts.b,
+        h_q=facts.h_q,
+        device_sm_count=facts.device_sm_count or 0,
+        device_cc=facts.device_cc,
+        max_total_seq_len_q=facts.max_total_seq_len_q,
+    )
     if selected_cga not in domain:
         raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
     return selected_sched, selected_cga
@@ -805,6 +878,10 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
     if facts.d_qk <= 128 and facts.d_v <= 128:
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
+        if cga == 1 and _sm100_f16(caps, facts) and facts.thd and not facts.has_paged_kv:
+            # Nonpaged half THD uses the shared one-Q-tile pipeline. Dense,
+            # paged, quantized and Rubin D192 keep their prefill geometry.
+            return _D128_DECODE_TILE_ROWS
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
@@ -858,16 +935,16 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
-    the batch is dense, the graph carries no fused epilogue gate (its per-head
+    the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
     declines the same pair), there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
-    A THD graph packs only on the decode tile's ragged-Q leg (the row base is
-    token-unit there, so the packed group composes with the ragged offset)."""
+    THD prefill packs only on a flavor advertising token-unit worklists and
+    packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
     return (
         True in caps.pack_gqas
-        and not (facts.thd and not _thd_decode_leg(caps, facts))
+        and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
         and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
@@ -887,11 +964,32 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
 
 
+def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
+    """The measured native-half THD causal family, separate from decode."""
+    return (
+        _sm100_f16(caps, facts)
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.thd
+        and not _thd_decode_leg(caps, facts)
+        and facts.causal
+        and not facts.has_epilogue_gate
+        and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
+        and facts.h_q // facts.h_kv in (4, 8)
+    )
+
+
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
+    if facts.thd and not _thd_decode_leg(caps, facts):
+        # On the admitted d128 half prefill tile, packing shortens the token
+        # span along the causal diagonal and shares KV across query heads.
+        # Keep the default bounded to the measured GQA4/GQA8 family; other
+        # supported groups remain explicit tuning candidates. This also
+        # covers a long declared envelope replayed with short live lengths.
+        return (True, False) if _prefer_thd_pack_gqa(caps, facts) else (False, True)
     if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
         return (True, False)
     return (False, True)
@@ -1096,8 +1194,49 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
+    if not (
+        paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.b == 1
+        and facts.h_q in (4, 8, 16)
+        and facts.h_q == 4 * facts.h_kv
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 16384
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return 1, False
+    # Packing changes token rows per tile as well as the number of head
+    # groups. Score both geometries within the first wave only: extra waves
+    # need a separate model of the unsplit kernel and combine cost.
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    choices = []
+    for pack in (False, True):
+        group = facts.h_q // facts.h_kv if pack else 1
+        units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        # Keep four KV tiles per partition to amortize setup/combine.
+        budget = min(16, max(1, (facts.device_sm_count or 128) // units), max(1, kv_tiles // 4))
+        loop_tiles = _ceil_div(kv_tiles, budget)
+        splits = _ceil_div(kv_tiles, loop_tiles)
+        if splits > 1:
+            # Equal longest loops prefer fewer partials, then unpacked.
+            choices.append((loop_tiles, splits, pack))
+    if not choices:
+        return 1, False
+    _, splits, pack = min(choices)
+    return splits, pack
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
-    """The cell's ordered COMPLETE knob assignments.
+    """The cell's ordered concrete assignments and eligible runtime choice.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
     geometry at a time (tiles, sched, pack_gqa, split), recomputing split for
@@ -1230,6 +1369,21 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if knobs not in seen:
             seen.add(knobs)
             unique.append(knobs)
+    if base.split_kv == 1 and base.pack_gqa is False and runtime_cga_choices(caps, facts):
+        # Keep the concrete choice as a runner-up/fallback. Persist the policy
+        # itself; a missing width alone must not silently opt into new behavior.
+        adaptive = replace(base, cga=None, cga_policy=2)
+        unique.insert(0, adaptive)
+        split_policy = 4 if 4 in caps.split_kv_policies else 3
+        if split_policy in caps.split_kv_policies and facts.h_q == facts.h_kv and facts.h_q in (4, 8, 16):
+            # Override declarations are cache envelopes, not the next request's
+            # live geometry. The recorded policy chooses bounded split members
+            # from the current bindings and keeps the same unsplit members for
+            # larger queries / batches. Retain the smaller-workspace alternative.
+            unique.insert(0, replace(adaptive, split_kv=None, split_kv_policy=split_policy))
+    splits, packed = paged_thd_split_choice(caps, facts)
+    if splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
@@ -1275,7 +1429,7 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     ``kind`` is ``"A"`` (candidates worth timing, best guess first) or
     ``"FALLBACK"`` (least-demanding configs). Every returned entry carries a
-    complete knob assignment validated through ``mismatch(caps, facts, knobs)``
+    knob assignment validated through ``mismatch(caps, facts, knobs)``
     — honored-or-never-listed — and NO mode. Standalone callers (wrappers,
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.

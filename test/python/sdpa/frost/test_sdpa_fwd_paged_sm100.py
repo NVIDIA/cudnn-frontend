@@ -817,7 +817,7 @@ def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window
     return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
 
 
-def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None):
+def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables, optionally under
     top-left causal + a left window of ``causal_window`` keys.  Checks every packed
@@ -877,7 +877,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -907,6 +907,15 @@ def test_paged_graph_thd_queries(dims, hnd):
     KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
     kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
     _run_thd_graph(dims, hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("heads", [(32, 8), (48, 8), (96, 8)])
+def test_paged_graph_thd_pack_gqa(hnd, heads):
+    """Explicit packed prefill over both page layouts, including partial groups."""
+    plan = _run_thd_graph((128, 128), hnd, q_lens=[257, 130, 5], kv_lens=[300, 77, 129], H=heads[0], KH=heads[1], pack_gqa=True)
+    assert plan.knobs.pack_gqa is True
 
 
 # Left-window offset W for the THD + causal cases below.  Wide enough that the

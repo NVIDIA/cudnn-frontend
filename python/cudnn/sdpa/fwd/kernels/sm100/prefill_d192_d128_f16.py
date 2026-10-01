@@ -104,7 +104,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     scheduler_warp_loop,
     scheduler_warp_loop_persistent,
     read_tile_id_arrive,
-    read_clc_payload,
+    read_clc_payload as _read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -118,7 +118,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -271,6 +271,13 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 # envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
 # and the setup kernel publishes the live unit total it stops at.
 THD_PERSISTENT = True
+
+
+@cute.jit
+def read_clc_payload(sched, base_word):
+    # A local persistent producer may recycle the slot once this warp returns
+    # its credit. Broadcast from one reader so no lagging lane retains a load.
+    return _read_clc_payload(sched, base_word, warp_broadcast=bool(CFG.THD_VARLEN and CGA_SIZE == 1))
 
 
 # LPT q-tile accounting is expressed in CGA-tile units; make_cfg_d192 has
@@ -1166,6 +1173,11 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below stays branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        if cutlass.const_expr(CFG.THD_PAIR_ACQUIRE):
+            # Setup publishes these immutable descriptors before this launch.
+            # Every consuming load warp acquires them, including the peer CTA.
+            tma_tensormap_acquire(_k_rt_ptr)
+            tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     elif cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -1304,6 +1316,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_PAIR_ACQUIRE,
                 )
 
             _wait_mbarrier(mb_q_reload[1], q_empty_phase)
@@ -1356,6 +1369,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_PAIR_ACQUIRE,
                 )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1391,6 +1405,7 @@ def _tmaldg_warp_group(
                         bars.mb_k_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not CFG.THD_PAIR_ACQUIRE,
                     )
 
                 _wait_mbarrier(bars.mb_v_empty[kv_state.idx], kv_state.phase)
@@ -1422,6 +1437,7 @@ def _tmaldg_warp_group(
                         bars.mb_v_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not CFG.THD_PAIR_ACQUIRE,
                     )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)

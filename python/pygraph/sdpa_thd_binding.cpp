@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include <pybind11/stl.h>
 
@@ -121,23 +122,42 @@ enum HostSlot : size_t {
     ODescPtr,
     Stream,
     ScaleSoftmaxLog2,
+    ThdUnits,
     KTablePtr,
     VTablePtr,
     TableStrides,
     NumPages,
+    OPartialPtr,
+    LSEPartialPtr,
+    PartialOStrides,
     NumHostSlots
 };
-constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
-                                                                    "v_ptr",           "o_ptr",
-                                                                    "q_strides",       "k_strides",
-                                                                    "v_strides",       "o_strides",
-                                                                    "thd_q_lens_ptr",  "thd_kv_lens_ptr",
-                                                                    "lse_ptr",         "lse_ext",
-                                                                    "problem_size",    "sinks_ptr",
-                                                                    "meta_ptr",        "o_desc_ptr",
-                                                                    "stream",          "scale_softmax_log2",
-                                                                    "block_table_ptr", "block_table_v_ptr",
-                                                                    "table_strides",   "n_pages"};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
+                                                                    "k_ptr",
+                                                                    "v_ptr",
+                                                                    "o_ptr",
+                                                                    "q_strides",
+                                                                    "k_strides",
+                                                                    "v_strides",
+                                                                    "o_strides",
+                                                                    "thd_q_lens_ptr",
+                                                                    "thd_kv_lens_ptr",
+                                                                    "lse_ptr",
+                                                                    "lse_ext",
+                                                                    "problem_size",
+                                                                    "sinks_ptr",
+                                                                    "meta_ptr",
+                                                                    "o_desc_ptr",
+                                                                    "stream",
+                                                                    "scale_softmax_log2",
+                                                                    "n_thd_units",
+                                                                    "block_table_ptr",
+                                                                    "block_table_v_ptr",
+                                                                    "table_strides",
+                                                                    "n_pages",
+                                                                    "o_partial_ptr",
+                                                                    "lse_partial_ptr",
+                                                                    "partial_o_strides"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -158,14 +178,33 @@ class SdpaThdBinder {
         device_          = integer(spec, "device_index");
         lens_form_       = integer(spec, "lens_form");
         off_o_desc_      = integer(spec, "off_o_desc");
+        cga_tile_m_      = integer(spec, "cga_tile_m");
         total_q_         = optional_integer(spec, "total_q");
         total_kv_        = optional_integer(spec, "total_kv");
         has_lse_         = spec.attr("has_lse").cast<bool>();
         lse_head_major_  = spec.attr("lse_head_major").cast<bool>();
         lse_head_stride_ = integer(spec, "lse_head_stride");
+        lse_stride_override_ =
+            py::hasattr(spec, "lse_stride_override") && spec.attr("lse_stride_override").cast<bool>();
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
-            lse_head_stride_ < 0)
+            lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
+        if (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()) {
+            const auto split = spec.attr("split_workspace").cast<std::array<int64_t, 4>>();
+            splits_          = split[0];
+            split_capacity_  = split[1];
+            off_partial_o_   = split[2];
+            off_partial_lse_ = split[3];
+            if (splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 ||
+                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 || cga_tile_m_ != 128 ||
+                integer(spec, "d_qk") != (paged_ ? 128 : 192) || integer(spec, "d_v") != 128)
+                invalid("invalid prepared packed split geometry");
+            const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
+            if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
+                off_partial_lse_ < add(off_partial_o_, multiply(partial_rows, 128 * 4)) ||
+                integer(spec, "scratch_bytes") < add(off_partial_lse_, multiply(partial_rows, 4)))
+                invalid("packed split workspace regions overlap or exceed the reservation");
+        }
         auto expect = spec.attr("expect").cast<py::dict>();
         auto decl   = spec.attr("decl").cast<py::dict>();
         for (size_t i = Q; i <= O; ++i) {
@@ -182,11 +221,14 @@ class SdpaThdBinder {
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
-            if (!paged_ && slot >= KTablePtr) continue;
+            if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
+            if (splits_ == 1 && slot >= OPartialPtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
+        units_ = template_[index_[ThdUnits]].cast<int64_t>();
+        if (units_ <= 0) invalid("native THD launch bound must be positive");
     }
 
     py::object
@@ -197,6 +239,14 @@ class SdpaThdBinder {
          py::object scale) const {
         if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
         const auto facts = read_native_operand_views(pack, indices);
+        return bind_facts(facts, workspace, std::move(stream), std::move(scale));
+    }
+
+    py::object
+    bind_facts(const std::vector<NativeOperandView> &facts,
+               int64_t workspace,
+               py::object stream,
+               py::object scale) const {
         std::array<Geometry, 4> geometry;
         for (size_t i = Q; i <= O; ++i) {
             const auto &f = required(facts, i);
@@ -222,24 +272,25 @@ class SdpaThdBinder {
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
 
-        const auto &lse      = facts[LSE];
-        int64_t lse_capacity = -1;
+        const auto &lse         = facts[LSE];
+        int64_t lse_capacity    = -1;
+        int64_t lse_head_stride = lse_head_stride_;
         if (has_lse_) {
             if (!lse.filled) invalid("lse_tensor is required by this compiled specialization");
             on_device(lse, "lse_tensor");
             if (!dtype_is(lse, kDLFloat, 32)) invalid("lse_tensor must be float32");
             if (lse.pointer % 4 != 0) invalid("lse_tensor must be 4-byte aligned");
-            if (lse_head_major_ && lse_head_stride_) {
-                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride_))
+            lse_head_stride = check_stats_layout(lse);
+            if (lse_head_major_ && lse_head_stride) {
+                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
-                if (numel(lse) < multiply(qh_, lse_head_stride_))
+                if (numel(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor must hold H_q*head_stride elements");
             } else {
                 if (span(lse) < 0)
                     invalid("lse_tensor: a ragged Stats operand needs a sized buffer, not a bare address");
                 lse_capacity = span(lse) / qh_;
             }
-            check_stats_layout(lse);
         } else if (lse.filled) {
             invalid("this specialization was compiled without a Stats output; construct the API without sample_lse");
         }
@@ -247,6 +298,7 @@ class SdpaThdBinder {
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
+        if (splits_ > 1 && tq > split_capacity_) invalid("packed Q capacity exceeds the prepared split workspace");
         int64_t tkv = 0;
         if (!paged_) {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
@@ -255,6 +307,7 @@ class SdpaThdBinder {
         if (facts[Sinks].filled)
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         if (workspace % 16 != 0) invalid("the workspace must be 16-byte aligned");
+        if (splits_ > 1 && workspace <= 0) invalid("packed split requires a non-null workspace");
 
         // Copy references to immutable constants, then replace invocation-local
         // slots. No frame or runtime pointer is ever written into the plan.
@@ -279,11 +332,22 @@ class SdpaThdBinder {
             put(frame, KStrides, py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
             put(frame, VStrides, py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
         }
-        if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, LSEExtent, py::int_(tq));
+        if (has_lse_ && lse_head_major_) put(frame, LSEExtent, py::int_(lse_head_stride ? lse_head_stride : tq));
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
+        // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
+        // Rebind a safe grid without reading device lengths or mutating the plan.
+        // min also preserves a persistent kernel's resident-cluster launch cap.
+        const int64_t units = multiply(multiply(add((tq - 1) / cga_tile_m_, b), qh_), splits_);
+        put(frame, ThdUnits, py::int_(std::min(units_, units)));
         put(frame, SinksPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(workspace));
         put(frame, ODescPtr, py::int_(add(workspace, off_o_desc_)));
+        if (splits_ > 1) {
+            put(frame, OPartialPtr, py::int_(add(workspace, off_partial_o_)));
+            put(frame, LSEPartialPtr, py::int_(add(workspace, off_partial_lse_)));
+            const int64_t row = multiply(qh_, 128);
+            put(frame, PartialOStrides, py::make_tuple(multiply(tq, row), row, 128));
+        }
         put(frame, Stream, std::move(stream));
         if (!scale.is_none()) put(frame, ScaleSoftmaxLog2, std::move(scale));
         return frame;
@@ -296,6 +360,11 @@ class SdpaThdBinder {
             py::object stream,
             py::object scale) const {
         py::object frame = bind(pack, indices, workspace, std::move(stream), std::move(scale));
+        return launch(frame);
+    }
+
+    bool
+    launch(const py::object &frame) const {
         if (frame.is_none()) return false;
         // Retain the official Python tvm-ffi entry: it owns error conversion and
         // the stable tuple/stream ABI. No private TVM object layouts or new build
@@ -303,6 +372,51 @@ class SdpaThdBinder {
         py::object result = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::error_already_set();
         return true;
+    }
+
+    int64_t
+    query_heads() const {
+        return qh_;
+    }
+
+    std::array<int64_t, 2>
+    choice_units(const std::vector<NativeOperandView> &facts) const {
+        // Selection observes only current host metadata. The selected binder
+        // still performs all ordinary dtype, pointer, device and span checks.
+        const auto &q = required(facts, Q), &o = required(facts, O);
+        const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
+        if (b <= 0 || b > b_) invalid("plan-choice Q lengths exceed the declared batch capacity");
+        int64_t tokens = std::min(capacity(q, resolve(q, Q, b), "q"), capacity(o, resolve(o, O, b), "o"));
+        if (total_q_ >= 0) tokens = std::min(tokens, total_q_);
+        const int64_t max_q = q.shape.size() == 4 ? q.shape[2] : tokens;
+        std::array<int64_t, 2> units;
+        for (size_t i = 0; i < units.size(); ++i) {
+            const int64_t tile         = i == 0 ? 128 : 512;
+            const int64_t per_sequence = max_q / tile + (max_q % tile != 0);
+            const int64_t packed       = add(tokens, multiply(b, tile - 1)) / tile;
+            units[i]                   = multiply(qh_, std::min({multiply(b, per_sequence), tokens, packed}));
+        }
+        return units;
+    }
+
+    std::array<int64_t, 3>
+    split_capacities(const std::vector<NativeOperandView> &facts,
+                     int64_t max_q_capacity,
+                     int64_t max_batch        = 1,
+                     int64_t min_kv_per_batch = 32768) const {
+        // The recorded policy bounds the short-Q/long-KV region.
+        // Capacities are host observations, never reads of mutable device lengths.
+        const int64_t b = numel(required(facts, QLens)) - ((lens_form_ & 1) ? 1 : 0);
+        if (b <= 0 || b > max_batch) return {};
+        int64_t tq = std::min(capacity(required(facts, Q), resolve(facts[Q], Q, b), "q"),
+                              capacity(required(facts, O), resolve(facts[O], O, b), "o"));
+        if (total_q_ >= 0) tq = std::min(tq, total_q_);
+        if (tq <= 0 || tq > max_q_capacity) return {};
+        int64_t tkv = std::min(capacity(required(facts, K), resolve(facts[K], K, b), "k"),
+                               capacity(required(facts, V), resolve(facts[V], V, b), "v"));
+        if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
+        if (tkv < multiply(b, min_kv_per_batch)) return {};
+        return {tq, tkv, b};
     }
 
    private:
@@ -377,9 +491,9 @@ class SdpaThdBinder {
         if (n < 0) invalid(std::string(name) + " was passed as a bare address; a ragged operand needs a sized buffer");
         return n < g.row ? 0 : (n - g.row) / g.token + 1;
     }
-    void
+    int64_t
     check_stats_layout(const NativeOperandView &f) const {
-        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return;
+        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return lse_head_stride_;
         int64_t hs, ts;
         if (f.shape.size() == 4 || (f.shape.size() == 3 && lse_head_major_)) {
             hs = stride(f, 1);
@@ -395,11 +509,14 @@ class SdpaThdBinder {
         }
         if (lse_head_major_) {
             if (ts != 1) invalid("head-major lse_tensor must have the token axis contiguous");
+            if (hs <= 0) invalid("head-major lse_tensor head stride must be positive");
+            if (lse_stride_override_) return hs;
             if (lse_head_stride_ && hs != lse_head_stride_)
                 invalid("head-major lse_tensor head stride must be the declared head stride");
         } else if (hs != 1 || ts != qh_) {
             invalid("token-major lse_tensor must be packed (T, H): head stride 1, token stride H_q");
         }
+        return lse_head_stride_;
     }
     struct TableGeometry {
         int64_t batch, pages, batch_stride, page_stride;
@@ -476,8 +593,181 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
-    int64_t page_size_;
-    bool has_lse_, lse_head_major_, paged_, paged_hnd_;
+    int64_t cga_tile_m_, units_, page_size_;
+    int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
+    bool has_lse_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
+};
+
+class SdpaThdPlanChoices {
+   public:
+    SdpaThdPlanChoices(const py::object &single,
+                       const py::object &pair,
+                       int64_t sm_count,
+                       int64_t policy,
+                       const py::object &split,
+                       int64_t split_policy,
+                       const py::object &split_large,
+                       const py::object &split_wide,
+                       const py::object &split_batch)
+        : binders_{SdpaThdBinder(single), SdpaThdBinder(pair)}, sm_count_(sm_count), policy_(policy) {
+        if (policy != 1 && policy != 2) invalid("unknown native THD CGA policy");
+        if (split_policy < 0 || split_policy > 4) invalid("unknown native THD split policy");
+        if (split.is_none() != (split_policy == 0)) invalid("a split member requires its explicit split policy");
+        if (split_large.is_none() != (split_policy < 3))
+            invalid("split policy3 or policy4 requires both short and long prepared split members");
+        if (split_wide.is_none() != (split_policy != 4))
+            invalid("split policy4 requires an additional wide prepared split member");
+        if (!split_batch.is_none() &&
+            (split_policy != 4 || (single.attr("qh").cast<int64_t>() != 4 && single.attr("qh").cast<int64_t>() != 8)))
+            invalid("split policy4 reduced batch member requires H_q in {4, 8}");
+        for (const auto &member : {single, pair}) {
+            if (py::hasattr(member, "split_workspace") && !member.attr("split_workspace").is_none())
+                invalid("CGA policy requires unsplit plan members");
+        }
+        if (sm_count < 2 || single.attr("cga_tile_m").cast<int64_t>() != 128 ||
+            pair.attr("cga_tile_m").cast<int64_t>() != 512 || single.attr("paged").cast<bool>() ||
+            single.attr("d_qk").cast<int64_t>() != 192 || single.attr("d_v").cast<int64_t>() != 128 ||
+            !single.attr("quant").is_none() || !pair.attr("quant").is_none())
+            invalid("native plan choices require unsplit nonpaged half D192/V128 tiles of 128 and 512 rows");
+        // A plan family changes only launch geometry. Each member owns its
+        // immutable host frame, compiled artifact and workspace layout.
+        std::vector<py::object> common_members{pair};
+        if (!split.is_none()) common_members.push_back(split);
+        if (!split_large.is_none()) common_members.push_back(split_large);
+        if (!split_wide.is_none()) common_members.push_back(split_wide);
+        if (!split_batch.is_none()) common_members.push_back(split_batch);
+        for (const auto &member : common_members) {
+            for (const char *name : {"b",
+                                     "qh",
+                                     "kh",
+                                     "d_qk",
+                                     "d_v",
+                                     "paged",
+                                     "device_index",
+                                     "lens_form",
+                                     "has_lse",
+                                     "has_sink",
+                                     "lse_padded",
+                                     "lse_head_major",
+                                     "lse_head_stride",
+                                     "lse_stride_override",
+                                     "total_q",
+                                     "total_kv",
+                                     "s_q_max",
+                                     "decl",
+                                     "expect"}) {
+                const int equal = PyObject_RichCompareBool(single.attr(name).ptr(), member.attr(name).ptr(), Py_EQ);
+                if (equal < 0) throw py::error_already_set();
+                if (!equal) invalid(std::string("plan choices must share ") + name);
+            }
+        }
+        if (!split.is_none()) {
+            const auto heads = single.attr("qh").cast<int64_t>();
+            if (split_policy >= 3) {
+                if ((heads != 4 && heads != 8 && heads != 16) || single.attr("kh").cast<int64_t>() != heads)
+                    invalid("split policy3 or policy4 requires H_q=H_kv in {4, 8, 16}");
+                std::vector<py::object> split_members{split, split_large};
+                if (split_policy == 4) split_members.push_back(split_wide);
+                if (!split_batch.is_none()) split_members.push_back(split_batch);
+                for (size_t i = 0; i < split_members.size(); ++i) {
+                    const auto &member = split_members[i];
+                    if (!py::hasattr(member, "split_workspace") || member.attr("split_workspace").is_none())
+                        invalid("split policy requires a prepared split member");
+                    const auto workspace = member.attr("split_workspace").cast<std::array<int64_t, 4>>();
+                    const auto capacity  = 128 << i;
+                    const auto splits    = (128 >> i) / heads;
+                    if (workspace[0] != splits || workspace[1] != capacity)
+                        invalid("split policy3 or policy4 requires bounded row members with 16384 partial head-rows");
+                    binders_.emplace_back(member);
+                }
+                split_q_capacity_ = split_policy == 4 ? 512 : 256;
+                return;
+            }
+            if (!py::hasattr(split, "split_workspace") || split.attr("split_workspace").is_none())
+                invalid("split policy requires a prepared split member");
+            const auto workspace = split.attr("split_workspace").cast<std::array<int64_t, 4>>();
+            split_q_capacity_    = split_policy == 1 ? 128 : 256;
+            if (workspace[0] != 8 || workspace[1] != split_q_capacity_ || single.attr("qh").cast<int64_t>() != 16 ||
+                single.attr("kh").cast<int64_t>() != 16)
+                invalid("split policy" + std::to_string(split_policy) + " requires eight splits, packed capacity" +
+                        std::to_string(split_q_capacity_) + " and H_q=H_kv=16");
+            binders_.emplace_back(split);
+        }
+    }
+
+    int
+    select_index(const py::handle &pack, const std::vector<int64_t> &indices) const {
+        return select(read(pack, indices));
+    }
+
+    py::tuple
+    bind(const py::handle &pack, const std::vector<int64_t> &indices, int64_t workspace, py::object stream) const {
+        const auto facts = read(pack, indices);
+        const int index  = select(facts);
+        return py::make_tuple(index, binders_[index].bind_facts(facts, workspace, std::move(stream), py::none()));
+    }
+
+    bool
+    execute(const py::handle &pack, const std::vector<int64_t> &indices, int64_t workspace, py::object stream) const {
+        const auto facts   = read(pack, indices);
+        const auto &binder = binders_[select(facts)];
+        auto frame         = binder.bind_facts(facts, workspace, std::move(stream), py::none());
+        return binder.launch(frame);
+    }
+
+   private:
+    static std::vector<NativeOperandView>
+    read(const py::handle &pack, const std::vector<int64_t> &indices) {
+        if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
+        return read_native_operand_views(pack, indices);
+    }
+
+    int
+    select(const std::vector<NativeOperandView> &facts) const {
+        if (binders_.size() >= 5) {
+            const auto capacities = binders_[0].split_capacities(facts, split_q_capacity_, 8, 2048);
+            const auto q_capacity = capacities[0];
+            if (q_capacity > 0) {
+                const auto units = binders_[0].choice_units(facts);
+                // Packed Q alone does not bound per-sequence tile work: two
+                // 64-row sequences occupy two tiles. The host-visible max-Q
+                // and storage bounds also cover empty or changed device prefixes.
+                const auto heads = binders_[0].query_heads();
+                // Shorter KV only repays splitting when the unsplit tiles occupy
+                // at most a quarter of the SMs. Retain the longer-KV rule otherwise.
+                const auto min_kv = units[0] <= sm_count_ / 4 ? 2048 : 4096;
+                if (capacities[1] >= multiply(capacities[2], min_kv)) {
+                    // Very short KV work does not repay the widest split, especially
+                    // at H4/H8. Keep its partitions bounded by observed head-token work.
+                    if (q_capacity <= 128 && units[0] <= heads && capacities[1] >= 131072 / heads) return 2;
+                    if (q_capacity <= 256 && units[0] <= 2 * heads) return 3;
+                    // Small head counts can leave most SMs idle even with more
+                    // than four sequence tiles. The existing wide member covers
+                    // their packed storage without increasing partial workspace.
+                    if (units[0] <= std::max(4 * heads, sm_count_ / 2)) {
+                        // Eight short sequences already supply many independent
+                        // tiles. Halve their partitions while retaining the wider
+                        // split for smaller batches and longer individual queries.
+                        if (binders_.size() == 6 && capacities[2] == 8) return 5;
+                        return 4;
+                    }
+                }
+            }
+        } else if (binders_.size() >= 3) {
+            const auto q_capacity = binders_[0].split_capacities(facts, split_q_capacity_)[0];
+            if (q_capacity > 0) return binders_.size() == 4 && q_capacity > 128 ? 3 : 2;
+        }
+        const auto units = binders_[0].choice_units(facts);
+        if (policy_ == 1) return units[0] <= sm_count_ ? 0 : 1;
+        const auto waves = [](int64_t work, int64_t resident) { return work / resident + (work % resident != 0); };
+        // Each two-CTA cluster consumes two SMs. Prefer one CTA when both
+        // geometries need the same bounded number of resident waves.
+        return waves(units[0], sm_count_) <= waves(units[1], sm_count_ / 2) ? 0 : 1;
+    }
+
+    std::vector<SdpaThdBinder> binders_;
+    int64_t sm_count_, policy_;
+    int64_t split_q_capacity_ = 0;
 };
 
 }  // namespace
@@ -486,6 +776,9 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
+        .def_property_readonly_static("supports_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_paged_packed_split", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),
@@ -500,6 +793,41 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("workspace"),
              py::arg("stream"),
              py::arg("scale") = py::none());
+    py::class_<SdpaThdPlanChoices>(m, "_SdpaThdPlanChoices")
+        .def(py::init<const py::object &,
+                      const py::object &,
+                      int64_t,
+                      int64_t,
+                      const py::object &,
+                      int64_t,
+                      const py::object &,
+                      const py::object &,
+                      const py::object &>(),
+             py::arg("single"),
+             py::arg("pair"),
+             py::arg("sm_count"),
+             py::arg("policy")       = 1,
+             py::arg("split")        = py::none(),
+             py::arg("split_policy") = 0,
+             py::arg("split_large")  = py::none(),
+             py::arg("split_wide")   = py::none(),
+             py::arg("split_batch")  = py::none())
+        .def_property_readonly_static("supports_balanced_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_batched_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_reduced_batched_split", [](py::object) { return true; })
+        .def("select_index", &SdpaThdPlanChoices::select_index, py::arg("pack"), py::arg("indices"))
+        .def("bind",
+             &SdpaThdPlanChoices::bind,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("workspace"),
+             py::arg("stream"))
+        .def("execute",
+             &SdpaThdPlanChoices::execute,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("workspace"),
+             py::arg("stream"));
 }
 
 }  // namespace python_bindings
