@@ -106,6 +106,15 @@ _SM100_KERNEL_FILES = {
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
 }
+# The d512 f16/bf16 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2 -> the sibling file below):
+# one pipeline per CTA on the cta_group::2 M=128 atom instead of the cga4x1 role split.  Selected by
+# the record field, never by a knob (phase 1); D512_2X2 is the CALL-TIME module-constant twin that
+# template_params() reads so an A/B (or the two_by_two test fixture) flips the record for a process
+# -- the DQ_SINGLE_LAUNCH precedent: a module constant, not configuration, and never per plan.  Off,
+# the record keeps mma_2x2=False and every plan renders byte-identically to before the field existed.
+_SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
+_SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
+D512_2X2: bool = False
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -485,6 +494,19 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         files = (_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES) if fp8 else _SM107_KERNEL_FILES
         filename = files[flavor]
         tag = f"sdpa_fwd_sm107_{kind}_{tag}"
+        if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+            # The 2x2-datapath d512 sibling (its cc 10.7 port lands in its own lane; the record is what routes).
+            # template_params() never sets mma_2x2 on cc 10.7 until then; a direct load gets a clear error, not an
+            # ImportError from a missing file.
+            if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", _SM107_D512_2X2_KERNEL_FILE)):
+                raise ValueError(f"the d512 2x2 kernel has no cc 10.7 sibling yet ({_SM107_D512_2X2_KERNEL_FILE} absent); the cc 10.7 arm keeps mma_2x2=False")
+            filename = _SM107_D512_2X2_KERNEL_FILE
+            tag = f"{tag}_2x2"
+    elif not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+        # d512 f16/bf16 on the 2x2 datapath: a distinct record -> a distinct module cache key and tag, so
+        # the role-split and the 2x2 specializations coexist in one process (the decode_q_tile precedent).
+        filename = _SM100_D512_2X2_KERNEL_FILE
+        tag = f"sdpa_fwd_sm100_{tag}_2x2"
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
@@ -2108,6 +2130,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
+        if self.flavor == (512, 512) and not self._fp8 and self._device_cc != (10, 7):
+            # The 2x2-datapath twin (module constant D512_2X2, read at CALL time): half d512 only, dense or
+            # THD, unsplit, unpaged, PackGQA only when the whole group divides the 64-row tile (G=128 and
+            # split_kv > 1 stay on the role-split kernel in phase 1).  cc 10.7 keeps the role split until its
+            # 2x2 sibling lands.  Default False -> the record is untouched.
+            two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
+            if two_by_two:
+                params = replace(params, mma_2x2=True)
         return params
 
     def compile(self) -> None:

@@ -185,6 +185,59 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
+
+Kernels on this atom: `fwd/kernels/sm100/prefill_d512_f16_2x2.py` (`TemplateParams.mma_2x2`). Each lesson names the
+runnable detector in `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; add to the list, do not restate.
+
+- **Every per-row reduction is a HALF-row value until combined with lane r + 64's.** The fp32 D of a 2SM M=128 MMA
+  lands on TMEM lane `(m % 64) + 64 * (n // (N/2))`: warps w and w + 2 hold the same 64 rows, one column half each, so
+  `row_max_reduction` / `ld.red.max` / a row sum on one lane is half the row. Exchange through SMEM + a named barrier
+  before the online-softmax chain, and run the identical scalar chain on both halves so alpha / beta agree bitwise.
+  Detector: `test_two_by_two_directed_numerics[skewed_halves]` (every odd 64-key half scaled by 2^10: the half with
+  the smaller max exponentiates unnormalised without the exchange).
+- **An SMEM slab that a TWIN CTA multicasts into is gated by every DESTINATION's consumer, not the issuer's.** Under
+  `KV_SHARE=2` CTA c's TMA lands bytes in CTA c ^ 2 too; if that slab aliases something the destination still reads
+  (here `sO` over the V ring), the issuer's own `*_empty` wait proves nothing about the destination. Make the gate
+  pair-wide (`mb_o_empty` init `32 x KV_SHARE`, `arrive()` + `arrive_on_peer(cta ^ 2)` from the TMA-STG warp, and
+  drain the last phase before exit so no remote arrive targets an exited CTA). Detector:
+  `test_two_by_two_twin_alias_gate_under_pair_skew` (the test-only `DEBUG_STG_DELAY_US` lever holds pair 0's O store;
+  RED on a per-CTA gate with the twin's V subtile over O subtiles 2, 3, 6, 7; GREEN on the pair-wide one). The natural
+  race is frequency-bounded -- `test_two_by_two_persistent_multi_tile` passed on the broken protocol -- so a
+  multi-tile cell alone is not a detector; the skew lever is.
+- **`mb_o_full` init = the lanes of ONE column half (64), not the warpgroup (128).** Lane (r, h) drains d_v
+  `[256h, +256)`, so an 8 KiB O subtile is published by the 64 lanes of half h only. Detector:
+  `test_config_2x2_pins_and_ledger_formulas` (`O_CHUNK_ARRIVERS == CORR_LANES // 2`, raises on 128) +
+  `test_kernel_source_arrive_sites_match_the_ledger` (arrive-site counts per barrier).
+- **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
+  complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
+  `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp
+  and can miss the wake-up under GPU time-slicing.** Measured on the d512 2x2 backward (2026-10-01): hang within
+  2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
+  (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
+  o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
+  The poll is two-phase (`POLL_TIGHT_ITERS` = 32 tight tests, then a TIMER `nanosleep(POLL_SLEEP_NS=128)` between
+  tests): a tight loop on the MMA / TMA-LDG warp starves the compute warps sharing its SMSP (the backward ran 2.2x
+  slower with it); the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never
+  parks on the barrier.
+- **A fixed TMEM column is NOT protected by a ring it rides.** Per-ring-step payload goes in per-SLOT columns (alpha
+  at `384 + s`, tile stats at `386 + 2s`): a fixed stats pair is protected only if the next writer waits the SAME
+  slot's empty, and an EMPTY tile (one ring step) waits the other slot's -- the slow-arm correction then read
+  `final_sum = 0` and published live rows DEAD (sm107 lane, 2026-10-01; reproduced on the SM100 body:
+  `lane_d512_fprop/fix/stair_red_sm100.log`). Detector: `test_two_by_two_stats_ring_slot_race_empty_after_live`.
+- **Dead / trimmed rows are zeroed by a SELECT, never by `o * beta` with beta = 0.** A trimmed row whose Q memory is
+  NaN (poisoned padded tail) carries NaN through S, P and O; `NaN * 0 = NaN` reaches the output. Detector:
+  `test_two_by_two_trimmed_rows_with_nan_inputs_store_zero`.
+  Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
+  barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
+  load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
+  `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
+  reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
+- **Cluster-shared K/V needs cluster-UNION tile bounds.** Two pairs sharing one K/V ring must iterate the identical
+  KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
+  over the cluster's 256 rows and the per-cell mask trims. Detector:
+  `test_two_by_two_causal_512_cluster_union_bounds`.
+
 ## Output initialization regressions
 
 When removing wrapper-side output clears, verify that the prepared chain
