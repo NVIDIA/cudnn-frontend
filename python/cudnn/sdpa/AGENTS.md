@@ -358,6 +358,56 @@ ordered by CTA barriers. Check prefix lengths around warp boundaries and
 zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
 and run racecheck/memcheck before changing this shared setup again.
 
+**One metadata buffer, several persistent-scheduler launches per execute (the
+SM100 d512 backward's `heads // chunk` stage-2 launches): the two scheduler
+words are per LAUNCH.** `live` (`meta[4B+2]`) counts the units ONE launch
+decodes -- `sum_b ceil(s_b / 256) * chunk`, the head extent that launch's kernel
+receives as `n_qh` -- never the plan's head count; and the claim counter
+(`meta[4B+3]`) must be re-seeded to the cluster count before EVERY launch,
+because a launch leaves it at `live + clusters` and an unreset second launch
+finds every claim past the bound, computes only the units its clusters were
+pre-assigned by blockIdx, and stage 3 reads the previous chunk's S/dS for the
+rest (wrong, finite gradients -- cos 0.50 on dQ/dK of 7 of 9 sequences at
+d4b024671, 2026-10-01). The reset rides in the clamp kernel that already
+precedes each stage-2 launch (`_clamp_thd_input_descs`, both stage-2 files),
+so the fix added no launch (Rule 2). The miss is observable only when a launch
+has MORE live units than clusters (SMs // 4 = 37 on a 148-SM part), which is why
+every one-chunk THD test (h <= 4) passed. Detectors
+(`test_sdpa_bwd_thd_sm100.py`):
+`test_graph_thd_forced_head_chunks_match_reference_and_unchunked` (forces
+`_sm100_head_chunk_thd` to 8 / 4 over 12 q-units; per-sequence fp64 and
+bitwise the one-chunk plan) and
+`test_graph_thd_forced_head_chunks_publish_live_and_reseed_the_claim_counter`
+(reads `meta[4B+2] == q_units * chunk` and `meta[4B+3] == live + clusters`
+back out of the executed workspace). A new multi-launch consumer of
+`write_thd_live_and_ctr` owes the same two pins.
+
+**The blocked workspace's padding tips the head-chunk divisor at the budget
+edge.**  Each sequence's block is padded to 128 rows, so an equal-length packed
+plan carries `B * 128` more rows per head than the dense plan of the same
+lengths; charged in full that halved the chunk whenever the dense chunk sat
+exactly on the 4 GiB budget (B=1 / B=4 S=8192: 16 -> 8 / 4 -> 2 heads per
+launch, twice the stage-2 and stage-3 launches for the same work).  The rule
+(`api_dsl._sm100_head_chunk_thd(..., t_rows=)`) charges the budget on the TOKEN
+rows and lets the padded slab overshoot by at most `budget //
+_SM100_WS_THD_PAD_SLACK` (1/8); `scratch_workspace_bytes` is still computed
+from the chosen chunk (Rule 8).  Detectors (`test_sdpa_bwd_thd_sm100.py`):
+`test_thd_head_chunk_matches_dense_at_equal_tile_multiple_lengths` (THD chunk
+== dense chunk at six equal-length shapes, the original rule's halved answers
+pinned, the many-short-sequences cap) and
+`test_graph_thd_launch_count_is_the_promised_chain` (launches per execute from
+a CUPTI trace == `setup + dot [+ zero] + chunks * (clamp + stage 2 + (2 +
+group) * (patch + GEMM)) [+ dkv_reduce]`, per-chunk helpers counted by name --
+the Rule 1-2 pin for this chain).
+
+Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
+on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
+`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
+`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
+testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
+confirm the key moved (the detector pair above fails on the stale host).
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's
