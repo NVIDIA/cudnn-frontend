@@ -297,8 +297,9 @@ class SdpaThdBinder {
         int64_t tq = std::min(capacity(facts[Q], geometry[Q], "q"), capacity(facts[O], geometry[O], "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
+        // Spare backing storage does not enlarge the declared live-Q bound.
+        if (splits_ > 1) tq = std::min(tq, split_capacity_);
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
-        if (splits_ > 1 && tq > split_capacity_) invalid("packed Q capacity exceeds the prepared split workspace");
         int64_t tkv = 0;
         if (!paged_) {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));

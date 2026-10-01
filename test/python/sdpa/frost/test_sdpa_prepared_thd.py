@@ -1948,8 +1948,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
-    q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype)
-    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap, h, device=DEV))
+    spare = 17 if b == 1 else 0
+    q = torch.randn(b * qcap + spare, h, d, device=DEV, dtype=dtype)
+    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap + spare, h, device=DEV))
     if stats_layout == "HN":
         bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
     lse_tokens = bufs["lse"].T if stats_layout == "HN" else bufs["lse"]
@@ -1979,7 +1980,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         seq_len_kv=t["seq_kv"],
-        max_total_seq_len_q=b * qcap,
+        max_total_seq_len_q=None if spare else b * qcap,
         paged_attention_k_table=t["k_table"],
         paged_attention_v_table=t["v_table"],
         paged_attention_max_seq_len_kv=kcap,
