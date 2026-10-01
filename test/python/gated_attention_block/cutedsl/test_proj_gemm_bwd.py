@@ -26,7 +26,8 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   products at the forced tile in BOTH MMA K forms -- :func:`test_fp8_mn_major_matches_fp64_on_cc107`
   is the validation that lifted the refusal, and everything outside the table stays a
   typed decline; ``mma_tile_k_bytes=64`` is an EXPLICIT request of a dense e4m3 plan (never
-  keyed on the dtype) and the forward's fp8 plans stay at K32.
+  keyed on the dtype) and the forward's fp8 plans stay at K32; the ``alpha`` epilogue reads
+  a device slot the caller owns (:func:`device_alpha`).
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
 tests run anywhere.
@@ -55,6 +56,7 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     _forced_tile_config,
     _frost_plan_index,
     build_proj_gemm,
+    device_alpha,
     run_dgrad_gemm,
     run_wgrad_gemm,
     sf_blob_bytes,
@@ -251,7 +253,7 @@ def test_dgrad_matches_fp64(stage, geom_id, t, dtype):
 
 
 # ---------------------------------------------------------------------------
-# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile, K32 and K64
+# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile, K32 and K64, device alpha
 # ---------------------------------------------------------------------------
 #
 # Oracle and bound: the e4m3 operands are EXACT in fp64, so `(dequant(A) @ dequant(B))` in fp64 is the exact
@@ -330,7 +332,7 @@ _FP8_CASES = [(st, g, t, kb) for (st, g, t) in _FP8_SHAPES for kb in (32, 64)]
 def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
     """THE validation behind the fp8 MN-major lift (``FP8_MN_MAJOR_VALIDATED``): the e4m3 M-major-A / N-major-B
     (wgrad) and N-major-B (dgrad) renderings of the forced tile, in both MMA K forms (``mma_tile_k_bytes`` 32 and
-    64), with the descale product bound as the ``alpha`` epilogue, against the fp64 reference of the
+    64), with the descale product bound as the device ``alpha`` epilogue, against the fp64 reference of the
     dequantized products under the bf16-output bound.  Each cell also pins: the plan IS the forced JIT at the
     requested K form (a fallback is a FAILURE), no sentinel survivor, not silently zero, two launches bitwise
     equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along."""
@@ -339,10 +341,11 @@ def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
     plan = _fp8_plan(kind, m, k, n, k_bytes)
     _assert_fp8_plan_is_the_forced_tile(plan, k_bytes)
     ws = _ws(plan)
+    alpha_slot = torch.zeros(1, dtype=torch.float32, device="cuda")  # the caller's workspace slot
     if kind == "wgrad":
         dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
         out2 = out1.clone()
-        alpha = d_dy * d_x  # the descale product, a device fp32 scalar
+        alpha = device_alpha(alpha_slot, d_dy, d_x)
         run_wgrad_gemm(plan, dy8, x8, out1, ws, alpha=alpha)
         run_wgrad_gemm(plan, dy8, x8, out2, ws, alpha=alpha)
         torch.cuda.synchronize()
@@ -350,7 +353,7 @@ def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
     else:
         dy8, d_dy, w8, d_w, out1 = _fp8_dgrad_operands(m, k, n)
         out2 = out1.clone()
-        alpha = d_dy * d_w
+        alpha = device_alpha(alpha_slot, d_dy, d_w)
         run_dgrad_gemm(plan, dy8, w8, out1, ws, alpha=alpha)
         run_dgrad_gemm(plan, dy8, w8, out2, ws, alpha=alpha)
         torch.cuda.synchronize()
@@ -370,7 +373,7 @@ def test_fp8_k32_and_k64_are_two_renderings_of_one_function():
     assert p32.jit is not p64.jit and p32.tile_config_name != p64.tile_config_name
     dy8, d_dy, w8, d_w, dx32 = _fp8_dgrad_operands(m, k, n)
     dx64 = dx32.clone()
-    alpha = d_dy * d_w
+    alpha = device_alpha(torch.zeros(1, dtype=torch.float32, device="cuda"), d_dy, d_w)
     run_dgrad_gemm(p32, dy8, w8, dx32, _ws(p32), alpha=alpha)
     run_dgrad_gemm(p64, dy8, w8, dx64, _ws(p64), alpha=alpha)
     torch.cuda.synchronize()
@@ -455,6 +458,112 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
         st64 = ab._QkvGateDgrad(m=2048, k=5120, n=512, dtype=dt, label="b8", mma_tile_k_bytes=64)
         with pytest.raises(NotImplementedError, match=r"mma_tile_k_bytes=64 is a knob of an 8-bit \(e4m3\) GEMM stage"):
             st64.check_support()
+
+
+# ---------------------------------------------------------------------------
+# The device alpha slot (the per-tensor fp8 GEMMs' descale product)
+# ---------------------------------------------------------------------------
+
+
+def _fp32_product(*xs: float) -> float:
+    """The correctly-rounded fp32 product of ``xs`` taken left to right -- what ``device_alpha`` documents (one
+    fp32 multiply per factor, round-to-nearest); the Python double ``0.25 * 0.03`` is NOT it."""
+    acc = torch.tensor(xs[0], dtype=torch.float32)
+    for x in xs[1:]:
+        acc = (acc.double() * torch.tensor(x, dtype=torch.float32).double()).float()  # exact in double, one fp32 rounding
+    return acc.item()
+
+
+def test_device_alpha_contract():
+    """``device_alpha`` writes ``descale_a * descale_b (* scale_out)`` into the CALLER's fp32 slot ON THE DEVICE and
+    returns the ``[1, 1, 1]`` view the GEMM binds: the view ALIASES the slot (same ``data_ptr``), nothing is
+    allocated per call, no host sync happens (the inputs are device tensors and never ``.item()``-ed), the value
+    is the correctly-rounded fp32 product (``_fp32_product``, bit-exact -- not the Python double), and the
+    multiplies run on the launch stream (deterministic probe: the default stream
+    is parked and the INPUTS are overwritten on the side stream right after the call -- a product issued on the
+    default stream would read the overwritten scales).  Rejects, typed and before any write: a slot or input that
+    is not a 1-element fp32 CUDA tensor, an input on another device where one is visible."""
+    dev = torch.device("cuda")
+    region = torch.zeros(8, dtype=torch.float32, device=dev)  # a workspace REGION; slot 3 is this GEMM's alpha
+    slot = region[3:4]
+    a = torch.tensor([0.25], dtype=torch.float32, device=dev)
+    b = torch.tensor([0.03], dtype=torch.float32, device=dev)
+    c = torch.tensor([64.0], dtype=torch.float32, device=dev)
+    v = device_alpha(slot, a, b)
+    torch.cuda.synchronize()
+    assert tuple(v.shape) == (1, 1, 1) and v.dtype == torch.float32 and v.data_ptr() == slot.data_ptr() == region[3:4].data_ptr()
+    assert region[3].item() == _fp32_product(0.25, 0.03) and region[[0, 1, 2, 4, 5, 6, 7]].abs().sum().item() == 0
+    v2 = device_alpha(slot, a, b, c)
+    torch.cuda.synchronize()
+    assert v2.data_ptr() == slot.data_ptr() and region[3].item() == _fp32_product(0.25, 0.03, 64.0)
+    before = torch.cuda.memory_allocated()
+    device_alpha(slot, a, b)
+    device_alpha(slot, a, b, c)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before, "a call allocated"
+    # stream threading: the product lands on the side stream, ahead of the overwrite issued there
+    side = torch.cuda.Stream()
+    expect = _fp32_product(0.25, 0.03)
+    for how in ("ambient", "explicit"):
+        slot.zero_()
+        a.fill_(0.25)
+        b.fill_(0.03)
+        torch.cuda.synchronize()
+        park_the_default_stream()
+        if how == "ambient":
+            with torch.cuda.stream(side):
+                device_alpha(slot, a, b)
+        else:
+            device_alpha(slot, a, b, stream=side.cuda_stream)
+        with torch.cuda.stream(side):
+            a.fill_(7.0)  # ordered AFTER the product on the side stream; a product parked on the default stream reads 7.0
+            b.fill_(7.0)
+        torch.cuda.synchronize()
+        assert slot.item() == expect, f"device_alpha ran off the launch stream ({how}): slot = {slot.item()}"
+    # rejects
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(2, dtype=torch.float32, device=dev), a, b)
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(1, dtype=torch.float64, device=dev), a, b)
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(1, dtype=torch.float32), a, b)
+    with pytest.raises(ValueError, match=r"descale_b must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, a, torch.zeros(1, dtype=torch.bfloat16, device=dev))
+    with pytest.raises(ValueError, match=r"descale_a must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, 0.25, b)
+    with pytest.raises(ValueError, match=r"scale_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, a, b, torch.zeros(1, 2, dtype=torch.float32, device=dev))
+    if torch.cuda.device_count() > 1:
+        other = (dev.index if dev.index is not None else torch.cuda.current_device()) + 1
+        with pytest.raises(ValueError, match=r"descale_b is on cuda:\d+ but the alpha slot is on"):
+            device_alpha(slot, a, torch.tensor([0.03], dtype=torch.float32, device=f"cuda:{other % torch.cuda.device_count()}"))
+    # the MN-major drivers thread it: a plan without alpha refuses one, a plan with alpha requires one (run_proj_gemm's gate)
+    t, dm, hd = 256, 512, 1024
+    with_alpha = ProjGemmPlan(
+        graph=None,
+        a=None,
+        b=None,
+        c=None,
+        m=dm,
+        k=t,
+        n=hd,
+        label="wa",
+        dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        alpha=object(),
+        a_major="m",
+        b_major="n",
+    )
+    without = ProjGemmPlan(
+        graph=None, a=None, b=None, c=None, m=t, k=dm, n=hd, label="wo", dtype=torch.bfloat16, out_dtype=torch.bfloat16, a_major="k", b_major="n"
+    )
+    dy = torch.zeros(t, dm, device=dev, dtype=torch.bfloat16)
+    x = torch.zeros(t, hd, device=dev, dtype=torch.bfloat16)
+    ws = torch.empty(1, dtype=torch.uint8, device=dev)
+    with pytest.raises(ValueError, match=r"built with alpha=True; pass alpha="):
+        run_wgrad_gemm(with_alpha, dy, x, torch.zeros(dm, hd, device=dev, dtype=torch.bfloat16), ws)
+    with pytest.raises(ValueError, match=r"has no alpha epilogue.*refusing to drop the value"):
+        run_dgrad_gemm(without, dy, torch.zeros(dm, hd, device=dev, dtype=torch.bfloat16), torch.zeros(t, hd, device=dev, dtype=torch.bfloat16), ws, alpha=v)
 
 
 # ---------------------------------------------------------------------------

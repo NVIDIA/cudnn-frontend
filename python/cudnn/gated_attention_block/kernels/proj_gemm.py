@@ -111,7 +111,8 @@ documented on :func:`build_proj_gemm`.
 
 **The QUANTIZED backward's GEMMs** ride the same drivers: per-tensor e4m3 operands take
 the MN-major renderings above with the descale product bound as the ``[1, 1, 1]`` fp32
-``alpha`` epilogue, and the 64-byte MMA K form when the stage asks for it explicitly
+``alpha`` epilogue (:func:`device_alpha` writes it into the caller's workspace slot on the
+launch stream), and the 64-byte MMA K form when the stage asks for it explicitly
 (``mma_tile_k_bytes=64``; the forward's plans stay at K32).
 """
 
@@ -1802,7 +1803,7 @@ def run_wgrad_gemm(
     ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream).
     ``alpha`` (appended): the per-tensor fp8 plan's ``[1, 1, 1]`` fp32 descale product --
     required when the plan was built with ``alpha=True``, refused otherwise, exactly as
-    :func:`run_proj_gemm` spells it."""
+    :func:`run_proj_gemm` spells it; :func:`device_alpha` writes it into the caller's slot."""
     if (plan.a_major, plan.b_major) != ("m", "n"):
         raise ValueError(
             f"{plan.label}: run_wgrad_gemm binds A = dy_like^T (M-major) and B = x (N-major), but this plan was built with "
@@ -1849,3 +1850,68 @@ def run_dgrad_gemm(
     _check_view_against_declaration(plan, "B", "w", b3)
     _check_output_view(plan, "dx", c3)
     run_proj_gemm(plan, a3, b3, c3, workspace, handle, alpha=alpha, stream=stream)
+
+
+# ---------------------------------------------------------------------------
+# The QUANTIZED backward: the device alpha slot (the per-tensor fp8 GEMMs' descale product)
+# ---------------------------------------------------------------------------
+
+
+def _check_scalar(label: str, name: str, t: torch.Tensor, device) -> torch.Tensor:
+    if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32 or not t.is_cuda:
+        raise ValueError(
+            f"{label}: {name} must be a 1-element fp32 CUDA tensor (a slot of the caller's workspace, or a plan-time constant), got "
+            f"{type(t).__name__}{' ' + str(tuple(t.shape)) + ' ' + str(t.dtype) + ' on ' + str(t.device) if isinstance(t, torch.Tensor) else ''}"
+        )
+    if t.device != device:
+        raise ValueError(f"{label}: {name} is on {t.device} but the alpha slot is on {device}; every scalar of one GEMM lives on the launch device")
+    return t.reshape(1)  # one element is always contiguous: a view, never a copy
+
+
+def device_alpha(
+    alpha_out: torch.Tensor,
+    descale_a: torch.Tensor,
+    descale_b: torch.Tensor,
+    scale_out: Optional[torch.Tensor] = None,
+    *,
+    stream=None,
+    label: str = "proj_gemm",
+) -> torch.Tensor:
+    """``alpha_out[:] = descale_a * descale_b`` (``* scale_out`` when a quantized output wants it) ON THE DEVICE,
+    on the launch stream; returns the ``[1, 1, 1]`` fp32 view :func:`run_proj_gemm` binds as the fp8 plan's
+    ``alpha`` epilogue.
+
+    The contract of the quantized backward's descale products (B1 ``descale_dY * (1 / scale_o)``, B2
+    ``descale_dY * descale_w_o``, B7 ``descale_dQKVG * descale_h``, B8 ``descale_dQKVG * descale_w_qkvg``):
+
+    * ``alpha_out`` is the CALLER's slot -- one fp32 element of a workspace region the caller carved at plan
+      time (a view into it is fine; the write is in place and the returned view aliases it), so nothing is
+      allocated per execute (Rule 1) and a CUDA-graph capture sees stable pointers;
+    * every input is a 1-element fp32 CUDA tensor on the slot's device -- a plan-time constant or another
+      slot a quantize kernel wrote this step (the "current" recipe's device-side scales) -- and is READ on
+      the device: no ``.item()``, no host round trip, no host-side float ever reaches the product;
+    * the two multiplies run under ``stream`` (a raw ``CUstream`` int or a ``torch.cuda.Stream``; ``None`` =
+      torch's current stream on the slot's device) -- the SAME launch stream the GEMM takes (Rule 5), so a
+      scale written by an earlier kernel on that stream is ordered before the product, and the product
+      before the GEMM that reads it.
+
+    Numerics: one fp32 product (two with ``scale_out``), rounded to nearest -- the same value a host-side
+    ``descale_a * descale_b`` in fp32 would give, so the oracle may compute it either way.
+    """
+    from cudnn._torch_stream import stream_context
+
+    if not isinstance(alpha_out, torch.Tensor) or alpha_out.numel() != 1 or alpha_out.dtype != torch.float32 or not alpha_out.is_cuda:
+        raise ValueError(
+            f"{label}: alpha_out must be a 1-element fp32 CUDA tensor -- the caller's workspace slot the GEMM's alpha epilogue reads -- got "
+            f"{type(alpha_out).__name__}{' ' + str(tuple(alpha_out.shape)) + ' ' + str(alpha_out.dtype) + ' on ' + str(alpha_out.device) if isinstance(alpha_out, torch.Tensor) else ''}"
+        )
+    dev = alpha_out.device
+    out1 = alpha_out.reshape(1)
+    a1 = _check_scalar(label, "descale_a", descale_a, dev)
+    b1 = _check_scalar(label, "descale_b", descale_b, dev)
+    s1 = _check_scalar(label, "scale_out", scale_out, dev) if scale_out is not None else None
+    with stream_context(stream, dev):
+        torch.mul(a1, b1, out=out1)
+        if s1 is not None:
+            out1.mul_(s1)
+    return alpha_out.reshape(1, 1, 1)
