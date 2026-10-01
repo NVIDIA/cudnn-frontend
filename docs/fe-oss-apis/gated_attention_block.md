@@ -46,8 +46,10 @@ so they are unspellable on the bf16 and per-tensor FP8 pipelines rather than dec
 
 ### Fusion knobs
 
-Two optional fusions are constructor flags; each is a different compiled specialization behind the same
-`execute()` signature, and both default to off.
+Two optional forward fusions are constructor flags; each is a different compiled specialization behind the same
+`execute()` signature, and both default to off. The backward has its own knob, `fuse_gate_bwd` (default off): the
+gate backward emits the SDPA backward's `delta`, one launch fewer, bitwise the unfused block -- see
+[Backward](#backward).
 
 - `fuse_norm_rope=True` folds stages (2)+(3) into stage (1)'s epilogue: Q/K tiles are normed and rotated on the
   fp32 accumulator and written once (needs `inplace_qkv`; inference only, no pre-norm Q/K is kept). Under FP8 /
@@ -231,8 +233,8 @@ Quantization specs:
 
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
-need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32)` is the
-UNFUSED block backward: eight stages on ONE launch stream, no allocation, against the forward's
+need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
+fuse_gate_bwd=False)` is the block backward: eight stages on ONE launch stream, no allocation, against the forward's
 `SavedForBackward(h, gate, o, lse, rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` record written
 in the **proj_slab save mode** (`GatedAttentionBlockFwd(save_for_backward=True)`, the default `saved_gate_copy=False`;
 `gate` / `q_pre` / `k_pre` may be `None` there -- they are bands of `proj_slab`). Recipe, the same lifecycle as the forward:
@@ -251,7 +253,7 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 ```
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
-recompute=..., current_stream=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+recompute=..., current_stream=None, fuse_gate_bwd=False)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
 `saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached).
@@ -273,9 +275,20 @@ given for a `need_*=False`, or missing for a `need_*=True`, is a typed error at 
 `geometry.qk_norm`, and asking for norm-weight gradients under `qk_norm=False` is a typed decline. `RecomputePolicy`
 (`SAVE_ALL` / `RECOMPUTE_QK_PRE`) both read the slab's bands today; `RECOMPUTE_GATE` is reserved.
 
+**Fusion knob -- `fuse_gate_bwd` (default `False`).** The SDPA backward's first launch is `delta = rowsum(dO * O)` over
+the `dO` the gate backward just wrote and the `O` it just read. With the knob on, the gate-backward kernel emits `delta`
+as a fourth output (the bf16 / fp16-rounded `dO` it stores, summed in the chain's own `dot_do_o` order, the pad rows
+zeroed) into a block-owned fp32 `[B, H_q, S_pad]` region, and the SDPA backward adapter is built with
+`external_delta=True` and reads that tensor: one launch and one read each of `O` and `dO` fewer (`11 + c*(2+q)` launches,
+14 / 21 at the test geometry), the adapter's own `delta` region gone from its scratch (the block's region takes its
+place, same bytes). Performance-only in the strict sense: the gradients are **bitwise** the unfused block's
+(`test_fused_gate_bwd_is_bitwise_the_unfused_block`, bf16 and fp16, dense and causal, B=1 and B=3 under GQA), and the
+two-run and stream-order pins run under both knob values. Measured whole-backward effect: see the performance section.
+
 **Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
 `O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
-bf16 (102 KiB/token at the 397B geometry), plus the SDPA backward's scratch (`delta` and the per-Q-head `dK` / `dV`
+bf16 (102 KiB/token at the 397B geometry), plus the SDPA backward's scratch (`delta` -- the block's own region under
+`fuse_gate_bwd` -- and the per-Q-head `dK` / `dV`
 partials, ~32 KiB/token, and ONE dS chunk of `qh_chunk x S_q_pad x S_kv_pad x 2` bytes with `qh_chunk` a multiple of the
 GQA group: **4.25 / 8.50 / 33.0 GiB at S = 8K / 16K / 32K** for the 397B geometry at B=1), plus the `dW_norm` partial
 planes (`(n_ctas_q + n_ctas_k) x D x 4` bytes, at most `2 x SMs x 8 x 1 KiB`), plus the GEMMs' scratch
@@ -338,6 +351,22 @@ Dense (no mask):
 | 8192 | 2.33x | 2.44x | 3.84x | 4.27x | 3.71x | 4.13x |
 | 16384 | 1.85x | 1.90x | 3.37x | 3.63x | 3.30x | 3.51x |
 | 32768 | 1.50x | 1.53x | 2.92x | 3.03x | 2.81x | 2.86x |
+
+Backward, `fuse_gate_bwd` (the gate backward feeding the SDPA backward's delta): whole-backward wall time of the bf16 block
+backward at the 397B geometry, B=1, causal, QK-norm on, Rubin perf node (212 SMs), knob off and on interleaved launch by launch
+in one process with the knob-off arm timed twice as the control, 3 rounds x 20 launches per process, 3 fresh processes per S;
+`+X % = unfused ms / fused ms - 1`, positive = the knob is faster. The gradients were bitwise equal between the arms in every
+process.
+
+| S | knob off (ms) | knob on (ms) | fuse_gate_bwd vs unfused | control pair |
+|---|---|---|---|---|
+| 2048 | 0.528 | 0.516 | +2.3 % | within 0.2 % |
+| 8192 | 2.424 | 2.389 | +1.5 % | within 0.6 % |
+| 32768 | 25.26 | 25.03 | +0.7 % (positive in 3 of 3 processes, but within 2x the control: a weak claim) | within 0.5 % |
+
+The SM clock was locked at 2376 MHz but power-capped during the 8K and 32K runs (sampled 2150-2376 and 1550-1850 MHz), so
+only the interleaved ratios are quoted; the absolute 8K / 32K milliseconds are capped-clock numbers. The knob removes one
+launch and one read each of `O` and `dO` (32 KiB/token) per backward; it stays off by default.
 
 ## Related
 

@@ -200,6 +200,27 @@ requires both) and no body threads per-batch Q lengths, so serving the graph for
 would mean ignoring the q lengths. The fp8 and MXFP8 bodies take one uniform real kv
 length (`seqlen_kv_real`), so their adapters decline `seq_kv_lens_present` as well.
 
+An externally computed `delta` is the other plan fact of that standalone surface:
+`SdpaBwdDslSm107(..., external_delta=True)` declares that the caller computes stage 1's
+`delta = rowsum(dO ∘ O)` and hands it to `execute(..., delta_tensor=)` — an fp32
+contiguous tensor of `external_delta_shape` = `(B, H_q, S_q_pad)` (`S_q_pad` = `S_q`
+rounded up to the 128-row q tile, zeros past `S_q`), 16-byte aligned, on the plan's
+device, holding the raw row dot (`attn_scale` is applied in the main kernel). The chain
+then launches no `dot` and reads O once less, and the workspace carve has no `delta`
+region (`scratch_workspace_bytes()` shrinks by exactly it); the operand is checked before
+any bind — dtype, shape, strides, device, alignment, each a typed `ValueError` — and a
+plan built without the flag refuses a delta. The producer this exists for is the gated
+attention block's sigmoid-gate backward kernel, which forms the delta over the `dO` it
+stores in `dot`'s own reduction order, so the fused and the unfused block backward are
+bitwise equal (`fuse_gate_bwd` in [gated_attention_block.md](../gated_attention_block.md)).
+The flag is independent of `seq_kv_lens_present`: each decides its own appended operand
+(the lengths, then the delta) and a plan built with both takes both at `execute`. It is a
+plan fact, not an eligibility fact — `Capabilities` and the graph path are unchanged (no
+graph declares a delta, so a graph plan keeps the chain's own `dot` launch and its
+region). The fp8 and MXFP8 rows decline it: their delta is the dot of their own payloads
+(the descaled fp8 dot of the scaled pre-pass; the `o_f16` / `dO_f16` ports' dot),
+computed by their own pre-pass.
+
 One exception on the fp8 row: **bottom-right causal needs `S_q % 128 == 0`**
 (declined otherwise, at plan build, as not supported). The bottom-right
 diagonal is `S_kv − S_q` in real rows; the f16 kernel takes the real lengths,
@@ -311,7 +332,8 @@ plan creation.
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
   row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any
   `p_scale_log2 != 8`
-- Workspace (carved from the caller's buffer): fp32 `delta`, one head/batch
+- Workspace (carved from the caller's buffer): fp32 `delta` (not carved under the
+  standalone adapter's `external_delta`), one head/batch
   chunk of the dS workspace (`B_chunk · H_chunk · S_kv · S_q` bytes at e4m3 on
   the fp8 row, `· 2` on the half and MXFP8 rows), padded staging copies when
   S_q / S_kv are not tile multiples, per-Q-head dK/dV partials under GQA; the
