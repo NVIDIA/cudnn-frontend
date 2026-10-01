@@ -503,10 +503,10 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
-            # Measured B200 full-prefill envelopes. Runtime lengths may still
+            # Measured B200 D256 full-prefill envelopes. Runtime lengths may still
             # become prefix chunks after capture; LPT keeps ordering live rows.
             # Keep mixed batches and 32K envelopes on the existing default.
-            if (
+            elif (
                 SCHED_LPT in domain
                 and facts.device_cc == (10, 0)
                 and facts.has_paged_kv

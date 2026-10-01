@@ -528,7 +528,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
-    elif params.decode_tile or (
+    elif getattr(params, "decode_tile", False) or (
         flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1))
     ):
         # D64's explicit decode tile and D128's one-CTA tile share this body.
@@ -1712,6 +1712,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not (self.thd_decode_leg or self.paged_thd_split),
             "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
             "other THD (ragged) graphs run the cga2 prefill tile",
+        )
+        # The per-tensor FP8 d128 flavor admits cga1 too, as its dense unsplit
+        # prefill leg (heuristics._auto_sched_cga); its THD leg is validated on
+        # the cga2 pair only, which is what engines.mismatch declines for every
+        # dtype (the decode tile's ragged-Q leg never admits FP8).
+        self._not_implemented_error_if(
+            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and self._fp8 and self.thd,
+            "cga=1 on the per-tensor FP8 d128 flavor is its dense unsplit prefill leg; THD (ragged) graphs run the cga2 pair",
         )
         self._not_implemented_error_if(
             self.thd_decode_leg and self.split_kv < 2,
@@ -2954,6 +2962,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             v=self._thd_decl(self.v_desc),
             o=self._thd_decl(self.o_desc),
             units=units,
+            cga_tile_m=int(self._k_mod.CGA_TILE_M),
             n_q_lens=b + 1 if self.cu_seq_q_lens else b,
             n_kv_lens=b + 1 if self.cu_seq_kv_lens else b,
             lens_form=(1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0),
@@ -4245,6 +4254,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             v=self._thd_decl(self.v_desc),
             o=self._thd_decl(self.o_desc),
             units=self._persistent_ctas(self.q_desc.device),
+            cga_tile_m=int(self.q_tile),
             n_q_lens=b + int(self.cu_seq_q_lens),
             n_kv_lens=b + int(self.cu_seq_kv_lens),
             lens_form=int(self.cu_seq_q_lens) | (int(self.cu_seq_kv_lens) << 1),

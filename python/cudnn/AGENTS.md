@@ -202,6 +202,11 @@ not become a compile key.
   `check_support()` validates and what the kernel specializes on; the key
   is that set.
 
+- **Scratch state needs an owner, not just a pointer.** When cached plans share
+  an allocation, invalidate cached geometry whenever another plan writes it.
+  Test A→B→A reuse with the same pointer; see
+  `test_te_workspace_plan_switch` for the compact GQA regression.
+
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
 

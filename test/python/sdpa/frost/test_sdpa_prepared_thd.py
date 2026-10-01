@@ -19,7 +19,7 @@ import torch
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep_mod
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _dsl_installed, requires_blackwell, requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _dsl_installed, requires_blackwell, requires_blackwell_geforce, requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0]
 
@@ -1434,109 +1434,6 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [128, 256, 512])
-def test_thd_cache_shape_grid_tracks_runtime_capacity(d):
-    """One large cache-shape artifact, small changing batches and captured device lengths."""
-    if torch.cuda.get_device_capability() == (10, 7):
-        pytest.skip("SM107 overlaunch admission is qualified separately")
-    arch = "sm100"
-    hq, hk = 4, 2
-    g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
-    plan = _plan(g)
-    spec = plan._prepared.spec
-    template = list(spec.template)
-    rec = _Recorder(spec)
-    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
-    torch.manual_seed(5350)
-
-    def cumulative(lengths):
-        return [0] + list(accumulate(lengths))
-
-    def reference(bufs, qlens, klens):
-        oq, ok = cumulative(qlens), cumulative(klens)
-        expected_o = torch.empty_like(bufs["o"], dtype=torch.float32)
-        expected_lse = torch.empty_like(bufs["lse"])
-        for i, (nq, nk) in enumerate(zip(qlens, klens)):
-            if nq == 0:
-                continue
-            q = bufs["q"][oq[i] : oq[i + 1]].float().transpose(0, 1)
-            k = bufs["k"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
-            v = bufs["v"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
-            scores = q @ k.transpose(1, 2) / math.sqrt(d)
-            mask = torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None]
-            scores.masked_fill_(mask, -float("inf"))
-            expected_o[oq[i] : oq[i + 1]] = (scores.softmax(-1) @ v).transpose(0, 1)
-            expected_lse[oq[i] : oq[i + 1]] = scores.logsumexp(-1).transpose(0, 1)
-        return expected_o, expected_lse
-
-    captured = None
-    try:
-        for qlens in ([517], [1, 3, 0, 513], [517]):
-            b, total = len(qlens), sum(qlens)
-            klens = [n + 17 for n in qlens]
-            bufs = {
-                name: torch.randn(n, heads, d, device=DEV, dtype=torch.bfloat16)
-                for name, n, heads in (("q", total, hq), ("k", sum(klens), hk), ("v", sum(klens), hk))
-            }
-            bufs.update(o=torch.empty_like(bufs["q"]), lse=torch.empty(total, hq, device=DEV))
-            for name, values, width in (("cu_q", qlens, 1), ("cu_kv", klens, 1), ("off_q", qlens, hq * d), ("off_kv", klens, hk * d), ("off_lse", qlens, hq)):
-                bufs[name] = torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width
-            sq, sk = max(qlens), max(klens)
-            uids = [t[n].get_uid() for n in ("q", "k", "v", "o", "stats", "cu_q", "cu_kv", "off_q", "off_kv", "off_lse")]
-            shapes = [[b, hq, sq, d], [b, hk, sk, d], [b, hk, sk, d], [b, hq, sq, d], [b, hq, sq, 1]] + [[b + 1, 1, 1, 1]] * 5
-            strides = [
-                [sq * hq * d, d, hq * d, 1],
-                [sk * hk * d, d, hk * d, 1],
-                [sk * hk * d, d, hk * d, 1],
-                [sq * hq * d, d, hq * d, 1],
-                [sq * hq, 1, hq, 1],
-            ] + [[1, 1, 1, 1]] * 5
-            pack = _pack(t, bufs)
-
-            def run():
-                g.execute(pack, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
-
-            with _Tripwire():
-                previous = torch.cuda.get_sync_debug_mode()
-                torch.cuda.set_sync_debug_mode("error")
-                try:
-                    run()
-                finally:
-                    torch.cuda.set_sync_debug_mode(previous)
-                captured = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(captured):
-                    run()
-            bound = ((total - 1) // spec.cga_tile_m + b) * hq
-            assert rec.frames[-1]["n_thd_units"] <= bound
-            assert spec.template == template
-            for lengths in (qlens, ([129, 129, 129, 130] if b == 4 else qlens)):
-                kv_lengths = [n + 17 for n in lengths]
-                for name, values, width in (
-                    ("cu_q", lengths, 1),
-                    ("cu_kv", kv_lengths, 1),
-                    ("off_q", lengths, hq * d),
-                    ("off_kv", kv_lengths, hk * d),
-                    ("off_lse", lengths, hq),
-                ):
-                    bufs[name].copy_(torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width)
-                bufs["q"].mul_(0.75)
-                bufs["o"].fill_(float("nan"))
-                bufs["lse"].fill_(float("nan"))
-                captured.replay()
-                expected_o, expected_lse = reference(bufs, lengths, kv_lengths)
-                torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
-                torch.testing.assert_close(bufs["lse"], expected_lse, atol=1e-3, rtol=1e-3)
-            assert _plan(g) is plan
-            captured.reset()
-            captured = None
-    finally:
-        if captured is not None:
-            captured.reset()
-        rec.restore()
-
-
-@requires_blackwell
-@requires_dsl
 @pytest.mark.parametrize("d", [96, 128, 200, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
@@ -1726,6 +1623,126 @@ def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
     finally:
         for graph in captures:
             graph.reset()
+
+
+@requires_dsl
+@pytest.mark.parametrize("arch", [pytest.param("sm100", marks=requires_blackwell), pytest.param("sm120", marks=requires_blackwell_geforce)])
+@pytest.mark.parametrize("d", [128, 256, 512])
+@pytest.mark.parametrize("backend_lowering", [True, False])
+def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering, monkeypatch):
+    """One large cache-shape artifact, small changing batches and captured device lengths."""
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 overlaunch admission is qualified separately")
+    if not backend_lowering:
+
+        def decline(self):
+            raise cudnn.cudnnGraphNotSupportedError("backend lowering unavailable for this test")
+
+        monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
+        monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
+    hq, hk = 4, 2
+    g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
+    if not backend_lowering:
+        assert g._lowered_graph is None
+    plan = _plan(g)
+    spec = plan._prepared.spec
+    template = list(spec.template)
+    rec = _Recorder(spec)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    torch.manual_seed(5350)
+
+    def cumulative(lengths):
+        return [0] + list(accumulate(lengths))
+
+    def reference(bufs, qlens, klens):
+        oq, ok = cumulative(qlens), cumulative(klens)
+        expected_o = torch.empty_like(bufs["o"], dtype=torch.float32)
+        expected_lse = torch.empty_like(bufs["lse"])
+        for i, (nq, nk) in enumerate(zip(qlens, klens)):
+            if nq == 0:
+                continue
+            q = bufs["q"][oq[i] : oq[i + 1]].float().transpose(0, 1)
+            k = bufs["k"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            v = bufs["v"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            scores = q @ k.transpose(1, 2) / math.sqrt(d)
+            mask = torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None]
+            scores.masked_fill_(mask, -float("inf"))
+            expected_o[oq[i] : oq[i + 1]] = (scores.softmax(-1) @ v).transpose(0, 1)
+            expected_lse[oq[i] : oq[i + 1]] = scores.logsumexp(-1).transpose(0, 1)
+        return expected_o, expected_lse
+
+    captured = None
+    try:
+        for qlens in ([517], [1, 3, 0, 513], [517]):
+            b, total = len(qlens), sum(qlens)
+            klens = [n + 17 for n in qlens]
+            bufs = {
+                name: torch.randn(n, heads, d, device=DEV, dtype=torch.bfloat16)
+                for name, n, heads in (("q", total, hq), ("k", sum(klens), hk), ("v", sum(klens), hk))
+            }
+            bufs.update(o=torch.empty_like(bufs["q"]), lse=torch.empty(total, hq, device=DEV))
+            for name, values, width in (("cu_q", qlens, 1), ("cu_kv", klens, 1), ("off_q", qlens, hq * d), ("off_kv", klens, hk * d), ("off_lse", qlens, hq)):
+                bufs[name] = torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width
+            sq, sk = max(qlens), max(klens)
+            uids = [t[n].get_uid() for n in ("q", "k", "v", "o", "stats", "cu_q", "cu_kv", "off_q", "off_kv", "off_lse")]
+            shapes = [[b, hq, sq, d], [b, hk, sk, d], [b, hk, sk, d], [b, hq, sq, d], [b, hq, sq, 1]] + [[b + 1, 1, 1, 1]] * 5
+            strides = [
+                [sq * hq * d, d, hq * d, 1],
+                [sk * hk * d, d, hk * d, 1],
+                [sk * hk * d, d, hk * d, 1],
+                [sq * hq * d, d, hq * d, 1],
+                [sq * hq, 1, hq, 1],
+            ] + [[1, 1, 1, 1]] * 5
+            # Ragged offsets are backend-only operands. A backend that cannot
+            # lower this graph leaves them out of the Python operand layout.
+            operands = set(g._variant_pack_uids())
+            assert all(uid in operands for uid in uids[:7])
+            if not backend_lowering:
+                assert all(uid not in operands for uid in uids[7:])
+            overrides = [(uid, shape, stride) for uid, shape, stride in zip(uids, shapes, strides) if uid in operands]
+            uids, shapes, strides = map(list, zip(*overrides))
+            pack = _pack(t, bufs)
+
+            def run():
+                g.execute(pack, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
+
+            with _Tripwire():
+                previous = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    run()
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous)
+                captured = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(captured):
+                    run()
+            bound = ((total - 1) // spec.cga_tile_m + b) * hq
+            assert rec.frames[-1]["n_thd_units"] <= bound
+            assert spec.template == template
+            for lengths in (qlens, ([129, 129, 129, 130] if b == 4 else qlens)):
+                kv_lengths = [n + 17 for n in lengths]
+                for name, values, width in (
+                    ("cu_q", lengths, 1),
+                    ("cu_kv", kv_lengths, 1),
+                    ("off_q", lengths, hq * d),
+                    ("off_kv", kv_lengths, hk * d),
+                    ("off_lse", lengths, hq),
+                ):
+                    bufs[name].copy_(torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width)
+                bufs["q"].mul_(0.75)
+                bufs["o"].fill_(float("nan"))
+                bufs["lse"].fill_(float("nan"))
+                captured.replay()
+                expected_o, expected_lse = reference(bufs, lengths, kv_lengths)
+                torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
+                torch.testing.assert_close(bufs["lse"], expected_lse, atol=1e-3, rtol=1e-3)
+            assert _plan(g) is plan
+            captured.reset()
+            captured = None
+    finally:
+        if captured is not None:
+            captured.reset()
+        rec.restore()
 
 
 # Define DSL probes at module scope: the tracer resolves names from the
