@@ -1233,7 +1233,8 @@ def _tmastg_warp_group(
                             q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
                             cutlass.Int32(0),
                         )
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     tma_store_tile(
                         sO[qs],

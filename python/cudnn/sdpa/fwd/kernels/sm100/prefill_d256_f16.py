@@ -861,6 +861,9 @@ def _tmastg_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
+    # Each per-sequence O map is immutable for this launch.
+    last_o_batch = cutlass.Int32(-1)
+
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
@@ -887,8 +890,11 @@ def _tmastg_warp_group(
                 # skip the store; the barrier protocol below still runs.
                 if batch_idx < n_batch:
                     o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                    if batch_idx != last_o_batch:
+                        tma_tensormap_acquire(o_desc_ptr)
+                        last_o_batch = batch_idx
                     o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), q_head_idx, q_row_coord, cutlass.Int32(0))
-                    tma_store_tile(sO[0], o_slice)
+                    tma_store_tile(sO[0], o_slice, acquire=False)
             else:
                 tma_store_tile(
                     sO[0],

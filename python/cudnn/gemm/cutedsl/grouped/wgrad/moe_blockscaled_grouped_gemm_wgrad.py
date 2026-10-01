@@ -1051,7 +1051,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     work_tile_info,
                 )
                 acquire_expert = True
-                if cutlass.const_expr(self.architecture == "sm_100" and not self.use_2cta_instrs):
+                if cutlass.const_expr(not self.use_2cta_instrs):
                     acquire_expert = work_tile_info.expert_idx != last_acquired_expert
                 if acquire_expert:
                     for desc_name, desc_ptr in (
@@ -1484,7 +1484,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     work_tile_info,
                 )
                 acquire_expert = True
-                if cutlass.const_expr(self.architecture == "sm_100" and not self.use_2cta_instrs):
+                if cutlass.const_expr(not self.use_2cta_instrs):
                     acquire_expert = work_tile_info.expert_idx != last_acquired_expert
                 if acquire_expert:
                     if cutlass.const_expr(desc_ptr_c is not None):

@@ -18,11 +18,12 @@ from test_utils import torch_fork_set_rng
 @torch_fork_set_rng(seed=1313)
 def test_wgrad_tensormaps_rebind_and_replay(fp4, discrete, cga):
     major, minor = torch.cuda.get_device_capability()
-    if not 100 <= major * 10 + minor <= 106:
-        pytest.skip("SM100 WGrad qualification")
+    if not 100 <= major * 10 + minor <= 107:
+        pytest.skip("SM100/SM107 WGrad qualification")
 
     # More output tiles per expert than resident CTAs, including two-CTA MMA.
-    m, n, total_k, experts = 3072, 2048, 640, 2
+    rubin = (major, minor) == (10, 7)
+    m, n, total_k, experts = 3072, 2048, 768 if rubin else 640, 2
     vec = 16 if fp4 else 32
     sf_dtype = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
     global_scale = torch.ones(experts, device="cuda") if fp4 else None
@@ -50,7 +51,7 @@ def test_wgrad_tensormaps_rebind_and_replay(fp4, discrete, cga):
             pointers=torch.tensor([out[i].data_ptr() for i in range(experts)], dtype=torch.int64, device="cuda"),
         )
 
-    first_lengths = [256, 384]
+    first_lengths = [256, 512] if rubin else [256, 384]
     first = inputs(first_lengths)
     output_kwargs = dict(num_experts=experts, wgrad_shape=(m, n), wgrad_dtype=torch.bfloat16) if discrete else dict(sample_wgrad=first["out"])
     api = cudnn.GroupedGemmWgradSm100(
@@ -97,7 +98,7 @@ def test_wgrad_tensormaps_rebind_and_replay(fp4, discrete, cga):
     first["out"].fill_(float("nan"))
     run(first)
     check(first, first_lengths)
-    second_lengths = [384, 256]
+    second_lengths = [512, 256] if rubin else [384, 256]
     second = inputs(second_lengths)
     second["out"].fill_(float("nan"))
     run(second)
@@ -116,7 +117,7 @@ def test_wgrad_tensormaps_rebind_and_replay(fp4, discrete, cga):
         graph.replay()
         check(second, second_lengths)
 
-        third_lengths = [128, 512]
+        third_lengths = [256, 512] if rubin else [128, 512]
         second["offsets"].copy_(torch.tensor(third_lengths, dtype=torch.int32).cumsum(0).to(torch.int32))
         if fp4:
             second["a"].view(torch.uint8).bitwise_xor_(0x88)

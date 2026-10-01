@@ -9,16 +9,21 @@ import torch
 from frost_test_utils import _SM, requires_dsl
 from test_utils import torch_fork_set_rng
 
-pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(not 100 <= _SM <= 106, reason="SM100 templates")]
+pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(not 100 <= _SM <= 107, reason="SM100/SM107 templates")]
 
 
 @pytest.mark.parametrize(
-    "d,dv,cga", [(256, 256, 2), (192, 128, 1), (192, 128, 2), (512, 512, 2)], ids=["d256_cga2", "d192_d128_cga1", "d192_d128_cga2", "d512_cga2"]
+    "d,dv,cga",
+    [(128, 128, 2), (256, 256, 2), (192, 128, 1), (192, 128, 2), (512, 512, 2)],
+    ids=["d128_cga2", "d256_cga2", "d192_d128_cga1", "d192_d128_cga2", "d512_cga2"],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch_fork_set_rng(seed=1300)
 def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if _SM == 107 and cga == 1:
+        pytest.skip("D192 half single-CTA exceeds the current SM107 shared-memory carveout")
 
     q_lengths = [193, 97, 33]
     b, h, hk, sq, sk = 3, 8, 2, 193, 257
@@ -142,13 +147,22 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
         graph.reset()
 
 
-@pytest.mark.parametrize("d,block_scaled", [(128, False), (512, False), (128, True)], ids=["d128_fp8", "d512_fp8", "d128_mxfp8"])
+@pytest.mark.parametrize(
+    "d,dv,block_scaled",
+    [(128, 128, False), (192, 128, False), (256, 256, False), (512, 512, False), (128, 128, True), (192, 128, True)],
+    ids=["d128_fp8", "d192_fp8", "d256_fp8", "d512_fp8", "d128_mxfp8", "d192_mxfp8"],
+)
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"])
 @torch_fork_set_rng(seed=1313)
-def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype):
+def test_quantized_thd_tensormaps_rebind_and_replay(d, dv, block_scaled, input_dtype):
     """Rebuilt FP8 maps must clip poisoned tails after rebinding and replay."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
     from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    if _SM == 107 and block_scaled:
+        pytest.skip("SM107 MXFP8 does not support THD")
+    if _SM != 107 and d == 256:
+        pytest.skip("The changed D256 FP8 template is SM107 only")
 
     q_lengths = [193, 97, 33]
     b, h, hk, sq, sk = 3, 8, 2, 193, 257
@@ -156,20 +170,26 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
     ones = torch.ones(1, dtype=torch.float32, device="cuda")
 
     def tensor_view(raw, heads, length):
-        return raw.as_strided((b, heads, length, d), (length * heads * d, d, heads * d, 1))
+        width = raw.shape[-1]
+        return raw.as_strided((b, heads, length, width), (length * heads * width, width, heads * width, 1))
 
     def update(x, k_lengths):
         x["k_lens"].copy_(torch.tensor(k_lengths, dtype=torch.int32))
         for name, heads, length, lens in (("q", h, sq, q_lengths), ("k", hk, sk, k_lengths), ("v", hk, sk, k_lengths)):
+            width = dv if name == "v" else d
             values, dequantized, factors = [], [], []
             for n in lens:
-                source = torch.randn(1, heads, n, d, dtype=torch.float32, device="cuda") * 0.25
+                source = torch.randn(1, heads, n, width, dtype=torch.float32, device="cuda") * 0.25
                 if block_scaled:
-                    dd, ds, sf_d, sd, ss, sf_s = quantize_to_mxfp8(source, 1, heads, n, d, 32, input_dtype, with_ref=True)
+                    dd, ds, sf_d, sd, ss, sf_s = quantize_to_mxfp8(source, 1, heads, n, width, 32, input_dtype, with_ref=True)
                     value, scale, sf = (sd, ss, sf_s) if name == "v" else (dd, ds, sf_d)
-                    # This regression's MXFP8 flavor is D128, hence one V SF plane.
-                    factors.append(sf.view(torch.uint8).reshape(heads, (n + 127) // 128, 512))
-                    reference = value.double() * scale.reshape(1, heads, n, d).double()
+                    tiles = (n + 127) // 128
+                    if name == "v":
+                        packed_sf = sf.view(torch.uint8).reshape(width // 128, heads, tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(heads, tiles, -1)
+                    else:
+                        packed_sf = sf.view(torch.uint8).reshape(heads, tiles, -1)
+                    factors.append(packed_sf)
+                    reference = value.double() * scale.reshape(1, heads, n, width).double()
                 else:
                     value = source.to(input_dtype)
                     reference = value.double()
@@ -187,10 +207,11 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
     def inputs(k_lengths):
         x = dict(reference={}, q_lens=torch.tensor(q_lengths, dtype=torch.int32, device="cuda"), k_lens=torch.empty(b, dtype=torch.int32, device="cuda"))
         for name, heads, length in (("q", h, sq), ("k", hk, sk), ("v", hk, sk)):
-            x[name] = torch.empty(b * length, heads, d, dtype=input_dtype, device="cuda")
+            width = dv if name == "v" else d
+            x[name] = torch.empty(b * length, heads, width, dtype=input_dtype, device="cuda")
             if block_scaled:
-                x["sf_" + name] = torch.empty(heads, b * ((length + 127) // 128), 512, dtype=torch.uint8, device="cuda")
-        x["out"] = torch.empty(b * sq, h, d, dtype=torch.bfloat16, device="cuda")
+                x["sf_" + name] = torch.empty(heads, b * ((length + 127) // 128), ((width + 127) // 128) * 512, dtype=torch.uint8, device="cuda")
+        x["out"] = torch.empty(b * sq, h, dv, dtype=torch.bfloat16, device="cuda")
         x["stats"] = torch.empty(b * sq, h, dtype=torch.float32, device="cuda")
         update(x, k_lengths)
         return x
@@ -207,6 +228,7 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
     first_lengths = [257, 161, 65]
     first = inputs(first_lengths)
     q, k, v, out, stats = views(first)
+    cga = 1 if d == 256 or (d == 512 and block_scaled and _SM != 107) else 2
     api = SdpaFwdDslSm100(
         sample_q=q,
         sample_k=k,
@@ -217,7 +239,7 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
         is_causal=True,
         causal_bottom_right=True,
         seq_kv_lens_present=True,
-        cga=2,
+        cga=cga,
         sched_policy=1,
         split_kv=1,
         pack_gqa=False,
@@ -226,7 +248,7 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
     )
     assert api.check_support()
     api.compile()
-    assert api._k_mod.CFG.THD_VARLEN and api._k_mod.CFG.CTA_MMA == 2
+    assert api._k_mod.CFG.THD_VARLEN and api._k_mod.CFG.CTA_MMA == cga
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
 
     def run(x):
@@ -251,7 +273,11 @@ def test_quantized_thd_tensormaps_rebind_and_replay(d, block_scaled, input_dtype
             expected = scores.softmax(-1) @ v
             # Existing quantized suites' half-output bounds include P rounding.
             torch.testing.assert_close(x["out"][qb : qb + nq].transpose(0, 1).double(), expected, atol=0.05 if block_scaled else 0.04, rtol=0)
-            torch.testing.assert_close(x["stats"][qb : qb + nq].T.double(), scores.logsumexp(-1), atol=2e-4, rtol=0)
+            # D192 MXFP8 mixes quadratic exp2 approximations into the row sum.
+            # The unchanged kernel has the same LSE (bitwise); its maximum
+            # error over this binding/replay probe is 2.40e-4 on B200.
+            lse_atol = 4e-4 if block_scaled and d == 192 else 2e-4
+            torch.testing.assert_close(x["stats"][qb : qb + nq].T.double(), scores.logsumexp(-1), atol=lse_atol, rtol=0)
             qb += nq
             kb += nk
 
