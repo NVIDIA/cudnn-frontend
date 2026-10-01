@@ -845,14 +845,14 @@ red (2026-09-08).
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ |
+| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ❌ · mxfp8 ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | f16 ✅ · fp8 ✅ **`S_q % 128 == 0` only**ᵇ · mxfp8 ✅ **`S_q % 128 == 0` only**ᵐˣ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on the f16 row's standalone adapterᵇ |
+| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ dense graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on the f16 row's standalone adapterᵇ; a RAGGED padded graph (THD) is served on the f16 rowᵇ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -1128,6 +1128,33 @@ L1-resident refill in the 40-register TMA-LDG / TMA-STG / scheduler warps around
 `setmaxnreg` boundary, 0 in the gate math; the f16 and per-tensor FP8 gated bodies stay
 at 6) whose cost is UNMEASURED until a perf-node A/B/A -- a correctness claim, not yet a
 perf one.
+
+**THD / ragged (f16 row only).** The packed path: Q/K/V/O/dO and the gradients are
+PACKED `[1, T, H, D]` (packed BSHD rows -- element stride 1, head stride D, token stride
+>= H·D and a multiple of 8; a padded token stride is served as declared), `seq_len_q/kv`
+as `(B,)` tensors on the graph (`(B,)` or `(B+1,)` prefixes standalone), both declared
+totals REQUIRED (`Capabilities.thd_declared_totals`: the kv-blocked dS workspace, delta
+and the GQA partials are sized at build time), both packed Stats layouts the forward
+emits.  Mechanics: a setup launch (`kernels/thd_helpers.thd_bwd_setup_host(kv_blocked=True)`)
+builds the metadata with the dS workspace row offsets blocked over the KV lengths at the
+kernel's 256-row kv block; the main kernel's own setup kernel clamps the five input
+descriptors to the live packed totals (a NaN capacity tail is TMA-OOB zero), emits one
+clipped dV descriptor per sequence and resets the claim counter per launch; the kernel
+claims (sequence, kv block, head) units from the device counter, masks each sequence's kv
+tail and q pad columns from its own lengths (the bottom-right diagonal `S_kv[b] − S_q[b]`
+included) and reads the packed Stats past `S_q[b]` as `+inf`; stage 3 renders the THD arm
+with `MatmulTemplateParams.thd_rows_kv` (the kv-major workspace flips the token side of
+each reduction against the SM100 chain's q-major one), UNTRIMMED, the workspace zero-filled
+once per execute under a causal-family mask or window; GQA via per-Q-head partials over the
+packed kv axis, dQ once per group member.  Degenerate sequences exact (empty-KV: no unit,
+zero dQ by select; empty-Q: one forced fully-masked tile, zero dK/dV).  Declined under THD:
+right-band widening (as dense), bias, THD on the fp8 / MXFP8 rows (one uniform real kv
+length per body).  Perf: stage 3 untrimmed under masks (the SM100 measured −20 % at d512
+causal), unmeasured here.  Tests: `test_sdpa_bwd_thd_sm107.py` (direct adapter + pinned
+graph, per-sequence fp64 oracle under the dense suite's bounds; empty sequences, NaN
+capacity tails, dead units, GQA, the causal family, both Stats packings, prepared rebind /
+replay / length forms), the SM100 stage-3 renderings PTX-identical at `thd_rows_kv`'s
+default, the dense f16 PTX identical to before the port.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
 d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
