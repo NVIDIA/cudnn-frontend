@@ -212,9 +212,10 @@ def _names_d512(metafunc) -> bool:
     return False
 
 
-@pytest.hookimpl(trylast=True)
 def pytest_generate_tests(metafunc):
-    # trylast: after the function's own parametrize marks, so the arm is the LAST id component ([...-two_by_two]).
+    # A test module's hook is handed to pluggy's call_extra, which ignores hookimpl options (trylast / wrapper), so it runs
+    # BEFORE pytest applies the function's own parametrize marks: the arm is the FIRST id component
+    # ([two_by_two-fp16-dense-dsv4_d512]; `-k "(d512 or dsv4) and two_by_two"` selects the twin run).
     if "d512_arm" in metafunc.fixturenames and _names_d512(metafunc):
         metafunc.parametrize("d512_arm", _D512_ARMS, ids=_D512_ARMS, indirect=True)
 

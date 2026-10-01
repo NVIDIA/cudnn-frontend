@@ -116,7 +116,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
-from cudnn.frost.tile_dsl.mma import mma_ss, desc_opaque
+from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_load_subtiles,
@@ -1480,10 +1480,16 @@ def _softmax_warp_group(
 
 @cute.jit
 def _rescale_o_half(tmem_base, alpha, first_block: cutlass.Constexpr[int], n_blocks: cutlass.Constexpr[int]):
-    """O[lane][cols of blocks first_block .. +n_blocks) *= alpha (16-col ld / packed mul / st), then wait::st."""
+    """O[lane][cols of blocks first_block .. +n_blocks) *= alpha (16-col ld / wait::ld / packed mul / st), then wait::st.
+
+    The ``tcgen05.wait::ld`` after each load is the DSL contract ("pair tcgen05_ld with tcgen05_wait(LOAD) before reading
+    the result"); the shipped d256 (prefill_d256_f16.py _correction rescale) and role-split d512 rescale loops omit it and
+    pass by hardware grace -- this kernel keeps the contract on its rare slow arm (one wait per 16-col block, alpha != 1
+    only)."""
     for blk in cutlass.range_constexpr(n_blocks):
         o_addr = tmem_base + cutlass.Int32(LAYOUT.O_OFF + (first_block + blk) * CORR_BLOCK_COLS)
         o_chunk = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), num=CORR_BLOCK_COLS)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         o_scaled = vec_scale_pair(o_chunk, alpha, CORR_BLOCK_COLS)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
