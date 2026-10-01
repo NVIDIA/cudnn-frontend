@@ -35,6 +35,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_O_NVFP4,
     SCHED_LPT,
     SCHED_LPT_L2,
+    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
@@ -51,6 +52,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     derive_d192_internal_params,
     derive_d256_internal_params,
     pack_gqa_supported,
+    supports_live_lpt,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
@@ -1611,8 +1613,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self._sfo_geometry = self._sf_o_geometry(self.o_block_scale, int(d_v))
         self._value_error_if(
-            self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
-            f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
+            self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL),
+            f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2/LPT_IF_FULL (or None to derive); got {self.sched_policy}",
+        )
+        self._value_error_if(
+            self.sched_policy == SCHED_LPT_IF_FULL
+            and not (
+                self._device_cc == (10, 0)
+                and supports_live_lpt(
+                    self.flavor,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    bottom_right=self.causal_bottom_right,
+                    window_left=self.window_left,
+                    window_right=self.window_right,
+                )
+            ),
+            "LPT_IF_FULL requires SM100 half D256 paged THD bottom-right causal attention without a left window",
         )
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),

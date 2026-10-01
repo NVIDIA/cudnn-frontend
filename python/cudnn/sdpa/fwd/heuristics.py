@@ -56,6 +56,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_FP16,
     SCHED_LPT,
     SCHED_LPT_L2,
+    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -486,12 +487,31 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:
-        # A ragged batch carries its own scheduler: it walks the LIVE units
-        # through batch_remap over a machine-sized grid. The LPT decodes map a
-        # linear tile id onto a dense rectangular tile space, so ranking them
-        # here would hand THD a decode built for a geometry it does not have --
-        # and spend autotune slots on it. Same exclusion the adapters apply to
-        # their standalone-wrapper derivation.
+        # A ragged batch walks LIVE units through batch_remap over a
+        # machine-sized grid. Only flavors with a THD policy decoder can tune
+        # its ordering; the dense rectangular LPT decoder cannot serve it.
+        # D128/D256 half THD implements policy ordering within the live list.
+        # Expose alternatives for tuning and prefer live-length policies only
+        # for the measured prefill families below.
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+            primary = SCHED_NATURAL
+            # Measured B200 full-prefill envelopes. Runtime lengths may still
+            # become prefix chunks after capture; policy 3 reads them on GPU.
+            # Keep mixed batches and 32K envelopes on the existing default.
+            if (
+                SCHED_LPT_IF_FULL in domain
+                and facts.dtype == cudnn.data_type.BFLOAT16
+                and (facts.d_qk, facts.d_v) == (256, 256)
+                and facts.b == 1
+                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+                and facts.s_q == facts.s_kv
+                and facts.page_size in (16, 128)
+                and not (facts.has_sink or facts.has_epilogue_gate)
+            ):
+                # Packed Stats use the same measured full/prefix scheduling.
+                primary = SCHED_LPT_IF_FULL
+            return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:

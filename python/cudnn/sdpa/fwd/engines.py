@@ -33,10 +33,10 @@ from typing import Any, Callable, Optional
 
 import cudnn
 
-from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported, supports_live_lpt
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -604,11 +604,26 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     d256 kernel that honours LPT next to flavors that do not.
     """
     selected = _selected_d_shape(capabilities, facts)
+    domain = capabilities.sched_policies
     if selected is not None:
         for shape, shape_domain in capabilities.sched_policies_by_d_shape:
             if shape == selected:
-                return shape_domain
-    return capabilities.sched_policies
+                domain = shape_domain
+                break
+    if SCHED_LPT_IF_FULL in domain and not (
+        facts.device_cc == (10, 0)
+        and supports_live_lpt(
+            selected,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            bottom_right=facts.bottom_right,
+            window_left=facts.window_left,
+            window_right=(facts.right_bound or 0) if facts.causal else None,
+        )
+    ):
+        domain = domain - {SCHED_LPT_IF_FULL}
+    return domain
 
 
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
@@ -1075,7 +1090,7 @@ def _sm100_spec() -> EngineSpec:
             # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
             # scale-factor paths are validated against relaxed layouts.
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2, SCHED_LPT_IF_FULL}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
