@@ -2126,11 +2126,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
-        if self.flavor == (512, 512) and not self._fp8 and self._device_cc != (10, 7):
+        if self.flavor == (512, 512) and not self._fp8:
             # The 2x2-datapath twin (module constant D512_2X2, read at CALL time): half d512 only, dense or
             # THD, unsplit, unpaged, PackGQA only when the whole group divides the 64-row tile (G=128 and
-            # split_kv > 1 stay on the role-split kernel in phase 1).  Rubin keeps the role split until its
-            # 2x2 sibling lands.  Default False -> the record is untouched.
+            # split_kv > 1 stay on the role-split kernel in phase 1).  Both arch lines: the loader's rubin arm
+            # routes the record to sm107/prefill_d512_f16_2x2.py (the Rubin row already declines split / paged /
+            # PackGQA on d512, so the domain terms below are no-ops there).  Default False -> the record is untouched.
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
             if two_by_two:
                 params = replace(params, mma_2x2=True)
