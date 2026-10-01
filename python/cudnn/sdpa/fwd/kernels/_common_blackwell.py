@@ -232,10 +232,11 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     both CTAs of the pair arrive on the LEADER's copy; every init count is the exact per-phase
     arrival sum, P3):
 
-    WAIT FORM RULE (``cross_pair_poll``, default True -- the kernel's CROSS_PAIR_WAIT_POLL constant; a test
-    flips it to reproduce the hang): every barrier whose phase can be completed by an operation issued from
-    the OTHER pair of the cluster is waited with the NON-BLOCKING ``test_wait.parity`` poll
-    (``MBarrier(poll=True)`` -> ``barrier.wait_poll``): mb_k_empty / mb_v_empty (both pair leaders' commits,
+    WAIT FORM RULE (``cross_pair_poll``, default True -- the kernel's POLL_CROSS_PAIR_WAITS constant; only the
+    time-slicing negative control flips it): every barrier whose phase can be completed by an operation issued
+    from the OTHER pair of the cluster is waited with the NON-BLOCKING ``test_wait.parity`` poll
+    (``MBarrier(poll=True)`` -> ``barrier.wait_poll``, POLL_TIGHT_ITERS tight tests then a timer nanosleep
+    between tests): mb_k_empty / mb_v_empty (both pair leaders' commits,
     mask 0xF), mb_o_empty (the twin's arrive_on_peer), mb_k_full / mb_v_full (the twin pair's TMA
     complete_tx).  A parked waiter (the default ``try_wait`` hint form AND the hint-less spin) loses such a
     wake-up under GPU time-slicing (d512_bprop lane, B200 2026-10-01: hang within 2-74 launches; the poll
@@ -275,6 +276,10 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
       mb_stat_full [STAT_STAGES]  init SOFTMAX_LANES (128), THREAD.  Every softmax lane after its
                            alpha (or tile-end stats) tcgen05.st + wait::st: 1x/iteration + 1x/tile
                            end; the ring advances on both.  Waiters: correction lanes, phase 0.
+                           The payload of ring step s lives in slot-s columns ONLY (alpha at 384+s,
+                           the tile stats at 386+2s / 387+2s): a fixed stats pair is protected by the
+                           ring only if the next writer waits the SAME slot's empty, which an EMPTY
+                           tile (one ring step) does not -- the dead-row race the sm107 lane found.
       mb_stat_empty [STAT_STAGES]  init CORR_LANES (128), THREAD.  Every correction lane once per
                            consumed ring step.  Waiters: softmax lanes before the next store into
                            that slot, pre-armed 1.

@@ -85,6 +85,15 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
             pass
 
 
+# wait_poll shape: POLL_TIGHT_ITERS back-to-back test_wait's (~1 us), then a plain TIMER ``nanosleep.u32 POLL_SLEEP_NS``
+# between tests.  The sleep is the timer form (SASS NANOSLEEP), NOT the event-sleep of a parked try_wait (NANOSLEEP.SYNCS) --
+# the warp still never hands itself to the barrier unit.  MEASURED (d512 2x2 backward, B200 2026-10-01): a TIGHT test_wait
+# loop on the MMA / TMA-LDG warp starves the compute warps that share its SMSP -- stage 2 ran 2.2x SLOWER (94575 vs 39166 us
+# dense 8K); the two-phase form removes that while keeping the no-park property.
+POLL_TIGHT_ITERS: int = 32
+POLL_SLEEP_NS: int = 128
+
+
 @cute.jit
 def wait_poll(mb, phase):
     """NON-BLOCKING poll: ``mbarrier.test_wait.parity.acquire.cta`` in an inline-PTX loop until the phase parity differs from
@@ -103,9 +112,12 @@ def wait_poll(mb, phase):
     hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on
     4.7.0, hence the inline PTX; labels are block-scoped, so the fixed names are legal at every instantiation."""
     nvvm.inline_ptx(
-        "{\n\t.reg .pred P1;\n\tLAB_POLL:\n\t"
+        "{\n\t.reg .pred P1;\n\t.reg .u32 n;\n\tmov.u32 n, 0;\n\tLAB_TIGHT:\n\t"
         "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
-        "@P1 bra.uni DONE;\n\tbra.uni LAB_POLL;\n\tDONE:\n\t}",
+        "@P1 bra DONE;\n\tadd.u32 n, n, 1;\n\tsetp.lt.u32 P1, n, " + str(POLL_TIGHT_ITERS) + ";\n\t@P1 bra LAB_TIGHT;\n\tLAB_SLEEP:\n\t"
+        "nanosleep.u32 " + str(POLL_SLEEP_NS) + ";\n\t"
+        "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+        "@!P1 bra LAB_SLEEP;\n\tDONE:\n\t}",
         read_only_args=[mb, cutlass.Int32(phase)],
     )
 

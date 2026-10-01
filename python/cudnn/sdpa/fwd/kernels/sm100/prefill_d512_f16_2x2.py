@@ -17,7 +17,7 @@ hold the SAME 64 rows, one column half each.  Thread (r, h) = (tid & 63, tid >> 
 compute warpgroup therefore owns row r's columns of half h:
   S parity p   : cols [256 + 64p, +64)  = kv [64h, +64) of the 128-wide tile      (ONE 32x32b x64 ld)
   O            : cols [0, 256)          = d_v [256h, +256)                        (BMM2 N-block c at cols [128c, +128))
-  alpha[p]     : col 384 + p (both halves write the SAME value); tile stats: cols 386 (max) / 387 (sum)
+  alpha[p]     : col 384 + p (both halves write the SAME value); tile stats of ring slot s: cols 386 + 2s / 387 + 2s
 Per-row max / sum are HALF-row values until exchanged with lane r + 64 through SMEM (sXchgMax
 per parity, sXchgSum at tile end) and a 128-thread named barrier -- both halves then run the
 identical scalar chain (RESCALE_THRESHOLD, row_max_for_exp2, alpha, beta, lse), so alpha / beta
@@ -89,12 +89,16 @@ CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 4))
 # per-CTA mb_o_empty gate, GREEN on the pair-wide one).
 DEBUG_STG_DELAY_US: int = int(globals().get("FROST_D512_2X2_DEBUG_STG_DELAY_US", 0))
 # Wait form of the CROSS-PAIR barriers (k/v_full, k/v_empty, o_empty: their phase is completed by the other pair's
-# commit / arrive / TMA bytes): True = the non-blocking test_wait poll (barrier.wait_poll).  A parked waiter (the
-# default try_wait hint form, and the hint-less spin too) LOSES such a wake-up under GPU time-slicing -- the d512 2x2
-# backward hung within 2-74 launches, the poll ran 200/200 (lane_d512_bprop/fix/HANDOFF2.md).  Same loader-style
-# channel as the two globals above; the contention detector flips it to 0 to reproduce the hang, never a knob.
-CROSS_PAIR_WAIT_POLL: bool = bool(int(globals().get("FROST_D512_2X2_CROSS_PAIR_WAIT_POLL", 1)))
+# commit / arrive / TMA bytes): True = the non-blocking test_wait poll (barrier.wait_poll: POLL_TIGHT_ITERS tight tests,
+# then a timer nanosleep(POLL_SLEEP_NS) between tests).  A parked waiter (the default try_wait hint form, and the
+# hint-less spin too) LOSES such a wake-up under GPU time-slicing -- the d512 2x2 backward hung within 2-74 launches,
+# the poll ran 200/200 (lane_d512_bprop/fix/HANDOFF2.md).  A correctness constant (the sm107 sibling's spelling): the
+# module refuses to trace with False unless the time-slicing NEGATIVE CONTROL injects the loader-style global
+# FROST_D512_2X2_POLL_CROSS_PAIR_WAITS=0 to render the pre-fix parking form -- never a knob.
+POLL_CROSS_PAIR_WAITS: bool = bool(int(globals().get("FROST_D512_2X2_POLL_CROSS_PAIR_WAITS", 1)))
 CFG, _TMA = make_cfg_d512_2x2(PARAMS, cga_m=CGA_M_ARM)
+if not POLL_CROSS_PAIR_WAITS and "FROST_D512_2X2_POLL_CROSS_PAIR_WAITS" not in globals():
+    raise ValueError("prefill_sdpa_d512_f16_2x2_sm100: cross-pair-released barriers must be polled with mbarrier.test_wait.parity (poll-wait rule)")
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -250,15 +254,28 @@ class KernelTmemLayout:
     S_ACC_OFF: int = 256  # parity p at S_ACC_OFF + 64p: lane r + 64*(kv >> 6), col kv & 63
     S_ACC_COLS: int = 64
     ALPHA_OFF: int = 384  # + stat ring idx
-    STATS_MAX_OFF: int = 386
-    STATS_SUM_OFF: int = 387
+    # Tile stats (total_max_safe, final_sum) PER RING SLOT: cols STATS_OFF + 2*idx, +1.  They USED to live in the two FIXED
+    # columns 386 / 387 -- a race (found by the sm107 lane 2026-10-01, reproduced on the B200 with this body: lane_d512_fprop/
+    # fix/stair_red_sm100.log, 576 live rows published DEAD): the stats ride the alpha ring (mb_stat_full / mb_stat_empty, 2
+    # slots) but a fixed column is protected by the ring only when the NEXT writer of that column waits the SAME slot's empty.
+    # An EMPTY tile is ONE ring step, so its stats store waited mb_stat_empty[1 - s] (the correction's consumption of the
+    # previous tile's LAST ALPHA), not mb_stat_empty[s] (its read of the previous tile's stats): a softmax lane entering an
+    # empty tile while its correction lane was still in the slow arm (two O rescales between that alpha consume and the stats
+    # read) overwrote 386/387 with (-, 0) and the correction read final_sum = 0 -> O = 0, LSE = -inf.  Only rows whose last
+    # alpha != 1 lose the race (test_two_by_two_stats_ring_slot_race_empty_after_live: the +1 stair rows).  Slot-indexed
+    # stats put every ring step's payload in its own columns, so the ring's full/empty protocol covers them exactly as alpha.
+    STATS_OFF: int = 386
+    STATS_COLS_PER_SLOT: int = 2
 
 
 LAYOUT = KernelTmemLayout()
 _require(LAYOUT.TOTAL_COLS == CFG.TMEM_COLS and LAYOUT.O_COLS == CFG.O_TMEM_COLS and LAYOUT.S_ACC_COLS == CFG.S_TMEM_COLS, "TMEM layout disagrees with the Cfg")
 _require(LAYOUT.O_OFF + LAYOUT.O_COLS == LAYOUT.S_ACC_OFF, "S parities must abut O")
 _require(LAYOUT.S_ACC_OFF + CFG.XFER_STAGES * LAYOUT.S_ACC_COLS == LAYOUT.ALPHA_OFF, "alpha ring must abut the S parities")
-_require(LAYOUT.ALPHA_OFF + STAT_STAGES == LAYOUT.STATS_MAX_OFF and LAYOUT.STATS_SUM_OFF + 1 <= LAYOUT.TOTAL_COLS, "alpha/stats columns overflow")
+_require(
+    LAYOUT.ALPHA_OFF + STAT_STAGES == LAYOUT.STATS_OFF and LAYOUT.STATS_OFF + STAT_STAGES * LAYOUT.STATS_COLS_PER_SLOT <= LAYOUT.TOTAL_COLS,
+    "alpha/stats columns overflow",
+)
 _require(CFG.XFER_STAGES >= CFG.BMM1_LOOKAHEAD + 1, "XFER_STAGES >= BMM1_LOOKAHEAD + 1 (S/P slot reuse rides the MMA issue order)")
 _require(CFG.BMM1_LOOKAHEAD == 1 and CFG.XFER_STAGES == 2, "v1 issue schedule is written for one iteration of BMM1 lookahead over two S/P parities")
 
@@ -409,7 +426,7 @@ def _kernel(
         desc_version=CFG.DESC_VERSION,
     )
 
-    bars = make_d512_2x2_bars(CFG, N_O_CHUNKS=N_O_CHUNKS, STAT_STAGES=STAT_STAGES, cross_pair_poll=CROSS_PAIR_WAIT_POLL)
+    bars = make_d512_2x2_bars(CFG, N_O_CHUNKS=N_O_CHUNKS, STAT_STAGES=STAT_STAGES, cross_pair_poll=POLL_CROSS_PAIR_WAITS)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -1463,8 +1480,9 @@ def _softmax_warp_group(
 
         # Tile end: row-sum exchange through the DEDICATED sXchgSum (fixed operand order -> identical on
         # both halves); a second barrier so no fast lane's next write (sum of the next tile, or the max
-        # slot of its first iteration) races the partner's read; then the tile stats to cols
-        # STATS_MAX_OFF / STATS_SUM_OFF as the next ring step -- unconditional, empty tiles included
+        # slot of its first iteration) races the partner's read; then the tile stats to THIS ring step's
+        # stats columns (STATS_OFF + 2 * slot: the ring's empty wait below protects exactly these two
+        # columns, see KernelTmemLayout) as the next ring step -- unconditional, empty tiles included
         # (the correction consumes one ring step per tile end).
         partial_sum = total_sum_vec[0] + total_sum_vec[1]
         sXchgSum.subview(half_h * cutlass.Int32(CFG.TILE_M) + row_r).store(partial_sum)
@@ -1472,7 +1490,7 @@ def _softmax_warp_group(
         final_sum = sXchgSum.subview(row_r).load() + sXchgSum.subview(cutlass.Int32(CFG.TILE_M) + row_r).load()
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=CFG.SOFTMAX_LANES)
         bars.mb_stat_empty[stat_state.idx].wait(stat_state.phase)
-        stats_addr = tmem_base + cutlass.Int32(LAYOUT.STATS_MAX_OFF)
+        stats_addr = tmem_base + cutlass.Int32(LAYOUT.STATS_OFF) + stat_state.idx * cutlass.Int32(LAYOUT.STATS_COLS_PER_SLOT)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), cutlass.Vector.from_elements((total_max_safe, final_sum), cutlass.Float32))
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_stat_full[stat_state.idx].arrive()
@@ -1612,9 +1630,10 @@ def _correction_warp_group(
                 bars.mb_bmm2_ready[ready_c1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
 
-        # ---- tile end: stats (UNCONDITIONAL ring step, empty tiles included) ----
+        # ---- tile end: stats (UNCONDITIONAL ring step, empty tiles included; read from THIS ring step's columns) ----
         bars.mb_stat_full[stat_state.idx].wait(stat_state.phase)
-        stats_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(LAYOUT.STATS_MAX_OFF), cutlass.Float32), num=2)
+        stats_addr_rd = tmem_base + cutlass.Int32(LAYOUT.STATS_OFF) + stat_state.idx * cutlass.Int32(LAYOUT.STATS_COLS_PER_SLOT)
+        stats_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(stats_addr_rd, cutlass.Float32), num=2)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         final_max = stats_vec[0]
         final_ell = stats_vec[1]
@@ -1706,7 +1725,8 @@ def _correction_warp_group(
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_o_full[half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)].arrive()
         else:
-            o_cur = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_EPI_BLOCK_COLS)), cutlass.Float32)
+            o_zeros = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_EPI_BLOCK_COLS)), cutlass.Float32)
+            o_cur = o_zeros
             if tile_live:
                 o_cur = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(LAYOUT.O_OFF), cutlass.Float32), num=O_EPI_BLOCK_COLS)
             for b in cutlass.range_constexpr(N_O_EPI_BLOCKS):
@@ -1721,7 +1741,13 @@ def _correction_warp_group(
                         )
                 if tile_live:
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                o_half = (o_cur * beta).to(OUT_STORAGE_DTYPE)
+                # Dead / trimmed rows are zeroed by a SELECT, never by `* beta` with beta = 0: a q-trimmed row whose Q memory
+                # holds NaN (a poisoned padded tail) has S = P = O = NaN in TMEM, and NaN * 0 = NaN would reach the output
+                # (test_two_by_two_trimmed_rows_with_nan_inputs_store_zero).  The fp32-partials arm below selects per element.
+                o_scaled = o_cur * beta
+                if row_dead:
+                    o_scaled = o_zeros
+                o_half = o_scaled.to(OUT_STORAGE_DTYPE)
                 subtile_rt = half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)
                 smem_off = (
                     subtile_rt * cutlass.Int32(O_SUBTILE_STRIDE_ELEMS)

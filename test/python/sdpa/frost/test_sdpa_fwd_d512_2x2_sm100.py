@@ -189,7 +189,7 @@ def test_two_by_two_cross_pair_waits_poll():
     """Every barrier whose phase the OTHER pair can complete (k/v_empty: both leaders' commits mask 0xF; o_empty: the twin's
     arrive_on_peer; k/v_full: the twin pair's TMA bytes) is waited with the non-blocking test_wait poll (MBarrier.poll), and
     no pair-local barrier is: a waiter parked in the barrier unit loses a cross-pair wake-up under GPU time-slicing (the
-    d512 2x2 backward hung within 2-74 launches on every parking form).  The kernel threads its CROSS_PAIR_WAIT_POLL
+    d512 2x2 backward hung within 2-74 launches on every parking form).  The kernel threads its POLL_CROSS_PAIR_WAITS
     constant (default ON) into make_d512_2x2_bars; the contention run (lane_d512_fprop/fix/run_contention.sh) flips it to
     0 for RED.  Source pins (the bundle allocates SMEM arrays, so it cannot be built on the host)."""
     import inspect
@@ -845,7 +845,7 @@ def test_two_by_two_twin_alias_gate_under_pair_skew(causal):
 # One child = one process = one CUDA context.  ``load`` launches the shipped role-split d512 forward back to back (the second
 # context that makes the GPU time-slice); ``twin`` runs the 2x2 forward for N launches with a per-launch wall budget enforced
 # by polling a CUDA event from Python (a wedged launch never returns, so the budget is the only way out) and exits 3 on a
-# hang.  Levers (JSON) are the kernel's loader-style module globals (FROST_D512_2X2_CROSS_PAIR_WAIT_POLL=0 renders the
+# hang.  Levers (JSON) are the kernel's loader-style module globals (FROST_D512_2X2_POLL_CROSS_PAIR_WAITS=0 renders the
 # pre-fix parking waits).  B=1 H=128 S=8192 dense; the values are irrelevant to the schedule.
 _CONTENTION_CHILD = _textwrap.dedent(r"""
     import importlib.util, json, math, os, sys, time
@@ -883,7 +883,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     scale_log2 = cutlass.Float32(math.log2(math.e) / math.sqrt(D))
     def run():
         launch_f16(fn, q, k, v, o, lse, sinks, seq_kv, o_desc, (B, H, H, S, S, 0), scale_log2, cutlass.Int32(0), 0, stream=stream, host=mod._host)
-    print(f"[{role}] kernel {os.path.basename(mod.__file__)} poll={getattr(mod, 'CROSS_PAIR_WAIT_POLL', None)}", flush=True)
+    print(f"[{role}] kernel {os.path.basename(mod.__file__)} poll={getattr(mod, 'POLL_CROSS_PAIR_WAITS', None)}", flush=True)
     for i in range(n):
         t0 = time.time()
         run()
@@ -957,13 +957,13 @@ def test_two_by_two_survives_gpu_time_slicing(tmp_path):
     strict=False, reason="the FORWARD's parking form has not reproduced the hang yet (0 in 1700+ time-sliced launches on 2026-10-01); the backward's did"
 )
 def test_two_by_two_parking_wait_form_under_time_slicing(tmp_path):
-    """NEGATIVE CONTROL of the detector above: FROST_D512_2X2_CROSS_PAIR_WAIT_POLL=0 renders the pre-fix kernel (the parking
+    """NEGATIVE CONTROL of the detector above: FROST_D512_2X2_POLL_CROSS_PAIR_WAITS=0 renders the pre-fix kernel (the parking
     try_wait on the cross-pair barriers too) and is EXPECTED to hang within 300 time-sliced launches, as the backward did
     (launch 2 / 23 / 25 / 74 in four of four runs).  On the forward the hang has NOT been reproduced yet (300/300 at S=8192,
     800/800 at S=16384, 600/600 causal S=16384 under two load contexts, lane_d512_fprop/fix/cont_red_park*.log), so the assertion is xfail(strict=False):
     an XPASS here is the forward reproducing the mechanism -- record its log.  It can wedge a kernel for the 30 s budget
     before the child dies, hence ``gpu_exclusive``: deselect it on a GPU other jobs share."""
-    twin = _contention_run(tmp_path, twin_levers={"FROST_D512_2X2_CROSS_PAIR_WAIT_POLL": 0}, n_twin=300, budget_s=30.0, tag="parking")
+    twin = _contention_run(tmp_path, twin_levers={"FROST_D512_2X2_POLL_CROSS_PAIR_WAITS": 0}, n_twin=300, budget_s=30.0, tag="parking")
     assert twin.returncode == 3 and "HANG" in twin.stdout, f"the parking wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-1500:]}"
 
 

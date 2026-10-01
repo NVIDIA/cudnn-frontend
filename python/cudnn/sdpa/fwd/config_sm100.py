@@ -1492,7 +1492,8 @@ class CfgD512X2:
     PAIR_LANES: int = 128 * 2
 
     # TMEM: O 64x512 fp32 in the 2x2 atom = 256 cols at [0,256), S parity p =
-    # 64 cols at [256 + 64p, +64), alpha[p] at 384+p, tile stats at 386/387.
+    # 64 cols at [256 + 64p, +64), alpha[s] at 384+s, tile stats of ring slot s
+    # at 386+2s / 387+2s (slot-indexed: a fixed stats pair raced the alpha ring).
     TMEM_COLS: int = 512
     O_TMEM_COLS: int = 256
     S_TMEM_COLS: int = 64
@@ -1617,8 +1618,8 @@ def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
             "d512 2x2: 2x2 atom TMEM footprints (N/2 cols)",
         ),
         (
-            cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 4 <= cfg.TMEM_COLS,
-            f"d512 2x2: TMEM carve O {cfg.O_TMEM_COLS} + S {cfg.XFER_STAGES * cfg.S_TMEM_COLS} + alpha/stats 4 > {cfg.TMEM_COLS}",
+            cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 2 + 2 * 2 <= cfg.TMEM_COLS,
+            f"d512 2x2: TMEM carve O {cfg.O_TMEM_COLS} + S {cfg.XFER_STAGES * cfg.S_TMEM_COLS} + alpha ring 2 + per-slot stats 4 > {cfg.TMEM_COLS}",
         ),
         (cfg.DESC_VERSION == 0, "d512 2x2 (SM100): every operand sits below 256 KiB -> tcgen05 SMEM descriptor version 0"),
         (

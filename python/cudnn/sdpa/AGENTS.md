@@ -216,6 +216,18 @@ runnable detector in `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; a
   2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
   (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
   o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
+  The poll is two-phase (`POLL_TIGHT_ITERS` = 32 tight tests, then a TIMER `nanosleep(POLL_SLEEP_NS=128)` between
+  tests): a tight loop on the MMA / TMA-LDG warp starves the compute warps sharing its SMSP (the backward ran 2.2x
+  slower with it); the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never
+  parks on the barrier.
+- **A fixed TMEM column is NOT protected by a ring it rides.** Per-ring-step payload goes in per-SLOT columns (alpha
+  at `384 + s`, tile stats at `386 + 2s`): a fixed stats pair is protected only if the next writer waits the SAME
+  slot's empty, and an EMPTY tile (one ring step) waits the other slot's -- the slow-arm correction then read
+  `final_sum = 0` and published live rows DEAD (sm107 lane, 2026-10-01; reproduced on the SM100 body:
+  `lane_d512_fprop/fix/stair_red_sm100.log`). Detector: `test_two_by_two_stats_ring_slot_race_empty_after_live`.
+- **Dead / trimmed rows are zeroed by a SELECT, never by `o * beta` with beta = 0.** A trimmed row whose Q memory is
+  NaN (poisoned padded tail) carries NaN through S, P and O; `NaN * 0 = NaN` reaches the output. Detector:
+  `test_two_by_two_trimmed_rows_with_nan_inputs_store_zero`.
   Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
   barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
   load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
