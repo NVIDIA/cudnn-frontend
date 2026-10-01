@@ -96,14 +96,22 @@ ambient or an explicit launch stream sees the whole backward exactly as before
 (Rule 5 kept; ``test_a_caller_stream_orders_every_stage`` runs under the knob);
 the same kernels launch (the CUPTI count is unchanged) and the gradients are
 bitwise the in-order block's -- the GEMMs are deterministic
-(``test_fuse_wgrad_overlap_is_bitwise_the_in_order_block``).  The side streams
-and the four events are created once at ``compile()`` (Rule 1: nothing per
-execute; two pool streams, the one that is not the caller's launch stream is
-used).  CUDA-graph capture of ``execute`` records the fork and the join as
-graph edges -- a side stream that joins before the capture ends is the
-canonical fork/join pattern -- and the replay is bitwise the eager run
+(``test_fuse_wgrad_overlap_is_bitwise_the_in_order_block``).  The side stream
+is the block's OWN -- one dedicated non-blocking stream at the device's lowest
+priority, created through the driver, never a torch pool stream (so never a
+caller's launch stream) -- and it and the four events are created once at
+``compile()`` and released with the block (Rule 1: nothing per execute).  One
+compiled block may be driven from several host threads on different launch
+streams (the convenience wrapper caches a block process-wide): the fork pair
+is atomic and the join needs no lock (``_WgradSideStream``).  CUDA-graph
+capture of ``execute`` records the fork and the join as graph edges -- a side
+stream that joins before the capture ends is the canonical fork/join pattern --
+and the replay is bitwise the eager run
 (``test_cuda_graph_capture_replays_bitwise``, both knob values).  Declined typed
-when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing to overlap).
+when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing to overlap);
+the convenience wrapper, whose needs follow ``requires_grad``, runs the
+in-order block instead when the weights are frozen (a frozen-weights phase of
+a training loop must not fail over a scheduling knob).
 
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
@@ -203,6 +211,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import threading
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -1017,6 +1027,15 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
     return ps.view(t, geom.n_qkvg), saved.o.view(t, geom.h_q, d)
 
 
+def _release_side_stream(handle: int) -> None:
+    """``cuStreamDestroy`` of a block's side stream -- the driver defers the destruction until the stream's work has
+    drained.  Errors are swallowed: this also runs at interpreter exit, when the context may already be gone."""
+    try:
+        cuda.cuStreamDestroy(cuda.CUstream(handle))
+    except Exception:  # noqa: BLE001 -- the teardown order at exit is not ours to control
+        pass
+
+
 class _WgradSideStream:
     """The block-owned side stream of ``fuse_wgrad_overlap`` and its events -- created ONCE per compiled block
     (Rule 1: nothing per execute), used by :meth:`GatedAttentionBlockBwd.execute` as a fork / join pair per
@@ -1030,48 +1049,76 @@ class _WgradSideStream:
         join_record(tag):   record ev_join[tag] on side (right after the GEMM)
         join(launch, tag):  the launch stream waits ev_join[tag]        (at the END of execute: the latest legal point)
 
-    Two pool streams are drawn at construction and :meth:`pick` returns the one that is NOT the caller's launch stream,
-    so the fork / join never degenerates into a same-stream no-op (torch hands pool streams out round-robin; a caller
-    who drew the same one would otherwise get an in-order backward with no overlap and no error).  The events are
-    torch events (no timing), created eagerly here by one record on the side stream so no CUDA object is created on
-    the execute path -- inside a CUDA-graph capture included, where the record / wait pair becomes a graph edge and
-    the side stream joins the capture (torch's ``Event`` / ``Stream.wait_event`` are ``cudaEventRecord`` /
-    ``cudaStreamWaitEvent``).  The launch stream reaches here as the raw handle every stage takes; it is wrapped
-    through :func:`cudnn._torch_stream.as_torch_stream` (torch's current / default stream object when it is one of
-    them, an ``ExternalStream`` view otherwise -- a Python object, no CUDA allocation).
+    The side stream is DEDICATED: one ``cuStreamCreateWithPriority`` on the device's primary context (torch's), never a
+    torch pool stream -- the pool's 32 default-priority streams go round-robin to every ``torch.cuda.Stream()`` in the
+    process, so a pool stream could be the caller's launch stream (a same-stream fork / join = an in-order backward
+    with no overlap and no error) or carry a stranger's work in front of the wgrad GEMM.  ``CU_STREAM_NON_BLOCKING``
+    (no implicit ordering against the legacy default stream, which a default-stream launch stream would otherwise
+    impose on both sides and lose the overlap to), at the LOWEST priority the device offers
+    (``cuCtxGetStreamPriorityRange``'s least -- the level of torch's default-priority streams; a high-priority launch
+    stream outranks it, so the GEMMs stay a filler).  Released by ``cuStreamDestroy`` when the owner is collected
+    (``weakref.finalize``).  The four events are torch events (no timing), created eagerly here by one record on the
+    side stream, so no CUDA object is created on the execute path -- inside a CUDA-graph capture included, where the
+    record / wait pair becomes a graph edge and the side stream joins the capture (torch's ``Event`` /
+    ``Stream.wait_event`` are ``cudaEventRecord`` / ``cudaStreamWaitEvent``).  The launch stream reaches here as the raw
+    handle every stage takes; it is wrapped through :func:`cudnn._torch_stream.as_torch_stream` (torch's current /
+    default stream object when it is one of them, an ``ExternalStream`` view otherwise -- a Python object, no CUDA
+    allocation).
+
+    Reentrant across host threads driving ONE compiled block on DIFFERENT launch streams (the convenience wrapper
+    caches a block for the process; the in-order block is stateless, and this must not be less):
+
+    * fork -- the pair (record on the launch stream, side waits) is atomic under ``_fork_lock``.  A re-record of the
+      shared event by another thread BETWEEN the two would point the side stream at the OTHER launch stream's
+      producer: the one under-wait the shared state admits (this thread's dW GEMM running before its own operand
+      exists).  The lock covers two enqueue calls, never a kernel.
+    * join -- safe without a lock.  A record on the ONE side stream marks a point after everything enqueued on it so
+      far, this execute's GEMM included, so whichever record the launch stream's wait sees is at or after the GEMM
+      it waits for: over-waiting (on the other thread's GEMM too) at worst, never under-waiting.
+    * the GEMMs of two executes serialise on the one side stream (each runs at full width anyway) and touch only their
+      own execute's buffers (the caller's ``gemm_scratch_side`` carve and gradients).
+
+    Two threads on the SAME launch stream are the trivially safe case (every record is later in that stream's order
+    than the one it replaces).  Pinned by ``test_fuse_wgrad_overlap_is_reentrant_across_launch_streams`` and
+    ``test_wgrad_side_stream_is_dedicated_and_released``.
     """
 
     TAGS = ("o", "qkvg")  # B1 (dW_o) and B7 (dW_qkvg)
 
     def __init__(self, device) -> None:
+        from cudnn.frost.device import device_context
+
         dev = torch.device(device)
-        self.device = dev
-        self._streams = (torch.cuda.Stream(device=dev), torch.cuda.Stream(device=dev))
-        if self._streams[0].cuda_stream == self._streams[1].cuda_stream:
-            raise RuntimeError("fuse_wgrad_overlap: torch handed out the same pool stream twice; the block needs two distinct side-stream candidates")
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        self.device = torch.device("cuda", idx)
+        with device_context(idx):  # the stream belongs to this device's primary context, whatever is current later
+            err, least, _greatest = cuda.cuCtxGetStreamPriorityRange()
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuCtxGetStreamPriorityRange failed: {err}")
+            err, handle = cuda.cuStreamCreateWithPriority(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, int(least))
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuStreamCreateWithPriority failed: {err}")
+        self._handle = int(handle)
+        self.priority = int(least)
+        self._finalizer = weakref.finalize(self, _release_side_stream, self._handle)
+        self.side = torch.cuda.ExternalStream(self._handle, device=self.device)
         self.ev_fork = {tag: torch.cuda.Event() for tag in self.TAGS}
         self.ev_join = {tag: torch.cuda.Event() for tag in self.TAGS}
         for ev in list(self.ev_fork.values()) + list(self.ev_join.values()):
-            ev.record(self._streams[0])  # eager creation (torch creates the CUDA event at the first record)
-        self.side = None  # the stream chosen for the current execute (pick)
-
-    def pick(self, launch_handle: int) -> torch.cuda.Stream:
-        """The side stream for this execute: the first candidate unless it IS the caller's launch stream."""
-        s0, s1 = self._streams
-        self.side = s1 if int(launch_handle) == int(s0.cuda_stream) else s0
-        return self.side
+            ev.record(self.side)  # eager creation (torch creates the CUDA event at the first record)
+        self._fork_lock = threading.Lock()
 
     @property
     def handle(self) -> int:
-        """The chosen side stream as the raw handle the GEMM drivers take (``pick`` first)."""
-        if self.side is None:
-            raise RuntimeError("pick(launch_handle) before handle")
-        return int(self.side.cuda_stream)
+        """The side stream as the raw handle the GEMM drivers take."""
+        return self._handle
 
     def fork(self, launch: torch.cuda.Stream, tag: str) -> None:
-        """The launch stream's work so far (the producer stage included) precedes the side GEMM."""
-        self.ev_fork[tag].record(launch)
-        self.side.wait_event(self.ev_fork[tag])
+        """The launch stream's work so far (the producer stage included) precedes the side GEMM -- the record and the
+        wait as ONE step, so a concurrent execute on another launch stream cannot re-record the event in between."""
+        with self._fork_lock:
+            self.ev_fork[tag].record(launch)
+            self.side.wait_event(self.ev_fork[tag])
 
     def join_record(self, tag: str) -> None:
         """Mark the side GEMM's completion right after its launch."""
@@ -1557,13 +1604,10 @@ class GatedAttentionBlockBwd(APIBase):
         # THE launch stream (Rule 5): the caller's, else torch's current stream on dy's device -- resolved once and handed
         # to EVERY stage (the CuTe-DSL kernels and the GEMM drivers take the raw int; the adapter a CUstream of it).
         stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(dev).cuda_stream
-        # fuse_wgrad_overlap (Rule 5 kept): the launch stream as a torch stream object for the event record / wait pair,
-        # the side stream picked so it is never the launch stream itself.  `side is None` = the in-order path, unchanged.
+        # fuse_wgrad_overlap (Rule 5 kept): the launch stream as a torch stream object for the event record / wait pair;
+        # the side stream is the block's own (dedicated, never a caller's).  `side is None` = the in-order path, unchanged.
         side = self._side
-        launch_ts = None
-        if side is not None:
-            launch_ts = as_torch_stream(stream, dev)
-            side.pick(stream)
+        launch_ts = as_torch_stream(stream, dev) if side is not None else None
         ws = self._ws
         do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
         dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
@@ -1714,6 +1758,12 @@ def gated_attention_block_backward(
     scheduling knobs, part of the cache key; under ``fuse_wgrad_overlap`` the
     side-stream GEMMs are joined back to the launch stream before ``execute``
     returns, so the per-call workspace freed here is reused only behind them.
+    With the weights frozen (neither ``w_o`` nor ``w_qkvg`` requires a
+    gradient) there is no weight-gradient GEMM to overlap, and the wrapper runs
+    the in-order block instead of surfacing the class's typed decline -- the
+    needs follow ``requires_grad`` here, not an explicit declaration, and a
+    frozen-weights phase of a training loop must not fail over a scheduling
+    knob; the EFFECTIVE knob value is what the cache key carries.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1721,6 +1771,9 @@ def gated_attention_block_backward(
     need_dw_norms = bool(geometry.qk_norm and ((w_q_norm is not None and w_q_norm.requires_grad) or (w_k_norm is not None and w_k_norm.requires_grad)))
     if not (need_dh or need_dw_qkvg or need_dw_o or need_dw_norms):
         raise ValueError("gated_attention_block_backward: nothing requires a gradient (saved.h, w_qkvg, w_o, w_q_norm / w_k_norm all have requires_grad=False)")
+    # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
+    # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
+    fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
     saved_d = dataclasses.replace(
         saved,
         h=_detach(saved.h),
