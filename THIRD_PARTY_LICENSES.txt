@@ -162,7 +162,7 @@ License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 6. labml.ai Annotated Deep Learning Paper Implementations
    https://github.com/labmlai/annotated_deep_learning_paper_implementations
 
-The RoPE reference implementation in test/python/test_apply_rope.py is
+The RoPE reference implementation in test/python/rope/graph/test_apply_rope.py is
 derived from labml.ai's annotated implementations, as noted in that
 file.
 

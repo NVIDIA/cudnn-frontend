@@ -39,8 +39,14 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   ``<= 64`` tiles win from an 8k cache (0.52-0.77; 0.11-0.43 at >= 32k), ``<= 128`` tiles win from a
   32k cache (0.58-0.71; parity 0.96-1.03 at 8k), 256 tiles lose 1.09-1.16 at every cache length
   (d256 at 128 tiles is parity, 0.95-1.01). Dense squares 2k-16k are 1.0-1.44, sliding window 2.8x,
-  d64 (through the d128 envelope) 1.3-1.5x -> TRAIL. THD and paged prefill are unmeasured -> TRAIL
-  (the FlashInfer ragged prefill keeps the backend until it is timed).
+  d64 (through the d128 envelope) 1.3-1.5x -> TRAIL. Ragged prefill keeps the backend.
+- paged THD, exact d256 BF16, causal bottom-right without Stats/SWA/sinks: a separate public
+  cuDNN 9.26.0.51 follow-up (2026-09-27, CuTeDSL 4.7, CUDA 13.0, CUPTI graph replay with L2
+  flushed) measures 0.52-0.72 against the backend across per-rank heads 16/2, 8/1, 4/1, 2/1,
+  HND/NHD pools and page sizes 16/128. The matrix includes full 2k/8k, mixed full and
+  B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
+  irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
+  FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
@@ -55,6 +61,8 @@ opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGIN
 """
 
 from __future__ import annotations
+
+import cudnn
 
 from .engines import Capabilities, _selected_d_shape
 
@@ -74,6 +82,14 @@ CHUNKED_SMALL_MAX_Q_TILES = 64  # <= 64 tiles wins from an 8k cache (0.52-0.77 a
 CHUNKED_SMALL_MIN_KV_TOKENS = 8192
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 32k cache (0.58-0.71; parity 0.96-1.03 at 8k); 256 tiles loses 1.09-1.16 at every cache length
 CHUNKED_MIN_KV_TOKENS = 32768
+
+# B200 paged THD prefill shard; conservative bounds on graph declarations.
+PAGED_D256_PREFILL_HEADS = frozenset({(16, 2), (8, 1), (4, 1), (2, 1)})
+PAGED_D256_PREFILL_PAGE_SIZES = frozenset({16, 128})
+PAGED_D256_PREFILL_MIN_Q = 2048
+PAGED_D256_PREFILL_MAX_KV = 32768
+PAGED_D256_PREFILL_MAX_BATCH = 4
+
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
@@ -112,6 +128,25 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
     return LEAD
 
 
+def _in_paged_d256_prefill_domain(facts) -> bool:
+    """Bounded shard derived from measured workloads; inspect only graph declarations."""
+    return (
+        facts.device_cc == (10, 0)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and facts.has_paged_kv
+        and facts.thd
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.wants_stats or facts.has_epilogue_gate)
+        and (facts.h_q, facts.h_kv) in PAGED_D256_PREFILL_HEADS
+        and facts.page_size in PAGED_D256_PREFILL_PAGE_SIZES
+        and 1 <= facts.b <= PAGED_D256_PREFILL_MAX_BATCH
+        and PAGED_D256_PREFILL_MIN_Q <= facts.s_q <= facts.s_kv <= PAGED_D256_PREFILL_MAX_KV
+    )
+
+
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
@@ -129,6 +164,8 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             return TRAIL
         return TRAIL  # d128 flavor (d64 rides its envelope), d192: backend decode engine ahead or at parity
     # prefill-shaped
+    if _in_paged_d256_prefill_domain(facts):
+        return LEAD
     envelope_padded = (facts.d_qk, facts.d_v) not in caps.d_shapes
     if facts.thd or facts.has_paged_kv or facts.window_left is not None or envelope_padded:
         return TRAIL

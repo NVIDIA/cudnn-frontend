@@ -305,7 +305,7 @@ The Torch public surface consists of allocating function wrappers under
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
-`test/python/fe_api/bsa`.
+`test/python/block_sparse_attention/cutedsl`.
 
 ## Acknowledgements
 
@@ -415,7 +415,7 @@ backward. `bucket_size_blocks` optionally controls backward query buckets;
 the default reuses the torch path's heuristic. Multi-device placement and cache
 portability across architectures require further qualification.
 
-The JAX tests live in `test/python/fe_api/jax` and are collected by the OSS
+The JAX tests live in `test/python/block_sparse_attention/jax` and are collected by the OSS
 suite. Torch-free import and gradient checks run in fresh subprocesses. To run
-the suite in a torch-free container, pass `--confcutdir=test/python/fe_api/jax`
+the suite in a torch-free container, pass `--confcutdir=test/python/block_sparse_attention/jax`
 so pytest does not load the torch-based parent conftest.

@@ -334,7 +334,28 @@ python/cudnn/
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
         thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
-    bwd/                        future: same shape, its own api_dsl.py
+    bwd/                        same shape, its own api_dsl.py / engines.py /
+                                config_sm*.py
+      kernels/                  one package per ARCH LINE, like fwd/
+        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
+        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
+        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
+                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+                                      TMEM, dS to a kv-major GMEM workspace)
+        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+                                      the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
+        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
+                                      (dq2k, converts)
+        bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
+                                  GQA reduce, dsink, fold_quant): sm120/
+                                  re-exports them, the sm100 / sm107 chains
+                                  import them
+        bprop_matmul_blackwell.py SHARED stage-3 GEMM: codegen targets span
+                                  SM100/SM103/SM107/SM110, so it sits ABOVE
+                                  the arch packages like _common_blackwell.py
+        thd_helpers.py            SHARED by sm80/ + the sm100 chain
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
@@ -343,11 +364,15 @@ python/cudnn/
                                 import (arch_family.py picks it from the GPU, or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
-                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+                                + kernel_templates/ (sm100_*, sm103_*)
     sm120/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm120_*)
     kernel_templates/           SHARED by both trees (the split-K reduction), so
                                 it sits above them like thd_helpers.py does
+    tile_helpers.py             SHARED device helpers: tile/group mapping, TMA
+                                gather and descriptor operations, plus the
+                                SM100-only tcgen05 compatibility wrappers;
+                                imported directly, never rendered as a kernel
 ```
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
@@ -364,8 +389,8 @@ arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
 file sits in always names its only owner, and a file inside `sm107/` can be
 changed without asking who else imports it.
 
-A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
-coverage matrix on one screen.
+A new reader should be able to list `sdpa/fwd/kernels/*/` (or
+`sdpa/bwd/kernels/*/`) and see the whole coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 

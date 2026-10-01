@@ -105,6 +105,9 @@ class TemplateParams:
     # False compiles the LSE store out entirely (the template None-specializes
     # the LSE argument) — a stats-less graph binds no LSE buffer at any level.
     has_lse: bool = True
+    # Pointer hosts consume the public natural-log sink directly. Legacy tensor
+    # hosts keep their log2-unit ABI until their remaining callers migrate.
+    sink_natural: bool = False
 
 
 def validate_params(p: TemplateParams) -> None:

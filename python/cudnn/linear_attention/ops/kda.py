@@ -96,6 +96,7 @@ def make_fprop_cache_key(
     overwrite_initial_state,
     state_pool_rows=None,
 ):
+    """Return the complete plan-cache identity for a KDA forward graph."""
     return (
         "fprop",
         total,
@@ -167,6 +168,7 @@ def make_bprop_cache_key(
     device,
     plan_name,
 ):
+    """Return the complete plan-cache identity for a KDA backward graph."""
     return (
         "bprop",
         total,
@@ -238,6 +240,7 @@ def build_fprop_graph(
     state_indices_dtype=None,
     state_pool_rows=None,
 ):
+    """Build a single-node KDA forward graph and its tensor placeholders."""
     graph = cudnn.pygraph()
     HO = max(H, HV)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
@@ -630,6 +633,7 @@ def kda_fwd_fake(
     checkpoint_every_n_tokens=0,
     plan_name: Optional[str] = None,
 ):
+    """Return FakeTensor-compatible output metadata for KDA forward."""
     total, H, K = q.shape
     HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
@@ -682,6 +686,7 @@ def kda_fwd_overwrite_state_fake(
     state_indices=None,
     output_final_state=True,
 ):
+    """Return fake outputs for the in-place KDA forward custom op."""
     o, _, state_checkpoints = kda_fwd_fake(
         q=q,
         k=k,
@@ -739,6 +744,7 @@ def build_bprop_graph(
     dt_bias_dtype=None,
     checkpoint_every_n_tokens=0,
 ):
+    """Build a single-node KDA backward graph and its tensor placeholders."""
     graph = cudnn.pygraph()
     HO = max(H, HV)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
@@ -1042,6 +1048,7 @@ def kda_bwd_fake(
     dt_bias=None,
     plan_name=None,
 ):
+    """Return FakeTensor-compatible output metadata for KDA backward."""
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
         raise TypeError(f"kimi_delta_attention: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
@@ -1066,6 +1073,7 @@ def kda_bwd_fake(
 
 
 def kda_setup_context(ctx, inputs, output):
+    """Save KDA forward inputs and static options needed by autograd."""
     (
         q,
         k,
@@ -1115,13 +1123,16 @@ def kda_setup_context(ctx, inputs, output):
 
 
 def kda_backward(ctx, dO, dFinal, dstate_checkpoints):
+    """Apply the registered first-order KDA backward formula."""
+    # Non-reentrant activation checkpointing allows one saved-tensor unpack.
+    saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
-        q, k, v, g, beta, cu_seqlens, state_checkpoints = ctx.saved_tensors[:7]
-        gate_params = list(ctx.saved_tensors[7:])
+        q, k, v, g, beta, cu_seqlens, state_checkpoints = saved_tensors[:7]
+        gate_params = list(saved_tensors[7:])
     else:
-        q, k, v, g, beta, cu_seqlens = ctx.saved_tensors[:6]
+        q, k, v, g, beta, cu_seqlens = saved_tensors[:6]
         state_checkpoints = None
-        gate_params = list(ctx.saved_tensors[6:])
+        gate_params = list(saved_tensors[6:])
     a_log = gate_params.pop(0) if ctx.has_a_log else None
     dt_bias = gate_params.pop(0) if ctx.has_dt_bias else None
     initial_state = ctx.initial_state
@@ -1398,6 +1409,7 @@ def build_kda_summary_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
 ):
+    """Build a KDA forward-summary graph and its tensor placeholders."""
     graph = cudnn.pygraph()
     k_t = graph.tensor([total, HK, K], data_type=io_dtype, name="k")
     v_t = graph.tensor([total, HV, V], data_type=io_dtype, name="v")
@@ -1622,6 +1634,7 @@ def kda_summary_fake(
     batch_invariant=False,
     plan_name: Optional[str] = None,
 ):
+    """Return FakeTensor-compatible outputs for a KDA forward summary."""
     total, HK, K = k.shape
     HV, V = v.shape[1], v.shape[2]
     HO = g.shape[1]
@@ -1672,6 +1685,7 @@ def build_kda_summary_bwd_graph(
     dt_bias_dtype=None,
     output_transition=False,
 ):
+    """Build a KDA backward-summary graph and its tensor placeholders."""
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, HQ, K], data_type=io_dtype, name="q")
     k_t = graph.tensor([total, HK, K], data_type=io_dtype, name="k")
@@ -1916,6 +1930,7 @@ def kda_summary_bwd_fake(
     batch_invariant=False,
     plan_name: Optional[str] = None,
 ):
+    """Return FakeTensor-compatible outputs for a KDA backward summary."""
     HV, V = dO.shape[1], dO.shape[2]
     K = k.shape[2]
     HO = g.shape[1]

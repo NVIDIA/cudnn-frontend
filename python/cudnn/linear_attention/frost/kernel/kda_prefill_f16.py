@@ -2224,7 +2224,6 @@ def build_descs_body(
 
 @cute.kernel
 def frost_kda_prefill_prologue(
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
     tiles_per_head: cutlass.Constexpr[int],
@@ -2242,16 +2241,15 @@ def frost_kda_prefill_prologue(
     gate: cute.Tensor,
     o: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
-    scheduler rings via :func:`order_body`, block 1 builds the per-batch
-    TMA-descriptor arrays via :func:`build_descs_body`, one warp per array."""
+    """Two-CTA prologue: block 0 synthesizes the uncut work-item table (one item per sequence and head, longest first)
+    and zeroes the scheduler rings via :func:`order_body`, block 1 builds the per-batch TMA-descriptor arrays via
+    :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
@@ -2267,7 +2265,7 @@ def frost_kda_prefill_prologue(
         n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
     if bidx == cutlass.Int32(0):
         order_body(
-            order_gen,
+            True,
             b_t,
             ORDER_THREADS,
             ORDER_ELEMENTS,
@@ -2275,7 +2273,7 @@ def frost_kda_prefill_prologue(
             n_heads_out,
             n_heads_out * n_batch,
             cu_seqlens,
-            mStaging,
+            None,
             mCount,
             mWorkItems,
             mScheduler,
@@ -2311,7 +2309,6 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -2319,7 +2316,6 @@ def prologue(
     o: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor,
     scheduler_counter: cute.Tensor,
@@ -2328,7 +2324,7 @@ def prologue(
     stream: cuda_driver.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
 ):
-    """One-launch prologue: LPT-order the work items and build the 6
+    """One-launch prologue: synthesize the uncut work items and build the 6
     per-(batch, head) TMA-descriptor arrays (q, k, v, gate, o,
     state_checkpoints) into ``tensormap_workspace``, one block each."""
     h_q = q.shape[1]
@@ -2371,7 +2367,6 @@ def prologue(
             checkpoint_view, box_dims=(box_elems, d_v_state // tiles_per_head, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle
         )
     frost_kda_prefill_prologue(
-        order_gen,
         b_t,
         num_ctas,
         tiles_per_head,
@@ -2389,7 +2384,6 @@ def prologue(
         gate,
         o,
         state_checkpoints,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_counter,

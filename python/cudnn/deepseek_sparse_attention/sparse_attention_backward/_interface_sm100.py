@@ -23,6 +23,14 @@ torch2cute_dtype_map = {
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
+_STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32")
+
+
+def _topk_indices_compile_tensor(topk_idxs: torch.Tensor, max_topk: int, backend: str):
+    """Keep Q dynamic while specializing the physical row stride for tuned backends."""
+    if backend in _STATIC_TOPK_STRIDE_BACKENDS:
+        return cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), max_topk), stride_order=(1, 0), assumed_align=16)
+    return to_cute_tensor(topk_idxs)
 
 
 def _align_workspace_bytes(num_bytes: int) -> int:
@@ -400,7 +408,7 @@ def flash_attn_bwd_sm100(
         dout_tensor = to_cute_tensor(dout, divisibility=head_dim_v)
         lse_tensor = to_cute_tensor(lse, assumed_align=8)
         attn_sink_tensor = to_cute_tensor(attn_sink)
-        topk_idxs_tensor = to_cute_tensor(topk_idxs)
+        topk_idxs_tensor = _topk_indices_compile_tensor(topk_idxs, max_topk, backend)
         topk_length_tensor = to_cute_tensor(topk_length) if has_topk_length else None
         dq_tensor = to_cute_tensor(dq, divisibility=head_dim)
         dkv_tensor = to_cute_tensor(dkv, divisibility=head_dim)
