@@ -2342,3 +2342,19 @@ def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
             probe.stats[key] <= pins[key] + _D128_FP8_SASS_SLACK
         ), f"{key} {probe.stats[key]} > {pins[key]} + {_D128_FP8_SASS_SLACK}: emulation instructions with the gate off: {probe.stats}"
     assert_no_new_spills(probe.stats, pins, f"[{spec}] ")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("cu_lens", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_batched_setup(batch, cu_lens):
+    """Parallel setup crosses warp chunks and descriptor-owner strides.
+
+    Zero Q/KV lengths and NaN-poisoned capacity tails exercise prefix publication,
+    per-request O extents, and packed-total K/V clamps together.
+    """
+    q_lens = [([0, 1, 17, 65, 129][i % 5]) for i in range(batch)]
+    kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
+    out = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
+    _check(out[0], out[1], torch.float16, "e4m3", out[2], out[3])
