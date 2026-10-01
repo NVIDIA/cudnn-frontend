@@ -43,6 +43,7 @@ add_executable(
     matmul/int8_matmul.cpp
     matmul/mixed_matmul.cpp
     matmul/blackwell_nvfp4_mxfp8_block_scale_matmul.cpp
+    matmul/custom_weight_dequantize.cpp
     matmul/general_block_scale_matmul.cpp
     matmul/complex_fp32_matmul.cpp
 

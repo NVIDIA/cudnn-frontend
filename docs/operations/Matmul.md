@@ -28,3 +28,6 @@ set_compute_data_type(DataType_t value)
     - B
     - name
     - compute_data_type
+
+For customer-defined narrow numerical weight types, see the experimental
+[custom weight dequantization](WeightDequantize.md) producer API.

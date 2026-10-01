@@ -179,6 +179,7 @@ class INode {
         MOE_GROUPED_MATMUL_BWD,
         DIAGONAL_BAND_MASK,
         SOFTMAX,
+        WEIGHT_DEQUANTIZE,
     };
     Type tag;
 
