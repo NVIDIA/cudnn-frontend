@@ -42,6 +42,7 @@ TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
+THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
 THD_LIVE_OFF = lambda b: 4 * b + 2  # noqa: E731   live unit total (device-computed)
 THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim counter

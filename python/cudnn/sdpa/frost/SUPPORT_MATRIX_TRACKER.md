@@ -1146,15 +1146,30 @@ included) and reads the packed Stats past `S_q[b]` as `+inf`; stage 3 renders th
 with `MatmulTemplateParams.thd_rows_kv` (the kv-major workspace flips the token side of
 each reduction against the SM100 chain's q-major one), UNTRIMMED, the workspace zero-filled
 once per execute under a causal-family mask or window; GQA via per-Q-head partials over the
-packed kv axis, dQ once per group member.  Degenerate sequences exact (empty-KV: no unit,
-zero dQ by select; empty-Q: one forced fully-masked tile, zero dK/dV).  Declined under THD:
-right-band widening (as dense), bias, THD on the fp8 / MXFP8 rows (one uniform real kv
-length per body).  Perf: stage 3 untrimmed under masks (the SM100 measured −20 % at d512
-causal), unmeasured here.  Tests: `test_sdpa_bwd_thd_sm107.py` (direct adapter + pinned
-graph, per-sequence fp64 oracle under the dense suite's bounds; empty sequences, NaN
-capacity tails, dead units, GQA, the causal family, both Stats packings, prepared rebind /
-replay / length forms), the SM100 stage-3 renderings PTX-identical at `thd_rows_kv`'s
-default, the dense f16 PTX identical to before the port.
+packed kv axis up to the live total `cu_k[B]` (a device word; the SM80 row's contract that
+nothing past the packed total is written into the caller's gradients holds on every path:
+dQ / dK / dV through per-sequence clipped output descriptors, the fold bounded on device),
+dQ once per group member.  Degenerate sequences exact (empty-KV: no unit, zero dQ by
+select; empty-Q: one forced fully-masked tile whose every operand load is routed past the
+clamped extent -- zero-filled, so an all-NaN Q / dO capacity with no live query row still
+yields exact-zero dK/dV; the same routing for the spare units of the occupancy-sized grid).
+Declined under THD: right-band widening (as dense), bias, THD on the fp8 / MXFP8 rows (one
+uniform real kv length per body).  Perf: unmeasured here; the THD-specific costs to
+measure first, all numerics-neutral: (1) stage 3 untrimmed under masks plus the
+whole-workspace zero-fill per execute (the SM100 measured −20 % for the trim at d512
+causal); (2) the stage-3 grids sized on the KV / Q ENVELOPE per (head, sequence) group --
+B × ceil(S_max/256) M tiles per head where only Σ ceil(s[b]/256) are live, the spare
+tiles clipped by the output descriptor (a B-fold waste on skewed batches); (3) every spare
+cluster of the occupancy-sized grid runs one forced masked tile whose zero dS tile lands in
+the same slack rows past `row_off[B]` (up to ~100 clusters on one 64 KiB region on a small
+problem).  Levers, in order: a per-group M-tile early-out in the GEMM template, a THD grid
+bounded by the live units, the per-sequence K-trim.  Tests: `test_sdpa_bwd_thd_sm107.py`
+(direct adapter + pinned graph, per-sequence fp64 oracle under the dense suite's bounds;
+empty sequences, NaN capacity tails, a finite sentinel on the gradient rows past the packed
+totals, dead units, GQA, the causal family, both Stats packings, prepared rebind / replay /
+length forms, every sequence empty on the Q side with a NaN dO capacity), the SM100 stage-3
+renderings PTX-identical at `thd_rows_kv`'s default, the dense f16 PTX identical to before
+the port.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
 d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were

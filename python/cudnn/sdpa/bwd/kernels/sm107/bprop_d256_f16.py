@@ -415,14 +415,23 @@ def _thd_map_ptr(meta_t, n_batch, slot):
 
 
 def _seq_ctx(meta_t, batch_idx, n_batch, seqlen_q_real, seqlen_kv_real):
-    """``(q_tok, kv_tok, ws_row, s_q, s_kv)`` of the tile's sequence -- THD reads them from the metadata buffer, dense
-    returns ``(0, 0, 0, SQ_REAL, SKV_REAL)`` and every use folds.  The per-sequence values ride WITH the tile decode
-    (every warp refreshes them from the same ``(batch_idx)`` the decode returned), so a stale sequence after a tile
-    change is impossible by construction -- that omission would not fault, it would address the previous sequence.
-    A DEAD unit (the occupancy-sized grid hands out ``uid >= live``) decodes ``batch_idx == n_batch``: every read stays
-    IN BOUNDS of the buffer (``cu_q[B+1]`` is ``cu_k[0]``, ``cu_k[B+1]`` is ``batch_remap[0]``, ``row_off[B]`` the blocked
-    total) and yields ``s_q <= 0``, so its one forced tile is fully masked by the q band and its dS lands in the
-    workspace's allocated slack rows (``R_kv_cap >= row_off[B] + 256``)."""
+    """``(q_tok, kv_tok, ws_row, s_q, s_kv, q_load, kv_load)`` of the tile's sequence -- THD reads them from the metadata
+    buffer, dense returns ``(0, 0, 0, SQ_REAL, SKV_REAL, 0, 0)`` and every use folds.  The per-sequence values ride WITH
+    the tile decode (every warp refreshes them from the same ``(batch_idx)`` the decode returned), so a stale sequence
+    after a tile change is impossible by construction -- that omission would not fault, it would address the previous
+    sequence.  A DEAD unit (the occupancy-sized grid hands out ``uid >= live``) decodes ``batch_idx == n_batch``: every
+    read stays IN BOUNDS of the buffer (``cu_q[B+1]`` is ``cu_k[0]``, ``cu_k[B+1]`` is ``batch_remap[0]``, ``row_off[B]``
+    the blocked total) and yields ``s_q <= 0``, so its one forced tile is fully masked by the q band and its dS lands in
+    the workspace's allocated slack rows (``R_kv_cap >= row_off[B] + 256``).
+
+    ``q_load`` / ``kv_load`` are the sequence offsets the TMA LOADS take (``_thd_tma_offsets``): ``cu_q[b]`` / ``cu_k[b]``
+    for a unit with query rows, and for one WITHOUT (an ``s_q[b] = 0`` sequence, a dead unit) the clamped descriptors'
+    own extent ``max(cu_q[B], 1)`` / ``max(cu_k[B], 1)`` -- OUT OF BOUNDS by construction, so TMA zero-fills every operand
+    row.  The setup kernel cannot clamp an extent to 0 (invalid, traps), so an all-empty side keeps ONE addressable row,
+    the packed buffer's row 0; a tile that addressed ``cu_q[b] = 0`` there would load that row, and a NaN in it (a
+    poisoned capacity with no live token) would reach ``dV = P^T . dO`` as ``0 * NaN`` -- P is select-masked, the MMA
+    is a multiply.  Routing the load past the extent makes the operand itself zero (sdpa-invariants: a dead range must
+    not depend on what the residue holds).  The stats index keeps ``q_tok`` (its own select, in the scheduler warp)."""
     if cutlass.const_expr(_THD):
         meta = cutlass.make_array_view(meta_t)
         cu_q0 = n_batch
@@ -433,8 +442,13 @@ def _seq_ctx(meta_t, batch_idx, n_batch, seqlen_q_real, seqlen_kv_real):
         s_q = cute.arch.make_warp_uniform(cutlass.Int32(meta[cu_q0 + batch_idx + cutlass.Int32(1)]) - q_tok)
         s_kv = cute.arch.make_warp_uniform(cutlass.Int32(meta[cu_k0 + batch_idx + cutlass.Int32(1)]) - kv_tok)
         ws_row = cute.arch.make_warp_uniform(cutlass.Int32(meta[row0 + batch_idx]))
-        return q_tok, kv_tok, ws_row, s_q, s_kv
-    return cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), seqlen_q_real, seqlen_kv_real
+        q_cap = cute.math.max(cutlass.Int32(meta[cu_q0 + n_batch]), cutlass.Int32(1))  # cu_q[B], the clamped Q / dO extent
+        kv_cap = cute.math.max(cutlass.Int32(meta[cu_k0 + n_batch]), cutlass.Int32(1))  # cu_k[B], the clamped K / V extent
+        has_q = s_q > cutlass.Int32(0)
+        q_load = cute.arch.make_warp_uniform(cutlass.Int32(arith.select(has_q.ir_value(), q_tok.ir_value(), q_cap.ir_value())))
+        kv_load = cute.arch.make_warp_uniform(cutlass.Int32(arith.select(has_q.ir_value(), kv_tok.ir_value(), kv_cap.ir_value())))
+        return q_tok, kv_tok, ws_row, s_q, s_kv, q_load, kv_load
+    return cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), seqlen_q_real, seqlen_kv_real, cutlass.Int32(0), cutlass.Int32(0)
 
 
 def _eff_lengths(seq_kv_lens_tensor, batch_idx, batch_base, seqlen_q_real, seqlen_kv_real, ctx):
@@ -448,9 +462,10 @@ def _eff_lengths(seq_kv_lens_tensor, batch_idx, batch_base, seqlen_q_real, seqle
 def _thd_tma_offsets(ctx, full_batch):
     """``(q_seq_off, kv_seq_off, tma_batch)`` for EVERY packed-operand TMA coordinate (rules/frost-tile-dsl.md S5: the
     detector ``check_thd_load_coords`` requires a ``seq_off`` term at every Q / K / V / dO load): THD adds ``cu_q[b]`` /
-    ``cu_k[b]`` to the sequence coordinate of a one-batch packed descriptor, dense keeps the full-tensor batch."""
+    ``cu_k[b]`` to the sequence coordinate of a one-batch packed descriptor (the clamped extent itself -- out of bounds,
+    zero-filled -- for a unit without query rows; ``_seq_ctx``), dense keeps the full-tensor batch."""
     if cutlass.const_expr(_THD):
-        return ctx[0], ctx[1], cutlass.Int32(0)
+        return ctx[5], ctx[6], cutlass.Int32(0)
     return cutlass.Int32(0), cutlass.Int32(0), full_batch
 
 
@@ -1085,7 +1100,9 @@ def _tmaldg_warp(
 
     THD: the five load sites -- there is no separate prologue; K / V are loaded once per kv
     block inside the persistent loop, so these five are the whole list -- take the SEQUENCE
-    offset ``cu_q[b]`` / ``cu_k[b]`` on the sequence coordinate and batch coordinate 0, through
+    offset ``cu_q[b]`` / ``cu_k[b]`` on the sequence coordinate and batch coordinate 0 (a unit
+    without query rows takes the clamped extent instead: every row out of bounds, zero-filled;
+    ``_seq_ctx``), through
     the setup launch's packed-total-CLAMPED runtime descriptors (acquired ONCE per slot here;
     the launch writes them once and never rewrites them, so the per-call fence
     ``tma_load_tile`` would emit is hot-path cost).
@@ -1961,7 +1978,8 @@ def _thd_setup_kernel(
 
     * warp 0's elected lane: the five input descriptors copied with their sequence extent CLAMPED to the current packed
       total ``cu_q[B]`` / ``cu_k[B]`` (at least 1: a zero extent is INVALID and traps; the one row an all-empty side then
-      exposes is select-masked by every consumer) -- a declared ``max_total_seq_len`` cannot do this job, it is a maximum
+      keeps addressable is never addressed -- ``_seq_ctx`` routes every load of a unit without query rows to the extent
+      itself, out of bounds, zero-filled) -- a declared ``max_total_seq_len`` cannot do this job, it is a maximum
       while the row that must read as zero is the current total;
     * every warp's elected lane: one CLIPPED dV descriptor per sequence (base ``cu_k[b]``, extent ``max(s_kv[b], 1)``), the
       sequences shared round-robin over the warps; each writer publishes to the TMA proxy;

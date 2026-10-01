@@ -240,8 +240,11 @@ from them at build time; a graph without them is declined at plan creation). Sta
 the forward's packed Stats in either layout the forward emits -- token-major `(T, H)`
 or head-major `(1, H, head_stride)` with `head_stride >= T`. The standalone surface is
 `SdpaBwdDslSm107(..., thd=True, max_total_seq_len_q=.., max_total_seq_len_kv=..,
-thd_stats_token_major=..)` with `execute(seq_q_lens=.., seq_kv_lens=..)` taking `(B,)`
-lengths or `(B+1,)` prefix sums per side.
+thd_stats_token_major=.., thd_stats_head_stride=..)` with `execute(seq_q_lens=..,
+seq_kv_lens=..)` taking `(B,)` lengths or `(B+1,)` prefix sums per side;
+`thd_stats_head_stride` (head-major only) is required when the Stats buffer's head stride
+is not exactly the packed capacity -- the FROST forwards emit `(1, H, ceil64(T))` -- and
+must cover the packed total (the graph path infers it from the ragged strides).
 
 How it runs: one setup launch builds the metadata on device (no host cumsum), the dS
 workspace is blocked over packed KV tokens (each sequence owns a 256-row-aligned block),
@@ -251,7 +254,13 @@ declared-but-unused capacity tail cannot reach an MMA), masks each sequence's kv
 q pad columns from its own lengths (bottom-right's diagonal is `S_kv[b] − S_q[b]` per
 sequence) and stores dV through per-sequence clipped descriptors; the gradient GEMMs run
 untrimmed over the blocked rows with per-sequence output descriptors and the workspace
-zero-filled once per execute under a causal-family mask or window. Served under THD:
+zero-filled once per execute under a causal-family mask or window. Nothing past the
+packed totals is written into the caller's gradients: dQ / dK / dV stop at the
+per-sequence clipped output descriptors and the GQA fold stops at the live kv total on
+device (the rows up to the declared capacity keep whatever the caller left there). A unit
+without query rows -- an empty-Q sequence, a spare unit of the occupancy-sized grid --
+loads every operand past the clamped extent (zero-filled), so even an all-NaN Q / dO
+capacity with no live query row yields exact-zero dK / dV. Served under THD:
 none / causal / bottom-right / sliding window, GQA / MQA, empty sequences on either side
 (their gradients are exact zeros). Declined under THD: right-band widening, bias, and
 THD on the fp8 / MXFP8 rows (their bodies take one uniform real kv length).

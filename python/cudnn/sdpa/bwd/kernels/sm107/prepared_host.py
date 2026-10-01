@@ -39,7 +39,16 @@ from cuda.bindings import driver
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
 from cudnn.sdpa.bwd.config_sm107 import DS_SF_P_B, DS_SF_P_C, DS_SF_POLICY_DEFAULT, MX_BLOCK, SF_ATOM_BYTES, SF_ATOM_ROWS
-from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS, DOT_Q_TILE, dkv_reduce_host, dot_do_o_host, dot_do_o_scaled_host, fold_quant_host
+from cudnn.frost.tile_dsl.thd import THD_CU_K_TOTAL_OFF
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import (
+    DOT_CHUNK_ELEMS,
+    DOT_Q_TILE,
+    dkv_reduce_bounded_host,
+    dkv_reduce_host,
+    dot_do_o_host,
+    dot_do_o_scaled_host,
+    fold_quant_host,
+)
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
 
@@ -885,7 +894,8 @@ def host_f16_thd(
         delta    dot_do_o over the packed O / dO -> [1, H, ceil128(T_q)]
         per head chunk: the main kernel (its own setup launch clamps the five input descriptors, emits the per-sequence dV
                  descriptors and resets live / ctr for THIS launch's heads), then dK / dQ through the THD stage-3 arm
-        fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis -> the KV heads (fixed order)
+        fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis, rows below the live total cu_k[B] only (a
+                 device word) -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is never written
 
     ``lens_form`` bit 0 / 1 = the Q / KV length tensor is a ``(B+1,)`` prefix (``bind()`` derives it from numel); the setup
     kernel branches on it before reading the prefix tail, so both tensors are viewed ``(B+1,)``.
@@ -927,9 +937,12 @@ def host_f16_thd(
         # STAGE 3: the THD arm over the chunk's workspace; the outputs' head slice, every sequence through its own descriptor.
         _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp)
 
-    # STAGE 4: fold the per-Q-head partials onto the KV heads over the packed kv axis (fixed order).
+    # STAGE 4: fold the per-Q-head partials onto the KV heads over the packed kv axis (fixed order), rows [0, cu_k[B]) ONLY.
+    # The partials past the live total were never written (the kernel's dV and the dK GEMM store through per-sequence clipped
+    # descriptors), so an unbounded fold would copy the 0xFF-poisoned workspace (NaN) into the caller's dK / dV capacity tail;
+    # the limit is the metadata's cu_k[B] word read on device, so a rebind with new lengths needs no host work.
     if cutlass.const_expr(group > 1):
-        dkv_reduce_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, stream)
+        dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
 
 
 # --- the per-tensor FP8 row ---------------------------------------------------------------------------------------------

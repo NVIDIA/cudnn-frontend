@@ -198,6 +198,27 @@ def _assert_empty_sequence_exactly_zero(case, dq, dk, dv, i):
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
 
 
+# A FINITE sentinel for the gradient rows past the packed totals, exactly representable in bf16 / fp16 and never a value the
+# chain produces over a whole tail.  Not NaN: the one way the tail used to be written -- the GQA fold copying the never-written
+# (0xFF-poisoned) partials past cu_k[B] -- writes NaN, which a NaN fill could not tell from "untouched".
+_TAIL_SENTINEL = -7.0
+
+
+def _sentinel_tails(case, dq, dk, dv):
+    """Fill the rows PAST the packed totals (the declared capacity the chain may not touch) of all three gradients."""
+    for x, live in ((dq, case.t_q), (dk, case.t_kv), (dv, case.t_kv)):
+        x[0, live:] = _TAIL_SENTINEL
+
+
+def _assert_tails_untouched(case, dq, dk, dv):
+    """Nothing past the packed total is written into the caller's gradients: dQ / dK stop at the per-sequence clipped output
+    descriptors, dV at the kernel's per-sequence descriptors, and the GQA fold at the live kv total ``cu_k[B]`` on device."""
+    for name, x, live in (("dQ", dq, case.t_q), ("dK", dk, case.t_kv), ("dV", dv, case.t_kv)):
+        tail = x[0, live:]
+        written = int((tail != _TAIL_SENTINEL).sum()) if tail.numel() else 0
+        assert written == 0, f"{name}: {written} of {tail.numel()} elements past the packed total ({live} rows) were written"
+
+
 # --------------------------------------------------------------------------- the direct adapter surface
 
 
@@ -420,14 +441,16 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, hkv=None, **sdpa_kwargs):
+def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, hkv=None, envelope_q=None, **sdpa_kwargs):
     """A ragged backward graph over ``case``'s packed buffers: everything declared as the ENVELOPE (B, H, S_max, D) plus a
     per-tensor ragged offset -- how cuDNN spells a packed tensor (the packed totals never appear as a dim, which is why the
-    lowering cannot reinterpret a variant-pack buffer through the port geometry)."""
+    lowering cannot reinterpret a variant-pack buffer through the port geometry).  The envelope is the longest sequence
+    unless ``envelope_q`` names it: a batch with no query anywhere would otherwise declare S_q = 1, a decode shape no
+    prefill row serves, while a real caller declares the batch's capacity."""
     b, h, d, dev = case.b, case.h, case.d, "cuda"
     hkv = h if hkv is None else hkv
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    s_max_q, s_max_kv = max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
+    s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
     st_q = [s_max_q * h * d, d, h * d, 1]
     st_kv = [s_max_kv * hkv * d, d, hkv * d, 1]
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -496,7 +519,20 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
 
 
 def _run_graph(
-    lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, poison_outputs=False, runs=1, **kw
+    lens_q,
+    lens_kv,
+    *,
+    h=2,
+    hkv=None,
+    d=_D,
+    dtype=torch.bfloat16,
+    stats_layout="head_major",
+    poison=False,
+    pad_cap=0,
+    poison_outputs=False,
+    runs=1,
+    envelope_q=None,
+    **kw,
 ):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.  ``use_causal_mask`` / ``use_causal_mask_bottom_right``
     / ``sliding_window_length`` thread through ``kw`` to the graph AND into the case, so the fp64 reference masks with the same
@@ -507,7 +543,7 @@ def _run_graph(
         causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right")), bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
         window_left=kw.get("sliding_window_length"), hkv=hkv,
     )  # fmt: skip
-    g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, **kw)
+    g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, envelope_q=envelope_q, **kw)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -526,6 +562,7 @@ def _run_graph(
     for _ in range(runs):
         for x in (dq, dk, dv):
             x.fill_(fill)
+        _sentinel_tails(case, dq, dk, dv)
         ws.fill_(0xFF)
         g.execute(vp, ws)
         torch.cuda.synchronize()
@@ -533,6 +570,7 @@ def _run_graph(
     for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
         live = x[0, : case.t_q] if name == "dQ" else x[0, : case.t_kv]
         assert torch.isfinite(live).all(), f"{name} has non-finite values in the packed region"
+    _assert_tails_untouched(case, dq, dk, dv)
     _check(case, dq, dk, dv)
     return case, dq, dk, dv, outs
 
@@ -612,6 +650,28 @@ def test_graph_thd_gqa_cross_attention_and_zero_length():
     """GQA over unequal Q / KV totals with an empty sequence in the middle: the dK / dV partials are sized on the packed KV
     capacity while dQ rides the Q one."""
     _run_graph((256, 0, 100), (180, 0, 300), h=4, hkv=2)
+
+
+@requires_rubin
+def test_graph_thd_gqa_capacity_tail_untouched():
+    """GQA with declared totals past the live packing and a NaN tail on BOTH sides.  The per-Q-head partials past ``cu_k[B]``
+    are never written (dV and dK store through per-sequence clipped descriptors), so the fold must stop at the live kv total
+    on device: an unbounded fold reads the 0xFF-poisoned workspace there and writes NaN into the caller's dK / dV capacity
+    tail -- which only the FINITE tail sentinel of ``_run_graph`` can see (a NaN-filled output could not)."""
+    _run_graph((300, 128, 200), (300, 128, 200), h=4, hkv=2, poison=True, pad_cap=384, poison_outputs=True)
+
+
+@requires_rubin
+def test_graph_thd_every_sequence_empty_q_with_nan_in_dO_row_0():
+    """No query anywhere (``cu_q[B] = 0``), keys in every sequence, the Q / dO capacity all NaN (no live row to keep it finite).
+    The clamped Q / dO descriptors keep an extent of 1 (0 is invalid), so a forced tile that addressed ``cu_q[b] = 0`` would
+    load the NaN row and ``dV = P^T . dO`` would be ``0 * NaN`` on every live kv row.  The kernel routes every load of a unit
+    without query rows past the clamped extent instead (zero-filled), so dK and dV come out as exact zeros and nothing past
+    the packed totals is written.  The graph declares the capacity envelope (128), as a caller does: the longest sequence
+    would be S_q = 1, a decode shape."""
+    case, dq, dk, dv, _ = _run_graph((0, 0), (128, 256), poison=True, pad_cap=128, poison_outputs=True, envelope_q=128)
+    for i in range(case.b):
+        _assert_empty_sequence_exactly_zero(case, dq, dk, dv, i)
 
 
 # --- causal family: the per-sequence diagonal is the whole risk, and stage 3 reads a workspace whose masked tiles the kernel
@@ -794,6 +854,7 @@ def test_prepared_thd_rebind_lengths_and_replay(stats_layout, causal, monkeypatc
             torch.full_like(case.q, float("nan")),
             *(torch.full((1, case.cap_kv, 2, _D), float("nan"), device="cuda", dtype=torch.bfloat16) for _ in range(2)),
         ]
+        _sentinel_tails(case, *gradients)
         fresh.update(zip(outputs, gradients))
         by_name = {ref.get_name(): tensor for ref, tensor in fresh.items()}
         assert set(by_name) == set(names)
@@ -823,6 +884,7 @@ def test_prepared_thd_rebind_lengths_and_replay(stats_layout, causal, monkeypatc
     finally:
         torch.cuda.set_sync_debug_mode("default")
     _check(case, *gradients)
+    _assert_tails_untouched(case, *gradients)  # GQA + a padded capacity: the fold must stop at the rebound live total
     capture = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(capture):
@@ -833,6 +895,7 @@ def test_prepared_thd_rebind_lengths_and_replay(stats_layout, causal, monkeypatc
         workspace.fill_(0xBD)
         capture.replay()
         _check(case, *gradients)
+        _assert_tails_untouched(case, *gradients)
     finally:
         capture.reset()
 
