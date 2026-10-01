@@ -83,12 +83,15 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     regions = delta, scores, dscores, meta, desc2, desc3, dkw, dvw
     geometry = tuple(geometry)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (stage2, mm_lo, mm_hi)), params, geometry, regions, sm))
-    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key)
+    # The row's name is the spec's, the artifact symbol's (``frost_sdpa_bwd_sm100_prepared`` on the SM100 row, the cc 10.7 d512
+    # row's own on ``sdpa_bwd_sm107_d512``) and the launch spec's; the chain is the same for both.
+    name = api._NAME
+    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm100", True)
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):

@@ -107,7 +107,11 @@ def test_engine_is_registered_and_opt_in():
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
 
-    assert ENGINE_SPECS[-1].name == _ENGINE, "append-only: the new row ranks last"
+    names = [s.name for s in ENGINE_SPECS]
+    # Append-only: this row ranks after every row that existed when it landed (the position is the rank in the ranked plan
+    # list, never the id); rows appended later (the cc 10.7 d512 row) rank after it.  A membership + order pin, not a
+    # ``[-1]`` pin, so the next appended row does not break this one.
+    assert names.index(_ENGINE) > names.index("sdpa_bwd_sm107_fp8"), names
 
 
 def test_capabilities_match_what_is_implemented():

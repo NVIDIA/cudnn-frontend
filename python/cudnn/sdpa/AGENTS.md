@@ -334,6 +334,52 @@ Backward (d512 stage 2):
   untouched buffer (an exactly-zero accumulator). Detectors:
   `test_descriptor_roots_and_version_per_arm`, `test_kernel_source_pins`
   (every `SmemTile(` takes `desc_version=DESC_VERSION`).
+- **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
+  CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
+  rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
+  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  parent in a handful of code lines (the ring-arm default record, the
+  hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
+  fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
+  `test_sdpa_bwd_d512_sm107.py::test_fork_code_diff_is_only_the_listed_deltas`
+  blanks strings and comments and asserts every `+` / `-` line matches a listed
+  regex, so a fix landed in ONE sibling fails the test. The fork refuses the
+  parent's arm (and a 9th ring stage) at import
+  (`test_fork_refuses_the_sm100_arm_and_a_ninth_stage`, RED-first: both raise),
+  and at the same parameters its sm_107a PTX md5 EQUALS the parent's
+  (`renderings/md5_stage2_2x2_sm107a.txt`; `wait(spin=False)` and a literal
+  `DESC_VERSION = 0` render identically), which is what makes the on-board
+  `test_fork_is_bitwise_the_sm100_body_at_rubin_params` (`torch.equal` on int16
+  views of dQ / dK / dV and the S / dS workspace) a guarantee rather than a hope.
+  Fork AFTER the parent has run at the new arm (the d512 case: 14 / 14 direct
+  adapter cases on the board first), so every delta is deliberate.
+- **A directly constructed adapter must spell the analyzer's mask
+  conventions; one of them is `window_size_left = diagonal_band_left_bound - 1`**
+  (`graph_analyzer.py`, the `left_bound - 1` line). A hand-built
+  `SdpaBwdDsl*(window_size_left=L)` checked against `_causal_keep(left=L)` is
+  one column off: it reads as cos 0.9996 / max-rel 2-3e-2 on dQ / dK -- inside a
+  5e-2 / 3e-2 `allclose`, outside the suites' 0.9999 / 2e-2 gate -- and looks like
+  a kernel bug on a new arch (the cc 10.7 d512 bring-up's only "failure":
+  9 / 10 direct-adapter cases passed on the board on 2026-10-01 and the SWA case
+  read cos 0.9996 until the convention was applied). Detector: run the same case
+  through the graph API with the engine pinned (`test_sliding_window`); a graph
+  pass with a direct-adapter fail is the convention, not the kernel.
+- **The `LDTM` SASS count of the masked (three-range) compute body is a
+  TOOLCHAIN fact, not a kernel fact.** The public DSL 4.7.0 + CUDA 13.3 ptxas
+  keeps three traced range bodies (6 `LDTM`, the SM100 twin's pin); the board's
+  internal DSL 0.3.0 + cuda-39029786 emits two for the same source (4). Pin the
+  per-body count the kernel owes (2 per traced body) against the set a toolchain
+  can produce (`test_fork_sass_pins_sm_107a`: `LDTM in (4, 6)` on the causal arm),
+  never `2 * n_bodies` alone -- and record the toolchain next to the pin.
+- **cuDNN 9.26 builds NO d > 256 backward plan on cc 10.7** (engines 17 and 7
+  decline `d_qk > 128` outside the 192x128 and 256x256 cases; probed 2026-10-01
+  with the FROST opt-in OFF on cuDNN 9.26.0.51 at B1 H8 S2048 dense and causal:
+  `create_execution_plans` raised `cudnnGraphNotSupportedError` both times), so a
+  Rubin-line d512 backward has no FROST-vs-backend A/B -- its perf gate is
+  floor-relative (stage-2 MMA floor 2502 clk per CTA-kv-tile at the board's
+  39.1-clk 2SM M=128 N=128 K=16 rate, stage 3 at 4096 MAC/clk/SM). Probe before
+  planning an A/B: `g.create_execution_plans` raises `cudnnGraphNotSupportedError`
+  with the backend's decline reasons when no engine proposes a plan.
 
 ## Output initialization regressions
 

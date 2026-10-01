@@ -1,0 +1,16 @@
+# PTX md5 of the cc 10.7 d512 stage-2 2x2 renderings (kernels/sm107/bprop_d512_f16_2x2.py at the 8-stage ring arm:
+# stages_kv 8 / cast_stages 2 / SM107_USABLE_DYN_SMEM_2X2), CUTE_DSL_ARCH=sm_107a, rendered on the cc 10.7 board
+# (w2u1g-lc-0030) on 2026-10-01 from the fork commit.  The same three md5s were rendered on that board from the SM100
+# body (kernels/sm100/bprop_d512_f16_2x2.py) at the same parameters BEFORE the fork existed (same day, same DSL build),
+# so the fork is a byte-identical rendering of the SM100 twin at the cc 10.7 ring arm and the SM100 twin's
+# bitwise-vs-role-split oracle carries over.  BOARD-ONLY PIN: the public 4.7.0 DSL has no sm_107a target, so in public
+# CI the md5 and SASS cases of this record SKIP (a skip there is not coverage); there the fork is held by
+# test_fork_code_diff_is_only_the_listed_deltas, test_fork_source_pins and its import-time _require pins, while the
+# SM100 4x1 sm_100a record (md5_stage2_4x1_sm100a.txt) does run on the public 4.7.0.  The PTX text is a function of the
+# DSL build:
+# test_sdpa_bwd_d512_sm107.py::test_fork_rendering_ptx_md5_is_recorded compares only when the installed DSL matches the
+# `dsl=` line and skips otherwise -- re-render on the board to refresh (the public 4.7.0 DSL has no sm_107a).
+dsl=nvidia-cutlass-dsl-internal 0.3.0+20260728043000.556925e
+stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=84dcf017c85f4768f2a48cddd499eecf
+stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=c71bbe7a8a124005cbd49f65faacc1e7
+stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=2f7b3cfcd0062a048c8a01fda743b6aa

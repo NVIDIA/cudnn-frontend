@@ -25,6 +25,7 @@ _OFFERED = {
     "sdpa_bwd_sm107": 20604,
     "sdpa_bwd_sm107_fp8": 20605,
     "sdpa_bwd_sm100_d256": 20606,
+    "sdpa_bwd_sm107_d512": 20607,
 }
 
 
@@ -120,6 +121,33 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
         assert 20606 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
         assert recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED) == []
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
+
+
+@pytest.mark.parametrize(
+    "cc, d, want",
+    [
+        ((10, 7), 512, [20607]),
+        ((11, 0), 512, [20607]),
+        ((10, 7), 264, [20607]),
+        ((10, 7), 504, [20607]),
+        ((10, 0), 512, [20602]),
+        ((10, 3), 512, [20602]),
+        ((10, 7), 256, [20604]),
+        ((10, 7), 128, []),
+        ((12, 0), 512, []),
+    ],
+    ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm120-d512"],
+)
+def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
+    """The cc 10.7 d512 bf16 / fp16 backward row (slot 7 -> 20607) is fixed-geometry: on the Rubin line (cc 10.7-11.x) a
+    d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
+    own d512 row (20602); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
+    d = 128 and SM120 list no python row for the half d512 graph."""
+    assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
+    plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
+    assert [p.engine_id for p in plans] == want
+    assert all(p.knobs is None for p in plans if p.engine_id in (20602, 20604, 20607)), "the fixed-geometry rows have no tile axis: {} is the complete record"
+    assert all(p.mode is None and p.cpp_index is None for p in plans)
 
 
 @pytest.mark.parametrize("cc, want", [((10, 7), [20605]), ((10, 0), []), ((12, 0), [])], ids=["sm107", "sm100", "sm120"])

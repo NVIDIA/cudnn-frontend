@@ -45,16 +45,23 @@ def test_prepared_chain_codegen_targets(monkeypatch):
     calls = []
 
     def fake_compile(*args, **kwargs):
-        calls.append(kwargs["options"])
+        calls.append(kwargs)
         return object()
 
     monkeypatch.setattr(prepared_host, "compile_cached", fake_compile)
     params = prepared_host.Params(1, 2, 2, 512, 128, 128, 256, 128, 2, False, False, 0, 256)
-    for sm in (100, 103, 107, 110):
+    # SM100 / SM103 exactly, then the Rubin line as a RANGE (107..119, the cc 10.7 d512 row's span): the part that ships next
+    # is not declined by a list.  101 (no such device) and 120 (the GeForce line) are still refused.
+    for sm in (100, 103, 107, 110, 119):
         prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, sm, "target-probe")
-    with pytest.raises(ValueError, match="got SM101"):
-        prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, 101, "target-probe")
-    assert calls == [f"--enable-tvm-ffi --gpu-arch sm_{sm}a" for sm in (100, 103, 107, 110)]
+    for bad in (101, 120):
+        with pytest.raises(ValueError, match=f"got SM{bad}"):
+            prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, bad, "target-probe")
+    assert [c["options"] for c in calls] == [f"--enable-tvm-ffi --gpu-arch sm_{sm}a" for sm in (100, 103, 107, 110, 119)]
+    # The artifact symbol is per engine row (Rule 6): the SM100 row's by default, ``frost_<row>_prepared`` when the caller names one.
+    assert all(c["symbol"] == "frost_sdpa_bwd_sm100_prepared" for c in calls)
+    prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, 107, "target-probe", symbol="frost_sdpa_bwd_sm107_d512_prepared")
+    assert calls[-1]["symbol"] == "frost_sdpa_bwd_sm107_d512_prepared"
 
 
 def _io_dtype(dt):

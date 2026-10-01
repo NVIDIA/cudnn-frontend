@@ -204,11 +204,13 @@ def host(
         dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
 
 
-def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key):
-    # Source codegen domain; the complete engine remains qualified only on
-    # SM100/SM103. Other targets are used for isolated lowering checks.
-    if sm not in (100, 103, 107, 110):
-        raise ValueError(f"SM100 SDPA bwd has codegen targets for SM100, SM103, SM107, SM110; got SM{sm}")
+def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key, symbol="frost_sdpa_bwd_sm100_prepared"):
+    # Source codegen domain: the SM100 line proper (SM100 / SM103, where the ``sdpa_bwd_sm100`` row is qualified) and the
+    # Rubin line as a RANGE (cc 10.7 up to the SM100 line's end, the ``sdpa_bwd_sm107_d512`` row's ``_RUBIN`` span -- the
+    # part that ships next is not declined by a list).  Other targets are used for isolated lowering checks only.
+    # ``symbol`` is the artifact's exported entry (``frost_<engine name>_prepared``, Rule 6): one per engine row.
+    if not (sm in (100, 103) or 107 <= sm <= 119):
+        raise ValueError(f"SM100 SDPA bwd has codegen targets for SM100, SM103 and the Rubin line SM107-SM119; got SM{sm}")
 
     def ptr(t, align=16):
         return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
@@ -248,5 +250,5 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
-        symbol="frost_sdpa_bwd_sm100_prepared",
+        symbol=symbol,
     )
