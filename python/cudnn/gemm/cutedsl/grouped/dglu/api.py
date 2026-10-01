@@ -126,6 +126,7 @@ class DgluCall:
     weight_mode: Optional[MoEWeightMode] = None
     b_shape: Optional[Tuple[int, ...]] = None
     num_experts: Optional[int] = None
+    deterministic: bool = False
 
 
 class GroupedGemmDgluSm100(APIBase):
@@ -208,6 +209,7 @@ class GroupedGemmDgluSm100(APIBase):
         glu_clamp_min: float = -7.0,
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
+        _deterministic: bool = False,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -649,6 +651,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
     if generate_dbias:
         dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
+    deterministic = call.deterministic
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
@@ -776,12 +779,17 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             num_experts,
         )
 
+    if deterministic:  # the kernel writes per-N-tile slots instead of dprob; key on their count
+        from ..dsrelu.api import _dprob_n_slots
+
+        cache_key = (*cache_key, "deterministic", _dprob_n_slots(n_weight, mma_tiler_mn, cluster_shape_mn, True))
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Using cached object")
         api = _cache_of_GroupedGemmDgluSm100Objects[cache_key]
     else:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Creating new object")
+        dprob_kernel_tensor = _dglu_dprob_slots(call, n_weight, valid_m) if deterministic else dprob_tensor
         if is_dense:
             api = GroupedGemmDgluSm100(
                 sample_a=a_tensor,
@@ -793,7 +801,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 sample_alpha=alpha_tensor,
                 sample_beta=beta_tensor,
                 sample_prob=prob_tensor,
-                sample_dprob=dprob_tensor,
+                sample_dprob=dprob_kernel_tensor,
                 sample_dbias=dbias_tensor,
                 sample_b=b_tensor,
                 sample_sfb=sfb_tensor,
@@ -819,6 +827,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 glu_clamp_min=glu_clamp_min,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                _deterministic=deterministic,
             )
         else:
             api = GroupedGemmDgluSm100(
@@ -831,7 +840,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 sample_alpha=alpha_tensor,
                 sample_beta=beta_tensor,
                 sample_prob=prob_tensor,
-                sample_dprob=dprob_tensor,
+                sample_dprob=dprob_kernel_tensor,
                 sample_dbias=dbias_tensor,
                 num_experts=num_experts,
                 b_shape=b_shape,
@@ -859,6 +868,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 glu_clamp_min=glu_clamp_min,
                 situ_beta1=situ_beta1,
                 situ_beta2=situ_beta2,
+                _deterministic=deterministic,
             )
 
         if not api.check_support():
@@ -867,6 +877,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
     # ---- Execute ----
+    dprob_slots = _dglu_dprob_slots(call, n_weight, valid_m) if deterministic else None
     if is_dense:
         api.execute(
             a_tensor=a_tensor,
@@ -878,7 +889,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             alpha_tensor=alpha_tensor,
             beta_tensor=beta_tensor,
             prob_tensor=prob_tensor,
-            dprob_tensor=dprob_tensor,
+            dprob_tensor=dprob_tensor if dprob_slots is None else dprob_slots,
             dbias_tensor=dbias_tensor,
             b_tensor=b_tensor,
             sfb_tensor=sfb_tensor,
@@ -899,7 +910,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             alpha_tensor=alpha_tensor,
             beta_tensor=beta_tensor,
             prob_tensor=prob_tensor,
-            dprob_tensor=dprob_tensor,
+            dprob_tensor=dprob_tensor if dprob_slots is None else dprob_slots,
             dbias_tensor=dbias_tensor,
             b_ptrs=b_ptrs,
             sfb_ptrs=sfb_ptrs,
@@ -909,6 +920,10 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             norm_const_tensor=norm_const_tensor,
             current_stream=current_stream,
         )
+    if dprob_slots is not None:
+        from ..dsrelu.api import _reduce_dprob_slots
+
+        _reduce_dprob_slots(dprob_slots, dprob_tensor, current_stream)
 
     return TupleDict(
         d_row_tensor=d_row_tensor,
@@ -919,6 +934,18 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
     )
+
+
+def _dglu_dprob_slots(call: DgluCall, n_weight: int, valid_m: int):
+    """Deterministic dprob scratch: one zeroed fp32 slot per (token, N-tile), zeroed on the launch stream."""
+    import torch
+
+    from ..backend_utils import _torch_stream_context
+    from ..dsrelu.api import _dprob_n_slots
+
+    n_slots = _dprob_n_slots(n_weight, call.mma_tiler_mn, call.cluster_shape_mn, True)
+    with _torch_stream_context(call.current_stream, call.a_tensor.device):
+        return torch.zeros((valid_m, n_slots, 1), dtype=torch.float32, device=call.a_tensor.device)
 
 
 def _normalize_dglu_call(
@@ -1295,8 +1322,13 @@ def grouped_gemm_dglu_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
-    """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
+    """Dispatch grouped GEMM dGLU once from an immutable normalized call.
+
+    ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
+    no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
+    """
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
     # the op cache-key rebuild -- and a pure function of the operands' metadata plus the
@@ -1343,6 +1375,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         epilogue_op,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        deterministic,
     )
     memo = _dglu_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -1425,8 +1458,11 @@ def grouped_gemm_dglu_wrapper_sm100(
         use_dynamic_sched=use_dynamic_sched,
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
+        deterministic=deterministic and dprob_tensor is not None,  # without dprob there is nothing to make deterministic
     )
     normalized, backend = _normalize_dglu_call(call)
+    if deterministic and (framework != "torch" or backend is GroupedGemmBackend.BF16):
+        raise NotImplementedError("deterministic=True is implemented only for the block-scaled kernel with torch tensors")
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_dglu_bf16_call(normalized, memo_key)
     if framework == "jax":
