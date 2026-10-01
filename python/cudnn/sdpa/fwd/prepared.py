@@ -429,7 +429,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     km = api._k_mod
     compiled = api._compiled_kernel
     host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
-    if getattr(api, "paged_thd_split", False):
+    if getattr(api, "packed_thd_split", False):
         host = km._host_thd_split
     raw = positional_entry(compiled)
     if raw is None:

@@ -819,6 +819,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
+        # The packed THD split ABI uses the single-Q tile. The existing dense
+        # D192 split remains a two-CTA lowering.
+        return sched_policy, 1
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
@@ -915,6 +919,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             return 256
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
+        if cga == 1 and _sm100_f16(caps, facts) and facts.thd and not facts.has_paged_kv:
+            return _D128_DECODE_TILE_ROWS
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)

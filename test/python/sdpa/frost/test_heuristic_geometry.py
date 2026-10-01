@@ -189,8 +189,9 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
 
 @requires_dsl
 @pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
-def test_paged_split_override_requires_bounded_workspace(capacity):
-    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity)
+@pytest.mark.parametrize("paged,d", [(True, 128), (False, 192)])
+def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
+    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity, has_paged_kv=paged, d_qk=d)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
     assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
 
