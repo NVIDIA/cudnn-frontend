@@ -1360,8 +1360,8 @@ class SM90FusedMultiHeadAttentionForward:
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
         sinks: Optional[cute.Tensor],
-        seq_q_lens: cute.Tensor,
-        seq_kv_lens: cute.Tensor,
+        seq_q_lens: Optional[cute.Tensor],
+        seq_kv_lens: Optional[cute.Tensor],
         scale: cutlass.Float32,
         thd_max_sq: cutlass.Int32,
         thd_q_lens: Optional[cute.Tensor],
@@ -1388,9 +1388,9 @@ class SM90FusedMultiHeadAttentionForward:
             store at compile time.
         :param sinks: ``(H_q,)`` FP32 per-Q-head sink logits, ``None`` without
             ``has_sink``.
-        :param seq_q_lens: Int32 ``(B,)`` Q lengths, or an unused dummy.
-        :param seq_kv_lens: Int32 ``(B,)`` KV lengths, or an unused dummy. Under THD, the
-            128-byte-aligned ``THD_MAPS_META_WORDS(B)`` scratch: metadata, then maps.
+        :param seq_q_lens: Int32 ``(B,)`` Q lengths, ``None`` when no role reads them.
+        :param seq_kv_lens: Int32 ``(B,)`` KV lengths, ``None`` when no role reads them. Under
+            THD, the 128-byte-aligned ``THD_MAPS_META_WORDS(B)`` scratch: metadata, then maps.
         :param scale: The host softmax scale in natural units; the kernel folds
             ``log2(e)`` itself. Its sign must match ``scale_mode``.
         :param thd_max_sq: THD only: the declared S_q envelope, which sizes the grid.
@@ -1598,14 +1598,19 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         lse_tokens = cute.sym_int(divisibility=1) if PARAMS.thd_varlen else s_q
         fake_lse = cute.runtime.make_fake_tensor(cutlass.Float32, (fake_batch, h_q, lse_tokens), tuple(lse_stride), assumed_align=4)
     fake_sinks = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (h_q,), stride_order=(0,), assumed_align=4) if PARAMS.has_sink else None
-    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=4)
-    # THD: metadata, then tensor maps, on the TMA boundary the launcher checks.
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (THD_MAPS_META_WORDS(b),) if PARAMS.thd_varlen else (b,),
-        stride_order=(0,),
-        assumed_align=TENSOR_MAP_ALIGN if PARAMS.thd_varlen else 4,
-    )
+    # A length slot no role reads compiles out. THD's seq_kv_lens is the metadata, then tensor maps, on the TMA
+    # boundary the launcher checks.
+    fake_seq_q_lens = None
+    if PARAMS.seq_q_lens_present and not PARAMS.thd_varlen:
+        fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=4)
+    fake_seq_kv_lens = None
+    if PARAMS.thd_varlen or PARAMS.seq_kv_lens_present:
+        fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (THD_MAPS_META_WORDS(b),) if PARAMS.thd_varlen else (b,),
+            stride_order=(0,),
+            assumed_align=TENSOR_MAP_ALIGN if PARAMS.thd_varlen else 4,
+        )
     # Dynamic extents: (B,) lengths and (B+1,) prefix sums bind one artifact.
     if PARAMS.thd_varlen:
         fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
