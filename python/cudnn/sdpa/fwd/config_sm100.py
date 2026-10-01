@@ -1568,12 +1568,22 @@ def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
     )
 
 
-def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
-    """Consistency checks on the 2x2-datapath d512 geometry (every count the kernel's
-    mbarrier inits and setmaxnreg take is re-derived here)."""
+def d512_2x2_p_ring_start_bytes(cfg: CfgD512X2) -> int:
+    """SMEM byte offset at which the P ring begins = sQ + the K ring + the (V ring u O staging) slab -- the first
+    MMA-operand tile that can cross the 256 KiB version-0 tcgen05 descriptor window (config_sm107.TCGEN05_V0_ADDR_LIMIT):
+    192 KiB at 2/2 sub-chunk stages (SM100), exactly 262144 at 3/3 (SM107)."""
+    smem = d512_2x2_smem_bytes(cfg)
+    vo = max(cfg.STAGES_V_SUB * smem["v_sub"], smem["o"]) if cfg.OV_ALIAS else cfg.STAGES_V_SUB * smem["v_sub"] + smem["o"]
+    return smem["q"] + cfg.STAGES_K_SUB * smem["k_sub"] + vo
+
+
+def d512_2x2_geometry_checks(cfg: CfgD512X2) -> tuple:
+    """The ARCH-NEUTRAL consistency checks on the 2x2-datapath d512 geometry, as ``(ok, message)`` pairs: every count
+    the kernel's mbarrier inits and setmaxnreg take is re-derived here.  config_sm107 appends the Rubin arch checks
+    (descriptor version from the layout, the 320 KiB usable budget) to this list; the SM100 ones follow below."""
     smem = d512_2x2_smem_bytes(cfg)
     n_pairs = cfg.CGA_M // cfg.CTA_MMA
-    checks = (
+    return (
         (cfg.TILE_M == 64 and cfg.TILE_N == 128, "d512 2x2: TILE_M=64 (cta_group::2 M=128 atom) / TILE_N=128"),
         (cfg.TILE_K == 512 and cfg.TILE_O == 512, "d512 2x2: d_qk = d_v = 512"),
         (cfg.CTA_MMA == 2 and cfg.CGA_N == 1, "d512 2x2: cta_group::2 pairs, CGA_N=1"),
@@ -1621,12 +1631,23 @@ def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
             cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 2 + 2 * 2 <= cfg.TMEM_COLS,
             f"d512 2x2: TMEM carve O {cfg.O_TMEM_COLS} + S {cfg.XFER_STAGES * cfg.S_TMEM_COLS} + alpha ring 2 + per-slot stats 4 > {cfg.TMEM_COLS}",
         ),
-        (cfg.DESC_VERSION == 0, "d512 2x2 (SM100): every operand sits below 256 KiB -> tcgen05 SMEM descriptor version 0"),
         (
             smem["total"] <= cfg.SMEM_CAP_BYTES,
             f"d512 2x2: SMEM {smem['total']} B (incl. {cfg.SMEM_ALIGN_PAD} B pad) over the {cfg.SMEM_CAP_BYTES} B cap: {smem}",
         ),
         (not cfg.PACK_GQA or cfg.TILE_M % cfg.PACK_G == 0, "d512 2x2: PACK_G must divide TILE_M"),
+    )
+
+
+def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
+    """The SM100 2x2-datapath d512 configuration: the arch-neutral geometry checks plus the SM100 arch facts
+    (227 KiB opt-in cap, every operand below the 256 KiB version-0 descriptor window)."""
+    checks = d512_2x2_geometry_checks(cfg) + (
+        (cfg.SMEM_CAP_BYTES == 227 * 1024, f"d512 2x2 (SM100): the budget is checked against the 227 KiB opt-in cap, got {cfg.SMEM_CAP_BYTES}"),
+        (
+            cfg.DESC_VERSION == 0 and d512_2x2_p_ring_start_bytes(cfg) + cfg.XFER_STAGES * cfg.TILE_M * cfg.TILE_N * cfg.BPE <= 256 * 1024,
+            "d512 2x2 (SM100): every operand sits below 256 KiB -> tcgen05 SMEM descriptor version 0",
+        ),
     )
     for ok, msg in checks:
         if not ok:
