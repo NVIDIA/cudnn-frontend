@@ -101,7 +101,9 @@ class TemplateParamsDbg(TemplateParams):
     ``FROST_SOURCE_DIGEST`` and its compiled-plan cache entries, and ``make_cfg_d512`` reads the two fields through
     ``getattr`` with the defaults.  Test / measurement only -- the adapter never builds this record.
 
-    ``debug_clk`` = 1 (with a non-zero ``debug_dump_addr``, a device-accessible host-pinned buffer >= 16 MiB): every
+    ``debug_clk`` = 1 (with a non-zero ``debug_dump_addr``, a device-accessible host-pinned buffer of 16 MiB = 8192 CTAs x
+    8 warps x 32 Int64 -- the record index is not bounds-checked, so a stage-2 launch of more than 8192 CTAs must not
+    be armed; the GPU accounting test asserts the grid fits): every
     mbarrier wait of the 4x1 keeps its production form but is bracketed by two %clock64 reads, and each warp
     accumulates the clk per barrier id (+ its issue segments) in a 2 KiB SMEM slice that ``_dbg_exit`` writes to the
     buffer as 32 x Int64 at ``(linear block * 8 + warp) * 32`` (layout: the kernel's ``DBG_CLK_*`` constants).  Default
@@ -837,8 +839,10 @@ class TemplateParams2x2(TemplateParams):
     # (STG store drain, compute math / cast store, MMA chunk issue, LDG chunk issue) in a per-warp SMEM slice, and at exit
     # writes the slice -- 32 x Int64: [0] body clk, [1..10] wait clk per DBG_BAR id, [11..15] segments, [16] q tiles,
     # [17] role kv total, [18..27] waits per DBG_BAR id that took > DBG_CLK_BLOCKED_THRESH clk -- to the dump buffer at
-    # ``(linear block * 8 + warp) * 32`` Int64.  The waits keep their production form; the cost is two S2R clock reads and
-    # one SMEM read-modify-write by the elected lane per wait (measured as the lever's own overhead next to its numbers).
+    # ``(linear block * 8 + warp) * 32`` Int64 (unchecked index: the 16 MiB buffer holds 8192 CTAs per launch -- a larger
+    # grid must be head-chunked by the host; the GPU accounting test asserts it).  The waits keep their production form;
+    # the cost is two S2R clock reads and one SMEM read-modify-write by the elected lane per wait (measured as the lever's
+    # own overhead next to its numbers).
     debug_clk: int = 0
 
 

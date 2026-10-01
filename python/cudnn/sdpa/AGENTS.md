@@ -380,7 +380,10 @@ Backward (d512 stage 2):
   wait ~1200 on `smem_empty` (a 32 KiB TMA store drains in ~2600 clk), its
   MMA idles 3100 on `acc_empty`; the twin's MMA waits 2100-2650 on
   `ring_full` (K/V chunk latency, ~800 of it the cross-pair lock-step:
-  `kv_share 1` is -7..-10 % stage 2, bitwise) while `acc_empty` and
+  `kv_share 1` measured -6.9 / -10.0 / -9.6 % of stage-2 wall time on dense
+  8K / dense 2K / causal 8K, bitwise -- ONCE per cell as the B arms of an
+  A/B/A series in one slot whose four control arms spread +-1.7 / 0.2 / 0.8 %,
+  so n = 1 per cell, three cells agreeing) while `acc_empty` and
   `smem_empty` never block (`stages_acc 4` and a two-stage cast are no-ops
   there) -- a lever that is right for one kernel is a no-op on the other.
   The body's clk / ns ratio is the SM clock the kernel ACTUALLY ran at:
@@ -394,10 +397,19 @@ Backward (d512 stage 2):
   `test_stage2_2x2_default_rendering_ptx_md5_is_unchanged`), the armed lever
   renders different PTX (`test_stage2_{2x2,4x1}_debug_clk_lever_renders_code`),
   and `test_stage2_{2x2,4x1}_debug_clk_dump_accounts_the_waits` checks every
-  role accumulates exactly the barriers it waits on with bitwise outputs; the
-  decoder / A/B driver is the job's `attr_dbg.py` (its `[clock]` line), and
-  NCU `--clock-control base` (688 MHz on that box) is the other way to hold
-  the clock -- never compare two wall times without one of the two.
+  role accumulates exactly the barriers it waits on with bitwise outputs and
+  reads the record layout (the module's `DBG_CLK_*` constants: slot 0 is the
+  body's clk, slot `DBG_CLK_BODY_NS` -- 28 on the twin, 31 on the 4x1 -- its
+  %globaltimer span, so `slot0 / slot28|31` is the SM clock in GHz the body
+  ran at; a decoder is a few lines over those constants and the per-warp
+  `(linear block * 8 + warp) * 32` record offset). The record index is not
+  bounds-checked: the 16 MiB dump holds 8192 CTAs per launch, so assert
+  `grid * 8 * 32 <= DBG_CLK_MAX_WORDS` before arming (both accounting tests
+  do). NCU `--clock-control base` (688 MHz on that box) is the other way to
+  hold the clock -- never compare two wall times without one of the two, and
+  never compare two ARMS run in a fixed order on a power-capped board without
+  an in-run thermal control: the matrix's `4x1, twin` order timed the
+  IDENTICAL stage-3 GEMMs 10-25 % slower in the second arm at S >= 8K.
 
 ## Output initialization regressions
 

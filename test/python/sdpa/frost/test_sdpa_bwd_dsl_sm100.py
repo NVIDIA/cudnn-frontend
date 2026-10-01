@@ -1044,7 +1044,15 @@ def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
 # --------------------------------------------------------------------------- the 2x2 twin's DEFAULT rendering pin + its lever
 
 _STAGE2_2X2_MD5_RECORD = _Path(__file__).resolve().parent / "renderings" / "md5_stage2_2x2_sm100a.txt"
-_STAGE2_2X2_RECORDS = {"dense_bf16": dict(dtype_qkv=2), "causal_bf16": dict(dtype_qkv=2, window_right=0)}
+_STAGE2_2X2_RECORDS = {
+    "dense_bf16": dict(dtype_qkv=2),
+    "causal_bf16": dict(dtype_qkv=2, window_right=0),
+    "dense_fp16": dict(dtype_qkv=3),
+    "thd_bf16": dict(dtype_qkv=2, thd_varlen=True),
+}
+# The RED side (an armed lever renders different PTX) needs no fp16 / THD render: the lever is dtype- and
+# layout-independent code, and each render is a ~1 min host trace-compile.
+_STAGE2_2X2_RED_RECORDS = ("dense_bf16", "causal_bf16")
 # The attribution lever armed with a fake (non-zero, 64-B aligned) dump address: a host trace-compile only reads the
 # constant, so any aligned value renders the instrumented kernel.
 _FAKE_DUMP_ADDR = 4096
@@ -1101,7 +1109,7 @@ def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     assert got == want, f"{record}: PTX md5 {got} != the record's {want} -- the 2x2 stage-2 DEFAULT rendering changed"
 
 
-@pytest.mark.parametrize("record", list(_STAGE2_2X2_RECORDS))
+@pytest.mark.parametrize("record", list(_STAGE2_2X2_RED_RECORDS))
 def test_stage2_2x2_debug_clk_lever_renders_code(tmp_path, record):
     """The RED side of the pin above: ARMED, the attribution lever renders a DIFFERENT kernel (the clock reads, the SMEM
     accumulators and the exit dump are real code), so a lever that leaked into the default rendering would trip the md5
@@ -1155,6 +1163,7 @@ def test_stage2_2x2_debug_clk_dump_accounts_the_waits(monkeypatch):
 
     nx, ny = (sq // 256) * 4, hq
     nblk = nx * ny
+    assert nblk * 8 * words <= K2.DBG_CLK_MAX_WORDS, "the record index is unchecked in the kernel: the grid must fit the 16 MiB dump (<= 8192 CTAs)"
     rec = dump[: nblk * 8 * words].view(nblk, 8, words)
     total, tiles, kv_total = rec[:, :, K2.DBG_CLK_TOTAL], rec[:, :, K2.DBG_CLK_TILES], rec[:, :, K2.DBG_CLK_KV_TOTAL]
     assert bool((total[:, :7] > 0).all()), "every non-scheduler warp of every CTA records a body clock"
@@ -1252,6 +1261,7 @@ def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
 
     nx, ny = (sq // 256) * 4, hq
     nblk = nx * ny
+    assert nblk * 8 * words <= K1.DBG_CLK_MAX_WORDS, "the record index is unchecked in the kernel: the grid must fit the 16 MiB dump (<= 8192 CTAs)"
     rec = dump[: nblk * 8 * words].view(nblk, 8, words)
     total, tiles, kv_total = rec[:, :, K1.DBG_CLK_TOTAL], rec[:, :, K1.DBG_CLK_TILES], rec[:, :, K1.DBG_CLK_KV_TOTAL]
     assert bool((total[:, :7] > 0).all()) and bool((rec[:, 7, :] == 0).all())

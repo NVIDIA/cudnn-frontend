@@ -214,6 +214,10 @@ LOG2E = 1.4426950408889634
 # lane accumulates the delta per barrier id in this warp's SMEM slice, together
 # with the clock of its issue segments; ``_dbg_exit`` writes the slice to the
 # dump buffer as 32 x Int64 at (linear block * TOTAL_WARPS + warp) * DBG_CLK_WORDS.
+# The record index is NOT bounds-checked: the 16 MiB dump holds 8192 CTAs per
+# launch (DBG_CLK_MAX_WORDS / (TOTAL_WARPS * DBG_CLK_WORDS)); a larger stage-2
+# grid (B4 S2K H128 = 16384 CTAs in one chunk, a THD N_THD_UNITS grid above it)
+# must be chunked by the host -- the GPU accounting test asserts the bound.
 # Same record shape as the 2x2 twin's lever (its decoder reads both); the 4x1
 # has four more barrier ids (the alias seam, the two ship barriers, named
 # barrier 8), so the segment / count slots sit higher.
@@ -241,7 +245,10 @@ DBG_CLK_BLOCKED_THRESH = 128  # a wait that passes on its first test costs ~30-6
 
 
 class Dbg(NamedTuple):
-    """Attribution context: the Int64 dump view + this warp's record offset, the SMEM accumulators + this warp's slice."""
+    """Attribution context: the Int64 dump view + this warp's record offset, the SMEM accumulators + this warp's slice.
+    The accumulators are read-modify-written by the ``elect_sync()`` lane with no warp sync between the RMWs (the lane may
+    differ between waits): this leans on the warp's single in-order instruction stream over its own private slice --
+    test-only; a fixed ``lane_idx == 0`` or a ``bar.warp.sync`` before each read is the formally ordered form."""
 
     arr: object
     slot: object

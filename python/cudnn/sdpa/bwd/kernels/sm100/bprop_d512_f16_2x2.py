@@ -207,8 +207,12 @@ _DBG_BOUNDED: bool = _DBG_WAIT_NS > 0 and _DBG_DUMP_ADDR != 0
 # ATTRIBUTION lever (TemplateParams2x2.debug_clk; default OFF = zero traced code): the waits keep their production form,
 # and every warp accumulates in its own SMEM slice the %clock64 spent INSIDE each barrier's waits (per DBG_BAR id), the
 # number of those waits that actually blocked, and the clock of its issue segments; `_dbg_exit` writes the slice to the
-# dump buffer as 32 x Int64 at (linear block * TOTAL_WARPS + warp) * DBG_CLK_WORDS.  The decoder is the lane's
-# attr_dbg.py (hang_dbg.py pattern); the record layout is the DBG_CLK_* constants below.
+# dump buffer as 32 x Int64 at (linear block * TOTAL_WARPS + warp) * DBG_CLK_WORDS.  The record index is NOT bounds-
+# checked: the 16 MiB dump holds DBG_CLK_MAX_WORDS / (TOTAL_WARPS * DBG_CLK_WORDS) = 8192 CTAs per launch, so a larger
+# stage-2 grid (B4 S2K H128 = 16384 CTAs in one head chunk; a THD N_THD_UNITS grid above it) must be chunked by the
+# host or the records overrun the buffer -- the GPU accounting test and the job's attr_dbg.py assert the bound before
+# the launch.  The record layout is the DBG_CLK_* constants below (slot DBG_CLK_BODY_NS over slot 0 = the SM clock the
+# body ran at); the accounting test reads it, a decoder is a few lines over these constants.
 _DBG_CLK: bool = bool(CFG.DEBUG_CLK) and _DBG_DUMP_ADDR != 0
 # Any debug mode needs the dump context built in the kernel entry.
 _DBG: bool = _DBG_BOUNDED or _DBG_HEARTBEAT or _DBG_CLK
@@ -252,7 +256,10 @@ DBG_DRAIN = -2
 
 class Dbg(NamedTuple):
     """Per-warp debug context: the dump view (Int32 records; Int64 under the attribution lever), this warp's record word
-    offset and the CTA's identity; under the attribution lever also the SMEM accumulator array and this warp's slice."""
+    offset and the CTA's identity; under the attribution lever also the SMEM accumulator array and this warp's slice.
+    The accumulators are read-modify-written by the ``elect_sync()`` lane with no warp sync between the RMWs: PTX does not
+    promise the same lane each time, so this leans on the warp's single in-order instruction stream over its own private
+    slice (test-only; a fixed ``lane_idx == 0`` or a ``bar.warp.sync`` before each read is the formally ordered form)."""
 
     arr: object
     slot: object
@@ -347,7 +354,9 @@ def _wait_plain(mb, phase, poll: bool = False):
 def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4, poll: bool = False):
     """``_wait_plain(mb, phase, poll)``; with the bounded-wait lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer ->
     record -> wait on; with the heartbeat armed, the record (status WAITING) goes out BEFORE the unmodified wait and the
-    status flips to RUNNING after it."""
+    status flips to RUNNING after it; with the attribution lever (``_DBG_CLK``) armed, the UNMODIFIED wait is bracketed by
+    two %clock64 reads and the elected lane adds the delta to this warp's bucket for ``bar_id`` (plus one to its blocked
+    count when the wait took more than DBG_CLK_BLOCKED_THRESH clk)."""
     if cutlass.const_expr(not _DBG):
         _wait_plain(mb, phase, poll)
     elif cutlass.const_expr(_DBG_HEARTBEAT):
@@ -394,8 +403,9 @@ def _clk_add(dbg, word: int, dt):
 
 @cute.jit
 def _dbg_exit(dbg, tile_no, kv_total):
-    """This warp left its persistent loop and every drain: status EXITED (a warp that timed out never gets here).  Under
-    the attribution lever: close the body clock, record the tile counts and write the warp's 32 x Int64 slice out."""
+    """This warp left its persistent loop and every drain.  Under the attribution lever (the primary branch): close the body
+    clock and its %globaltimer span, record the tile counts and write the warp's 32 x Int64 slice out.  Under the bounded /
+    heartbeat levers: status EXITED (a warp that timed out never gets here)."""
     if cutlass.const_expr(_DBG_CLK):
         if nvvm.elect_sync():
             i0 = dbg.cslot

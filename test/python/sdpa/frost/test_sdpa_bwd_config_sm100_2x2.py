@@ -216,21 +216,8 @@ def test_make_bwd_decode_reads_the_span_through_getattr_defaults():
         (TemplateParams2x2(debug_clk=1, debug_dump_addr=4096, debug_wait_ms=5), "debug_clk writes a different dump record"),
         (TemplateParams2x2(debug_clk=2, debug_dump_addr=4096), "debug_heartbeat / debug_clk need debug_dump_addr"),
     ],
-    ids=[
-        "sm100_5_stages",
-        "sm100_2_cast",
-        "1_stage",
-        "0_cast",
-        "chunk_48",
-        "chunk_256",
-        "fp8",
-        "br_without_causal",
-        "sm107_11_stages",
-        "clk_without_dump",
-        "clk_with_heartbeat",
-        "clk_with_bounded",
-        "clk_not_a_flag",
-    ],
+    ids=["sm100_5_stages", "sm100_2_cast", "1_stage", "0_cast", "chunk_48", "chunk_256", "fp8", "br_without_causal", "cc107_11_stages"]
+    + ["clk_without_dump", "clk_with_heartbeat", "clk_with_bounded", "clk_not_a_flag"],
 )
 def test_validator_rejects(params, match):
     with pytest.raises(ValueError, match=re.escape(match)):
