@@ -894,6 +894,37 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("LDTM_ORDER_GROUPS", n_groups)
     print("LDTM_ORDER_VIOLATIONS", n_bad)
     """)
+_NATURAL_PROBE = textwrap.dedent(r"""
+    import sys
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+    MASKS = {"dense": {}, "causal": dict(window_right=0)}
+    for mask, kw in MASKS.items():
+        mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, **kw), tag="natural_2x2_" + mask)
+        assert mod.MMA_LOOKAHEAD is True, "the shipped arm is the lookahead order"
+        mod.MMA_LOOKAHEAD = False
+        mod.compile(b=1, qh=2, kh=1, sq=256, skv=512)
+        print("NATURAL_OK", mask)
+    """)
+
+
+@requires_pre_rubin_blackwell
+def test_natural_mma_order_arm_compiles():
+    """The NATURAL MMA-order arm (``MMA_LOOKAHEAD = False``: S(i) at the top of iteration i instead of S(i+1) after dP(i))
+    trace-compiles for dense and causal.  Regression pin for the DSL's branch-join typing: every name the NATURAL block
+    assigns inside the q loop (``desc_Q``, ``s_bar``) must already exist with the same type on the lookahead-free entry
+    path, or the DSL raises TYPE_UNSTABLE_JOIN (hit 2026-10-01 on the first stage-2 arm A/B).  A fresh process, because
+    the arm is a module constant flipped on the loaded template (the ``SPIN_RING_WAITS`` idiom) and must not leak into
+    the other tests' cached module.  Correctness of the arm: the lane's direct-launch bring-up (dense, causal, GQA causal
+    against the fp64 reference) -- it is an A/B arm, not a shipped rendering."""
+    env = dict(os.environ, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
+    proc = subprocess.run([sys.executable, "-c", _NATURAL_PROBE], capture_output=True, text=True, timeout=1500, env=env)
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
+    assert proc.stdout.count("NATURAL_OK") == 2, proc.stdout
+
+
 _SASS_ROWS = [pytest.param("dense", id="dense"), pytest.param("causal", id="causal"), pytest.param("causal_swa", id="causal-swa")]
 # MEASURED on this box's toolchain (nvidia-cutlass-dsl 4.7.0 ptxas, sm_100a, 2026-10-01, B=1 H=8 S=1024): 0 / 0 at 176 / 152.
 _SPILL_PINS = {"STL": 0, "LDL": 0}

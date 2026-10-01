@@ -1140,6 +1140,13 @@ def _mma_warp(
             s_acc_empty_state = advance(s_acc_empty_state, CFG.STAGES_TMEM_S)
             bars.mb_q_empty[q_full_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             q_full_state = advance(q_full_state, CFG.STAGES_Q)
+        else:
+            # NATURAL: `desc_Q` / `s_bar` are (re)defined at the top of every iteration below, but the DSL types a name
+            # assigned under a branch at the branch's join, so each must exist with the SAME type on the other path too
+            # (TYPE_UNSTABLE_JOIN otherwise; the lookahead arm defines both in its prologue).  One mov.b64 of slot 0's
+            # base and a folded constant, never consumed as these values.
+            desc_Q = desc_opaque(sQ[0].desc(), anchor=q_lo)
+            s_bar = cutlass.Int32(0)
 
         for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
             if cutlass.const_expr(not MMA_LOOKAHEAD):
