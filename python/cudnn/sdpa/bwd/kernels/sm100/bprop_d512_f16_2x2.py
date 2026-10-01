@@ -268,17 +268,41 @@ def _test_wait_parity(mb, phase):
     return v != cutlass.Int32(0)
 
 
+# The poll's shape (module constants, not levers): up to POLL_TIGHT_ITERS back-to-back tests (a few us: a phase that is
+# about to flip pays no extra latency), then a plain timer ``nanosleep`` between tests.  The timer sleep wakes on its own
+# (SASS ``NANOSLEEP``, not the event-sleep ``NANOSLEEP.SYNCS`` that loses the wake-up), so the wait still never parks on the
+# barrier.  MEASURED (B200 @1155 MHz, dense B=1 H=128 S=8192, CUPTI stage-2 medians, one clean twin slot per point,
+# lane_d512_bprop/fix/poll_sweep.out + abtight_* / absleep* logs; 4x1 on the same slots 41696-43186 us, pre-fix parked
+# twin 39166):
+#     tight forever  94575 us   (2.2x: the pollers on the MMA and TMA-LDG warps share SMSPs 0 / 1 with compute warps 0 / 1
+#                                and take half their issue slots on the softmax critical path)
+#     4 / 64 ns      41426, 41930      32 / 256 ns    41338      64 / 64 ns   41602
+#     32 / 128 ns    40531, 40391, 41595               128 / 128 ns  40312   <- shipped
+# More tight iterations and fewer, longer sleeps win; 32/128 and 128/128 are within the ~3 % slot noise, and the residual
+# cost against the parked twin is ~3 %.  (The forward 2x2 kernel's shared ``barrier.wait_poll`` uses 32 / 128.)
+POLL_TIGHT_ITERS = 128
+POLL_SLEEP_NS = 128
+
+
 @cute.jit
 def _poll_wait(mb, phase):
-    """A wait that NEVER parks the warp: ``mbarrier.test_wait.parity`` until the phase flips.
+    """A wait that NEVER parks the warp on the barrier: ``mbarrier.test_wait.parity`` until the phase flips, with a timer
+    back-off after ``POLL_TIGHT_ITERS`` tests.
 
     The form every barrier whose completing event is issued from OUTSIDE the pair must take (``ring_empty``: the partner
     leader's ``tcgen05.commit`` multicast; ``ring_full``: the partner's TMA ``complete_tx``).  Measured 2026-10-01 under
     GPU time-slicing: a warp parked in NANOSLEEP.SYNCS (the ``try_wait`` retry of tile_dsl ``wait()``, with the 1 ns or
     the 10 ms hint, and the hint-less spin alike) on such a barrier can miss the wake-up and the cluster hangs; this
     poll never does (``lane_d512_bprop/fix/HANDOFF2.md``)."""
-    while not _test_wait_parity(mb, phase):
-        pass
+    done = cutlass.Int32(0)
+    spins = cutlass.Int32(0)
+    while done == cutlass.Int32(0):
+        if _test_wait_parity(mb, phase):
+            done = cutlass.Int32(1)
+        else:
+            spins = spins + cutlass.Int32(1)
+            if spins > cutlass.Int32(POLL_TIGHT_ITERS):
+                nvvm.nanosleep(POLL_SLEEP_NS)
 
 
 @cute.jit
