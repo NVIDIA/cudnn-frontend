@@ -206,6 +206,9 @@ class TemplateParams:
     # publishes immutable K/V descriptors, so this variant acquires them once
     # before its persistent loop. Fixed widths keep their measured schedule.
     thd_pair_acquire: bool = False
+    # The graph declares capacity for exactly one sequence. Runtime lengths
+    # remain device data; the prepared binder rejects a larger batch.
+    thd_batch_one: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

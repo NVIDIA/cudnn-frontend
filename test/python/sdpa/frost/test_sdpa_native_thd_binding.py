@@ -981,3 +981,27 @@ def test_native_paged_packed_split_rejects_other_head_geometry():
     s.scratch_bytes = s.split_workspace.off_lse + 4 * 16 * s.qh * 4
     with pytest.raises(ValueError, match="packed split geometry"):
         cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_native_paged_batch_capacity_survives_geometry_cache_hits(capacity):
+    """A B1 plan stays B1; a larger plan can repeatedly bind smaller batches."""
+    s, facts, _ = _paged_fixture()
+    s.b = capacity
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for batch in (1, 2, 1, 2):
+        changed = dict(facts)
+        for role in ("q", "o"):
+            f = facts[role]
+            changed[role] = f._replace(shape=(batch, *f.shape[1:]), span=batch * 4 * s.qh * s.d_qk)
+        for role, size in (("q_lens", batch + 1), ("kv_lens", batch)):
+            changed[role] = facts[role]._replace(shape=(size,), span=size)
+        for role in ("block_table", "block_table_v"):
+            changed[role] = facts[role]._replace(shape=(batch, 4), strides=(4, 1), span=batch * 4)
+        if batch > capacity:
+            for bind in (_native, _reference):
+                with pytest.raises(ValueError, match="prepared for|batch capacity"):
+                    bind(s, changed)
+        else:
+            frame = _equal(s, changed)
+            assert frame[s.index["problem_size"]][0] == batch

@@ -2096,6 +2096,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # the launched kernel.
             emit_amax_o=(not self.pv_bf16) or self.has_amax_o,
             epilogue_gate=self.gate_desc is not None,
+            thd_batch_one=self.paged_thd_split and self.batch_size == 1,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs

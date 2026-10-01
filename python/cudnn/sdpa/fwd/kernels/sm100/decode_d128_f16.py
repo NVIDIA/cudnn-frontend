@@ -327,6 +327,10 @@ def _kernel(
     paged_hnd: cutlass.Constexpr[bool] = False,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
 ) -> None:
+    if cutlass.const_expr(PARAMS.thd_batch_one):
+        # Fold the generic batch scan and split-index quotient/remainder.
+        # Only the declared batch capacity is fixed; Q/KV lengths stay live.
+        n_batch = cutlass.Int32(1)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
 
