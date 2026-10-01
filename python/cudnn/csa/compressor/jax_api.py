@@ -267,8 +267,9 @@ def csa_compressor_backward_jax_sm100(
         return call(
             _compressor_bwd_r128_adapter,
             output_shape_dtype=shapes,
-            # grad_kv / grad_score are fully written; grad_ape is accumulated.
-            initialized_outputs={2: zeros_init},
+            # Only grad_ape needs zeros, but every output is initialized because the
+            # bridge's argument order for partially aliased outputs is not guaranteed.
+            initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init},
             ratio=ratio,
             head_dim=head_dim,
             coff=coff,
