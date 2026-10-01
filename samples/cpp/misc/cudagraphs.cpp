@@ -4,6 +4,7 @@
  */
 
 #include "../utils/helpers.h"
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cudnn_frontend.h>
@@ -363,6 +364,87 @@ TEST_CASE("Cuda graph outlives the frontend graph", "[cudagraph][graph]") {
         REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
+#endif  // CUDART_VERSION < 12000
+}
+
+/*
+Only execution plans with runtime-compiled kernels are retained by the CUDA graphs recorded from
+them. A plan of a precompiled engine (kernels that are part of the cuDNN library) is recorded
+without a reference, and its CUDA graph keeps working after the frontend graph is gone.
+*/
+TEST_CASE("Precompiled plans need no retention by the CUDA graph", "[cudagraph][graph]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    // A plain matmul, which precompiled engines serve.
+    int64_t b = 1, m = 64, n = 64, k = 64;
+    half starter_value   = __float2half(1.f);
+    float const expected = static_cast<float>(k);
+
+    Surface<half> a_gpu(b * m * k, starter_value);
+    Surface<half> b_gpu(b * k * n, starter_value);
+    Surface<half> d_gpu(b * m * n);
+    std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, void *> variant_pack = {
+        {A_UID, a_gpu.devPtr}, {B_UID, b_gpu.devPtr}, {D_UID, d_gpu.devPtr}};
+
+    namespace fe = cudnn_frontend;
+    auto graph   = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto A = graph->tensor(fe::graph::Tensor_attributes().set_uid(A_UID).set_dim({b, m, k}).set_stride({m * k, k, 1}));
+    auto B = graph->tensor(fe::graph::Tensor_attributes().set_uid(B_UID).set_dim({b, k, n}).set_stride({k * n, n, 1}));
+    auto D = graph->matmul(A, B, fe::graph::Matmul_attributes());
+    D->set_output(true).set_uid(D_UID);
+
+    REQUIRE(graph->validate().is_good());
+    REQUIRE(graph->build_operation_graph(handle).is_good());
+    REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+    graph->deselect_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
+    if (graph->check_support().is_bad()) {
+        SKIP("No precompiled engine for this graph.");
+    }
+    REQUIRE(graph->build_plans().is_good());
+    std::vector<fe::BehaviorNote_t> notes;
+    REQUIRE(graph->get_behavior_notes(notes).is_good());
+    REQUIRE(std::find(notes.begin(), notes.end(), fe::BehaviorNote_t::RUNTIME_COMPILATION) == notes.end());
+    Surface<int8_t> workspace(graph->get_workspace_size());
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    REQUIRE(cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS);
+
+    cudaGraph_t captured_graph;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    CUDA_CHECK(cudaStreamEndCapture(stream, &captured_graph));
+    cudaGraphExec_t cuda_graph_exec;
+    CUDA_CHECK(cudaGraphInstantiate(&cuda_graph_exec, captured_graph, nullptr, nullptr, 0));
+
+    graph.reset();
+
+    for (int replay = 0; replay < 3; ++replay) {
+        CUDA_CHECK(cudaGraphLaunch(cuda_graph_exec, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> d_host(d_gpu.size);
+        CUDA_CHECK(cudaMemcpy(d_host.data(), d_gpu.devPtr, sizeof(half) * d_host.size(), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < d_host.size(); i++) {
+            REQUIRE(__half2float(d_host[i]) == expected);
+        }
+        CUDA_CHECK(cudaMemsetAsync(d_gpu.devPtr, 0xFF, sizeof(half) * d_gpu.size, stream));
+    }
+
+    CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
+    CUDA_CHECK(cudaGraphDestroy(captured_graph));
+    REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
+    CUDA_CHECK(cudaStreamDestroy(stream));
 #endif  // CUDART_VERSION < 12000
 }
 

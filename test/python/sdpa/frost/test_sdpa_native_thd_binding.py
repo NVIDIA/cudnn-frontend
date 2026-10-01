@@ -19,6 +19,7 @@ pytestmark = [pytest.mark.L0]
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s = prep.ThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
+    s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
     s.has_lse, s.lse_head_major = layout is not None, layout == "HN"
     s.lse_head_stride, s.lse_stride = (16 if layout == "HN" else 0), None
@@ -31,6 +32,7 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
+    s.template[s.index["n_thd_units"]] = 32
     s.template[s.index["lse_ext"]] = s.lse_head_stride
     s.template[s.index["scale_softmax_log2"]] = 0.125
     s._geometry_cache, s.native = None, None
@@ -223,7 +225,9 @@ def test_native_unknown_metadata_span_keeps_the_bare_pointer_contract():
     _equal(s, changed)
 
 
-@pytest.mark.parametrize("field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2)])
+@pytest.mark.parametrize(
+    "field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2), ("cga_tile_m", 0)]
+)
 def test_native_rejects_malformed_plan(field, value):
     s, _, _ = _fixture()
     setattr(s, field, value)
@@ -381,3 +385,30 @@ def test_native_nonpaged_host_does_not_require_paged_slots():
     s.index = {n: i for i, n in enumerate(s.order)}
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
+
+
+@pytest.mark.parametrize("batch,tokens,expected_limit", [(1, 8192, 128), (4, 512, 32), (4, 1, 32)])
+def test_native_thd_launch_bound_uses_current_capacity(batch, tokens, expected_limit):
+    """A cache-shape envelope must not launch millions of dead THD units."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    declared_units = 4096 * 128 * s.qh
+    s.template[s.index["n_thd_units"]] = declared_units
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for role in ("q", "o"):
+        facts[role] = facts[role]._replace(shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+    for role in ("q_lens", "kv_lens"):
+        facts[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+    before = list(s.template)
+    frame = _equal(s, facts)
+    assert frame[s.index["n_thd_units"]] <= expected_limit
+    assert frame[s.index["n_thd_units"]] >= s.qh
+    assert s.template == before, "launch bounds belong to the invocation, not the shared plan"
+
+
+def test_native_thd_launch_bound_retains_persistent_cap():
+    s, facts, _ = _fixture(layout=None)
+    s.template[s.index["n_thd_units"]] = 7
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    assert _equal(s, facts)[s.index["n_thd_units"]] == 7
+    assert s.template[s.index["n_thd_units"]] == 7
