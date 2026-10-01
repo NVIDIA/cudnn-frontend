@@ -11,7 +11,7 @@ tcgen05 MMAs with the accumulator resident in TMEM, TMA loads and stores, a
 forward activations (`Q/K/V/O`), the loss gradient `dO` and the forward `Stats`
 (natural-log LSE) and produces `dQ/dK/dV`.
 
-Two FROST engines serve it (`cudnn.sdpa.bwd.engines`), both `opt_in` — set
+Three FROST engines serve it (`cudnn.sdpa.bwd.engines`), all `opt_in` — set
 `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before `import cudnn`, and pin the
 engine from the ranked plan list (`graph.plans` / `graph.select_plan(i)`) when
 validating or measuring, because the bf16 d256 graph also has a native backend
@@ -20,15 +20,20 @@ plan:
 * `sdpa_bwd_sm107` — bf16 / fp16 `sdpa_backward()` graphs;
 * `sdpa_bwd_sm107_fp8` — per-tensor FP8 E4M3 `sdpa_fp8_backward()` graphs
   (cuDNN's contract: scalar descales in, FP8 or half gradients plus the
-  `amax_dQ/dK/dV/dP` outputs).
+  `amax_dQ/dK/dV/dP` outputs);
+* `sdpa_bwd_sm107_mxfp8` — block-scale MXFP8 `sdpa_mxfp8_backward()` graphs
+  (E4M3 payloads with F8_128x4 E8M0 scale factors, bf16 `o_f16 / dO_f16`, bf16
+  gradients, **no `amax_*` outputs** — a graph requesting them is declined; see
+  [MXFP8](#mxfp8-numerics-sdpa_bwd_sm107_mxfp8)). The sole provider of that
+  graph on Rubin: cuDNN 9.27 has no MXFP8 d = 256 backward kernel there.
 
 There is no standalone wrapper for this pass yet; the graph API is the surface.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
-(`bprop_d256_f16.py`, `bprop_d256_fp8.py`; config `bwd/config_sm107.py`), the
-adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, and the rest of the launch
-chain is shared with the other Blackwell-line backward engines
-(`kernels/bprop_matmul_blackwell.py`, `kernels/bprop_chain_common.py`).
+(`bprop_d256_f16.py`, `bprop_d256_fp8.py`, `bprop_d256_mxfp8.py`; config
+`bwd/config_sm107.py`), the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
+and the rest of the launch chain is shared with the other Blackwell-line backward
+engines (`kernels/bprop_matmul_blackwell.py`, `kernels/bprop_chain_common.py`).
 
 ## Requirements
 
@@ -105,9 +110,19 @@ fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
         dK under GQA (the bf16 partials are summed BEFORE the amax, scale and cast)
 ```
 
-The workspace is head-chunked (and batch-chunked on the half row) to a 4 GiB
-budget; the artifact's host loops over the chunks with `head_base` / `batch_base`,
-so one compiled artifact serves every launch of a plan.
+The workspace is head-chunked (and batch-chunked on the half row) to one 8 GiB
+budget shared by all three rows (at B=1 H=128 S=8K: 64-head chunks on the half row,
+one 128-head launch on the fp8 row, 32-head chunks on the MXFP8 row; at 16K every
+row still chunks); the artifact's host loops over the chunks with `head_base` /
+`batch_base`, so one compiled artifact serves every launch of a plan.  The budget is
+a chunking constant: `get_workspace_size()` reports the chunk's whole carve and the
+caller allocates it -- a caller that cannot hold it bounds the plan with
+`deselect_workspace_greater_than(...)`, a typed decline before any launch.  Measured on
+Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz) at that shape, whole row: 8 GiB over 4 GiB
+is +3.7 % causal / +0.8 % dense on the bf16 row (4 -> 2 launches), +0.9 % dense on the
+fp8 row (2 -> 1), and +9.3 % causal / +1.4 % dense on the MXFP8 row (8 -> 4; the control
+twin's value -- the arm read +11.6 % against a slot whose control pair spread 2 %); every
+extra chunk launch ends in a scheduler tail the next launch cannot fill.
 
 The two GEMMs render the shared template at its **d = 256 cluster tile**
 (`MatmulTemplateParams.cgrp_tile_mn = (256, 256)`: cluster 2x1, one 256-row ×
@@ -131,7 +146,10 @@ the whole block); eight softmax warps recompute `P = exp2(S·scale·log2e − LS
 from the forward's LSE, form `dS`, and stream it through a SMEM ring to the
 workspace by TMA store. The bf16/fp16 body splits the `K·Qᵀ` contraction so half
 of K rides TMEM (a UTCCP per block); the fp8 body keeps a lookahead MMA order
-and a two-slot fp8 P ring in TMEM. Rubin's 576 TMEM columns and 327 KiB SMEM
+and a two-slot fp8 P ring in TMEM; the MXFP8 body picks its S issue order per
+mask arm at load time (the lookahead on masked graphs, `K·Qᵀ` at the top of the
+q iteration on dense ones — the same MMAs, bitwise identical, measured faster
+each way). Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 
@@ -189,25 +207,91 @@ DTYPE_BF16` selects the pre-quantized twin used for A/B and oracle work: bf16 dS
 bf16 GEMMs over exact E4M3 → bf16 upcasts of Q / K, three fold + quantize passes,
 `descale_dP` / `scale_dP` bound and unused.
 
+### MXFP8 numerics (`sdpa_bwd_sm107_mxfp8`)
+
+The block-scale row is the same graph through `g.sdpa_mxfp8_backward(...)` —
+E4M3 `q / k / v / dO` plus the transposed-quantization payloads `q_T / k_T / dO_T`
+(each contraction axis needs its own 1x32 quantization), bf16 `o_f16 / dO_f16`,
+fp32 `stats`, and the seven `F8_128x4`-reordered E8M0 scale tensors
+(`descale_q / q_T / k / k_T / v / dO / dO_T`; `descale_v` is the **rowwise** V
+scale, as in the C++ node's own reference math) — with `dQ / dK / dV` declared
+bf16. **One kernel plus scale-factor plumbing** (`sm107/bprop_d256_mxfp8.py`, the
+fp8 body's pipeline): the scale factors ride their operands' TMA barriers into
+TMEM and dequantize inside every tcgen05 block-scale MMA, so `S` and `dP` are in
+TRUE units; `P` is recomputed from the exact fp32 Stats and quantized to E4M3
+with the fixed `2^8` scale (byte 119, cuDNN's MXFP8 convention; `p_scale_log2` is
+pinned to 8) into the fp8 body's two-slot TMEM P ring (the scale factors of each q
+iteration ride along in the slot that is dead that iteration) for `dV += P · dO_T`; `dS = attn_scale · P ∘ (dP −
+delta)` is formed from the **fp32** P (never the e4m3 P — pinned by
+`test_ds_is_computed_from_the_fp32_p_not_the_e4m3_p`).
+
+**dS policy: P-b ships** (`config_sm107.DS_SF_POLICY_DEFAULT = DS_SF_P_B`, read by the
+adapter constant `api_dsl_sm107.MXFP8_DS_SF_POLICY` when the adapter is built — a
+module constant, never a knob): dS is quantized to e4m3 per 32-element block in **both**
+orientations — the kernel writes two payloads (`ds_dk` scaled per 32-q block of a kv row,
+`ds_dq` per 32-kv block of a q column) plus their F8_128x4 E8M0 atoms, and the gradient
+GEMMs render `MatmulTemplateParams.block_scale` over them and the columnwise
+`q_T / k_T` scale factors, dequantizing in the MMA with no dequant pass (Rubin-line
+only). Accept cells run the oracle at `quantize_ds=True` (its own 1x32 quantization of
+the fp32 dS) under the fp8 recipe on dV, dK and dQ alike: both sides round dS to e4m3
+per block from fp32 values that agree to ~1e-6, so a midpoint flip of one dS cell moves
+one gradient row by one e4m3 step at the block's scale — the fp8 row's dS-flip class.
+P-c — dS through a **bf16** workspace into the bf16 renderings over the *exactly*
+dequantized bf16 `q_T / k_T` (`prepared_host.dequant_mxfp8_to_bf16_host`: `e4m3 ×
+2^(e−127)` is a bf16 value), so dQ / dK carry no dS quantization at all, more accurate
+than cuDNN's 1x32-quantized dS and the oracle twin (`sdpa.mxfp8_ref.compute_ref_backward(...,
+quantize_ds=False)`) — stays built and selectable through
+`api_dsl_sm107.MXFP8_DS_SF_POLICY = DS_SF_P_C`, with the bf16 row's recipe on dK / dQ.
+The flip was a numerics change (the accept matrix re-run on Rubin, the support-matrix
+cell re-written), decided on the measured A/B: on Rubin (cc 10.7, 212 SMs, SM clock
+2376 MHz) at B=1 H=128/128 S=8192 the whole backward is +22.0 % (dense) / +17.1 %
+(causal) faster than the bf16-dS chain; the block-scaled chain chunks its stage-2
+workspace against the rows' shared 8 GiB budget (32-head chunks at 8K H=128) for
+another +1.4 % / +9.3 % over a 4 GiB budget's 16-head chunks (the control twin's
+value; the arm read +11.6 %).
+
+Padding on this row has one obligation the other rows do not: the producer's
+scale-factor tensors cover `ceil128(S)` rows / groups and their pad bytes are
+undefined, while the kernel **reads** the pad positions (a `0xFF` there is an
+E8M0 NaN → `0 × NaN` in `S` on the Q side, NaN in the dead rows' dS on the kv
+side). So the artifact re-stages `descale_q / dO / dO_T` (when `S_q % 128 != 0`)
+and `descale_k / v` (when `S_kv % 256 != 0`, grown to the kernel's 256-row pad)
+with every pad byte zeroed, next to the zero-padded payload copies.
+Poisoned-pad RED-then-green tests pin it.
+
+Not produced: the `amax_dQ / dK / dV` outputs — a graph that marks them real
+(the backend's canonical MXFP8 backward shape) is declined, typed. This row is
+the sole provider of the d = 256 MXFP8 backward on Rubin (cuDNN 9.27 has no such
+kernel on smVersion 1070), so that graph gets `cudnnGraphNotSupportedError` at
+plan creation.
+
 ## Support surface and constraints
 
 - SM107-line devices (cc 10.7 – 11.9)
 - Head dims: `d_qk = d_v = 256` exactly (no envelope)
 - Dtypes: bf16 / fp16 (`sdpa_bwd_sm107`); E4M3 payloads with E4M3, bf16 or fp16
-  gradients (`sdpa_bwd_sm107_fp8`; E5M2 is declined). Stats fp32, contiguous
+  gradients (`sdpa_bwd_sm107_fp8`; E5M2 is declined); E4M3 payloads with
+  F8_128x4 E8M0 scales and **bf16** `o_f16 / dO_f16 / dQ / dK / dV`
+  (`sdpa_bwd_sm107_mxfp8`; fp16 gradients are declined — the bf16 GEMM stores its
+  io dtype, an fp16 cast pass is a follow-up). Stats fp32, contiguous
   `(B, H_q, S_q, 1)`
-- Layout: BSHD-physical Q/K/V/O/dO/dQ/dK/dV (stride order 3,1,2,0)
+- Layout: BSHD-physical Q/K/V/O/dO/dQ/dK/dV (and `q_T / k_T / dO_T / dO_f16`;
+  stride order 3,1,2,0)
 - Masks: none, causal (top-left or bottom-right), sliding window (left,
   with or without causal); any S_q / S_kv — except bottom-right on
-  `sdpa_bwd_sm107_fp8`, which needs `S_q % 128 == 0` (see above)
+  `sdpa_bwd_sm107_fp8` and `sdpa_bwd_sm107_mxfp8`, which needs `S_q % 128 == 0`
+  (see above)
 - GQA/MQA: any `H_kv` dividing `H_q`
 - Declined (asserted by tests): dense padding masks (`seq_len_q/kv`), sink /
   dSink, bias / dBias, right-band widening, THD, `dense_flex` layouts, decode
-  shapes (`S_q == 1`), `use_deterministic_algorithm` (the chain has no atomics;
-  the claim waits on the bring-up sweep), dropout / ALiBi / softcap
+  shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
+  the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
+  row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any
+  `p_scale_log2 != 8`
 - Workspace (carved from the caller's buffer): fp32 `delta`, one head/batch
   chunk of the dS workspace (`B_chunk · H_chunk · S_kv · S_q` bytes at e4m3 on
-  the fp8 row, `· 2` on the half row), padded staging copies when S_q / S_kv are
-  not tile multiples, per-Q-head dK/dV partials under GQA; the fp8 row adds the
-  bf16 dV partials (and dK partials under GQA) and an amax scratch. Use
-  `graph.get_workspace_size()`.
+  the fp8 row, `· 2` on the half and MXFP8 rows), padded staging copies when
+  S_q / S_kv are not tile multiples, per-Q-head dK/dV partials under GQA; the
+  fp8 row adds the bf16 dV partials (and dK partials under GQA) and an amax
+  scratch; the MXFP8 row adds the two dequantized bf16 `q_T / k_T` slabs and the
+  zero-filled scale-factor pad slabs. Use `graph.get_workspace_size()`.

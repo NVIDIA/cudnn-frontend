@@ -67,9 +67,9 @@ THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
 THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
 THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
 
-# Threads for a THD setup launch. The metadata write itself is one elected
-# thread; the batch-remap ranking that follows is parallel over batches, so the
-# block is sized for that (B > THD_SETUP_THREADS just loops).
+# Threads for a THD setup launch. Callers write metadata on an elected thread
+# or cooperating warps; batch-remap ranking is parallel over batches. Larger
+# batches loop over the same block (B > THD_SETUP_THREADS is supported).
 THD_SETUP_THREADS = 256
 
 
@@ -116,6 +116,63 @@ def write_thd_meta(meta, ql, kl, lens_form: cutlass.Int32, n_batch: cutlass.Int3
             meta[b] = lkv
             acc_k = acc_k + lkv
             meta[cuk0 + b + cutlass.Int32(1)] = acc_k
+
+
+@cute.jit
+def write_thd_prefix_warp(
+    meta,
+    lens,
+    n_batch: cutlass.Int32,
+    prefix_offset: cutlass.Int32,
+    is_cu: cutlass.Boolean,
+    lane: cutlass.Int32,
+    *,
+    store_lengths: cutlass.Constexpr[bool],
+    round_to: cutlass.Int32 = 1,
+):
+    """One FULL warp writes a normalized prefix and optional adjacent lengths.
+
+    All 32 lanes must participate, including the inactive tail of a batch.
+    Per-batch lengths use a warp scan with a carry between 32-element chunks;
+    cumulative inputs copy adjacent entries after subtracting their first one.
+    ``round_to`` pads each length before scanning, for blocked workspace offsets;
+    stored lengths remain unrounded. Rounded cumulative inputs scan differences.
+    The caller publishes these disjoint writes with a block barrier before
+    another warp reads them. Integer arithmetic matches :func:`write_thd_meta`.
+    """
+    if lane == cutlass.Int32(0):
+        meta[prefix_offset] = cutlass.Int32(0)
+    if is_cu and round_to == 1:
+        base = cutlass.Int32(lens[0])
+        for start in cutlass.range(0, n_batch, 32, unroll=1):
+            b = start + lane
+            if b < n_batch:
+                next_value = cutlass.Int32(lens[b + cutlass.Int32(1)])
+                meta[prefix_offset + b + cutlass.Int32(1)] = next_value - base
+                if cutlass.const_expr(store_lengths):
+                    meta[b] = next_value - cutlass.Int32(lens[b])
+    else:
+        carry = cutlass.Int32(0)
+        for start in cutlass.range(0, n_batch, 32, unroll=1):
+            b = start + lane
+            value = cutlass.Int32(0)
+            if b < n_batch:
+                if is_cu:
+                    value = cutlass.Int32(lens[b + 1]) - cutlass.Int32(lens[b])
+                else:
+                    value = cutlass.Int32(lens[b])
+                if cutlass.const_expr(store_lengths):
+                    meta[b] = value
+            value = ((value + round_to - 1) // round_to) * round_to
+            for shift in cutlass.range_constexpr(5):
+                delta = 1 << shift
+                prior = cute.arch.shuffle_sync_up(value, offset=delta, mask_and_clamp=0)
+                if lane >= delta:
+                    value = value + prior
+            prefix = carry + value
+            if b < n_batch:
+                meta[prefix_offset + b + cutlass.Int32(1)] = prefix
+            carry = cute.arch.shuffle_sync(prefix, 31)
 
 
 @cute.jit
@@ -212,19 +269,30 @@ def write_thd_live_and_ctr(
     Leaving these two words unwritten hands out units off uninitialized
     workspace — an illegal-instruction fault, not a silent wrong answer.
 
-    Guards on ``tidx == 0`` internally, deliberately WITHOUT ``elect_sync``:
-    ``elect.sync`` picks an implementation-defined lane, so conjoining it with
-    ``tidx == 0`` can select no thread at all.  The caller must have barriered
-    after :func:`write_thd_meta` so the ``cu_seqlens_q`` read below is visible.
+    WHOLE-BLOCK (not elected): warp 0 reduces strided batches in parallel;
+    B <= 1 keeps the single-thread path. The publisher is ``tidx == 0``,
+    deliberately WITHOUT ``elect_sync``: its implementation-defined lane can
+    disagree with ``tidx == 0`` and leave both words unwritten. The caller must
+    have barriered after the prefix writes so ``cu_seqlens_q`` is visible.
     """
-    if tidx == cutlass.Int32(0):
-        cuq0 = n_batch
+    if n_batch <= cutlass.Int32(1):
+        if tidx == cutlass.Int32(0):
+            live = cutlass.Int32(0)
+            if n_batch == cutlass.Int32(1):
+                s_b = cutlass.Int32(meta[n_batch + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch])
+                live = ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
+    elif tidx < cutlass.Int32(32):
         live = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
+        for b in cutlass.range(tidx, n_batch, 32, unroll=1):
+            s_b = cutlass.Int32(meta[n_batch + b + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch + b])
             live = live + ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
-        meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
-        meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
+        for i in cutlass.range_constexpr(5):
+            live = live + cute.arch.shuffle_sync_bfly(live, 1 << i)
+        if tidx == cutlass.Int32(0):
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
 
 
 @cute.jit
@@ -322,6 +390,8 @@ def emit_seq_descs(
     row_stride: cutlass.Int64,
     seq_ord: cutlass.Constexpr[int],
     slot_base=0,
+    first_batch=0,
+    batch_step=1,
 ) -> None:
     """Build a per-BATCH descriptor array over a packed ``[T, H, D]`` tensor.
 
@@ -336,14 +406,15 @@ def emit_seq_descs(
     is **2**, not 1.  ``slot_base`` (a RUNTIME value -- the arrays are B slots long and B is not
     a compile-time constant) lets several arrays share one buffer.
 
-    Runs on ONE elected thread; the caller elects and issues the
-    ``GENERIC -> TENSORMAP`` release fence afterwards (one fence covers every
-    array a setup kernel builds).
+    Each participating warp elects one writer for batches
+    ``first_batch, first_batch + batch_step, ...``. These ranges must be
+    disjoint; defaults preserve the single-writer contract. The caller must
+    issue a ``GENERIC -> TENSORMAP`` release fence on every writer afterwards.
     """
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
     base = base_ptr.iterator.raw_ptr()
-    for b in cutlass.range(0, n_batch, 1, unroll=1):
+    for b in cutlass.range(first_batch, n_batch, batch_step, unroll=1):
         cu_b = cutlass.Int32(cu[cu0 + b])
         s_b = cutlass.Int32(cu[cu0 + b + cutlass.Int32(1)]) - cu_b
         dptr = desc_base + (b + cutlass.Int32(slot_base)) * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -424,5 +495,6 @@ __all__ = [
     "write_thd_batch_remap",
     "write_thd_live_and_ctr",
     "write_thd_meta",
+    "write_thd_prefix_warp",
     "write_thd_row_offsets",
 ]

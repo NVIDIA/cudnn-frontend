@@ -26,7 +26,7 @@ from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
-from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
@@ -37,6 +37,7 @@ _SM100 = "SdpaBwdDslSm100"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
+_SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 
 
 def _adapter(name: str):
@@ -46,8 +47,8 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
-    if name in (_SM107, _SM107_FP8):
-        # The Rubin d=256 chains (half + per-tensor FP8) share one module.
+    if name in (_SM107, _SM107_FP8, _SM107_MXFP8):
+        # The Rubin d=256 chains (half + per-tensor FP8 + block-scale MXFP8) share one module.
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         return getattr(api_dsl_sm107, name)
@@ -275,6 +276,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     if cutedsl_too_old(version):
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
+    # AGENTS.md Rule 7, the ARCH half (fwd/engines.py has the same line): the floor (4.7.0) is below what the Rubin rows need
+    # (a DSL that knows sm_107a, >= 4.8.0).  Said HERE so a cc 10.7 box on a 4.7.x DSL gets a typed decline at eligibility
+    # instead of `KeyError: 'sm_107a'` out of Arch.from_string inside the template compile, after the plan is already ranked --
+    # and, for the MXFP8 row (the graph's sole provider on Rubin), cudnnGraphNotSupportedError instead of a crash.
+    arch_error = cutedsl_arch_requirement_error(cc)
+    if arch_error is not None:
+        return arch_error
     if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
         quant = (
             "block-scale MXFP8 (sdpa_mxfp8_backward)"
@@ -326,7 +334,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return f"{ports} must be BSHD-physical (stride order 3,1,2,0)"
 
     for fact, cap, label in (
-        (facts.deterministic, capabilities.deterministic, "use_deterministic_algorithm (dQ accumulates through fp32 atomics)"),
+        # Row-neutral reason: the sm120 / sm80 rows accumulate dQ through fp32 atomics, but the sm107 chains have no atomics at
+        # all and simply have not claimed the two-run bitwise guarantee yet -- the old shared text was false for them.
+        (facts.deterministic, capabilities.deterministic, "use_deterministic_algorithm (this engine has not claimed the two-run bitwise guarantee)"),
         (facts.has_dbias, capabilities.dbias, "dBias output"),
         (facts.has_dsink, capabilities.dsink, "dSink_token output"),
         (facts.has_bias, capabilities.bias, "bias"),
@@ -1316,7 +1326,83 @@ def _sm107_fp8_spec() -> EngineSpec:
     )
 
 
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec(), _sm107_spec(), _sm107_fp8_spec())
+def _sm107_mxfp8_spec() -> EngineSpec:
+    """SM107 (Rubin) d=256 block-scale MXFP8 backward row (``sdpa_mxfp8_backward``;
+    ``api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, kernel ``sm107/bprop_d256_mxfp8.py``).
+
+    ONE kernel plus scale-factor plumbing (no separate SF-repack or dequant kernels): the per-tensor
+    fp8 body's pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every
+    tcgen05 block-scale MMA (K / V / Q / dO / dO_T SF ride their operands' TMA barriers
+    into TMEM through UTCCP), P quantized to e4m3 with the fixed 2^8 scale (byte 119,
+    cuDNN's MXFP8 convention; ``p_scale_log2`` is pinned to 8 -- any other value is a
+    typed decline) into the fp8 body's TMEM P ring -- whose dead slot also carries the
+    UTCCP'd scale factors of each q iteration -- dV in TMEM (bf16 per-Q-head partials, TRUE
+    units), dS = attn_scale * P (dP - delta) from the fp32 P.
+
+    **dS policy: P-b ships behind ``config_sm107.DS_SF_POLICY_DEFAULT = DS_SF_P_B``** (read
+    by ``api_dsl_sm107.MXFP8_DS_SF_POLICY`` when the adapter is built): exact 1x32 block-scaled
+    e4m3 dS in both orientations -- the kernel writes two payloads (ds_dk per 32-q block, ds_dq
+    per 32-kv block) plus their F8_128x4 E8M0 atoms, and dK = ds_dk . q_T / dQ = ds_dq^T . k_T
+    render the block-scale GEMM arm over them and the columnwise q_T / k_T scale factors,
+    dequantizing in the MMA (no dequant pass).  Its accept cells run the oracle at
+    ``quantize_ds=True`` under the fp8 recipe on every gradient.  P-c (bf16 dS workspace; the
+    bf16 stage-3 renderings over the EXACTLY dequantized bf16 q_T / k_T -- the oracle twin,
+    more accurate than cuDNN's 1x32-quantized dS) stays a built, selectable arm behind
+    ``MXFP8_DS_SF_POLICY = DS_SF_P_C`` with the bf16 recipe on dK / dQ.  The flip was a
+    numerics change (accept matrix re-run on Rubin, tracker cell re-written), never a knob;
+    measured on Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz) at B=1 H=128/128 S=8192, the
+    whole row is +22.0 % dense / +17.1 % causal over the bf16-dS chain.
+
+    Served: E4M3 payloads (q / k / v / dO + the transposed-quantization q_T / k_T / dO_T)
+    with bf16 ``o_f16`` / ``dO_f16`` / dQ / dK / dV, contiguous fp32 Stats (natural-log
+    LSE), BSHD-physical layout, MHA / GQA / MQA, any S_q / S_kv (padded: zero-filled
+    staging of the payloads AND of the scale-factor pads -- the producer's SF pad bytes
+    are undefined and the kernel reads them), dense / top-left causal / bottom-right
+    causal (``S_q % 128 == 0``, as the fp8 row: the body derives the diagonal from its
+    padded S_q) / sliding window (left).  Wider than the SM100 MXFP8 row (bottom-right,
+    SWA) and the sole provider of this graph on Rubin: cuDNN 9.27 has no MXFP8 d=256
+    backward kernel on smVersion 1070 (verified 2026-09-29: a typed decline at plan creation).
+
+    Declined, each asserted by a test: fp16 gradients (both chains' stage-3 GEMMs write
+    bf16; the fp16 arm is a follow-up), E5M2, ``amax_dQ / dK / dV`` requested
+    as real outputs (no amax in the MXFP8 row -- the backend's canonical
+    graph shape declares them, the parity gap is documented in the tracker), a
+    ``p_scale_log2`` other than 8, dense padding masks, sink / dSink, bias / dBias,
+    right-band widening, THD, ``dense_flex``, decode shapes, and
+    ``use_deterministic_algorithm`` (no atomics anywhere in the chain; the claim waits on
+    the two-run sweep, as on the sibling rows).
+
+    A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8``): the
+    four extra payloads bind by geometry, the seven SF tensors as opaque byte blobs.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_mxfp8=True,
+            # bf16 only for now: the P-c chain's bf16 stage-3 renderings store their io dtype (the template refuses another
+            # output dtype under EPI_NONE); the fp16 arm (a final cast pass per gradient) is a follow-up with its own accept case.
+            out_dtypes=frozenset({cudnn.data_type.BFLOAT16}),
+            amax_dgrad=False,  # no amax in the MXFP8 row (a requesting graph is declined, typed)
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            decode=False,
+            deterministic=False,
+            layouts=frozenset({"bshd"}),
+            # == api_dsl_sm107._SM107_Q_PAD: the body derives the bottom-right diagonal from its padded S_q (as the fp8 body).
+            bottom_right_s_q_multiple=128,
+        ),
+        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM107_MXFP8),
+    )
+
+
+ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec(), _sm107_spec(), _sm107_fp8_spec(), _sm107_mxfp8_spec())
 
 __all__ = [
     "ENGINE_SPECS",
