@@ -1098,14 +1098,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         #
         # Manually store pvscale to avoid spilling
         #
-        if tile_idx == 0:
-            pvscale[0] = tmp_f32
-        elif tile_idx == 1:
-            pvscale[1] = tmp_f32
-        elif tile_idx == 2:
-            pvscale[2] = tmp_f32
-        elif tile_idx == 3:
-            pvscale[3] = tmp_f32
+        for scale_idx in cutlass.range_constexpr(cute.size(pvscale)):
+            if tile_idx == scale_idx:
+                pvscale[scale_idx] = tmp_f32
 
         #
         # Compute quantized output values and convert to D type
@@ -1208,7 +1203,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             (tokens_this_group, n_total, mSFDCol_mnl.shape[2]),
             (1, 2, 3),
         )
-        regPerSubtile = 4
+        regPerSubtile = self.mma_tiler_d[1] // 32
         sfd_tile = (
             cute.make_layout(128),
             cute.make_layout(32 * regPerSubtile),
@@ -2139,7 +2134,7 @@ class BlockScaledContiguousGroupedGemmKernel:
 
             if cutlass.const_expr(self.generate_sfd):
                 norm_const = norm_const_tensor[0]
-                regPerSubtile = 4
+                regPerSubtile = self.mma_tiler_d[1] // 32
                 sfd_row_tile = (
                     cute.make_layout(128),
                     cute.make_layout(32 * regPerSubtile),
@@ -2534,7 +2529,7 @@ class BlockScaledContiguousGroupedGemmKernel:
                             )
                         ]
 
-                        if subtile_idx == 6:
+                        if subtile_idx == subtile_cnt - 2:
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                                 cute.autovec_copy(tCrSFDRow, tCgSFDRow)
