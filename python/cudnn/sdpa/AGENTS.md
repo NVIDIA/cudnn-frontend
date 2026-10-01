@@ -185,6 +185,30 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+**Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
+
+- A setup kernel may publish K/V maps once before attention. Acquire each map
+  in every consuming loader warp before its persistent loop, including both
+  CTAs of a pair, before disabling the per-load acquire. A fence in another
+  CTA is insufficient; cluster or stream ordering does not replace it.
+- Repeat the acquire on every launch and graph replay. A map rewritten or
+  selected inside the loop needs acquisition at the corresponding boundary.
+  Preserve the shared TMA helpers' safe default for other callers.
+- Check fresh bindings and changed device-side lengths after capture, with
+  NaN-filled K/V capacity tails and independent O/LSE references.
+  `test_thd_tensormaps_rebind_and_replay` covers D128, D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D192/D512 FP8
+  and D128/D192 MXFP8, including both E4M3 and E5M2 inputs. The same probe
+  covers all four half/FP8 widths on SM107 (including FP8 D256); unsupported
+  SM107 MXFP8 THD and D192 half single-CTA configurations are skipped.
+- O slabs within one work item share a map. Acquire before the first slab
+  inside the existing live-work guard; retain store commit/wait and pipeline
+  synchronization for every slab. Reuse across work items requires reacquiring
+  whenever the selected batch/map changes. Exercise empty and repeated work items
+  with the existing `thd_over_launched_units_are_dead` and
+  `thd_multi_unit_per_cta` regressions.
+
 ## Output initialization regressions
 
 When removing wrapper-side output clears, verify that the prepared chain
