@@ -126,6 +126,7 @@ from cudnn.frost.tile_dsl.barrier import (
     WAIT_TIMEOUT,
     MBarrier,
     wait,
+    wait_poll,
     PipelineState,
     Producer,
     Scope,
@@ -262,20 +263,6 @@ def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux
         dbg.arr[s + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(status)
 
 
-@cute.jit
-def _test_wait_parity(mb, phase):
-    """Non-blocking ``mbarrier.test_wait.parity`` -> Int32 1/0 (the DSL's ``mbarrier_test_wait`` wrapper is broken on 4.7.0).
-
-    The primitive of :func:`_poll_wait` only; both are the kernel-local spelling of the shared
-    ``tile_dsl.barrier.wait_poll(mb, phase, tight_iters, sleep_ns)`` and are replaced by it at integration."""
-    v = nvvm.inline_ptx(
-        "{\n\t.reg .pred P1;\n\tmbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\tselp.u32 {$w0}, 1, 0, P1;\n\t}",
-        write_only_types=[cutlass.Int32],
-        read_only_args=[mb, cutlass.Int32(phase)],
-    )
-    return v != cutlass.Int32(0)
-
-
 # The poll's shape (module constants, not levers): up to POLL_TIGHT_ITERS back-to-back tests (a few us: a phase that is
 # about to flip pays no extra latency), then a plain timer ``nanosleep`` between tests.  The timer sleep wakes on its own
 # (SASS ``NANOSLEEP``, not the event-sleep ``NANOSLEEP.SYNCS`` that loses the wake-up), so the wait still never parks on the
@@ -287,7 +274,8 @@ def _test_wait_parity(mb, phase):
 #     4 / 64 ns      41426, 41930      32 / 256 ns    41338      64 / 64 ns   41602
 #     32 / 128 ns    40531, 40391, 41595               128 / 128 ns  40312   <- shipped
 # More tight iterations and fewer, longer sleeps win; 32/128 and 128/128 are within the ~3 % slot noise, and the residual
-# cost against the parked twin is ~3 %.  (The forward 2x2 kernel's shared ``barrier.wait_poll`` uses 32 / 128.)
+# cost against the parked twin is ~3 %.  (Both 2x2 forwards ship the shared default 32 / 128: their pollers wait briefly,
+# and on the cc 10.7 forward the tight loop and 32 / 128 measured within 0.15 % of each other.)
 POLL_TIGHT_ITERS = 128
 POLL_SLEEP_NS = 128
 
@@ -303,18 +291,10 @@ def _poll_wait(mb, phase):
     the 10 ms hint, and the hint-less spin alike) on such a barrier can miss the wake-up and the cluster hangs; this
     poll never does (``lane_d512_bprop/fix/HANDOFF2.md``).
 
-    This body is the ONLY place the two-phase shape is spelled in this kernel (``_wait_plain`` WAIT_FORM 0 and 2 call it);
-    it is the kernel-local twin of the shared ``tile_dsl.barrier.wait_poll(mb, phase, tight_iters, sleep_ns)`` and is
-    swapped onto ``wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)`` at integration."""
-    done = cutlass.Int32(0)
-    spins = cutlass.Int32(0)
-    while done == cutlass.Int32(0):
-        if _test_wait_parity(mb, phase):
-            done = cutlass.Int32(1)
-        else:
-            spins = spins + cutlass.Int32(1)
-            if spins > cutlass.Int32(POLL_TIGHT_ITERS):
-                nvvm.nanosleep(POLL_SLEEP_NS)
+    The kernel's ONE call of the shared ``tile_dsl.barrier.wait_poll`` (an inline-PTX ``mbarrier.test_wait.parity`` loop
+    with the timer back-off; the DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on 4.7.0) in THIS kernel's shape
+    (``POLL_TIGHT_ITERS`` / ``POLL_SLEEP_NS``); ``_wait_plain`` WAIT_FORM 0 and 2 call it."""
+    wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)
 
 
 @cute.jit
