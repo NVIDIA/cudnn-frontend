@@ -2781,8 +2781,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return plan
         b = self.batch_size
         # Persistent THD kernels ordinarily launch one resident wave and pull further
-        # units from a device-bounded counter. A bounded packed family benefits from
-        # handing its short second wave directly to the hardware scheduler instead.
+        # units from a device-bounded counter. For the packed family below, assign
+        # all declared work directly when it fits within two waves; otherwise keep
+        # one persistent wave. Page size does not affect this packed work count.
         env = units = self._thd_unit_envelope()
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
@@ -2794,7 +2795,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and self.dtype == torch.bfloat16
                 and self.head_dim_qk == self.head_dim_v == 128
                 and self.batch_size == 1
-                and self.paged_page_size == 16
+                and self.paged
                 and self.is_causal
                 and self.window_left is None
                 and self.window_right == 0

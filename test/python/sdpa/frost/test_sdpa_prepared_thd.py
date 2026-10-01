@@ -1503,7 +1503,7 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("page", [16, 128])
+@pytest.mark.parametrize("page", [8, 16, 32, 64, 128, 256])
 @pytest.mark.parametrize("geometry", ["d128_packed", "d128_short", "d128_long"])
 def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
     """Live scheduling and the packed grid preserve O/Stats under old captures."""
@@ -1569,7 +1569,7 @@ def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
         resident = torch.cuda.get_device_properties(0).multi_processor_count // 2
         # Independent worklist oracle: every 128-token tile has eight packed heads.
         work = len({(row // 128, head // 4) for row in range(qcap) for head in range(h)})
-        expanded = dtype == torch.bfloat16 and page == 16 and policy == 1 and resident < work <= 2 * resident
+        expanded = dtype == torch.bfloat16 and policy == 1 and resident < work <= 2 * resident
         assert spec.template[spec.index["n_thd_units"]] == (work if expanded else min(resident, ((qcap + 511) // 512) * h))
         ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
