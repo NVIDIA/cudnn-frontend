@@ -468,7 +468,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.lse_stride_override = False
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
-    s.cga_tile_m = int(km.CGA_TILE_M)
+    s.cga_tile_m = int(plan.cga_tile_m)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)

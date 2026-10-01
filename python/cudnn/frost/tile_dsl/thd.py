@@ -135,19 +135,29 @@ def write_thd_meta(meta, ql, kl, lens_form: cutlass.Int32, n_batch: cutlass.Int3
 
 @cute.jit
 def write_thd_prefix_warp(
-    meta, lens, n_batch: cutlass.Int32, prefix_offset: cutlass.Int32, is_cu: cutlass.Boolean, lane: cutlass.Int32, *, store_lengths: cutlass.Constexpr[bool]
+    meta,
+    lens,
+    n_batch: cutlass.Int32,
+    prefix_offset: cutlass.Int32,
+    is_cu: cutlass.Boolean,
+    lane: cutlass.Int32,
+    *,
+    store_lengths: cutlass.Constexpr[bool],
+    round_to: cutlass.Int32 = 1,
 ):
     """One FULL warp writes a normalized prefix and optional adjacent lengths.
 
     All 32 lanes must participate, including the inactive tail of a batch.
     Per-batch lengths use a warp scan with a carry between 32-element chunks;
     cumulative inputs copy adjacent entries after subtracting their first one.
+    ``round_to`` pads each length before scanning, for blocked workspace offsets;
+    stored lengths remain unrounded. Rounded cumulative inputs scan differences.
     The caller publishes these disjoint writes with a block barrier before
     another warp reads them. Integer arithmetic matches :func:`write_thd_meta`.
     """
     if lane == cutlass.Int32(0):
         meta[prefix_offset] = cutlass.Int32(0)
-    if is_cu:
+    if is_cu and round_to == 1:
         base = cutlass.Int32(lens[0])
         for start in cutlass.range(0, n_batch, 32, unroll=1):
             b = start + lane
@@ -162,9 +172,13 @@ def write_thd_prefix_warp(
             b = start + lane
             value = cutlass.Int32(0)
             if b < n_batch:
-                value = cutlass.Int32(lens[b])
+                if is_cu:
+                    value = cutlass.Int32(lens[b + 1]) - cutlass.Int32(lens[b])
+                else:
+                    value = cutlass.Int32(lens[b])
                 if cutlass.const_expr(store_lengths):
                     meta[b] = value
+            value = ((value + round_to - 1) // round_to) * round_to
             for shift in cutlass.range_constexpr(5):
                 delta = 1 << shift
                 prior = cute.arch.shuffle_sync_up(value, offset=delta, mask_and_clamp=0)

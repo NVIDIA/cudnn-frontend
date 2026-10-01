@@ -635,12 +635,13 @@ The kernel reads current GPU lengths, so the same policy handles full and
 prefix requests under a retained capture without a host length read,
 additional setup launch, or replan.
 
-Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
+For D256, Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
 causal attention without a left window, single-sequence full-prefill
 envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page size 16/128,
 and no sink or epilogue gate. Requesting Stats does not change this preference.
 That plan keeps LPT when its live lengths become prefix chunks; it does not
-switch policies at the full/prefix boundary. Other THD defaults stay NATURAL.
+switch policies at the full/prefix boundary. Other D256 THD defaults stay NATURAL.
+The separate D128 THD PackGQA/LPT preference is preserved.
 This changes scheduling within FROST, not engine placement, and adds no new
 scheduler policy value.
 
