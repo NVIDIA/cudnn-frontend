@@ -83,7 +83,8 @@ def test_config_2x2_pins_and_ledger_formulas():
     assert cfg.O_CHUNK_ARRIVERS == cfg.CORR_LANES // 2 == 64
     assert cfg.O_EMPTY_ARRIVERS == cfg.ONE_WARP * cfg.KV_SHARE == 64  # own + twin TMA-STG warps (pair-wide O u V gate)
     assert cfg.PAIR_LANES == cfg.SOFTMAX_LANES * cfg.CTA_MMA == cfg.CORR_LANES * cfg.CTA_MMA == 256
-    assert cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 4 == 388 <= cfg.TMEM_COLS
+    # alpha ring (2) + tile stats PER RING SLOT (2 x 2): cols 384..389 (the fixed 386/387 pair raced the alpha ring).
+    assert cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 2 + 2 * 2 == 390 <= cfg.TMEM_COLS
     assert cfg.XFER_STAGES >= cfg.BMM1_LOOKAHEAD + 1
     smem = d512_2x2_smem_bytes(cfg)
     assert smem["data"] == 65536 + 2 * 32768 + 2 * 32768 + 2 * 16384 and smem["n_bars"] == 35
@@ -201,13 +202,18 @@ def test_two_by_two_cross_pair_waits_poll():
     for name, call in calls.items():
         assert ("poll=cross_pair_poll" in call) is (name in _CROSS_PAIR_BARS), (name, call)
     assert "cross_pair_poll: bool = True" in inspect.getsource(_common.make_d512_2x2_bars)
-    # MBarrier(poll=True) dispatches to the test_wait poll; the poll never parks (no try_wait anywhere in it).
+    # MBarrier(poll=True) dispatches to the test_wait poll; the poll never parks (no try_wait anywhere in it), and it has
+    # the two-phase shape: POLL_TIGHT_ITERS tight tests, then a plain TIMER nanosleep (NOT the event-sleep NANOSLEEP.SYNCS)
+    # of POLL_SLEEP_NS between tests -- a tight loop on the MMA / TMA-LDG warp starved the compute warps that share its SMSP
+    # (the d512 backward measured 2.2x slower with the tight form).
     poll_src = inspect.getsource(_barrier.wait_poll)
-    assert "mbarrier.test_wait.parity" in poll_src and "try_wait" not in poll_src.split('"""')[2]
+    body = poll_src.split('"""')[2]
+    assert "mbarrier.test_wait.parity" in body and "try_wait" not in body and "nanosleep.u32" in body
+    assert (_barrier.POLL_TIGHT_ITERS, _barrier.POLL_SLEEP_NS) == (32, 128)
     assert "if cutlass.const_expr(self.poll):" in inspect.getsource(_barrier.MBarrier.wait)
     src = open(os.path.join(_kernels_dir(), _KERNEL_FILE)).read()
-    assert src.count("bars = make_d512_2x2_bars(") == 1 and "cross_pair_poll=CROSS_PAIR_WAIT_POLL)" in src
-    assert 'bool(int(globals().get("FROST_D512_2X2_CROSS_PAIR_WAIT_POLL", 1)))' in src  # default ON
+    assert src.count("bars = make_d512_2x2_bars(") == 1 and "cross_pair_poll=POLL_CROSS_PAIR_WAITS)" in src
+    assert 'bool(int(globals().get("FROST_D512_2X2_POLL_CROSS_PAIR_WAITS", 1)))' in src  # default ON (sm107 spelling)
 
 
 # ------------------------------------------------------------------------------------------- host-only: byte identity
@@ -959,3 +965,125 @@ def test_two_by_two_parking_wait_form_under_time_slicing(tmp_path):
     before the child dies, hence ``gpu_exclusive``: deselect it on a GPU other jobs share."""
     twin = _contention_run(tmp_path, twin_levers={"FROST_D512_2X2_CROSS_PAIR_WAIT_POLL": 0}, n_twin=300, budget_s=30.0, tag="parking")
     assert twin.returncode == 3 and "HANG" in twin.stdout, f"the parking wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-1500:]}"
+
+
+# ---------------------------------------------------------------- GPU: tile-stats ring race (empty tile after a live one), dead rows
+
+
+def _stair_inputs(*, B=4, H=8, KH=4, SQ=1024, SKV=512, step=12.0):
+    """The sm107 lane's 'rising stair' (lane_d512_fprop/sm107/stair_probe.py `repro ... multi`): Q[..., 0] = +1 / 0 / -1 by
+    32-row group, K[..., 0] = step * floor(key / 128) -> every KV tile raises the +1 rows' max by step/2 log2 (> RESCALE_THRESHOLD
+    8 for step 12: the slow correction arm on every iteration), S is equal within a tile; random V."""
+    dev, dt = "cuda", torch.bfloat16
+    rows = torch.arange(SQ, device=dev)
+    sign = torch.tensor([0.0, 1.0, -1.0], device=dev)[(rows // 32) % 3]
+    q = torch.zeros(B, SQ, H, _D, device=dev, dtype=dt)
+    q[..., 0] = sign.view(1, SQ, 1).to(dt)
+    keys = torch.arange(SKV, device=dev)
+    k = torch.zeros(B, SKV, KH, _D, device=dev, dtype=dt)
+    k[..., 0] = (step * torch.div(keys, 128, rounding_mode="floor").float()).view(1, SKV, 1).to(dt)
+    v = (torch.randn(B, SKV, KH, _D, device=dev) * 0.5).to(dt)
+    return q, k, v
+
+
+def _direct_launch_trim(mod, q, k, v, scale, *, seq_kv, q_lens):
+    """_direct_launch with the dense padded-KV lengths and the q-trim lengths (seq_q_lens_addr) bound."""
+    import cutlass
+    import cuda.bindings.driver as cuda_driver
+
+    B, SQ, H, _ = q.shape
+    KH, SKV = k.shape[2], k.shape[1]
+    fn = mod.compile(d_qk=_D, d_v=_D, has_lse=True, lse_kind="dense")
+    o = torch.full((B, SQ, H, _D), float("nan"), device="cuda", dtype=q.dtype)
+    lse = torch.full((B, H, SQ), float("nan"), device="cuda", dtype=torch.float32)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    launch_f16(
+        fn,
+        q,
+        k,
+        v,
+        o,
+        lse,
+        torch.zeros(H, dtype=torch.float32, device="cuda"),
+        seq_kv,
+        torch.zeros(1, dtype=torch.int64, device="cuda"),
+        (B, H, KH, SQ, SKV, 0),
+        cutlass.Float32(scale * math.log2(math.e)),
+        cutlass.Int32(0),
+        q_lens.data_ptr(),
+        stream=stream,
+        host=mod._host,
+    )
+    torch.cuda.synchronize()
+    return o, lse
+
+
+def _ref_trim(q, k, v, scale, q_lens):
+    o_ref, lse_ref = _ref_bshd(q, k, v, scale, False)
+    for bi in range(q.shape[0]):
+        o_ref[bi, int(q_lens[bi]) :] = 0.0
+        lse_ref[bi, :, int(q_lens[bi]) :] = float("-inf")
+    return o_ref, lse_ref
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_two_by_two_stats_ring_slot_race_empty_after_live():
+    """The tile stats (total_max_safe, final_sum) ride the 2-deep alpha ring (mb_stat_full / mb_stat_empty) but used to live in the
+    FIXED TMEM columns 386 / 387.  A fixed column is protected by the ring only when the next writer waits the SAME slot's empty; an
+    EMPTY tile (q-trim: q_len 0, or every row past q_len) is ONE ring step, so its stats store waited mb_stat_empty[1 - s] (the
+    consume of the previous tile's last alpha), not mb_stat_empty[s] (the read of its stats): a softmax lane entering the empty tile
+    while its correction lane was still in the slow arm (two O rescales between that alpha consume and the stats read) overwrote
+    386/387 with (-, 0) and the correction published the row DEAD (O = 0, LSE = -inf).  Slot-indexed stats (386 + 2 * ring slot) put
+    every ring step's payload in its own columns.  Found by the sm107 lane (stair_probe.py `repro padded qtrim qlens gqa sq1024
+    multi`), reproduced on the B200 with this body: B4 H8 KH4 Sq1024 Skv512, q_lens (1024, 641, 0, 1024) -> the +1 rows of the FULL
+    batches came back dead.  Only slow-arm rows lose the race, which is why random-data multi-tile cells never saw it."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    q, k, v = _stair_inputs()
+    B, SQ, SKV = q.shape[0], q.shape[1], k.shape[1]
+    scale = 0.5
+    q_lens = torch.tensor([SQ, 641, 0, SQ], dtype=torch.int32, device="cuda")
+    seq_kv = torch.full((B,), SKV, dtype=torch.int32, device="cuda")
+    mod = _load_2x2(TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2, qh_per_kh=2, seq_kv_lens_present=True, seq_q_lens_present=True), 4, "stair")
+    o, lse = _direct_launch_trim(mod, q, k, v, scale, seq_kv=seq_kv, q_lens=q_lens)
+    o_ref, lse_ref = _ref_trim(q, k, v, scale, q_lens)
+    dead = torch.isneginf(lse) & torch.isfinite(lse_ref)
+    assert not dead.any(), f"{int(dead.sum())} live rows published DEAD (LSE = -inf); (b, h, row) first 12: {dead.nonzero()[:12].tolist()}"
+    _assert_rows_close(o, lse, o_ref, lse_ref, "stair stats-ring")  # the LSE compare skips the -inf rows via the exact match of -inf
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+def test_two_by_two_trimmed_rows_with_nan_inputs_store_zero():
+    """Dead / trimmed rows are zeroed by a SELECT, never by `o * beta` with beta = 0: a q-trimmed row (row >= seq_len_q[b]) whose Q
+    memory holds NaN (a poisoned padded tail) has S = P = O = NaN in TMEM, and NaN * 0 = NaN would reach the output.  The fp32-partials
+    arm already selects; this pins the staged bf16 arm.  Rows >= q_len must come back exactly 0 with LSE = -inf, the live rows exact
+    vs the reference."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dtype = torch.bfloat16
+    B, H, SQ, SKV = 2, 2, 256, 512
+    scale = 1.0 / math.sqrt(_D)
+    q = torch.randn(B, SQ, H, _D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    v = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    q_lens = torch.tensor([200, 70], dtype=torch.int32, device="cuda")
+    for bi in range(B):
+        q[bi, int(q_lens[bi]) :] = float("nan")  # the trimmed rows' memory is poisoned
+    seq_kv = torch.full((B,), SKV, dtype=torch.int32, device="cuda")
+    mod = _load_2x2(TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2, seq_kv_lens_present=True, seq_q_lens_present=True), 4, "nantrim")
+    o, lse = _direct_launch_trim(mod, q, k, v, scale, seq_kv=seq_kv, q_lens=q_lens)
+    q_ref = q.clone()
+    for bi in range(B):
+        q_ref[bi, int(q_lens[bi]) :] = 0.0
+    o_ref, lse_ref = _ref_trim(q_ref, k, v, scale, q_lens)
+    for bi in range(B):
+        ql = int(q_lens[bi])
+        assert (o[bi, ql:] == 0).all(), f"batch {bi}: trimmed rows carry non-zero / NaN output (NaN count {int(torch.isnan(o[bi, ql:]).sum())})"
+        assert torch.isneginf(lse[bi, :, ql:]).all()
+    _assert_rows_close(o, lse, o_ref, lse_ref, "nan-trim")
