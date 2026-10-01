@@ -1689,6 +1689,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q only over paged K/V at S_q == 1 with ragged Stats; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )
+        # The per-tensor FP8 d128 flavor admits cga1 too, as its dense unsplit
+        # prefill leg (heuristics._auto_sched_cga); its THD leg is validated on
+        # the cga2 pair only, which is what engines.mismatch declines for every
+        # dtype (the decode tile's ragged-Q leg never admits FP8).
+        self._not_implemented_error_if(
+            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and self._fp8 and self.thd,
+            "cga=1 on the per-tensor FP8 d128 flavor is its dense unsplit prefill leg; THD (ragged) graphs run the cga2 pair",
+        )
         self._not_implemented_error_if(
             self.thd_decode_leg and self.split_kv < 2,
             "the d128 decode tile's ragged-Q leg rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2",
