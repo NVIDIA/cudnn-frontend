@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The block backward (``GatedAttentionBlockBwd``: bf16 / fp16, proj_slab save mode) against fp64 autograd -- the unfused
-assembly, and its ``fuse_gate_bwd`` step pinned BITWISE against it.
+assembly, and its ``fuse_gate_bwd`` and ``fuse_wgrad_overlap`` knobs pinned BITWISE against it.
 
 Every stage is individually tested (``test_proj_gemm_bwd.py``, ``test_sigmoid_gate_bwd.py``,
 ``test_qk_norm_rope_bwd.py``, the sdpa bwd suite); what is under test here is the ASSEMBLY -- the
@@ -43,6 +43,13 @@ printed on every cell, never widened again:
 
 A DENSE ``S % 128 != 0`` has no training record: the FORWARD's SDPA row declines it typed (its KV tail would be
 unmasked on the SM100 DSL), so the two dense S=1000 cells of the S sweep pin that decline instead of a gradient.
+
+``fuse_wgrad_overlap`` (the two weight-gradient GEMMs on a block-owned side stream, forked / joined through events) is a
+SCHEDULING knob: the same launches, so it is pinned by bitwise equality with the in-order block (bf16 / fp16 x dense /
+causal, B=3 GQA, composed with ``fuse_gate_bwd``), by the stream-order probe under the knob (both arms: the join is
+what the probe's post-block zeroing would expose), by the unchanged CUPTI launch count, by a CUDA-graph capture whose
+replay is bitwise the eager run, and -- on any CUDA device -- by a recorder test of the fork / join protocol itself
+(which stage goes to which stream, and that the launch stream waits both join events after the last stage).
 
 Accept tests are ``requires_rubin`` (the block binds ONE engine, the Rubin d256 backward -- AGENTS.md
 Rule 9); reject tests build CUDA tensors for a DECLARED block (``requires_cuda``, no compile);
@@ -98,6 +105,15 @@ _GEOM_397B = dict(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 _CAUSAL = pytest.mark.parametrize("causal", [True, False], ids=["causal", "dense"])
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+# The knob sets the determinism / stream / workspace pins run under: both knobs are performance-only, so every one of them
+# must give the SAME gradients (bitwise) and the same caller-visible stream semantics.
+_KNOBS = {
+    "unfused": {},
+    "fuse_gate_bwd": {"fuse_gate_bwd": True},
+    "fuse_wgrad_overlap": {"fuse_wgrad_overlap": True},
+    "both": {"fuse_gate_bwd": True, "fuse_wgrad_overlap": True},
+}
+_KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
 
 # The bounds (module docstring): one per output dtype, tensor-scaled atol, plus a cosine floor.
 # bf16: worst cells 0.40-0.66 of the bound over every accept cell; fp16 (8x tighter): 0.45-0.56 -- both MEASURED on Rubin cc 10.7.
@@ -512,12 +528,13 @@ def test_partial_needs_skip_whole_stages():
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-def test_two_runs_are_bitwise(fuse):
+@_KNOB_SETS
+def test_two_runs_are_bitwise(knobs):
     """Determinism by construction (no atomics anywhere on the chain, fixed-order folds and reduces): two executes
     with the workspace POISONED in between (0xFF bytes = bf16 NaN) give bitwise-equal gradients -- which also proves
-    no region depends on prior workspace content (the fused chain's ``delta`` region included)."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
+    no region depends on prior workspace content (the fused chain's ``delta`` region and the side-stream GEMMs'
+    ``gemm_scratch_side`` included).  Under every knob set."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, **knobs)
     res.ws.fill_(0xFF)
     grads2 = _alloc_grads(res.blk, fill=float("nan"))
     _execute(res.blk, res.inp, res.saved, res.dy, grads2, res.ws)
@@ -529,19 +546,22 @@ def test_two_runs_are_bitwise(fuse):
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+@_KNOB_SETS
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
-def test_a_caller_stream_orders_every_stage(how, fuse):
+def test_a_caller_stream_orders_every_stage(how, knobs):
     """Every stage -- the CuTe-DSL kernels, the four FROST GEMMs and the SDPA backward adapter -- launches on ONE
     stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``). The default
     stream is parked behind a long spin and the workspace is zeroed on the side stream right after the block, so a
     stage enqueued on the default stream runs late (a late producer leaves zeros for its consumers; a late consumer
     reads the zeros written over the workspace) and the gradients differ from the default-stream run -- which they
     must equal BITWISE (the block is deterministic).  Under ``fuse_gate_bwd`` the delta hand-off (B3 -> the adapter)
-    is one more producer / consumer pair on that stream."""
+    is one more producer / consumer pair on that stream.  Under ``fuse_wgrad_overlap`` the block's OWN side stream
+    carries the two wgrad GEMMs: the caller's zeroing right after the block is what a missing JOIN would expose
+    (B7 reading a zeroed ``dqkvg`` slab, ``dW_o`` / ``dW_qkvg`` landing after the caller moved on), and the parked
+    default stream what a missing FORK or a GEMM escaping to the default stream would."""
     import cuda.bindings.driver as cuda_drv
 
-    res = _backward(dict(_COMMON), batch=1, seq_len=256, fuse_gate_bwd=fuse)  # default stream, synchronized
+    res = _backward(dict(_COMMON), batch=1, seq_len=256, **knobs)  # default stream, synchronized
     side = torch.cuda.Stream()
     ws2 = torch.zeros_like(res.ws)
     grads2 = _alloc_grads(res.blk, fill=0)
@@ -557,7 +577,11 @@ def test_a_caller_stream_orders_every_stage(how, fuse):
     torch.cuda.synchronize()
     for name, ten in grads2.items():
         if ten is not None:
-            assert torch.equal(ten, res.grads[name]), f"{name}: a stage escaped the caller's stream ({how})"
+            assert torch.equal(ten, res.grads[name]), f"{name}: a stage escaped the caller's stream ({how}, knobs={knobs})"
+    if knobs.get("fuse_wgrad_overlap"):
+        # the side stream the block used is neither the caller's nor the default one
+        used = res.blk._side.side.cuda_stream
+        assert used not in (side.cuda_stream, torch.cuda.default_stream().cuda_stream), (used, side.cuda_stream)
 
 
 @requires_rubin
@@ -600,14 +624,56 @@ def test_fused_gate_bwd_is_bitwise_the_unfused_block(dtype, causal, batch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-def test_workspace_size_is_honest(fuse):
+@pytest.mark.parametrize(
+    "dtype, causal, batch, base",
+    [
+        (torch.bfloat16, True, 1, {}),
+        (torch.bfloat16, False, 1, {}),
+        (torch.float16, True, 1, {}),
+        (torch.float16, False, 1, {}),
+        (torch.bfloat16, True, 3, {}),
+        (torch.bfloat16, False, 3, {}),
+        (torch.bfloat16, True, 1, {"fuse_gate_bwd": True}),
+    ],
+    ids=["bf16-causal-b1", "bf16-dense-b1", "fp16-causal-b1", "fp16-dense-b1", "bf16-causal-b3-gqa", "bf16-dense-b3-gqa", "bf16-causal-b1-on-fuse_gate_bwd"],
+)
+def test_fuse_wgrad_overlap_is_bitwise_the_in_order_block(dtype, causal, batch, base):
+    """``fuse_wgrad_overlap=True`` computes the SAME function with the SAME launches: every gradient ``torch.equal`` the
+    in-order block's over the same record (bf16 and fp16, dense and causal, B=1 and B=3 under GQA 8/2, and composed
+    with ``fuse_gate_bwd`` on in both arms).  The deterministic GEMMs land the same bytes from the side stream; the
+    workspace is poisoned first, the gradients NaN-filled.  The side layout appends ``gemm_scratch_side`` (sized to the
+    two wgrad plans, never 0) after everything else, and nothing else in the carve moves."""
+    geom_kw = {**_COMMON, "is_causal": causal}
+    res = _backward(geom_kw, batch=batch, seq_len=256, dtype=dtype, **base)
+    on, ws_on, grads_on = _twin(res, fuse_wgrad_overlap=True, **base)
+    assert on.fuse_wgrad_overlap and on._side is not None and on._side.side is not None
+    assert on._side.side.cuda_stream != torch.cuda.current_stream().cuda_stream  # the executed side stream was not the launch stream
+    for name, ten in grads_on.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), name
+            assert torch.equal(ten, res.grads[name]), f"{name}: the overlapped block differs from the in-order one"
+    lay_i, lay_o = res.blk._layout(), on._layout()
+    assert lay_i.gemm_scratch_side == -1 and lay_i.gemm_scratch_side_bytes == 0
+    wgrad_need = max(p.workspace_bytes for k, p in on.gemm_plans.items() if k.endswith("_wgrad"))
+    assert lay_o.gemm_scratch_side >= 0 and lay_o.gemm_scratch_side_bytes == max(wgrad_need, 1)
+    assert lay_o.gemm_scratch_side >= max(lay_o.gemm_scratch + lay_o.gemm_scratch_bytes, lay_o.delta)  # appended LAST
+    for f in ("do_gated", "dqkvg", "o_gated", "recompute", "recompute_k", "recompute_v", "dq", "dk", "dv", "sdpa_bwd_ws", "gemm_scratch", "delta"):
+        assert getattr(lay_i, f) == getattr(lay_o, f), f
+    jit_ws = {k: int(getattr(p.jit, "workspace_bytes", 0) or 0) for k, p in on.gemm_plans.items()}
+    print(f"gemm_scratch_side {lay_o.gemm_scratch_side_bytes} B (wgrad plans report {wgrad_need}); the forced-tile JITs carve {jit_ws} bytes of scratch")
+
+
+@requires_rubin
+@_KNOB_SETS
+def test_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: a buffer 4096 B larger keeps its tail
-    untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up); the result over a
-    sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
-    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under both knob
-    values: the fused layout appends its ``delta`` region LAST, the position where a size slip would run past the end."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
+    untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up -- under ``fuse_wgrad_overlap``
+    that is also the pin that the side stream and its events exist from ``compile()``, never per execute); the result
+    over a sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
+    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under every knob
+    set: the fused layouts append their ``delta`` / ``gemm_scratch_side`` regions LAST, the position where a size slip
+    would run past the end."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, **knobs)
     blk = res.blk
     size = blk.get_workspace_size()
     lay = blk._layout()
@@ -615,9 +681,15 @@ def test_workspace_size_is_honest(fuse):
     plans = blk.gemm_plans
     assert len(plans) == 4
     need_gemm = max(p.workspace_bytes for p in plans.values())
-    print(f"workspace {size} B; gemm_scratch {lay.gemm_scratch_bytes} B (plans need {need_gemm}); sdpa scratch {lay.sdpa_bwd_bytes} B")
+    print(
+        f"workspace {size} B; gemm_scratch {lay.gemm_scratch_bytes} B (plans need {need_gemm}); sdpa scratch {lay.sdpa_bwd_bytes} B; side scratch {lay.gemm_scratch_side_bytes} B"
+    )
     assert lay.gemm_scratch_bytes >= need_gemm >= 1
     assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes()
+    if knobs.get("fuse_wgrad_overlap"):
+        assert lay.gemm_scratch_side_bytes >= max(p.workspace_bytes for k, p in plans.items() if k.endswith("_wgrad"))
+    else:
+        assert lay.gemm_scratch_side == -1
     ws = torch.full((size + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
     _execute(blk, res.inp, res.saved, res.dy, grads, ws)  # warm-up: first-use artefacts, if any
@@ -665,21 +737,26 @@ def test_dw_partial_planes_are_sized_to_n_ctas_for():
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-@pytest.mark.parametrize("seq_len, expected", [(256, 15), (1000, 22)])
-def test_launch_count_is_honest(seq_len, expected, fuse):
+@pytest.mark.parametrize(
+    "knobs, seq_len, expected",
+    [({}, 256, 15), ({}, 1000, 22), ({"fuse_gate_bwd": True}, 256, 14), ({"fuse_gate_bwd": True}, 1000, 21), ({"fuse_wgrad_overlap": True}, 256, 15)],
+    ids=["unfused-256", "unfused-1000", "fuse_gate_bwd-256", "fuse_gate_bwd-1000", "fuse_wgrad_overlap-256"],
+)
+def test_launch_count_is_honest(seq_len, expected, knobs):
     """CUPTI kernel records of one execute == the launch table: ``12 + c*(2+q)`` (15 at this geometry: c = 1 and q = 1 dQ
     GEMM launch per chunk under the adapter's single-launch dQ rendering -- its ``b_head_group`` is the GQA group; the
     per-member twin would make it g = 4) plus the adapter's padded launches at S = 1000 (+3 q / dO / lse pads, +2 k / v
-    pads, +2 GQA fold copy-outs = 22); ONE fewer under ``fuse_gate_bwd`` (the adapter's ``dot_do_o`` is gone: 14 / 21).
-    Profiled on a warm block; no hidden memcpy. The formula is ALSO recomputed from the adapter's own facts (chunks, the
-    dQ record's ``b_head_group``, padding, zero-fill, the external delta) so a change in either side is visible."""
+    pads, +2 GQA fold copy-outs = 22); ONE fewer under ``fuse_gate_bwd`` (the adapter's ``dot_do_o`` is gone: 14 / 21);
+    UNCHANGED under ``fuse_wgrad_overlap`` (a scheduling knob: the two wgrad GEMMs move to the side stream, nothing is
+    added or removed -- the fork / join events are not kernels).  Profiled on a warm block; no hidden memcpy. The
+    formula is ALSO recomputed from the adapter's own facts (chunks, the dQ record's ``b_head_group``, padding,
+    zero-fill, the external delta) so a change in either side is visible."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
-    expected -= 1 if fuse else 0
-    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len, fuse_gate_bwd=fuse)
+    fuse = bool(knobs.get("fuse_gate_bwd", False))
+    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len, **knobs)
     blk, g = res.blk, res.geom
     impl = blk._sdpa._impl
     assert impl.external_delta is fuse
@@ -740,6 +817,12 @@ def test_convenience_wrapper_matches_the_class():
         torch.cuda.synchronize()
         assert len(_BWD_CACHE) == n_cached + 1 and torch.equal(out3["dh"], res.grads["dh"])
         assert any(b.fuse_gate_bwd for b in _BWD_CACHE.values())
+        out4 = gated_attention_block_backward(
+            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, fuse_wgrad_overlap=True
+        )
+        torch.cuda.synchronize()
+        assert len(_BWD_CACHE) == n_cached + 2 and all(torch.equal(out4[k], res.grads[k]) for k in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"))
+        assert any(b.fuse_wgrad_overlap for b in _BWD_CACHE.values())
         # a PADDED record through the wrapper: the record's seq_lens presence is in the cache key, so this is a NEW
         # declaration, declined typed at its check_support -- never the cached dense block's chain
         lens = torch.full((1,), 256, dtype=torch.int32, device="cuda")
@@ -877,6 +960,61 @@ def test_convenience_wrapper_explicit_stream_from_the_default_stream(monkeypatch
 
 
 @requires_rubin
+@pytest.mark.parametrize("knobs", [_KNOBS["unfused"], _KNOBS["fuse_wgrad_overlap"], _KNOBS["both"]], ids=["unfused", "fuse_wgrad_overlap", "both"])
+def test_cuda_graph_capture_replays_bitwise(knobs):
+    """One ``execute`` captured into a CUDA graph on a side torch stream replays bitwise the eager run -- and recomputes
+    NEW inputs written through the captured pointers.  Under ``fuse_wgrad_overlap`` the fork / join (an event recorded
+    on the capturing stream, waited by the block's side stream, and the join the launch stream waits before ``execute``
+    returns) is the canonical cross-stream capture pattern: the side stream joins the capture and is joined back before
+    it ends, so the capture succeeds and the replay carries both wgrad GEMMs.  The capture itself launches nothing (the
+    NaN-filled gradients are still NaN after it); the block allocates nothing, so no private-pool allocation is
+    captured either."""
+    res = _backward(dict(_COMMON), batch=1, seq_len=256, **knobs)
+    blk = res.blk
+    dy2 = res.dy.clone()
+    ws = torch.empty_like(res.ws)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _execute(blk, res.inp, res.saved, dy2, grads, ws)  # warm-up on the capture stream (torch's own capture recipe)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for ten in grads.values():
+        if ten is not None:
+            ten.fill_(float("nan"))
+    ws.fill_(0xFF)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _execute(blk, res.inp, res.saved, dy2, grads, ws)
+    torch.cuda.synchronize()
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.isnan(ten).all(), f"{name}: the capture launched work"
+    graph.replay()
+    torch.cuda.synchronize()
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: the replay differs from the eager run (knobs={knobs})"
+    # new inputs through the captured pointers: a second replay == a fresh eager run over the new dy
+    dy3 = _make_dy(res.out, seed=7)
+    dy2.copy_(dy3)
+    ws.fill_(0xFF)
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = _alloc_grads(blk, fill=float("nan"))
+    ws_ref = torch.empty_like(ws).fill_(0xFF)
+    _execute(blk, res.inp, res.saved, dy3, ref, ws_ref)
+    torch.cuda.synchronize()
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all() and torch.equal(ten, ref[name]), f"{name}: the replay over new inputs differs from eager (knobs={knobs})"
+    graph.reset()
+
+
+@requires_rubin
 def test_execute_contracts_on_a_compiled_block():
     """Rule 1 both directions at EXECUTE, before any launch: a missing needed output, an output for a ``need_*`` the
     block was declared without, a ``dw_*_norm`` in the wrong dtype (naming ``dw_norm_dtype``), ``seq_lens`` on a block
@@ -1002,6 +1140,23 @@ def test_workspace_carve_is_the_declared_composition():
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_q, s - 1))
     with pytest.raises(ValueError, match="delta_shape"):
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_kv, s))
+    # fuse_wgrad_overlap: the side-stream GEMMs' own scratch, appended LAST (after delta), max(.., 1) like gemm_scratch
+    assert fused.gemm_scratch_side == -1 and fused.gemm_scratch_side_bytes == 0 and lean.gemm_scratch_side == -1
+    for want, side_bytes in ((1, 0), (12345, 12345)):
+        side = _plan_bwd_workspace(
+            g,
+            b,
+            s,
+            torch.bfloat16,
+            RecomputePolicy.SAVE_ALL,
+            need=dict(dw_o=False, dw_norms=False),
+            sdpa_bwd_bytes=1000,
+            gemm_scratch_bytes=4096,
+            delta_shape=(b, g.h_q, 384),
+            side_gemm_scratch_bytes=side_bytes,
+        )
+        assert side.gemm_scratch_side == fused.total_bytes and side.gemm_scratch_side_bytes == want
+        assert side.total_bytes == fused.total_bytes + al(want) and side.delta == fused.delta and side.gemm_scratch == fused.gemm_scratch
 
 
 @requires_cuda
@@ -1014,6 +1169,151 @@ def test_fuse_gate_bwd_knob_is_wired_at_declaration():
     assert on.fuse_gate_bwd is True and on._gate_bwd.want_delta is True and on._sdpa.external_delta is True
     assert on._sdpa.delta_shape == (1, _COMMON["h_q"], 256) and on._sdpa._impl.external_delta is True
     assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages]
+
+
+@requires_cuda
+def test_fuse_wgrad_overlap_knob_is_wired_at_declaration():
+    """The knob (appended, keyword-only, default False) is a declaration fact: stored, no side stream before ``compile()``
+    (Rule 1: the stream and its events belong to the compiled block), the stage list unchanged (a scheduling knob adds
+    no stage), and a typed ``ValueError`` at ``check_support`` when no weight-gradient GEMM exists to overlap
+    (``need_dw_o=False, need_dw_qkvg=False``) -- before the Rubin gate, so it fires on any CUDA device.  Each
+    single-wgrad declaration is accepted (one GEMM to overlap is work enough)."""
+    off = _declare_bwd(dict(_COMMON), 1, 256).blk
+    on = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True).blk
+    assert off.fuse_wgrad_overlap is False and off._side is None
+    assert on.fuse_wgrad_overlap is True and on._side is None
+    assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages]
+    none = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True, need_dw_o=False, need_dw_qkvg=False).blk
+    with pytest.raises(ValueError, match="fuse_wgrad_overlap=True with need_dw_o=False and need_dw_qkvg=False"):
+        none.check_support()
+    for kw in (dict(need_dw_o=False), dict(need_dw_qkvg=False)):
+        one = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True, **kw).blk
+        try:
+            one.check_support()
+        except NotImplementedError as exc:  # the Rubin gate (or a stage's) on a non-Rubin device: the knob was accepted
+            assert "fuse_wgrad_overlap" not in str(exc)
+        except ValueError as exc:
+            assert "fuse_wgrad_overlap" not in str(exc)
+
+
+@requires_cuda
+@pytest.mark.parametrize("how", ["ambient", "explicit"])
+def test_fuse_wgrad_overlap_fork_join_protocol(how, monkeypatch):
+    """The fork / join protocol of ``fuse_wgrad_overlap`` on ANY CUDA device, with every stage replaced by a recorder
+    (the artifacts need Rubin; the protocol is host logic): B1 and B7 launch on the block's side stream and every other
+    stage on the launch stream (ambient or explicit); B1's fork event is recorded on the launch stream AFTER B3 and
+    waited by the side stream BEFORE B1; B7's after B5+B6 and before B7 (so B7 overlaps the reduce and B8); each join
+    event is recorded on the side stream right after its GEMM; and the launch stream waits BOTH join events after the
+    last stage (B8) -- the last things ``execute`` does.  The side stream is never the launch stream.  With the knob
+    off the same recorders see every stage on the launch stream and no event at all."""
+    import cuda.bindings.driver as cuda_drv
+    from cudnn.gated_attention_block import api_bwd as api_bwd_mod
+
+    def wire(dec):
+        blk, g = dec.blk, dec.geom
+        blk._ws = _plan_bwd_workspace(
+            g,
+            dec.batch,
+            dec.seq_len,
+            torch.bfloat16,
+            RecomputePolicy.RECOMPUTE_QK_PRE,
+            need=dict(dw_o=True, dw_norms=True),
+            sdpa_bwd_bytes=4096,
+            gemm_scratch_bytes=1,
+            n_ctas_q=4,
+            n_ctas_k=2,
+            side_gemm_scratch_bytes=1 if blk.fuse_wgrad_overlap else None,
+        )
+        blk._compiled_kernel = blk._ws
+        if blk.fuse_wgrad_overlap:
+            blk._side = api_bwd_mod._WgradSideStream(blk.device)
+        log = []
+
+        def rec(name, key):
+            def f(*a, **k):
+                log.append((name, int(k[key])))
+
+            return f
+
+        for name, attr, key in (
+            ("B2", "_out_proj_dgrad", "stream"),
+            ("B3", "_gate_bwd", "stream"),
+            ("B1", "_out_proj_wgrad", "stream"),
+            ("recompute", "_recompute_qk", "current_stream"),
+            ("compact_v", "_compact_v", "current_stream"),
+            ("B4", "_sdpa", "stream"),
+            ("B5+B6", "_norm_bwd", "stream"),
+            ("B7", "_qkv_gate_wgrad", "stream"),
+            ("B8", "_qkv_gate_dgrad", "stream"),
+        ):
+            setattr(getattr(blk, attr), "execute", rec(name, key))
+        blk._norm_bwd.reduce = rec("reduce", "stream")
+        return log
+
+    real_record, real_wait = torch.cuda.Event.record, torch.cuda.Stream.wait_event
+    logs = []
+
+    def record(ev, stream=None):
+        st = stream if stream is not None else torch.cuda.current_stream()
+        for log in logs:
+            log.append(("record", id(ev), int(st.cuda_stream)))
+        return real_record(ev, stream)
+
+    def wait_event(stream, ev):
+        for log in logs:
+            log.append(("wait", int(stream.cuda_stream), id(ev)))
+        return real_wait(stream, ev)
+
+    monkeypatch.setattr(torch.cuda.Event, "record", record)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", wait_event)
+    launch = torch.cuda.Stream()
+    L = launch.cuda_stream
+
+    def run(dec, log):
+        logs.clear()
+        logs.append(log)
+        ws = torch.empty(dec.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        grads = _alloc_grads(dec.blk)
+        if how == "ambient":
+            with torch.cuda.stream(launch):
+                _execute(dec.blk, dec.inp, dec.saved, dec.dy, grads, ws)
+        else:
+            _execute(dec.blk, dec.inp, dec.saved, dec.dy, grads, ws, current_stream=cuda_drv.CUstream(L))
+        logs.clear()
+
+    # knob ON
+    on = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True)
+    log = wire(on)
+    run(on, log)
+    side = on.blk._side
+    S = side.handle
+    assert S != L and S != torch.cuda.default_stream().cuda_stream
+    stages = [(e[0], e[1]) for e in log if e[0] not in ("record", "wait")]
+    assert [n for n, _ in stages] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"], stages
+    assert all(st == (S if n in ("B1", "B7") else L) for n, st in stages), stages
+    idx = {e[0]: i for i, e in enumerate(log) if e[0] not in ("record", "wait")}
+    fo, jo, fq, jq = (id(side.ev_fork["o"]), id(side.ev_join["o"]), id(side.ev_fork["qkvg"]), id(side.ev_join["qkvg"]))
+    events = [(i, e) for i, e in enumerate(log) if e[0] in ("record", "wait")]
+    assert [e for _, e in events] == [
+        ("record", fo, L),  # fork dW_o: after B3 ...
+        ("wait", S, fo),
+        ("record", jo, S),  # ... join recorded right after B1 on the side stream
+        ("record", fq, L),  # fork dW_qkvg: after B5+B6 ...
+        ("wait", S, fq),
+        ("record", jq, S),  # ... join recorded right after B7
+        ("wait", L, jo),  # the launch stream waits both joins after B8 -- the last things execute does
+        ("wait", L, jq),
+    ], events
+    pos = {e: i for i, e in events}
+    assert idx["B3"] < pos[("record", fo, L)] < pos[("wait", S, fo)] < idx["B1"] < pos[("record", jo, S)] < idx["recompute"]
+    assert idx["B5+B6"] < pos[("record", fq, L)] < pos[("wait", S, fq)] < idx["B7"] < pos[("record", jq, S)] < idx["reduce"] < idx["B8"]
+    assert idx["B8"] < pos[("wait", L, jo)] < pos[("wait", L, jq)] == len(log) - 1
+    # knob OFF: the same recorders, one stream, no event
+    off = _declare_bwd(dict(_COMMON), 1, 256)
+    log_off = wire(off)
+    run(off, log_off)
+    assert [e[0] for e in log_off] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "reduce", "B7", "B8"], log_off
+    assert all(e[1] == L for e in log_off), log_off
 
 
 def test_bwd_constructor_no_longer_stubs():
