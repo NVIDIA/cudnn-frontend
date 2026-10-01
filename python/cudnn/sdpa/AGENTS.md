@@ -382,6 +382,24 @@ bitwise the one-chunk plan) and
 back out of the executed workspace). A new multi-launch consumer of
 `write_thd_live_and_ctr` owes the same two pins.
 
+**The blocked workspace's padding tips the head-chunk divisor at the budget
+edge.**  Each sequence's block is padded to 128 rows, so an equal-length packed
+plan carries `B * 128` more rows per head than the dense plan of the same
+lengths; charged in full that halved the chunk whenever the dense chunk sat
+exactly on the 4 GiB budget (B=1 / B=4 S=8192: 16 -> 8 / 4 -> 2 heads per
+launch, twice the stage-2 and stage-3 launches for the same work).  The rule
+(`api_dsl._sm100_head_chunk_thd(..., t_rows=)`) charges the budget on the TOKEN
+rows and lets the padded slab overshoot by at most `budget //
+_SM100_WS_THD_PAD_SLACK` (1/8); `scratch_workspace_bytes` is still computed
+from the chosen chunk (Rule 8).  Detectors (`test_sdpa_bwd_thd_sm100.py`):
+`test_thd_head_chunk_matches_dense_at_equal_tile_multiple_lengths` (THD chunk
+== dense chunk at six equal-length shapes, the original rule's halved answers
+pinned, the many-short-sequences cap) and
+`test_graph_thd_launch_count_is_the_promised_chain` (launches per execute from
+a CUPTI trace == `setup + dot [+ zero] + chunks * (clamp + stage 2 + (2 +
+group) * (patch + GEMM)) [+ dkv_reduce]`, per-chunk helpers counted by name --
+the Rule 1-2 pin for this chain).
+
 Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
 on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
 `sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
