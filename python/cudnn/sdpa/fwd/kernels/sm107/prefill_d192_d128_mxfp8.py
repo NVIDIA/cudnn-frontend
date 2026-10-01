@@ -173,6 +173,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
 )
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts, mma_ts_step
+from cudnn.sdpa.kernels._mxfp8_sf import build_rowwise_sf_desc, sf_peer_split, sf_tma_rows
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_store_tile,
@@ -603,8 +604,6 @@ def _kernel(
     )
 
     # SF SmemTiles: no-swizzle, leading=16, stride=128. TMA-LDG warp issues one 5-D bulk.tensor per slab.
-    K_SF_BYTES_PER_PEER = SF_SMEM_SIZE_K // CFG.CTA_MMA
-    V_SF_BYTES_PER_PEER = SF_SMEM_SIZE_V // CFG.CTA_MMA
     sQ_SF = SmemTile(
         base=sQ_SF_raw,
         elems_per_stage=SF_SMEM_SIZE_Q,
@@ -982,16 +981,14 @@ def _tmaldg_warp_group(
     tma_k_sf = GmemTileTma(tma_k_sf_desc)
     tma_v_sf = GmemTileTma(tma_v_sf_desc)
 
-    # cga2 split-half offsets fold to 0 under cga1.
-    SF_TMA_ROW_BYTES = 128
-    K_SF_BYTES_PER_PEER = SF_SMEM_SIZE_K // CFG.CTA_MMA
-    V_SF_BYTES_PER_PEER = SF_SMEM_SIZE_V // CFG.CTA_MMA
-    K_SF_ROWS_PER_PEER = K_SF_BYTES_PER_PEER // SF_TMA_ROW_BYTES
-    V_SF_ROWS_PER_PEER = V_SF_BYTES_PER_PEER // SF_TMA_ROW_BYTES
-    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_BYTES_PER_PEER)
-    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_BYTES_PER_PEER)
-    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_ROWS_PER_PEER)
-    v_sf_peer_row = cta_in_pair * cutlass.Int32(V_SF_ROWS_PER_PEER)
+    # cga2 split-half offsets fold to 0 under cga1 -- bytes in SMEM, 128-B rows in the
+    # descriptor (sdpa/kernels/_mxfp8_sf.py; V is rowwise here: one D-plane at d_v = 128).
+    K_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_K, CFG.CTA_MMA)
+    V_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_V, CFG.CTA_MMA)
+    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_SPLIT.bytes_per_peer)
+    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_SPLIT.bytes_per_peer)
+    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_SPLIT.rows_per_peer)
+    v_sf_peer_row = cta_in_pair * cutlass.Int32(V_SF_SPLIT.rows_per_peer)
 
     q_super_idx, head_idx, batch_idx = _dispatch_decode_initial(
         sched.bidx_init,
@@ -2683,10 +2680,9 @@ def _host(
 
     # SF TMA: 5-D, box=(128, num_rows, 1, 1, 1); cga2 K_SF/V_SF narrows to (128, num_rows//CTA_MMA, ...).
     # 5-D layout assumes SF SMEM flat-contiguous (single block-K); Qwen d=256 (SF_NUM_BLOCKS_V=2) needs split TMA or 6-D.
-    SF_TMA_ROW_BYTES = 128
-    SF_NUM_ROWS_Q = SF_SMEM_SIZE_Q // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_K = SF_SMEM_SIZE_K // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_V = SF_SMEM_SIZE_V // SF_TMA_ROW_BYTES
+    SF_NUM_ROWS_Q = sf_tma_rows(SF_SMEM_SIZE_Q)
+    SF_NUM_ROWS_K = sf_tma_rows(SF_SMEM_SIZE_K)
+    SF_NUM_ROWS_V = sf_tma_rows(SF_SMEM_SIZE_V)
 
     def _tma_swz(byte_w: int):
         return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
@@ -2730,33 +2726,19 @@ def _host(
     _q_sf_num_tiles = total_q_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else sq_sf_tiles
     _kv_sf_num_tiles = total_kv_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else skv_sf_tiles
 
-    def _build_sf_desc(sf_tensor, num_tiles, sf_smem_size, num_rows_box, num_heads):
-        sf_base = cutlass.Int64(sf_tensor.iterator.toint())
-        tile_stride_16 = sf_smem_size // 16
-        return tmap.create_tensor_map_tiled(
-            global_address=sf_base,
-            dtype=cutlass.Uint8,
-            global_dims=[
-                SF_TMA_ROW_BYTES,
-                sf_smem_size // SF_TMA_ROW_BYTES,
-                num_tiles,
-                num_heads,
-                _B_SF,
-            ],
-            global_strides=[
-                SF_TMA_ROW_BYTES // 16,
-                tile_stride_16,
-                cutlass.Int64(num_tiles) * tile_stride_16,
-                cutlass.Int64(num_heads) * cutlass.Int64(num_tiles) * tile_stride_16,
-            ],
-            box_dims=[SF_TMA_ROW_BYTES, num_rows_box, 1, 1, 1],
-            swizzle=tmap.TensorMapSwizzle.none,
-            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-        )
-
-    tma_q_sf_desc = _build_sf_desc(sf_q_tensor, _q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
-    tma_k_sf_desc = _build_sf_desc(sf_k_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K // CFG.CTA_MMA, KH)
-    tma_v_sf_desc = _build_sf_desc(sf_v_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_V, SF_NUM_ROWS_V // CFG.CTA_MMA, KH)
+    # SF TMA descriptors (sdpa/kernels/_mxfp8_sf.py): all three ROWWISE -- Q / K by
+    # construction, V because d_v = 128 is ONE D-plane, where the columnwise
+    # (D-plane-major) layout coincides with the per-tile one.  K / V boxes are a
+    # peer's share of the slab at cga2.
+    tma_q_sf_desc = build_rowwise_sf_desc(
+        sf_q_tensor, num_tiles=_q_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_Q, num_rows_box=SF_NUM_ROWS_Q, num_heads=QH, num_batches=_B_SF
+    )
+    tma_k_sf_desc = build_rowwise_sf_desc(
+        sf_k_tensor, num_tiles=_kv_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_K, num_rows_box=SF_NUM_ROWS_K // CFG.CTA_MMA, num_heads=KH, num_batches=_B_SF
+    )
+    tma_v_sf_desc = build_rowwise_sf_desc(
+        sf_v_tensor, num_tiles=_kv_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_V, num_rows_box=SF_NUM_ROWS_V // CFG.CTA_MMA, num_heads=KH, num_batches=_B_SF
+    )
 
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
     q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster

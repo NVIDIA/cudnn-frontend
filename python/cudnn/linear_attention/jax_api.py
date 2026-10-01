@@ -31,7 +31,6 @@ class KdaConfig:
     batch_invariant: bool = False
     checkpoint_every_n_tokens: int = 0
     gate_domain: str = "log"
-    enable_gate_decay_split: bool = False
 
 
 @partial(
@@ -193,7 +192,6 @@ def kimi_delta_attention_fwd(
     batch_invariant=False,
     checkpoint_every_n_tokens=0,
     gate_domain="log",
-    enable_gate_decay_split=False,
 ):
     """Return ``(output, final_state_or_None, residual)``; see the JAX KDA guide."""
     config = KdaConfig(
@@ -207,7 +205,6 @@ def kimi_delta_attention_fwd(
         batch_invariant=batch_invariant,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         gate_domain=gate_domain,
-        enable_gate_decay_split=enable_gate_decay_split,
     )
     return forward((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)
 
@@ -268,7 +265,6 @@ def kimi_delta_attention(
     batch_invariant=False,
     checkpoint_every_n_tokens=0,
     gate_domain="log",
-    enable_gate_decay_split=False,
 ):
     """KDA on packed THD arrays; return ``(output, final_state_or_None)``.
 
@@ -288,6 +284,5 @@ def kimi_delta_attention(
         batch_invariant=batch_invariant,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         gate_domain=gate_domain,
-        enable_gate_decay_split=enable_gate_decay_split,
     )
     return differentiable((q, k, v, g, beta, cu_seqlens, initial_state, a_log, dt_bias), config)

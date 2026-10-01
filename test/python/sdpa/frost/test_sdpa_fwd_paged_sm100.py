@@ -679,7 +679,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("page_size", [32, 64, 256])
+@pytest.mark.parametrize("page_size", [8, 32, 64, 256])
 def test_paged_kernel_page_sizes(page_size):
     """Pages narrower than the tile (several row boxes per tile) and wider than it
     (one box inside the page, runtime row offset)."""

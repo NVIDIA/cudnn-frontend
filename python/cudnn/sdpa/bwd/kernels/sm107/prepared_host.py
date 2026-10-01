@@ -13,8 +13,11 @@ handle's stream and captures into a CUDA graph.  ``prepared_sm107.compile_plan``
 the ``BwdLaunchSpec`` that ``engines.lower_dsl_bwd*`` hands the graph plan.
 
 The stage-3 operand orders follow the kv-major ``[B, H, S_kv, S_q]`` workspace (see ``api_dsl_sm107``): dK reads dS
-as ``A[kv, q]`` (K-major) against ``Q[D, q]``, dQ reads ``dS^T[q, kv]`` (M-major) against ``K[D, kv]``; under GQA the dQ
-GEMM runs once per group member over every ``group``-th Q head so its operands line up with the KV heads.
+as ``A[kv, q]`` (K-major) against ``Q[D, q]``, dQ reads ``dS^T[q, kv]`` (M-major) against ``K[D, kv]``.  Under GQA the K
+head is shared by ``group`` Q heads: the shipped dQ rendering indexes its B by ``h // group`` itself
+(``MatmulTemplateParams.b_head_group = group``), so ONE launch covers the whole chunk; the per-head rendering
+(``b_head_group = 1``, the ``api_dsl_sm107.DQ_SINGLE_LAUNCH = False`` twin) runs once per group member over every
+``group``-th Q head so each launch's operands line up with the KV heads (``_stage3``).
 """
 
 from typing import Optional
@@ -265,7 +268,7 @@ def _stage2_inputs(
 ):
     """The kernel-facing Q / dO / K / V / LSE (zero- / +inf-padded staging copies when the graph's extents are not tile multiples),
     the per-batch kv lengths and the (zero-filled under a mask) dS workspace -- as launches of this artifact."""
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
     q_k, do_k, lse_k, k_k, v_k = q, do, stats, k, v
     if cutlass.const_expr(regions[R_Q_PAD] is not None):
         q_k = _scratch(workspace, regions[R_Q_PAD], dtype)
@@ -315,23 +318,44 @@ def _stage3(
     stream,
     dk_epi: cutlass.Constexpr = None,
     dq_epi: cutlass.Constexpr = None,
+    dq_b_head_group: cutlass.Constexpr = 1,
 ):
     """dK = dS . Q into ``dk_out[bb:bb+bc, :, hb:hb+hc]`` and dQ = dS^T . K into ``dq_out[bb:bb+bc, :, hb:hb+hc]`` for one (batch, head)
     chunk; ``ds`` is the chunk's REAL-extent ``[bc, hc, S_kv, S_q]`` workspace view, ``q`` / ``k`` the full ``[B, S, H, D]`` operands,
-    ``dk_out`` a ``[B, S_kv, H_q, D]`` real-row view.  ``dk_epi`` / ``dq_epi`` are the fp8 arm's epilogue operands (``_matmul``).
-    Every operand is a view; nothing is copied."""
+    ``dk_out`` a ``[B, S_kv, H_q, D]`` real-row view.  ``dk_epi`` / ``dq_epi`` are the fp8 arm's epilogue operands (``_matmul``);
+    ``dq_b_head_group`` is the dQ rendering's ``MatmulTemplateParams.b_head_group`` (how it indexes its B = K head: ``h // group``
+    at the GQA group, per head at 1), which decides the launch count (``_dq_launches``).  Every operand is a view; nothing is copied."""
     q_c = _window(_window(q, 0, bb, bc), 2, hb, hc)  # [bc, S_q, hc, D]
     dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
     # dK = dS . Q: A = dS[kv, q] (M, K, H, B) K-major; B = Q (D, q, H, B); out (kv, D, H, B).
     _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, bc, meta, desc, stream, dk_epi)
     # dQ = dS^T . K: A = dS^T[q, kv] (M, K, H, B) M-major; B = K (D, kv, H_kv, B); out (q, D, H, B).  Under GQA the K head is
-    # shared by `group` Q heads, so the GEMM runs once per group MEMBER over every `group`-th Q head.
+    # shared by `group` Q heads.  The shipped rendering (`dq_b_head_group == group`) indexes B by `h // group` itself, so ONE
+    # launch covers the chunk's `hc` Q heads (A = the whole dS chunk, out = the whole dQ chunk, B = the chunk's kv_n K heads:
+    # kv_n x (S_q / 256) x group clusters instead of kv_n x (S_q / 256), `group` times).  The per-head rendering
+    # (`dq_b_head_group == 1`, the `DQ_SINGLE_LAUNCH = False` twin) runs once per group MEMBER over every `group`-th Q head, so
+    # each launch's A / out heads line up with its B heads.  Both walk the same k tiles per output tile: bitwise-equal dQ.
     kv_n = hc // group
+    n_launch = _dq_launches(group, dq_b_head_group)
+    heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(_window(k, 0, bb, bc), 2, hb // group, kv_n)  # [bc, S_kv, kv_n, D]
-    for member in range(group):
-        a_g = _window(ds, 1, member, kv_n, group)  # ds[:, member::group] -> [bc, kv_n, S_kv, S_q]
-        o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, kv_n, group)  # dq[bs, :, hb+member::group] -> [bc, S_q, kv_n, D]
-        _matmul(mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), kv_n, bc, meta, desc, stream, dq_epi)
+    for member in range(n_launch):
+        a_g = _window(ds, 1, member, heads, n_launch)  # ds[:, member::n_launch] -> [bc, heads, S_kv, S_q] (ds itself at one launch)
+        o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, heads, n_launch)  # dq[bs, :, hb+member::n_launch] -> [bc, S_q, heads, D]
+        _matmul(mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), heads, bc, meta, desc, stream, dq_epi)
+
+
+def _dq_launches(group: int, dq_b_head_group: int) -> int:
+    """How many dQ GEMM launches one chunk takes: ``group // dq_b_head_group`` -- 1 when the dQ rendering groups its B head by
+    the GQA group (``MatmulTemplateParams.b_head_group == group``), ``group`` when B is batched per head (the per-member loop).
+    Plain Python at trace time, so a rendering / host mismatch -- which would silently pair a Q head with the wrong K head --
+    raises instead of launching."""
+    if dq_b_head_group not in (1, group):
+        raise ValueError(
+            f"sm107 bwd d256 stage 3: the dQ rendering's b_head_group ({dq_b_head_group}) must be 1 (one launch per GQA group member) or the group "
+            f"({group}, one launch per chunk); nothing in between pairs every Q head with its K head"
+        )
+    return group // dq_b_head_group
 
 
 # --- the half row --------------------------------------------------------------------------------------------------------
@@ -359,7 +383,7 @@ def host_f16(
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -390,7 +414,7 @@ def host_f16(
             # STAGE 2: head_base / batch_base offset every full-tensor read; dS stays chunk-local.
             main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
             # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
-            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream)
+            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, bb, bc, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
 
     # STAGE 4: fold the per-Q-head partials onto the KV heads (fixed order, deterministic); copy real rows out of a padded staging.
     if cutlass.const_expr(group > 1):
@@ -447,7 +471,7 @@ def host_fp8(
     grad_dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
-    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds = config
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -527,7 +551,7 @@ def host_fp8(
                 stream,
             )
             # STAGE 3: the fp8 K64 arm over the e4m3 dS and the e4m3 Q / K payloads; the epilogue undoes scale_dP and the payload's scale.
-            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, 0, b, hb, hc, group, seq_kv, desc, stream, dk_epi, dq_epi)
+            _stage3(mm_dk, mm_dq, ds, q, k, dk_real, dq, 0, b, hb, hc, group, seq_kv, desc, stream, dk_epi, dq_epi, dq_b_head_group=dq_bhg)
         # STAGE 4: dV always folds + quantizes here (the kernel publishes bf16 per-Q-head dV_true); dK only under GQA, where the
         # bf16 true-unit partials are summed in fixed order BEFORE the amax fold, the scale and the cast (the backend's order).
         fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
@@ -572,7 +596,7 @@ def host_fp8(
                 stream,
             )
             # STAGE 3 at bf16 over the exact upcasts; the partials still carry descale_q / descale_k.
-            _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream)
+            _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
         # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue (descale, amax, scale, cast) into the caller's gradients.
         fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
         fold_quant_host(dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, stream)

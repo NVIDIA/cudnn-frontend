@@ -863,6 +863,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === Compute warps: softmax + dsoftmax per q iteration, dV epilogue per kv tile ========================================
 
 
