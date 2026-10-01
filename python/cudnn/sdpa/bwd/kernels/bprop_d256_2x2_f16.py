@@ -394,7 +394,8 @@ class Bars(NamedTuple):
     mb_v_full: object
     mb_v_empty: object
     # S / dP TMEM parity rings, sub-block indexed [s * STAGES_TMEM_S + slot]: MMA commit -> compute; compute LOAD-wait
-    # -> MMA (the explicit WAR of the lookahead: the fp8 twin's mb_s_acc_empty, never an issue-order invariant).
+    # -> MMA (the lookahead's explicit write-after-read handshake: the fp8 twin's mb_s_acc_empty, never an
+    # issue-order invariant).
     mb_s_full: object
     mb_s_acc_empty: object
     mb_dp_full: object

@@ -788,7 +788,7 @@ bound and unused) is the A/B and oracle base. E5M2 payloads are declined (no bod
 (`seq_len_q/kv`), sink / dSink, bias / dBias, right-band widening, THD,
 `dense_flex`, decode shapes, and `use_deterministic_algorithm` (the chain has no
 atomics; the claim waits on the bring-up sweep). The bf16 d256 graph has a native
-backend competitor (engine 17): pin the engine when validating or measuring. Both
+backend competitor (backend engine 5, `eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2`, the FORT flash_bprop 128x128x256 cga2x1x1 chain; not engine 17): pin the engine when validating or measuring. Both
 rows are `opt_in`. Tests: `test_sdpa_bwd_dsl_sm107.py`, `test_sdpa_bwd_fp8_sm107.py`.
 ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
 multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.

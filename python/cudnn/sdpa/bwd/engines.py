@@ -1138,8 +1138,9 @@ def _sm107_spec() -> EngineSpec:
     THD, decode shapes, ``dense_flex`` layouts, and ``deterministic`` -- the
     chain has no atomics and a two-run bitwise test exists, but the claim waits
     on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
-    competitor (engine 17, which forces its own deterministic flag): pin the
-    engine when validating or measuring this row.
+    competitor (engine 5, ``eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2``, the FORT
+    flash_bprop 128x128x256 cga2x1x1 chain -- NOT engine 17): pin the engine when
+    validating or measuring this row.
 
     A prepared launch: ``compile()`` builds one pointer-host artifact for the whole
     chain (``bwd/prepared_sm107.py``, ``kernels/sm107/prepared_host.py``) and the graph

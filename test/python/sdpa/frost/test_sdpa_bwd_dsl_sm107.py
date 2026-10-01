@@ -826,7 +826,8 @@ def test_unserved_d256_graph_never_surfaces_a_bare_runtime_error():
     """Regression test for the error TYPE: a d256 backward this row declines (deterministic, while deferred) either
     finds another plan or raises ``cudnnGraphNotSupportedError`` -- never the bare RuntimeError a pinned backend config
     that fails to finalize used to fold into (every SDPA harness skips on the typed error and FAILS on anything else).
-    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 17, which forces its deterministic flag),
+    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 5, eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2;
+    the deterministic ask is served by the backend's own plan),
     so "served" is a legitimate outcome here; the bare RuntimeError is the only forbidden one."""
     try:
         g, _t, _outs = _half_bwd_graph(b=2, hq=2, sq=256, skv=256, use_deterministic_algorithm=True)
