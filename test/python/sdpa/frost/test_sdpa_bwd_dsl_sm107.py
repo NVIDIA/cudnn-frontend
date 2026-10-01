@@ -2905,6 +2905,7 @@ def test_plan_declines_typed_when_the_workspace_exceeds_what_the_caller_can_hold
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
     monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)  # host-only: the descriptor helper asks for the device even on a CUDA-less runner
     monkeypatch.setattr(SdpaBwdDslSm107, "compile", lambda self: None)  # size only: _prepared stays None, the plan's bytes come from scratch_workspace_bytes()
 
     def _never(*_a, **_k):

@@ -1425,8 +1425,11 @@ def _bprop_matmul_bh_sm100_kernel(
                     # This stage's scale-factor atoms, onto the same ab_full[stage] barrier as the operands (tx counted above).
                     # SFA: the atom of (this CTA's 128-row M block, this K stage) -- coordinates (byte-in-atom, K tile, M tile, h, b)
                     # over the 5-D atom tensor; the atom order along K and M is the F8_128x4 grid of the A operand's scale matrix.
-                    # SFB: the num_blocks_n D-plane atoms of this K stage -- coordinates (byte-in-atom, plane 0, K tile, h, b), the
-                    # box spanning the planes (the columnwise SF's plane stride grows with S; the descriptor carries it).
+                    # SFB: the num_blocks_n D-plane atoms of this K stage -- coordinates (byte-in-atom, first D plane, K tile, h, b),
+                    # the box spanning the planes (the columnwise SF's plane stride grows with S; the descriptor carries it).  The
+                    # first plane is the pair's N base in 128-column planes -- the same base the B operand load advances with
+                    # (tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n, without the pair-member half), so a grid with more
+                    # than one N tile dequantizes each tile with its own planes; the shipped records have one N tile (n == 256).
                     if elect_one:
                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                             smem_sfa.subview(sfa_smem_bytes * stage),
@@ -1438,10 +1441,11 @@ def _bprop_matmul_bh_sm100_kernel(
                             group=_CTA_GROUP,
                         )
                     if elect_one:
+                        sfb_plane_base = (tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n) // SF_ATOM_ROWS
                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                             smem_sfb.subview(sfb_smem_bytes * stage),
                             tma_sfb_desc_0.get_ptr(),
-                            (cutlass.Int32(0), cutlass.Int32(0), k_tile_idx, tile_h_b, tile_b_b),
+                            (cutlass.Int32(0), sfb_plane_base, k_tile_idx, tile_h_b, tile_b_b),
                             ab_full_mbar_ptr.subview(stage),
                             [],
                             multicast_mask=tma_mcast_mask_b,
