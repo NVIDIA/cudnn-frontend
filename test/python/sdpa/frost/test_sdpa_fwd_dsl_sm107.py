@@ -520,7 +520,9 @@ def test_sm107_d512_2x2_source_arrive_sites_match_the_ledger():
             got = src.count(key + "(")
         assert got == n, f"{key}: {got} arrive sites, ledger says {n}"
     assert "bars.mb_o_empty.arrive_on_peer(cta_id_x ^ cutlass.Int32(2))" in src, "the twin is cluster rank cta_id_x ^ 2"
-    assert src.count("bars.mb_o_empty.wait(") == 3, "TMA-LDG per tile + correction per tile + the kernel-end drain of the final phase"
+    # The three mb_o_empty waits (TMA-LDG per tile + the kernel-end drain of the final phase, correction per tile) are POLLED:
+    # the barrier is released by the twin's remote arrive (the poll-wait rule), so no .wait( site may remain on it.
+    assert src.count("_poll_wait(bars.mb_o_empty.smem_ptr, ") == 3 and "bars.mb_o_empty.wait(" not in src, "mb_o_empty: 3 polled waits, no parked wait"
     lines = src.splitlines()
     idx = [i for i, ln in enumerate(lines) if "mb_p_full[" in ln and "].arrive(" in ln]
     assert len(idx) == 1 and 'fence_proxy("async.shared", space="cta")' in lines[idx[0] - 1]
@@ -3537,11 +3539,23 @@ def _handoff_check(o, lse, ref_o, ref_lse, q_lens, *, tag):
 
 
 _HANDOFF_MASKS = {"dense": dict(causal_br=False, window_left=None), "causal_br_swa129": dict(causal_br=True, window_left=_HANDOFF_WINDOW_LEFT)}
+
+
+def _d512_twin_on() -> bool:
+    """The call-time d512 2x2 twin (api_dsl.D512_2X2), read at collection: under it these cells lower onto the 2x2 sibling
+    (sm107/prefill_d512_f16_2x2.py), whose softmax has no section-3 floor leak -- the scale-1 cells PASS there (measured
+    2026-10-01 on w2u1g-lc-0030), so the strict xfail below is the ROLE-SPLIT kernel's and must not turn that pass into an XPASS failure."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    return bool(api_dsl.D512_2X2)
+
+
 _HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
+    condition=not _d512_twin_on(),
     strict=True,
-    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 kernel NaNs the LIVE rows whose 130-key window excludes the first KV "
-    "tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
-    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups",
+    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 ROLE-SPLIT kernel NaNs the LIVE rows whose 130-key window excludes the "
+    "first KV tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
+    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups.  The 2x2 sibling (twin on) passes these cells",
 )
 _HANDOFF_CASES = [
     pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
