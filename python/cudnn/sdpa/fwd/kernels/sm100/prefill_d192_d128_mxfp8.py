@@ -1707,7 +1707,8 @@ def _tmastg_warp_group(
                     if batch_idx < n_batch:
                         o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                         o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     tma_store_tile(
                         sO[qs],

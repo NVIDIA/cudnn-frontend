@@ -149,6 +149,7 @@ from cudnn.frost.tile_dsl.tma import (
     tma_store_wait,
     bulk_copy,
     bulk_copy_multicast,
+    tma_tensormap_acquire,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, GmemTileLinear, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -1089,6 +1090,10 @@ def _tmaldg_warp_group(
         # closure shape as the dense GmemTileTma — load sites are branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes these packed-total maps once before attention.
+        # Every consuming loader warp acquires them before its tile loop.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     else:
@@ -1207,6 +1212,7 @@ def _tmaldg_warp_group(
                 bars.mb_k_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not CFG.THD_VARLEN,
             )
             tma_load_tile(
                 sK_SF[kv_state.idx].shifted(k_sf_peer_off),
@@ -1254,6 +1260,7 @@ def _tmaldg_warp_group(
                 bars.mb_v_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not CFG.THD_VARLEN,
             )
             if cutlass.const_expr(not CFG.PV_BF16):
                 tma_load_tile(
@@ -1284,6 +1291,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
                 tma_load_tile(
                     sK_SF[kv_state.idx].shifted(k_sf_peer_off),
@@ -1307,6 +1315,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
                 if cutlass.const_expr(not CFG.PV_BF16):
                     tma_load_tile(
@@ -1433,7 +1442,8 @@ def _tmastg_warp_group(
                     if batch_idx < n_batch:
                         o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                         o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     tma_store_tile(
                         sO[qs],

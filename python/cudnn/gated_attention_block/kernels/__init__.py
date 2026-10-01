@@ -18,6 +18,9 @@ stage of the pipeline in ``api.py``::
     qk_norm_rope_tma.py         stages (2)+(3), TMA-staged A/B of the above
     quantize.py                 (3q) / (5q): per-tensor e4m3 quantize pass (unfused FP8)
     elementwise.py              stage (5) sigmoid gate, and (3b) V compaction
+    sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
+    qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
+                                the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the
