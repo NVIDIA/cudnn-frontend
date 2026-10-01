@@ -228,7 +228,7 @@ def d512_arm(request, monkeypatch):
     arm = getattr(request, "param", "role_split")
     if arm == "two_by_two":
         if _SM == 107:
-            pytest.skip("the 2x2 d512 kernel's Rubin sibling lands in its own lane; the twin stays off on cc 10.7")
+            pytest.skip("the 2x2 d512 kernel's cc 10.7 sibling lands in its own lane; the twin stays off on cc 10.7")
         from cudnn.sdpa.fwd import api_dsl
 
         monkeypatch.setattr(api_dsl, "D512_2X2", True)

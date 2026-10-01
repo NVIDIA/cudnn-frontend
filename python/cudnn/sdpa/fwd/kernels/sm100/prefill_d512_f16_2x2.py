@@ -929,7 +929,7 @@ def _tmastg_warp_group(
         # O u V alias gate, PAIR-WIDE under KV_SHARE=2: the twin (cta ^ 2) multicasts its V(t+1) share into MY sVO, so
         # its first V issue of the next tile must also wait for MY store -- every TMA-STG lane arrives on its own
         # mb_o_empty AND on the twin's copy (init O_EMPTY_ARRIVERS = 32 x KV_SHARE).  wait_group.read 0 above has
-        # retired every SMEM read of this tile's store, so the relaxed cross-CTA arrive is a pure WAR credit.
+        # retired every SMEM read of this tile's store, so the relaxed cross-CTA arrive is a pure write-after-read credit.
         bars.mb_o_empty.arrive()
         if cutlass.const_expr(KV_SHARE == 2):
             bars.mb_o_empty.arrive_on_peer(cta_id_x ^ cutlass.Int32(2))

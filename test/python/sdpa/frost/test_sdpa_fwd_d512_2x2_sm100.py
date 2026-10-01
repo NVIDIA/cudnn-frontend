@@ -5,7 +5,7 @@
 
 Host-only: the Cfg / mbarrier-ledger pins, the byte-identity of the 4x1 role-split renderings (cubin md5 with and
 without the appended field, against the pin recorded before the field existed), the arrive-site counts of the kernel
-source, and the SASS pins of the 2x2 cubin.  GPU (requires_blackwell, pre-Rubin): the graph API under the
+source, and the SASS pins of the 2x2 cubin.  GPU (requires_blackwell, pre-cc-10.7): the graph API under the
 ``two_by_two`` fixture (api_dsl.D512_2X2 flipped for the test) on the d512 cases plus the directed cells the 2x2 atom
 needs -- column-half-skewed S (the row-max exchange), a rescale storm, non-tile-multiple seqlens, causal
 S_q = S_kv = 512 (cluster-union bounds), SWA with empty tiles, q-trim, PackGQA g4 / g64 (g128 stays role-split), THD
@@ -35,7 +35,7 @@ _KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _TEMPLATE = "prefill_d512_f16_2x2"
 _ROLE_SPLIT_TEMPLATE = "prefill_d512_f16"
 _D = 512
-_pre_rubin = pytest.mark.skipif(_SM == 107, reason="the 2x2 d512 kernel's Rubin sibling lands in its own lane; the twin stays off on cc 10.7")
+_pre_rubin = pytest.mark.skipif(_SM == 107, reason="the 2x2 d512 kernel's cc 10.7 sibling lands in its own lane; the twin stays off on cc 10.7")
 
 
 def _kernels_dir():
