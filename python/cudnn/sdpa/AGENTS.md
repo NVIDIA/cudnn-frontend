@@ -185,6 +185,39 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+The COMPACT path is the one without `wide_index`, and it is the one production
+hits. A compact BSHD io tensor past 2^31 ELEMENTS (`B x S x H x D > 2^31`:
+d512 at B2 S32K H128, B1 S64K H72+, B32 S2K H128 -- B8 S8K H128 is the same
+count) is addressed by the chain's `dot_do_o` through
+`((batch * S_Q + q_block * Q_TILE) * H + head) * D_V`, an Int32 product chain
+of `block_idx()` values and static extents that the DSL widens only at the
+byte multiply (`mul.wide.s32 %rd, %r, 2` in the PTX), so every row past 2^31
+elements read 8 GiB below the tensor. Measured 2026-10-01 on the B200: B1 S64K
+H72 / H96 completed with a silently wrong delta (dq error 2-3x the bf16 norm,
+inside a vacuous absolute tolerance), B1 S64K H128 / B2 S32K H128 / B32 S2K
+H128 died with an illegal address -- cuda-gdb on the GPU coredump
+(`CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`; the only sanitizer-free way to name the
+kernel when compute-sanitizer and the driver disagree): `Warp MMU Fault` in
+`cudnn_kernel_dot_do_o_kernel`, grid (16, 128, 32), block (15, 6, 29) = batch
+29 (the first batch whose base passes 2^31 is 16). `dkv_reduce` and
+`fold_quant` carried the same `idx * 8` chain over the GQA partials
+(`B x S x H_q x D`). The fix promotes the block indices BEFORE the multiply
+(`wide_index(batch, o) * S_Q + ...`; `_span_exceeds_int32` for the vector
+indices), the identity below 2^31 -- the small-shape PTX is byte-identical
+(md5 8ad680c0 before and after at B2 S1K H8). Detectors:
+`test_sdpa_bwd_prepared_sm100_wide.py::test_prepared_sm100_compact_io_past_int32_elements`
+(L1, ~77 GiB: the chain's delta region against torch's rowsum on every batch --
+a wrapped read is O(100 %) off -- and dQ/dK/dV of the FIRST and LAST batch
+against fp32; it skips where the memory is not free), and the grep
+`grep -nE "^\s+(base|pos|ws_base|dq_accum_base) = " python/cudnn/sdpa/bwd/kernels/bprop_chain_common.py`:
+every product chain it lists must start from a `wide_index(...)` or an
+`Int64(...)` index. Reference checks that gate a large-span run must be
+RELATIVE to the reference magnitude (`max_err <= rel * max|ref|`; with |dq|
+~3e-5 an absolute 5e-2 passed an all-zero tensor) and must include the LAST
+batch, where the linear offsets are largest. Rendering a kernel host-only for
+a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
+on the address path shows the wrap before any GPU run.
+
 **Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
 
 - A setup kernel may publish K/V maps once before attention. Acquire each map
@@ -440,6 +473,50 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
   HAND-KEPT dict pins whatever the hand remembered: the tile rule made eight renderings default renderings and two were pinned.
   Derive the expected set from the rule (`_stage3_default_tiles` walks `_sm100_stage3_cgrp_tile_mn` over S x cc per record) so
   a rule that grows a row demands its renderings.
+
+- **Attribute a floor gap with in-kernel clocks before touching a wait, and
+  quote cycles, not nominal-clock wall time.** Both SM100 d512 stage-2
+  kernels carry a default-off attribution lever (`TemplateParams2x2.debug_clk`
+  on the twin, the sibling record `TemplateParamsDbg.debug_clk` on the 4x1):
+  every mbarrier wait keeps its production form and is bracketed by
+  `%clock64`, the elected lane accumulates per barrier id in the warp's SMEM
+  slice, and each warp dumps 32 x Int64 (waits, blocked counts, issue
+  segments, tiles, and the body's `%globaltimer` span) to a host-pinned buffer
+  at exit. Measured 2026-10-01 (B200, CLEAN slots): the two datapaths wait on
+  DIFFERENT things -- the 4x1's sg0 compute warps are busy ~2850 clk/tile and
+  wait ~1200 on `smem_empty` (a 32 KiB TMA store drains in ~2600 clk), its
+  MMA idles 3100 on `acc_empty`; the twin's MMA waits 2100-2650 on
+  `ring_full` (K/V chunk latency, ~800 of it the cross-pair lock-step:
+  `kv_share 1` measured -6.9 / -10.0 / -9.6 % of stage-2 wall time on dense
+  8K / dense 2K / causal 8K, bitwise -- ONCE per cell as the B arms of an
+  A/B/A series in one slot whose four control arms spread +-1.7 / 0.2 / 0.8 %,
+  so n = 1 per cell, three cells agreeing) while `acc_empty` and
+  `smem_empty` never block (`stages_acc 4` and a two-stage cast are no-ops
+  there) -- a lever that is right for one kernel is a no-op on the other.
+  The body's clk / ns ratio is the SM clock the kernel ACTUALLY ran at:
+  705-820 MHz on sustained S >= 8K backwards while NVML sampled 1155 MHz (the
+  600 W power cap gates cycles; the PLL readout does not move), so a CUPTI
+  "clk per tile at 1155 MHz" overstates cycles by up to 1.6x and the
+  S_kv-scaling of such numbers (5400 -> 6900 -> 7600 clk/tile at 2K / 8K /
+  16K) is the throttle, not kernel work (the bodies are 4860 / 4700 / 4660
+  cycles). Detectors: the default renderings are PTX-identical with the lever
+  off (`test_stage2_default_rendering_ptx_md5_is_unchanged`,
+  `test_stage2_2x2_default_rendering_ptx_md5_is_unchanged`), the armed lever
+  renders different PTX (`test_stage2_{2x2,4x1}_debug_clk_lever_renders_code`),
+  and `test_stage2_{2x2,4x1}_debug_clk_dump_accounts_the_waits` checks every
+  role accumulates exactly the barriers it waits on with bitwise outputs and
+  reads the record layout (the module's `DBG_CLK_*` constants: slot 0 is the
+  body's clk, slot `DBG_CLK_BODY_NS` -- 28 on the twin, 31 on the 4x1 -- its
+  %globaltimer span, so `slot0 / slot28|31` is the SM clock in GHz the body
+  ran at; a decoder is a few lines over those constants and the per-warp
+  `(linear block * 8 + warp) * 32` record offset). The record index is not
+  bounds-checked: the 16 MiB dump holds 8192 CTAs per launch, so assert
+  `grid * 8 * 32 <= DBG_CLK_MAX_WORDS` before arming (both accounting tests
+  do). NCU `--clock-control base` (688 MHz on that box) is the other way to
+  hold the clock -- never compare two wall times without one of the two, and
+  never compare two ARMS run in a fixed order on a power-capped board without
+  an in-run thermal control: the matrix's `4x1, twin` order timed the
+  IDENTICAL stage-3 GEMMs 10-25 % slower in the second arm at S >= 8K.
 
 ## Output initialization regressions
 

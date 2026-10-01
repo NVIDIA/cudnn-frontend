@@ -1,0 +1,13 @@
+# PTX md5 of the 2x2-twin SM100 d512 stage-2 DEFAULT renderings (SM100 arm: stages_kv 4 / cast_stages 1, every debug
+# lever off), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 on 2026-10-01 BEFORE the stage-2 attribution lever
+# (TemplateParams2x2.debug_clk) landed (lanes2/measure_attribute/md5_pre_edit.txt; re-rendered identical at the lever's
+# commit).  The PTX text is a function of the DSL build: test_stage2_2x2_default_rendering_ptx_md5_is_unchanged compares
+# only when the installed DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=0b820f68694a4bc7295d9f1634ee8763
+stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=7914fff929ec40076bafa89e793069a3
+# dense_fp16 / thd_bf16 rendered 2026-10-01 from BOTH the pre-lever tree (d4b024671: the twin's kernel, config and the probe
+# text taken from that commit) and the lever tree (836d71492 + the Rule S7 chain fix): identical md5s -- the lever is zero
+# traced code on the fp16 and THD renderings too (lanes2/measure_attribute/fix/md5_twin_extra{,_prelever}.txt).
+stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=184fbc2495b6c82a0e6cea8b5582f48b
+stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=9acde7e87408c6b664d02df15798b3f8

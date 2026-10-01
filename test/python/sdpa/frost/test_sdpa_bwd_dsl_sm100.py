@@ -931,9 +931,10 @@ import cutlass.cute as cute
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_FP16
 from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
-from cudnn.sdpa.bwd.config_sm100 import TemplateParams, TemplateParams2x2
+from cudnn.sdpa.bwd.config_sm100 import TemplateParams, TemplateParams2x2, TemplateParamsDbg
 kernel_file, twin = params_kw.pop("kernel_file"), params_kw.pop("twin")
-params = TemplateParams2x2(**params_kw) if twin else TemplateParams(**params_kw)
+dbg = params_kw.pop("dbg", False)  # the 4x1's attribution record (TemplateParamsDbg); default = the shipped base record
+params = TemplateParams2x2(**params_kw) if twin else (TemplateParamsDbg(**params_kw) if dbg else TemplateParams(**params_kw))
 mod = load_template(_sm100_kernel_path(kernel_file), params, tag="stage2_probe")
 print("DESC_VERSION", int(getattr(mod, "DESC_VERSION", 0)))
 print("CLUSTER_Q_ROWS", int(getattr(mod.CFG, "CLUSTER_Q_ROWS", mod.CFG.TILE_M * mod.CFG.CTA_MMA)))
@@ -1045,6 +1046,258 @@ def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     got = out["PTX_MD5"].strip()
     print(f"\nSM100 stage-2 4x1 {record}: PTX md5 {got} (pre-edit {want[record]})")
     assert got == want[record], f"{record}: PTX md5 {got} != the pre-edit record's {want[record]} -- the 4x1 stage-2 rendering changed"
+
+
+# --------------------------------------------------------------------------- the 2x2 twin's DEFAULT rendering pin + its lever
+
+_STAGE2_2X2_MD5_RECORD = _Path(__file__).resolve().parent / "renderings" / "md5_stage2_2x2_sm100a.txt"
+_STAGE2_2X2_RECORDS = {
+    "dense_bf16": dict(dtype_qkv=2),
+    "causal_bf16": dict(dtype_qkv=2, window_right=0),
+    "dense_fp16": dict(dtype_qkv=3),
+    "thd_bf16": dict(dtype_qkv=2, thd_varlen=True),
+}
+# The RED side (an armed lever renders different PTX) needs no fp16 / THD render: the lever is dtype- and
+# layout-independent code, and each render is a ~1 min host trace-compile.
+_STAGE2_2X2_RED_RECORDS = ("dense_bf16", "causal_bf16")
+# The attribution lever armed with a fake (non-zero, 64-B aligned) dump address: a host trace-compile only reads the
+# constant, so any aligned value renders the instrumented kernel.
+_FAKE_DUMP_ADDR = 4096
+
+
+def _parse_md5_record_2x2(f):
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = _re.match(r"stage2_2x2 sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def _render_stage2_ptx_md5(tmp_path, name, kw):
+    """Host trace-compile of one stage-2 record for sm_100a -> (PTX md5, probe prints); skips where the DSL cannot."""
+    if not arch_known_to_the_dsl("sm_100a"):
+        pytest.skip("this cutlass-dsl has no sm_100a")
+    dump = tmp_path / name
+    dump.mkdir()
+    script = dump / "ptx_probe.py"
+    script.write_text(_STAGE2_PTX_PROBE)
+    proc = _subprocess.run([_sys.executable, str(script), str(dump), "sm_100a", _json.dumps(kw)], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_100a trace-compile of {name} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION", "N_CHUNKS")))
+    return out["PTX_MD5"].strip(), out
+
+
+def _stage2_2x2_md5_want(record):
+    assert _STAGE2_2X2_MD5_RECORD.is_file(), _STAGE2_2X2_MD5_RECORD
+    dsl, want = _parse_md5_record_2x2(_STAGE2_2X2_MD5_RECORD)
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    from cudnn.frost.buffers import cutedsl_state
+
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
+    return want[record]
+
+
+@pytest.mark.parametrize("record", list(_STAGE2_2X2_RECORDS))
+def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
+    """The 2x2 twin's DEFAULT rendering (every debug lever off) is PTX-IDENTICAL to the committed pre-lever record
+    (``renderings/md5_stage2_2x2_sm100a.txt``, rendered at d4b024671 before ``TemplateParams2x2.debug_clk`` landed): the
+    attribution lever is zero traced code when off.  Host trace-compile for sm_100a, no device."""
+    want = _stage2_2x2_md5_want(record)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True)
+    got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_{record}", kw)
+    assert out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8"
+    print(f"\nSM100 stage-2 2x2 {record}: PTX md5 {got} (record {want})")
+    assert got == want, f"{record}: PTX md5 {got} != the record's {want} -- the 2x2 stage-2 DEFAULT rendering changed"
+
+
+@pytest.mark.parametrize("record", list(_STAGE2_2X2_RED_RECORDS))
+def test_stage2_2x2_debug_clk_lever_renders_code(tmp_path, record):
+    """The RED side of the pin above: ARMED, the attribution lever renders a DIFFERENT kernel (the clock reads, the SMEM
+    accumulators and the exit dump are real code), so a lever that leaked into the default rendering would trip the md5
+    pin rather than ride along unnoticed."""
+    want = _stage2_2x2_md5_want(record)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    got, _out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_clk_{record}", kw)
+    assert got != want, f"{record}: the armed debug_clk lever rendered the SAME PTX as the default -- the lever traces no code"
+
+
+def test_stage2_2x2_debug_clk_dump_accounts_the_waits(monkeypatch):
+    """GPU: the attribution lever on a one-wave shape (B=1 H=4 S=1024: 16 clusters, one q tile each, 8 kv tiles).  Every
+    non-scheduler warp of every CTA writes a record whose body clock is positive and bounds its wait buckets; each role
+    accumulates exactly the barriers it waits on (and nothing else), the MMA leader's kv total is the 8 kv tiles, and the
+    instrumented twin's dQ / dK / dV are BITWISE the plain twin's (the lever never changes a wait's form or the math)."""
+    import dataclasses
+
+    from cuda.bindings import driver as cu
+
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+
+    b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
+    torch.manual_seed(2026)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    o_ref, lse, _all_masked, _, _, _ = _reference(q, k, v, do, None, 1)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt)
+    plain = _twin_capture(monkeypatch, True, tensors, **kw)
+
+    words = K2.DBG_CLK_WORDS
+    dump = torch.zeros(K2.DBG_CLK_MAX_WORDS, dtype=torch.int64, pin_memory=True)
+    err, dp = cu.cuMemHostGetDevicePointer(dump.data_ptr(), 0)
+    assert err == cu.CUresult.CUDA_SUCCESS, err
+    levers = dict(debug_clk=1, debug_dump_addr=int(dp))
+    original = api_dsl.load_template
+
+    def armed(path, params, tag="template"):
+        if tag == "sdpa_bwd_sm100_stage2":
+            params = dataclasses.replace(params, **levers)
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", armed)
+    got = _twin_capture(monkeypatch, True, tensors, **kw)
+    torch.cuda.synchronize()
+    for name, a, c in zip(("dq", "dk", "dv"), plain[:3], got[:3]):
+        assert torch.equal(a, c), f"{name}: the instrumented twin is not bitwise the plain twin"
+
+    nx, ny = (sq // 256) * 4, hq
+    nblk = nx * ny
+    assert nblk * 8 * words <= K2.DBG_CLK_MAX_WORDS, "the record index is unchecked in the kernel: the grid must fit the 16 MiB dump (<= 8192 CTAs)"
+    rec = dump[: nblk * 8 * words].view(nblk, 8, words)
+    total, tiles, kv_total = rec[:, :, K2.DBG_CLK_TOTAL], rec[:, :, K2.DBG_CLK_TILES], rec[:, :, K2.DBG_CLK_KV_TOTAL]
+    assert bool((total[:, :7] > 0).all()), "every non-scheduler warp of every CTA records a body clock"
+    assert bool((rec[:, 7, :] == 0).all()), "the scheduler warp never records"
+    assert bool((tiles[:, :7] == 1).all()), tiles[:, :7]  # 16 clusters on 37 slots: one q tile each
+    leaders = torch.arange(nblk) % 2 == 0  # cta_in_pair == 0
+    assert bool((kv_total[leaders, 4] == skv // 128).all()), kv_total[leaders, 4]
+    assert bool((kv_total[~leaders, 4] == 0).all())
+    assert bool((kv_total[:, 5] == (skv // 128) * K2.CFG.N_CHUNKS).all()), kv_total[:, 5]  # LDG counts chunks
+    assert bool((kv_total[:, 6] == skv // 128).all()), kv_total[:, 6]
+    waits = rec[:, :, 1:11].sum(dim=-1)
+    assert bool((waits[:, :7] <= total[:, :7]).all()), "the wait buckets are a part of the body clock"
+    # Which barriers each role waits on (DBG_BAR ids 1..10 -> slots 1..10): exactly these buckets are positive.
+    expect = {
+        5: {2, 4, 10},  # LDG: op_empty, ring_empty, sched
+        6: {7, 10},  # STG: smem_full, sched
+    }
+    for w in range(4):
+        expect[w] = {5, 8, 10}  # compute: bmm_done, smem_empty, sched
+    for w, bars in expect.items():
+        pos = {i for i in range(1, 11) if bool((rec[:, w, i] > 0).all())}
+        zero = {i for i in range(1, 11) if bool((rec[:, w, i] == 0).all())}
+        assert pos == bars and zero == set(range(1, 11)) - bars, (w, pos, zero)
+    lead_mma = rec[leaders, 4, :]
+    pos = {i for i in range(1, 11) if bool((lead_mma[:, i] > 0).all())}
+    assert pos == {1, 3, 6, 9, 10}, pos  # op_full, ring_full, acc_empty, tmem_dealloc, sched
+    assert bool((lead_mma[:, K2.DBG_CLK_SEG_MMA_ISSUE] > 0).all()) and bool((rec[:, 5, K2.DBG_CLK_SEG_LDG_ISSUE] > 0).all())
+    assert (
+        bool((rec[:, 6, K2.DBG_CLK_SEG_STG_STORE] > 0).all())
+        and bool((rec[:, :4, K2.DBG_CLK_SEG_CMP_MATH] > 0).all())
+        and bool((rec[:, :4, K2.DBG_CLK_SEG_CMP_CAST] > 0).all())
+    )
+
+
+@pytest.mark.parametrize("record", ["dense_bf16", "causal_bf16"])
+def test_stage2_4x1_debug_clk_lever_renders_code(tmp_path, record):
+    """The RED side of the committed 4x1 md5 pin: ARMED through the sibling ``TemplateParamsDbg`` record, the 4x1's
+    attribution lever renders a DIFFERENT kernel than the shipped one, so a lever leaking into the default rendering
+    would trip ``test_stage2_default_rendering_ptx_md5_is_unchanged`` rather than ride along unnoticed."""
+    f = _stage2_md5_record()
+    dsl, want = _parse_md5_record(f)
+    from cudnn.frost.buffers import cutedsl_state
+
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}")
+    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False, dbg=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_4x1_clk_{record}", kw)
+    assert out["CLUSTER_Q_ROWS"] == "256"
+    assert got != want[record], f"{record}: the armed 4x1 debug_clk lever rendered the SAME PTX as the shipped kernel -- the lever traces no code"
+
+
+def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
+    """GPU: the 4x1 role split's attribution lever on the same one-wave shape as the twin's test.  Every non-scheduler
+    warp records a positive body clock bounding its wait buckets, each role accumulates exactly the barriers it waits
+    on (sg0 = CTAs 0,1 waits the ship's ``xfer_empty``, sg1 = CTAs 2,3 its ``xfer_full``; the alias seam on the LDG warp;
+    named barrier 8 on the compute WG), the kv totals are the 8 kv tiles, and dQ / dK / dV are BITWISE the shipped
+    kernel's (the lever changes no wait's form and no math)."""
+    import dataclasses
+
+    from cuda.bindings import driver as cu
+
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd import config_sm100 as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16 as K1
+
+    b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
+    torch.manual_seed(2027)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    o_ref, lse, _all_masked, _, _, _ = _reference(q, k, v, do, None, 1)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt)
+    plain = _twin_capture(monkeypatch, False, tensors, **kw)
+
+    words = K1.DBG_CLK_WORDS
+    dump = torch.zeros(K1.DBG_CLK_MAX_WORDS, dtype=torch.int64, pin_memory=True)
+    err, dp = cu.cuMemHostGetDevicePointer(dump.data_ptr(), 0)
+    assert err == cu.CUresult.CUDA_SUCCESS, err
+    original = api_dsl.load_template
+
+    def armed(path, params, tag="template"):
+        if tag == "sdpa_bwd_sm100_stage2":
+            params = cfgmod.TemplateParamsDbg(**dataclasses.asdict(params), debug_clk=1, debug_dump_addr=int(dp))
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", armed)
+    got = _twin_capture(monkeypatch, False, tensors, **kw)
+    torch.cuda.synchronize()
+    for name, a, c in zip(("dq", "dk", "dv"), plain[:3], got[:3]):
+        assert torch.equal(a, c), f"{name}: the instrumented 4x1 is not bitwise the shipped kernel"
+
+    nx, ny = (sq // 256) * 4, hq
+    nblk = nx * ny
+    assert nblk * 8 * words <= K1.DBG_CLK_MAX_WORDS, "the record index is unchecked in the kernel: the grid must fit the 16 MiB dump (<= 8192 CTAs)"
+    rec = dump[: nblk * 8 * words].view(nblk, 8, words)
+    total, tiles, kv_total = rec[:, :, K1.DBG_CLK_TOTAL], rec[:, :, K1.DBG_CLK_TILES], rec[:, :, K1.DBG_CLK_KV_TOTAL]
+    assert bool((total[:, :7] > 0).all()) and bool((rec[:, 7, :] == 0).all())
+    assert bool((tiles[:, :7] == 1).all()), tiles[:, :7]
+    cta = torch.arange(nblk) % 4
+    leaders = cta % 2 == 0
+    assert bool((kv_total[leaders, 4] == skv // 128).all()) and bool((kv_total[~leaders, 4] == 0).all())
+    assert bool((kv_total[:, 5] == skv // 128).all()) and bool((kv_total[:, 6] == skv // 128).all())
+    nb = 14
+    waits = rec[:, :, 1 : nb + 1].sum(dim=-1)
+    assert bool((waits[:, :7] <= total[:, :7]).all())
+
+    def _buckets(sel, w):
+        return {i for i in range(1, nb + 1) if bool((rec[sel, w, i] > 0).all())}, {i for i in range(1, nb + 1) if bool((rec[sel, w, i] == 0).all())}
+
+    everyone = torch.ones(nblk, dtype=torch.bool)
+    for w, bars in {5: {2, 4, 10, 11}, 6: {7, 10}}.items():  # LDG: op_empty, ring_empty, sched, utccp_done; STG: smem_full, sched
+        pos, zero = _buckets(everyone, w)
+        assert pos == bars and zero == set(range(1, nb + 1)) - bars, (w, pos, zero)
+    for w in range(4):
+        pos, zero = _buckets(cta < 2, w)  # sg0 compute: bmm_done, smem_empty, sched, xfer_empty, bar8
+        assert pos == {5, 8, 10, 13, 14} and zero == set(range(1, nb + 1)) - {5, 8, 10, 13, 14}, (w, pos, zero)
+        pos, zero = _buckets(cta >= 2, w)  # sg1 compute: bmm_done, smem_empty, sched, xfer_full, bar8
+        assert pos == {5, 8, 10, 12, 14} and zero == set(range(1, nb + 1)) - {5, 8, 10, 12, 14}, (w, pos, zero)
+    pos, zero = _buckets(leaders, 4)  # leader MMA: op_full, ring_full, acc_empty, tmem_dealloc, sched
+    assert pos == {1, 3, 6, 9, 10} and zero == set(range(1, nb + 1)) - {1, 3, 6, 9, 10}, (pos, zero)
+    assert bool((rec[leaders, 4, K1.DBG_CLK_SEG_MMA_ISSUE] > 0).all()) and bool((rec[:, 5, K1.DBG_CLK_SEG_LDG_ISSUE] > 0).all())
+    assert bool((rec[:, 6, K1.DBG_CLK_SEG_STG_STORE] > 0).all())
+    assert bool((rec[:, :4, K1.DBG_CLK_SEG_CMP_MATH] > 0).all()) and bool((rec[:, :4, K1.DBG_CLK_SEG_CMP_CAST] > 0).all())
 
 
 def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **sdpa_kwargs):
