@@ -103,7 +103,13 @@ def dot_do_o_kernel(
         do_base = wide_index(batch, do) * do_batch_stride + wide_index(q_block, do) * Q_TILE * do_seq_stride + wide_index(head, do) * do_head_stride
     else:
         row_stride = H * D_V
-        base = ((batch * S_Q + q_block * Q_TILE) * H + head) * D_V
+        # Rule S7: this compact base is a 32-bit product chain (block indices x static extents) that the DSL
+        # sign-extends only at the byte multiply (`mul.wide.s32 ..., 2`), so it wraps once the tensor's linear offset
+        # passes 2^31 elements -- B x S_Q x H x D_V >= 2^31 (d512: B2 S32K H128 at batch 1, B1 S64K H72+ for rows
+        # >= 58K): those rows read 8 GiB below the tensor -- a silently wrong delta (B1 S64K H72 / H96), an illegal
+        # address at 2^32 elements (B1 S64K H128, B32 S2K H128).  Promote the block indices BEFORE the multiply when
+        # the declared span needs Int64 (`wide_index` is the identity below it: smaller shapes render unchanged).
+        base = ((wide_index(batch, o) * S_Q + wide_index(q_block, o) * Q_TILE) * H + wide_index(head, o)) * D_V
     delta_base = (batch * H + head) * S_Q_R + q_block * Q_TILE
     q_left = S_Q - q_block * Q_TILE
 
@@ -171,7 +177,8 @@ def dot_do_o_kernel(
             ),
             cutlass.Float32,
         )
-        dq_accum_base = ((batch * S_Q_R + q_block * Q_TILE) * H + head) * D_QK
+        # Rule S7 (same product chain as `base` above, over the fp32 accumulator's B x S_Q_R x H x D_QK span).
+        dq_accum_base = ((wide_index(batch, dq_accum) * S_Q_R + wide_index(q_block, dq_accum) * Q_TILE) * H + wide_index(head, dq_accum)) * D_QK
         for im in cutlass.range_constexpr(Q_TILE // zero_rows_per_pass):
             for jn in cutlass.range_constexpr(D_QK // (zero_threads_per_row * 4)):
                 addr = dq_accum_base + (zero_row0 + im * zero_rows_per_pass) * (H * D_QK) + zero_col0 + jn * zero_threads_per_row * 4
@@ -258,11 +265,15 @@ def _reduce_group_vec(
     out_head_stride: cutlass.Constexpr[int] = 0,
     out_strided: cutlass.Constexpr[bool] = False,
     skv: cutlass.Constexpr[int] = 0,
+    wide: cutlass.Constexpr[bool] = False,
 ):
     """Sum one 16 B output vector over the group's q-head partials (fp32,
-    fixed order -> deterministic) and store it in the io dtype."""
+    fixed order -> deterministic) and store it in the io dtype.  ``wide``: the
+    partials' or the output's span passes 2^31 elements, so the vector index is
+    promoted to Int64 BEFORE the element multiply (Rule S7); off, the Int32 math
+    renders unchanged."""
     VEC = 8  # 8 elements per vector (16 bytes)
-    pos = idx * VEC
+    pos = (cutlass.Int64(idx) if cutlass.const_expr(wide) else idx) * VEC
     col = pos % D
     row = pos // D  # (b*S_KV + s)*H_KV + kv_head
     kv_head = row % h_kv
@@ -303,12 +314,13 @@ def _reduce_group_vec_guarded(
     out_head_stride: cutlass.Constexpr[int],
     out_strided: cutlass.Constexpr[bool],
     skv: cutlass.Constexpr[int],
+    wide: cutlass.Constexpr[bool] = False,
 ):
     """``_reduce_group_vec``, skipping the pad-column vectors when the output
     head dim is narrower than the padded workspace rows (those columns are
     zero)."""
     if cutlass.const_expr(D_OUT != D):
-        if (idx * 8) % D < D_OUT:
+        if ((cutlass.Int64(idx) if cutlass.const_expr(wide) else idx) * 8) % D < D_OUT:
             _reduce_group_vec(
                 ws_ptr,
                 out_ptr,
@@ -323,6 +335,7 @@ def _reduce_group_vec_guarded(
                 out_head_stride=out_head_stride,
                 out_strided=out_strided,
                 skv=skv,
+                wide=wide,
             )
     else:
         _reduce_group_vec(
@@ -339,7 +352,14 @@ def _reduce_group_vec_guarded(
             out_head_stride=out_head_stride,
             out_strided=out_strided,
             skv=skv,
+            wide=wide,
         )
+
+
+def _span_exceeds_int32(*tensors) -> bool:
+    """Trace-time (static layouts): does any tensor's declared span need Int64 indices?  The `wide_index` test, over
+    several tensors."""
+    return any(1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride)) > 2**31 - 1 for t in tensors)
 
 
 @cute.kernel
@@ -374,6 +394,9 @@ def dkv_reduce_kernel(
     dv_batch_stride, dv_seq_stride, dv_head_stride, _ = dv.stride
     dk_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (S_KV * H_KV * D_QK, H_KV * D_QK, D_QK)
     dv_strided = (dv_batch_stride, dv_seq_stride, dv_head_stride) != (S_KV * H_KV * D_V, H_KV * D_V, D_V)
+    # Rule S7: the per-q-head partials hold B x S_KV x H_Q x D elements (the io count of q / dq) -- past 2^31 the
+    # Int32 vector index wraps exactly like dot_do_o's compact base; promote it inside the reducer when any span needs it.
+    wide = _span_exceeds_int32(dk_ws, dv_ws, dk, dv)
     gidx = bidx * 256 + tidx  # host launch 256 threads
     if cutlass.const_expr(D_QK == D_V):
         OUT_VECS = B * S_KV * H_KV * D_QK // VEC
@@ -393,6 +416,7 @@ def dkv_reduce_kernel(
                 out_head_stride=dk_head_stride,
                 out_strided=dk_strided,
                 skv=S_KV,
+                wide=wide,
             )
             _reduce_group_vec_guarded(
                 dv_ws_ptr,
@@ -409,6 +433,7 @@ def dkv_reduce_kernel(
                 out_head_stride=dv_head_stride,
                 out_strided=dv_strided,
                 skv=S_KV,
+                wide=wide,
             )
     else:
         # Unequal head dims: dK and dV vectors index different row widths, so
@@ -431,6 +456,7 @@ def dkv_reduce_kernel(
                 out_head_stride=dk_head_stride,
                 out_strided=dk_strided,
                 skv=S_KV,
+                wide=wide,
             )
         else:
             if gidx < K_VECS + V_VECS:
@@ -449,6 +475,7 @@ def dkv_reduce_kernel(
                     out_head_stride=dv_head_stride,
                     out_strided=dv_strided,
                     skv=S_KV,
+                    wide=wide,
                 )
 
 
@@ -523,7 +550,9 @@ def fold_quant_kernel(
     gidx = bidx * 256 + tidx  # host launch 256 threads
     m = cutlass.Float32(0.0)
     if gidx < OUT_VECS:
-        pos = gidx * VEC
+        # Rule S7: promote the vector index before the element multiply once the partials' or the output's span
+        # passes 2^31 elements (dkv_reduce's rule); the Int32 form renders unchanged below it.
+        pos = (cutlass.Int64(gidx) if cutlass.const_expr(_span_exceeds_int32(ws, out)) else gidx) * VEC
         col = pos % D
         row = pos // D  # (b * S_OUT + s) * H_OUT + h
         h = row % H_OUT

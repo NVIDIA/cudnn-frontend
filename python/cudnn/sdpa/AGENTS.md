@@ -185,6 +185,39 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+The COMPACT path is the one without `wide_index`, and it is the one production
+hits. A compact BSHD io tensor past 2^31 ELEMENTS (`B x S x H x D > 2^31`:
+d512 at B2 S32K H128, B1 S64K H72+, B32 S2K H128 -- B8 S8K H128 is the same
+count) is addressed by the chain's `dot_do_o` through
+`((batch * S_Q + q_block * Q_TILE) * H + head) * D_V`, an Int32 product chain
+of `block_idx()` values and static extents that the DSL widens only at the
+byte multiply (`mul.wide.s32 %rd, %r, 2` in the PTX), so every row past 2^31
+elements read 8 GiB below the tensor. Measured 2026-10-01 on the B200: B1 S64K
+H72 / H96 completed with a silently wrong delta (dq error 2-3x the bf16 norm,
+inside a vacuous absolute tolerance), B1 S64K H128 / B2 S32K H128 / B32 S2K
+H128 died with an illegal address -- cuda-gdb on the GPU coredump
+(`CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`; the only sanitizer-free way to name the
+kernel when compute-sanitizer and the driver disagree): `Warp MMU Fault` in
+`cudnn_kernel_dot_do_o_kernel`, grid (16, 128, 32), block (15, 6, 29) = batch
+29 (the first batch whose base passes 2^31 is 16). `dkv_reduce` and
+`fold_quant` carried the same `idx * 8` chain over the GQA partials
+(`B x S x H_q x D`). The fix promotes the block indices BEFORE the multiply
+(`wide_index(batch, o) * S_Q + ...`; `_span_exceeds_int32` for the vector
+indices), the identity below 2^31 -- the small-shape PTX is byte-identical
+(md5 8ad680c0 before and after at B2 S1K H8). Detectors:
+`test_sdpa_bwd_prepared_sm100_wide.py::test_prepared_sm100_compact_io_past_int32_elements`
+(L1, ~77 GiB: the chain's delta region against torch's rowsum on every batch --
+a wrapped read is O(100 %) off -- and dQ/dK/dV of the FIRST and LAST batch
+against fp32; it skips where the memory is not free), and the grep
+`grep -nE "^\s+(base|pos|ws_base|dq_accum_base) = " python/cudnn/sdpa/bwd/kernels/bprop_chain_common.py`:
+every product chain it lists must start from a `wide_index(...)` or an
+`Int64(...)` index. Reference checks that gate a large-span run must be
+RELATIVE to the reference magnitude (`max_err <= rel * max|ref|`; with |dq|
+~3e-5 an absolute 5e-2 passed an all-zero tensor) and must include the LAST
+batch, where the linear offsets are largest. Rendering a kernel host-only for
+a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
+on the address path shows the wrap before any GPU run.
+
 **Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
 
 - A setup kernel may publish K/V maps once before attention. Acquire each map
