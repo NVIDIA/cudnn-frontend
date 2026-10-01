@@ -1493,4 +1493,11 @@ using caller-owned, bounded packed partials and the existing combine. NH/HN
 Stats are optional and may use ln or log2. Sink and padded-Stats split
 combinations remain declined. Shape overrides require a declared positive
 `max_total_seq_len_q` within the graph's packed-Q capacity. This extension
-does not add an automatic D192 split policy or a new public tuning knob.
+adds no public tuning knob. A bounded BF16 automatic policy fills the first
+wave of 128-row single-CTA work and retains at least four KV tiles per split.
+It covers fixed SM100 nonpaged THD graphs with B1..4, equal Q/KV heads 4..64,
+Q64..1024 and KV2K..32K, with KV at least four times Q, no window/sink/gate,
+and either no causal mask or bottom-right causal masking. These measured
+split choices lead the backend with or without packed Stats. Other graphs,
+including shape overrides and full prefill, keep their previous automatic
+policy; explicit legal splits remain available.

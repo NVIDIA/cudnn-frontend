@@ -75,6 +75,7 @@ from cudnn.sdpa.fwd.engines import (
     EngineSpec,
     SdpaFwdKnobs,
     paged_thd_split_domain,
+    thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -1299,6 +1300,46 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def mla_thd_split_choice(caps: Capabilities, facts) -> int:
+    """Fill the first wave of the 128-row MLA tile; one keeps the old choice.
+
+    B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
+    the smaller tile plus splitting beats the wide unsplit tile and backend
+    while the launch is underfilled. Full prefill, overrides and other graph
+    features keep their existing policy. Bottom-right prefixes are at least
+    three quarters KV, so the unmasked loop bounds their work closely.
+    """
+    if not (
+        thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (192, 128)
+        and not facts.has_paged_kv
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= 4
+        and 4 <= facts.h_q == facts.h_kv <= 64
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and 4 * facts.s_q <= facts.s_kv
+        and (not facts.causal or facts.bottom_right)
+        and not facts.right_band_widening
+        and facts.window_left is None
+        and facts.device_sm_count
+    ):
+        return 1
+    # This unpacked tile has one physical CTA per 128 query rows. Do not
+    # overfill its first wave: beyond it the extra partials/combine usually
+    # cost more than the shorter loop saves. Four KV tiles per partition
+    # amortize that overhead. Reuse the power-of-two specialization set;
+    # selection uses host graph facts only, never live device lengths.
+    units = facts.b * facts.h_q * _ceil_div(facts.s_q, 128)
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    return max(
+        (s for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles) if units * s <= facts.device_sm_count and kv_tiles // s >= 4),
+        default=1,
+    )
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -1436,6 +1477,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
         unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
+    mla_splits = mla_thd_split_choice(caps, facts)
+    if mla_splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

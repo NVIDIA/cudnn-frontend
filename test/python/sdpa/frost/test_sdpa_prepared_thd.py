@@ -2143,13 +2143,21 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
 @requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("splits,stats_layout,stats_log2", [(1, "NH", False), (2, "HN", False), (3, "NH", True), (8, "HN", True), (3, None, False)])
+@pytest.mark.parametrize(
+    "splits,stats_layout,stats_log2",
+    [(1, "NH", False), (2, "HN", False), (3, "NH", True), (8, "HN", True), (3, None, False), (None, "NH", False), (None, "HN", True), (None, None, False)],
+)
 @pytest.mark.parametrize("batch", [1, 3])
 def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch):
-    """Explicit MLA tiles/splits preserve rebased views, live lengths and output layouts."""
+    """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("Nonpaged packed split is initially admitted only on SM100")
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, 192, 128, 129, 513
+    if splits is None:
+        if dtype != torch.bfloat16:
+            pytest.skip("Automatic MLA placement is currently measured for BF16")
+        hk, kcap = h, 4097
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     torch.manual_seed(192128)
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -2162,7 +2170,10 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     for name in ("cu_q", "cu_kv", "off_q", "off_k", "off_v", "off_o", "off_lse"):
         bufs[name] = torch.zeros(b + 1, dtype=torch.int32, device=DEV)
     g = cudnn.pygraph(
-        io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=stats_layout == "HN"
+        io_data_type=dt,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        is_override_shape_enabled=stats_layout == "HN" and splits is not None,
     )
     t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "k", "v", "o", "lse")}
     for n, heads, cap, width in (("q", h, qcap, d), ("k", hk, kcap, d), ("v", hk, kcap, dv)):
@@ -2194,14 +2205,18 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
-    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: 0})
-    g.build_plan_at_index(g.get_execution_plan_count() - 1)
+    if splits is None:
+        # Exercise the public default without pinning a particular split count.
+        g.build_plans()
+    else:
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: 0})
+        g.build_plan_at_index(g.get_execution_plan_count() - 1)
     ws = torch.empty(g.get_workspace_size(), device=DEV, dtype=torch.uint8)
     pack = {t[n]: x for n, x in bufs.items() if n in t}
     # The effective HN descriptor includes the padding in each head's capacity.
     overrides = (
         {}
-        if stats_layout != "HN"
+        if stats_layout != "HN" or splits is None
         else dict(
             override_uids=[t["lse"].get_uid()],
             override_shapes=[[1, h, tq + 17, 1]],
@@ -2226,11 +2241,18 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
             bufs[n].copy_(torch.tensor(x, device=DEV, dtype=torch.int32))
         return cq, ck
 
+    handle = cudnn.create_handle()
+
+    def execute():
+        # The same stream contract also works if a later heuristic chooses backend.
+        cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+        g.execute(pack, ws, handle=handle, **overrides)
+
     lengths([65, 129, 0], [257, 513, 0])
-    g.execute(pack, ws, **overrides)
+    execute()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        g.execute(pack, ws, **overrides)
+        execute()
     try:
         for ql, kl in (([65, 129, 0], [257, 513, 0]), ([0, 33, 1], [0, 17, 0]), ([1, 0, 65], [1, 0, 129]), ([17, 0, 0], [0, 0, 0])):
             ql, kl = ql[:b], kl[:b]
@@ -2243,7 +2265,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
             # Execute and replay must bind existing storage without constructing new buffers.
             with monkeypatch.context() as m:
                 m.setattr(torch, "empty", lambda *args, **kwargs: pytest.fail("execute allocated a tensor"))
-                g.execute(pack, ws, **overrides)
+                execute()
                 graph.replay()
             for i, (nq, nk) in enumerate(zip(ql, kl)):
                 if not nq:

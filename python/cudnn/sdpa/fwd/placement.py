@@ -51,6 +51,10 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   prepared single-CTA split plans cover bounded short-query/long-cache work.
   The shared split rule below owns the measured shape/layout limits; no-Stats
   graphs lead the backend only when that rule actually selects splitting.
+- nonpaged THD, exact d192/v128 BF16 with equal Q/KV head counts: the shared
+  MLA split rule bounds the measured short-query/long-cache shard. Its
+  single-CTA split leads the backend with or without packed Stats; the
+  existing order remains when there is no first-wave split to use.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
@@ -152,11 +156,13 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import paged_thd_split_choice
+    from .heuristics import mla_thd_split_choice, paged_thd_split_choice
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
     if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    if mla_thd_split_choice(caps, facts) > 1:
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
